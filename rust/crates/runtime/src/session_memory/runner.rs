@@ -13,8 +13,8 @@ use astra_turn_core::cloud_session_memory_extract::{
     SESSION_MEMORY_TEMPLATE, build_extraction_prompt, extract_section,
 };
 use astra_turn_types::{
-    has_durable_correction_directive, is_runtime_scaffolding_message, is_user_correction_signal,
-    session_facts::SessionFacts,
+    has_durable_correction_directive, is_runtime_scaffolding_message,
+    is_transient_runtime_status_text, is_user_correction_signal, session_facts::SessionFacts,
 };
 
 use crate::memory_hooks::relevance::LlmConnParams;
@@ -487,7 +487,9 @@ fn session_memory_extraction_messages(messages: &[Value]) -> Vec<Value> {
 }
 
 fn is_ephemeral_message_for_session_memory(msg: &Value) -> bool {
-    is_runtime_scaffolding_message(msg) || is_vague_reanchor_message(msg)
+    is_runtime_scaffolding_message(msg)
+        || is_vague_reanchor_message(msg)
+        || message_text(msg).is_some_and(is_transient_runtime_status_text)
 }
 
 fn is_vague_reanchor_message(msg: &Value) -> bool {
@@ -1952,6 +1954,26 @@ mod tests {
         assert!(!content.contains("do NOT re-read"));
     }
 
+    #[test]
+    fn rule_fallback_skips_transient_runtime_status_messages() {
+        let messages = vec![
+            json!({"role": "user", "content": "Keep long-running sessions healthy"}),
+            json!({"role": "assistant", "content": "Read failed before returning output: Reading: .../tool-results/call.txt"}),
+            json!({"role": "assistant", "content": "Tool web_search timed out while waiting for the server"}),
+            json!({"role": "assistant", "content": "Sensitive path requires explicit opt-in in Auto mode"}),
+            json!({"role": "user", "content": "Preserve explicit durable session goals"}),
+        ];
+
+        let content = build_rule_fallback_memory("", &messages, 6, 14_000);
+
+        assert!(content.contains("Keep long-running sessions healthy"));
+        assert!(content.contains("Preserve explicit durable session goals"));
+        assert!(!content.contains("Read failed before returning output"));
+        assert!(!content.contains("web_search timed out"));
+        assert!(!content.contains("Sensitive path requires explicit opt-in"));
+        assert!(!content.contains("tool-results/call.txt"));
+    }
+
     #[tokio::test]
     async fn run_extraction_without_selector_persists_rule_fallback() {
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaClient>;
@@ -2167,6 +2189,80 @@ mod tests {
             } => {
                 assert_eq!(source, SessionMemoryExtractionSource::Llm);
                 assert!(content.contains("Scaffolding Filtered"));
+            }
+            _ => panic!("expected llm persistence"),
+        }
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_extraction_selector_prompt_filters_transient_runtime_status() {
+        let (server_url, server_handle) = spawn_json_server(
+            Arc::new(|request: &str| {
+                assert!(
+                    !request.contains("Read failed before returning output"),
+                    "tool-result read failure must not reach selector prompt: {request}"
+                );
+                assert!(
+                    !request.contains("web_search timed out"),
+                    "transient search timeout must not reach selector prompt: {request}"
+                );
+                assert!(
+                    !request.contains("Sensitive path requires explicit opt-in"),
+                    "permission-status text must not reach selector prompt: {request}"
+                );
+                assert!(
+                    request.contains("Improve session cleanup nudges"),
+                    "real task should remain visible to selector prompt: {request}"
+                );
+            }),
+            json!({
+                "choices": [{
+                    "message": {
+                        "content": "# Session Memory\n\n## Session Title\nTransient Filtered"
+                    }
+                }]
+            }),
+        )
+        .await;
+
+        let messages = vec![
+            json!({"role": "user", "content": "Improve session cleanup nudges"}),
+            json!({"role": "assistant", "content": "Read failed before returning output: Reading: .../tool-results/call.txt"}),
+            json!({"role": "assistant", "content": "Tool web_search timed out while waiting for the server"}),
+            json!({"role": "assistant", "content": "Sensitive path requires explicit opt-in in Auto mode"}),
+        ];
+        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaClient>;
+        let params = LlmConnParams {
+            base_url: format!("{server_url}/v1"),
+            api_key: "test-key".to_string(),
+            model_name: "selector-openai".to_string(),
+            wire_model_name: None,
+            provider: "openai".to_string(),
+            request_body_overrides: None,
+            thinking_capability: None,
+        };
+
+        let artifacts = run_extraction(
+            &memoria,
+            "sess-filtered-transient-status",
+            &messages,
+            4,
+            20_000,
+            "",
+            &SessionFacts::default(),
+            std::slice::from_ref(&params),
+            Duration::from_secs(3),
+            512,
+        )
+        .await;
+
+        match artifacts {
+            ExtractionArtifacts::Persisted {
+                source, content, ..
+            } => {
+                assert_eq!(source, SessionMemoryExtractionSource::Llm);
+                assert!(content.contains("Transient Filtered"));
             }
             _ => panic!("expected llm persistence"),
         }
