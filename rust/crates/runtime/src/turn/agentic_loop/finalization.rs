@@ -561,6 +561,7 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     reset_per_turn_corrective_state(state);
     state.refresh_task_board_snapshot().await;
     ensure_terminal_text(state);
+    update_working_memory_for_turn_settlement(state);
 
     // ── Harness: SessionEnd (observe only, fire at most once) ──
     // Fire after terminal text/interruption normalization so snapshots expose
@@ -586,6 +587,97 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
         host.render_final_text(&state.final_text);
         state.final_text_streamed = true;
     }
+}
+
+fn update_working_memory_for_turn_settlement(state: &mut AgenticLoopState) {
+    let task_summary = state
+        .hooks
+        .task_board_snapshot
+        .has_unfinished_tasks()
+        .then(|| state.hooks.task_board_snapshot.short_summary());
+    let interruption = state.interruption.clone();
+    let Some(session) = state.pipeline_session.as_mut() else {
+        return;
+    };
+    let memory = session.working_memory_mut();
+
+    // Rebuild blocker pressure from current settlement state instead of
+    // accumulating old outages/nudges across turns.
+    memory.clear_blockers();
+
+    if let Some(summary) = task_summary {
+        memory.set_next_action(format!(
+            "Resume unfinished task-board work: {}",
+            bounded_working_memory_line(&summary)
+        ));
+        if let Some(interruption) = interruption.as_ref()
+            && interruption_requires_intervention(interruption)
+        {
+            memory.push_blocker(format!(
+                "{}: {}",
+                interruption.kind.label(),
+                bounded_working_memory_line(&interruption.user_message)
+            ));
+        }
+        return;
+    }
+
+    let Some(interruption) = interruption.as_ref() else {
+        memory.clear_next_action();
+        return;
+    };
+
+    if interruption_requires_intervention(interruption) {
+        memory.clear_next_action();
+        memory.push_blocker(format!(
+            "{}: {}",
+            interruption.kind.label(),
+            bounded_working_memory_line(&interruption.user_message)
+        ));
+        return;
+    }
+
+    if matches!(
+        interruption.kind,
+        astra_turn_core::interruption::InterruptionKind::UserCancelled
+    ) {
+        memory.clear_next_action();
+        return;
+    }
+
+    if interruption.kind.is_resumable() {
+        memory.set_next_action(format!(
+            "If the user asks to continue, resume after {}: {}",
+            interruption.kind.label(),
+            bounded_working_memory_line(&interruption.user_message)
+        ));
+    } else {
+        memory.clear_next_action();
+    }
+}
+
+fn interruption_requires_intervention(
+    interruption: &astra_turn_core::interruption::InterruptionRecord,
+) -> bool {
+    matches!(
+        &interruption.resume_action,
+        astra_turn_core::interruption::ResumeAction::RequiresIntervention { .. }
+            | astra_turn_core::interruption::ResumeAction::StartNewSession
+    ) || !interruption.kind.is_resumable()
+}
+
+fn bounded_working_memory_line(raw: &str) -> String {
+    const MAX_CHARS: usize = 512;
+    let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= MAX_CHARS {
+        return normalized;
+    }
+    let mut out = normalized
+        .chars()
+        .take(MAX_CHARS.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
 }
 
 fn settlement_interruption_summary(
@@ -832,6 +924,12 @@ mod tests {
     };
 
     use super::*;
+
+    fn attach_pipeline_session(state: &mut AgenticLoopState) {
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+    }
 
     // E2E: full execution-retry guard lifecycle through the production loop.
     // Round 1: model defers ("需要我直接执行这些修改吗？") on a mutating-profile
@@ -1229,6 +1327,114 @@ mod tests {
             "terminal output should surface unfinished task context"
         );
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+    }
+
+    #[tokio::test]
+    async fn finalize_and_render_persists_unfinished_task_resume_memory() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        attach_pipeline_session(&mut state);
+        state.final_text = "Done.".into();
+        state.hooks.task_board_snapshot =
+            crate::turn::agentic_loop::host::TaskBoardSnapshot::from_active_tasks(&[
+                astra_tools::task_mgmt::SessionTask {
+                    archived_at: None,
+                    id: "task-1".to_string(),
+                    title: "finish validation".to_string(),
+                    description: None,
+                    status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
+                    subtasks: Vec::new(),
+                    created_at: "2025-01-01T00:00:00Z".to_string(),
+                    updated_at: "2025-01-01T00:00:00Z".to_string(),
+                    active_form: None,
+                    owner: None,
+                    metadata: None,
+                    blocks: Vec::new(),
+                    blocked_by: Vec::new(),
+                },
+            ]);
+
+        finalize_and_render(&mut host, &mut state).await;
+
+        let rendered = state
+            .pipeline_session
+            .as_ref()
+            .expect("pipeline session")
+            .working_memory()
+            .render_prompt_section();
+        assert!(
+            rendered.contains("Next action: Resume unfinished task-board work:"),
+            "unfinished task-board state must become durable resume guidance: {rendered}"
+        );
+        assert!(rendered.contains("finish validation"));
+    }
+
+    #[tokio::test]
+    async fn finalize_and_render_clears_stale_resume_memory_on_clean_completion() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        attach_pipeline_session(&mut state);
+        state.final_text = "Done.".into();
+        {
+            let memory = state
+                .pipeline_session
+                .as_mut()
+                .expect("pipeline session")
+                .working_memory_mut();
+            memory.push_decision("keep durable architecture decision");
+            memory.push_blocker("stale network outage");
+            memory.set_next_action("retry stale nudge");
+        }
+
+        finalize_and_render(&mut host, &mut state).await;
+
+        let rendered = state
+            .pipeline_session
+            .as_ref()
+            .expect("pipeline session")
+            .working_memory()
+            .render_prompt_section();
+        assert!(rendered.contains("keep durable architecture decision"));
+        assert!(!rendered.contains("stale network outage"));
+        assert!(!rendered.contains("retry stale nudge"));
+        assert!(!rendered.contains("Next action:"));
+    }
+
+    #[tokio::test]
+    async fn finalize_and_render_records_intervention_as_blocker_not_resume_action() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        attach_pipeline_session(&mut state);
+        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+            astra_turn_core::interruption::InterruptionKind::AuthFailure,
+            astra_turn_core::interruption::ResumeAction::RequiresIntervention {
+                description: "refresh credentials".to_string(),
+            },
+            astra_turn_core::interruption::InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 1,
+                turns_completed: 1,
+                remaining_turns: 3,
+                error_detail: Some("credential refresh required".to_string()),
+                stall_signal: None,
+                resume_restricted_tools: vec![],
+            },
+        ));
+
+        finalize_and_render(&mut host, &mut state).await;
+
+        let rendered = state
+            .pipeline_session
+            .as_ref()
+            .expect("pipeline session")
+            .working_memory()
+            .render_prompt_section();
+        assert!(
+            rendered.contains("Blockers:"),
+            "external intervention must be prompt-visible as a blocker: {rendered}"
+        );
+        assert!(rendered.contains("auth_failure"));
+        assert!(!rendered.contains("Next action:"));
     }
 
     #[tokio::test]
