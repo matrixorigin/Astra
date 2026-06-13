@@ -104,7 +104,7 @@ pub fn render_messages_for_summary(messages: &[serde_json::Value]) -> String {
                 if msg.get("attachment_metadata").is_some() {
                     continue;
                 }
-                let truncated = truncate_str(&content, MAX_CONTENT_CHARS);
+                let truncated = truncate_preserving_edges(&content, MAX_CONTENT_CHARS);
                 out.push_str(&format!("[USER]: {truncated}\n\n"));
             }
             _ => {
@@ -114,6 +114,30 @@ pub fn render_messages_for_summary(messages: &[serde_json::Value]) -> String {
         }
     }
     out
+}
+
+fn truncate_preserving_edges(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    const MARKER: &str = "\n...[middle omitted for compaction]...\n";
+    let marker_chars = MARKER.chars().count();
+    let keep_chars = max_chars.saturating_sub(marker_chars);
+    if keep_chars < 8 {
+        return truncate_str(s, max_chars);
+    }
+    let head_chars = keep_chars.div_ceil(2);
+    let tail_chars = keep_chars / 2;
+    let head: String = s.chars().take(head_chars).collect();
+    let tail: String = s
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}{MARKER}{tail}")
 }
 
 /// Strip `<analysis>...</analysis>` and extract content from `<summary>...</summary>`.
@@ -316,6 +340,25 @@ mod tests {
         assert!(rendered.contains("[TOOL RESULT]"));
         assert!(rendered.contains('…'));
         assert!(rendered.len() < 2000);
+    }
+
+    #[test]
+    fn render_long_user_message_preserves_tail_constraints() {
+        let tail = "FINAL_CONSTRAINT_DO_NOT_LOSE: commit and push after verification";
+        let content = format!(
+            "Primary goal: keep the long-running session healthy. {} {tail}",
+            "middle details ".repeat(260)
+        );
+        let msgs = vec![json!({"role": "user", "content": content})];
+
+        let rendered = render_messages_for_summary(&msgs);
+
+        assert!(rendered.contains("Primary goal"));
+        assert!(
+            rendered.contains(tail),
+            "tail constraints must survive compaction rendering: {rendered}"
+        );
+        assert!(rendered.contains("[middle omitted for compaction]"));
     }
 
     #[test]
