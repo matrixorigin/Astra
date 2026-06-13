@@ -564,7 +564,10 @@ mod tests {
             vec!["module contents".to_string()]
         );
 
-        let _ = std::fs::remove_dir_all(crate::step_checkpoint::session_dir_for(&session_id));
+        let _ = std::fs::remove_dir_all(
+            crate::step_checkpoint::session_dir_for(&session_id)
+                .expect("valid session id for test cleanup"),
+        );
     }
 
     // ── Tool timeline extraction ──

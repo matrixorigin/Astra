@@ -735,7 +735,7 @@ impl HybridRestoreService {
 fn read_composite_snapshot_index_local(
     session_id: &str,
 ) -> Result<astra_core::composite_snapshot::CompositeSnapshotIndex, String> {
-    let path = composite_snapshots_json_path(session_id);
+    let path = composite_snapshots_json_path(session_id)?;
     if !path.exists() {
         return Ok(astra_core::composite_snapshot::CompositeSnapshotIndex::default());
     }
@@ -748,10 +748,12 @@ fn read_composite_snapshot_index_local(
     Ok(index)
 }
 
-fn composite_snapshots_json_path(session_id: &str) -> PathBuf {
+fn composite_snapshots_json_path(
+    session_id: &str,
+) -> Result<PathBuf, String> {
     crate::local_session_artifact_store()
         .session_path(session_id, "step_checkpoints/composite_snapshots.json")
-        .expect("validated session_id must resolve composite snapshot path")
+        .map_err(|error| format!("invalid session_id: {error}"))
 }
 
 fn composite_snapshot_index_to_remote_artifact_record(

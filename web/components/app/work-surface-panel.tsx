@@ -16,7 +16,7 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ACTIVE_AGENT_SURFACE_STATUSES } from "@/lib/work-surface";
 import type {
   AgentSurfaceItem,
@@ -25,6 +25,7 @@ import type {
   WorkSurfaceState,
 } from "@/lib/work-surface";
 import type { WorkSurfaceRunResponse } from "@/lib/api/types";
+import { useKeyboardShortcut } from "@/hooks/use-keyboard-shortcut";
 import { cn } from "@/lib/utils/cn";
 
 export type WorkSurfaceTab = "tasks" | "agents" | "tools";
@@ -143,6 +144,29 @@ export function WorkSurfacePanel({
   const selectedAgent = selectedAgentId
     ? visibleAgents.find((agent) => agent.agentId === selectedAgentId)
     : undefined;
+
+  const toggleWorkSurface = useCallback(() => {
+    if (window.innerWidth < 1024) {
+      setMobileOpen((value) => !value);
+      return;
+    }
+    setCollapsed((value) => !value);
+  }, []);
+
+  useKeyboardShortcut(
+    useCallback(
+      (event) =>
+        (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "t",
+      [],
+    ),
+    useCallback(
+      (event) => {
+        event.preventDefault();
+        toggleWorkSurface();
+      },
+      [toggleWorkSurface],
+    ),
+  );
 
   useEffect(() => {
     if (tab !== "agents") {
@@ -263,9 +287,11 @@ export function WorkSurfacePanel({
         <button
           type="button"
           className="hidden size-8 items-center justify-center rounded-control text-text-muted transition hover:bg-surface-muted hover:text-text lg:inline-flex"
-          onClick={() => setCollapsed((value) => !value)}
+          onClick={toggleWorkSurface}
           aria-label={
-            collapsed ? "Expand work surface" : "Collapse work surface"
+            collapsed
+              ? "Expand work surface (Ctrl+T)"
+              : "Collapse work surface (Ctrl+T)"
           }
         >
           <ChevronRight
@@ -278,6 +304,9 @@ export function WorkSurfacePanel({
             <h2 className="truncate text-sm font-semibold text-text">
               Work Surface
             </h2>
+            <span className="ml-auto hidden rounded-control border border-border/40 px-2 py-0.5 text-[11px] text-text-muted lg:inline-flex">
+              Ctrl+T
+            </span>
           </div>
           <p className="mt-0.5 truncate text-xs text-text-muted">
             {visibleRunStatus
@@ -400,13 +429,14 @@ export function WorkSurfacePanel({
           <button
             type="button"
             className="flex h-full w-full flex-col items-center gap-3 py-4 text-text-muted transition hover:bg-surface-muted/60 hover:text-text"
-            onClick={() => setCollapsed(false)}
-            aria-label="Expand work surface"
+            onClick={toggleWorkSurface}
+            aria-label="Expand work surface (Ctrl+T)"
           >
             <ClipboardList className="size-5" />
             <span className="[writing-mode:vertical-rl] text-xs font-medium">
               Work
             </span>
+            <span className="text-[11px] text-text-muted">Ctrl+T</span>
           </button>
         ) : (
           body

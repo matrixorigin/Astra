@@ -103,16 +103,18 @@ struct LineageContributionContext {
     parent_event_ids: Vec<String>,
 }
 
-fn composite_snapshots_json_path(session_id: &str) -> std::path::PathBuf {
+fn composite_snapshots_json_path(
+    session_id: &str,
+) -> Result<std::path::PathBuf, (StatusCode, Json<ErrorResponse>)> {
     crate::local_session_artifact_store()
         .session_path(session_id, "step_checkpoints/composite_snapshots.json")
-        .expect("validated session_id must resolve data-versioning snapshot path")
+        .map_err(internal_error)
 }
 
 fn read_composite_snapshot_index_local(
     session_id: &str,
 ) -> Result<Option<CompositeSnapshotIndex>, (StatusCode, Json<ErrorResponse>)> {
-    let path = composite_snapshots_json_path(session_id);
+    let path = composite_snapshots_json_path(session_id)?;
     if !path.exists() {
         return Ok(None);
     }

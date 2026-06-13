@@ -445,14 +445,14 @@ pub fn read_composite_snapshot_index(
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// File path for step events JSONL.
-pub(crate) fn events_path_for(session_id: &str) -> PathBuf {
-    session_dir_for(session_id).join("step_events.jsonl")
+pub(crate) fn events_path_for(session_id: &str) -> std::io::Result<PathBuf> {
+    Ok(session_dir_for(session_id)?.join("step_events.jsonl"))
 }
 
-pub(crate) fn session_dir_for(session_id: &str) -> PathBuf {
+pub(crate) fn session_dir_for(session_id: &str) -> std::io::Result<PathBuf> {
     astra_services::local_session_artifact_store()
         .session_dir(session_id)
-        .expect("validated session_id must resolve step session dir")
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
 }
 
 /// File-backed event store: in-memory DAG + append-only JSONL on disk.
@@ -504,7 +504,17 @@ impl FileBackedEventStore {
     }
 
     fn load_events_lenient(session_id: &str) -> Vec<StepEvent> {
-        let path = events_path_for(session_id);
+        let path = match events_path_for(session_id) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    error = %error,
+                    "invalid session_id while loading step events leniently"
+                );
+                return Vec::new();
+            }
+        };
         let mut events = Vec::new();
         if !path.exists() {
             return events;
@@ -568,7 +578,7 @@ impl FileBackedEventStore {
         session_id: &str,
         mut visit: impl FnMut(&StepEvent),
     ) -> std::io::Result<()> {
-        let path = events_path_for(session_id);
+        let path = events_path_for(session_id)?;
         if !path.exists() {
             return Ok(());
         }
@@ -597,9 +607,9 @@ impl FileBackedEventStore {
 
     /// Append a single event to the JSONL file.
     fn persist_event(&self, event: &StepEvent) -> std::io::Result<()> {
-        let dir = session_dir_for(&self.session_id);
+        let dir = session_dir_for(&self.session_id)?;
         std::fs::create_dir_all(&dir)?;
-        let path = events_path_for(&self.session_id);
+        let path = events_path_for(&self.session_id)?;
         let json = serde_json::to_string(event)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         append_encrypted_line(&path, &json)
@@ -1101,7 +1111,7 @@ mod tests {
     #[test]
     fn file_event_store_persist_and_reload() {
         let session_id = format!("test-persist-events-{}", std::process::id());
-        let path = events_path_for(&session_id);
+        let path = events_path_for(&session_id).unwrap();
 
         // Clean up from previous runs
         let _ = std::fs::remove_file(&path);
@@ -1120,14 +1130,14 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(session_dir_for(&session_id));
+        let _ = std::fs::remove_dir(session_dir_for(&session_id).unwrap());
     }
 
     #[test]
     fn file_event_store_recovers_valid_events_after_torn_encrypted_tail() {
         let session_id = unique_session_id("test-torn-encrypted-tail");
-        let path = events_path_for(&session_id);
-        let _ = std::fs::remove_dir_all(session_dir_for(&session_id));
+        let path = events_path_for(&session_id).unwrap();
+        let _ = std::fs::remove_dir_all(session_dir_for(&session_id).unwrap());
 
         {
             let mut store = FileBackedEventStore::empty(&session_id);
@@ -1164,14 +1174,14 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["e1", "e2"]);
 
-        let _ = std::fs::remove_dir_all(session_dir_for(&session_id));
+        let _ = std::fs::remove_dir_all(session_dir_for(&session_id).unwrap());
     }
 
     #[test]
     fn append_after_torn_encrypted_tail_keeps_new_events_readable() {
         let session_id = unique_session_id("test-append-after-torn-encrypted-tail");
-        let path = events_path_for(&session_id);
-        let _ = std::fs::remove_dir_all(session_dir_for(&session_id));
+        let path = events_path_for(&session_id).unwrap();
+        let _ = std::fs::remove_dir_all(session_dir_for(&session_id).unwrap());
 
         {
             let mut store = FileBackedEventStore::empty(&session_id);
@@ -1204,13 +1214,13 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["e1", "e2"]);
 
-        let _ = std::fs::remove_dir_all(session_dir_for(&session_id));
+        let _ = std::fs::remove_dir_all(session_dir_for(&session_id).unwrap());
     }
 
     #[test]
     fn file_event_store_loads_recovery_window_without_full_store_materialization() {
         let session_id = format!("test-recovery-window-{}", std::process::id());
-        let path = events_path_for(&session_id);
+        let path = events_path_for(&session_id).unwrap();
         let _ = std::fs::remove_file(&path);
 
         {
@@ -1229,15 +1239,15 @@ mod tests {
         assert_eq!(ids, vec!["e5", "e6", "e7", "e8", "e9"]);
 
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(session_dir_for(&session_id));
+        let _ = std::fs::remove_dir(session_dir_for(&session_id).unwrap());
     }
 
     #[test]
     fn file_event_store_fails_on_corrupt_event_json() {
         let session_id = format!("test-corrupt-event-json-{}", std::process::id());
-        let path = events_path_for(&session_id);
+        let path = events_path_for(&session_id).unwrap();
         let _ = std::fs::remove_file(&path);
-        std::fs::create_dir_all(session_dir_for(&session_id)).expect("session dir");
+        std::fs::create_dir_all(session_dir_for(&session_id).unwrap()).expect("session dir");
         append_encrypted_line(&path, r#"{"not":"a step event"}"#).expect("append corrupt event");
 
         let error = FileBackedEventStore::load_events_created_at_or_after(&session_id, 0)
@@ -1245,15 +1255,15 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(session_dir_for(&session_id));
+        let _ = std::fs::remove_dir(session_dir_for(&session_id).unwrap());
     }
 
     #[test]
     fn file_event_store_new_skips_invalid_event_without_emptying_history() {
         let session_id = unique_session_id("test-lenient-invalid-event");
-        let path = events_path_for(&session_id);
-        let _ = std::fs::remove_dir_all(session_dir_for(&session_id));
-        std::fs::create_dir_all(session_dir_for(&session_id)).expect("session dir");
+        let path = events_path_for(&session_id).unwrap();
+        let _ = std::fs::remove_dir_all(session_dir_for(&session_id).unwrap());
+        std::fs::create_dir_all(session_dir_for(&session_id).unwrap()).expect("session dir");
 
         let e1 = serde_json::to_string(&make_event("e1", "s1", StepEventType::StepCreated))
             .expect("serialize e1");
@@ -1275,7 +1285,7 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["e1", "e2"]);
 
-        let _ = std::fs::remove_dir_all(session_dir_for(&session_id));
+        let _ = std::fs::remove_dir_all(session_dir_for(&session_id).unwrap());
     }
 
     #[test]
@@ -1353,7 +1363,7 @@ mod tests {
     #[test]
     fn file_event_store_skips_malformed_jsonl_lines() {
         let session_id = format!("test-malformed-jsonl-{}", std::process::id());
-        let dir = session_dir_for(&session_id);
+        let dir = session_dir_for(&session_id).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -1370,7 +1380,7 @@ mod tests {
             "{}\n{}\n{}\n{}\n",
             encrypted_valid, encrypted_malformed, encrypted_malformed2, encrypted_valid
         );
-        std::fs::write(events_path_for(&session_id), &content).unwrap();
+        std::fs::write(events_path_for(&session_id).unwrap(), &content).unwrap();
 
         // Load should skip malformed lines, keep valid ones
         let store = FileBackedEventStore::new(&session_id);
