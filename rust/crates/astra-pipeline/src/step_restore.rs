@@ -23,8 +23,8 @@ use std::collections::HashMap;
 
 use crate::step_checkpoint::{FileBackedEventStore, read_latest_heavy_checkpoint};
 use crate::step_protocol::{
-    CachedToolResult, HeavyCheckpoint, IdempotencyKey, InMemoryIdempotencyCache, PROTOCOL_VERSION,
-    SlotState, StepEvent, StepEventType, VersionPolicy, check_protocol_version_with_policy,
+    CachedToolResult, HeavyCheckpoint, InMemoryIdempotencyCache, PROTOCOL_VERSION, SlotState,
+    StepEvent, StepEventType, VersionPolicy, check_protocol_version_with_policy,
 };
 
 /// Restored session state — everything needed to resume execution.
@@ -183,7 +183,7 @@ fn extract_resume_turn(heavy: &HeavyCheckpoint) -> u32 {
         .unwrap_or(0)
 }
 
-/// Replay step events from JSONL to warm the idempotency cache.
+/// Stream step events from JSONL to warm the idempotency cache.
 ///
 /// Extracts completed tool results and pre-populates the cache so that
 /// on resume, already-executed tools are skipped (especially important
@@ -194,15 +194,11 @@ pub fn warm_cache_from_events(
     let mut cache = InMemoryIdempotencyCache::new();
     let mut completed_results: HashMap<String, Vec<String>> = HashMap::new();
 
-    // Load events from JSONL
-    let store = FileBackedEventStore::new(session_id);
-    let events = store.all_events();
-
-    // Extract tool completion events and populate cache
-    for event in events {
-        if let StepEventType::ToolCallCompleted = event.event_type
-            && let Some(payload) = &event.payload
-        {
+    let result = FileBackedEventStore::for_each_event(session_id, |event| {
+        if let StepEventType::ToolCallCompleted = &event.event_type {
+            let Some(payload) = &event.payload else {
+                return;
+            };
             let tool_name = payload
                 .get("tool_name")
                 .and_then(|v| v.as_str())
@@ -215,18 +211,14 @@ pub fn warm_cache_from_events(
                 .get("is_error")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let content_hash = payload
+            let cache_key = payload
                 .get("idempotency_key")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
 
-            if !tool_name.is_empty() && !content_hash.is_empty() {
-                let key = IdempotencyKey::semantic(
-                    tool_name,
-                    &serde_json::Value::String(content_hash.to_string()),
-                );
-                cache.record(
-                    &key,
+            if !tool_name.is_empty() && !cache_key.is_empty() && !is_error {
+                cache.record_cache_key(
+                    cache_key,
                     CachedToolResult {
                         tool_name: tool_name.to_string(),
                         output: output.to_string(),
@@ -244,6 +236,14 @@ pub fn warm_cache_from_events(
                     .push(output.to_string());
             }
         }
+    });
+
+    if let Err(error) = result {
+        tracing::warn!(
+            session_id,
+            error = %error,
+            "failed to stream step events while warming idempotency cache"
+        );
     }
 
     (cache, completed_results)
@@ -368,7 +368,9 @@ pub struct ToolTimelineEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::step_protocol::{ExecutionCursor, LightCheckpoint, epoch_ms};
+    use crate::step_protocol::{
+        ExecutionCursor, IdempotencyKey, LightCheckpoint, StepEventStore, epoch_ms,
+    };
 
     // ── Helper: build a heavy checkpoint for testing ──
 
@@ -527,6 +529,42 @@ mod tests {
         let (cache, results) = warm_cache_from_events("nonexistent-session-xyz");
         assert!(cache.is_empty());
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn warm_cache_from_events_uses_persisted_cache_key() {
+        let session_id = format!("warm-cache-key-{}-{}", std::process::id(), epoch_ms());
+        let args = serde_json::json!({"path": "src/lib.rs"});
+        let key = IdempotencyKey::semantic("read_file", &args);
+        let mut store = FileBackedEventStore::empty(&session_id);
+        store.append(StepEvent {
+            event_id: "completed-read".to_string(),
+            canonical_event_id: None,
+            step_id: "step-1".to_string(),
+            event_type: StepEventType::ToolCallCompleted,
+            agent_id: None,
+            caused_by: vec![],
+            payload: Some(serde_json::json!({
+                "tool_name": "read_file",
+                "idempotency_key": key.cache_key(),
+                "output": "module contents",
+                "is_error": false,
+            })),
+            created_at: 1000,
+        });
+        drop(store);
+
+        let (cache, results) = warm_cache_from_events(&session_id);
+        let cached = cache
+            .check(&key)
+            .expect("warm cache must restore the exact persisted idempotency key");
+        assert_eq!(cached.output, "module contents");
+        assert_eq!(
+            results.get("read_file").cloned().unwrap_or_default(),
+            vec!["module contents".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(crate::step_checkpoint::session_dir_for(&session_id));
     }
 
     // ── Tool timeline extraction ──

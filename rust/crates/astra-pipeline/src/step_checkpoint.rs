@@ -438,9 +438,19 @@ impl FileBackedEventStore {
                 "failed to decrypt checkpoint",
             )
         })?;
-        serde_json::from_str::<StepEvent>(&json)
-            .map(Some)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        match serde_json::from_str::<StepEvent>(&json) {
+            Ok(event) => Ok(Some(event)),
+            Err(error)
+                if matches!(
+                    error.classify(),
+                    serde_json::error::Category::Syntax | serde_json::error::Category::Eof
+                ) =>
+            {
+                tracing::warn!(error = %error, "skipping malformed step event JSONL line");
+                Ok(None)
+            }
+            Err(error) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        }
     }
 
     fn load_events_matching(

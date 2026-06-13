@@ -156,7 +156,7 @@ fn build_restored_from_scan(
     scan: &JournalScanResult,
     heavy: &HeavyCheckpoint,
 ) -> Result<RestoredSession, RecoveryError> {
-    use crate::step_protocol::{IdempotencyKey, InMemoryIdempotencyCache};
+    use crate::step_protocol::InMemoryIdempotencyCache;
     use std::collections::HashMap;
 
     let mut cache = InMemoryIdempotencyCache::new();
@@ -165,11 +165,9 @@ fn build_restored_from_scan(
     // Extract completed tool results from events
     for tool_call in &scan.tool_calls_found {
         if let Some(ref cached) = tool_call.cached_result {
-            let key = IdempotencyKey::semantic(
-                &tool_call.tool_name,
-                &serde_json::Value::String(cached.output.clone()),
-            );
-            cache.record(&key, cached.clone());
+            if let Some(cache_key) = tool_call.idempotency_key.as_deref() {
+                cache.record_cache_key(cache_key, cached.clone());
+            }
 
             completed_results
                 .entry(tool_call.tool_name.clone())
@@ -417,6 +415,7 @@ pub struct ToolCallRecord {
     pub step_id: String,
     pub tool_name: String,
     pub tool_index: u32,
+    pub idempotency_key: Option<String>,
     pub status: ToolCallStatus,
     pub cached_result: Option<CachedToolResult>,
 }
@@ -547,6 +546,38 @@ fn extract_tool_info_from_event(event: &StepEvent) -> Option<(String, u32)> {
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
     Some((tool_name, tool_index))
+}
+
+fn extract_idempotency_key_from_event(event: &StepEvent) -> Option<String> {
+    event
+        .payload
+        .as_ref()?
+        .get("idempotency_key")?
+        .as_str()
+        .filter(|key| !key.is_empty())
+        .map(ToString::to_string)
+}
+
+fn extract_cached_result_from_event(
+    event: &StepEvent,
+    tool_name: &str,
+) -> Option<CachedToolResult> {
+    let payload = event.payload.as_ref()?;
+    let output = payload
+        .get("result")
+        .or_else(|| payload.get("output"))
+        .and_then(|v| v.as_str())?;
+
+    Some(CachedToolResult {
+        tool_name: tool_name.to_string(),
+        output: output.to_string(),
+        is_error: payload
+            .get("is_error")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        cached_at: event.created_at,
+        context_signature: None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -785,6 +816,7 @@ impl CrashRecoveryManager {
                                 step_id: event.step_id.clone(),
                                 tool_name,
                                 tool_index,
+                                idempotency_key: extract_idempotency_key_from_event(event),
                                 status: ToolCallStatus::StartedOnly,
                                 cached_result: None,
                             },
@@ -796,28 +828,22 @@ impl CrashRecoveryManager {
                         let key = format!("{}:{}:{}", event.step_id, tool_name, tool_index);
                         if let Some(mut record) = started.remove(&key) {
                             record.status = ToolCallStatus::Completed;
-                            // Try to extract cached result from payload
-                            if let Some(payload) = &event.payload
-                                && let Some(result_str) =
-                                    payload.get("result").and_then(|v| v.as_str())
-                            {
-                                record.cached_result = Some(CachedToolResult {
-                                    tool_name: tool_name.clone(),
-                                    output: result_str.to_string(),
-                                    is_error: false,
-                                    cached_at: event.created_at,
-                                    context_signature: None,
-                                });
+                            if record.idempotency_key.is_none() {
+                                record.idempotency_key = extract_idempotency_key_from_event(event);
                             }
+                            record.cached_result =
+                                extract_cached_result_from_event(event, &tool_name);
                             completed.push(record);
                         } else {
                             // Completed without start — orphan event
+                            let cached_result = extract_cached_result_from_event(event, &tool_name);
                             completed.push(ToolCallRecord {
                                 step_id: event.step_id.clone(),
                                 tool_name,
                                 tool_index,
+                                idempotency_key: extract_idempotency_key_from_event(event),
                                 status: ToolCallStatus::Completed,
-                                cached_result: None,
+                                cached_result,
                             });
                         }
                     }
@@ -827,6 +853,9 @@ impl CrashRecoveryManager {
                         let key = format!("{}:{}:{}", event.step_id, tool_name, tool_index);
                         if let Some(mut record) = started.remove(&key) {
                             record.status = ToolCallStatus::Failed;
+                            if record.idempotency_key.is_none() {
+                                record.idempotency_key = extract_idempotency_key_from_event(event);
+                            }
                             completed.push(record);
                         }
                     }
@@ -836,6 +865,9 @@ impl CrashRecoveryManager {
                         let key = format!("{}:{}:{}", event.step_id, tool_name, tool_index);
                         if let Some(mut record) = started.remove(&key) {
                             record.status = ToolCallStatus::Skipped;
+                            if record.idempotency_key.is_none() {
+                                record.idempotency_key = extract_idempotency_key_from_event(event);
+                            }
                             completed.push(record);
                         }
                     }
@@ -1029,7 +1061,9 @@ impl Default for CrashRecoveryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::step_protocol::{ExecutionCursor, StepCheckpoint, StepEvent, StepEventType};
+    use crate::step_protocol::{
+        ExecutionCursor, IdempotencyKey, StepCheckpoint, StepEvent, StepEventType,
+    };
 
     // -- Helper: build a minimal valid checkpoint --
     fn make_test_checkpoint() -> StepCheckpoint {
@@ -1039,6 +1073,18 @@ mod tests {
             "test-agent".to_string(),
             ExecutionCursor::default(),
         )
+    }
+
+    fn make_test_heavy_checkpoint() -> HeavyCheckpoint {
+        match StepCheckpoint::heavy(
+            "test-session-turn-3".to_string(),
+            "test-task".to_string(),
+            "test-agent".to_string(),
+            ExecutionCursor::default(),
+        ) {
+            StepCheckpoint::Heavy(heavy) => *heavy,
+            StepCheckpoint::Light(_) => unreachable!("StepCheckpoint::heavy returned light"),
+        }
     }
 
     fn checkpoint_json() -> String {
@@ -1164,6 +1210,21 @@ mod tests {
         )
     }
 
+    fn tool_record(
+        tool_name: &str,
+        status: ToolCallStatus,
+        cached_result: Option<CachedToolResult>,
+    ) -> ToolCallRecord {
+        ToolCallRecord {
+            step_id: "step-1".to_string(),
+            tool_name: tool_name.to_string(),
+            tool_index: 0,
+            idempotency_key: None,
+            status,
+            cached_result,
+        }
+    }
+
     // =======================================================================
     // Begin recovery tests
     // =======================================================================
@@ -1266,6 +1327,87 @@ mod tests {
         assert_eq!(scan.tool_calls_found[0].status, ToolCallStatus::Completed);
         assert_eq!(scan.tool_calls_found[1].tool_name, "bash");
         assert_eq!(scan.tool_calls_found[1].status, ToolCallStatus::Completed);
+    }
+
+    #[test]
+    fn scan_journal_extracts_persisted_idempotency_key_and_output_payload() {
+        let mut mgr = CrashRecoveryManager::new();
+        mgr.begin_recovery().unwrap();
+
+        let args = serde_json::json!({"path": "src/lib.rs"});
+        let key = IdempotencyKey::semantic("read_file", &args);
+        let cache_key = key.cache_key();
+        let events = vec![StepEvent {
+            event_id: "e1".to_string(),
+            canonical_event_id: None,
+            step_id: "step-1".to_string(),
+            event_type: StepEventType::ToolCallCompleted,
+            agent_id: None,
+            caused_by: Vec::new(),
+            payload: Some(serde_json::json!({
+                "tool_name": "read_file",
+                "tool_index": 0,
+                "idempotency_key": cache_key.clone(),
+                "output": "module contents",
+            })),
+            created_at: 1000,
+        }];
+
+        let json = checkpoint_json();
+        let scan = mgr
+            .scan_journal("sess-1", 5, Some(&json), 3, events)
+            .unwrap();
+
+        assert_eq!(scan.tool_calls_found.len(), 1);
+        let record = &scan.tool_calls_found[0];
+        assert_eq!(record.idempotency_key.as_deref(), Some(cache_key.as_str()));
+        assert_eq!(
+            record
+                .cached_result
+                .as_ref()
+                .map(|result| result.output.as_str()),
+            Some("module contents")
+        );
+    }
+
+    #[test]
+    fn build_restored_from_scan_restores_cache_under_persisted_key() {
+        let args = serde_json::json!({"path": "src/lib.rs"});
+        let key = IdempotencyKey::semantic("read_file", &args);
+        let cached_result = CachedToolResult {
+            tool_name: "read_file".to_string(),
+            output: "module contents".to_string(),
+            is_error: false,
+            cached_at: 1000,
+            context_signature: None,
+        };
+        let scan = JournalScanResult {
+            last_checkpoint: make_test_checkpoint(),
+            checkpoint_turn: 3,
+            events_after: Vec::new(),
+            tool_calls_found: vec![ToolCallRecord {
+                step_id: "step-1".to_string(),
+                tool_name: "read_file".to_string(),
+                tool_index: 0,
+                idempotency_key: Some(key.cache_key()),
+                status: ToolCallStatus::Completed,
+                cached_result: Some(cached_result),
+            }],
+            gap_detected: None,
+        };
+        let heavy = make_test_heavy_checkpoint();
+
+        let restored = build_restored_from_scan(&scan, &heavy).unwrap();
+        let restored_cached = restored
+            .idempotency_cache
+            .check(&key)
+            .expect("restored cache must use the persisted idempotency cache key");
+
+        assert_eq!(restored_cached.output, "module contents");
+        assert_eq!(
+            restored.completed_tool_results.get("read_file"),
+            Some(&vec!["module contents".to_string()])
+        );
     }
 
     #[test]
@@ -1405,26 +1547,14 @@ mod tests {
 
     #[test]
     fn replay_decision_pure_read_completed() {
-        let record = ToolCallRecord {
-            step_id: "s1".to_string(),
-            tool_name: "read_file".to_string(),
-            tool_index: 0,
-            status: ToolCallStatus::Completed,
-            cached_result: None,
-        };
+        let record = tool_record("read_file", ToolCallStatus::Completed, None);
         let decision = CrashRecoveryManager::classify_tool_for_replay(&record);
         assert_eq!(decision, ToolReplayDecision::Replay);
     }
 
     #[test]
     fn replay_decision_side_effect_completed_no_cache() {
-        let record = ToolCallRecord {
-            step_id: "s1".to_string(),
-            tool_name: "bash".to_string(),
-            tool_index: 0,
-            status: ToolCallStatus::Completed,
-            cached_result: None,
-        };
+        let record = tool_record("bash", ToolCallStatus::Completed, None);
         let decision = CrashRecoveryManager::classify_tool_for_replay(&record);
         assert!(matches!(
             decision,
@@ -1441,13 +1571,7 @@ mod tests {
             cached_at: 1000,
             context_signature: None,
         };
-        let record = ToolCallRecord {
-            step_id: "s1".to_string(),
-            tool_name: "bash".to_string(),
-            tool_index: 0,
-            status: ToolCallStatus::Completed,
-            cached_result: Some(cached.clone()),
-        };
+        let record = tool_record("bash", ToolCallStatus::Completed, Some(cached.clone()));
         let decision = CrashRecoveryManager::classify_tool_for_replay(&record);
         assert_eq!(
             decision,
@@ -1459,13 +1583,7 @@ mod tests {
 
     #[test]
     fn replay_decision_in_flight_at_crash() {
-        let record = ToolCallRecord {
-            step_id: "s1".to_string(),
-            tool_name: "bash".to_string(),
-            tool_index: 0,
-            status: ToolCallStatus::StartedOnly,
-            cached_result: None,
-        };
+        let record = tool_record("bash", ToolCallStatus::StartedOnly, None);
         let decision = CrashRecoveryManager::classify_tool_for_replay(&record);
         assert!(matches!(
             decision,
@@ -1475,13 +1593,7 @@ mod tests {
 
     #[test]
     fn replay_decision_failed_tool_is_safe_to_replay() {
-        let record = ToolCallRecord {
-            step_id: "s1".to_string(),
-            tool_name: "bash".to_string(),
-            tool_index: 0,
-            status: ToolCallStatus::Failed,
-            cached_result: None,
-        };
+        let record = tool_record("bash", ToolCallStatus::Failed, None);
         let decision = CrashRecoveryManager::classify_tool_for_replay(&record);
         assert_eq!(decision, ToolReplayDecision::Replay);
     }
@@ -1495,13 +1607,7 @@ mod tests {
             cached_at: 1000,
             context_signature: None,
         };
-        let record = ToolCallRecord {
-            step_id: "s1".to_string(),
-            tool_name: "read_file".to_string(),
-            tool_index: 0,
-            status: ToolCallStatus::Skipped,
-            cached_result: Some(cached.clone()),
-        };
+        let record = tool_record("read_file", ToolCallStatus::Skipped, Some(cached.clone()));
         let decision = CrashRecoveryManager::classify_tool_for_replay(&record);
         assert_eq!(
             decision,

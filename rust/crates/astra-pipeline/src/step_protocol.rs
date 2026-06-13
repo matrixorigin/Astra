@@ -1286,11 +1286,20 @@ impl InMemoryIdempotencyCache {
 
     /// Record a tool result. Evicts oldest entry if at capacity.
     pub fn record(&mut self, key: &IdempotencyKey, result: CachedToolResult) {
+        self.record_cache_key(&key.cache_key(), result);
+    }
+
+    /// Record a tool result under an already-persisted cache key.
+    ///
+    /// Recovery paths store the cache key that was used at execution time.
+    /// Re-hashing a redacted preview or output would create a different key and
+    /// let resumed sessions re-run tools that should have been skipped.
+    pub fn record_cache_key(&mut self, cache_key: &str, result: CachedToolResult) {
         // Evict if at capacity (LRU: evict oldest by cached_at)
         if self.cache.len() >= self.max_entries {
             self.evict_oldest();
         }
-        self.cache.insert(key.cache_key(), result);
+        self.cache.insert(cache_key.to_string(), result);
     }
 
     /// Evict oldest entry by cached_at timestamp
@@ -1340,7 +1349,7 @@ impl IdempotencyCache for InMemoryIdempotencyCache {
     }
 
     fn record(&mut self, key: &IdempotencyKey, result: CachedToolResult) {
-        self.cache.insert(key.cache_key(), result);
+        InMemoryIdempotencyCache::record(self, key, result);
     }
 
     fn evict_step(&mut self, step_id: &str) {
@@ -1981,6 +1990,30 @@ mod tests {
     }
 
     #[test]
+    fn inmemory_cache_records_persisted_cache_key_without_rehashing() {
+        let mut cache = InMemoryIdempotencyCache::new();
+        let args = serde_json::json!({"path": "src/lib.rs"});
+        let key = IdempotencyKey::semantic("read_file", &args);
+        let persisted_key = key.cache_key();
+
+        cache.record_cache_key(
+            &persisted_key,
+            CachedToolResult {
+                tool_name: "read_file".into(),
+                output: "module contents".into(),
+                is_error: false,
+                cached_at: epoch_ms(),
+                context_signature: None,
+            },
+        );
+
+        let cached = cache
+            .check(&key)
+            .expect("recorded raw cache key must be usable by the original idempotency key");
+        assert_eq!(cached.output, "module contents");
+    }
+
+    #[test]
     fn inmemory_cache_evict_step() {
         let mut cache = InMemoryIdempotencyCache::new();
         let k1 = IdempotencyKey::new("step-A", 0, "grep", &serde_json::json!({}));
@@ -2589,6 +2622,39 @@ mod tests {
         assert!(cache.check(&key).is_some());
         cache.evict_step("s1");
         assert!(cache.check(&key).is_none());
+    }
+
+    #[test]
+    fn idempotency_cache_trait_record_respects_capacity() {
+        let mut cache: Box<dyn IdempotencyCache> =
+            Box::new(InMemoryIdempotencyCache::with_capacity(1));
+        let old = IdempotencyKey::new("s1", 0, "grep", &serde_json::json!({"pattern": "old"}));
+        let new = IdempotencyKey::new("s1", 1, "grep", &serde_json::json!({"pattern": "new"}));
+
+        cache.record(
+            &old,
+            CachedToolResult {
+                tool_name: "grep".into(),
+                output: "old".into(),
+                is_error: false,
+                cached_at: 1,
+                context_signature: None,
+            },
+        );
+        cache.record(
+            &new,
+            CachedToolResult {
+                tool_name: "grep".into(),
+                output: "new".into(),
+                is_error: false,
+                cached_at: 2,
+                context_signature: None,
+            },
+        );
+
+        assert_eq!(cache.len(), 1);
+        assert!(cache.check(&old).is_none());
+        assert_eq!(cache.check(&new).unwrap().output, "new");
     }
 
     // ── Checkpoint Trigger Strategy ──
