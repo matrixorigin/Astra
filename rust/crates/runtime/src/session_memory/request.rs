@@ -15,6 +15,7 @@ pub struct ExtractionRequest {
     pub current_tokens: usize,
     pub current_tool_calls: usize,
     pub had_error: bool,
+    pub had_user_correction: bool,
     pub turn_number: u32,
     pub config: SessionMemoryExtractConfig,
 }

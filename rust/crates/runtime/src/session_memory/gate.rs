@@ -27,6 +27,7 @@ pub fn evaluate(
     current_tokens: usize,
     current_tool_calls: usize,
     had_error: bool,
+    had_user_correction: bool,
     config: &SessionMemoryExtractConfig,
 ) -> GateDecision {
     let decision = evaluate_inner(
@@ -35,6 +36,7 @@ pub fn evaluate(
         current_tokens,
         current_tool_calls,
         had_error,
+        had_user_correction,
         config,
     );
     // Operator-facing trace: inspectable in production logs when
@@ -50,6 +52,7 @@ pub fn evaluate(
         current_tokens,
         current_tool_calls,
         had_error,
+        had_user_correction,
         min_tokens_to_init = config.min_tokens_to_init,
         min_tokens_between_updates = config.min_tokens_between_updates,
         min_tool_calls_between_updates = config.min_tool_calls_between_updates,
@@ -61,7 +64,7 @@ pub fn evaluate(
     // without `--diagnostic-log`).
     if std::env::var("ASTRA_SESSION_MEMORY_TRACE").is_ok() {
         eprintln!(
-            "[gate] sid={} init={} tokens_at_last={} current_tokens={} tool_calls_at_last={} current_tool_calls={} had_error={} min_init={} min_between={} decision={:?}",
+            "[gate] sid={} init={} tokens_at_last={} current_tokens={} tool_calls_at_last={} current_tool_calls={} had_error={} had_user_correction={} min_init={} min_between={} decision={:?}",
             truncate_sid(session_id),
             state.initialized,
             state.tokens_at_last_extraction,
@@ -69,6 +72,7 @@ pub fn evaluate(
             state.tool_calls_at_last_extraction,
             current_tool_calls,
             had_error,
+            had_user_correction,
             config.min_tokens_to_init,
             config.min_tokens_between_updates,
             decision,
@@ -85,6 +89,7 @@ fn evaluate_inner(
     current_tokens: usize,
     current_tool_calls: usize,
     had_error: bool,
+    had_user_correction: bool,
     config: &SessionMemoryExtractConfig,
 ) -> GateDecision {
     if session_id.is_empty() {
@@ -103,6 +108,13 @@ fn evaluate_inner(
     // `had_error=true` with `session_id=""` is still NoSessionId, not
     // a runnable extraction. Do not reorder.
     if had_error {
+        return GateDecision::Run;
+    }
+
+    // A user correction/reanchor means the previous session summary may now
+    // contain stale intent. Refresh promptly so the next turn doesn't retrieve
+    // old working memory that conflicts with the user's latest direction.
+    if had_user_correction {
         return GateDecision::Run;
     }
 
@@ -144,7 +156,7 @@ mod tests {
     #[test]
     fn empty_session_id_is_no_session_id() {
         let state = SessionMemoryState::default();
-        let decision = evaluate(&state, "", 50_000, 10, false, &cfg());
+        let decision = evaluate(&state, "", 50_000, 10, false, false, &cfg());
         assert_eq!(
             decision,
             GateDecision::Skip(SessionMemoryExtractionSkipReason::NoSessionId)
@@ -154,7 +166,7 @@ mod tests {
     #[test]
     fn below_init_threshold_is_below_init_gate() {
         let state = SessionMemoryState::default();
-        let decision = evaluate(&state, "sess-1", 5_000, 0, false, &cfg());
+        let decision = evaluate(&state, "sess-1", 5_000, 0, false, false, &cfg());
         assert_eq!(
             decision,
             GateDecision::Skip(SessionMemoryExtractionSkipReason::BelowInitGate)
@@ -169,7 +181,7 @@ mod tests {
             tool_calls_at_last_extraction: 5,
             last_extraction_time: None,
         };
-        let decision = evaluate(&state, "sess-1", 13_000, 6, false, &cfg());
+        let decision = evaluate(&state, "sess-1", 13_000, 6, false, false, &cfg());
         assert_eq!(
             decision,
             GateDecision::Skip(SessionMemoryExtractionSkipReason::NoGrowth)
@@ -184,7 +196,7 @@ mod tests {
             tool_calls_at_last_extraction: 5,
             last_extraction_time: None,
         };
-        let decision = evaluate(&state, "sess-1", 17_500, 5, false, &cfg());
+        let decision = evaluate(&state, "sess-1", 17_500, 5, false, false, &cfg());
         assert_eq!(decision, GateDecision::Run);
     }
 
@@ -196,14 +208,14 @@ mod tests {
             tool_calls_at_last_extraction: 5,
             last_extraction_time: None,
         };
-        let decision = evaluate(&state, "sess-1", 12_500, 10, false, &cfg());
+        let decision = evaluate(&state, "sess-1", 12_500, 10, false, false, &cfg());
         assert_eq!(decision, GateDecision::Run);
     }
 
     #[test]
     fn past_init_gate_with_room_to_run_fires_run() {
         let state = SessionMemoryState::default();
-        let decision = evaluate(&state, "sess-1", 50_000, 10, false, &cfg());
+        let decision = evaluate(&state, "sess-1", 50_000, 10, false, false, &cfg());
         assert_eq!(decision, GateDecision::Run);
     }
 
@@ -216,7 +228,7 @@ mod tests {
             last_extraction_time: None,
         };
         // Only +1K tokens and +1 tool call — normally debounced.
-        let decision = evaluate(&state, "sess-1", 12_000, 5, true, &cfg());
+        let decision = evaluate(&state, "sess-1", 12_000, 5, true, false, &cfg());
         assert_eq!(decision, GateDecision::Run);
     }
 
@@ -234,7 +246,7 @@ mod tests {
         let state = SessionMemoryState::default();
         // Tokens well below min_tokens_to_init (10_000 default) and
         // state is uninitialized — normally BelowInitGate.
-        let decision = evaluate(&state, "sess-1", 500, 0, true, &cfg());
+        let decision = evaluate(&state, "sess-1", 500, 0, true, false, &cfg());
         assert_eq!(
             decision,
             GateDecision::Run,
@@ -248,10 +260,21 @@ mod tests {
     #[test]
     fn no_error_below_init_still_skips() {
         let state = SessionMemoryState::default();
-        let decision = evaluate(&state, "sess-1", 500, 0, false, &cfg());
+        let decision = evaluate(&state, "sess-1", 500, 0, false, false, &cfg());
         assert_eq!(
             decision,
             GateDecision::Skip(SessionMemoryExtractionSkipReason::BelowInitGate)
+        );
+    }
+
+    #[test]
+    fn user_correction_on_uninitialized_session_bypasses_init_gate() {
+        let state = SessionMemoryState::default();
+        let decision = evaluate(&state, "sess-1", 500, 0, false, true, &cfg());
+        assert_eq!(
+            decision,
+            GateDecision::Run,
+            "user correction must refresh session memory even below init gate"
         );
     }
 
@@ -264,7 +287,7 @@ mod tests {
     #[test]
     fn had_error_with_empty_session_id_is_no_session_id() {
         let state = SessionMemoryState::default();
-        let decision = evaluate(&state, "", 50_000, 10, true, &cfg());
+        let decision = evaluate(&state, "", 50_000, 10, true, false, &cfg());
         assert_eq!(
             decision,
             GateDecision::Skip(SessionMemoryExtractionSkipReason::NoSessionId),
@@ -279,7 +302,17 @@ mod tests {
     #[test]
     fn had_error_empty_sid_below_init_is_no_session_id() {
         let state = SessionMemoryState::default();
-        let decision = evaluate(&state, "", 100, 0, true, &cfg());
+        let decision = evaluate(&state, "", 100, 0, true, false, &cfg());
+        assert_eq!(
+            decision,
+            GateDecision::Skip(SessionMemoryExtractionSkipReason::NoSessionId)
+        );
+    }
+
+    #[test]
+    fn user_correction_empty_sid_below_init_is_no_session_id() {
+        let state = SessionMemoryState::default();
+        let decision = evaluate(&state, "", 100, 0, false, true, &cfg());
         assert_eq!(
             decision,
             GateDecision::Skip(SessionMemoryExtractionSkipReason::NoSessionId)

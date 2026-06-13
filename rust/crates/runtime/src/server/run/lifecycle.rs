@@ -4721,6 +4721,9 @@ fn build_shutdown_extraction_request(
                 as usize,
             current_tool_calls: state.total_tool_calls as usize,
             had_error: state.error_recovery.consecutive_same_error > 0,
+            had_user_correction: astra_turn_core::input_classifier::is_correction_signal(
+                &state.message,
+            ),
             turn_number: state.max_turns.saturating_sub(state.remaining_turns) as u32,
             config:
                 astra_turn_core::cloud_session_memory_extract::SessionMemoryExtractConfig::default(

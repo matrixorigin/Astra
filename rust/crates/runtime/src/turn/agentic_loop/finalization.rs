@@ -880,6 +880,9 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
         current_tokens,
         current_tool_calls: state.total_tool_calls as usize,
         had_error,
+        had_user_correction: astra_turn_core::input_classifier::is_correction_signal(
+            &state.message,
+        ),
         turn_number: turn_number as u32,
         config: astra_turn_core::cloud_session_memory_extract::SessionMemoryExtractConfig::default(
         ),

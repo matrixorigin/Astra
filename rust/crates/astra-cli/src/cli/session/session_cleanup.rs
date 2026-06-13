@@ -123,6 +123,7 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
                     .as_ref()
                     .and_then(|event| event.error.as_ref())
                     .is_some(),
+                had_user_correction: false,
                 turn_number: state.turn,
                 config:
                     astra_turn_core::cloud_session_memory_extract::SessionMemoryExtractConfig::default(

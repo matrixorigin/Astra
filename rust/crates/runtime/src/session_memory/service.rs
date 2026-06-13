@@ -522,6 +522,8 @@ impl MemoryExtractionService {
             // crossing.
             let trig = if req.had_error {
                 ExtractionTrigger::ErrorOverride
+            } else if req.had_user_correction {
+                ExtractionTrigger::UserCorrection
             } else if !state.initialized {
                 ExtractionTrigger::InitGate
             } else {
@@ -533,6 +535,7 @@ impl MemoryExtractionService {
                 req.current_tokens,
                 req.current_tool_calls,
                 req.had_error,
+                req.had_user_correction,
                 &req.config,
             );
 
@@ -1518,6 +1521,7 @@ mod tests {
             current_tokens: tokens,
             current_tool_calls: 0,
             had_error,
+            had_user_correction: false,
             turn_number: 1,
             config: SessionMemoryExtractConfig::default(),
         }
@@ -1534,6 +1538,7 @@ mod tests {
             current_tokens: tokens,
             current_tool_calls: 0,
             had_error: false,
+            had_user_correction: false,
             turn_number: 1,
             config: SessionMemoryExtractConfig::default(),
         }
@@ -1708,6 +1713,7 @@ mod tests {
             current_tokens: 12,
             current_tool_calls: 0,
             had_error: false,
+            had_user_correction: false,
             turn_number: 1,
             config: SessionMemoryExtractConfig::default(),
         };
@@ -2515,6 +2521,7 @@ mod tests {
             current_tokens: 1_000,
             current_tool_calls: 0,
             had_error: false,
+            had_user_correction: false,
             turn_number: 1,
             config: SessionMemoryExtractConfig::default(),
         };
@@ -2606,6 +2613,36 @@ mod tests {
             crate::session_memory::ExtractionTrigger::ErrorOverride,
             "trigger must reflect the error-driven bypass"
         );
+    }
+
+    #[tokio::test]
+    async fn observatory_records_user_correction_refresh_below_init() {
+        let (ctx, obs) = build_ctx_with_obs();
+        let sid = format!("obs-correction-{}", nanos());
+        let mut req = sample_req(&sid, 1_000, false);
+        req.had_user_correction = true;
+        req.messages = vec![json!({
+            "role": "user",
+            "content": "我想要的是长久健康运行，不是临时补丁"
+        })];
+
+        assert_eq!(
+            ctx.svc.maybe_spawn(req),
+            SpawnDecision::Spawned,
+            "user correction should refresh session memory even below init gate"
+        );
+        ctx.svc.wait_for_pending(Duration::from_secs(2)).await;
+
+        let snap = obs.extractions_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[0].trigger,
+            crate::session_memory::ExtractionTrigger::UserCorrection
+        );
+        assert!(matches!(
+            snap[0].outcome,
+            crate::session_memory::ExtractionOutcome::Persisted { .. }
+        ));
     }
 
     #[tokio::test]

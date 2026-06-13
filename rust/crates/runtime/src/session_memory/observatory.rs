@@ -51,6 +51,10 @@ pub enum ExtractionTrigger {
     /// Gate bypass — errors (or §4.4 staleness) forced an extra
     /// extraction past the normal debounce.
     ErrorOverride,
+    /// Gate bypass — latest user message corrected or reanchored the task, so
+    /// the L1 session summary should be refreshed before stale intent is
+    /// retrieved again.
+    UserCorrection,
 }
 
 /// Terminal outcome of one extraction. Mirrors the
