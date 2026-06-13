@@ -390,56 +390,36 @@ pub(crate) fn history_as_messages(history: &[(String, String)]) -> Vec<serde_jso
         .collect()
 }
 
-/// Fields extracted from HeavyCheckpoint for CSL persistence.
-/// `None` on any field means "no data available, preserve previous CSL value".
-/// For nullable fields (approval_overrides, delegation, compaction_tracker,
-/// interruption): `Some(None)` = explicitly cleared, `Some(Some(v))` = new value.
+/// Checkpoint-derived metadata available to CSL projection.
+///
+/// This is intentionally empty: the conversation state log is prompt material,
+/// not execution policy. Runtime controls such as blocked tools, approvals,
+/// interruptions, budget pressure, and compaction counters belong to explicit
+/// heavy checkpoints and must not accumulate in CSL across turns.
 #[derive(Default)]
-pub(crate) struct CslCheckpointFields {
-    pub(crate) blocked_tools: Option<Vec<String>>,
-    pub(crate) approval_overrides: Option<Option<serde_json::Value>>,
-    pub(crate) budget_remaining_tokens: Option<u64>,
-    pub(crate) budget_remaining_rounds: Option<u32>,
-    pub(crate) consecutive_ctx_errors: Option<u32>,
-    pub(crate) interruption: Option<Option<serde_json::Value>>,
-    pub(crate) delegation: Option<Option<astra_turn_core::conversation_log::DelegationCompact>>,
-    pub(crate) compaction_tracker: Option<Option<serde_json::Value>>,
-}
+pub(crate) struct CslCheckpointFields;
 
-/// Build a full `SessionStateCompact` from REPL state, checkpoint fields, and
-/// the previous CSL state. Fields from `cp` that are `None` fall back to
-/// `prev_state`, so the no-checkpoint path preserves previously persisted values.
+/// Build the prompt-facing CSL state for the current turn.
+///
+/// Runtime-control fields are intentionally reset instead of falling back to
+/// previous CSL materialization. Long-running sessions must not let a temporary
+/// blocked tool, approval, budget, interruption, or compaction failure become a
+/// durable instruction for later turns.
 pub(crate) fn build_full_session_state_compact(
     state: &SessionState,
-    cp: CslCheckpointFields,
-    prev_state: &astra_turn_core::conversation_log::SessionStateCompact,
+    _cp: CslCheckpointFields,
+    _prev_state: &astra_turn_core::conversation_log::SessionStateCompact,
 ) -> astra_turn_core::conversation_log::SessionStateCompact {
     astra_turn_core::conversation_log::SessionStateCompact {
         recent_tools: state.recent_tools.clone(),
-        blocked_tools: cp
-            .blocked_tools
-            .unwrap_or_else(|| prev_state.blocked_tools.clone()),
-        approval_overrides: cp
-            .approval_overrides
-            .unwrap_or_else(|| prev_state.approval_overrides.clone()),
-        budget_remaining_tokens: cp
-            .budget_remaining_tokens
-            .unwrap_or(prev_state.budget_remaining_tokens),
-        budget_remaining_rounds: cp
-            .budget_remaining_rounds
-            .unwrap_or(prev_state.budget_remaining_rounds),
-        consecutive_ctx_errors: cp
-            .consecutive_ctx_errors
-            .unwrap_or(prev_state.consecutive_ctx_errors),
-        interruption: cp
-            .interruption
-            .unwrap_or_else(|| prev_state.interruption.clone()),
-        delegation: cp
-            .delegation
-            .unwrap_or_else(|| prev_state.delegation.clone()),
-        compaction_tracker: cp
-            .compaction_tracker
-            .unwrap_or_else(|| prev_state.compaction_tracker.clone()),
+        blocked_tools: Vec::new(),
+        approval_overrides: None,
+        budget_remaining_tokens: 0,
+        budget_remaining_rounds: 0,
+        consecutive_ctx_errors: 0,
+        interruption: None,
+        delegation: None,
+        compaction_tracker: None,
     }
 }
 
@@ -905,73 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn no_checkpoint_preserves_blocked_tools_from_prev_state() {
-        let state = &SessionState {
-            recent_tools: vec!["read_file".into()],
-            ..Default::default()
-        };
-        let prev = astra_turn_core::conversation_log::SessionStateCompact {
-            blocked_tools: vec!["bash".into(), "write".into()],
-            ..Default::default()
-        };
-
-        let cp = CslCheckpointFields::default();
-        let result = build_full_session_state_compact(state, cp, &prev);
-        assert_eq!(result.blocked_tools, vec!["bash", "write"]);
-    }
-
-    #[test]
-    fn no_checkpoint_preserves_approval_overrides_from_prev_state() {
-        let state = &SessionState::default();
-        let prev = astra_turn_core::conversation_log::SessionStateCompact {
-            approval_overrides: Some(serde_json::json!({"tool": "bash", "approved": true})),
-            ..Default::default()
-        };
-
-        let cp = CslCheckpointFields::default();
-        let result = build_full_session_state_compact(state, cp, &prev);
-        assert_eq!(
-            result.approval_overrides,
-            Some(serde_json::json!({"tool": "bash", "approved": true}))
-        );
-    }
-
-    #[test]
-    fn no_checkpoint_preserves_delegation_from_prev_state() {
-        let state = &SessionState::default();
-        let delegation = astra_turn_core::conversation_log::DelegationCompact {
-            id: "d1".into(),
-            pattern: "review".into(),
-            completed_sub_runs: vec![],
-        };
-        let prev = astra_turn_core::conversation_log::SessionStateCompact {
-            delegation: Some(delegation.clone()),
-            ..Default::default()
-        };
-
-        let cp = CslCheckpointFields::default();
-        let result = build_full_session_state_compact(state, cp, &prev);
-        assert_eq!(result.delegation, Some(delegation));
-    }
-
-    #[test]
-    fn no_checkpoint_preserves_compaction_tracker_from_prev_state() {
-        let state = &SessionState::default();
-        let prev = astra_turn_core::conversation_log::SessionStateCompact {
-            compaction_tracker: Some(serde_json::json!({"version": 3})),
-            ..Default::default()
-        };
-
-        let cp = CslCheckpointFields::default();
-        let result = build_full_session_state_compact(state, cp, &prev);
-        assert_eq!(
-            result.compaction_tracker,
-            Some(serde_json::json!({"version": 3}))
-        );
-    }
-
-    #[test]
-    fn checkpoint_path_overrides_prev_state() {
+    fn csl_projection_preserves_recent_tools_only() {
         let state = &SessionState {
             recent_tools: vec!["exec".into()],
             ..Default::default()
@@ -988,42 +902,24 @@ mod tests {
             budget_remaining_tokens: 99_999,
             budget_remaining_rounds: 99,
             consecutive_ctx_errors: 99,
+            interruption: Some(serde_json::json!({"kind": "budget_exhausted"})),
             ..Default::default()
         };
 
-        let cp = CslCheckpointFields {
-            blocked_tools: Some(vec!["new_bash".into()]),
-            approval_overrides: Some(Some(serde_json::json!({"new": true}))),
-            budget_remaining_tokens: Some(50_000),
-            budget_remaining_rounds: Some(5),
-            consecutive_ctx_errors: Some(1),
-            interruption: None,
-            delegation: Some(Some(astra_turn_core::conversation_log::DelegationCompact {
-                id: "new_d".into(),
-                pattern: "new_p".into(),
-                completed_sub_runs: vec![],
-            })),
-            compaction_tracker: Some(Some(serde_json::json!({"new": 2}))),
-        };
-
-        let result = build_full_session_state_compact(state, cp, &prev);
-        assert_eq!(result.blocked_tools, vec!["new_bash"]);
-        assert_eq!(
-            result.approval_overrides,
-            Some(serde_json::json!({"new": true}))
-        );
-        assert_eq!(result.budget_remaining_tokens, 50_000);
-        assert_eq!(result.budget_remaining_rounds, 5);
-        assert_eq!(result.consecutive_ctx_errors, 1);
-        assert_eq!(result.delegation.unwrap().id, "new_d");
-        assert_eq!(
-            result.compaction_tracker,
-            Some(serde_json::json!({"new": 2}))
-        );
+        let result = build_full_session_state_compact(state, CslCheckpointFields, &prev);
+        assert_eq!(result.recent_tools, vec!["exec"]);
+        assert!(result.blocked_tools.is_empty());
+        assert!(result.approval_overrides.is_none());
+        assert_eq!(result.budget_remaining_tokens, 0);
+        assert_eq!(result.budget_remaining_rounds, 0);
+        assert_eq!(result.consecutive_ctx_errors, 0);
+        assert!(result.interruption.is_none());
+        assert!(result.delegation.is_none());
+        assert!(result.compaction_tracker.is_none());
     }
 
     #[test]
-    fn checkpoint_explicitly_clears_fields() {
+    fn csl_projection_ignores_checkpoint_runtime_controls() {
         let state = &SessionState::default();
         let prev = astra_turn_core::conversation_log::SessionStateCompact {
             blocked_tools: vec!["bash".into()],
@@ -1037,40 +933,13 @@ mod tests {
             ..Default::default()
         };
 
-        let cp = CslCheckpointFields {
-            blocked_tools: Some(vec![]),
-            approval_overrides: Some(None),
-            budget_remaining_tokens: Some(0),
-            budget_remaining_rounds: Some(0),
-            consecutive_ctx_errors: Some(0),
-            interruption: Some(None),
-            delegation: Some(None),
-            compaction_tracker: Some(None),
-        };
-
-        let result = build_full_session_state_compact(state, cp, &prev);
+        let result = build_full_session_state_compact(state, CslCheckpointFields, &prev);
         assert!(result.blocked_tools.is_empty());
         assert!(result.approval_overrides.is_none());
         assert!(result.interruption.is_none());
         assert!(result.delegation.is_none());
         assert!(result.compaction_tracker.is_none());
         assert_eq!(result.budget_remaining_tokens, 0);
-    }
-
-    #[test]
-    fn no_checkpoint_preserves_interruption_from_prev_state() {
-        let state = &SessionState::default();
-        let prev = astra_turn_core::conversation_log::SessionStateCompact {
-            interruption: Some(serde_json::json!({"kind": "budget_exhausted"})),
-            ..Default::default()
-        };
-
-        let cp = CslCheckpointFields::default();
-        let result = build_full_session_state_compact(state, cp, &prev);
-        assert_eq!(
-            result.interruption,
-            Some(serde_json::json!({"kind": "budget_exhausted"}))
-        );
     }
 
     #[tokio::test]

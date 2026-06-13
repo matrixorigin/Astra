@@ -33,18 +33,8 @@ pub(crate) fn session_state_compact_from_heavy_checkpoint(
     heavy: &astra_pipeline::step_protocol::HeavyCheckpoint,
 ) -> astra_turn_core::conversation_log::SessionStateCompact {
     astra_turn_core::conversation_log::SessionStateCompact {
-        blocked_tools: heavy.blocked_tools.clone(),
         recent_tools: heavy.recent_tools.clone(),
-        approval_overrides: heavy.approval_overrides.clone(),
-        compaction_tracker: heavy.compaction_state.clone(),
-        budget_remaining_tokens: heavy.budget_remaining_tokens,
-        budget_remaining_rounds: heavy.budget_remaining_rounds,
-        consecutive_ctx_errors: heavy.consecutive_context_window_errors,
-        delegation: delegation_from_heavy_checkpoint(
-            heavy,
-            "session_state_compact_from_heavy_checkpoint",
-        ),
-        interruption: heavy.interruption.clone(),
+        ..Default::default()
     }
 }
 
@@ -90,7 +80,7 @@ pub(crate) fn next_step_checkpoint_number(sid: &str) -> Result<u32, String> {
 pub(crate) fn build_manual_heavy_step_checkpoint(
     state: &SessionState,
     sid: &str,
-    session_state: &astra_turn_core::conversation_log::SessionStateCompact,
+    _session_state: &astra_turn_core::conversation_log::SessionStateCompact,
     previous_heavy: Option<&astra_pipeline::step_protocol::HeavyCheckpoint>,
 ) -> astra_pipeline::step_protocol::StepCheckpoint {
     use astra_pipeline::step_protocol::{
@@ -114,49 +104,76 @@ pub(crate) fn build_manual_heavy_step_checkpoint(
         total_tokens: total_tok,
         created_at: now_ms,
     };
+    let preserve_interrupted_recovery = state.last_turn_interrupted;
+    let previous_budget_tokens = preserve_interrupted_recovery
+        .then(|| previous_heavy.map(|heavy| heavy.budget_remaining_tokens))
+        .flatten();
+    let previous_budget_rounds = preserve_interrupted_recovery
+        .then(|| previous_heavy.map(|heavy| heavy.budget_remaining_rounds))
+        .flatten();
+    let interrupted_blocked_tools = if preserve_interrupted_recovery {
+        if state.resume_restricted_tools.is_empty() {
+            previous_heavy
+                .map(|heavy| heavy.blocked_tools.clone())
+                .unwrap_or_default()
+        } else {
+            state.resume_restricted_tools.clone()
+        }
+    } else {
+        Vec::new()
+    };
+    let interrupted_approval_overrides = preserve_interrupted_recovery
+        .then(|| previous_heavy.and_then(|heavy| heavy.approval_overrides.clone()))
+        .flatten();
+    let interrupted_interruption = preserve_interrupted_recovery
+        .then(|| previous_heavy.and_then(|heavy| heavy.interruption.clone()))
+        .flatten();
+    let interrupted_delegation = preserve_interrupted_recovery
+        .then(|| {
+            previous_heavy
+                .and_then(|heavy| delegation_from_heavy_checkpoint(heavy, "manual_checkpoint"))
+        })
+        .flatten();
+
     let heavy = HeavyCheckpoint {
         light,
         messages,
-        budget_remaining_tokens: {
-            if previous_heavy.is_some() || session_state.budget_remaining_tokens > 0 {
-                session_state.budget_remaining_tokens
+        budget_remaining_tokens: previous_budget_tokens.unwrap_or_else(|| {
+            let limit = astra_core::RuntimeLimits::global().max_turn_input_tokens;
+            if limit == 0 {
+                0
             } else {
-                let limit = astra_core::RuntimeLimits::global().max_turn_input_tokens;
-                if limit == 0 {
-                    0
-                } else {
-                    limit.saturating_sub(state.total_prompt_tokens)
-                }
+                limit.saturating_sub(state.total_prompt_tokens)
             }
-        },
-        budget_remaining_rounds: if previous_heavy.is_some()
-            || session_state.budget_remaining_rounds > 0
-        {
-            session_state.budget_remaining_rounds
-        } else {
-            max_turns.saturating_sub(state.turn)
-        },
-        blocked_tools: session_state.blocked_tools.clone(),
+        }),
+        budget_remaining_rounds: previous_budget_rounds
+            .unwrap_or_else(|| max_turns.saturating_sub(state.turn)),
+        blocked_tools: interrupted_blocked_tools,
         recent_tools: state.recent_tools.clone(),
         memory_context: previous_heavy.and_then(|heavy| heavy.memory_context.clone()),
-        delegation_id: session_state
-            .delegation
+        delegation_id: interrupted_delegation
             .as_ref()
             .map(|delegation| delegation.id.clone()),
-        delegation_pattern: session_state
-            .delegation
+        delegation_pattern: interrupted_delegation
             .as_ref()
             .map(|delegation| delegation.pattern.clone()),
-        delegation_sub_run_summaries: session_state
-            .delegation
+        delegation_sub_run_summaries: interrupted_delegation
             .as_ref()
             .map(|delegation| delegation.completed_sub_runs.clone())
             .unwrap_or_default(),
-        interruption: session_state.interruption.clone(),
-        approval_overrides: session_state.approval_overrides.clone(),
-        consecutive_context_window_errors: session_state.consecutive_ctx_errors,
-        compaction_state: session_state.compaction_tracker.clone(),
-        pipeline_state: previous_heavy.and_then(|heavy| heavy.pipeline_state.clone()),
+        interruption: interrupted_interruption,
+        approval_overrides: interrupted_approval_overrides,
+        consecutive_context_window_errors: if preserve_interrupted_recovery {
+            state.runtime_consecutive_context_window_errors
+        } else {
+            0
+        },
+        compaction_state: preserve_interrupted_recovery
+            .then(|| state.runtime_compaction_state.clone())
+            .flatten(),
+        pipeline_state: preserve_interrupted_recovery
+            .then(|| state.runtime_pipeline_state.clone())
+            .flatten(),
         config_version_id: state.config_version_id.clone(),
     };
     StepCheckpoint::Heavy(Box::new(heavy))

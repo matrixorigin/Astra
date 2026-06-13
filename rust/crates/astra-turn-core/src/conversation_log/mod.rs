@@ -63,8 +63,13 @@ impl CslEntry {
 
 // ─── Session state (non-message fields) ─────────────────────────────────────
 
-/// Compact representation of session state beyond the message array.
-/// Replaces the scattered fields in the old `HeavyCheckpoint`.
+/// Compact prompt-facing state beyond the message array.
+///
+/// CSL materializes conversation continuity; it is not an execution-policy
+/// checkpoint. Runtime controls such as tool restrictions, approvals,
+/// interruption state, budgets, and compaction pressure remain deserializable
+/// for older logs, but new writers should treat them as legacy/advisory and
+/// restore authoritative runtime state from explicit heavy checkpoints.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionStateCompact {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

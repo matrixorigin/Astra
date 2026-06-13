@@ -1096,24 +1096,19 @@ fn extract_session_state_compact(
 ) -> astra_turn_core::conversation_log::SessionStateCompact {
     astra_turn_core::conversation_log::SessionStateCompact {
         // CSL is conversation materialization, not execution policy. Persisting
-        // transient tool restrictions here makes old compaction state hard-block
-        // later turns. Runtime restrictions are restored only from explicit
-        // runtime checkpoints/interruption contracts.
+        // transient restrictions, approvals, interruptions, budgets, or
+        // compaction pressure here makes old materialized state hard-steer later
+        // turns. Runtime controls are restored only from explicit runtime
+        // checkpoints/interruption contracts.
         blocked_tools: Vec::new(),
         recent_tools: state.recent_tools.clone(),
-        approval_overrides: state
-            .approval_overrides
-            .as_ref()
-            .and_then(|ao| serde_json::to_value(ao).ok()),
-        budget_remaining_tokens: state.max_turn_input_tokens,
-        budget_remaining_rounds: state.remaining_turns as u32,
-        consecutive_ctx_errors: state.consecutive_context_window_errors,
-        interruption: state
-            .interruption
-            .as_ref()
-            .and_then(|i| serde_json::to_value(i).ok()),
+        approval_overrides: None,
+        budget_remaining_tokens: 0,
+        budget_remaining_rounds: 0,
+        consecutive_ctx_errors: 0,
+        interruption: None,
         delegation: None,
-        compaction_tracker: Some(state.compaction_effectiveness.to_json()),
+        compaction_tracker: None,
     }
 }
 
@@ -1124,31 +1119,10 @@ fn restore_session_state_compact(
     if !ss.recent_tools.is_empty() {
         loop_state.recent_tools = ss.recent_tools;
     }
-    if let Some(ao_value) = ss.approval_overrides
-        && loop_state.approval_overrides.is_none()
-        && let Ok(ao) = serde_json::from_value(ao_value)
-    {
-        loop_state.approval_overrides = Some(ao);
-    }
-    if let Some(intr_value) = ss.interruption
-        && loop_state.interruption.is_none()
-        && let Ok(intr) = serde_json::from_value(intr_value)
-    {
-        loop_state.interruption = Some(intr);
-    }
-    if ss.budget_remaining_tokens > 0 {
-        loop_state.max_turn_input_tokens = ss.budget_remaining_tokens;
-    }
-    if ss.budget_remaining_rounds > 0 {
-        loop_state.remaining_turns = ss.budget_remaining_rounds as usize;
-    }
-    loop_state.consecutive_context_window_errors = ss.consecutive_ctx_errors;
-    if let Some(compaction_tracker) = ss.compaction_tracker.as_ref() {
-        loop_state.compaction_effectiveness =
-            crate::turn::compaction_replay::CompactionEffectivenessTracker::from_json_lossy(
-                compaction_tracker,
-            );
-    }
+    // Intentionally ignore all runtime-control fields in SessionStateCompact.
+    // Older CSL records may contain them, but restoring them here would leak
+    // stale pauses, approvals, budget pressure, and compaction failures into a
+    // new user turn.
 }
 
 fn restore_step_checkpoint_runtime_state(
@@ -7551,15 +7525,24 @@ mod tests {
     }
 
     #[test]
-    fn restore_session_state_compact_restores_compaction_tracker_and_context_errors() {
+    fn restore_session_state_compact_ignores_runtime_control_state() {
         let svc = test_service();
         let request = test_request("resume");
         let mut state =
             svc.build_initial_state("test-user", &request, "session-1", "run-1", None, None);
+        state.max_turn_input_tokens = 123_456;
+        state.remaining_turns = 9;
 
         restore_session_state_compact(
             astra_turn_core::conversation_log::SessionStateCompact {
+                approval_overrides: Some(json!({"approval": "stale"})),
+                budget_remaining_tokens: 42_000,
+                budget_remaining_rounds: 3,
                 consecutive_ctx_errors: 3,
+                interruption: Some(json!({
+                    "kind": "budget_exhausted",
+                    "resume_action": "continue_immediately"
+                })),
                 compaction_tracker: Some(json!({
                     "attempt_count": 4,
                     "cumulative_tokens_freed": 18_000,
@@ -7572,27 +7555,38 @@ mod tests {
             &mut state,
         );
 
-        assert_eq!(state.consecutive_context_window_errors, 3);
-        assert_eq!(state.compaction_effectiveness.attempt_count, 4);
-        assert_eq!(
-            state.compaction_effectiveness.cumulative_tokens_freed,
-            18_000
-        );
-        assert_eq!(state.compaction_effectiveness.last_tokens_freed, 2_000);
-        assert!(state.compaction_effectiveness.last_was_insufficient);
-        assert_eq!(
-            state.compaction_effectiveness.consecutive_futile_attempts,
-            2
-        );
+        assert!(state.approval_overrides.is_none());
+        assert!(state.interruption.is_none());
+        assert_eq!(state.max_turn_input_tokens, 123_456);
+        assert_eq!(state.remaining_turns, 9);
+        assert_eq!(state.consecutive_context_window_errors, 0);
+        assert_eq!(state.compaction_effectiveness.attempt_count, 0);
     }
 
     #[test]
-    fn csl_session_state_does_not_persist_transient_restricted_tools() {
+    fn csl_session_state_does_not_persist_runtime_control_state() {
         let svc = test_service();
         let request = test_request("resume");
         let mut state =
             svc.build_initial_state("test-user", &request, "session-1", "run-1", None, None);
         state.restricted_tools.insert("write_file".to_string());
+        state.max_turn_input_tokens = 50_000;
+        state.remaining_turns = 2;
+        state.consecutive_context_window_errors = 5;
+        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+            astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+            astra_turn_core::interruption::InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 1,
+                turns_completed: 1,
+                remaining_turns: 0,
+                error_detail: Some("stale interruption".to_string()),
+                stall_signal: None,
+                resume_restricted_tools: vec![],
+            },
+        ));
+        state.compaction_effectiveness.attempt_count = 7;
 
         let compact = extract_session_state_compact(&state);
 
@@ -7600,6 +7594,12 @@ mod tests {
             compact.blocked_tools.is_empty(),
             "conversation-log state must not persist transient runtime restrictions"
         );
+        assert!(compact.approval_overrides.is_none());
+        assert!(compact.interruption.is_none());
+        assert_eq!(compact.budget_remaining_tokens, 0);
+        assert_eq!(compact.budget_remaining_rounds, 0);
+        assert_eq!(compact.consecutive_ctx_errors, 0);
+        assert!(compact.compaction_tracker.is_none());
     }
 
     #[test]

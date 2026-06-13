@@ -8,7 +8,6 @@ use crate::cli::session::session_projection::{
     CslCheckpointFields, build_full_session_state_compact,
     rebuild_continuation_anchor_from_live_state,
 };
-use crate::cli::session::session_recovery;
 use crate::cli::session::session_runtime;
 use crate::cli::session::session_side_effects::close_pending_memory_feedback_at_turn_end;
 use crate::cli::session::session_state::SessionState;
@@ -111,41 +110,16 @@ fn maybe_spawn_turn_completion_notification(state: &SessionState, elapsed: std::
     }
 }
 
-pub(crate) fn extract_csl_fields_from_result(result: &StreamResult) -> CslCheckpointFields {
-    if let Some(astra_pipeline::step_protocol::StepCheckpoint::Heavy(ref heavy)) =
-        result.last_heavy_checkpoint
-    {
-        let delegation = session_recovery::delegation_from_heavy_checkpoint(
-            heavy,
-            "extract_csl_fields_from_result",
-        );
-        CslCheckpointFields {
-            blocked_tools: Some(heavy.blocked_tools.clone()),
-            approval_overrides: Some(heavy.approval_overrides.clone()),
-            budget_remaining_tokens: Some(heavy.budget_remaining_tokens),
-            budget_remaining_rounds: Some(heavy.budget_remaining_rounds),
-            consecutive_ctx_errors: Some(heavy.consecutive_context_window_errors),
-            interruption: Some(heavy.interruption.clone()),
-            delegation: Some(delegation),
-            compaction_tracker: Some(heavy.compaction_state.clone()),
-        }
-    } else {
-        CslCheckpointFields {
-            blocked_tools: None,
-            approval_overrides: None,
-            budget_remaining_tokens: None,
-            budget_remaining_rounds: None,
-            consecutive_ctx_errors: None,
-            interruption: None,
-            delegation: None,
-            compaction_tracker: None,
-        }
-    }
+pub(crate) fn extract_csl_fields_from_result(_result: &StreamResult) -> CslCheckpointFields {
+    CslCheckpointFields
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_csl_fields_from_result, run_turn_post_commit_tasks};
+    use super::{
+        build_full_session_state_compact, extract_csl_fields_from_result,
+        run_turn_post_commit_tasks,
+    };
     use crate::cli::session::session_projection::CslCheckpointFields;
     use crate::cli::session::session_state::SessionState;
     use std::time::Instant;
@@ -175,15 +149,24 @@ mod tests {
     }
 
     #[test]
-    fn extract_csl_fields_from_result_without_checkpoint_returns_empty_fields() {
+    fn extract_csl_fields_from_result_without_checkpoint_returns_empty_projection() {
         let result = crate::tests::stub_stream_result("done");
 
-        let fields = extract_csl_fields_from_result(&result);
+        let state = SessionState {
+            recent_tools: vec!["bash".into()],
+            ..Default::default()
+        };
+        let compact = build_full_session_state_compact(
+            &state,
+            extract_csl_fields_from_result(&result),
+            &Default::default(),
+        );
 
-        assert!(fields.blocked_tools.is_none());
-        assert!(fields.approval_overrides.is_none());
-        assert!(fields.interruption.is_none());
-        assert!(fields.compaction_tracker.is_none());
+        assert_eq!(compact.recent_tools, vec!["bash".to_string()]);
+        assert!(compact.blocked_tools.is_empty());
+        assert!(compact.approval_overrides.is_none());
+        assert!(compact.interruption.is_none());
+        assert!(compact.compaction_tracker.is_none());
     }
 
     #[tokio::test]

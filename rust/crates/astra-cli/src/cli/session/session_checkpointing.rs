@@ -371,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn create_manual_checkpoint_preserves_previous_heavy_recovery_state() {
+    fn create_manual_checkpoint_drops_stale_previous_heavy_recovery_state() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = uuid::Uuid::new_v4().to_string();
         let journal = session_journal::JournalWriter::new(&sid).unwrap();
@@ -420,6 +420,9 @@ mod tests {
             journal: Some(journal),
             model: Some("test-model".to_string()),
             recent_tools: vec!["bash".into()],
+            runtime_pipeline_state: Some(serde_json::json!({"stale": "pipeline"})),
+            runtime_compaction_state: Some(serde_json::json!({"attempt_count": 99})),
+            runtime_consecutive_context_window_errors: 9,
             ..Default::default()
         };
         state.history.push(("hi".into(), "hello".into()));
@@ -430,25 +433,19 @@ mod tests {
         let restored = astra_pipeline::step_restore::restore_session(&sid)
             .unwrap()
             .expect("restored session");
-        assert_eq!(restored.blocked_tools, vec!["write_file".to_string()]);
-        assert_eq!(restored.budget_remaining_tokens, 4321);
-        assert_eq!(restored.budget_remaining_rounds, 6);
-        assert_eq!(
-            restored.interruption,
-            Some(serde_json::json!({"kind": "context_overflow"}))
-        );
-        assert_eq!(
-            restored.approval_overrides,
-            Some(serde_json::json!({"tool": "bash"}))
-        );
-        assert_eq!(restored.consecutive_context_window_errors, 3);
-        assert_eq!(
-            restored.compaction_state,
-            Some(serde_json::json!({"attempt_count": 4}))
-        );
-        assert_eq!(
-            restored.pipeline_state,
-            Some(serde_json::json!({"ema": 0.6}))
-        );
+        assert!(restored.blocked_tools.is_empty());
+        let limit = astra_core::RuntimeLimits::global().max_turn_input_tokens;
+        let expected_tokens = if limit == 0 {
+            0
+        } else {
+            limit.saturating_sub(state.total_prompt_tokens)
+        };
+        assert_eq!(restored.budget_remaining_tokens, expected_tokens);
+        assert_eq!(restored.budget_remaining_rounds, 50);
+        assert!(restored.interruption.is_none());
+        assert!(restored.approval_overrides.is_none());
+        assert_eq!(restored.consecutive_context_window_errors, 0);
+        assert!(restored.compaction_state.is_none());
+        assert!(restored.pipeline_state.is_none());
     }
 }

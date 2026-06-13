@@ -8,9 +8,9 @@ pub(crate) mod workspace;
 
 // Re-export public items from sub-modules
 pub(crate) use checkpoint::{
-    build_manual_heavy_step_checkpoint, delegation_from_heavy_checkpoint,
-    next_step_checkpoint_number, persist_manual_heavy_and_composite,
-    session_state_compact_from_heavy_checkpoint, sync_recovery_snapshot_after_history_edit,
+    build_manual_heavy_step_checkpoint, next_step_checkpoint_number,
+    persist_manual_heavy_and_composite, session_state_compact_from_heavy_checkpoint,
+    sync_recovery_snapshot_after_history_edit,
 };
 
 pub(crate) use workspace::{
@@ -407,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_heavy_checkpoint_preserves_recovery_fields_from_prior_state() {
+    fn manual_heavy_checkpoint_drops_stale_recovery_fields_after_clean_turn() {
         let mut state = SessionState::default();
         state.recent_tools = vec!["bash".to_string()];
         state.turn = 3;
@@ -415,6 +415,9 @@ mod tests {
         state.total_completion_tokens = 12;
         state.config_version_id = Some("cfg-live".to_string());
         state.history.push(("u1".into(), "a1".into()));
+        state.runtime_pipeline_state = Some(serde_json::json!({"stale": "pipeline"}));
+        state.runtime_compaction_state = Some(serde_json::json!({"attempt_count": 99}));
+        state.runtime_consecutive_context_window_errors = 9;
 
         let previous_heavy = astra_pipeline::step_protocol::HeavyCheckpoint {
             light: astra_pipeline::step_protocol::LightCheckpoint {
@@ -462,15 +465,83 @@ mod tests {
         let StepCheckpoint::Heavy(heavy) = checkpoint else {
             panic!("expected Heavy checkpoint");
         };
-        assert_eq!(heavy.budget_remaining_tokens, 321);
-        assert_eq!(heavy.budget_remaining_rounds, 7);
-        assert_eq!(heavy.blocked_tools, vec!["write_file".to_string()]);
+        let limit = astra_core::RuntimeLimits::global().max_turn_input_tokens;
+        let expected_tokens = if limit == 0 {
+            0
+        } else {
+            limit.saturating_sub(state.total_prompt_tokens)
+        };
+        assert_eq!(heavy.budget_remaining_tokens, expected_tokens);
+        assert_eq!(heavy.budget_remaining_rounds, 47);
+        assert!(heavy.blocked_tools.is_empty());
         let memory_context = heavy.memory_context.expect("memory context");
         assert_eq!(memory_context.retrieved_memory_ids, vec!["m-1".to_string()]);
         assert_eq!(memory_context.domain_hints, vec!["rust".to_string()]);
         assert_eq!(memory_context.boost_terms, vec!["resume".to_string()]);
         assert_eq!(memory_context.provenance, vec!["memoria".to_string()]);
         assert_eq!(memory_context.snapshot_id.as_deref(), Some("snapshot-1"));
+        assert!(heavy.interruption.is_none());
+        assert!(heavy.approval_overrides.is_none());
+        assert_eq!(heavy.consecutive_context_window_errors, 0);
+        assert!(heavy.pipeline_state.is_none());
+        assert!(heavy.compaction_state.is_none());
+        assert_eq!(heavy.config_version_id.as_deref(), Some("cfg-live"));
+    }
+
+    #[test]
+    fn manual_heavy_checkpoint_preserves_explicit_interrupted_recovery_state() {
+        let mut state = SessionState::default();
+        state.recent_tools = vec!["bash".to_string()];
+        state.turn = 3;
+        state.total_prompt_tokens = 40;
+        state.total_completion_tokens = 12;
+        state.config_version_id = Some("cfg-live".to_string());
+        state.last_turn_interrupted = true;
+        state.resume_restricted_tools = vec!["read_file".to_string()];
+        state.runtime_pipeline_state = Some(serde_json::json!({"ema": 0.7}));
+        state.runtime_compaction_state = Some(serde_json::json!({"attempt_count": 5}));
+        state.runtime_consecutive_context_window_errors = 4;
+
+        let previous_heavy = astra_pipeline::step_protocol::HeavyCheckpoint {
+            light: astra_pipeline::step_protocol::LightCheckpoint {
+                protocol_version: astra_pipeline::step_protocol::PROTOCOL_VERSION,
+                cursor: Default::default(),
+                step_id: "session-turn-3".to_string(),
+                task_id: "task-3".to_string(),
+                agent_id: "sess-prev".to_string(),
+                progress: 1.0,
+                total_tokens: 52,
+                created_at: astra_pipeline::step_protocol::epoch_ms(),
+            },
+            messages: Vec::new(),
+            budget_remaining_tokens: 321,
+            budget_remaining_rounds: 7,
+            blocked_tools: vec!["write_file".to_string()],
+            recent_tools: vec!["read_file".to_string()],
+            memory_context: None,
+            delegation_id: None,
+            delegation_pattern: None,
+            delegation_sub_run_summaries: Vec::new(),
+            interruption: Some(serde_json::json!({"kind": "budget_exhausted"})),
+            approval_overrides: Some(serde_json::json!({"tool": "bash"})),
+            consecutive_context_window_errors: 2,
+            pipeline_state: Some(serde_json::json!({"ema": 0.9})),
+            compaction_state: Some(serde_json::json!({"attempt_count": 2})),
+            config_version_id: Some("cfg-old".to_string()),
+        };
+
+        let checkpoint = build_manual_heavy_step_checkpoint(
+            &state,
+            "sess-prev",
+            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+            Some(&previous_heavy),
+        );
+        let StepCheckpoint::Heavy(heavy) = checkpoint else {
+            panic!("expected Heavy checkpoint");
+        };
+        assert_eq!(heavy.budget_remaining_tokens, 321);
+        assert_eq!(heavy.budget_remaining_rounds, 7);
+        assert_eq!(heavy.blocked_tools, vec!["read_file".to_string()]);
         assert_eq!(
             heavy.interruption,
             Some(serde_json::json!({"kind": "budget_exhausted"}))
@@ -479,11 +550,11 @@ mod tests {
             heavy.approval_overrides,
             Some(serde_json::json!({"tool": "bash"}))
         );
-        assert_eq!(heavy.consecutive_context_window_errors, 2);
-        assert_eq!(heavy.pipeline_state, Some(serde_json::json!({"ema": 0.9})));
+        assert_eq!(heavy.consecutive_context_window_errors, 4);
+        assert_eq!(heavy.pipeline_state, Some(serde_json::json!({"ema": 0.7})));
         assert_eq!(
             heavy.compaction_state,
-            Some(serde_json::json!({"attempt_count": 2}))
+            Some(serde_json::json!({"attempt_count": 5}))
         );
         assert_eq!(heavy.config_version_id.as_deref(), Some("cfg-live"));
     }
@@ -748,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn session_state_compact_from_heavy_checkpoint_extracts_recovery_fields() {
+    fn session_state_compact_from_heavy_checkpoint_keeps_prompt_material_only() {
         let heavy = astra_pipeline::step_protocol::HeavyCheckpoint {
             light: astra_pipeline::step_protocol::LightCheckpoint {
                 protocol_version: astra_pipeline::step_protocol::PROTOCOL_VERSION,
@@ -789,27 +860,15 @@ mod tests {
 
         let compact = session_state_compact_from_heavy_checkpoint(&heavy);
 
-        assert_eq!(compact.blocked_tools, vec!["bash".to_string()]);
         assert_eq!(compact.recent_tools, vec!["read_file".to_string()]);
-        assert_eq!(
-            compact.approval_overrides,
-            Some(serde_json::json!({"bash": "allow"}))
-        );
-        assert_eq!(
-            compact.compaction_tracker,
-            Some(serde_json::json!({"attempt_count": 4}))
-        );
-        assert_eq!(compact.budget_remaining_tokens, 321);
-        assert_eq!(compact.budget_remaining_rounds, 7);
-        assert_eq!(compact.consecutive_ctx_errors, 2);
-        assert_eq!(
-            compact.interruption,
-            Some(serde_json::json!({"kind": "context_overflow"}))
-        );
-        let delegation = compact.delegation.expect("delegation");
-        assert_eq!(delegation.id, "deleg-1");
-        assert_eq!(delegation.pattern, "fan_out");
-        assert_eq!(delegation.completed_sub_runs.len(), 1);
+        assert!(compact.blocked_tools.is_empty());
+        assert!(compact.approval_overrides.is_none());
+        assert!(compact.compaction_tracker.is_none());
+        assert_eq!(compact.budget_remaining_tokens, 0);
+        assert_eq!(compact.budget_remaining_rounds, 0);
+        assert_eq!(compact.consecutive_ctx_errors, 0);
+        assert!(compact.interruption.is_none());
+        assert!(compact.delegation.is_none());
     }
 
     #[test]
@@ -885,7 +944,7 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn history_sync_preserves_previous_recovery_state_without_existing_csl() {
+    async fn history_sync_drops_stale_recovery_state_without_existing_csl() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("history-sync-{}", uuid::Uuid::new_v4());
         let mut state = SessionState {
@@ -896,6 +955,9 @@ mod tests {
                 ("follow-up".to_string(), "done".to_string()),
             ],
             recent_tools: vec!["bash".to_string()],
+            runtime_pipeline_state: Some(serde_json::json!({"stale": "pipeline"})),
+            runtime_compaction_state: Some(serde_json::json!({"attempt_count": 99})),
+            runtime_consecutive_context_window_errors: 9,
             ..Default::default()
         };
 
@@ -941,26 +1003,20 @@ mod tests {
             .unwrap()
             .expect("restored session");
         assert_eq!(restored.messages.len(), 4);
-        assert_eq!(restored.blocked_tools, vec!["write_file".to_string()]);
-        assert_eq!(restored.budget_remaining_tokens, 1234);
-        assert_eq!(restored.budget_remaining_rounds, 9);
-        assert_eq!(
-            restored.interruption,
-            Some(serde_json::json!({"kind": "budget_exhausted"}))
-        );
-        assert_eq!(
-            restored.approval_overrides,
-            Some(serde_json::json!({"tool": "bash"}))
-        );
-        assert_eq!(restored.consecutive_context_window_errors, 2);
-        assert_eq!(
-            restored.compaction_state,
-            Some(serde_json::json!({"attempt_count": 2}))
-        );
-        assert_eq!(
-            restored.pipeline_state,
-            Some(serde_json::json!({"ema": 0.9}))
-        );
+        assert!(restored.blocked_tools.is_empty());
+        let limit = astra_core::RuntimeLimits::global().max_turn_input_tokens;
+        let expected_tokens = if limit == 0 {
+            0
+        } else {
+            limit.saturating_sub(state.total_prompt_tokens)
+        };
+        assert_eq!(restored.budget_remaining_tokens, expected_tokens);
+        assert_eq!(restored.budget_remaining_rounds, 48);
+        assert!(restored.interruption.is_none());
+        assert!(restored.approval_overrides.is_none());
+        assert_eq!(restored.consecutive_context_window_errors, 0);
+        assert!(restored.compaction_state.is_none());
+        assert!(restored.pipeline_state.is_none());
 
         let store = std::sync::Arc::new(
             astra_turn_core::conversation_log::file_store::FileCslStore::new(
@@ -974,14 +1030,8 @@ mod tests {
         )
         .unwrap();
         let mat = mgr.load().await.unwrap().expect("csl snapshot");
-        assert_eq!(
-            mat.session_state.blocked_tools,
-            vec!["write_file".to_string()]
-        );
-        assert_eq!(
-            mat.session_state.interruption,
-            Some(serde_json::json!({"kind": "budget_exhausted"}))
-        );
+        assert!(mat.session_state.blocked_tools.is_empty());
+        assert!(mat.session_state.interruption.is_none());
     }
 
     #[serial_test::serial]
