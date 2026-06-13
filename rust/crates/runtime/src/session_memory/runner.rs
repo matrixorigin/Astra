@@ -12,7 +12,9 @@ use astra_services::session_journal::{
 use astra_turn_core::cloud_session_memory_extract::{
     SESSION_MEMORY_TEMPLATE, build_extraction_prompt, extract_section,
 };
-use astra_turn_types::session_facts::SessionFacts;
+use astra_turn_types::{
+    has_durable_correction_directive, is_user_correction_signal, session_facts::SessionFacts,
+};
 
 use crate::memory_hooks::relevance::LlmConnParams;
 use crate::turn::cloud::memoria_compact::{MemoriaClient, MemoriaMemory};
@@ -1381,6 +1383,9 @@ fn render_recent_messages(messages: &[Value], take: usize, max_len: usize) -> Ve
         .filter_map(|msg| {
             let role = msg.get("role").and_then(Value::as_str)?;
             match role {
+                "user" if message_text(msg).is_some_and(is_vague_reanchor_for_session_memory) => {
+                    None
+                }
                 "user" | "assistant" | "tool" => {
                     let text = message_text_or_summary(msg)?;
                     Some(format!("{role}: {}", truncate(&text, max_len)))
@@ -1400,6 +1405,7 @@ fn first_user_message(messages: &[Value]) -> Option<&str> {
         (msg.get("role").and_then(Value::as_str) == Some("user"))
             .then(|| message_text(msg))
             .flatten()
+            .filter(|text| !is_vague_reanchor_for_session_memory(text))
     })
 }
 
@@ -1408,6 +1414,7 @@ fn last_user_message(messages: &[Value]) -> Option<&str> {
         (msg.get("role").and_then(Value::as_str) == Some("user"))
             .then(|| message_text(msg))
             .flatten()
+            .filter(|text| !is_vague_reanchor_for_session_memory(text))
     })
 }
 
@@ -1419,6 +1426,7 @@ fn recent_user_messages(messages: &[Value], take: usize, max_len: usize) -> Vec<
             (msg.get("role").and_then(Value::as_str) == Some("user"))
                 .then(|| message_text(msg))
                 .flatten()
+                .filter(|text| !is_vague_reanchor_for_session_memory(text))
                 .map(|text| truncate(text, max_len).to_string())
         })
         .take(take)
@@ -1426,6 +1434,10 @@ fn recent_user_messages(messages: &[Value], take: usize, max_len: usize) -> Vec<
         .into_iter()
         .rev()
         .collect()
+}
+
+fn is_vague_reanchor_for_session_memory(text: &str) -> bool {
+    is_user_correction_signal(text) && !has_durable_correction_directive(text)
 }
 
 fn last_assistant_message(messages: &[Value]) -> Option<String> {
@@ -1849,6 +1861,46 @@ mod tests {
         assert!(
             content.contains("## Completed\n- No completed work recorded."),
             "fallback should be explicit when no completed user work is known: {content}"
+        );
+    }
+
+    #[test]
+    fn rule_fallback_skips_vague_reanchor_user_messages() {
+        let messages = vec![
+            json!({"role": "user", "content": "Implement durable session memory refresh"}),
+            json!({"role": "assistant", "content": "I will patch the immediate case."}),
+            json!({"role": "user", "content": "我要的是长久健康运行，不是临时补丁"}),
+        ];
+
+        let content = build_rule_fallback_memory("", &messages, 4, 9_000);
+
+        assert!(
+            content.contains("Implement durable session memory refresh"),
+            "original task focus should remain: {content}"
+        );
+        assert!(
+            !content.contains("长久健康运行"),
+            "vague reanchor should not become L1 session memory: {content}"
+        );
+        assert!(
+            !content.contains("临时补丁"),
+            "vague reanchor should not leak through workflow/current state: {content}"
+        );
+    }
+
+    #[test]
+    fn rule_fallback_keeps_reanchor_with_concrete_directive() {
+        let messages = vec![
+            json!({"role": "user", "content": "Improve session memory"}),
+            json!({"role": "assistant", "content": "I will patch this single path."}),
+            json!({"role": "user", "content": "我重新说一次，不要用case-by-case修补"}),
+        ];
+
+        let content = build_rule_fallback_memory("", &messages, 4, 9_000);
+
+        assert!(
+            content.contains("不要用case-by-case修补"),
+            "concrete directive should remain eligible for L1 session memory: {content}"
         );
     }
 
