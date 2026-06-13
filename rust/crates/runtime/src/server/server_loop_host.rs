@@ -62,6 +62,7 @@ use crate::orchestration::{AgentProgressEvent, ProgressEventType};
 
 const MAX_PENDING_PROGRESS_AGENTS: usize = 128;
 const MAX_PENDING_PROGRESS_PER_AGENT: usize = 8;
+const MAX_STREAMED_TURN_EVENT_BUFFER: usize = 2_048;
 
 #[derive(Debug)]
 pub(crate) struct RunScopedAgentProgressFilter {
@@ -1453,10 +1454,12 @@ impl ServerAgenticLoopHost {
 
     /// Push an SSE event to both the internal buffer and the streaming channel.
     /// If the streaming channel is closed (client disconnected), triggers
-    /// cancellation so the agentic loop stops at the next turn boundary.
+    /// cancellation so the agentic loop stops at the next turn boundary. If the
+    /// channel is full, live streaming is detached but the run continues.
     fn emit_event(&mut self, mut event: Value) {
         self.attach_execution_metadata_to_tool_event(&mut event);
         self.mirror_agent_live_event(&event);
+        let streaming_turn = self.event_tx.is_some();
         if let Some(ref tx) = self.event_tx {
             match tx.try_send(event.clone()) {
                 Ok(()) => {}
@@ -1471,19 +1474,22 @@ impl ServerAgenticLoopHost {
                     self.event_tx = None;
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    // Backpressure: client can't keep up. Cancel to avoid unbounded buffering.
-                    tracing::warn!(target: "sse_channel", "SSE event channel full — cancelling run");
-                    if let Some(flag) = &self.client_cancel_flag {
-                        flag.store(true, Ordering::SeqCst);
-                    }
-                    if let Some(token) = &self.client_cancel_token {
-                        token.cancel();
-                    }
+                    // Backpressure is a delivery problem, not a user cancel. Detach
+                    // live streaming and keep the loop running so long jobs survive
+                    // slow clients or background tabs.
+                    tracing::warn!(target: "sse_channel", "SSE event channel full; detaching live stream without cancelling run");
                     self.event_tx = None;
                 }
             }
         }
         self.emitted_events.push(event);
+        if streaming_turn && self.emitted_events.len() > MAX_STREAMED_TURN_EVENT_BUFFER {
+            let overflow = self
+                .emitted_events
+                .len()
+                .saturating_sub(MAX_STREAMED_TURN_EVENT_BUFFER);
+            self.emitted_events.drain(0..overflow);
+        }
     }
 
     fn attach_execution_metadata_to_tool_event(&self, event: &mut Value) {
@@ -6952,6 +6958,41 @@ mod tests {
 
         assert!(host.progress_rx.is_none());
         assert!(host.progress_filter.is_none());
+    }
+
+    #[test]
+    fn full_sse_channel_detaches_stream_without_cancelling_run() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_token = Arc::new(CancellationToken::new());
+        host.set_client_cancel(Arc::clone(&cancel_flag), Arc::clone(&cancel_token));
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(json!({"type": "preloaded"}))
+            .expect("pre-fill bounded channel");
+        host.set_event_tx(tx);
+
+        host.emit_event(json!({"type": "text_delta", "content": "slow client"}));
+
+        assert!(
+            !cancel_flag.load(Ordering::SeqCst),
+            "backpressure must not be promoted to user cancellation"
+        );
+        assert!(
+            !cancel_token.is_cancelled(),
+            "LLM cancellation token must remain active on channel backpressure"
+        );
+        assert!(
+            host.event_tx.is_none(),
+            "live stream sender should be detached after bounded channel backpressure"
+        );
+        assert_eq!(host.emitted_events.len(), 1);
     }
 
     #[test]

@@ -242,7 +242,9 @@ pub struct StepRecorder {
     checkpoint_count: u32,
     /// Optional file-backed persistence (JSONL) for events
     file_store: Option<FileBackedEventStore>,
+    persistence_required: bool,
     persisted_tail_event_id: Option<String>,
+    persistence_error: Option<String>,
 }
 
 impl StepRecorder {
@@ -261,7 +263,9 @@ impl StepRecorder {
             phase_log: Vec::new(),
             checkpoint_count: 0,
             file_store: None,
+            persistence_required: false,
             persisted_tail_event_id: None,
+            persistence_error: None,
         }
     }
 
@@ -280,6 +284,7 @@ impl StepRecorder {
             .unwrap_or(0);
         Self {
             file_store: Some(file_store),
+            persistence_required: true,
             events: Vec::new(),
             step_sequence: persisted_summary.next_step_sequence,
             checkpoint_count: existing_max.saturating_add(1),
@@ -315,8 +320,16 @@ impl StepRecorder {
             None
         };
         let mut file_store = FileBackedEventStore::empty(session_id);
+        self.persistence_required = true;
         for event in &self.events {
-            file_store.append(event.clone());
+            if let Err(error) = file_store.append(event.clone()) {
+                self.record_persistence_error(format!(
+                    "failed to attach step-event persistence for {}: {}",
+                    event.event_id, error
+                ));
+                self.file_store = None;
+                return;
+            }
         }
         self.file_store = Some(file_store);
     }
@@ -1001,6 +1014,11 @@ impl StepRecorder {
         &self.events
     }
 
+    /// Last durable event persistence error, if any.
+    pub fn persistence_error(&self) -> Option<&str> {
+        self.persistence_error.as_deref()
+    }
+
     /// Get current step reference.
     pub fn current_step(&self) -> Option<&Step> {
         self.current_step.as_ref()
@@ -1126,10 +1144,7 @@ impl StepRecorder {
             payload: Some(self.trace_context_payload()),
             created_at: epoch_ms(),
         };
-        if let Some(ref mut fs) = self.file_store {
-            fs.append(event.clone());
-        }
-        self.events.push(event);
+        self.append_recorded_event(event);
     }
 
     fn emit_with_payload(&mut self, event_type: StepEventType, payload: serde_json::Value) {
@@ -1148,10 +1163,32 @@ impl StepRecorder {
             payload: Some(self.with_trace_context(payload)),
             created_at: epoch_ms(),
         };
-        if let Some(ref mut fs) = self.file_store {
-            fs.append(event.clone());
+        self.append_recorded_event(event);
+    }
+
+    fn append_recorded_event(&mut self, event: StepEvent) {
+        if let Some(ref mut fs) = self.file_store
+            && let Err(error) = fs.append(event.clone())
+        {
+            self.record_persistence_error(format!(
+                "failed to persist step event {}: {}",
+                event.event_id, error
+            ));
+            return;
+        }
+        if self.persistence_required {
+            self.record_persistence_error(format!(
+                "step-event persistence unavailable; dropping event {}",
+                event.event_id
+            ));
+            return;
         }
         self.events.push(event);
+    }
+
+    fn record_persistence_error(&mut self, message: String) {
+        astra_core::agent_warn!("event_store", "{}", message);
+        self.persistence_error = Some(message);
     }
 
     fn trace_context_payload(&self) -> serde_json::Value {
@@ -1862,6 +1899,23 @@ mod tests {
                 .join("ephemeral")
                 .join("step_events.jsonl")
                 .exists()
+        );
+    }
+
+    #[test]
+    fn required_persistence_drops_new_events_after_attach_failure() {
+        let mut rec = StepRecorder::new("ephemeral", "task-1");
+        rec.begin_turn(0);
+        rec.attach_persistence("../invalid-session-id");
+        let events_after_failed_attach = rec.events().len();
+
+        rec.record_plan(&["bash".into()], 0.9, 0.0, 4000);
+
+        assert!(rec.persistence_error().is_some());
+        assert_eq!(
+            rec.events().len(),
+            events_after_failed_attach,
+            "required persistence must fail closed instead of reverting to memory-only events"
         );
     }
 

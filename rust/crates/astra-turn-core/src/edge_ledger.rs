@@ -47,20 +47,31 @@ fn backoff_delay(retry_count: u32) -> Duration {
     Duration::from_millis(ms)
 }
 
-fn ledger_crypto() -> &'static JournalCrypto {
-    static CRYPTO: OnceLock<JournalCrypto> = OnceLock::new();
-    CRYPTO.get_or_init(JournalCrypto::from_env_or_local_key)
+fn ledger_crypto() -> io::Result<&'static JournalCrypto> {
+    static CRYPTO: OnceLock<Result<JournalCrypto, String>> = OnceLock::new();
+    match CRYPTO
+        .get_or_init(|| JournalCrypto::from_env_or_local_key().map_err(|error| error.to_string()))
+    {
+        Ok(crypto) => Ok(crypto),
+        Err(error) => Err(io::Error::other(error.clone())),
+    }
 }
 
-fn encrypt_persisted_ledger_line(line: &str) -> String {
-    let encrypted = ledger_crypto().encrypt(line.as_bytes());
-    hex_encode(&encrypted)
+fn encrypt_persisted_ledger_line(line: &str) -> io::Result<String> {
+    let encrypted = ledger_crypto()?.encrypt(line.as_bytes())?;
+    Ok(hex_encode(&encrypted))
 }
 
-fn decrypt_persisted_ledger_line(line: &str) -> Option<String> {
-    let bytes = hex_decode(line.trim())?;
-    let decrypted = ledger_crypto().decrypt(&bytes)?;
-    String::from_utf8(decrypted).ok()
+fn decrypt_persisted_ledger_line(line: &str) -> io::Result<Option<String>> {
+    let Some(bytes) = hex_decode(line.trim()) else {
+        return Ok(None);
+    };
+    let Some(decrypted) = ledger_crypto()?.decrypt(&bytes) else {
+        return Ok(None);
+    };
+    String::from_utf8(decrypted)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn sync_parent_dir(dir: &Path) -> io::Result<()> {
@@ -275,7 +286,7 @@ impl LedgerPersistence {
                 .unwrap_or_default()
                 .as_millis() as u64,
         });
-        let encrypted = encrypt_persisted_ledger_line(&line.to_string());
+        let encrypted = encrypt_persisted_ledger_line(&line.to_string())?;
         #[cfg(unix)]
         let mut file = {
             use std::os::unix::fs::OpenOptionsExt;
@@ -328,7 +339,7 @@ impl LedgerPersistence {
             if line.trim().is_empty() {
                 continue;
             }
-            let json = decrypt_persisted_ledger_line(&line).unwrap_or(line);
+            let json = decrypt_persisted_ledger_line(&line)?.unwrap_or(line);
             let entry: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
             let Some(op) = entry.get("op").and_then(|v| v.as_str()) else {
                 continue;
@@ -388,7 +399,7 @@ impl LedgerPersistence {
                     .unwrap_or_default()
                     .as_millis() as u64,
             });
-            let encrypted = encrypt_persisted_ledger_line(&line.to_string());
+            let encrypted = encrypt_persisted_ledger_line(&line.to_string())?;
             writeln!(file, "{encrypted}")?;
         }
         file.sync_all()?;

@@ -14,18 +14,9 @@ use std::path::{Path, PathBuf};
 
 use astra_services::SessionArtifactStore;
 
-use crate::journal_crypto::JournalCrypto;
-use crate::journal_crypto::hex_decode;
-use crate::journal_crypto::hex_encode;
 use crate::step_protocol::{
     CheckpointTier, HeavyCheckpoint, LightCheckpoint, StepCheckpoint, StepEvent, StepEventStore,
 };
-use std::sync::OnceLock;
-
-fn journal_crypto() -> &'static JournalCrypto {
-    static CRYPTO: OnceLock<JournalCrypto> = OnceLock::new();
-    CRYPTO.get_or_init(JournalCrypto::from_env_or_local_key)
-}
 
 /// Directory name within session workspace for step checkpoints.
 const STEP_CHECKPOINT_DIR: &str = "step_checkpoints";
@@ -36,14 +27,13 @@ const MAX_LIGHT_CHECKPOINTS: usize = 50;
 /// Get the step checkpoint directory for a session.
 /// Decrypt checkpoint content. All checkpoints are encrypted.
 pub(crate) fn decrypt_checkpoint(content: &str) -> Option<String> {
-    let bytes = hex_decode(content.trim())?;
-    let decrypted = journal_crypto().decrypt(&bytes)?;
-    String::from_utf8(decrypted).ok()
+    astra_services::checkpoint_crypto::decrypt_text(content)
+        .ok()
+        .flatten()
 }
 
-fn encrypt_checkpoint(content: &str) -> String {
-    let encrypted = journal_crypto().encrypt(content.as_bytes());
-    hex_encode(&encrypted)
+fn encrypt_checkpoint(content: &str) -> std::io::Result<String> {
+    astra_services::checkpoint_crypto::encrypt_text(content)
 }
 
 fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
@@ -76,7 +66,7 @@ fn write_atomic_encrypted_text(path: &Path, content: &str) -> std::io::Result<()
             .unwrap_or_default()
             .as_nanos()
     ));
-    let encrypted = encrypt_checkpoint(content);
+    let encrypted = encrypt_checkpoint(content)?;
     {
         use std::io::Write;
         let mut file = std::fs::File::create(&tmp_path)?;
@@ -97,7 +87,7 @@ fn append_encrypted_line(path: &Path, content: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let existed = path.exists();
     let needs_leading_newline = existed && file_needs_trailing_newline(path)?;
-    let encrypted = encrypt_checkpoint(content);
+    let encrypted = encrypt_checkpoint(content)?;
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -434,11 +424,10 @@ pub fn read_composite_snapshot_index(
     let decrypted = match decrypt_checkpoint(&content) {
         Some(plain) => plain,
         None => {
-            astra_core::agent_warn!(
-                "checkpoint",
-                "composite_snapshots.json decryption failed (key rotation or tampering?), returning empty index"
-            );
-            return Ok(astra_core::composite_snapshot::CompositeSnapshotIndex::default());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "composite_snapshots.json decryption failed",
+            ));
         }
     };
     let mut index: astra_core::composite_snapshot::CompositeSnapshotIndex =
@@ -635,16 +624,10 @@ impl FileBackedEventStore {
 }
 
 impl StepEventStore for FileBackedEventStore {
-    fn append(&mut self, event: StepEvent) {
-        if let Err(err) = self.persist_event(&event) {
-            astra_core::agent_warn!(
-                "event_store",
-                "Failed to persist step event {}: {}",
-                event.event_id,
-                err
-            );
-        }
+    fn append(&mut self, event: StepEvent) -> std::io::Result<()> {
+        self.persist_event(&event)?;
         self.events.push(event);
+        Ok(())
     }
 
     fn events_for_step(&self, step_id: &str) -> Vec<&StepEvent> {
@@ -1050,17 +1033,30 @@ mod tests {
         let mut store = FileBackedEventStore::empty("test-events-empty");
         assert_eq!(store.event_count(), 0);
 
-        store.append(make_event("e1", "step-1", StepEventType::StepCreated));
-        store.append(make_event("e2", "step-1", StepEventType::ToolCallStarted));
+        let _ = store.append(make_event("e1", "step-1", StepEventType::StepCreated));
+        let _ = store.append(make_event("e2", "step-1", StepEventType::ToolCallStarted));
         assert_eq!(store.event_count(), 2);
+    }
+
+    #[test]
+    fn file_event_store_does_not_advance_memory_when_append_fails() {
+        let mut store = FileBackedEventStore::empty("../invalid-session-id");
+        let result = store.append(make_event("e1", "step-1", StepEventType::StepCreated));
+
+        assert!(result.is_err());
+        assert_eq!(
+            store.event_count(),
+            0,
+            "memory view must not advance ahead of durable journal"
+        );
     }
 
     #[test]
     fn file_event_store_events_for_step() {
         let mut store = FileBackedEventStore::empty("test-events-step");
-        store.append(make_event("e1", "step-1", StepEventType::StepCreated));
-        store.append(make_event("e2", "step-2", StepEventType::StepCreated));
-        store.append(make_event("e3", "step-1", StepEventType::ToolCallCompleted));
+        let _ = store.append(make_event("e1", "step-1", StepEventType::StepCreated));
+        let _ = store.append(make_event("e2", "step-2", StepEventType::StepCreated));
+        let _ = store.append(make_event("e3", "step-1", StepEventType::ToolCallCompleted));
 
         let step1_events = store.events_for_step("step-1");
         assert_eq!(step1_events.len(), 2);
@@ -1071,15 +1067,15 @@ mod tests {
     #[test]
     fn file_event_store_ancestors() {
         let mut store = FileBackedEventStore::empty("test-events-ancestors");
-        store.append(make_event("root", "s1", StepEventType::StepCreated));
+        let _ = store.append(make_event("root", "s1", StepEventType::StepCreated));
 
         let mut child = make_event("child", "s1", StepEventType::ToolCallStarted);
         child.caused_by = vec!["root".to_string()];
-        store.append(child);
+        let _ = store.append(child);
 
         let mut grandchild = make_event("grandchild", "s1", StepEventType::ToolCallCompleted);
         grandchild.caused_by = vec!["child".to_string()];
-        store.append(grandchild);
+        let _ = store.append(grandchild);
 
         let ancestors = store.ancestors("grandchild");
         assert_eq!(ancestors.len(), 2);
@@ -1091,11 +1087,11 @@ mod tests {
     #[test]
     fn file_event_store_descendants() {
         let mut store = FileBackedEventStore::empty("test-events-desc");
-        store.append(make_event("root", "s1", StepEventType::StepCreated));
+        let _ = store.append(make_event("root", "s1", StepEventType::StepCreated));
 
         let mut child = make_event("child", "s1", StepEventType::ToolCallStarted);
         child.caused_by = vec!["root".to_string()];
-        store.append(child);
+        let _ = store.append(child);
 
         let desc = store.descendants("root");
         assert_eq!(desc.len(), 1);
@@ -1105,11 +1101,11 @@ mod tests {
     #[test]
     fn file_event_store_leaves() {
         let mut store = FileBackedEventStore::empty("test-events-leaves");
-        store.append(make_event("root", "s1", StepEventType::StepCreated));
+        let _ = store.append(make_event("root", "s1", StepEventType::StepCreated));
 
         let mut child = make_event("child", "s1", StepEventType::ToolCallCompleted);
         child.caused_by = vec!["root".to_string()];
-        store.append(child);
+        let _ = store.append(child);
 
         let leaves = store.leaves();
         assert_eq!(leaves.len(), 1);
@@ -1126,8 +1122,8 @@ mod tests {
 
         {
             let mut store = FileBackedEventStore::empty(&session_id);
-            store.append(make_event("e1", "s1", StepEventType::StepCreated));
-            store.append(make_event("e2", "s1", StepEventType::ToolCallCompleted));
+            let _ = store.append(make_event("e1", "s1", StepEventType::StepCreated));
+            let _ = store.append(make_event("e2", "s1", StepEventType::ToolCallCompleted));
         }
 
         // Reload from disk
@@ -1149,14 +1145,14 @@ mod tests {
 
         {
             let mut store = FileBackedEventStore::empty(&session_id);
-            store.append(make_event("e1", "s1", StepEventType::StepCreated));
-            store.append(make_event("e2", "s1", StepEventType::ToolCallCompleted));
+            let _ = store.append(make_event("e1", "s1", StepEventType::StepCreated));
+            let _ = store.append(make_event("e2", "s1", StepEventType::ToolCallCompleted));
         }
 
         let torn_json =
             serde_json::to_string(&make_event("torn", "s1", StepEventType::ToolCallCompleted))
                 .unwrap();
-        let torn_encrypted = encrypt_checkpoint(&torn_json);
+        let torn_encrypted = encrypt_checkpoint(&torn_json).unwrap();
         {
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
@@ -1193,13 +1189,13 @@ mod tests {
 
         {
             let mut store = FileBackedEventStore::empty(&session_id);
-            store.append(make_event("e1", "s1", StepEventType::StepCreated));
+            let _ = store.append(make_event("e1", "s1", StepEventType::StepCreated));
         }
 
         let torn_json =
             serde_json::to_string(&make_event("torn", "s1", StepEventType::ToolCallCompleted))
                 .unwrap();
-        let torn_encrypted = encrypt_checkpoint(&torn_json);
+        let torn_encrypted = encrypt_checkpoint(&torn_json).unwrap();
         {
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
@@ -1211,7 +1207,7 @@ mod tests {
 
         {
             let mut store = FileBackedEventStore::empty(&session_id);
-            store.append(make_event("e2", "s1", StepEventType::ToolCallCompleted));
+            let _ = store.append(make_event("e2", "s1", StepEventType::ToolCallCompleted));
         }
 
         let store = FileBackedEventStore::new(&session_id);
@@ -1237,7 +1233,7 @@ mod tests {
                 let mut event =
                     make_event(&format!("e{idx}"), "s1", StepEventType::ToolCallCompleted);
                 event.created_at = idx * 100;
-                store.append(event);
+                let _ = store.append(event);
             }
         }
 
@@ -1279,9 +1275,9 @@ mod tests {
             .expect("serialize e2");
         let content = format!(
             "{}\n{}\n{}\n",
-            encrypt_checkpoint(&e1),
-            encrypt_checkpoint(r#"{"not":"a step event"}"#),
-            encrypt_checkpoint(&e2)
+            encrypt_checkpoint(&e1).unwrap(),
+            encrypt_checkpoint(r#"{"not":"a step event"}"#).unwrap(),
+            encrypt_checkpoint(&e2).unwrap()
         );
         std::fs::write(&path, content).expect("write mixed event log");
 
@@ -1316,7 +1312,7 @@ mod tests {
         let heavy = make_heavy("step-ok", vec![json!({"role": "user", "content": "hello"})]);
         let cp = StepCheckpoint::Heavy(Box::new(heavy));
         let json_str = serde_json::to_string(&cp).unwrap();
-        let encrypted = encrypt_checkpoint(&json_str);
+        let encrypted = encrypt_checkpoint(&json_str).unwrap();
         std::fs::write(dir.join("000002-heavy.json"), &encrypted).unwrap();
 
         // Write a corrupted heavy checkpoint with a higher number
@@ -1348,7 +1344,7 @@ mod tests {
         let light = make_light("step-ok", 0.5);
         let cp = StepCheckpoint::Light(light);
         let json_str = serde_json::to_string(&cp).unwrap();
-        let encrypted = encrypt_checkpoint(&json_str);
+        let encrypted = encrypt_checkpoint(&json_str).unwrap();
         std::fs::write(dir.join("000001-light.json"), &encrypted).unwrap();
 
         // Write a corrupted light checkpoint with higher number
@@ -1380,9 +1376,9 @@ mod tests {
         let valid_json = serde_json::to_string(&valid_event).unwrap();
 
         // Encrypt all lines (both valid and malformed) before writing
-        let encrypted_valid = encrypt_checkpoint(&valid_json);
-        let encrypted_malformed = encrypt_checkpoint("NOT VALID JSON");
-        let encrypted_malformed2 = encrypt_checkpoint("{");
+        let encrypted_valid = encrypt_checkpoint(&valid_json).unwrap();
+        let encrypted_malformed = encrypt_checkpoint("NOT VALID JSON").unwrap();
+        let encrypted_malformed2 = encrypt_checkpoint("{").unwrap();
 
         let content = format!(
             "{}\n{}\n{}\n{}\n",
@@ -1414,7 +1410,7 @@ mod tests {
         let heavy = make_heavy("step-1", vec![]);
         let cp = StepCheckpoint::Heavy(Box::new(heavy));
         let json_str = serde_json::to_string(&cp).unwrap();
-        let encrypted = encrypt_checkpoint(&json_str);
+        let encrypted = encrypt_checkpoint(&json_str).unwrap();
         std::fs::write(dir.join("000001-heavy.json"), &encrypted).unwrap();
 
         let result = read_latest_heavy_checkpoint(&session_id);
@@ -1441,7 +1437,7 @@ mod tests {
         );
         let cp = StepCheckpoint::Heavy(Box::new(heavy));
         let json_str = serde_json::to_string(&cp).unwrap();
-        let encrypted = encrypt_checkpoint(&json_str);
+        let encrypted = encrypt_checkpoint(&json_str).unwrap();
         std::fs::write(dir.join("000001-heavy.json"), &encrypted).unwrap();
 
         // Write a CORRUPTED checkpoint as #2 (latest)
@@ -1481,7 +1477,7 @@ mod tests {
         let heavy = make_heavy("step-valid", vec![]);
         let cp = StepCheckpoint::Heavy(Box::new(heavy));
         let json_str = serde_json::to_string(&cp).unwrap();
-        let encrypted = encrypt_checkpoint(&json_str);
+        let encrypted = encrypt_checkpoint(&json_str).unwrap();
         std::fs::write(dir.join("000001-heavy.json"), &encrypted).unwrap();
 
         // Simulate power loss: a corrupted temp file left behind (never renamed)
@@ -1607,7 +1603,7 @@ mod tests {
     }
 
     #[test]
-    fn read_composite_snapshot_index_returns_default_on_unencrypted_file() {
+    fn read_composite_snapshot_index_rejects_unencrypted_file() {
         let session_id = format!("test-unencrypted-composite-{}", std::process::id());
         let dir = checkpoint_dir_for(&session_id).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
@@ -1615,12 +1611,10 @@ mod tests {
         let bad_path = dir.join("composite_snapshots.json");
         std::fs::write(&bad_path, r#"{"snapshots":[]}"#).unwrap();
 
-        // Must return empty index, not parse the plaintext.
-        let result = read_composite_snapshot_index(&session_id).unwrap();
+        let result = read_composite_snapshot_index(&session_id);
         assert!(
-            result.snapshots.is_empty(),
-            "unencrypted composite snapshot must return empty index, got {} snapshots",
-            result.snapshots.len()
+            matches!(result, Err(ref error) if error.kind() == std::io::ErrorKind::InvalidData),
+            "unencrypted composite snapshot must be rejected, got {result:?}"
         );
 
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());

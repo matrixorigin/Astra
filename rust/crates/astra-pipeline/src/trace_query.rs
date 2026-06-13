@@ -310,8 +310,9 @@ mod tests {
     }
 
     impl StepEventStore for MockStepStore {
-        fn append(&mut self, event: StepEvent) {
+        fn append(&mut self, event: StepEvent) -> std::io::Result<()> {
             self.events.push(event);
+            Ok(())
         }
         fn events_for_step(&self, step_id: &str) -> Vec<&StepEvent> {
             self.events
@@ -404,7 +405,7 @@ mod tests {
         let id = log.events()[0].canonical_event_id.to_string();
 
         let mut store = MockStepStore { events: vec![] };
-        store.append(make_step("e1", "step-1", Some(&id), &[]));
+        let _ = store.append(make_step("e1", "step-1", Some(&id), &[]));
 
         let results = TraceQuery::find_by_canonical_id(&log, &store, &id, None);
         assert_eq!(results.len(), 2);
@@ -429,8 +430,8 @@ mod tests {
         );
 
         let mut store = MockStepStore { events: vec![] };
-        store.append(make_step("e1", "s1", None, &[]));
-        store.append(make_step("e2", "s1", None, &["e1"]));
+        let _ = store.append(make_step("e1", "s1", None, &[]));
+        let _ = store.append(make_step("e2", "s1", None, &["e1"]));
 
         let counts = TraceQuery::layer_counts(&log, &store);
         assert_eq!(counts["event_log"], 2);
@@ -450,7 +451,7 @@ mod tests {
         let id = log.events()[0].canonical_event_id.to_string();
 
         let mut store = MockStepStore { events: vec![] };
-        store.append(make_step("e1", "s1", Some(&id), &[]));
+        let _ = store.append(make_step("e1", "s1", Some(&id), &[]));
 
         let dups = TraceQuery::cross_layer_duplicates(&log, &store, None);
         assert_eq!(dups.len(), 1);

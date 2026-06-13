@@ -95,6 +95,7 @@ use crate::server::{server_skill_subrun, server_tool_executor};
 
 const MAX_DEFERRED_INPUT_CHARS: usize = 20_000;
 const MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS: u32 = 500;
+const MAX_ACTIVE_RUN_LIVE_EVENTS: usize = MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS as usize;
 const AGENT_PROGRESS_STREAM_DRAIN_GRACE: Duration = Duration::from_millis(25);
 
 const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
@@ -2560,6 +2561,23 @@ fn live_delta_event_for_persistence(event: &Value) -> bool {
                 | "tool_call_end"
         )
     )
+}
+
+fn push_active_run_live_event(run: &mut RunState, event: Value) {
+    run.events.push(event);
+    while run
+        .events
+        .iter()
+        .filter(|event| live_delta_event_for_persistence(event))
+        .count()
+        > MAX_ACTIVE_RUN_LIVE_EVENTS
+    {
+        let Some(oldest_live_event) = run.events.iter().position(live_delta_event_for_persistence)
+        else {
+            break;
+        };
+        run.events.remove(oldest_live_event);
+    }
 }
 
 /// Per-run state held in the lifecycle service.
@@ -5392,9 +5410,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
         });
 
-        // Create the bounded SSE channel. 512 events is generous for any single
-        // turn; hitting the limit means the client cannot keep up, so we treat
-        // channel-full the same as client disconnect (cancel the loop).
+        // Create bounded live channels. If a client cannot keep up, the host
+        // detaches that live stream without cancelling the server-side run.
         const SSE_CHANNEL_CAPACITY: usize = 512;
         let (client_event_tx, event_rx) = mpsc::channel::<Value>(SSE_CHANNEL_CAPACITY);
         let (event_tx, mut fanout_rx) = mpsc::channel::<Value>(SSE_CHANNEL_CAPACITY);
@@ -5407,7 +5424,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             while let Some(event) = fanout_rx.recv().await {
                 if live_delta_event_for_persistence(&event) {
                     if let Some(run) = fanout_runs.write().await.get_mut(&fanout_run_id) {
-                        run.events.push(event.clone());
+                        push_active_run_live_event(run, event.clone());
                     }
                 }
                 let _ = live_tx_for_fanout.send(event.clone());
@@ -9436,6 +9453,39 @@ mod tests {
         assert_eq!(persisted[2]["type"], "tool_call_end");
         assert_eq!(persisted[3]["event_type"], "text_done");
         assert_eq!(persisted[4]["event_type"], "run_finished");
+    }
+
+    #[test]
+    fn active_run_live_event_projection_is_bounded() {
+        let mut run = RunState {
+            run_id: "run-live-bound".to_string(),
+            session_id: "session-live-bound".to_string(),
+            status: RunStatus::Running,
+            events: vec![
+                json!({"event_type": "run_started", "data": {"run_id": "run-live-bound"}}),
+            ],
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            pause_flag: Arc::new(AtomicBool::new(false)),
+            llm_cancel_token: Arc::new(CancellationToken::new()),
+            live_tx: None,
+            waiting_for: None,
+        };
+
+        for idx in 0..(MAX_ACTIVE_RUN_LIVE_EVENTS + 5) {
+            push_active_run_live_event(
+                &mut run,
+                json!({"type": "text_delta", "content": idx.to_string()}),
+            );
+        }
+
+        let live_events: Vec<_> = run
+            .events
+            .iter()
+            .filter(|event| live_delta_event_for_persistence(event))
+            .collect();
+        assert_eq!(live_events.len(), MAX_ACTIVE_RUN_LIVE_EVENTS);
+        assert_eq!(run.events[0]["event_type"], "run_started");
+        assert_eq!(live_events[0]["content"], "5");
     }
 
     #[test]

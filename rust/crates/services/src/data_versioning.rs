@@ -119,13 +119,16 @@ fn read_composite_snapshot_index_local(
         return Ok(None);
     }
     let content = std::fs::read_to_string(&path).map_err(internal_error)?;
-    let Some(decrypted) = crate::checkpoint_crypto::decrypt_text(&content) else {
-        tracing::warn!(
-            session_id,
-            path = %path.display(),
-            "composite snapshot index decryption failed; skipping local index for data versioning"
-        );
-        return Ok(None);
+    let Some(decrypted) =
+        crate::checkpoint_crypto::decrypt_text(&content).map_err(internal_error)?
+    else {
+        return Err(internal_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "composite snapshot index decryption failed for {}",
+                path.display()
+            ),
+        )));
     };
     let mut index: CompositeSnapshotIndex =
         serde_json::from_str(&decrypted).map_err(internal_error)?;
@@ -897,7 +900,11 @@ mod tests {
         let path = composite_snapshots_json_path(&sid).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let json = serde_json::to_string(&index).unwrap();
-        std::fs::write(&path, crate::checkpoint_crypto::encrypt_text(&json)).unwrap();
+        std::fs::write(
+            &path,
+            crate::checkpoint_crypto::encrypt_text(&json).unwrap(),
+        )
+        .unwrap();
 
         let restored = read_composite_snapshot_index_local(&sid)
             .unwrap()

@@ -741,13 +741,13 @@ fn read_composite_snapshot_index_local(
     }
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("read composite_snapshots.json: {e}"))?;
-    let Some(decrypted) = crate::checkpoint_crypto::decrypt_text(&content) else {
-        tracing::warn!(
-            session_id,
-            path = %path.display(),
-            "composite snapshot index decryption failed; ignoring local index"
-        );
-        return Ok(astra_core::composite_snapshot::CompositeSnapshotIndex::default());
+    let Some(decrypted) = crate::checkpoint_crypto::decrypt_text(&content)
+        .map_err(|e| format!("decrypt composite_snapshots.json: {e}"))?
+    else {
+        return Err(format!(
+            "composite snapshot index decryption failed for {}",
+            path.display()
+        ));
     };
     let mut index: astra_core::composite_snapshot::CompositeSnapshotIndex =
         serde_json::from_str(&decrypted)
@@ -2545,12 +2545,33 @@ mod tests {
         let path = composite_snapshots_json_path(&sid).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let json = serde_json::to_string(&index).unwrap();
-        std::fs::write(&path, crate::checkpoint_crypto::encrypt_text(&json)).unwrap();
+        std::fs::write(
+            &path,
+            crate::checkpoint_crypto::encrypt_text(&json).unwrap(),
+        )
+        .unwrap();
 
         let restored = read_composite_snapshot_index_local(&sid).unwrap();
 
         assert_eq!(restored.snapshots.len(), 1);
         assert_eq!(restored.snapshots[0].snapshot_id, "snap-encrypted");
+    }
+
+    #[test]
+    fn local_composite_snapshot_index_rejects_undecryptable_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = uuid::Uuid::new_v4().to_string();
+        let path = composite_snapshots_json_path(&sid).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "not-encrypted-json").unwrap();
+
+        let error = read_composite_snapshot_index_local(&sid).unwrap_err();
+
+        assert!(
+            error.contains("decryption failed"),
+            "corrupt local index must surface as restore error: {error}"
+        );
     }
 
     #[tokio::test]

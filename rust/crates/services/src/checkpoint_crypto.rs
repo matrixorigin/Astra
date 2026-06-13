@@ -30,36 +30,44 @@ impl JournalCrypto {
     }
 
     /// Load from `ASTRA_JOURNAL_KEY` (hex) or a locally persisted random key.
-    pub fn from_env_or_local_key() -> Self {
+    pub fn from_env_or_local_key() -> io::Result<Self> {
         if let Ok(hex) = std::env::var(JOURNAL_KEY_ENV) {
             let trimmed = hex.trim();
-            let bytes = parse_hex_32(trimmed)
-                .unwrap_or_else(|| panic!("{JOURNAL_KEY_ENV} must be exactly 64 hex characters"));
-            return Self::new(&bytes);
+            let bytes = parse_hex_32(trimmed).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{JOURNAL_KEY_ENV} must be exactly 64 hex characters"),
+                )
+            })?;
+            return Ok(Self::new(&bytes));
         }
-        let bytes = load_or_create_local_key_bytes().unwrap_or_else(|err| {
-            panic!(
-                "failed to load or create journal key {}: {err}",
-                local_key_path().display()
+        let bytes = load_or_create_local_key_bytes().map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "failed to load or create journal key {}: {err}",
+                    local_key_path().display()
+                ),
             )
-        });
-        Self::new(&bytes)
+        })?;
+        Ok(Self::new(&bytes))
     }
 
-    pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
+    pub fn encrypt(&self, plaintext: &[u8]) -> io::Result<Vec<u8>> {
         let rng = SystemRandom::new();
         let mut nonce_bytes = [0u8; NONCE_LEN];
-        rng.fill(&mut nonce_bytes).expect("system random available");
+        rng.fill(&mut nonce_bytes)
+            .map_err(|_| io::Error::other("system random unavailable"))?;
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
         let mut in_out = plaintext.to_vec();
         self.key
             .seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
-            .expect("seal_in_place_append_tag succeeds");
+            .map_err(|_| io::Error::other("checkpoint encryption failed"))?;
 
         let mut result = nonce_bytes.to_vec();
         result.extend_from_slice(&in_out);
-        result
+        Ok(result)
     }
 
     /// Decrypt `nonce || ciphertext` and return plaintext.
@@ -107,23 +115,34 @@ pub fn hex_decode(hex: &str) -> Option<Vec<u8>> {
 }
 
 /// Decrypt a hex-encoded encrypted text payload.
-pub fn decrypt_text(content: &str) -> Option<String> {
-    let bytes = hex_decode(content.trim())?;
-    let decrypted = journal_crypto().decrypt(&bytes)?;
-    String::from_utf8(decrypted).ok()
+pub fn decrypt_text(content: &str) -> io::Result<Option<String>> {
+    let Some(bytes) = hex_decode(content.trim()) else {
+        return Ok(None);
+    };
+    let Some(decrypted) = journal_crypto()?.decrypt(&bytes) else {
+        return Ok(None);
+    };
+    String::from_utf8(decrypted)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 /// Encrypt a UTF-8 text payload to hex-encoded ciphertext.
-pub fn encrypt_text(content: &str) -> String {
-    let encrypted = journal_crypto().encrypt(content.as_bytes());
-    hex_encode(&encrypted)
+pub fn encrypt_text(content: &str) -> io::Result<String> {
+    let encrypted = journal_crypto()?.encrypt(content.as_bytes())?;
+    Ok(hex_encode(&encrypted))
 }
 
-fn journal_crypto() -> &'static JournalCrypto {
+fn journal_crypto() -> io::Result<&'static JournalCrypto> {
     use std::sync::OnceLock;
 
-    static CRYPTO: OnceLock<JournalCrypto> = OnceLock::new();
-    CRYPTO.get_or_init(JournalCrypto::from_env_or_local_key)
+    static CRYPTO: OnceLock<Result<JournalCrypto, String>> = OnceLock::new();
+    match CRYPTO
+        .get_or_init(|| JournalCrypto::from_env_or_local_key().map_err(|error| error.to_string()))
+    {
+        Ok(crypto) => Ok(crypto),
+        Err(error) => Err(io::Error::other(error.clone())),
+    }
 }
 
 fn parse_hex_32(hex: &str) -> Option<[u8; KEY_LEN]> {
@@ -237,7 +256,7 @@ mod tests {
         SystemRandom::new().fill(&mut key).unwrap();
         let crypto = JournalCrypto::new(&key);
 
-        let ciphertext = crypto.encrypt(b"hello checkpoint");
+        let ciphertext = crypto.encrypt(b"hello checkpoint").unwrap();
         assert_ne!(ciphertext, b"hello checkpoint");
         assert_eq!(crypto.decrypt(&ciphertext).unwrap(), b"hello checkpoint");
     }
@@ -248,7 +267,7 @@ mod tests {
         SystemRandom::new().fill(&mut key).unwrap();
         let crypto = JournalCrypto::new(&key);
 
-        let mut ciphertext = crypto.encrypt(b"secret");
+        let mut ciphertext = crypto.encrypt(b"secret").unwrap();
         let last = ciphertext.len() - 1;
         ciphertext[last] ^= 0x01;
         assert!(crypto.decrypt(&ciphertext).is_none());
@@ -264,6 +283,6 @@ mod tests {
 
     #[test]
     fn decrypt_text_rejects_plaintext_json() {
-        assert!(decrypt_text(r#"{"snapshots":[]}"#).is_none());
+        assert!(decrypt_text(r#"{"snapshots":[]}"#).unwrap().is_none());
     }
 }

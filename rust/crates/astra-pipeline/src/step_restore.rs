@@ -537,7 +537,7 @@ mod tests {
         let args = serde_json::json!({"path": "src/lib.rs"});
         let key = IdempotencyKey::semantic("read_file", &args);
         let mut store = FileBackedEventStore::empty(&session_id);
-        store.append(StepEvent {
+        let _ = store.append(StepEvent {
             event_id: "completed-read".to_string(),
             canonical_event_id: None,
             step_id: "step-1".to_string(),

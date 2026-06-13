@@ -1110,8 +1110,6 @@ pub struct ServerToolExecutor {
     /// Exactly-once executor for crash recovery deduplication.
     /// When active (Some), checks idempotency cache before executing tools.
     exactly_once_executor: Option<Mutex<astra_pipeline::exactly_once::ExactlyOnceExecutor>>,
-    /// Monotonic tool-call counter within the session, used for dedup key generation.
-    tool_call_counter: AtomicU32,
 }
 
 /// Snapshot used by the plan-mode write guard and the system-prompt
@@ -1207,7 +1205,6 @@ impl ServerToolExecutor {
             capabilities,
             server_tool_names,
             exactly_once_executor: None,
-            tool_call_counter: AtomicU32::new(0),
         }
     }
 
@@ -1244,24 +1241,17 @@ impl ServerToolExecutor {
 
     /// Check exactly-once cache and return cached result if available.
     /// Returns None if cache miss or exactly-once is disabled.
-    fn reserve_exactly_once_tool_index(&self) -> Option<u32> {
-        self.exactly_once_executor.as_ref()?;
-        Some(self.tool_call_counter.fetch_add(1, Ordering::SeqCst))
-    }
-
     fn check_exactly_once_cache(
         &self,
         name: &str,
         args: &Value,
-        tool_index: Option<u32>,
     ) -> Option<astra_tools::ToolResult> {
-        use astra_pipeline::step_protocol::IdempotencyKey;
         use astra_turn_types::classify_tool_idempotency;
 
-        let tool_index = tool_index?;
         let executor_mutex = self.exactly_once_executor.as_ref()?;
-        let step_id = self.session_id.clone();
-        let key = IdempotencyKey::new(&step_id, tool_index, name, args);
+        let public_args = Self::public_tool_arguments(args);
+        let key = Self::exactly_once_key(name, args);
+        let cache_key = key.cache_key();
 
         let executor = match executor_mutex.lock() {
             Ok(executor) => executor,
@@ -1274,15 +1264,14 @@ impl ServerToolExecutor {
             }
         };
         let cached = executor.cache().check(&key)?;
-        let idempotency = classify_tool_idempotency(name, Some(args));
+        let idempotency = classify_tool_idempotency(name, Some(&public_args));
 
         match idempotency {
             astra_turn_types::ToolIdempotency::NonIdempotent
             | astra_turn_types::ToolIdempotency::IdempotentWrite => {
                 tracing::debug!(
                     tool_name = %name,
-                    step_id = %step_id,
-                    tool_index = tool_index,
+                    cache_key = %cache_key,
                     "Exactly-once: cache hit, returning cached result"
                 );
                 Some(astra_tools::ToolResult {
@@ -1295,8 +1284,7 @@ impl ServerToolExecutor {
             astra_turn_types::ToolIdempotency::PureRead => {
                 tracing::debug!(
                     tool_name = %name,
-                    step_id = %step_id,
-                    tool_index = tool_index,
+                    cache_key = %cache_key,
                     "Exactly-once: cache hit for PureRead (AlwaysCache policy)"
                 );
                 Some(astra_tools::ToolResult {
@@ -1315,9 +1303,8 @@ impl ServerToolExecutor {
         name: &str,
         args: &Value,
         result: &astra_tools::ToolResult,
-        tool_index: Option<u32>,
     ) {
-        use astra_pipeline::step_protocol::{CachedToolResult, IdempotencyKey};
+        use astra_pipeline::step_protocol::CachedToolResult;
         use std::time::{SystemTime, UNIX_EPOCH};
 
         if result.is_error {
@@ -1328,15 +1315,12 @@ impl ServerToolExecutor {
             return;
         }
 
-        let Some(tool_index) = tool_index else {
-            return;
-        };
         let Some(executor_mutex) = self.exactly_once_executor.as_ref() else {
             return;
         };
 
-        let step_id = self.session_id.clone();
-        let key = IdempotencyKey::new(&step_id, tool_index, name, args);
+        let key = Self::exactly_once_key(name, args);
+        let cache_key = key.cache_key();
 
         let mut executor = match executor_mutex.lock() {
             Ok(executor) => executor,
@@ -1369,8 +1353,7 @@ impl ServerToolExecutor {
 
         tracing::debug!(
             tool_name = %name,
-            step_id = %step_id,
-            tool_index = tool_index,
+            cache_key = %cache_key,
             "Exactly-once: recorded successful tool result in cache"
         );
     }
@@ -1569,6 +1552,11 @@ impl ServerToolExecutor {
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
         )
+    }
+
+    fn exactly_once_key(name: &str, args: &Value) -> astra_pipeline::step_protocol::IdempotencyKey {
+        let public_args = Self::public_tool_arguments(args);
+        astra_pipeline::step_protocol::IdempotencyKey::semantic(name, &public_args)
     }
 
     fn try_emit_work_surface_event(&self, mut event: Map<String, Value>, unavailable_label: &str) {
@@ -2582,8 +2570,7 @@ impl ServerToolExecutor {
         }
 
         // ── Exactly-once: check cache before execution ──────────────
-        let exactly_once_tool_index = self.reserve_exactly_once_tool_index();
-        if let Some(cached) = self.check_exactly_once_cache(name, args, exactly_once_tool_index) {
+        if let Some(cached) = self.check_exactly_once_cache(name, args) {
             return cached;
         }
 
@@ -2971,7 +2958,7 @@ impl ServerToolExecutor {
                 .await;
         }
         // ── Exactly-once: record result in cache ────────────────────
-        self.record_exactly_once_result(name, args, &result, exactly_once_tool_index);
+        self.record_exactly_once_result(name, args, &result);
 
         result
     }
@@ -6278,15 +6265,25 @@ esac
     }
 
     #[tokio::test]
-    async fn exactly_once_cache_hit_consumes_tool_index_before_next_record() {
+    async fn exactly_once_cache_ignores_internal_tool_metadata() {
         use astra_pipeline::step_protocol::{CachedToolResult, IdempotencyKey};
 
         let (mut exec, _dir) = test_executor();
         exec.enable_exactly_once();
 
-        let first_args = json!({"action": "create", "title": "cached first"});
-        let second_args = json!({"action": "create", "title": "live second"});
-        let first_key = IdempotencyKey::new("test-session", 0, "task", &first_args);
+        let public_first_args = json!({"action": "create", "title": "cached first"});
+        let replay_first_args = json!({
+            "action": "create",
+            "title": "cached first",
+            "_tool_call_id": "call-replayed",
+            "_run_id": "run-replayed"
+        });
+        let second_args = json!({
+            "action": "create",
+            "title": "live second",
+            "_tool_call_id": "call-live"
+        });
+        let first_key = IdempotencyKey::semantic("task", &public_first_args);
         {
             let executor = exec
                 .exactly_once_executor
@@ -6318,7 +6315,9 @@ esac
             );
         }
 
-        let first = exec.execute_local_with_metadata("task", &first_args).await;
+        let first = exec
+            .execute_local_with_metadata("task", &replay_first_args)
+            .await;
         assert_eq!(first.output, "cached-first");
 
         let second = exec.execute_local_with_metadata("task", &second_args).await;
@@ -6327,8 +6326,8 @@ esac
             "second tool should execute normally: {second:?}"
         );
 
-        let second_key = IdempotencyKey::new("test-session", 1, "task", &second_args);
-        let stale_second_key = IdempotencyKey::new("test-session", 0, "task", &second_args);
+        let second_key =
+            IdempotencyKey::semantic("task", &json!({"action": "create", "title": "live second"}));
         let executor = exec
             .exactly_once_executor
             .as_ref()
@@ -6337,11 +6336,7 @@ esac
             .expect("exactly-once lock");
         assert!(
             executor.cache().check(&second_key).is_some(),
-            "cache hit for the first tool must advance the index before the second record"
-        );
-        assert!(
-            executor.cache().check(&stale_second_key).is_none(),
-            "second tool must not be recorded under the already-consumed index 0"
+            "live tool should be recorded under sanitized semantic args"
         );
     }
 
@@ -6359,9 +6354,9 @@ esac
             metadata: None,
             exit_semantics: None,
         };
-        exec.record_exactly_once_result("bash", &args, &result, Some(0));
+        exec.record_exactly_once_result("bash", &args, &result);
 
-        let key = IdempotencyKey::new("test-session", 0, "bash", &args);
+        let key = IdempotencyKey::semantic("bash", &args);
         let executor = exec
             .exactly_once_executor
             .as_ref()

@@ -1385,7 +1385,7 @@ pub struct StepEvent {
 /// in-memory is just a view/cache.
 pub trait StepEventStore {
     /// Append event to the store
-    fn append(&mut self, event: StepEvent);
+    fn append(&mut self, event: StepEvent) -> std::io::Result<()>;
     /// Query events for a step (ordered by created_at)
     fn events_for_step(&self, step_id: &str) -> Vec<&StepEvent>;
     /// Find all ancestors (BFS up the caused_by DAG)
@@ -2264,7 +2264,7 @@ mod tests {
     fn event_store_trait_append_and_len() {
         use crate::step_checkpoint::FileBackedEventStore;
         let mut store = FileBackedEventStore::empty("test-trait");
-        <FileBackedEventStore as StepEventStore>::append(
+        let _ = <FileBackedEventStore as StepEventStore>::append(
             &mut store,
             StepEvent {
                 event_id: "e1".into(),
@@ -2284,7 +2284,7 @@ mod tests {
     fn event_store_events_for_step() {
         use crate::step_checkpoint::FileBackedEventStore;
         let mut store = FileBackedEventStore::empty("test-events-for-step");
-        store.append(StepEvent {
+        let _ = store.append(StepEvent {
             event_id: "e1".into(),
             canonical_event_id: None,
             step_id: "s1".into(),
@@ -2294,7 +2294,7 @@ mod tests {
             payload: None,
             created_at: 100,
         });
-        store.append(StepEvent {
+        let _ = store.append(StepEvent {
             event_id: "e2".into(),
             canonical_event_id: None,
             step_id: "s2".into(),
@@ -2304,7 +2304,7 @@ mod tests {
             payload: None,
             created_at: 200,
         });
-        store.append(StepEvent {
+        let _ = store.append(StepEvent {
             event_id: "e3".into(),
             canonical_event_id: None,
             step_id: "s1".into(),
@@ -2324,7 +2324,7 @@ mod tests {
     fn event_store_single_parent_chain() {
         use crate::step_checkpoint::FileBackedEventStore;
         let mut store = FileBackedEventStore::empty("test-chain");
-        store.append(StepEvent {
+        let _ = store.append(StepEvent {
             event_id: "e1".into(),
             canonical_event_id: None,
             step_id: "s1".into(),
@@ -2334,7 +2334,7 @@ mod tests {
             payload: None,
             created_at: 100,
         });
-        store.append(StepEvent {
+        let _ = store.append(StepEvent {
             event_id: "e2".into(),
             canonical_event_id: None,
             step_id: "s1".into(),
@@ -2344,7 +2344,7 @@ mod tests {
             payload: None,
             created_at: 200,
         });
-        store.append(StepEvent {
+        let _ = store.append(StepEvent {
             event_id: "e3".into(),
             canonical_event_id: None,
             step_id: "s1".into(),
@@ -2368,7 +2368,7 @@ mod tests {
     fn event_store_multi_parent_convergence() {
         use crate::step_checkpoint::FileBackedEventStore;
         let mut store = FileBackedEventStore::empty("test-convergence");
-        store.append(StepEvent {
+        let _ = store.append(StepEvent {
             event_id: "start".into(),
             canonical_event_id: None,
             step_id: "s1".into(),
@@ -2379,7 +2379,7 @@ mod tests {
             created_at: 100,
         });
         for (i, tool) in ["grep", "read_file", "git_log"].iter().enumerate() {
-            store.append(StepEvent {
+            let _ = store.append(StepEvent {
                 event_id: format!("tool_start_{i}"),
                 canonical_event_id: None,
                 step_id: "s1".into(),
@@ -2391,7 +2391,7 @@ mod tests {
             });
         }
         for i in 0..3 {
-            store.append(StepEvent {
+            let _ = store.append(StepEvent {
                 event_id: format!("tool_done_{i}"),
                 canonical_event_id: None,
                 step_id: "s1".into(),
@@ -2402,7 +2402,7 @@ mod tests {
                 created_at: 400 + i as u64,
             });
         }
-        store.append(StepEvent {
+        let _ = store.append(StepEvent {
             event_id: "converge".into(),
             canonical_event_id: None,
             step_id: "s1".into(),
