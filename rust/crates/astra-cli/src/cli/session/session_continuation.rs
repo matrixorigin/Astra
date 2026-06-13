@@ -164,41 +164,29 @@ fn has_tool_use_content(msg: &serde_json::Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use astra_pipeline::step_protocol::{ExecutionCursor, StepCheckpoint};
     use serde_json::json;
 
     #[test]
     fn load_session_messages_returns_checkpoint_messages() {
         let session_id = format!("test-session-cont-{}", uuid::Uuid::new_v4());
-        let home = dirs::home_dir().unwrap();
-        let cp_dir = home
-            .join(".astra/sessions")
-            .join(&session_id)
-            .join("step_checkpoints");
-        std::fs::create_dir_all(&cp_dir).unwrap();
-
-        let checkpoint_json = r#"{
-            "Heavy": {
-                "light": {
-                    "protocol_version": 1,
-                    "cursor": {"phase": "Done", "slots": [], "parallel": false, "wait_trigger": null, "sub_step": null},
-                    "step_id": "s1",
-                    "task_id": "t1",
-                    "agent_id": "astra-cli",
-                    "progress": 1.0,
-                    "total_tokens": 100,
-                    "created_at": 1700000000
-                },
-                "messages": [
-                    {"role": "user", "content": "Remember: code is ZEBRA-99"},
-                    {"role": "assistant", "content": "OK, noted."}
-                ],
-                "budget_remaining_tokens": 100000,
-                "budget_remaining_rounds": 50,
-                "blocked_tools": [],
-                "recent_tools": []
-            }
-        }"#;
-        std::fs::write(cp_dir.join("000002-heavy.json"), checkpoint_json).unwrap();
+        let mut checkpoint = StepCheckpoint::heavy(
+            "s1".to_string(),
+            "t1".to_string(),
+            "astra-cli".to_string(),
+            ExecutionCursor::default(),
+        );
+        let StepCheckpoint::Heavy(heavy) = &mut checkpoint else {
+            unreachable!("StepCheckpoint::heavy must create a heavy checkpoint");
+        };
+        heavy.messages = vec![
+            json!({"role": "user", "content": "Remember: code is ZEBRA-99"}),
+            json!({"role": "assistant", "content": "OK, noted."}),
+        ];
+        heavy.budget_remaining_tokens = 100000;
+        heavy.budget_remaining_rounds = 50;
+        astra_pipeline::step_checkpoint::write_step_checkpoint(&session_id, 2, &checkpoint)
+            .unwrap();
 
         let messages = super::load_session_messages_for_continuation(&session_id);
 

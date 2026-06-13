@@ -66,6 +66,7 @@ fn is_direct_correction(lower: &str) -> bool {
         "incorrect",
         "actually,",
         "actually i",
+        "wait, hold on",
         "instead,",
         "forget that",
         "ignore that",

@@ -932,25 +932,25 @@ mod chat_stream_turnguard_e2e {
 
     // ── Tool health scenarios ──
 
-    /// Tool deprioritized after 3 errors → shows up in avoid_tools AND restricted_tools.
+    /// Mutating tool deprioritized after 3 errors → shows up in avoid_tools AND restricted_tools.
     #[test]
     fn tool_deprioritization_propagates_to_restricted() {
         let mut guard = TurnGuard::new();
         let mut restricted = HashSet::new();
 
-        guard.record_tool_result("mo_query", "Error: connection refused");
-        guard.record_tool_result("mo_query", "Error: connection refused");
-        guard.record_tool_result("mo_query", "Error: connection refused");
+        guard.record_tool_result("mo_snapshot", "Error: connection refused");
+        guard.record_tool_result("mo_snapshot", "Error: connection refused");
+        guard.record_tool_result("mo_snapshot", "Error: connection refused");
 
-        assert!(guard.health.is_deprioritized("mo_query"));
+        assert!(guard.health.is_deprioritized("mo_snapshot"));
 
         let v = guard.evaluate();
-        assert!(v.avoid_tools.contains(&"mo_query".to_string()));
+        assert!(v.avoid_tools.contains(&"mo_snapshot".to_string()));
 
         // Apply verdict
         apply_verdict(&v, 25, &mut restricted);
         assert!(
-            restricted.contains("mo_query"),
+            restricted.contains("mo_snapshot"),
             "deprioritized tool must land in restricted_tools"
         );
     }
@@ -978,7 +978,7 @@ mod chat_stream_turnguard_e2e {
     }
 
     #[test]
-    fn repeated_identical_cache_signature_propagates_to_restricted() {
+    fn repeated_identical_cache_signature_is_guidance_only() {
         let mut guard = TurnGuard::new();
         let mut restricted = HashSet::new();
 
@@ -987,12 +987,20 @@ mod chat_stream_turnguard_e2e {
         }
 
         let v = guard.evaluate();
-        assert!(v.avoid_tools.contains(&"read_file".to_string()));
+        assert_eq!(v.severity, VerdictSeverity::Info);
+        assert!(
+            !v.injections.is_empty(),
+            "repeated identical cached signature should still emit guidance"
+        );
+        assert!(
+            !v.avoid_tools.contains(&"read_file".to_string()),
+            "cache guidance should not hide read-only observation tools"
+        );
 
         apply_verdict(&v, 25, &mut restricted);
         assert!(
-            restricted.contains("read_file"),
-            "repeated identical cached signature must land in restricted_tools"
+            !restricted.contains("read_file"),
+            "repeated identical cached signature must not land in restricted_tools"
         );
     }
 
@@ -1162,7 +1170,10 @@ mod chat_stream_turnguard_e2e {
             "first Critical → restricted, not force_stop (progressive degradation)"
         );
 
-        // Second consecutive Critical → force_stop
+        // Next failing round is also Critical → force_stop
+        for _ in 0..3 {
+            guard.record_tool_result("t1", "Error: fail");
+        }
         let v2 = guard.evaluate();
         assert!(v2.force_stop, "second consecutive Critical → force_stop");
     }
@@ -1372,17 +1383,20 @@ mod chat_stream_turnguard_e2e {
         apply_verdict(&v, 25, &mut restricted);
         assert!(restricted.contains("bash"));
 
-        // Turn 2: deprioritize grep
+        // Turn 2: deprioritize another restrictable tool
         for _ in 0..3 {
-            guard.record_tool_result("grep", "Error: fail");
+            guard.record_tool_result("write_file", "Error: fail");
         }
         let v = guard.evaluate();
         apply_verdict(&v, 25, &mut restricted);
-        assert!(restricted.contains("grep"));
+        assert!(restricted.contains("write_file"));
 
         // Both should be in restricted
         assert!(restricted.contains("bash"), "bash still restricted");
-        assert!(restricted.contains("grep"), "grep also restricted");
+        assert!(
+            restricted.contains("write_file"),
+            "write_file also restricted"
+        );
     }
 
     /// Verdict with empty injections and Healthy severity → skip in chat_stream
@@ -1646,10 +1660,11 @@ mod chat_stream_turnguard_e2e {
         // Evaluate without any new activity — should still reflect health state
         let v = guard.evaluate();
 
-        // Both should be in avoid_tools
+        // Mutating unhealthy tools should be in avoid_tools; read-only
+        // observation tools stay visible even when their health is poor.
         assert!(
-            v.avoid_tools.contains(&"mo_query".to_string()),
-            "83% failure tool should be avoided: {:?}",
+            !v.avoid_tools.contains(&"mo_query".to_string()),
+            "read-only mo_query should not be avoided: {:?}",
             v.avoid_tools
         );
         assert!(
@@ -1662,7 +1677,7 @@ mod chat_stream_turnguard_e2e {
         let mut restricted = HashSet::new();
         let (_, _, force_stop) = apply_verdict(&v, 20, &mut restricted);
         assert!(!force_stop, "health-only issues should not force stop");
-        assert!(restricted.contains("mo_query"));
+        assert!(!restricted.contains("mo_query"));
         assert!(restricted.contains("mo_snapshot"));
     }
 }

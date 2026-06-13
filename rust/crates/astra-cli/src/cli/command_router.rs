@@ -1195,6 +1195,32 @@ pub(crate) async fn execute_cli_command(
     max_budget: f64,
     cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
+    Box::pin(execute_cli_command_impl(
+        command,
+        profile,
+        global_model,
+        auto_approve,
+        system_prompt,
+        api,
+        no_instructions,
+        max_budget,
+        cli_context,
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_cli_command_impl(
+    command: Option<Command>,
+    profile: Option<String>,
+    global_model: Option<String>,
+    auto_approve: bool,
+    system_prompt: Option<String>,
+    api: &astra_thin_client::ThinClient,
+    no_instructions: bool,
+    max_budget: f64,
+    cli_context: &crate::cli::cli_config::cli_context::CliContext,
+) -> Result<ExitCode, String> {
     match command {
         // No subcommand → interactive TUI (Codex-style default)
         None | Some(Command::Interactive) => {
