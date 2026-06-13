@@ -2846,6 +2846,22 @@ fn is_external_client_event_type(event_type: &str) -> bool {
     EXTERNAL_CLIENT_ALLOWLIST.contains(&event_type)
 }
 
+fn run_error_client_surface(error_kind: &str) -> Option<(&'static str, bool, Option<u64>)> {
+    match error_kind {
+        "rate_limit" => Some(("LLM_RATE_LIMIT", true, Some(5_000))),
+        "server_error" => Some(("SERVER_ERROR", true, Some(2_000))),
+        "stream_idle" | "tool_timeout" => Some(("LLM_TIMEOUT", true, Some(0))),
+        "stream_transport" => Some(("LLM_TRANSPORT_ERROR", true, Some(1_000))),
+        "network" => Some(("LLM_TRANSPORT_ERROR", true, Some(3_000))),
+        "budget_exhausted" => Some(("BUDGET_EXCEEDED", false, None)),
+        "auth" => Some(("AUTH_ERROR", false, None)),
+        "context_window" => Some(("CONTEXT_WINDOW_EXCEEDED", false, None)),
+        "invalid_request" => Some(("LLM_INVALID_REQUEST", false, None)),
+        "cancelled" => Some(("CANCELLED", false, None)),
+        _ => None,
+    }
+}
+
 pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::Value {
     // Already-client-ready shape (`{"type": ..., ...}`): allowlist the
     // `type` value. Drop anything not explicitly safe for external
@@ -3009,6 +3025,11 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 .or_else(|| data.get("message"))
                 .cloned()
                 .unwrap_or(serde_json::Value::String("Unknown error".to_string()));
+            let surface = data
+                .get("error_kind")
+                .and_then(serde_json::Value::as_str)
+                .and_then(run_error_client_surface);
+            let code = surface.map_or("RUN_ERROR", |(code, _, _)| code);
             let mut out = serde_json::Map::from_iter([
                 (
                     "type".to_string(),
@@ -3018,9 +3039,18 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 ("error".to_string(), message),
                 (
                     "code".to_string(),
-                    serde_json::Value::String("RUN_ERROR".to_string()),
+                    serde_json::Value::String(code.to_string()),
                 ),
             ]);
+            if let Some((_, retryable, retry_after_ms)) = surface {
+                out.insert("retryable".to_string(), serde_json::Value::Bool(retryable));
+                if let Some(retry_after_ms) = retry_after_ms {
+                    out.insert(
+                        "retry_after_ms".to_string(),
+                        serde_json::Value::from(retry_after_ms),
+                    );
+                }
+            }
             for key in ["run_id", "error_kind", "reason", "blocked"] {
                 insert_if_present(&mut out, &data, key);
             }
@@ -3594,6 +3624,28 @@ mod tests {
         assert_eq!(out["message"], "boom");
         assert_eq!(out["error"], "boom");
         assert_eq!(out["code"], "RUN_ERROR");
+    }
+
+    #[test]
+    fn run_error_uses_semantic_client_code_when_error_kind_is_known() {
+        let out = transform_run_event_for_client(make_event(
+            "run_error",
+            json!({"error": "slow down", "error_kind": "rate_limit"}),
+        ));
+        assert_eq!(out["type"], "run_error");
+        assert_eq!(out["message"], "slow down");
+        assert_eq!(out["error_kind"], "rate_limit");
+        assert_eq!(out["code"], "LLM_RATE_LIMIT");
+        assert_eq!(out["retryable"], true);
+        assert_eq!(out["retry_after_ms"], 5_000);
+
+        let out = transform_run_event_for_client(make_event(
+            "run_error",
+            json!({"error": "provider 500", "error_kind": "server_error"}),
+        ));
+        assert_eq!(out["code"], "SERVER_ERROR");
+        assert_eq!(out["retryable"], true);
+        assert_eq!(out["retry_after_ms"], 2_000);
     }
 
     #[test]

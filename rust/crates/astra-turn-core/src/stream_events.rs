@@ -41,26 +41,39 @@ pub fn build_runtime_error_event(
                 "MODEL_NOT_AVAILABLE",
                 false,
             ),
-            "budget" => build_stream_error_event(
+            "budget" | "budget_exhausted" => build_stream_error_event(
                 message.as_str().unwrap_or_default(),
                 "BUDGET_EXCEEDED",
                 false,
             ),
+            "auth" => {
+                build_stream_error_event(message.as_str().unwrap_or_default(), "AUTH_ERROR", false)
+            }
             "rate_limit" => build_stream_error_event(
                 message.as_str().unwrap_or_default(),
                 "LLM_RATE_LIMIT",
                 true,
             ),
-            "timeout" => {
+            "timeout" | "stream_idle" | "tool_timeout" => {
                 build_stream_error_event(message.as_str().unwrap_or_default(), "LLM_TIMEOUT", true)
             }
-            "server" => {
+            "server" | "server_error" => {
                 build_stream_error_event(message.as_str().unwrap_or_default(), "SERVER_ERROR", true)
             }
-            "transport" => build_stream_error_event(
+            "transport" | "stream_transport" | "network" => build_stream_error_event(
                 "LLM provider connection failed. Please retry.",
                 "LLM_TRANSPORT_ERROR",
                 true,
+            ),
+            "context_window" => build_stream_error_event(
+                message.as_str().unwrap_or_default(),
+                "CONTEXT_WINDOW_EXCEEDED",
+                false,
+            ),
+            "invalid_request" => build_stream_error_event(
+                message.as_str().unwrap_or_default(),
+                "LLM_INVALID_REQUEST",
+                false,
             ),
             _ => build_stream_error_event(
                 message.as_str().unwrap_or_default(),
@@ -74,10 +87,11 @@ pub fn build_runtime_error_event(
         Some("rate_limit") => {
             event.insert("retry_after_ms".to_string(), Value::from(5000));
         }
-        Some("timeout") | Some("transport") => {
+        Some("timeout" | "stream_idle" | "tool_timeout")
+        | Some("transport" | "stream_transport" | "network") => {
             event.insert("retry_after_ms".to_string(), Value::from(2000));
         }
-        Some("server") => {
+        Some("server" | "server_error") => {
             event.insert("retry_after_ms".to_string(), Value::from(1000));
         }
         _ => {}
@@ -507,6 +521,17 @@ mod tests {
             ev.get("code").and_then(Value::as_str),
             Some("BUDGET_EXCEEDED")
         );
+
+        let ev = build_runtime_error_event(
+            Value::String("exceeded".into()),
+            Some("budget_exhausted"),
+            None,
+            None,
+        );
+        assert_eq!(
+            ev.get("code").and_then(Value::as_str),
+            Some("BUDGET_EXCEEDED")
+        );
     }
 
     #[test]
@@ -557,11 +582,31 @@ mod tests {
                 .contains("connection failed")
         );
         assert_eq!(ev.get("retry_after_ms").and_then(Value::as_i64), Some(2000));
+
+        let ev = build_runtime_error_event(
+            Value::String("ignored".into()),
+            Some("stream_transport"),
+            None,
+            None,
+        );
+        assert_eq!(
+            ev.get("code").and_then(Value::as_str),
+            Some("LLM_TRANSPORT_ERROR")
+        );
     }
 
     #[test]
     fn runtime_error_kind_server_has_retry_after() {
         let ev = build_runtime_error_event(Value::String("500".into()), Some("server"), None, None);
+        assert_eq!(ev.get("code").and_then(Value::as_str), Some("SERVER_ERROR"));
+        assert_eq!(ev.get("retry_after_ms").and_then(Value::as_i64), Some(1000));
+
+        let ev = build_runtime_error_event(
+            Value::String("500".into()),
+            Some("server_error"),
+            None,
+            None,
+        );
         assert_eq!(ev.get("code").and_then(Value::as_str), Some("SERVER_ERROR"));
         assert_eq!(ev.get("retry_after_ms").and_then(Value::as_i64), Some(1000));
     }

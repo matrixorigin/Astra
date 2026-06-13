@@ -1825,8 +1825,8 @@ pub async fn run_server_loop_block_parse_failure_session_artifact_latest_and_dow
         "server-loop SSE should surface the fallback failure text: {body}"
     );
     assert!(
-        body.contains("\"code\":\"RUN_ERROR\""),
-        "server-loop SSE should expose the normalized run error code on fallback failure: {body}"
+        body.contains("\"code\":\"SERVER_ERROR\""),
+        "server-loop SSE should expose the provider server-error code on fallback failure: {body}"
     );
     assert!(
         body.contains("\"status\":\"failed\""),
@@ -1862,6 +1862,10 @@ pub async fn run_server_loop_block_parse_failure_session_artifact_latest_and_dow
     assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
     assert_eq!(latest_j["artifact_kind"].as_str(), Some("llm_capture"));
     assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("error"));
+    assert_eq!(
+        latest_j["content"]["response"]["kind"].as_str(),
+        Some("server_error")
+    );
     assert!(
         latest_j["content"]["response"]["error"]
             .as_str()
@@ -1882,6 +1886,10 @@ pub async fn run_server_loop_block_parse_failure_session_artifact_latest_and_dow
         assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
     let download_j = latest_j.clone();
     assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
+    assert_eq!(
+        download_j["content"]["response"]["kind"].as_str(),
+        Some("server_error")
+    );
     assert!(
         download_j["content"]["response"]["error"]
             .as_str()
@@ -2266,8 +2274,8 @@ pub async fn run_server_loop_transport_failure_session_artifact_latest_and_downl
         "server-loop SSE should surface the transport fallback failure text: {body}"
     );
     assert!(
-        body.contains("\"code\":\"RUN_ERROR\""),
-        "server-loop transport fallback failure should surface a normalized run error: {body}"
+        body.contains("\"code\":\"SERVER_ERROR\""),
+        "server-loop transport fallback failure should surface a provider server-error code: {body}"
     );
     assert!(
         body.contains("\"status\":\"failed\""),
@@ -2571,8 +2579,8 @@ pub async fn run_server_loop_idle_failure_session_artifact_latest_and_download_r
         "server-loop SSE should surface the idle fallback failure text: {body}"
     );
     assert!(
-        body.contains("\"code\":\"RUN_ERROR\""),
-        "server-loop idle fallback failure should surface a normalized run error: {body}"
+        body.contains("\"code\":\"SERVER_ERROR\""),
+        "server-loop idle fallback failure should surface a provider server-error code: {body}"
     );
     assert!(
         body.contains("\"status\":\"failed\""),
@@ -2608,6 +2616,10 @@ pub async fn run_server_loop_idle_failure_session_artifact_latest_and_download_r
     assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
     assert_eq!(latest_j["artifact_kind"].as_str(), Some("llm_capture"));
     assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("error"));
+    assert_eq!(
+        latest_j["content"]["response"]["kind"].as_str(),
+        Some("server_error")
+    );
     assert!(
         latest_j["content"]["response"]["error"]
             .as_str()
@@ -2628,6 +2640,10 @@ pub async fn run_server_loop_idle_failure_session_artifact_latest_and_download_r
         assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
     let download_j = latest_j.clone();
     assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
+    assert_eq!(
+        download_j["content"]["response"]["kind"].as_str(),
+        Some("server_error")
+    );
     assert!(
         download_j["content"]["response"]["error"]
             .as_str()
@@ -2717,8 +2733,8 @@ pub async fn run_server_loop_rate_limit_failure_session_artifact_latest_and_down
         "server-loop SSE should surface the normalized provider rate-limit text after retry exhaustion: {body}"
     );
     assert!(
-        body.contains("\"code\":\"RUN_ERROR\""),
-        "server-loop rate-limit exhaustion should surface a normalized run error: {body}"
+        body.contains("\"code\":\"LLM_RATE_LIMIT\""),
+        "server-loop rate-limit exhaustion should surface a rate-limit client code: {body}"
     );
     assert!(
         body.contains("\"status\":\"failed\""),
@@ -2782,8 +2798,8 @@ pub async fn run_server_loop_rate_limit_failure_session_artifact_latest_and_down
         "follow-up turn should be rejected by local rate-limit cooldown: {cooldown_body}"
     );
     assert!(
-        cooldown_body.contains("\"code\":\"RUN_ERROR\""),
-        "cooldown reject should still surface through the server-loop run lifecycle shape: {cooldown_body}"
+        cooldown_body.contains("\"code\":\"LLM_RATE_LIMIT\""),
+        "cooldown reject should surface the rate-limit client code: {cooldown_body}"
     );
     assert!(
         !cooldown_body.contains("\"type\":\"turn_complete\""),

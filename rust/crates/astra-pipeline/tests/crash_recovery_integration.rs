@@ -57,7 +57,7 @@ fn write_tool_events(session_id: &str, events: &[StepEvent]) {
     use astra_pipeline::step_protocol::StepEventStore;
     let mut store = FileBackedEventStore::empty(session_id);
     for event in events {
-        store.append(event.clone());
+        let _ = store.append(event.clone());
     }
 }
 

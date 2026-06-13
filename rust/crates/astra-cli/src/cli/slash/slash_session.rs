@@ -6509,7 +6509,7 @@ mod resume_tests {
         let idem_key = astra_pipeline::step_protocol::IdempotencyKey::semantic("read_file", &args);
         let mut event_store =
             astra_pipeline::step_checkpoint::FileBackedEventStore::empty(session_id);
-        <astra_pipeline::step_checkpoint::FileBackedEventStore as astra_pipeline::step_protocol::StepEventStore>::append(
+        let _ = <astra_pipeline::step_checkpoint::FileBackedEventStore as astra_pipeline::step_protocol::StepEventStore>::append(
             &mut event_store,
             astra_pipeline::step_protocol::StepEvent {
                 event_id: format!("completed-read-{turn_count}"),

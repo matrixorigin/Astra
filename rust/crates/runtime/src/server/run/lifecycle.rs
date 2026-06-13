@@ -2266,6 +2266,10 @@ fn build_run_turn_complete_event_with_interruption(
     ))
 }
 
+fn should_emit_stream_turn_complete(final_status: &RunStatus) -> bool {
+    matches!(final_status, RunStatus::Completed | RunStatus::Paused)
+}
+
 // ─── Run State ──────────────────────────────────────────────────────────────
 
 /// Status of a single agentic run.
@@ -5878,21 +5882,25 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
             }
 
-            // Emit turn_complete event so clients (HTTP SSE, WebSocket) know the turn is done.
-            let _ = event_tx
-                .send(build_run_turn_complete_event_with_interruption(
-                    state.total_tool_calls,
-                    &state.final_text,
-                    state.interruption.as_ref(),
-                ))
-                .await;
+            // `turn_complete` carries successful assistant reconciliation data.
+            // Failed/cancelled/waiting turns terminate via their run lifecycle
+            // event (`run_error`, `run_finished`, `run_waiting`) instead.
+            if should_emit_stream_turn_complete(&final_status) {
+                let _ = event_tx
+                    .send(build_run_turn_complete_event_with_interruption(
+                        state.total_tool_calls,
+                        &state.final_text,
+                        state.interruption.as_ref(),
+                    ))
+                    .await;
+            }
 
             // Drop event_tx — signals end-of-stream to the HTTP handler.
             drop(event_tx);
 
             // Post-loop memory cleanup — identical to `create_run`. Runs
-            // AFTER event_tx drops so the client sees turn_complete
-            // promptly and doesn't wait on governance RTT.
+            // AFTER event_tx drops so the client sees the terminal event promptly
+            // and doesn't wait on governance RTT.
             post_loop_memory_cleanup(
                 state.current_session_id.as_deref().unwrap_or(""),
                 &state.session_facts,
@@ -8330,6 +8338,17 @@ mod tests {
         assert_eq!(event["type"], "turn_complete");
         assert_eq!(event["has_tool_calls"], true);
         assert!(event.get("assistant_text").is_none());
+    }
+
+    #[test]
+    fn stream_turn_complete_is_only_for_completed_or_paused_turns() {
+        assert!(should_emit_stream_turn_complete(&RunStatus::Completed));
+        assert!(should_emit_stream_turn_complete(&RunStatus::Paused));
+        assert!(!should_emit_stream_turn_complete(&RunStatus::Failed));
+        assert!(!should_emit_stream_turn_complete(&RunStatus::Cancelled));
+        assert!(!should_emit_stream_turn_complete(&RunStatus::Waiting));
+        assert!(!should_emit_stream_turn_complete(&RunStatus::InputQueued));
+        assert!(!should_emit_stream_turn_complete(&RunStatus::Running));
     }
 
     #[test]

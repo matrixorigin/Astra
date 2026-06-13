@@ -1167,16 +1167,17 @@ impl StepRecorder {
     }
 
     fn append_recorded_event(&mut self, event: StepEvent) {
-        if let Some(ref mut fs) = self.file_store
-            && let Err(error) = fs.append(event.clone())
-        {
-            self.record_persistence_error(format!(
-                "failed to persist step event {}: {}",
-                event.event_id, error
-            ));
-            return;
-        }
-        if self.persistence_required {
+        if let Some(ref mut fs) = self.file_store {
+            if let Err(error) = fs.append(event.clone()) {
+                self.record_persistence_error(format!(
+                    "failed to persist step event {}: {}",
+                    event.event_id, error
+                ));
+                if self.persistence_required {
+                    return;
+                }
+            }
+        } else if self.persistence_required {
             self.record_persistence_error(format!(
                 "step-event persistence unavailable; dropping event {}",
                 event.event_id
