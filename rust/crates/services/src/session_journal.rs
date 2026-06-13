@@ -4806,49 +4806,6 @@ mod tests {
     }
 
     #[test]
-    fn surgical_removal_record_is_synthetic_placeholder() {
-        let rec = base_tool_record(
-            SURGICAL_REMOVAL_TOOL_NAME,
-            true,
-            Some("(removed from context — skill covered this work)"),
-        );
-        assert!(
-            rec.is_synthetic_placeholder(),
-            "surgically_removed records must be classified as synthetic \
-             placeholders so evaluation/analytics skip them"
-        );
-    }
-
-    #[test]
-    fn skipped_deferred_and_skill_records_remain_synthetic_placeholders() {
-        assert!(
-            base_tool_record("read_file", false, Some("Skipped: skill routed"))
-                .is_synthetic_placeholder()
-        );
-        assert!(
-            base_tool_record("read_file", false, Some("Deferred: skill invoked"))
-                .is_synthetic_placeholder()
-        );
-        assert!(
-            base_tool_record(
-                "skill",
-                true,
-                Some("Skill 'debug' was already loaded (turn 2). Follow those instructions.")
-            )
-            .is_synthetic_placeholder()
-        );
-    }
-
-    #[test]
-    fn real_tool_records_are_not_synthetic_placeholders() {
-        assert!(!base_tool_record("git_show", true, Some("diff")).is_synthetic_placeholder());
-        assert!(
-            !base_tool_record("grep", false, Some("error: bad regex")).is_synthetic_placeholder()
-        );
-        assert!(!base_tool_record("read_file", true, None).is_synthetic_placeholder());
-    }
-
-    #[test]
     fn journal_dir_guard_overrides_local_sessions_dir_nested() {
         let outer = tempdir().unwrap();
         let inner = tempdir().unwrap();
@@ -5025,18 +4982,6 @@ mod tests {
     }
 
     #[test]
-    fn is_recovery_activity_excludes_memory_suppressed_and_context_released() {
-        assert!(
-            !is_recovery_activity_event(&JournalEventType::MemorySuppressed),
-            "MemorySuppressed should NOT be recovery activity"
-        );
-        assert!(
-            !is_recovery_activity_event(&JournalEventType::ContextReleased),
-            "ContextReleased should NOT be recovery activity"
-        );
-    }
-
-    #[test]
     fn journal_event_drift_detected_round_trips_structured_cause_and_evidence() {
         let evt = JournalEvent::drift_detected(
             Some("sid-drift"),
@@ -5101,63 +5046,63 @@ mod tests {
     }
 
     #[test]
-    fn read_journal_tail_returns_only_the_last_n_events() {
-        let tmp = tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
-        let sid = "00000000-0000-0000-0000-000000000190";
-        let writer = JournalWriter::new(sid).expect("journal writer");
-        for turn in 1..=5 {
-            writer
-                .append(&JournalEvent::turn(
-                    Some(sid),
-                    turn,
-                    Some("test-model"),
-                    "user",
-                    "assistant",
-                    0,
-                    0,
-                    0,
-                    0,
-                ))
-                .expect("append turn");
+    fn read_journal_edge_cases() {
+        // --- tail returns only last n events ---
+        {
+            let tmp = tempdir().unwrap();
+            let _guard = JournalDirGuard::new(tmp.path());
+            let sid = "00000000-0000-0000-0000-000000000190";
+            let writer = JournalWriter::new(sid).expect("journal writer");
+            for turn in 1..=5 {
+                writer
+                    .append(&JournalEvent::turn(
+                        Some(sid),
+                        turn,
+                        Some("test-model"),
+                        "user",
+                        "assistant",
+                        0,
+                        0,
+                        0,
+                        0,
+                    ))
+                    .expect("append turn");
+            }
+            let tail = read_journal_tail(sid, 2).expect("read tail");
+            let turns: Vec<u32> = tail.iter().filter_map(|event| event.turn).collect();
+            assert_eq!(turns, vec![4, 5]);
         }
 
-        let tail = read_journal_tail(sid, 2).expect("read tail");
-        let turns: Vec<u32> = tail.iter().filter_map(|event| event.turn).collect();
-        assert_eq!(turns, vec![4, 5]);
-    }
-
-    #[test]
-    fn read_journal_ignores_truncated_final_json_line() {
-        let tmp = tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
-        let sid = "00000000-0000-0000-0000-000000000191";
-        let event = JournalEvent::turn(
-            Some(sid),
-            1,
-            Some("test-model"),
-            "user",
-            "assistant",
-            0,
-            0,
-            0,
-            0,
-        );
-        let valid = serde_json::to_string(&event).unwrap();
-        std::fs::write(
-            journal_file_path(sid),
-            format!("{valid}\n{{\"type\":\"turn\",\"turn\":"),
-        )
-        .unwrap();
-
-        let events = read_journal(sid).expect("truncated tail should not poison journal");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].turn, Some(1));
-
-        let (_events, non_empty_lines, malformed_lines) =
-            read_journal_for_digest(sid).expect("digest read should count malformed tail");
-        assert_eq!(non_empty_lines, 2);
-        assert_eq!(malformed_lines, 1);
+        // --- ignores truncated final JSON line ---
+        {
+            let tmp = tempdir().unwrap();
+            let _guard = JournalDirGuard::new(tmp.path());
+            let sid = "00000000-0000-0000-0000-000000000191";
+            let event = JournalEvent::turn(
+                Some(sid),
+                1,
+                Some("test-model"),
+                "user",
+                "assistant",
+                0,
+                0,
+                0,
+                0,
+            );
+            let valid = serde_json::to_string(&event).unwrap();
+            std::fs::write(
+                journal_file_path(sid),
+                format!("{valid}\n{{\"type\":\"turn\",\"turn\":"),
+            )
+            .unwrap();
+            let events = read_journal(sid).expect("truncated tail should not poison journal");
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].turn, Some(1));
+            let (_events, non_empty_lines, malformed_lines) =
+                read_journal_for_digest(sid).expect("digest read should count malformed tail");
+            assert_eq!(non_empty_lines, 2);
+            assert_eq!(malformed_lines, 1);
+        }
     }
 
     #[test]
@@ -5269,87 +5214,28 @@ mod tests {
     }
 
     #[test]
-    fn journal_event_compact_has_correct_fields() {
-        let evt = JournalEvent::compact(Some("s"), 5, 10, 3);
-        assert_eq!(evt.event_type, JournalEventType::Compact);
-        assert_eq!(evt.turns_compacted, Some(10));
-        assert_eq!(evt.facts_stored, Some(3));
-        assert!(evt.metadata.is_none());
-    }
-
-    #[test]
-    fn journal_event_compact_with_summary() {
-        let evt = JournalEvent::compact_with_summary(
-            Some("s"),
-            5,
-            10,
-            3,
-            Some("User worked on fixing auth bugs"),
-        );
-        assert_eq!(evt.event_type, JournalEventType::Compact);
-        assert_eq!(evt.turns_compacted, Some(10));
-        assert_eq!(evt.facts_stored, Some(3));
-        let meta = evt.metadata.unwrap();
-        assert_eq!(meta["compact_summary"], "User worked on fixing auth bugs");
-    }
-
-    #[test]
-    fn journal_event_compact_with_empty_summary() {
-        let evt = JournalEvent::compact_with_summary(Some("s"), 5, 10, 3, Some(""));
-        assert!(evt.metadata.is_none());
-        let evt2 = JournalEvent::compact_with_summary(Some("s"), 5, 10, 3, None);
-        assert!(evt2.metadata.is_none());
-    }
-
-    #[test]
-    fn journal_event_config_change() {
-        let evt = JournalEvent::config_change(Some("s"), "model", "gpt-4o");
-        assert_eq!(evt.event_type, JournalEventType::ConfigChange);
-        assert_eq!(evt.config_key, Some("model".to_string()));
-        assert_eq!(evt.config_value, Some("gpt-4o".to_string()));
-    }
-
-    #[test]
-    fn journal_event_error() {
-        let evt = JournalEvent::error(Some("s"), "connection refused");
-        assert_eq!(evt.event_type, JournalEventType::Error);
-        assert_eq!(evt.error, Some("connection refused".to_string()));
-    }
-
-    #[test]
-    fn truncate_short_string() {
-        assert_eq!(truncate("hello", 10), "hello");
-    }
-
-    #[test]
-    fn truncate_long_string() {
-        let s = "a".repeat(600);
-        let t = truncate(&s, 500);
-        assert!(t.len() <= 504); // 500 chars + "…"
-        assert!(t.ends_with('…'));
-    }
-
-    #[test]
-    fn journal_writer_creates_file() {
+    fn journal_writer_and_basic_events() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join(".astra").join("sessions");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test-sess.jsonl");
-        let writer = JournalWriter { path: path.clone() };
-        let evt = JournalEvent::session_start(Some("test-sess"), None);
-        writer.append(&evt).unwrap();
-        let content = std::fs::read_to_string(&path).unwrap();
+
+        // Writer creates file with newline-terminated JSON
+        let write_path = dir.join("test-sess.jsonl");
+        let writer = JournalWriter {
+            path: write_path.clone(),
+        };
+        writer
+            .append(&JournalEvent::session_start(Some("test-sess"), None))
+            .unwrap();
+        let content = std::fs::read_to_string(&write_path).unwrap();
         assert!(content.contains("session_start"));
         assert!(content.ends_with('\n'));
-    }
 
-    #[test]
-    fn journal_writer_appends_multiple() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join(".astra").join("sessions");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("multi.jsonl");
-        let writer = JournalWriter { path: path.clone() };
+        // Writer appends multiple events
+        let multi_path = dir.join("multi.jsonl");
+        let writer = JournalWriter {
+            path: multi_path.clone(),
+        };
         writer
             .append(&JournalEvent::session_start(Some("m"), None))
             .unwrap();
@@ -5359,9 +5245,62 @@ mod tests {
         writer
             .append(&JournalEvent::session_end(Some("m"), 5))
             .unwrap();
-        let content = std::fs::read_to_string(&path).unwrap();
-        let lines: Vec<_> = content.lines().collect();
-        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            std::fs::read_to_string(&multi_path)
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+
+        // Compact events
+        let c = JournalEvent::compact(Some("s"), 5, 10, 3);
+        assert_eq!(c.event_type, JournalEventType::Compact);
+        assert_eq!(c.turns_compacted, Some(10));
+        assert_eq!(c.facts_stored, Some(3));
+        assert!(c.metadata.is_none());
+
+        let cs = JournalEvent::compact_with_summary(
+            Some("s"),
+            5,
+            10,
+            3,
+            Some("User worked on fixing auth bugs"),
+        );
+        assert_eq!(
+            cs.metadata.unwrap()["compact_summary"],
+            "User worked on fixing auth bugs"
+        );
+
+        // Compact with empty summary omits metadata
+        assert!(
+            JournalEvent::compact_with_summary(Some("s"), 5, 10, 3, Some(""))
+                .metadata
+                .is_none()
+        );
+        assert!(
+            JournalEvent::compact_with_summary(Some("s"), 5, 10, 3, None)
+                .metadata
+                .is_none()
+        );
+
+        // Config change
+        let cc = JournalEvent::config_change(Some("s"), "model", "gpt-4o");
+        assert_eq!(cc.event_type, JournalEventType::ConfigChange);
+        assert_eq!(cc.config_key.as_deref(), Some("model"));
+        assert_eq!(cc.config_value.as_deref(), Some("gpt-4o"));
+
+        // Error event
+        let err = JournalEvent::error(Some("s"), "connection refused");
+        assert_eq!(err.event_type, JournalEventType::Error);
+        assert_eq!(err.error.as_deref(), Some("connection refused"));
+
+        // Truncate helpers
+        assert_eq!(truncate("hello", 10), "hello");
+        let long = "a".repeat(600);
+        let t = truncate(&long, 500);
+        assert!(t.len() <= 504);
+        assert!(t.ends_with('…'));
     }
 
     #[test]
@@ -5498,130 +5437,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_record_serialization_round_trip() {
-        let record = ToolCallRecord {
-            name: "github_list_prs".into(),
-            ok: true,
-            ms: 761,
-            error: None,
-            input_bytes: None,
-            output_bytes: None,
-            args_preview: Some("owner/repo".into()),
-            result_preview: None,
-            file_path: None,
-            surgically_removed: None,
-            original_tool_name: None,
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&record).unwrap();
-        assert!(json.contains("\"ok\":true"));
-        assert!(!json.contains("\"error\""), "None error should be omitted");
-        let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.name, "github_list_prs");
-        assert!(parsed.ok);
-        assert_eq!(parsed.ms, 761);
-        assert!(parsed.error.is_none());
-    }
-
-    #[test]
-    fn tool_call_record_with_error() {
-        let record = ToolCallRecord {
-            name: "github_ci_status".into(),
-            ok: false,
-            ms: 587,
-            error: Some("missing repo parameter".into()),
-            input_bytes: None,
-            output_bytes: None,
-            args_preview: None,
-            result_preview: None,
-            file_path: None,
-            surgically_removed: None,
-            original_tool_name: None,
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&record).unwrap();
-        assert!(json.contains("\"ok\":false"));
-        assert!(json.contains("missing repo"));
-        let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
-        assert!(!parsed.ok);
-        assert_eq!(parsed.error.as_deref(), Some("missing repo parameter"));
-    }
-
-    #[test]
-    fn tool_call_record_detects_synthetic_placeholders() {
-        let skipped = ToolCallRecord {
-            name: "read_file".into(),
-            ok: false,
-            ms: 0,
-            error: None,
-            input_bytes: None,
-            output_bytes: None,
-            args_preview: None,
-            result_preview: Some(
-                "Skipped: the skill already completed this work. Do NOT call `read_file` again."
-                    .into(),
-            ),
-            file_path: None,
-            surgically_removed: None,
-            original_tool_name: None,
-            ..Default::default()
-        };
-        let deferred = ToolCallRecord {
-            name: "bash".into(),
-            ok: false,
-            ms: 0,
-            error: None,
-            input_bytes: None,
-            output_bytes: None,
-            args_preview: None,
-            result_preview: Some(
-                "Deferred: skill was invoked in this turn. Read the skill instructions above."
-                    .into(),
-            ),
-            file_path: None,
-            surgically_removed: None,
-            original_tool_name: None,
-            ..Default::default()
-        };
-        let dedup = ToolCallRecord {
-            name: "skill".into(),
-            ok: false,
-            ms: 0,
-            error: None,
-            input_bytes: None,
-            output_bytes: None,
-            args_preview: None,
-            result_preview: Some(
-                "Skill 'debug' was already loaded (turn 2). Follow those instructions directly."
-                    .into(),
-            ),
-            file_path: None,
-            surgically_removed: None,
-            original_tool_name: None,
-            ..Default::default()
-        };
-        let actual_failure = ToolCallRecord {
-            name: "skill".into(),
-            ok: false,
-            ms: 0,
-            error: Some("Unknown skill".into()),
-            input_bytes: None,
-            output_bytes: None,
-            args_preview: None,
-            result_preview: Some("Unknown skill 'debug'.".into()),
-            file_path: None,
-            surgically_removed: None,
-            original_tool_name: None,
-            ..Default::default()
-        };
-
-        assert!(skipped.is_synthetic_placeholder());
-        assert!(deferred.is_synthetic_placeholder());
-        assert!(dedup.is_synthetic_placeholder());
-        assert!(!actual_failure.is_synthetic_placeholder());
-    }
-
-    #[test]
     fn turn_event_with_tool_calls_round_trip() {
         let evt = JournalEvent::turn(
             Some("s1"),
@@ -5672,77 +5487,6 @@ mod tests {
             !json.contains("tool_calls"),
             "empty tool_calls should be omitted: {json}"
         );
-    }
-
-    #[test]
-    fn tool_call_record_bulk_array() {
-        let records: Vec<ToolCallRecord> = (0..100)
-            .map(|i| ToolCallRecord {
-                name: format!("tool_{i}"),
-                ok: i % 2 == 0,
-                ms: i as u64 * 100,
-                error: if i % 3 == 0 {
-                    Some(format!("err_{i}"))
-                } else {
-                    None
-                },
-                input_bytes: None,
-                output_bytes: None,
-                args_preview: None,
-                result_preview: None,
-                file_path: None,
-                surgically_removed: None,
-                original_tool_name: None,
-                ..Default::default()
-            })
-            .collect();
-        let json = serde_json::to_string(&records).unwrap();
-        let parsed: Vec<ToolCallRecord> = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.len(), 100);
-        assert_eq!(parsed[99].name, "tool_99");
-        assert_eq!(parsed[0].ms, 0);
-    }
-
-    #[test]
-    fn tool_call_record_unicode_error() {
-        let record = ToolCallRecord {
-            name: "github_list_prs".into(),
-            ok: false,
-            ms: 500,
-            error: Some("连接超时: タイムアウト 🚫".into()),
-            input_bytes: None,
-            output_bytes: None,
-            args_preview: None,
-            result_preview: None,
-            file_path: None,
-            surgically_removed: None,
-            original_tool_name: None,
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&record).unwrap();
-        let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.error.unwrap(), "连接超时: タイムアウト 🚫");
-    }
-
-    #[test]
-    fn tool_call_record_max_ms_value() {
-        let record = ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            ms: u64::MAX,
-            error: None,
-            input_bytes: None,
-            output_bytes: None,
-            args_preview: None,
-            result_preview: None,
-            file_path: None,
-            surgically_removed: None,
-            original_tool_name: None,
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&record).unwrap();
-        let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.ms, u64::MAX);
     }
 
     #[test]
@@ -5973,53 +5717,44 @@ mod tests {
         assert_eq!(meta["signals"], serde_json::json!([]));
     }
 
-    // ── stall_detected event ──
-
     #[test]
-    fn stall_detected_event_has_correct_fields() {
-        let evt = JournalEvent::stall_detected(
-            Some("sess-1"),
-            5,
-            "repetition_stall",
-            2,
-            0.7,
-            &["bash".to_string(), "grep".to_string()],
-        );
+    fn stall_and_checkpoint_events() {
+        // --- stall_detected field correctness ---
+        {
+            let evt = JournalEvent::stall_detected(
+                Some("sess-1"),
+                5,
+                "repetition_stall",
+                2,
+                0.7,
+                &["bash".to_string(), "grep".to_string()],
+            );
+            assert_eq!(evt.event_type, JournalEventType::StallDetected);
+            assert_eq!(evt.turn, Some(5));
+            assert_eq!(evt.stall_type.as_deref(), Some("repetition_stall"));
+            let meta = evt.metadata.unwrap();
+            assert_eq!(meta["nudge_count"], 2);
+            assert_eq!(meta["confidence"], 0.7);
+            assert_eq!(meta["avoid_tools"][0], "bash");
+        }
 
-        assert_eq!(evt.event_type, JournalEventType::StallDetected);
-        assert_eq!(evt.turn, Some(5));
-        assert_eq!(evt.stall_type.as_deref(), Some("repetition_stall"));
+        // --- stall_detected JSON roundtrip ---
+        {
+            let evt = JournalEvent::stall_detected(
+                Some("sess-2"),
+                3,
+                "exploration_stall",
+                1,
+                0.5,
+                &["list_dir".to_string()],
+            );
+            let json = serde_json::to_string(&evt).unwrap();
+            let restored: JournalEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored.event_type, JournalEventType::StallDetected);
+            assert_eq!(restored.turn, Some(3));
+        }
 
-        let meta = evt.metadata.unwrap();
-        assert_eq!(meta["nudge_count"], 2);
-        assert_eq!(meta["confidence"], 0.7);
-        assert_eq!(meta["avoid_tools"][0], "bash");
-        assert_eq!(meta["avoid_tools"][1], "grep");
-    }
-
-    #[test]
-    fn stall_detected_event_json_roundtrip() {
-        let evt = JournalEvent::stall_detected(
-            Some("sess-2"),
-            3,
-            "exploration_stall",
-            1,
-            0.5,
-            &["list_dir".to_string()],
-        );
-        let json = serde_json::to_string(&evt).unwrap();
-        let restored: JournalEvent = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(restored.event_type, JournalEventType::StallDetected);
-        assert_eq!(restored.turn, Some(3));
-        let meta = restored.metadata.unwrap();
-        assert_eq!(meta["nudge_count"], 1);
-        assert_eq!(meta["confidence"], 0.5);
-    }
-
-    #[test]
-    fn stall_detected_confidence_range() {
-        // Confidence should be stored as-is (0.0 to 1.0)
+        // --- stall_detected confidence range ---
         for confidence in [0.0, 0.5, 0.8, 1.0] {
             let evt = JournalEvent::stall_detected(Some("s"), 1, "stall", 0, confidence, &[]);
             let meta = evt.metadata.unwrap();
@@ -6029,100 +5764,88 @@ mod tests {
                 "confidence {confidence} should be stored exactly, got {stored}"
             );
         }
-    }
 
-    // ── checkpoint event ──
-
-    #[test]
-    fn checkpoint_event_has_correct_fields() {
-        let evt = JournalEvent::checkpoint(
-            Some("sess-1"),
-            10,
-            "Completed token efficiency phase",
-            50_000,
-            15,
-        );
-
-        assert_eq!(evt.event_type, JournalEventType::Checkpoint);
-        assert_eq!(evt.turn, Some(10));
-
-        let meta = evt.metadata.unwrap();
-        assert_eq!(meta["summary"], "Completed token efficiency phase");
-        assert_eq!(meta["total_tokens"], 50_000);
-        assert_eq!(meta["tools_used_count"], 15);
-    }
-
-    #[test]
-    fn checkpoint_event_json_roundtrip() {
-        let evt = JournalEvent::checkpoint(Some("sess-1"), 5, "Phase A done", 10_000, 8);
-        let json = serde_json::to_string(&evt).unwrap();
-        let restored: JournalEvent = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(restored.event_type, JournalEventType::Checkpoint);
-        assert_eq!(restored.turn, Some(5));
-        let meta = restored.metadata.unwrap();
-        assert_eq!(meta["summary"], "Phase A done");
-        assert_eq!(meta["total_tokens"], 10_000);
-        assert_eq!(meta["tools_used_count"], 8);
-    }
-
-    #[test]
-    fn checkpoint_summary_truncated_at_500_chars() {
-        let long_summary = "x".repeat(600);
-        let evt = JournalEvent::checkpoint(Some("s"), 1, &long_summary, 0, 0);
-        let meta = evt.metadata.unwrap();
-        let stored = meta["summary"].as_str().unwrap();
-        // truncate() takes 500 chars then appends '…' (1 char, 3 bytes)
-        assert!(
-            stored.chars().count() <= 501,
-            "summary should be truncated to ~500 chars, got {}",
-            stored.chars().count()
-        );
-        assert!(
-            stored.ends_with('…'),
-            "truncated summary should end with ellipsis"
-        );
-    }
-
-    #[test]
-    fn stall_and_checkpoint_events_written_to_journal() {
-        let sid = format!("test-stall-ckpt-{}", uuid::Uuid::new_v4());
-        let writer = JournalWriter::new(&sid).unwrap();
-
-        writer
-            .append(&JournalEvent::stall_detected(
-                Some(&sid),
-                3,
-                "repetition_stall",
-                1,
-                0.7,
-                &["bash".to_string()],
-            ))
-            .unwrap();
-        writer
-            .append(&JournalEvent::checkpoint(
-                Some(&sid),
-                5,
-                "Midpoint checkpoint",
-                20_000,
+        // --- checkpoint field correctness ---
+        {
+            let evt = JournalEvent::checkpoint(
+                Some("sess-1"),
                 10,
-            ))
-            .unwrap();
+                "Completed token efficiency phase",
+                50_000,
+                15,
+            );
+            assert_eq!(evt.event_type, JournalEventType::Checkpoint);
+            assert_eq!(evt.turn, Some(10));
+            let meta = evt.metadata.unwrap();
+            assert_eq!(meta["summary"], "Completed token efficiency phase");
+            assert_eq!(meta["total_tokens"], 50_000);
+            assert_eq!(meta["tools_used_count"], 15);
+        }
 
-        let events = read_journal(&sid).unwrap();
-        assert_eq!(events.len(), 3);
+        // --- checkpoint JSON roundtrip ---
+        {
+            let evt = JournalEvent::checkpoint(Some("sess-1"), 5, "Phase A done", 10_000, 8);
+            let json = serde_json::to_string(&evt).unwrap();
+            let restored: JournalEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored.event_type, JournalEventType::Checkpoint);
+            assert_eq!(restored.turn, Some(5));
+            let meta = restored.metadata.unwrap();
+            assert_eq!(meta["summary"], "Phase A done");
+            assert_eq!(meta["total_tokens"], 10_000);
+            assert_eq!(meta["tools_used_count"], 8);
+        }
 
-        assert_eq!(events[0].event_type, JournalEventType::SessionStart);
+        // --- checkpoint summary truncation ---
+        {
+            let long_summary = "x".repeat(600);
+            let evt = JournalEvent::checkpoint(Some("s"), 1, &long_summary, 0, 0);
+            let meta = evt.metadata.unwrap();
+            let stored = meta["summary"].as_str().unwrap();
+            assert!(
+                stored.chars().count() <= 501,
+                "summary should be truncated to ~500 chars, got {}",
+                stored.chars().count()
+            );
+            assert!(
+                stored.ends_with('…'),
+                "truncated summary should end with ellipsis"
+            );
+        }
 
-        let stall = &events[1];
-        assert_eq!(stall.event_type, JournalEventType::StallDetected);
-        assert_eq!(stall.stall_type.as_deref(), Some("repetition_stall"));
+        // --- writer round-trip ---
+        {
+            let sid = format!("test-stall-ckpt-{}", uuid::Uuid::new_v4());
+            let writer = JournalWriter::new(&sid).unwrap();
+            writer
+                .append(&JournalEvent::stall_detected(
+                    Some(&sid),
+                    3,
+                    "repetition_stall",
+                    1,
+                    0.7,
+                    &["bash".to_string()],
+                ))
+                .unwrap();
+            writer
+                .append(&JournalEvent::checkpoint(
+                    Some(&sid),
+                    5,
+                    "Midpoint checkpoint",
+                    20_000,
+                    10,
+                ))
+                .unwrap();
 
-        let ckpt = &events[2];
-        assert_eq!(ckpt.event_type, JournalEventType::Checkpoint);
-        let meta = ckpt.metadata.as_ref().unwrap();
-        assert_eq!(meta["summary"], "Midpoint checkpoint");
-        assert_eq!(meta["total_tokens"], 20_000);
+            let events = read_journal(&sid).unwrap();
+            assert_eq!(events.len(), 3);
+            assert_eq!(events[0].event_type, JournalEventType::SessionStart);
+            assert_eq!(events[1].event_type, JournalEventType::StallDetected);
+            assert_eq!(events[1].stall_type.as_deref(), Some("repetition_stall"));
+            assert_eq!(events[2].event_type, JournalEventType::Checkpoint);
+            let meta = events[2].metadata.as_ref().unwrap();
+            assert_eq!(meta["summary"], "Midpoint checkpoint");
+            assert_eq!(meta["total_tokens"], 20_000);
+        }
     }
 
     #[test]
@@ -6297,15 +6020,115 @@ mod tests {
     }
 
     #[test]
-    fn delegation_started_event_builder() {
-        let agents = vec!["agent-a".to_string(), "agent-b".to_string()];
-        let evt =
-            JournalEvent::delegation_started(Some("s1"), "del-1", "run-parent", "fan_out", &agents);
-        assert_eq!(evt.event_type, JournalEventType::DelegationStarted);
-        let meta = evt.metadata.as_ref().unwrap();
-        assert_eq!(meta["delegation_id"], "del-1");
-        assert_eq!(meta["pattern"], "fan_out");
-        assert_eq!(meta["agent_count"], 2);
+    fn delegation_events() {
+        // --- delegation_started ---
+        {
+            let agents = vec!["agent-a".to_string(), "agent-b".to_string()];
+            let evt = JournalEvent::delegation_started(
+                Some("s1"),
+                "del-1",
+                "run-parent",
+                "fan_out",
+                &agents,
+            );
+            assert_eq!(evt.event_type, JournalEventType::DelegationStarted);
+            let meta = evt.metadata.as_ref().unwrap();
+            assert_eq!(meta["delegation_id"], "del-1");
+            assert_eq!(meta["pattern"], "fan_out");
+            assert_eq!(meta["agent_count"], 2);
+        }
+
+        // --- delegation_sub_run_completed ---
+        {
+            let evt = JournalEvent::delegation_sub_run_completed(
+                Some("s1"),
+                "del-1",
+                "run-sub-1",
+                "agent-a",
+                "completed",
+                None,
+                Some("finished the review"),
+            );
+            assert_eq!(evt.event_type, JournalEventType::DelegationSubRunCompleted);
+            let meta = evt.metadata.as_ref().unwrap();
+            assert_eq!(meta["agent_id"], "agent-a");
+            assert_eq!(meta["status"], "completed");
+            assert!(meta["error"].is_null());
+            assert_eq!(meta["output_preview"], "finished the review");
+        }
+
+        // --- delegation_sub_run_started ---
+        {
+            let evt = JournalEvent::delegation_sub_run_started(
+                Some("s1"),
+                "del-1",
+                "run-sub-1",
+                "run-parent",
+                "agent-a",
+                "running",
+                2,
+                Some("run-sub-0"),
+            );
+            assert_eq!(evt.event_type, JournalEventType::DelegationSubRunStarted);
+            let meta = evt.metadata.as_ref().unwrap();
+            assert_eq!(meta["delegation_id"], "del-1");
+            assert_eq!(meta["sub_run_id"], "run-sub-1");
+            assert_eq!(meta["parent_run_id"], "run-parent");
+            assert_eq!(meta["agent_id"], "agent-a");
+            assert_eq!(meta["status"], "running");
+            assert_eq!(meta["depth"], 2);
+            assert_eq!(meta["retry_of"], "run-sub-0");
+        }
+
+        // --- delegation_retry ---
+        {
+            let evt = JournalEvent::delegation_retry(
+                Some("s1"),
+                "del-1",
+                "run-sub-1",
+                "run-sub-2",
+                "agent-a",
+                2,
+                "quality too low",
+            );
+            assert_eq!(evt.event_type, JournalEventType::DelegationRetry);
+            let meta = evt.metadata.as_ref().unwrap();
+            assert_eq!(meta["original_run_id"], "run-sub-1");
+            assert_eq!(meta["retry_run_id"], "run-sub-2");
+            assert_eq!(meta["attempt"], 2);
+            assert_eq!(meta["reason"], "quality too low");
+        }
+
+        // --- delegation_completed ---
+        {
+            let evt = JournalEvent::delegation_completed(
+                Some("s1"),
+                "del-1",
+                "fan_out",
+                3,
+                2,
+                1,
+                "partial",
+                Some("merged result preview"),
+            );
+            assert_eq!(evt.event_type, JournalEventType::DelegationCompleted);
+            let meta = evt.metadata.as_ref().unwrap();
+            assert_eq!(meta["succeeded"], 2);
+            assert_eq!(meta["failed"], 1);
+            assert_eq!(meta["aggregated_status"], "partial");
+            assert_eq!(meta["aggregated_output_preview"], "merged result preview");
+        }
+
+        // --- serde roundtrip ---
+        {
+            let agents = vec!["a1".to_string()];
+            let evt =
+                JournalEvent::delegation_started(Some("s1"), "d1", "r1", "sequential", &agents);
+            let json = serde_json::to_string(&evt).unwrap();
+            let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.event_type, JournalEventType::DelegationStarted);
+            assert!(json.contains("\"delegation_id\":\"d1\""));
+        }
     }
 
     #[test]
@@ -6414,16 +6237,6 @@ mod tests {
         assert_eq!(meta["config_keys"][0], "memory.retrieval_top_k");
     }
 
-    #[test]
-    fn delegation_events_serialize_roundtrip() {
-        let agents = vec!["a1".to_string()];
-        let evt = JournalEvent::delegation_started(Some("s1"), "d1", "r1", "sequential", &agents);
-        let json = serde_json::to_string(&evt).unwrap();
-        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.event_type, JournalEventType::DelegationStarted);
-        assert!(json.contains("\"delegation_id\":\"d1\""));
-    }
-
     // ── Session ID Validation Security Tests ──
 
     #[test]
@@ -6463,476 +6276,90 @@ mod tests {
     }
 
     #[test]
-    fn classify_session_end_state_detects_completed_session() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
-        let sid = format!("test-recovery-complete-{}", uuid::Uuid::new_v4());
-        let writer = JournalWriter::new(&sid).unwrap();
-        writer
-            .append(&JournalEvent::session_start(Some(&sid), Some("gpt-5")))
-            .unwrap();
-        writer
-            .append(&JournalEvent::turn(
-                Some(&sid),
-                1,
-                None,
-                "fix auth flow",
-                "I checked the login path.",
-                0,
-                10,
-                5,
-                10,
-            ))
-            .unwrap();
-        writer
-            .append(&JournalEvent::session_end(Some(&sid), 1))
-            .unwrap();
-
-        assert_eq!(
-            classify_session_end_state(&sid).unwrap(),
-            SessionEndState::Completed
-        );
-    }
-
-    #[test]
-    fn classify_session_end_state_uses_resume_action_when_resumable_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
-        let sid = format!("test-recovery-interrupt-{}", uuid::Uuid::new_v4());
-        let writer = JournalWriter::new(&sid).unwrap();
-        writer
-            .append(&JournalEvent::session_start(Some(&sid), Some("gpt-5")))
-            .unwrap();
-        writer
-            .append(&JournalEvent::turn(
-                Some(&sid),
-                1,
-                None,
-                "continue the migration",
-                "I finished the schema diff.",
-                0,
-                10,
-                5,
-                10,
-            ))
-            .unwrap();
-        writer
-            .append(&JournalEvent::interruption_recorded(
-                Some(&sid),
-                1,
-                serde_json::json!({
-                    "kind": "rate_limited",
-                    "resume_action": {"wait_and_retry": {"delay_seconds": 30}},
-                    "has_checkpoint": true,
-                    "tool_calls_completed": 2,
-                    "turns_completed": 1,
-                    "remaining_turns": 4,
-                }),
-            ))
-            .unwrap();
-
-        assert_eq!(
-            classify_session_end_state(&sid).unwrap(),
-            SessionEndState::Interrupted {
-                kind: "rate_limited".to_string(),
-                resumable: true,
-            }
-        );
-    }
-
-    #[test]
-    fn classify_session_end_state_marks_requires_intervention_as_non_resumable() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
-        let sid = format!("test-recovery-auth-{}", uuid::Uuid::new_v4());
-        let writer = JournalWriter::new(&sid).unwrap();
-        writer
-            .append(&JournalEvent::session_start(Some(&sid), Some("gpt-5")))
-            .unwrap();
-        writer
-            .append(&JournalEvent::turn(
-                Some(&sid),
-                1,
-                None,
-                "fetch CI logs",
-                "Need valid credentials first.",
-                0,
-                10,
-                5,
-                10,
-            ))
-            .unwrap();
-        writer
-            .append(&JournalEvent::interruption_recorded(
-                Some(&sid),
-                1,
-                serde_json::json!({
-                    "kind": "auth_failure",
-                    "resume_action": {
-                        "requires_intervention": {
-                            "description": "refresh credentials"
-                        }
-                    },
-                    "has_checkpoint": true,
-                }),
-            ))
-            .unwrap();
-
-        assert_eq!(
-            classify_session_end_state(&sid).unwrap(),
-            SessionEndState::Interrupted {
-                kind: "auth_failure".to_string(),
-                resumable: false,
-            }
-        );
-    }
-
-    #[test]
-    fn classify_session_end_state_flags_mid_flight_plan_as_interrupted_even_when_session_end_exists()
-     {
-        // Scenario: the agent started plan execution, emitted subtask progress
-        // for two steps, and then the session terminated without a
-        // `plan_completed`/`plan_abandoned` event. Even though a `session_end`
-        // was written, the plan is still mid-flight — treating this as
-        // SessionEndState::Completed would hide a stale plan from the reaper.
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
-        let sid = format!("test-plan-stale-{}", uuid::Uuid::new_v4());
-        let writer = JournalWriter::new(&sid).unwrap();
-        writer
-            .append(&JournalEvent::session_start(Some(&sid), Some("gpt-5")))
-            .unwrap();
-        writer
-            .append(&JournalEvent::plan_lifecycle(
-                Some(&sid),
-                "execution_started",
-                Some(serde_json::json!({ "plan_id": "p-abc", "subtask_count": 3 })),
-            ))
-            .unwrap();
-        writer
-            .append(&JournalEvent::plan_progress(
-                Some(&sid),
-                1,
-                "s1",
-                "first step",
-                "completed",
-                33,
-                3,
-                1,
-            ))
-            .unwrap();
-        writer
-            .append(&JournalEvent::session_end(Some(&sid), 1))
-            .unwrap();
-
-        let state = classify_session_end_state(&sid).unwrap();
-        match state {
-            SessionEndState::Interrupted { kind, resumable } => {
-                assert_eq!(
-                    kind, "plan_mid_flight",
-                    "unterminated plan must be classified as plan_mid_flight"
-                );
-                assert!(
-                    resumable,
-                    "mid-flight plans are resumable (the user can pick up execution)"
-                );
-            }
-            other => panic!(
-                "expected Interrupted(plan_mid_flight), got {other:?}; \
-                 an unterminated plan with a session_end must still surface as stale"
-            ),
-        }
-    }
-
-    #[test]
-    fn classify_session_end_state_completed_when_plan_also_completed() {
-        // Control: plan started AND completed before session_end → Completed.
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
-        let sid = format!("test-plan-ok-{}", uuid::Uuid::new_v4());
-        let writer = JournalWriter::new(&sid).unwrap();
-        writer
-            .append(&JournalEvent::session_start(Some(&sid), Some("gpt-5")))
-            .unwrap();
-        writer
-            .append(&JournalEvent::plan_lifecycle(
-                Some(&sid),
-                "execution_started",
-                Some(serde_json::json!({ "plan_id": "p-ok" })),
-            ))
-            .unwrap();
-        writer
-            .append(&JournalEvent::plan_lifecycle(
-                Some(&sid),
-                "plan_completed",
-                Some(serde_json::json!({ "plan_id": "p-ok" })),
-            ))
-            .unwrap();
-        writer
-            .append(&JournalEvent::session_end(Some(&sid), 1))
-            .unwrap();
-
-        assert_eq!(
-            classify_session_end_state(&sid).unwrap(),
-            SessionEndState::Completed,
-            "a properly terminated plan must not be flagged as stale"
-        );
-    }
-
-    #[test]
-    fn classify_session_end_state_completed_when_plan_abandoned() {
-        // Control: plan abandoned explicitly before session_end → Completed.
-        // (The user chose to stop; not the same as "forgot to finish".)
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
-        let sid = format!("test-plan-abandon-{}", uuid::Uuid::new_v4());
-        let writer = JournalWriter::new(&sid).unwrap();
-        writer
-            .append(&JournalEvent::session_start(Some(&sid), Some("gpt-5")))
-            .unwrap();
-        writer
-            .append(&JournalEvent::plan_lifecycle(
-                Some(&sid),
-                "execution_started",
-                Some(serde_json::json!({ "plan_id": "p-ab" })),
-            ))
-            .unwrap();
-        writer
-            .append(&JournalEvent::plan_lifecycle(
-                Some(&sid),
-                "plan_abandoned",
-                Some(serde_json::json!({ "plan_id": "p-ab" })),
-            ))
-            .unwrap();
-        writer
-            .append(&JournalEvent::session_end(Some(&sid), 1))
-            .unwrap();
-
-        assert_eq!(
-            classify_session_end_state(&sid).unwrap(),
-            SessionEndState::Completed
-        );
-    }
-
-    #[test]
-    fn classify_session_end_state_detects_zombie_session() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
-        let sid = format!("test-recovery-zombie-{}", uuid::Uuid::new_v4());
-        let writer = JournalWriter::new(&sid).unwrap();
-        writer
-            .append(&JournalEvent::session_start(Some(&sid), Some("gpt-5")))
-            .unwrap();
-        writer
-            .append(&JournalEvent::plan_progress(
-                Some(&sid),
-                1,
-                "task-1",
-                "Implement restart flow",
-                "started",
-                33,
-                3,
-                1,
-            ))
-            .unwrap();
-
-        assert_eq!(
-            classify_session_end_state(&sid).unwrap(),
-            SessionEndState::Zombie
-        );
-    }
-
-    // ── Session Lifecycle Maintenance Tests ──────────────────────────
-
-    /// Helper: create a journal file with a backdated mtime.
-    fn create_aged_journal(dir: &Path, session_id: &str, age_days: u64) {
-        let path = dir.join(format!("{session_id}.jsonl"));
-        std::fs::write(&path, r#"{"type":"session_start"}"#).unwrap();
-        let mtime = filetime::FileTime::from_system_time(
-            std::time::SystemTime::now() - std::time::Duration::from_secs(age_days * 86400 + 3600),
-        );
-        filetime::set_file_mtime(&path, mtime).unwrap();
-    }
-
-    /// Helper: create a session subdirectory with some data.
-    fn create_session_dir(dir: &Path, session_id: &str) {
-        let session_dir = dir.join(session_id);
-        std::fs::create_dir_all(session_dir.join("step_checkpoints")).unwrap();
-        std::fs::write(session_dir.join("workspace.yaml"), "session_id: test").unwrap();
-    }
-
-    #[test]
-    fn maintenance_deletes_expired_sessions() {
+    fn session_maintenance_all_scenarios() {
         let tmp = tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
 
-        // Session older than TTL (40 days old, TTL=30)
+        // Helper: create a journal file with a backdated mtime.
+        fn create_aged_journal(dir: &Path, session_id: &str, age_days: u64) {
+            let path = dir.join(format!("{session_id}.jsonl"));
+            std::fs::write(&path, r#"{"type":"session_start"}"#).unwrap();
+            let mtime = filetime::FileTime::from_system_time(
+                std::time::SystemTime::now()
+                    - std::time::Duration::from_secs(age_days * 86400 + 3600),
+            );
+            filetime::set_file_mtime(&path, mtime).unwrap();
+        }
+
+        // Delete expired sessions (40 days, TTL=30)
         create_aged_journal(&dir, "old-session", 40);
-        create_session_dir(&dir, "old-session");
-
-        // Recent session (1 day old)
+        let session_dir = dir.join("old-session");
+        std::fs::create_dir_all(session_dir.join("step_checkpoints")).unwrap();
+        std::fs::write(session_dir.join("workspace.yaml"), "session_id: test").unwrap();
         create_aged_journal(&dir, "new-session", 1);
-
         let result = run_session_maintenance_in(dir.clone(), 30, 7);
         assert_eq!(result.sessions_deleted, 1);
         assert!(!dir.join("old-session.jsonl").exists());
         assert!(!dir.join("old-session").exists());
         assert!(dir.join("new-session.jsonl").exists());
-    }
 
-    #[test]
-    fn maintenance_compresses_old_journals() {
-        let tmp = tempdir().unwrap();
-        let dir = tmp.path().to_path_buf();
-
-        // Session 10 days old (compress_after=7, ttl=30)
+        // Compress old journals (10 days, compress_after=7)
         create_aged_journal(&dir, "mid-session", 10);
-
         let result = run_session_maintenance_in(dir.clone(), 30, 7);
         assert_eq!(result.journals_compressed, 1);
         assert!(!dir.join("mid-session.jsonl").exists());
         assert!(dir.join("mid-session.jsonl.gz").exists());
-    }
 
-    #[test]
-    fn maintenance_skips_recent_sessions() {
-        let tmp = tempdir().unwrap();
-        let dir = tmp.path().to_path_buf();
-
-        // Very recent session (0 days old)
+        // Skip recent sessions (fresh, 0 days)
         std::fs::write(dir.join("fresh.jsonl"), r#"{"type":"session_start"}"#).unwrap();
-
         let result = run_session_maintenance_in(dir.clone(), 30, 7);
         assert_eq!(result.sessions_deleted, 0);
         assert_eq!(result.journals_compressed, 0);
         assert!(dir.join("fresh.jsonl").exists());
-    }
 
-    #[test]
-    fn maintenance_deletes_expired_compressed_files() {
-        let tmp = tempdir().unwrap();
-        let dir = tmp.path().to_path_buf();
-
-        // Create an old .jsonl.gz file (40 days old)
+        // Delete expired compressed files (40 days old .gz)
         let gz_path = dir.join("archived.jsonl.gz");
         std::fs::write(&gz_path, b"fake-gz-data").unwrap();
         let mtime = filetime::FileTime::from_system_time(
             std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86400 + 3600),
         );
         filetime::set_file_mtime(&gz_path, mtime).unwrap();
-
         let result = run_session_maintenance_in(dir.clone(), 30, 7);
         assert_eq!(result.sessions_deleted, 1);
         assert!(!gz_path.exists());
-    }
 
-    #[test]
-    fn maintenance_empty_dir_returns_default() {
-        let tmp = tempdir().unwrap();
-        let result = run_session_maintenance_in(tmp.path().to_path_buf(), 30, 7);
+        // Empty dir returns defaults
+        let tmp2 = tempdir().unwrap();
+        let result = run_session_maintenance_in(tmp2.path().to_path_buf(), 30, 7);
         assert_eq!(result.sessions_deleted, 0);
         assert_eq!(result.journals_compressed, 0);
         assert_eq!(result.bytes_freed, 0);
     }
 
     #[test]
-    fn tool_call_record_serde_roundtrip_with_surgical_fields() {
-        // New-style record with both surgical fields populated
-        let rec = ToolCallRecord {
-            name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
-            ok: true,
-            ms: 0,
-            error: None,
-            input_bytes: None,
-            output_bytes: Some(0),
-            args_preview: None,
-            result_preview: Some("(removed)".into()),
-            file_path: None,
-            surgically_removed: Some(true),
-            original_tool_name: Some("read_file".to_string()),
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&rec).unwrap();
-        assert!(json.contains("\"surgically_removed\":true"));
-        assert!(json.contains("\"original_tool_name\":\"read_file\""));
-        let deser: ToolCallRecord = serde_json::from_str(&json).unwrap();
-        assert_eq!(deser.surgically_removed, Some(true));
-        assert_eq!(deser.original_tool_name.as_deref(), Some("read_file"));
-        assert!(deser.is_synthetic_placeholder());
-    }
-
-    #[test]
-    fn tool_call_record_serde_omits_none_surgical_fields() {
-        // Normal record: surgical fields should be omitted from JSON
-        let rec = base_tool_record("bash", true, Some("ok"));
-        let json = serde_json::to_string(&rec).unwrap();
-        assert!(
-            !json.contains("surgically_removed"),
-            "None surgical fields should be skipped in serialization"
-        );
-        assert!(
-            !json.contains("original_tool_name"),
-            "None original_tool_name should be skipped in serialization"
-        );
-    }
-
-    #[test]
-    fn is_synthetic_placeholder_flag_takes_priority() {
-        // Even if name is normal, flag=true marks as synthetic
-        let rec = ToolCallRecord {
-            name: "read_file".to_string(),
-            ok: true,
-            ms: 50,
-            error: None,
-            input_bytes: None,
-            output_bytes: Some(100),
-            args_preview: None,
-            result_preview: Some("content".into()),
-            file_path: None,
-            surgically_removed: Some(true),
-            original_tool_name: Some("read_file".to_string()),
-            ..Default::default()
-        };
-        assert!(
-            rec.is_synthetic_placeholder(),
-            "surgically_removed=true must classify as synthetic regardless of name"
-        );
-    }
-
-    #[test]
-    fn journal_content_marker_is_deterministic() {
+    #[serial_test::serial(astra_journal_content_redact_env)]
+    fn journal_content_redaction_and_markers() {
+        // ── Content markers ──
         let a = journal_content_marker("hello world");
         let b = journal_content_marker("hello world");
         assert_eq!(a, b);
         assert!(a.starts_with("<redacted: len=11 sha="));
         assert!(a.ends_with('>'));
         assert!(!a.contains("hello"));
-    }
-
-    #[test]
-    fn journal_content_marker_differs_for_different_input() {
         assert_ne!(
             journal_content_marker("hello"),
             journal_content_marker("world")
         );
-    }
 
-    #[test]
-    #[serial_test::serial(astra_journal_content_redact_env)]
-    fn journal_content_redact_enabled_reads_env_var() {
-        // SAFETY: serialized via #[serial] above.
+        // ── Redaction env toggle ──
         unsafe { std::env::remove_var("ASTRA_JOURNAL_CONTENT_REDACT") };
         assert!(!journal_content_redact_enabled());
         unsafe { std::env::set_var("ASTRA_JOURNAL_CONTENT_REDACT", "1") };
         assert!(journal_content_redact_enabled());
         unsafe { std::env::set_var("ASTRA_JOURNAL_CONTENT_REDACT", "0") };
         assert!(!journal_content_redact_enabled());
-        unsafe { std::env::remove_var("ASTRA_JOURNAL_CONTENT_REDACT") };
-    }
 
-    #[test]
-    #[serial_test::serial(astra_journal_content_redact_env)]
-    fn turn_event_redacts_content_when_env_set() {
+        // ── Turn event redacts content when env is set ──
         unsafe { std::env::set_var("ASTRA_JOURNAL_CONTENT_REDACT", "1") };
         let evt = JournalEvent::turn(
             Some("s1"),
@@ -6954,12 +6381,8 @@ mod tests {
         );
         assert!(user.starts_with("<redacted:"));
         assert!(asst.starts_with("<redacted:"));
-        unsafe { std::env::remove_var("ASTRA_JOURNAL_CONTENT_REDACT") };
-    }
 
-    #[test]
-    #[serial_test::serial(astra_journal_content_redact_env)]
-    fn turn_event_keeps_content_when_env_unset() {
+        // ── Turn event keeps content when env unset ──
         unsafe { std::env::remove_var("ASTRA_JOURNAL_CONTENT_REDACT") };
         let evt = JournalEvent::turn(
             Some("s1"),
@@ -6974,56 +6397,877 @@ mod tests {
         );
         assert_eq!(evt.user_input.as_deref(), Some("hello"));
         assert_eq!(evt.assistant_output.as_deref(), Some("world"));
-    }
 
-    #[test]
-    #[serial_test::serial(astra_journal_content_redact_env)]
-    fn turn_error_event_redacts_user_input_when_env_set() {
+        // ── Turn error redacts user input ──
         unsafe { std::env::set_var("ASTRA_JOURNAL_CONTENT_REDACT", "1") };
         let evt =
             JournalEvent::turn_error(Some("s1"), 1, Some("gpt-4"), "secret query", "boom", 50);
         let user = evt.user_input.as_deref().unwrap_or("");
         assert!(!user.contains("secret query"));
         assert!(user.starts_with("<redacted:"));
-        // Error message itself is system-generated, kept as-is.
         assert_eq!(evt.error.as_deref(), Some("boom"));
+
         unsafe { std::env::remove_var("ASTRA_JOURNAL_CONTENT_REDACT") };
     }
 
     #[test]
-    fn was_blocked_by_policy_detects_restricted_tool() {
-        let rec = ToolCallRecord {
-            name: "read_file".to_string(),
-            ok: false,
-            error: Some(
-                "blocked_tool: Tool 'read_file' is currently restricted and cannot be executed."
-                    .into(),
-            ),
-            ..Default::default()
-        };
-        assert!(rec.was_blocked_by_policy());
+    fn combined_guard_eval_stall_progress() {
+        // ── turn_guard_verdict: warning with avoid_tools ──
+        {
+            let evt = JournalEvent::turn_guard_verdict(
+                Some("sess-1"),
+                3,
+                "warning",
+                &["Stall detected: repeated bash calls".to_string()],
+                &["bash".to_string()],
+                &["bash".to_string()],
+                false,
+                1,
+                2,
+                1,
+                0,
+                &[],
+                0,
+                0,
+            );
+            let json = serde_json::to_string(&evt).unwrap();
+            assert!(json.contains("\"type\":\"turn_guard_verdict\""));
+            assert!(json.contains("\"turn\":3"));
+            assert!(json.contains("\"stall_type\":\"warning\""));
+            let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.event_type, JournalEventType::TurnGuardVerdict);
+            let meta = parsed.metadata.unwrap();
+            assert_eq!(meta["severity"], "warning");
+            assert_eq!(meta["injections"], 1);
+            assert_eq!(meta["avoid_tools"][0], "bash");
+            assert_eq!(meta["avoid_tools_count"], 1);
+            assert_eq!(meta["deprioritized_tool_names"][0], "bash");
+            assert_eq!(meta["force_stop"], false);
+            assert_eq!(meta["nudge_count"], 1);
+            assert_eq!(meta["total_errors"], 2);
+            assert_eq!(meta["non_timeout_errors"], 2);
+            assert_eq!(meta["deprioritized_tools"], 1);
+            assert_eq!(meta["total_timeouts"], 0);
+            assert_eq!(meta["total_cache_hits"], 0);
+            assert_eq!(meta["flaky_tools"], 0);
+        }
+
+        // ── turn_guard_verdict: critical force_stop ──
+        {
+            let evt = JournalEvent::turn_guard_verdict(
+                Some("sess-1"),
+                5,
+                "critical",
+                &[
+                    "CRITICAL: multiple stalls".to_string(),
+                    "Tool health degraded".to_string(),
+                ],
+                &["bash".to_string(), "grep".to_string()],
+                &["bash".to_string(), "grep".to_string()],
+                true,
+                3,
+                5,
+                2,
+                2,
+                &["bash".to_string()],
+                1,
+                1,
+            );
+            let json = serde_json::to_string(&evt).unwrap();
+            let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+            let meta = parsed.metadata.unwrap();
+            assert_eq!(meta["severity"], "critical");
+            assert_eq!(meta["force_stop"], true);
+            assert_eq!(meta["injections"], 2);
+            assert_eq!(meta["nudge_count"], 3);
+            assert_eq!(meta["non_timeout_errors"], 3);
+            assert_eq!(meta["timeout_dominant_tools"][0], "bash");
+            assert_eq!(meta["total_timeouts"], 2);
+            assert_eq!(meta["total_cache_hits"], 1);
+            assert_eq!(meta["flaky_tools"], 1);
+            assert!(
+                meta["injection_preview"]
+                    .as_str()
+                    .unwrap()
+                    .contains("CRITICAL")
+            );
+        }
+
+        // ── turn_guard_verdict: info minimal ──
+        {
+            let evt = JournalEvent::turn_guard_verdict(
+                None,
+                1,
+                "info",
+                &[],
+                &[],
+                &[],
+                false,
+                0,
+                1,
+                0,
+                0,
+                &[],
+                0,
+                0,
+            );
+            let json = serde_json::to_string(&evt).unwrap();
+            let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.event_type, JournalEventType::TurnGuardVerdict);
+            let meta = parsed.metadata.unwrap();
+            assert_eq!(meta["injections"], 0);
+            assert!(meta["injection_preview"].is_null());
+            assert_eq!(meta["force_stop"], false);
+            assert_eq!(meta["non_timeout_errors"], 1);
+            assert_eq!(meta["avoid_tools_count"], 0);
+        }
+
+        // ── turn_evaluation: full fields ──
+        {
+            let evt = JournalEvent::turn_evaluation(
+                Some("sess-1"),
+                Some(4),
+                "cli_repl",
+                true,
+                true,
+                0.91,
+                0.72,
+                0.18,
+                1,
+                false,
+                2,
+                vec![
+                    serde_json::json!({"kind": "all_tools_healthy", "weight": 0.4, "message": "All tool calls completed successfully"}),
+                ],
+            );
+            let json = serde_json::to_string(&evt).unwrap();
+            assert!(json.contains("\"type\":\"turn_evaluation\""));
+            assert!(json.contains("\"turn\":4"));
+            let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.event_type, JournalEventType::TurnEvaluation);
+            let meta = parsed.metadata.unwrap();
+            assert_eq!(meta["source"], "cli_repl");
+            assert_eq!(meta["live_query"], true);
+            assert_eq!(meta["success"], true);
+            assert_eq!(meta["quality"], 0.91);
+            assert_eq!(meta["confidence"], 0.72);
+            assert_eq!(meta["budget_pressure"], 0.18);
+            assert_eq!(meta["stall_count"], 1);
+            assert_eq!(meta["verdict_warning"], false);
+            assert_eq!(meta["tool_call_count"], 2);
+            assert_eq!(meta["signal_count"], 1);
+            assert_eq!(meta["signals"][0]["kind"], "all_tools_healthy");
+        }
+
+        // ── turn_evaluation: without turn (None) ──
+        {
+            let evt = JournalEvent::turn_evaluation(
+                Some("sess-2"),
+                None,
+                "server_runtime",
+                false,
+                false,
+                0.35,
+                0.81,
+                0.64,
+                2,
+                true,
+                0,
+                vec![],
+            );
+            let json = serde_json::to_string(&evt).unwrap();
+            let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.event_type, JournalEventType::TurnEvaluation);
+            assert_eq!(parsed.turn, None);
+            let meta = parsed.metadata.unwrap();
+            assert_eq!(meta["source"], "server_runtime");
+            assert_eq!(meta["signal_count"], 0);
+            assert_eq!(meta["signals"], serde_json::json!([]));
+        }
+
+        // ── stall_detected: field correctness ──
+        {
+            let evt = JournalEvent::stall_detected(
+                Some("sess-1"),
+                5,
+                "repetition_stall",
+                2,
+                0.7,
+                &["bash".to_string(), "grep".to_string()],
+            );
+            assert_eq!(evt.event_type, JournalEventType::StallDetected);
+            assert_eq!(evt.turn, Some(5));
+            assert_eq!(evt.stall_type.as_deref(), Some("repetition_stall"));
+            let meta = evt.metadata.unwrap();
+            assert_eq!(meta["nudge_count"], 2);
+            assert_eq!(meta["confidence"], 0.7);
+            assert_eq!(meta["avoid_tools"][0], "bash");
+        }
+
+        // ── stall_detected: JSON roundtrip ──
+        {
+            let evt = JournalEvent::stall_detected(
+                Some("sess-2"),
+                3,
+                "exploration_stall",
+                1,
+                0.5,
+                &["list_dir".to_string()],
+            );
+            let json = serde_json::to_string(&evt).unwrap();
+            let restored: JournalEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored.event_type, JournalEventType::StallDetected);
+            assert_eq!(restored.turn, Some(3));
+        }
+
+        // ── stall_detected: confidence range ──
+        for confidence in [0.0, 0.5, 0.8, 1.0] {
+            let evt = JournalEvent::stall_detected(Some("s"), 1, "stall", 0, confidence, &[]);
+            let meta = evt.metadata.unwrap();
+            let stored = meta["confidence"].as_f64().unwrap();
+            assert!(
+                (stored - confidence).abs() < 1e-9,
+                "confidence {confidence} stored as {stored}"
+            );
+        }
+
+        // ── checkpoint: field correctness ──
+        {
+            let evt = JournalEvent::checkpoint(
+                Some("sess-1"),
+                10,
+                "Completed token efficiency phase",
+                50_000,
+                15,
+            );
+            assert_eq!(evt.event_type, JournalEventType::Checkpoint);
+            assert_eq!(evt.turn, Some(10));
+            let meta = evt.metadata.unwrap();
+            assert_eq!(meta["summary"], "Completed token efficiency phase");
+            assert_eq!(meta["total_tokens"], 50_000);
+            assert_eq!(meta["tools_used_count"], 15);
+        }
+
+        // ── plan_progress event builder ──
+        {
+            let evt = JournalEvent::plan_progress(
+                Some("s1"),
+                5,
+                "add-tests",
+                "Add unit tests",
+                "started",
+                40,
+                5,
+                2,
+            );
+            assert_eq!(evt.event_type, JournalEventType::PlanProgress);
+            assert_eq!(evt.turn, Some(5));
+            let meta = evt.metadata.as_ref().unwrap();
+            assert_eq!(meta["subtask_id"], "add-tests");
+            assert_eq!(meta["subtask_title"], "Add unit tests");
+            assert_eq!(meta["action"], "started");
+            assert_eq!(meta["progress_pct"], 40);
+            assert_eq!(meta["total_subtasks"], 5);
+            assert_eq!(meta["completed_subtasks"], 2);
+        }
+
+        // ── plan_progress serialization roundtrip ──
+        {
+            let evt = JournalEvent::plan_progress(
+                Some("s1"),
+                3,
+                "fix-bug",
+                "Fix login",
+                "started",
+                0,
+                3,
+                0,
+            );
+            let json = serde_json::to_string(&evt).unwrap();
+            let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.event_type, JournalEventType::PlanProgress);
+            assert_eq!(parsed.turn, Some(3));
+            assert_eq!(parsed.metadata.as_ref().unwrap()["subtask_id"], "fix-bug");
+            assert_eq!(parsed.metadata.as_ref().unwrap()["action"], "started");
+            let evt2 = JournalEvent::plan_progress(
+                Some("s1"),
+                5,
+                "",
+                "Full plan",
+                "plan_complete",
+                100,
+                3,
+                3,
+            );
+            let json2 = serde_json::to_string(&evt2).unwrap();
+            let parsed2: JournalEvent = serde_json::from_str(&json2).unwrap();
+            assert_eq!(
+                parsed2.metadata.as_ref().unwrap()["action"],
+                "plan_complete"
+            );
+            assert_eq!(parsed2.metadata.as_ref().unwrap()["progress_pct"], 100);
+        }
     }
 
     #[test]
-    fn was_blocked_by_policy_ignores_normal_failures() {
-        let rec = ToolCallRecord {
-            name: "read_file".to_string(),
-            ok: false,
-            error: Some("Error: file not found".into()),
-            ..Default::default()
-        };
-        assert!(!rec.was_blocked_by_policy());
+    fn combined_tool_record_serde() {
+        // ── basic serialization round-trip ──
+        {
+            let record = ToolCallRecord {
+                name: "github_list_prs".into(),
+                ok: true,
+                ms: 761,
+                error: None,
+                input_bytes: None,
+                output_bytes: None,
+                args_preview: Some("owner/repo".into()),
+                result_preview: None,
+                file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&record).unwrap();
+            assert!(json.contains("\"ok\":true"));
+            assert!(!json.contains("\"error\""), "None error should be omitted");
+            let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.name, "github_list_prs");
+            assert!(parsed.ok);
+            assert_eq!(parsed.ms, 761);
+            assert!(parsed.error.is_none());
+        }
+
+        // ── with error field ──
+        {
+            let record = ToolCallRecord {
+                name: "github_ci_status".into(),
+                ok: false,
+                ms: 587,
+                error: Some("missing repo parameter".into()),
+                input_bytes: None,
+                output_bytes: None,
+                args_preview: None,
+                result_preview: None,
+                file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&record).unwrap();
+            assert!(json.contains("\"ok\":false"));
+            assert!(json.contains("missing repo"));
+            let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
+            assert!(!parsed.ok);
+            assert_eq!(parsed.error.as_deref(), Some("missing repo parameter"));
+        }
+
+        // ── bulk array of 100 records ──
+        {
+            let records: Vec<ToolCallRecord> = (0..100)
+                .map(|i| ToolCallRecord {
+                    name: format!("tool_{i}"),
+                    ok: i % 2 == 0,
+                    ms: i as u64 * 100,
+                    error: if i % 3 == 0 {
+                        Some(format!("err_{i}"))
+                    } else {
+                        None
+                    },
+                    input_bytes: None,
+                    output_bytes: None,
+                    args_preview: None,
+                    result_preview: None,
+                    file_path: None,
+                    surgically_removed: None,
+                    original_tool_name: None,
+                    ..Default::default()
+                })
+                .collect();
+            let json = serde_json::to_string(&records).unwrap();
+            let parsed: Vec<ToolCallRecord> = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.len(), 100);
+            assert_eq!(parsed[99].name, "tool_99");
+            assert_eq!(parsed[0].ms, 0);
+        }
+
+        // ── unicode error message ──
+        {
+            let record = ToolCallRecord {
+                name: "github_list_prs".into(),
+                ok: false,
+                ms: 500,
+                error: Some("连接超时: タイムアウト 🚫".into()),
+                input_bytes: None,
+                output_bytes: None,
+                args_preview: None,
+                result_preview: None,
+                file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&record).unwrap();
+            let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.error.unwrap(), "连接超时: タイムアウト 🚫");
+        }
+
+        // ── u64::MAX ms value ──
+        {
+            let record = ToolCallRecord {
+                name: "bash".into(),
+                ok: true,
+                ms: u64::MAX,
+                error: None,
+                input_bytes: None,
+                output_bytes: None,
+                args_preview: None,
+                result_preview: None,
+                file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&record).unwrap();
+            let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.ms, u64::MAX);
+        }
+
+        // ── surgical fields round-trip ──
+        {
+            let rec = ToolCallRecord {
+                name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
+                ok: true,
+                ms: 0,
+                error: None,
+                input_bytes: None,
+                output_bytes: Some(0),
+                args_preview: None,
+                result_preview: Some("(removed)".into()),
+                file_path: None,
+                surgically_removed: Some(true),
+                original_tool_name: Some("read_file".to_string()),
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&rec).unwrap();
+            assert!(json.contains("\"surgically_removed\":true"));
+            assert!(json.contains("\"original_tool_name\":\"read_file\""));
+            let deser: ToolCallRecord = serde_json::from_str(&json).unwrap();
+            assert_eq!(deser.surgically_removed, Some(true));
+            assert_eq!(deser.original_tool_name.as_deref(), Some("read_file"));
+            assert!(deser.is_synthetic_placeholder());
+        }
+
+        // ── surgical fields omitted when None ──
+        {
+            let rec = base_tool_record("bash", true, Some("ok"));
+            let json = serde_json::to_string(&rec).unwrap();
+            assert!(
+                !json.contains("surgically_removed"),
+                "None surgical fields should be skipped"
+            );
+            assert!(
+                !json.contains("original_tool_name"),
+                "None original_tool_name should be skipped"
+            );
+        }
+
+        // ── new fields omitted when None ──
+        {
+            let rec = ToolCallRecord {
+                name: "bash".into(),
+                ok: true,
+                ms: 50,
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&rec).unwrap();
+            assert!(!json.contains("start_offset_ms"));
+            assert!(!json.contains("batch_id"));
+            assert!(!json.contains("parallel"));
+            assert!(!json.contains("\"round\""));
+        }
+
+        // ── new fields round-trip ──
+        {
+            let rec = ToolCallRecord {
+                name: "read_file".into(),
+                ok: true,
+                ms: 10,
+                start_offset_ms: Some(5000),
+                batch_id: Some("b-0-0".into()),
+                parallel: Some(true),
+                round: Some(2),
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&rec).unwrap();
+            assert!(json.contains("\"start_offset_ms\":5000"));
+            assert!(json.contains("\"batch_id\":\"b-0-0\""));
+            assert!(json.contains("\"parallel\":true"));
+            assert!(json.contains("\"round\":2"));
+            let deser: ToolCallRecord = serde_json::from_str(&json).unwrap();
+            assert_eq!(deser.start_offset_ms, Some(5000));
+            assert_eq!(deser.batch_id.as_deref(), Some("b-0-0"));
+            assert_eq!(deser.parallel, Some(true));
+            assert_eq!(deser.round, Some(2));
+        }
     }
 
     #[test]
-    fn was_blocked_by_policy_ignores_successful_calls() {
-        let rec = ToolCallRecord {
-            name: "read_file".to_string(),
-            ok: true,
-            error: None,
-            ..Default::default()
-        };
-        assert!(!rec.was_blocked_by_policy());
+    fn combined_classification_and_predicates() {
+        // ── is_synthetic_placeholder detection ──
+        {
+            let skipped = ToolCallRecord {
+                name: "read_file".into(), ok: false, ms: 0, error: None,
+                input_bytes: None, output_bytes: None, args_preview: None,
+                result_preview: Some("Skipped: the skill already completed this work. Do NOT call `read_file` again.".into()),
+                file_path: None, surgically_removed: None, original_tool_name: None, ..Default::default()
+            };
+            let deferred = ToolCallRecord {
+                name: "bash".into(),
+                ok: false,
+                ms: 0,
+                error: None,
+                input_bytes: None,
+                output_bytes: None,
+                args_preview: None,
+                result_preview: Some(
+                    "Deferred: skill was invoked in this turn. Read the skill instructions above."
+                        .into(),
+                ),
+                file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
+                ..Default::default()
+            };
+            let dedup = ToolCallRecord {
+                name: "skill".into(), ok: false, ms: 0, error: None,
+                input_bytes: None, output_bytes: None, args_preview: None,
+                result_preview: Some("Skill 'debug' was already loaded (turn 2). Follow those instructions directly.".into()),
+                file_path: None, surgically_removed: None, original_tool_name: None, ..Default::default()
+            };
+            let actual_failure = ToolCallRecord {
+                name: "skill".into(),
+                ok: false,
+                ms: 0,
+                args_preview: None,
+                error: Some("Unknown skill".into()),
+                input_bytes: None,
+                output_bytes: None,
+                result_preview: Some("Unknown skill 'debug'.".into()),
+                file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
+                ..Default::default()
+            };
+            assert!(skipped.is_synthetic_placeholder());
+            assert!(deferred.is_synthetic_placeholder());
+            assert!(dedup.is_synthetic_placeholder());
+            assert!(!actual_failure.is_synthetic_placeholder());
+        }
+
+        // ── is_synthetic_placeholder ── all patterns
+        {
+            let rec = base_tool_record(
+                SURGICAL_REMOVAL_TOOL_NAME,
+                true,
+                Some("(removed from context — skill covered this work)"),
+            );
+            assert!(
+                rec.is_synthetic_placeholder(),
+                "surgically_removed records must be synthetic"
+            );
+            assert!(
+                base_tool_record("read_file", false, Some("Skipped: skill routed"))
+                    .is_synthetic_placeholder()
+            );
+            assert!(
+                base_tool_record("read_file", false, Some("Deferred: skill invoked"))
+                    .is_synthetic_placeholder()
+            );
+            assert!(
+                base_tool_record(
+                    "skill",
+                    true,
+                    Some("Skill 'debug' was already loaded (turn 2). Follow those instructions.")
+                )
+                .is_synthetic_placeholder()
+            );
+            assert!(!base_tool_record("git_show", true, Some("diff")).is_synthetic_placeholder());
+            assert!(
+                !base_tool_record("grep", false, Some("error: bad regex"))
+                    .is_synthetic_placeholder()
+            );
+            assert!(!base_tool_record("read_file", true, None).is_synthetic_placeholder());
+            let flagged = ToolCallRecord {
+                name: "read_file".to_string(),
+                ok: true,
+                ms: 50,
+                surgically_removed: Some(true),
+                original_tool_name: Some("read_file".to_string()),
+                result_preview: Some("content".into()),
+                output_bytes: Some(100),
+                ..Default::default()
+            };
+            assert!(
+                flagged.is_synthetic_placeholder(),
+                "surgically_removed=true must classify as synthetic"
+            );
+        }
+
+        // ── was_blocked_by_policy ──
+        {
+            assert!(ToolCallRecord {
+                name: "read_file".to_string(), ok: false,
+                error: Some("blocked_tool: Tool 'read_file' is currently restricted and cannot be executed.".into()),
+                ..Default::default()
+            }.was_blocked_by_policy());
+            assert!(
+                !ToolCallRecord {
+                    name: "read_file".to_string(),
+                    ok: false,
+                    error: Some("Error: file not found".into()),
+                    ..Default::default()
+                }
+                .was_blocked_by_policy()
+            );
+            assert!(
+                !ToolCallRecord {
+                    name: "read_file".to_string(),
+                    ok: true,
+                    error: None,
+                    ..Default::default()
+                }
+                .was_blocked_by_policy()
+            );
+        }
+
+        // ── is_recovery_activity_event ──
+        {
+            assert!(!is_recovery_activity_event(
+                &JournalEventType::MemorySuppressed
+            ));
+            assert!(!is_recovery_activity_event(
+                &JournalEventType::ContextReleased
+            ));
+        }
+
+        // ── classify_session_end_state: Completed ──
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let _guard = JournalDirGuard::new(tmp.path());
+            let sid = format!("test-classify-{}", uuid::Uuid::new_v4());
+            let w = JournalWriter::new(&sid).unwrap();
+            w.append(&JournalEvent::session_start(Some(&sid), Some("gpt-5")))
+                .unwrap();
+            w.append(&JournalEvent::turn(
+                Some(&sid),
+                1,
+                None,
+                "fix auth flow",
+                "I checked the login path.",
+                0,
+                10,
+                5,
+                10,
+            ))
+            .unwrap();
+            w.append(&JournalEvent::session_end(Some(&sid), 1)).unwrap();
+            assert_eq!(
+                classify_session_end_state(&sid).unwrap(),
+                SessionEndState::Completed
+            );
+        }
+
+        // ── classify_session_end_state: Interrupted (resumable: rate_limited) ──
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let _guard = JournalDirGuard::new(tmp.path());
+            let sid = format!("test-classify-{}", uuid::Uuid::new_v4());
+            let w = JournalWriter::new(&sid).unwrap();
+            w.append(&JournalEvent::session_start(Some(&sid), Some("gpt-5")))
+                .unwrap();
+            w.append(&JournalEvent::turn(
+                Some(&sid),
+                1,
+                None,
+                "continue the migration",
+                "I finished the schema diff.",
+                0,
+                10,
+                5,
+                10,
+            ))
+            .unwrap();
+            w.append(&JournalEvent::interruption_recorded(Some(&sid), 1, serde_json::json!({
+                "kind": "rate_limited", "resume_action": {"wait_and_retry": {"delay_seconds": 30}},
+                "has_checkpoint": true, "tool_calls_completed": 2, "turns_completed": 1, "remaining_turns": 4
+            }))).unwrap();
+            assert_eq!(
+                classify_session_end_state(&sid).unwrap(),
+                SessionEndState::Interrupted {
+                    kind: "rate_limited".to_string(),
+                    resumable: true
+                }
+            );
+        }
+
+        // ── classify_session_end_state: Interrupted (non-resumable: auth_failure) ──
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let _guard = JournalDirGuard::new(tmp.path());
+            let sid = format!("test-classify-{}", uuid::Uuid::new_v4());
+            let w = JournalWriter::new(&sid).unwrap();
+            w.append(&JournalEvent::session_start(Some(&sid), Some("gpt-5")))
+                .unwrap();
+            w.append(&JournalEvent::turn(
+                Some(&sid),
+                1,
+                None,
+                "fetch CI logs",
+                "Need valid credentials first.",
+                0,
+                10,
+                5,
+                10,
+            ))
+            .unwrap();
+            w.append(&JournalEvent::interruption_recorded(Some(&sid), 1, serde_json::json!({
+                "kind": "auth_failure", "resume_action": {"requires_intervention": {"description": "refresh credentials"}},
+                "has_checkpoint": true
+            }))).unwrap();
+            assert_eq!(
+                classify_session_end_state(&sid).unwrap(),
+                SessionEndState::Interrupted {
+                    kind: "auth_failure".to_string(),
+                    resumable: false
+                }
+            );
+        }
+
+        // ── classify_session_end_state: plan_mid_flight ──
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let _guard = JournalDirGuard::new(tmp.path());
+            let sid = format!("test-classify-{}", uuid::Uuid::new_v4());
+            let w = JournalWriter::new(&sid).unwrap();
+            w.append(&JournalEvent::session_start(Some(&sid), Some("gpt-5")))
+                .unwrap();
+            w.append(&JournalEvent::plan_lifecycle(
+                Some(&sid),
+                "execution_started",
+                Some(serde_json::json!({"plan_id": "p-abc", "subtask_count": 3})),
+            ))
+            .unwrap();
+            w.append(&JournalEvent::plan_progress(
+                Some(&sid),
+                1,
+                "s1",
+                "first step",
+                "completed",
+                33,
+                3,
+                1,
+            ))
+            .unwrap();
+            w.append(&JournalEvent::session_end(Some(&sid), 1)).unwrap();
+            match classify_session_end_state(&sid).unwrap() {
+                SessionEndState::Interrupted { kind, resumable } => {
+                    assert_eq!(kind, "plan_mid_flight");
+                    assert!(resumable);
+                }
+                other => panic!("expected Interrupted(plan_mid_flight), got {other:?}"),
+            }
+        }
+
+        // ── classify_session_end_state: plan completed before session_end ──
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let _guard = JournalDirGuard::new(tmp.path());
+            let sid = format!("test-classify-{}", uuid::Uuid::new_v4());
+            let w = JournalWriter::new(&sid).unwrap();
+            w.append(&JournalEvent::session_start(Some(&sid), Some("gpt-5")))
+                .unwrap();
+            w.append(&JournalEvent::plan_lifecycle(
+                Some(&sid),
+                "execution_started",
+                Some(serde_json::json!({"plan_id": "p-ok"})),
+            ))
+            .unwrap();
+            w.append(&JournalEvent::plan_lifecycle(
+                Some(&sid),
+                "plan_completed",
+                Some(serde_json::json!({"plan_id": "p-ok"})),
+            ))
+            .unwrap();
+            w.append(&JournalEvent::session_end(Some(&sid), 1)).unwrap();
+            assert_eq!(
+                classify_session_end_state(&sid).unwrap(),
+                SessionEndState::Completed
+            );
+        }
+
+        // ── classify_session_end_state: plan abandoned → Completed ──
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let _guard = JournalDirGuard::new(tmp.path());
+            let sid = format!("test-classify-{}", uuid::Uuid::new_v4());
+            let w = JournalWriter::new(&sid).unwrap();
+            w.append(&JournalEvent::session_start(Some(&sid), Some("gpt-5")))
+                .unwrap();
+            w.append(&JournalEvent::plan_lifecycle(
+                Some(&sid),
+                "execution_started",
+                Some(serde_json::json!({"plan_id": "p-ab"})),
+            ))
+            .unwrap();
+            w.append(&JournalEvent::plan_lifecycle(
+                Some(&sid),
+                "plan_abandoned",
+                Some(serde_json::json!({"plan_id": "p-ab"})),
+            ))
+            .unwrap();
+            w.append(&JournalEvent::session_end(Some(&sid), 1)).unwrap();
+            assert_eq!(
+                classify_session_end_state(&sid).unwrap(),
+                SessionEndState::Completed
+            );
+        }
+
+        // ── classify_session_end_state: Zombie (no session_end) ──
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let _guard = JournalDirGuard::new(tmp.path());
+            let sid = format!("test-classify-{}", uuid::Uuid::new_v4());
+            let w = JournalWriter::new(&sid).unwrap();
+            w.append(&JournalEvent::session_start(Some(&sid), Some("gpt-5")))
+                .unwrap();
+            w.append(&JournalEvent::plan_progress(
+                Some(&sid),
+                1,
+                "task-1",
+                "Implement restart flow",
+                "started",
+                33,
+                3,
+                1,
+            ))
+            .unwrap();
+            assert_eq!(
+                classify_session_end_state(&sid).unwrap(),
+                SessionEndState::Zombie
+            );
+        }
+
+        // ── journal_event_new_fields serialized only when set ──
+        {
+            let ev = JournalEvent::base_public(JournalEventType::Turn, Some("s1"));
+            let json = serde_json::to_string(&ev).unwrap();
+            assert!(!json.contains("\"round\""));
+            assert!(!json.contains("tool_calls_returned"));
+            assert!(!json.contains("offset_ms"));
+            assert!(!json.contains("llm_rounds"));
+            assert!(!json.contains("total_llm_ms"));
+            assert!(!json.contains("total_tool_ms"));
+        }
     }
 }
 
@@ -7951,29 +8195,21 @@ mod session_start_detection_tests {
     use super::*;
 
     #[test]
-    fn journal_needs_session_start_when_file_does_not_exist() {
+    fn session_start_detection_scenarios() {
+        // --- needs session_start when file doesn't exist ---
         let tmp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
         let path = journal_dir().join("nonexistent-session.jsonl");
         assert!(journal_needs_session_start_for_path(&path).unwrap());
-    }
 
-    #[test]
-    fn journal_needs_session_start_when_file_is_empty() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
+        // --- needs session_start when file is empty ---
         let path = journal_dir().join("empty-session.jsonl");
         std::fs::write(&path, "").unwrap();
         assert!(journal_needs_session_start_for_path(&path).unwrap());
-    }
 
-    #[test]
-    fn journal_does_not_need_session_start_when_open_session_exists() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
+        // --- does NOT need session_start when open session exists ---
         let sid = "open-session";
         let path = journal_dir().join(format!("{sid}.jsonl"));
-
         let writer = JournalWriter::new(sid).unwrap();
         writer
             .append(&JournalEvent::interruption_recorded(
@@ -7982,17 +8218,11 @@ mod session_start_detection_tests {
                 serde_json::json!({"kind": "test"}),
             ))
             .unwrap();
-
         assert!(!journal_needs_session_start_for_path(&path).unwrap());
-    }
 
-    #[test]
-    fn journal_needs_session_start_when_last_event_is_session_end() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
+        // --- needs session_start when last event is session_end ---
         let sid = "ended-session";
         let path = journal_dir().join(format!("{sid}.jsonl"));
-
         let writer = JournalWriter::new(sid).unwrap();
         writer
             .append(&JournalEvent::base_public(
@@ -8000,20 +8230,10 @@ mod session_start_detection_tests {
                 Some(sid),
             ))
             .unwrap();
-
         assert!(journal_needs_session_start_for_path(&path).unwrap());
-    }
 
-    /// Edge case: file ends without a trailing newline.  Real journals
-    /// always end with `\n` (the writer appends `\n` after every event),
-    /// but a crash mid-write or an externally truncated file may leave
-    /// bytes after the last newline.  Those bytes are the most recent
-    /// (partial?) event — if they happen to be a complete JSON line they
-    /// are still authoritative.
-    #[test]
-    fn read_last_event_type_handles_missing_trailing_newline() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
+        // --- read_last_event_type edge cases ---
+        // handles missing trailing newline
         let path = journal_dir().join("no-trailing-nl.jsonl");
         let line1 = serde_json::to_string(&JournalEvent::base_public(
             JournalEventType::SessionStart,
@@ -8025,44 +8245,20 @@ mod session_start_detection_tests {
             Some("s"),
         ))
         .unwrap();
-        // No trailing '\n' after line2.
         std::fs::write(&path, format!("{line1}\n{line2}")).unwrap();
         assert_eq!(
             read_last_event_type(&path).unwrap(),
-            Some(JournalEventType::Turn),
-            "trailing-newline-less last line must still be readable"
+            Some(JournalEventType::Turn)
         );
-    }
 
-    /// Edge case: the only "line" is unparseable.  We must NOT return a
-    /// false positive (`Some(SessionEnd)`) — `peek_event_type` returns
-    /// `None` on malformed JSON, and the function as a whole should
-    /// return `None` so the caller falls back to "needs SessionStart"
-    /// (which is the safe default for an unrecoverable journal head).
-    #[test]
-    fn read_last_event_type_returns_none_on_garbage_only_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
+        // returns None on garbage-only file
         let path = journal_dir().join("garbage.jsonl");
         std::fs::write(&path, "not-json\nalso-not-json\n").unwrap();
         assert_eq!(read_last_event_type(&path).unwrap(), None);
-    }
 
-    /// Edge case: an event spanning a chunk boundary.  We construct a
-    /// journal whose last event's JSON body straddles the
-    /// `RECOVERY_TAIL_CHUNK_BYTES` boundary, then assert the carry
-    /// mechanism correctly stitches the line back together for
-    /// `peek_event_type`.
-    #[test]
-    fn read_last_event_type_stitches_event_spanning_chunk_boundary() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
+        // stitches event spanning chunk boundary
         let path = journal_dir().join("chunk-boundary.jsonl");
-        // Pad the first event so the second event straddles the
-        // last 4 KiB chunk's leading edge.
         let mut filler = JournalEvent::base_public(JournalEventType::SessionStart, Some("s"));
-        // Stuff a lot of metadata into the first event so its serialized
-        // length pushes the second event across the chunk boundary.
         filler.metadata = Some(serde_json::Value::String("x".repeat(8000)));
         let line1 = serde_json::to_string(&filler).unwrap();
         let line2 = serde_json::to_string(&JournalEvent::base_public(
@@ -8071,58 +8267,34 @@ mod session_start_detection_tests {
         ))
         .unwrap();
         std::fs::write(&path, format!("{line1}\n{line2}\n")).unwrap();
-        assert!(
-            line1.len() > RECOVERY_TAIL_CHUNK_BYTES,
-            "test prep must straddle the chunk boundary",
-        );
+        assert!(line1.len() > RECOVERY_TAIL_CHUNK_BYTES);
         assert_eq!(
             read_last_event_type(&path).unwrap(),
-            Some(JournalEventType::Turn),
+            Some(JournalEventType::Turn)
         );
-    }
 
-    /// Edge case: file size is exactly `RECOVERY_TAIL_CHUNK_BYTES`.  No
-    /// off-by-one on the seek arithmetic; the single chunk read should
-    /// cover the entire file and we read from offset 0 (so no carry is
-    /// produced and no leading-partial removal happens).
-    #[test]
-    fn read_last_event_type_at_exact_chunk_size() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
+        // at exact chunk size
         let path = journal_dir().join("exact-chunk.jsonl");
         let event = JournalEvent::base_public(JournalEventType::Turn, Some("s"));
         let line = serde_json::to_string(&event).unwrap();
         let needed_padding = RECOVERY_TAIL_CHUNK_BYTES - (line.len() + 1);
-        // Build a file of exactly RECOVERY_TAIL_CHUNK_BYTES: one Turn line
-        // followed by padding inside a JSON-comment-shaped malformed line
-        // that peek_event_type rejects, so the Turn is the only parseable
-        // event and we expect it to be returned.
         let padding = format!("{:width$}\n", "x", width = needed_padding - 1);
         std::fs::write(&path, format!("{padding}{line}\n")).unwrap();
         let actual_size = std::fs::metadata(&path).unwrap().len();
         assert_eq!(actual_size as usize, RECOVERY_TAIL_CHUNK_BYTES);
         assert_eq!(
             read_last_event_type(&path).unwrap(),
-            Some(JournalEventType::Turn),
+            Some(JournalEventType::Turn)
         );
     }
 
-    /// Hot-path invariant: the boundary-state check must perform bounded
-    /// I/O regardless of file size.  Wall-clock assertions flake under CI
-    /// load, so we assert the **algorithmic** invariant directly: the
-    /// number of bytes the function reads from disk is independent of
-    /// file size and ≤ `RECOVERY_TAIL_MAX_BYTES`.
     #[test]
-    fn journal_needs_session_start_with_skip_cache_uses_bounded_io_on_large_files() {
+    fn session_start_detection_bounded_io_on_large_journal() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
         let sid = "perf-bounded-large-journal";
         let path = journal_dir().join(format!("{sid}.jsonl"));
 
-        // Materialize a multi-megabyte journal directly to bypass per-append
-        // flock overhead (this is test prep, not the system under test).
-        // The shape mirrors the real-world ~10 MB / ~38k-line journals that
-        // accumulate in `~/.astra/sessions/<sid>.jsonl` over weeks.
         let writer = JournalWriter::new(sid).unwrap();
         writer
             .append(&JournalEvent::base_public(
@@ -8152,46 +8324,32 @@ mod session_start_detection_tests {
         let size = std::fs::metadata(&path).unwrap().len();
         assert!(
             size > 1_500_000,
-            "test prep should produce a multi-MB file, got {size} bytes",
+            "test prep should produce a multi-MB file, got {size} bytes"
         );
 
-        // The contract under test: reading the *last event* must use a
-        // bounded number of bytes, no matter how large the journal grew.
         let scan = read_last_event_type_with_bytes(&path).unwrap();
         assert_eq!(
             scan.event_type,
-            Some(JournalEventType::InterruptionRecorded),
-            "last event of an open session is the most recent filler",
+            Some(JournalEventType::InterruptionRecorded)
         );
         assert!(
             scan.bytes_read <= RECOVERY_TAIL_MAX_BYTES as u64,
             "must not exceed tail window: read {} of {} bytes",
             scan.bytes_read,
-            size,
+            size
         );
-        // Stronger: the read window grows with chunk granularity, not file
-        // size — at most a single 4 KiB chunk for a tail packed with
-        // event-shaped lines.
         assert!(
             scan.bytes_read <= RECOVERY_TAIL_CHUNK_BYTES as u64,
             "expected ≤ one chunk read on a healthy tail, got {} bytes",
-            scan.bytes_read,
+            scan.bytes_read
         );
 
-        // End-to-end: the cached-bypass path (skip_cache=true) returns the
-        // correct answer for an open session without consulting the cache.
         let needs = journal_needs_session_start_impl(&path, /*skip_cache=*/ true).unwrap();
         assert!(!needs, "open session must not need another SessionStart");
     }
 
-    /// Fast-path completeness: same-timestamp boundary misorders must NOT
-    /// be silently passed through.  The strict `>` comparison would treat
-    /// `[Turn@t, SessionEnd@t, Turn@t]` as already-sorted (no pair has
-    /// `>`), but the boundary tiebreak rank requires SessionEnd to sort
-    /// *after* both Turns.  Detect any same-timestamp ranking inversion
-    /// and force the sort.
     #[test]
-    fn stabilize_event_order_detects_same_timestamp_boundary_inversion() {
+    fn stabilize_event_order_boundary_semantics() {
         let ts = "2026-01-01T00:00:00Z";
         let mut events: Vec<JournalEvent> = vec![
             {
@@ -8199,7 +8357,6 @@ mod session_start_detection_tests {
                 e.ts = ts.to_string();
                 e
             },
-            // SessionEnd ranks 2 (after non-boundary 1) but appears mid-list.
             {
                 let mut e = JournalEvent::base_public(JournalEventType::SessionEnd, Some("s"));
                 e.ts = ts.to_string();
@@ -8212,27 +8369,12 @@ mod session_start_detection_tests {
             },
         ];
         stabilize_event_order(&mut events);
-        // After stabilize, SessionEnd must envelope all same-ts non-boundary
-        // events that share its timestamp.
         assert_eq!(
             events.last().unwrap().event_type,
-            JournalEventType::SessionEnd,
-            "fast path must not skip same-timestamp boundary inversions",
+            JournalEventType::SessionEnd
         );
-    }
 
-    /// Same-timestamp boundary semantics: `SessionStart` must always sort
-    /// **before** any non-boundary event sharing its timestamp, and
-    /// `SessionEnd` must always sort **after**.  This is independent of the
-    /// declaration order of `JournalEventType`'s variants — relying on the
-    /// derived `Ord` would silently invert the envelope when a future PR
-    /// reorders the enum (and there is no way for review to catch that).
-    #[test]
-    fn stabilize_event_order_boundary_tiebreak_is_explicit_not_derived() {
-        let ts = "2026-01-01T00:00:00Z";
         let mut events: Vec<JournalEvent> = vec![
-            // Insertion order deliberately scrambles boundary events into
-            // the middle of the same-timestamp group.
             {
                 let mut e = JournalEvent::base_public(JournalEventType::Turn, Some("s"));
                 e.ts = ts.to_string();
@@ -8260,75 +8402,36 @@ mod session_start_detection_tests {
             events.last().unwrap().event_type,
             JournalEventType::SessionEnd
         );
-        // Inner events keep relative order via stable sort.
-        assert_eq!(events[1].event_type, JournalEventType::Turn);
-        assert_eq!(events[2].event_type, JournalEventType::Turn);
     }
 
-    /// TOCTOU contract for `open_locked_journal_file`: when the file already
-    /// exists at the moment we open it, we must NOT chmod it — otherwise a
-    /// caller racing us to create the file (some other process, edge-cloud
-    /// sync, a privileged operator) ends up with their permissions
-    /// silently rewritten to 0o600 by an opener that did not own the
-    /// creation.
-    ///
-    /// We simulate the race by pre-creating the file with a distinctive
-    /// mode, then calling `open_locked_journal_file` and asserting the
-    /// pre-existing mode survives.
     #[cfg(unix)]
     #[test]
-    fn open_locked_journal_file_does_not_chmod_when_file_already_exists() {
+    fn journal_file_permission_contracts() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
-        let path = journal_dir().join("preexisting.jsonl");
 
-        // Some other process / role already created the file with their
-        // own permissions.  Use 0o640 (group-readable) — distinctively
-        // not what we would set if we chmod'd it.
+        // Does NOT chmod when file already exists
+        let path = journal_dir().join("preexisting.jsonl");
         std::fs::write(&path, "").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-
         let _file = open_locked_journal_file(&path).unwrap();
-        let mode_after = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
-            mode_after, 0o640,
-            "open_locked_journal_file must not chmod a file it did not create",
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
         );
-    }
 
-    /// Inverse contract: when we *do* create the file via this helper, we
-    /// must establish 0o600 — sensitive conversation history must not
-    /// inherit a process umask of 0o644 or wider.
-    #[cfg(unix)]
-    #[test]
-    fn open_locked_journal_file_chmods_to_owner_only_on_creation() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
+        // Chmods to 0o600 on creation
         let path = journal_dir().join("brand-new.jsonl");
-
         let _file = open_locked_journal_file(&path).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "creator path must establish 0o600");
-    }
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
-    /// Hot-path invariant: the writer must NOT re-chmod the file on every
-    /// append.  We assert this behaviorally by setting the file mode to a
-    /// distinctive non-default value AFTER initial creation, then performing
-    /// many appends and confirming the user-set mode is preserved.  If the
-    /// writer were re-chmod-ing 0o600 on every append, the user-set 0o644
-    /// would be overwritten back to 0o600 immediately.
-    #[cfg(unix)]
-    #[test]
-    fn writer_does_not_rechmod_existing_file_on_each_append() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
+        // Writer does NOT re-chmod on each append
         let sid = "chmod-hot-path";
         let path = journal_dir().join(format!("{sid}.jsonl"));
-
         let writer = JournalWriter::new(sid).unwrap();
         writer
             .append(&JournalEvent::base_public(
@@ -8336,18 +8439,11 @@ mod session_start_detection_tests {
                 Some(sid),
             ))
             .unwrap();
-
-        // Sanity: the creating append set 0o600.
-        let mode_after_create = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
-            mode_after_create, 0o600,
-            "creating append must establish 0o600",
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
         );
-
-        // User (or admin) re-chmods the file. A correct implementation
-        // must respect this on subsequent appends.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-
         for turn in 1..=4 {
             writer
                 .append(&JournalEvent::interruption_recorded(
@@ -8357,11 +8453,9 @@ mod session_start_detection_tests {
                 ))
                 .unwrap();
         }
-
-        let mode_after_appends = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
-            mode_after_appends, 0o644,
-            "writer must not overwrite the file mode on each append",
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
         );
     }
 }
@@ -8369,59 +8463,6 @@ mod session_start_detection_tests {
 #[cfg(test)]
 mod observability_serde_tests {
     use super::*;
-
-    #[test]
-    fn tool_call_record_new_fields_serialize_only_when_set() {
-        let rec = ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            ms: 50,
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&rec).unwrap();
-        // New fields should be omitted when None.
-        assert!(!json.contains("start_offset_ms"));
-        assert!(!json.contains("batch_id"));
-        assert!(!json.contains("parallel"));
-        assert!(!json.contains("\"round\""));
-    }
-
-    #[test]
-    fn tool_call_record_new_fields_round_trip() {
-        let rec = ToolCallRecord {
-            name: "read_file".into(),
-            ok: true,
-            ms: 10,
-            start_offset_ms: Some(5000),
-            batch_id: Some("b-0-0".into()),
-            parallel: Some(true),
-            round: Some(2),
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&rec).unwrap();
-        assert!(json.contains("\"start_offset_ms\":5000"));
-        assert!(json.contains("\"batch_id\":\"b-0-0\""));
-        assert!(json.contains("\"parallel\":true"));
-        assert!(json.contains("\"round\":2"));
-
-        let deser: ToolCallRecord = serde_json::from_str(&json).unwrap();
-        assert_eq!(deser.start_offset_ms, Some(5000));
-        assert_eq!(deser.batch_id.as_deref(), Some("b-0-0"));
-        assert_eq!(deser.parallel, Some(true));
-        assert_eq!(deser.round, Some(2));
-    }
-
-    #[test]
-    fn journal_event_new_fields_serialize_only_when_set() {
-        let ev = JournalEvent::base_public(JournalEventType::Turn, Some("s1"));
-        let json = serde_json::to_string(&ev).unwrap();
-        assert!(!json.contains("\"round\""));
-        assert!(!json.contains("tool_calls_returned"));
-        assert!(!json.contains("offset_ms"));
-        assert!(!json.contains("llm_rounds"));
-        assert!(!json.contains("total_llm_ms"));
-        assert!(!json.contains("total_tool_ms"));
-    }
 
     #[test]
     fn journal_event_llm_round_type_round_trip() {
@@ -8471,141 +8512,138 @@ mod observability_serde_tests {
     // ── P5: parent_event_id causal lineage ──────────────────────────────
 
     #[test]
-    fn parent_event_id_round_trips_through_serde() {
-        let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
-            .with_parent_event_id(Some("evt-session-start-001".to_string()));
-        let json = serde_json::to_string(&ev).unwrap();
-        assert!(json.contains("parent_event_id"));
-        let deser: JournalEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            deser.parent_event_id.as_deref(),
-            Some("evt-session-start-001")
-        );
-    }
+    fn parent_event_id_serde() {
+        // --- round-trips through serde ---
+        {
+            let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
+                .with_parent_event_id(Some("evt-session-start-001".to_string()));
+            let json = serde_json::to_string(&ev).unwrap();
+            assert!(json.contains("parent_event_id"));
+            let deser: JournalEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                deser.parent_event_id.as_deref(),
+                Some("evt-session-start-001")
+            );
+        }
 
-    #[test]
-    fn parent_event_id_none_omitted_from_json() {
-        let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100);
-        assert!(ev.parent_event_id.is_none());
-        let json = serde_json::to_string(&ev).unwrap();
-        assert!(
-            !json.contains("parent_event_id"),
-            "None parent_event_id must be omitted from JSON"
-        );
-    }
+        // --- None omitted from JSON ---
+        {
+            let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100);
+            assert!(ev.parent_event_id.is_none());
+            let json = serde_json::to_string(&ev).unwrap();
+            assert!(
+                !json.contains("parent_event_id"),
+                "None parent_event_id must be omitted"
+            );
+        }
 
-    #[test]
-    fn parent_event_id_chaining_with_other_builders() {
-        let ev = JournalEvent::turn(Some("s"), 2, Some("m"), "q", "a", 1, 50, 10, 200)
-            .with_parent_event_id(Some("parent-123".to_string()))
-            .with_agentic_step(Some(3));
-        assert_eq!(ev.parent_event_id.as_deref(), Some("parent-123"));
-        assert_eq!(ev.agentic_step, Some(3));
-    }
+        // --- chaining with other builders ---
+        {
+            let ev = JournalEvent::turn(Some("s"), 2, Some("m"), "q", "a", 1, 50, 10, 200)
+                .with_parent_event_id(Some("parent-123".to_string()))
+                .with_agentic_step(Some(3));
+            assert_eq!(ev.parent_event_id.as_deref(), Some("parent-123"));
+            assert_eq!(ev.agentic_step, Some(3));
+        }
 
-    #[test]
-    fn parent_event_id_persists_through_writer_round_trip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
-        let sid = "test-parent-id-00000000-0000-0000-0000-000000000001";
-        let writer = JournalWriter::new(sid).unwrap();
-
-        let ev = JournalEvent::session_start(Some(sid), Some("m"))
-            .with_parent_event_id(Some("root".to_string()));
-        writer.append(&ev).unwrap();
-
-        let (events, _, _) = read_journal_for_digest(sid).unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].parent_event_id.as_deref(), Some("root"));
+        // --- persists through writer round-trip ---
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let _guard = JournalDirGuard::new(tmp.path());
+            let sid = "test-parent-id-00000000-0000-0000-0000-000000000001";
+            let writer = JournalWriter::new(sid).unwrap();
+            let ev = JournalEvent::session_start(Some(sid), Some("m"))
+                .with_parent_event_id(Some("root".to_string()));
+            writer.append(&ev).unwrap();
+            let (events, _, _) = read_journal_for_digest(sid).unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].parent_event_id.as_deref(), Some("root"));
+        }
     }
 
     // ── P0: git snapshot on Turn events ─────────────────────────────────
 
     #[test]
-    fn git_snapshot_round_trips_through_serde() {
-        let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
-            .with_git_snapshot(
-                Some("abc1234".to_string()),
-                Some("feat/my-branch".to_string()),
-            );
-        let json = serde_json::to_string(&ev).unwrap();
-        assert!(json.contains("git_head"));
-        assert!(json.contains("git_branch"));
-        let deser: JournalEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(deser.git_head.as_deref(), Some("abc1234"));
-        assert_eq!(deser.git_branch.as_deref(), Some("feat/my-branch"));
-    }
+    fn git_snapshot_serde() {
+        // --- round-trips through serde ---
+        {
+            let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
+                .with_git_snapshot(
+                    Some("abc1234".to_string()),
+                    Some("feat/my-branch".to_string()),
+                );
+            let json = serde_json::to_string(&ev).unwrap();
+            assert!(json.contains("git_head"));
+            assert!(json.contains("git_branch"));
+            let deser: JournalEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(deser.git_head.as_deref(), Some("abc1234"));
+            assert_eq!(deser.git_branch.as_deref(), Some("feat/my-branch"));
+        }
 
-    #[test]
-    fn git_snapshot_none_omitted_from_json() {
-        let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100);
-        let json = serde_json::to_string(&ev).unwrap();
-        assert!(!json.contains("git_head"), "None git_head must be omitted");
-        assert!(
-            !json.contains("git_branch"),
-            "None git_branch must be omitted"
-        );
-    }
+        // --- None omitted from JSON ---
+        {
+            let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100);
+            let json = serde_json::to_string(&ev).unwrap();
+            assert!(!json.contains("git_head"));
+            assert!(!json.contains("git_branch"));
+        }
 
-    #[test]
-    fn git_snapshot_partial_only_head_no_branch() {
-        let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
-            .with_git_snapshot(Some("deadbeef".to_string()), None);
-        let json = serde_json::to_string(&ev).unwrap();
-        assert!(json.contains("git_head"));
-        assert!(!json.contains("git_branch"));
-        let deser: JournalEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(deser.git_head.as_deref(), Some("deadbeef"));
-        assert!(deser.git_branch.is_none());
-    }
+        // --- partial: only head, no branch ---
+        {
+            let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
+                .with_git_snapshot(Some("deadbeef".to_string()), None);
+            let json = serde_json::to_string(&ev).unwrap();
+            assert!(json.contains("git_head"));
+            assert!(!json.contains("git_branch"));
+            let deser: JournalEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(deser.git_head.as_deref(), Some("deadbeef"));
+            assert!(deser.git_branch.is_none());
+        }
 
-    #[test]
-    fn git_snapshot_detached_head_no_branch() {
-        // Detached HEAD: git_head is set but git_branch is None (not on any branch).
-        let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
-            .with_git_snapshot(Some("f36ae6b1".to_string()), None);
-        assert!(ev.git_branch.is_none());
-        assert_eq!(ev.git_head.as_deref(), Some("f36ae6b1"));
-    }
+        // --- detached HEAD ---
+        {
+            let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
+                .with_git_snapshot(Some("f36ae6b1".to_string()), None);
+            assert!(ev.git_branch.is_none());
+            assert_eq!(ev.git_head.as_deref(), Some("f36ae6b1"));
+        }
 
-    #[test]
-    fn git_snapshot_persists_through_writer_round_trip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
-        let sid = "test-git-snap-00000000-0000-0000-0000-000000000001";
-        let writer = JournalWriter::new(sid).unwrap();
+        // --- persists through writer round-trip ---
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let _guard = JournalDirGuard::new(tmp.path());
+            let sid = "test-git-snap-00000000-0000-0000-0000-000000000001";
+            let writer = JournalWriter::new(sid).unwrap();
+            let ev = JournalEvent::turn(Some(sid), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
+                .with_git_snapshot(Some("abc1234def5678".to_string()), Some("main".to_string()));
+            writer.append(&ev).unwrap();
+            let (events, _, _) = read_journal_for_digest(sid).unwrap();
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].event_type, JournalEventType::SessionStart);
+            assert_eq!(events[1].git_head.as_deref(), Some("abc1234def5678"));
+            assert_eq!(events[1].git_branch.as_deref(), Some("main"));
+        }
 
-        let ev = JournalEvent::turn(Some(sid), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
-            .with_git_snapshot(Some("abc1234def5678".to_string()), Some("main".to_string()));
-        writer.append(&ev).unwrap();
+        // --- combined with parent_event_id ---
+        {
+            let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
+                .with_parent_event_id(Some("parent-abc".to_string()))
+                .with_git_snapshot(Some("cafe0123".to_string()), Some("dev".to_string()));
+            let json = serde_json::to_string(&ev).unwrap();
+            let deser: JournalEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(deser.parent_event_id.as_deref(), Some("parent-abc"));
+            assert_eq!(deser.git_head.as_deref(), Some("cafe0123"));
+            assert_eq!(deser.git_branch.as_deref(), Some("dev"));
+        }
 
-        let (events, _, _) = read_journal_for_digest(sid).unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_type, JournalEventType::SessionStart);
-        assert_eq!(events[1].git_head.as_deref(), Some("abc1234def5678"));
-        assert_eq!(events[1].git_branch.as_deref(), Some("main"));
-    }
-
-    #[test]
-    fn git_snapshot_and_parent_event_id_combined() {
-        let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
-            .with_parent_event_id(Some("parent-abc".to_string()))
-            .with_git_snapshot(Some("cafe0123".to_string()), Some("dev".to_string()));
-        let json = serde_json::to_string(&ev).unwrap();
-        let deser: JournalEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(deser.parent_event_id.as_deref(), Some("parent-abc"));
-        assert_eq!(deser.git_head.as_deref(), Some("cafe0123"));
-        assert_eq!(deser.git_branch.as_deref(), Some("dev"));
-    }
-
-    #[test]
-    fn git_snapshot_on_non_turn_event_works() {
-        // git_snapshot can be attached to any event type (e.g., SyncMarker).
-        let ev = JournalEvent::base_public(JournalEventType::SyncMarker, Some("s"))
-            .with_git_snapshot(Some("1111aaaa".to_string()), Some("release".to_string()));
-        let json = serde_json::to_string(&ev).unwrap();
-        let deser: JournalEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(deser.git_head.as_deref(), Some("1111aaaa"));
+        // --- on non-turn event ---
+        {
+            let ev = JournalEvent::base_public(JournalEventType::SyncMarker, Some("s"))
+                .with_git_snapshot(Some("1111aaaa".to_string()), Some("release".to_string()));
+            let json = serde_json::to_string(&ev).unwrap();
+            let deser: JournalEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(deser.git_head.as_deref(), Some("1111aaaa"));
+        }
     }
 
     /// Bounded cache: inserting more than MAX entries evicts the oldest

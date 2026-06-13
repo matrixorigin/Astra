@@ -7050,68 +7050,53 @@ mod tests {
     // See `reusable_speculative_output` for the fix rationale.
 
     #[test]
-    fn edge_post_auth_failure_is_auth_error_not_user_cancel() {
+    fn edge_post_auth_failure() {
+        // auth failure overrides "Cancelled by user"
         let mut accum = ChatTurnSseAccum {
             error_message: Some("Cancelled by user".to_string()),
             ..Default::default()
         };
-
         apply_edge_auth_failure_result(&mut accum, true);
-
         let error = accum.error_message.as_deref().unwrap_or_default();
         assert!(error.contains("401 Unauthorized"));
         assert!(!error.contains("Cancelled by user"));
-    }
 
-    #[test]
-    fn edge_post_without_auth_failure_keeps_existing_error() {
-        let mut accum = ChatTurnSseAccum {
+        // without auth failure keeps existing error
+        let mut accum2 = ChatTurnSseAccum {
             error_message: Some("Cancelled by user".to_string()),
             ..Default::default()
         };
-
-        apply_edge_auth_failure_result(&mut accum, false);
-
-        assert_eq!(accum.error_message.as_deref(), Some("Cancelled by user"));
+        apply_edge_auth_failure_result(&mut accum2, false);
+        assert_eq!(accum2.error_message.as_deref(), Some("Cancelled by user"));
     }
 
     #[test]
-    fn approval_stale_revalidation_allows_unchanged_file() {
+    fn approval_stale_revalidation() {
+        // unchanged file passes
         let dir = tempdir().unwrap();
         let path = dir.path().join("a.txt");
         std::fs::write(&path, b"baseline").unwrap();
         let previous = astra_turn_core::approval_base_digest::compute_file_digest(&path).unwrap();
+        assert!(
+            approval_stale_revalidation_error("str_replace", &path, previous).is_none(),
+            "unchanged file should pass revalidation"
+        );
 
-        let error = approval_stale_revalidation_error("str_replace", &path, previous);
-
-        assert!(error.is_none(), "unchanged file should pass revalidation");
-    }
-
-    #[test]
-    fn approval_stale_revalidation_blocks_modified_file() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("a.txt");
-        std::fs::write(&path, b"baseline").unwrap();
-        let previous = astra_turn_core::approval_base_digest::compute_file_digest(&path).unwrap();
+        // modified file blocked
         std::fs::write(&path, b"changed").unwrap();
+        let prev2 = astra_turn_core::approval_base_digest::compute_file_digest(&path).unwrap();
+        std::fs::write(&path, b"changed again").unwrap();
+        let error2 = approval_stale_revalidation_error("str_replace", &path, prev2).unwrap();
+        assert!(error2.contains("Approval expired for str_replace"));
+        assert!(error2.contains("changed from"));
 
-        let error = approval_stale_revalidation_error("str_replace", &path, previous).unwrap();
-
-        assert!(error.contains("Approval expired for str_replace"));
-        assert!(error.contains("changed from"));
-    }
-
-    #[test]
-    fn approval_stale_revalidation_blocks_file_appearing_after_prompt() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("new.txt");
-        let previous = astra_turn_core::approval_base_digest::compute_file_digest(&path).unwrap();
-        assert!(previous.is_none());
-        std::fs::write(&path, b"created elsewhere").unwrap();
-
-        let error = approval_stale_revalidation_error("write_file", &path, previous).unwrap();
-
-        assert!(error.contains("appeared after approval"));
+        // file appearing after prompt blocked
+        let path3 = dir.path().join("new.txt");
+        let prev3 = astra_turn_core::approval_base_digest::compute_file_digest(&path3).unwrap();
+        assert!(prev3.is_none());
+        std::fs::write(&path3, b"created elsewhere").unwrap();
+        let error3 = approval_stale_revalidation_error("write_file", &path3, prev3).unwrap();
+        assert!(error3.contains("appeared after approval"));
     }
 
     #[test]
@@ -7137,20 +7122,17 @@ mod tests {
     }
 
     #[test]
-    fn approval_default_always_scope_prefers_project_for_benign_request() {
-        let ctx = astra_turn_core::permission::scope::ScopeAvailabilityContext::default();
-
-        assert_eq!(
-            approval_default_always_scope(&ctx),
-            astra_turn_core::permission::scope::AllowScope::Project
-        );
-    }
-
-    #[test]
-    fn approval_default_always_scope_uses_session_for_non_persistent_risks() {
+    fn test_approval_default_always_scope() {
         use astra_turn_core::permission::engine::RiskTag;
         use astra_turn_core::permission::scope::{AllowScope, ScopeAvailabilityContext};
 
+        // prefers project for benign request
+        assert_eq!(
+            approval_default_always_scope(&ScopeAvailabilityContext::default()),
+            AllowScope::Project
+        );
+
+        // uses session for non-persistent risks
         let sensitive = ScopeAvailabilityContext {
             risk_tags: vec![RiskTag::WritesSensitiveFile],
             ..Default::default()
@@ -7290,28 +7272,23 @@ mod tests {
     }
 
     #[test]
-    fn approval_memory_preview_uses_product_language_not_permission_dsl() {
+    fn test_approval_memory_preview() {
         let preview = approval_memory_preview(
             "bash",
             &serde_json::json!({"command": "npm test -- --watch"}),
             Some("web"),
         );
-
         assert_eq!(preview, "the `npm test` command family under `web/`");
         assert!(
             !preview.contains("Bash(") && !preview.contains("argv_prefix"),
             "approval prompt must not expose permission-rule syntax: {preview}"
         );
-    }
 
-    #[test]
-    fn approval_memory_preview_describes_file_edits_without_exact_scope_terms() {
         let preview = approval_memory_preview(
             "write_file",
             &serde_json::json!({"path": "src/lib.rs"}),
             None,
         );
-
         assert_eq!(preview, "file edits in this workspace");
         assert!(
             !preview.contains("Exact") && !preview.contains("Prefix"),
@@ -7376,21 +7353,17 @@ mod tests {
     }
 
     #[test]
-    fn approval_memory_action_does_not_remember_allow_once() {
+    fn test_approval_memory_action() {
         use crate::cli::chat_stream::ApprovalResponse;
         use astra_turn_core::permission::scope::AllowScope;
 
+        // AllowOnce -> None
         assert_eq!(
             approval_memory_action(&ApprovalResponse::AllowOnce, AllowScope::Project, true),
             ApprovalMemoryAction::None
         );
-    }
 
-    #[test]
-    fn approval_memory_action_maps_always_scope_to_storage_effect() {
-        use crate::cli::chat_stream::ApprovalResponse;
-        use astra_turn_core::permission::scope::AllowScope;
-
+        // AlwaysAllow mappings
         assert_eq!(
             approval_memory_action(&ApprovalResponse::AlwaysAllow, AllowScope::Project, true),
             ApprovalMemoryAction::PersistProjectRule
@@ -7876,35 +7849,26 @@ mod tests {
     }
 
     #[test]
-    fn reusable_speculative_output_accepts_successful_result() {
+    fn test_reusable_speculative_output() {
+        // accepts successful result
         let out = reusable_speculative_output(Some(("real grep hit: line 42".to_string(), true)));
         assert_eq!(out, Some("real grep hit: line 42".to_string()));
-    }
 
-    #[test]
-    fn reusable_speculative_output_rejects_failed_result_even_with_content() {
-        // A failed speculation may carry a non-empty error message. That
-        // message MUST NOT be reused as a successful tool_result — the real
-        // execution path must re-run so genuine status surfaces.
-        let out = reusable_speculative_output(Some((
+        // rejects failed result even with content
+        let out2 = reusable_speculative_output(Some((
             "Error: permission denied on /etc/shadow".to_string(),
             false,
         )));
-        assert_eq!(out, None);
-    }
+        assert_eq!(out2, None);
 
-    #[test]
-    fn reusable_speculative_output_rejects_none() {
-        let out = reusable_speculative_output(None);
-        assert_eq!(out, None);
-    }
+        // rejects None
+        assert_eq!(reusable_speculative_output(None), None);
 
-    #[test]
-    fn reusable_speculative_output_rejects_failed_empty_content() {
-        // Semaphore-saturated speculation returns empty content + success=false.
-        // Must not be reused (would surface empty output as successful tool_result).
-        let out = reusable_speculative_output(Some((String::new(), false)));
-        assert_eq!(out, None);
+        // rejects failed empty content (semaphore saturation)
+        assert_eq!(
+            reusable_speculative_output(Some((String::new(), false))),
+            None
+        );
     }
 
     fn init_temp_git_repo() -> tempfile::TempDir {
@@ -7979,71 +7943,55 @@ mod tests {
     }
 
     #[test]
-    fn tool_completion_icon_grep_substring_warning_in_hit_is_not_warn() {
-        let out = r#"crates/x/src/lib.rs:42:    tracing::warn!("⚠ WARNING: retry");"#;
-        let (_icon, is_warning) = tool_completion_icon("grep", "ok", out, 50);
+    fn tool_completion_icon_ok_cases() {
+        // grep: substring "warning" in a match line is NOT a warning
+        let (_, w) = tool_completion_icon(
+            "grep",
+            "ok",
+            r#"crates/x/src/lib.rs:42:    tracing::warn!("⚠ WARNING: retry");"#,
+            50,
+        );
         assert!(
-            !is_warning,
+            !w,
             "grep output must not warn just because a match line contains the substring"
         );
-    }
-
-    #[test]
-    fn tool_completion_icon_platform_banner_line_is_warn() {
-        let out = "\n\n⚠ WARNING: This file has been read 4+ times this session.";
-        let (_icon, is_warning) = tool_completion_icon("read_file", "ok", out, 10);
-        assert!(is_warning);
-    }
-
-    #[test]
-    fn tool_completion_icon_glob_no_files_found_is_ok() {
-        let (_icon, is_warning) = tool_completion_icon("glob", "ok", "No files found", 50);
-        assert!(!is_warning);
-    }
-
-    #[test]
-    fn tool_completion_icon_grep_no_matches_is_ok() {
-        let (_icon, is_warning) = tool_completion_icon("grep", "ok", "No matches found", 50);
-        assert!(!is_warning);
-    }
-
-    #[test]
-    fn tool_completion_icon_grep_empty_stdout_is_ok() {
-        let (_icon, is_warning) = tool_completion_icon("grep", "ok", "", 50);
+        // glob: no files found is ok
+        assert!(!tool_completion_icon("glob", "ok", "No files found", 50).1);
+        // grep: no matches is ok
+        assert!(!tool_completion_icon("grep", "ok", "No matches found", 50).1);
+        // grep: empty stdout is ok
         assert!(
-            !is_warning,
+            !tool_completion_icon("grep", "ok", "", 50).1,
             "empty grep result must not be a warning when status is ok"
         );
-    }
-
-    #[test]
-    fn tool_completion_icon_glob_empty_stdout_is_ok() {
-        let (_icon, is_warning) = tool_completion_icon("glob", "ok", "", 50);
-        assert!(!is_warning);
-    }
-
-    #[test]
-    fn tool_completion_icon_read_file_empty_still_warns() {
-        let (_icon, is_warning) = tool_completion_icon("read_file", "ok", "", 50);
-        assert!(is_warning);
-    }
-
-    #[test]
-    fn tool_completion_icon_bash_clippy_style_warning_substring_is_ok() {
+        // glob: empty stdout is ok
+        assert!(!tool_completion_icon("glob", "ok", "", 50).1);
+        // bash: compiler warning lines are not a completion warning
         let out = "warning: unused variable\n --> src/lib.rs:1:5\n\nwarning: another\n";
-        let (_icon, is_warning) = tool_completion_icon("bash", "ok", out, 50);
         assert!(
-            !is_warning,
+            !tool_completion_icon("bash", "ok", out, 50).1,
             "stdout may contain compiler warning: lines; do not treat as completion warning"
         );
     }
 
     #[test]
-    fn tool_completion_icon_treats_non_ok_status_as_error() {
-        let (icon, is_warning) =
-            tool_completion_icon("bash", "permission_denied", "Permission denied", 50);
+    fn tool_completion_icon_warn_and_error() {
+        // platform banner line is a warning
+        assert!(
+            tool_completion_icon(
+                "read_file",
+                "ok",
+                "\n\n⚠ WARNING: This file has been read 4+ times this session.",
+                10
+            )
+            .1
+        );
+        // read_file empty still warns
+        assert!(tool_completion_icon("read_file", "ok", "", 50).1);
+        // non-ok status is error
+        let (icon, w) = tool_completion_icon("bash", "permission_denied", "Permission denied", 50);
         assert_eq!(icon, theme::icon_err());
-        assert!(!is_warning);
+        assert!(!w);
     }
 
     /// `dispatch_turn_event_block` with `quiet` must still fill the shared runtime accumulator.
@@ -8110,52 +8058,44 @@ mod tests {
     // ── Regression: intermediate draft text must not leak ─────────────
 
     #[test]
-    fn final_text_cleanup_strips_reflect_tags() {
+    fn final_text_cleanup_strips_xml_tags() {
+        // reflect tags
         let mut text = "before\n<reflect>hidden</reflect>\nafter".to_string();
         streaming_md::strip_xml_tags_inplace(&mut text);
         assert_eq!(text, "before\nafter");
-    }
 
-    #[test]
-    fn final_text_cleanup_strips_think_tags() {
-        let mut text = "before\n<think>\nlong thinking block\n</think>\nafter".to_string();
-        streaming_md::strip_xml_tags_inplace(&mut text);
-        assert_eq!(text, "before\nafter");
+        // think tags
+        let mut text2 = "before\n<think>\nlong thinking block\n</think>\nafter".to_string();
+        streaming_md::strip_xml_tags_inplace(&mut text2);
+        assert_eq!(text2, "before\nafter");
     }
 
     // ── Line tracking ────────────────────────────────────────────────
 
     #[test]
-    fn track_output_counts_newlines() {
+    fn track_line_counting() {
+        // count newlines
         let mut s = StreamRenderState::new();
         s.track_output("hello\nworld\n");
         assert_eq!(s.lines_written, 2);
-    }
 
-    #[test]
-    fn track_output_counts_wraps() {
-        let mut s = StreamRenderState::with_term_width(10, false, false);
-        // 20 chars = 2 wraps on a 10-col terminal
-        s.track_output("12345678901234567890");
-        assert_eq!(s.lines_written, 2);
-    }
+        // count wraps
+        let mut s2 = StreamRenderState::with_term_width(10, false, false);
+        s2.track_output("12345678901234567890");
+        assert_eq!(s2.lines_written, 2);
 
-    #[test]
-    fn track_eprintln_increments_line() {
-        let mut s = StreamRenderState::new();
-        s.track_eprintln();
-        s.track_eprintln();
-        assert_eq!(s.lines_written, 2);
-    }
+        // eprintln increments
+        let mut s3 = StreamRenderState::new();
+        s3.track_eprintln();
+        s3.track_eprintln();
+        assert_eq!(s3.lines_written, 2);
 
-    #[test]
-    fn track_mixed_stdout_stderr_lines() {
-        let mut s = StreamRenderState::with_term_width(80, false, false);
-        // Simulate: thinking line (stderr) + streamed text (stdout) + tool_request (stderr)
-        s.track_eprintln(); // ● Thought for 1.4s
-        s.track_output("Let me review the code\n"); // text_delta
-        s.track_eprintln(); // ⚡ tool_request: bash
-        assert_eq!(s.lines_written, 3);
+        // mixed stdout/stderr
+        let mut s4 = StreamRenderState::with_term_width(80, false, false);
+        s4.track_eprintln(); // ● Thought for 1.4s
+        s4.track_output("Let me review the code\n"); // text_delta
+        s4.track_eprintln(); // ⚡ tool_request: bash
+        assert_eq!(s4.lines_written, 3);
     }
 
     // ── Regression: stderr tool-done lines must be tracked in lines_written ──
@@ -8170,30 +8110,25 @@ mod tests {
     // now increment `lines_written` for stderr output lines.
 
     #[test]
-    fn tool_done_inline_stderr_lines_counted_in_lines_written() {
+    fn tool_done_tracks_stderr_lines() {
+        // inline mode
         let mut s = StreamRenderState::with_term_width(80, false, false);
-        s.track_output("Draft review text\n"); // 1 stdout line
+        s.track_output("Draft review text\n");
         assert_eq!(s.lines_written, 1);
-
-        // Call actual method: emits 1 stderr line (summary only, no error detail)
         s.tool_done_inline("bash", &serde_json::json!({}), "success", 100, "done");
         assert!(
             s.lines_written >= 2,
             "lines_written should account for stderr"
         );
         assert!(s.stderr_lines >= 1, "stderr_lines should be incremented");
-    }
 
-    #[test]
-    fn tool_done_md_mode_stderr_lines_counted_in_lines_written() {
-        let mut s = StreamRenderState::with_term_width(80, true, false); // md mode
-        s.track_output("Intermediate draft\n"); // 1 stdout line
-        assert_eq!(s.lines_written, 1);
-
-        // Call actual method in md mode
-        s.tool_done(0, "bash", &serde_json::json!({}), "success", 100, "done");
+        // md mode
+        let mut s2 = StreamRenderState::with_term_width(80, true, false);
+        s2.track_output("Intermediate draft\n");
+        assert_eq!(s2.lines_written, 1);
+        s2.tool_done(0, "bash", &serde_json::json!({}), "success", 100, "done");
         assert!(
-            s.lines_written >= 2,
+            s2.lines_written >= 2,
             "md mode should still track lines_written"
         );
     }
@@ -8201,31 +8136,28 @@ mod tests {
     // ── Partial tag detection ────────────────────────────────────────
 
     #[test]
-    fn could_become_suppressed_tag_matches_known_prefixes() {
+    fn could_become_suppressed_tag() {
         use crate::cli::stream::streaming_md::could_become_suppressed_tag;
-        assert!(could_become_suppressed_tag("<"));
-        assert!(could_become_suppressed_tag("</"));
-        assert!(could_become_suppressed_tag("<t"));
-        assert!(could_become_suppressed_tag("<th"));
-        assert!(could_become_suppressed_tag("<thi"));
-        assert!(could_become_suppressed_tag("<thin"));
-        assert!(could_become_suppressed_tag("<think"));
-        assert!(could_become_suppressed_tag("</think"));
-        assert!(could_become_suppressed_tag("<r"));
-        assert!(could_become_suppressed_tag("<ref"));
-        assert!(could_become_suppressed_tag("</reflect"));
-    }
-
-    #[test]
-    fn could_become_suppressed_tag_rejects_other_tags() {
-        use crate::cli::stream::streaming_md::could_become_suppressed_tag;
-        assert!(!could_become_suppressed_tag("<co")); // <code>
-        assert!(!could_become_suppressed_tag("<p"));
-        assert!(!could_become_suppressed_tag("<div"));
-        assert!(!could_become_suppressed_tag("<span"));
-        assert!(!could_become_suppressed_tag("</code"));
-        assert!(!could_become_suppressed_tag("<a"));
-        assert!(!could_become_suppressed_tag("<b"));
+        // known prefixes match
+        for p in &[
+            "<",
+            "</",
+            "<t",
+            "<th",
+            "<thi",
+            "<thin",
+            "<think",
+            "</think",
+            "<r",
+            "<ref",
+            "</reflect",
+        ] {
+            assert!(could_become_suppressed_tag(p));
+        }
+        // other tags rejected
+        for p in &["<co", "<p", "<div", "<span", "</code", "<a", "<b"] {
+            assert!(!could_become_suppressed_tag(p));
+        }
     }
 
     #[test]
@@ -8238,7 +8170,8 @@ mod tests {
     }
 
     #[test]
-    fn extract_cli_diff_from_write_file_json() {
+    fn extract_cli_diff() {
+        // from write_file JSON
         let diff_body = "--- a/x.js\n+++ b/x.js\n@@ -1,1 +1,1 @@\n-old\n+new\n";
         let out = serde_json::json!({
             "success": true,
@@ -8249,14 +8182,12 @@ mod tests {
         .to_string();
         let got = extract_cli_diff_block(&out).expect("diff");
         assert_eq!(got.as_ref(), diff_body);
-    }
 
-    #[test]
-    fn extract_cli_diff_sentinel_wrapped() {
+        // sentinel wrapped
         let embedded = "+++ b/f\n+ok\n";
-        let out = format!("<<<ASTRA_UNIFIED_DIFF>>>{embedded}<<<END_ASTRA_UNIFIED_DIFF>>>");
-        let got = extract_cli_diff_block(&out).expect("diff");
-        assert_eq!(got.as_ref(), embedded.trim());
+        let out2 = format!("<<<ASTRA_UNIFIED_DIFF>>>{embedded}<<<END_ASTRA_UNIFIED_DIFF>>>");
+        let got2 = extract_cli_diff_block(&out2).expect("diff");
+        assert_eq!(got2.as_ref(), embedded.trim());
     }
 
     // extract_first_absolute_path moved to crate::sandbox_retry — its
@@ -8266,72 +8197,58 @@ mod tests {
     // ── style_tool_description tests ──
 
     #[test]
-    fn style_skill_description_has_bold_prefix() {
-        let styled = style_tool_description("skill", "Running skill: code-review");
-        // Should contain ANSI codes (bold+magenta) and the skill name
-        assert!(styled.contains("code-review"));
-        assert!(styled.contains("Running skill"));
-        // Plain text without ANSI should NOT match (it has escape sequences)
-        assert_ne!(styled, "Running skill: code-review");
-    }
-
-    #[test]
-    fn style_mcp_description_has_bold_prefix() {
-        let styled = style_tool_description("mcp_github_search", "MCP github search");
-        assert!(styled.contains("search"));
-        assert!(styled.contains("MCP"));
-        assert_ne!(styled, "MCP github search");
-    }
-
-    #[test]
-    fn style_read_file_has_bold_prefix() {
-        let styled = style_tool_description("read_file", "Reading: src/main.rs");
-        assert!(styled.contains("src/main.rs"));
-        assert!(styled.contains("Reading:"));
-        assert_ne!(styled, "Reading: src/main.rs");
-    }
-
-    #[test]
-    fn style_bash_has_bold_prefix() {
-        let styled = style_tool_description("bash", "$ echo hello");
-        assert!(styled.contains("echo hello"));
-        assert!(styled.contains("$"));
-        assert_ne!(styled, "$ echo hello");
-    }
-
-    #[test]
-    fn style_shell_exec_matches_bash() {
-        let styled = style_tool_description("shell_exec", "$ cargo test -p astra-cli");
-        assert!(styled.contains("cargo test"));
-        assert_ne!(styled, "$ cargo test -p astra-cli");
+    fn test_style_tool_description() {
+        // skill
+        let s = style_tool_description("skill", "Running skill: code-review");
+        assert!(s.contains("code-review"));
+        assert!(s.contains("Running skill"));
+        assert_ne!(s, "Running skill: code-review");
+        // mcp
+        let s = style_tool_description("mcp_github_search", "MCP github search");
+        assert!(s.contains("search"));
+        assert!(s.contains("MCP"));
+        assert_ne!(s, "MCP github search");
+        // read_file
+        let s = style_tool_description("read_file", "Reading: src/main.rs");
+        assert!(s.contains("src/main.rs"));
+        assert!(s.contains("Reading:"));
+        assert_ne!(s, "Reading: src/main.rs");
+        // bash
+        let s = style_tool_description("bash", "$ echo hello");
+        assert!(s.contains("echo hello"));
+        assert!(s.contains("$"));
+        assert_ne!(s, "$ echo hello");
+        // shell_exec matches bash style
+        let s = style_tool_description("shell_exec", "$ cargo test -p astra-cli");
+        assert!(s.contains("cargo test"));
+        assert_ne!(s, "$ cargo test -p astra-cli");
     }
 
     // ── Skill/MCP format_tool_description tests ──
 
     #[test]
-    fn format_skill_description() {
+    fn format_tool_description_skill_and_mcp() {
         let r = StreamRenderState::new();
-        let args = serde_json::json!({"skill_name": "code-review"});
-        let desc = r.format_tool_description("skill", &args);
-        assert_eq!(desc, "Running skill: code-review");
+        // skill
+        assert_eq!(
+            r.format_tool_description("skill", &serde_json::json!({"skill_name": "code-review"})),
+            "Running skill: code-review"
+        );
+        // mcp with server_and_tool
+        assert_eq!(
+            r.format_tool_description("mcp_github_search_repos", &serde_json::json!({})),
+            "MCP github search_repos"
+        );
+        // mcp without underscore
+        assert_eq!(
+            r.format_tool_description("mcp_mytool", &serde_json::json!({})),
+            "MCP mytool"
+        );
     }
 
     #[test]
-    fn format_mcp_description_with_server_and_tool() {
-        let r = StreamRenderState::new();
-        let desc = r.format_tool_description("mcp_github_search_repos", &serde_json::json!({}));
-        assert_eq!(desc, "MCP github search_repos");
-    }
-
-    #[test]
-    fn format_mcp_description_no_underscore() {
-        let r = StreamRenderState::new();
-        let desc = r.format_tool_description("mcp_mytool", &serde_json::json!({}));
-        assert_eq!(desc, "MCP mytool");
-    }
-
-    #[test]
-    fn format_git_preview_display_names() {
+    fn format_git_and_github_previews() {
+        // git
         assert_eq!(
             format_tool_display_from_preview("git_revert_commit", Some("abc123")),
             "Git revert abc123"
@@ -8352,10 +8269,7 @@ mod tests {
             format_tool_display_from_preview("git_contributors", Some("src/ since 30 days ago")),
             "Git contributors src/ since 30 days ago"
         );
-    }
-
-    #[test]
-    fn format_additional_git_tool_preview_display_names() {
+        // additional git tools
         assert_eq!(
             format_tool_display_from_preview("git_checkout_file", Some("HEAD~1 -- src/lib.rs")),
             "Git checkout HEAD~1 -- src/lib.rs"
@@ -8364,10 +8278,7 @@ mod tests {
             format_tool_display_from_preview("git_worktree", Some("add feature/ui")),
             "Git worktree add feature/ui"
         );
-    }
-
-    #[test]
-    fn format_github_preview_display_names() {
+        // github
         assert_eq!(
             format_tool_display_from_preview("github_get_issue", Some("matrixorigin/astra#147")),
             "Getting issue: matrixorigin/astra#147"
@@ -8379,14 +8290,15 @@ mod tests {
         assert_eq!(
             format_tool_display_from_preview(
                 "github_create_issue",
-                Some("matrixorigin/astra: \"Fix renderer drift\""),
+                Some("matrixorigin/astra: \"Fix renderer drift\"")
             ),
             "Creating issue: matrixorigin/astra: \"Fix renderer drift\""
         );
     }
 
     #[test]
-    fn format_utility_preview_display_names() {
+    fn format_utility_and_meta_previews() {
+        // utility
         assert_eq!(
             format_tool_display_from_preview("ask_user", Some("Continue with the refactor?")),
             "Asking user: \"Continue with the refactor?\""
@@ -8399,10 +8311,7 @@ mod tests {
             format_tool_display_from_preview("tool_search", Some("\"git\"")),
             "Searching tools: \"git\""
         );
-    }
-
-    #[test]
-    fn format_meta_tool_preview_display_names() {
+        // meta / agent
         assert_eq!(
             format_tool_display_from_preview(
                 "agent",
@@ -8434,34 +8343,26 @@ mod tests {
             format_tool_display_from_preview("query_context", Some("auth/")),
             "Query context: auth/"
         );
-    }
-
-    #[test]
-    fn format_memory_maintenance_preview_display_names() {
+        // memory
         assert_eq!(
             format_tool_display_from_preview("memory", Some("action=purge topic=...")),
             "Memory: action=purge topic=..."
         );
         assert_eq!(format_tool_display_from_preview("memory", None), "Memory");
-    }
-
-    #[test]
-    fn format_web_search_description_and_preview() {
+        // web search
         let r = StreamRenderState::new();
-        let desc = r.format_tool_description(
-            "web_search",
-            &serde_json::json!({"query": "matrixone latest"}),
+        assert_eq!(
+            r.format_tool_description(
+                "web_search",
+                &serde_json::json!({"query": "matrixone latest"})
+            ),
+            "Searching web: \"matrixone latest\""
         );
-
-        assert_eq!(desc, "Searching web: \"matrixone latest\"");
         assert_eq!(
             format_tool_display_from_preview("web_search", Some("matrixone latest")),
             "Searching web: \"matrixone latest\""
         );
-    }
-
-    #[test]
-    fn format_analysis_tool_preview_display_names() {
+        // analysis
         assert_eq!(
             format_tool_display_from_preview("get_agent_info", Some("budget")),
             "Getting agent info: budget"
@@ -8481,23 +8382,21 @@ mod tests {
     }
 
     #[test]
-    fn format_session_state_tool_preview_display_names() {
+    fn format_session_and_rollback_previews() {
+        // session state
         assert_eq!(
             format_tool_display_from_preview("powershell", Some("Get-ChildItem")),
             "PS> Get-ChildItem"
         );
         assert_eq!(
-            format_tool_display_from_preview("adjust_config", Some("display.max_output_lines"),),
+            format_tool_display_from_preview("adjust_config", Some("display.max_output_lines")),
             "Adjust config: display.max_output_lines"
         );
         assert_eq!(
             format_tool_display_from_preview("rollback_session_state", Some("turn 5")),
             "Rollback session state: turn 5"
         );
-    }
-
-    #[test]
-    fn format_rollback_tool_preview_display_names() {
+        // rollback tools
         assert_eq!(
             format_tool_display_from_preview("rollback_file_edits", Some("src/main.rs")),
             "Revert file edits: src/main.rs"
@@ -8510,10 +8409,7 @@ mod tests {
             format_tool_display_from_preview("rollback_turn_actions", Some("turn 7")),
             "Rollback turn actions: turn 7"
         );
-    }
-
-    #[test]
-    fn format_task_preview_display_names() {
+        // task
         assert_eq!(
             format_tool_display_from_preview("task", Some("create \"Fix renderer drift\"")),
             "Creating task: \"Fix renderer drift\""
@@ -8544,7 +8440,8 @@ mod tests {
     }
 
     #[test]
-    fn format_mo_preview_display_names() {
+    fn format_code_tool_previews() {
+        // mo
         assert_eq!(
             format_tool_display_from_preview("mo_query", Some("select * from users")),
             "MatrixOne query: \"select * from users\""
@@ -8557,10 +8454,7 @@ mod tests {
             format_tool_display_from_preview("mo_branch", Some("create exp-a")),
             "MatrixOne branch: create exp-a"
         );
-    }
-
-    #[test]
-    fn format_code_navigation_preview_display_names() {
+        // code navigation
         assert_eq!(
             format_tool_display_from_preview("hover_info", Some("src/lib.rs:42:3")),
             "Hover info at src/lib.rs:42:3"
@@ -8568,7 +8462,7 @@ mod tests {
         assert_eq!(
             format_tool_display_from_preview(
                 "type_hierarchy",
-                Some("SessionStore (implementations)"),
+                Some("SessionStore (implementations)")
             ),
             "Type hierarchy for SessionStore (implementations)"
         );
@@ -8580,72 +8474,9 @@ mod tests {
             format_tool_display_from_preview("lsp", Some("hover src/lib.rs:42:3")),
             "LSP: hover src/lib.rs:42:3"
         );
-    }
-
-    #[test]
-    fn format_call_graph_preview_respects_path_budget() {
-        let r = StreamRenderState::new();
-        let preview = r
-            ._format_tool_arg_preview_unused(
-                "call_graph",
-                &serde_json::json!({
-                    "path": "/very/long/path/to/deeply/nested/module/with/more/components/src/lib.rs",
-                    "start_line": 10,
-                    "end_line": 24
-                }),
-            )
-            .expect("preview");
-        assert!(preview.starts_with(".../"));
-        assert!(preview.ends_with(":10-24"));
-        assert!(preview.chars().count() <= 40);
-    }
-
-    #[test]
-    fn format_location_previews_respect_path_budget() {
-        let r = StreamRenderState::new();
-        let hover = r
-            ._format_tool_arg_preview_unused(
-                "hover_info",
-                &serde_json::json!({
-                    "file": "/very/long/path/to/deeply/nested/module/with/more/components/src/lib.rs",
-                    "line": 42,
-                    "column": 3
-                }),
-            )
-            .expect("hover preview");
-        let extract = r
-            ._format_tool_arg_preview_unused(
-                "extract_members",
-                &serde_json::json!({
-                    "file": "/very/long/path/to/deeply/nested/module/with/more/components/src/lib.rs",
-                    "line": 88
-                }),
-            )
-            .expect("extract preview");
-        let lsp = r
-            ._format_tool_arg_preview_unused(
-                "lsp",
-                &serde_json::json!({
-                    "operation": "hover",
-                    "file": "/very/long/path/to/deeply/nested/module/with/more/components/src/lib.rs",
-                    "line": 42,
-                    "column": 3
-                }),
-            )
-            .expect("lsp preview");
-
-        assert!(hover.ends_with(":42:3"));
-        assert!(hover.chars().count() <= 40);
-        assert!(extract.ends_with(":88"));
-        assert!(extract.chars().count() <= 40);
-        assert!(lsp.ends_with(":42:3"));
-        assert!(lsp.chars().count() <= 40);
-    }
-
-    #[test]
-    fn format_remaining_code_tool_preview_display_names() {
+        // remaining
         assert_eq!(
-            format_tool_display_from_preview("rename_symbol", Some("SessionStore -> StoreSession"),),
+            format_tool_display_from_preview("rename_symbol", Some("SessionStore -> StoreSession")),
             "Rename symbol SessionStore -> StoreSession"
         );
         assert_eq!(
@@ -8656,6 +8487,44 @@ mod tests {
             format_tool_display_from_preview("extract_members", Some("src/lib.rs:88")),
             "Extract members: src/lib.rs:88"
         );
+    }
+
+    #[test]
+    fn format_path_budget_previews() {
+        let r = StreamRenderState::new();
+        let long_path = "/very/long/path/to/deeply/nested/module/with/more/components/src/lib.rs";
+        // call_graph
+        let p = r
+            ._format_tool_arg_preview_unused(
+                "call_graph",
+                &serde_json::json!({"path": long_path, "start_line": 10, "end_line": 24}),
+            )
+            .expect("preview");
+        assert!(p.starts_with(".../"));
+        assert!(p.ends_with(":10-24"));
+        assert!(p.chars().count() <= 40);
+        // hover_info
+        let p = r
+            ._format_tool_arg_preview_unused(
+                "hover_info",
+                &serde_json::json!({"file": long_path, "line": 42, "column": 3}),
+            )
+            .expect("preview");
+        assert!(p.ends_with(":42:3"));
+        assert!(p.chars().count() <= 40);
+        // extract_members
+        let p = r
+            ._format_tool_arg_preview_unused(
+                "extract_members",
+                &serde_json::json!({"file": long_path, "line": 88}),
+            )
+            .expect("preview");
+        assert!(p.ends_with(":88"));
+        assert!(p.chars().count() <= 40);
+        // lsp hover
+        let p = r._format_tool_arg_preview_unused("lsp", &serde_json::json!({"operation": "hover", "file": long_path, "line": 42, "column": 3})).expect("preview");
+        assert!(p.ends_with(":42:3"));
+        assert!(p.chars().count() <= 40);
     }
 
     #[serial_test::serial]
@@ -8673,224 +8542,149 @@ mod tests {
     // ── Skill/MCP output summary tests ──
 
     #[test]
-    fn skill_output_summary_collapses_preview_lines() {
+    fn output_summary_basics() {
         let r = StreamRenderState::new();
-        let output = "Result line 1\nResult line 2\nResult line 3\nLine 4\nLine 5";
-        let summary = r.format_output_summary("skill", output, "ok");
-        assert!(summary.is_some());
-        let s = summary.unwrap();
+        // skill: collapses preview lines
+        let s = r
+            .format_output_summary(
+                "skill",
+                "Result line 1\nResult line 2\nResult line 3\nLine 4\nLine 5",
+                "ok",
+            )
+            .expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Preview);
         assert_eq!(s.text, "5 output lines captured");
-    }
-
-    #[test]
-    fn skill_output_summary_empty() {
-        let r = StreamRenderState::new();
+        // skill empty
         assert!(r.format_output_summary("skill", "", "ok").is_none());
         assert!(
             r.format_output_summary("skill", "   \n  \n", "ok")
                 .is_none()
         );
-    }
 
-    #[test]
-    fn mcp_output_summary_collapses_preview_lines() {
-        let r = StreamRenderState::new();
-        let output = "Found 3 repos\nrepo1\nrepo2\nrepo3";
-        let summary = r.format_output_summary("mcp_github_search", output, "ok");
-        assert!(summary.is_some());
-        let s = summary.unwrap();
+        // mcp: collapses + json arrays + empty
+        let s = r
+            .format_output_summary(
+                "mcp_github_search",
+                "Found 3 repos\nrepo1\nrepo2\nrepo3",
+                "ok",
+            )
+            .expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Preview);
         assert_eq!(s.text, "4 output lines captured");
-    }
-
-    #[test]
-    fn mcp_output_summary_formats_json_arrays_structurally() {
-        let r = StreamRenderState::new();
-        let output = r#"[{"name":"repo1","stars":10},{"name":"repo2","stars":5}]"#;
-        let summary = r
-            .format_output_summary("mcp_github_search", output, "ok")
+        let s = r
+            .format_output_summary(
+                "mcp_github_search",
+                r#"[{"name":"repo1","stars":10},{"name":"repo2","stars":5}]"#,
+                "ok",
+            )
             .expect("summary");
-        assert_eq!(summary.kind, ToolOutputSummaryKind::Structural);
-        assert_eq!(summary.text, "json array · 2 items · keys: name, stars");
-    }
-
-    #[test]
-    fn mcp_output_summary_empty() {
-        let r = StreamRenderState::new();
+        assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
+        assert_eq!(s.text, "json array · 2 items · keys: name, stars");
         assert!(
             r.format_output_summary("mcp_github_search", "", "ok")
                 .is_none()
         );
-    }
 
-    #[test]
-    fn bash_output_summary_collapses_preview_lines() {
-        let r = StreamRenderState::new();
-        let summary = r
+        // bash
+        let s = r
             .format_output_summary("bash", "line 1\nline 2\nline 3\nline 4", "ok")
             .expect("summary");
-        assert_eq!(summary.kind, ToolOutputSummaryKind::Preview);
-        assert_eq!(summary.text, "4 lines captured");
-    }
-
-    #[test]
-    fn failure_output_summary_never_returns_empty_for_empty_output() {
-        let r = StreamRenderState::new();
-        let summary = r
+        assert_eq!(s.kind, ToolOutputSummaryKind::Preview);
+        assert_eq!(s.text, "4 lines captured");
+        // failure
+        let s = r
             .format_output_summary("bash", "", "failed")
-            .expect("failure summary");
-        assert_eq!(summary.kind, ToolOutputSummaryKind::Error);
-        assert_eq!(summary.text, "bash failed before returning output");
-    }
-
-    #[test]
-    fn grep_output_summary_keeps_only_match_counts() {
-        let r = StreamRenderState::new();
-        let output = "src/a.rs:10:foo\nsrc/a.rs:11:foo\nsrc/b.rs:8:foo";
-        let summary = r
-            .format_output_summary("grep", output, "ok")
             .expect("summary");
-        assert_eq!(summary.kind, ToolOutputSummaryKind::Preview);
-        assert_eq!(summary.text, "3 matches in 2 file(s)");
-    }
+        assert_eq!(s.kind, ToolOutputSummaryKind::Error);
+        assert_eq!(s.text, "bash failed before returning output");
 
-    #[test]
-    fn grep_output_summary_no_matches_found_not_one_match() {
-        let r = StreamRenderState::new();
-        let summary = r
+        // grep: match counts + no matches
+        let s = r
+            .format_output_summary(
+                "grep",
+                "src/a.rs:10:foo\nsrc/a.rs:11:foo\nsrc/b.rs:8:foo",
+                "ok",
+            )
+            .expect("summary");
+        assert_eq!(s.kind, ToolOutputSummaryKind::Preview);
+        assert_eq!(s.text, "3 matches in 2 file(s)");
+        let s = r
             .format_output_summary("grep", "No matches found", "ok")
             .expect("summary");
-        assert_eq!(summary.kind, ToolOutputSummaryKind::Structural);
-        assert_eq!(summary.text, "no matches");
-    }
+        assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
+        assert_eq!(s.text, "no matches");
 
-    #[test]
-    fn glob_output_summary_no_files_found_not_one_file() {
-        let r = StreamRenderState::new();
-        let summary = r
+        // glob
+        let s = r
             .format_output_summary("glob", "No files found", "ok")
             .expect("summary");
-        assert_eq!(summary.kind, ToolOutputSummaryKind::Structural);
-        assert_eq!(summary.text, "no matches");
-    }
+        assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
+        assert_eq!(s.text, "no matches");
 
-    #[test]
-    fn git_diff_output_summary_stays_structural() {
-        let r = StreamRenderState::new();
-        let output = "\
-diff --git a/src/a.rs b/src/a.rs\n\
---- a/src/a.rs\n\
-+++ b/src/a.rs\n\
-@@ -1 +1 @@\n\
--old\n\
-+new\n";
-        let summary = r
-            .format_output_summary("git_diff", output, "ok")
+        // git_diff
+        let s = r.format_output_summary("git_diff", "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n", "ok").expect("summary");
+        assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
+        assert!(s.text.contains("+1"));
+        assert!(s.text.contains("-1"));
+        assert!(s.text.contains("src/a.rs"));
+
+        // str_replace
+        let s = r.format_output_summary("str_replace", "<<<ASTRA_UNIFIED_DIFF>>>\n--- a/src/hello.py\n+++ b/src/hello.py\n@@ -1,2 +1,3 @@\n-print(\"old\")\n+print(\"new\")\n+print(\"more\")\n<<<END_ASTRA_UNIFIED_DIFF>>>", "ok").expect("summary");
+        assert_eq!(s.kind, ToolOutputSummaryKind::Diff);
+        assert!(s.text.contains("--- a/src/hello.py"));
+        assert!(s.text.contains("+++ b/src/hello.py"));
+        assert!(s.text.contains("@@ -1,2 +1,3 @@"));
+        assert!(s.text.contains("+print(\"new\")"));
+        assert!(!s.text.contains('\x1b'));
+
+        // generic json
+        let s = r
+            .format_output_summary(
+                "custom_tool",
+                r#"{"status":"ok","count":2,"items":["a","b"]}"#,
+                "ok",
+            )
             .expect("summary");
-        assert_eq!(summary.kind, ToolOutputSummaryKind::Structural);
-        assert!(summary.text.contains("+1"));
-        assert!(summary.text.contains("-1"));
-        assert!(summary.text.contains("src/a.rs"));
+        assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
+        assert_eq!(s.text, "json object · keys: count, items, status");
     }
 
     #[test]
-    fn str_replace_output_summary_keeps_raw_diff_preview_for_tui_rendering() {
+    fn web_fetch_output_summary() {
         let r = StreamRenderState::new();
-        let output = "\
-<<<ASTRA_UNIFIED_DIFF>>>\n\
---- a/src/hello.py\n\
-+++ b/src/hello.py\n\
-@@ -1,2 +1,3 @@\n\
--print(\"old\")\n\
-+print(\"new\")\n\
-+print(\"more\")\n\
-<<<END_ASTRA_UNIFIED_DIFF>>>";
-        let summary = r
-            .format_output_summary("str_replace", output, "ok")
+        // markdown heading
+        let s = r
+            .format_output_summary(
+                "web_fetch",
+                "# MatrixOne Docs\n\nWelcome to the docs.\nMore details.",
+                "ok",
+            )
             .expect("summary");
-        assert_eq!(summary.kind, ToolOutputSummaryKind::Diff);
-        assert!(summary.text.contains("--- a/src/hello.py"));
-        assert!(summary.text.contains("+++ b/src/hello.py"));
-        assert!(summary.text.contains("@@ -1,2 +1,3 @@"));
-        assert!(summary.text.contains("+print(\"new\")"));
-        assert!(!summary.text.contains('\x1b'));
+        assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
+        assert_eq!(s.text, "MatrixOne Docs · 3 lines");
+        // html title
+        let s = r.format_output_summary("web_fetch", "<html><head><title>Release Notes</title></head><body><p>Shipped.</p></body></html>", "ok").expect("summary");
+        assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
+        assert_eq!(s.text, "Release Notes · 1 line");
+        // structured json title
+        let s = r.format_output_summary("web_fetch", &serde_json::json!({"metadata": {"title": "Structured Docs"}, "content": "# Ignored Heading\n\nBody"}).to_string(), "ok").expect("summary");
+        assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
+        assert_eq!(s.text, "Structured Docs · 2 lines");
     }
 
     #[test]
-    fn generic_output_summary_formats_json_objects_structurally() {
+    fn mo_query_output_summary() {
         let r = StreamRenderState::new();
-        let output = r#"{"status":"ok","count":2,"items":["a","b"]}"#;
-        let summary = r
-            .format_output_summary("custom_tool", output, "ok")
-            .expect("summary");
-        assert_eq!(summary.kind, ToolOutputSummaryKind::Structural);
-        assert_eq!(summary.text, "json object · keys: count, items, status");
-    }
-
-    #[test]
-    fn web_fetch_output_summary_uses_markdown_heading() {
-        let r = StreamRenderState::new();
-        let output = "# MatrixOne Docs\n\nWelcome to the docs.\nMore details.";
-        let summary = r
-            .format_output_summary("web_fetch", output, "ok")
-            .expect("summary");
-        assert_eq!(summary.kind, ToolOutputSummaryKind::Structural);
-        assert_eq!(summary.text, "MatrixOne Docs · 3 lines");
-    }
-
-    #[test]
-    fn web_fetch_output_summary_uses_html_title() {
-        let r = StreamRenderState::new();
-        let output =
-            "<html><head><title>Release Notes</title></head><body><p>Shipped.</p></body></html>";
-        let summary = r
-            .format_output_summary("web_fetch", output, "ok")
-            .expect("summary");
-        assert_eq!(summary.kind, ToolOutputSummaryKind::Structural);
-        assert_eq!(summary.text, "Release Notes · 1 line");
-    }
-
-    #[test]
-    fn web_fetch_output_summary_uses_structured_json_title() {
-        let r = StreamRenderState::new();
-        let output = serde_json::json!({
-            "metadata": {"title": "Structured Docs"},
-            "content": "# Ignored Heading\n\nBody"
-        })
-        .to_string();
-        let summary = r
-            .format_output_summary("web_fetch", &output, "ok")
-            .expect("summary");
-        assert_eq!(summary.kind, ToolOutputSummaryKind::Structural);
-        assert_eq!(summary.text, "Structured Docs · 2 lines");
-    }
-
-    #[test]
-    fn mo_query_output_summary_extracts_row_and_column_counts() {
-        let r = StreamRenderState::new();
-        let output = "\
-+----+-------+\n\
-| id | name  |\n\
-+----+-------+\n\
-| 1  | alice |\n\
-| 2  | bob   |\n\
-+----+-------+\n";
-        let summary = r
-            .format_output_summary("mo_query", output, "ok")
-            .expect("summary");
-        assert_eq!(summary.kind, ToolOutputSummaryKind::Structural);
-        assert_eq!(summary.text, "2 rows · cols: id, name");
-    }
-
-    #[test]
-    fn mo_query_output_summary_handles_query_ok_messages() {
-        let r = StreamRenderState::new();
-        let summary = r
+        // row and column counts
+        let s = r.format_output_summary("mo_query", "+----+-------+\n| id | name  |\n+----+-------+\n| 1  | alice |\n| 2  | bob   |\n+----+-------+\n", "ok").expect("summary");
+        assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
+        assert_eq!(s.text, "2 rows · cols: id, name");
+        // query ok messages
+        let s = r
             .format_output_summary("mo_query", "Query OK, 1 row affected (0.02 sec)", "ok")
             .expect("summary");
-        assert_eq!(summary.kind, ToolOutputSummaryKind::Structural);
-        assert_eq!(summary.text, "Query OK, 1 row affected (0.02 sec)");
+        assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
+        assert_eq!(s.text, "Query OK, 1 row affected (0.02 sec)");
     }
 
     // ── Text buffering contract ─────────────────────────────────────────
@@ -8907,40 +8701,24 @@ diff --git a/src/a.rs b/src/a.rs\n\
     // the buffer; non-tool turns render it one-shot.
 
     #[test]
-    fn buffer_from_start_is_always_true() {
-        // The construction invariant: buffer_from_start must be true
-        // regardless of TTY mode or skill_continuation.  This prevents
-        // text from being rendered to stdout during streaming.
-        //
-        // Previously: `ctx.skill_continuation || !is_terminal()`
-        // Now:        `true`
-        //
-        // If this test fails, text leakage will return.
+    fn buffer_and_text_rendering_contract() {
+        // buffer_from_start must always be true to prevent text leakage
         let buffer_from_start = true; // mirrors stream_render.rs:176
         assert!(
             buffer_from_start,
             "buffer_from_start must be true to prevent TTY/scrollback text leakage"
         );
-    }
 
-    #[test]
-    fn tool_turn_discards_buffered_text() {
-        // Simulate tool turn finalization: text was buffered, tools executed.
-        // has_any_tool_work=true → buffer must be discarded.
+        // tool turn: buffer is discarded (not rendered)
         let pending_xml_buffer = "╔══════ draft review text ══════╗".to_string();
         let has_any_tool_work = true;
         if has_any_tool_work {
-            // Tool turn: buffer is dropped (not rendered).
             drop(pending_xml_buffer);
         } else {
             panic!("Tool turn should discard text");
         }
-    }
 
-    #[test]
-    fn final_answer_renders_buffered_text() {
-        // Simulate final-answer finalization: text was buffered, no tools.
-        // has_any_tool_work=false → buffer must be rendered.
+        // final answer: buffer is rendered (no tools)
         let pending_xml_buffer = "Here is my final answer".to_string();
         let has_any_tool_work = false;
         let rendered = if has_any_tool_work {
@@ -8952,66 +8730,45 @@ diff --git a/src/a.rs b/src/a.rs\n\
             buf
         };
         assert_eq!(rendered, "Here is my final answer");
+
+        // tool_turn_discards_text_buffer: when tools present, text discarded
+        let mut result = TurnResult::new();
+        result.core.full_text = "Let me use a tool...".to_string();
+        result.core.has_tool_calls = true;
+        assert!(
+            result.core.has_tool_calls || !result.edge_tool_round.is_empty(),
+            "tool turn should flag tool work"
+        );
     }
 
     #[test]
-    fn buffered_text_has_xml_tags_stripped_at_finalization() {
-        // Text that was buffered may contain thinking tags from the LLM.
-        // At finalization, strip_xml_tags_inplace removes them.
+    fn text_xml_cleanup_and_deferred_render() {
+        // xml tags stripped at finalization
         let mut buf = "intro\n<think>internal reasoning</think>\nconclusion".to_string();
         streaming_md::strip_xml_tags_inplace(&mut buf);
         assert_eq!(buf, "intro\nconclusion");
-    }
 
-    // ── Deferred text rendering tests ───────────────────────────────────
-
-    #[test]
-    fn consume_turn_sse_does_not_render_text_for_non_tool_turn() {
-        // With the deferred rendering architecture, consume_turn_sse should
-        // never render text directly. The text is returned in result.full_text
-        // and rendering is handled by host.render_final_text() in the agentic loop.
-        // This test verifies the contract by checking that result.full_text
-        // carries the answer text without any stdout side-effects.
+        // deferred rendering: text returned via result.full_text, not stdout
         let mut result = TurnResult::new();
         result.core.full_text = "The answer is 42.".to_string();
         assert!(!result.core.has_tool_calls);
         assert!(result.edge_tool_round.is_empty());
-        // The text is available for deferred rendering by the host.
         assert_eq!(result.core.full_text, "The answer is 42.");
-    }
-
-    #[test]
-    fn tool_turn_discards_text_buffer() {
-        // When tools are present, text is intermediate and should be discarded.
-        let mut result = TurnResult::new();
-        result.core.full_text = "Let me use a tool...".to_string();
-        result.core.has_tool_calls = true;
-        let has_any_tool_work = result.core.has_tool_calls || !result.edge_tool_round.is_empty();
-        assert!(has_any_tool_work, "tool turn should flag tool work");
-        // Caller discards text for tool turns — correct behavior.
     }
 
     // ── Edge-path skill dedup tests ─────────────────────────────────────
 
     #[test]
-    fn skill_dedup_hashset_tracks_invocations() {
-        // Verifies the dedup data structure used in CliSseStreamHost.
+    fn skill_dedup() {
+        // hashset tracks invocations
         let mut invoked = std::collections::HashSet::new();
-        // First insert returns true (new entry).
         assert!(invoked.insert("code-review".to_string()));
-        // Second insert returns false (duplicate).
         assert!(!invoked.insert("code-review".to_string()));
-        // Different skill is new.
         assert!(invoked.insert("test-writer".to_string()));
-    }
-
-    #[test]
-    fn skill_dedup_produces_correct_message() {
-        let skill_name = "code-review";
+        // produces correct message
         let msg = format!(
-            "Skill '{}' was already loaded in this turn. \
-             Follow the instructions already provided.",
-            skill_name,
+            "Skill '{}' was already loaded in this turn. Follow the instructions already provided.",
+            "code-review"
         );
         assert!(msg.contains("code-review"));
         assert!(msg.contains("already loaded"));
@@ -9020,17 +8777,8 @@ diff --git a/src/a.rs b/src/a.rs\n\
     // ── CLI skill-loaded marker tests ──────────────────────────────────
 
     #[test]
-    fn skill_loaded_marker_appended_to_successful_result() {
-        // Regression (session 11825116): the CLI edge path used
-        // `execute_skill_inline` which returned raw skill content
-        // WITHOUT appending `<skill-loaded name="..."/>`. The
-        // system prompt tells the LLM "On seeing <skill-loaded/>,
-        // do not re-invoke" — without the marker, the LLM loaded
-        // a second skill (review-code) after already loading
-        // review-changes, wasting context and confusing itself.
-        //
-        // Fix: `append_skill_loaded_marker` adds the tag to
-        // successful (non-error) results.
+    fn skill_loaded_marker() {
+        // appended to successful result
         let raw = "# Skill: review-changes\n\nYou are now executing...";
         let result = append_skill_loaded_marker(raw, "review-changes");
         assert!(
@@ -9041,26 +8789,16 @@ diff --git a/src/a.rs b/src/a.rs\n\
             result.ends_with("<skill-loaded name=\"review-changes\"/>"),
             "marker must be at the very end so LLM sees it last: {result}"
         );
-    }
 
-    #[test]
-    fn skill_loaded_marker_not_appended_to_error_result() {
-        // Error results must NOT carry the tag — the LLM should be
-        // free to retry or switch to another skill.
-        let raw = "Error: skill resolver not available";
-        let result = append_skill_loaded_marker(raw, "broken-skill");
+        // NOT appended to error result
+        let result =
+            append_skill_loaded_marker("Error: skill resolver not available", "broken-skill");
         assert!(
             !result.contains("<skill-loaded"),
             "error results must not carry the marker: {result}"
         );
-    }
 
-    #[test]
-    fn skill_loaded_marker_sanitizes_xml_special_chars() {
-        // XML-special characters (`<`, `>`, `&`, `"`, `'`) are outside
-        // the filename-safe allowlist, so they are replaced with `_`.
-        // This prevents a malicious skill name from breaking out of
-        // the `<skill-loaded name="..."/>` tag entirely.
+        // sanitizes XML special chars
         let result = append_skill_loaded_marker("ok", "a<b>&c\"d");
         assert!(
             result.contains("a_b__c_d"),
@@ -9075,15 +8813,14 @@ diff --git a/src/a.rs b/src/a.rs\n\
     // ── EdgeToolCache unit tests ─────────────────────────────────────────
 
     #[test]
-    fn edge_tool_cache_new_has_correct_limit() {
+    fn edge_tool_cache_basics() {
+        // new with correct limit
         let cache = EdgeToolCache::new(5);
         assert_eq!(cache.max_identical_calls, 5);
         assert!(cache.output_cache.is_empty());
         assert!(cache.call_counts.is_empty());
-    }
 
-    #[test]
-    fn edge_tool_cache_stores_and_retrieves() {
+        // stores and retrieves
         let mut cache = EdgeToolCache::new(3);
         let sig = "read_file:{\"path\":\"/tmp/foo\"}".to_string();
         cache.output_cache.insert(
@@ -9097,55 +8834,44 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 },
             },
         );
-        let hit = cache.output_cache.get(&sig);
-        assert!(hit.is_some());
-        let hit = hit.unwrap();
+        let hit = cache.output_cache.get(&sig).unwrap();
         assert_eq!(hit.output, "file content");
         assert_eq!(hit.status, "success");
-    }
 
-    #[test]
-    fn edge_tool_cache_call_count_increments() {
-        let mut cache = EdgeToolCache::new(3);
-        let sig = "grep:{\"pattern\":\"foo\"}".to_string();
-        let count = cache.call_counts.entry(sig.clone()).or_insert(0);
+        // call count increments
+        let sig2 = "grep:{\"pattern\":\"foo\"}".to_string();
+        let count = cache.call_counts.entry(sig2.clone()).or_insert(0);
         *count += 1;
-        assert_eq!(cache.call_counts[&sig], 1);
-        *cache.call_counts.get_mut(&sig).unwrap() += 1;
-        assert_eq!(cache.call_counts[&sig], 2);
-    }
+        assert_eq!(cache.call_counts[&sig2], 1);
+        *cache.call_counts.get_mut(&sig2).unwrap() += 1;
+        assert_eq!(cache.call_counts[&sig2], 2);
 
-    #[test]
-    fn edge_tool_cache_call_count_exceeds_limit() {
-        let mut cache = EdgeToolCache::new(2);
-        let sig = "bash:{\"command\":\"ls\"}".to_string();
-        let count = cache.call_counts.entry(sig.clone()).or_insert(0);
+        // call count exceeds limit
+        let mut cache2 = EdgeToolCache::new(2);
+        let sig3 = "bash:{\"command\":\"ls\"}".to_string();
+        let count = cache2.call_counts.entry(sig3.clone()).or_insert(0);
         *count += 1;
-        assert!(*count <= cache.max_identical_calls);
-        *cache.call_counts.get_mut(&sig).unwrap() += 1;
-        assert!(*cache.call_counts.get(&sig).unwrap() <= cache.max_identical_calls);
-        *cache.call_counts.get_mut(&sig).unwrap() += 1;
-        assert!(*cache.call_counts.get(&sig).unwrap() > cache.max_identical_calls);
+        assert!(*count <= cache2.max_identical_calls);
+        *cache2.call_counts.get_mut(&sig3).unwrap() += 1;
+        assert!(*cache2.call_counts.get(&sig3).unwrap() <= cache2.max_identical_calls);
+        *cache2.call_counts.get_mut(&sig3).unwrap() += 1;
+        assert!(*cache2.call_counts.get(&sig3).unwrap() > cache2.max_identical_calls);
     }
 
     #[test]
-    fn edge_tool_cache_read_only_tools_lookup() {
-        // Verify that well-known cacheable tools are in the set
+    fn edge_tool_cache_read_only_and_dedup() {
+        // read-only tools lookup
         assert!(READ_ONLY_TOOLS.contains(&"read_file"));
         assert!(READ_ONLY_TOOLS.contains(&"grep"));
         assert!(READ_ONLY_TOOLS.contains(&"glob"));
         assert!(READ_ONLY_TOOLS.contains(&"git_log"));
-        // bash is NOT cacheable (side effects)
         assert!(!READ_ONLY_TOOLS.contains(&"bash"));
-    }
 
-    #[test]
-    fn edge_tool_cache_dedup_signature_deterministic() {
+        // dedup signature deterministic
         let args = serde_json::json!({"path": "/tmp/foo", "pattern": "bar"});
         let sig1 = tool_dedup_signature("grep", &args);
         let sig2 = tool_dedup_signature("grep", &args);
         assert_eq!(sig1, sig2);
-        // Different tool name → different signature
         let sig3 = tool_dedup_signature("read_file", &args);
         assert_ne!(sig1, sig3);
     }
@@ -10685,7 +10411,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
     }
 
     #[test]
-    fn merge_edge_tool_rounds_recovers_missing_host_result() {
+    fn test_merge_edge_tool_rounds() {
         let consumed = vec![EdgeToolExecResult {
             request_id: "call-exit".to_string(),
             tool: "exit_plan_mode".to_string(),
@@ -10696,18 +10422,15 @@ diff --git a/src/a.rs b/src/a.rs\n\
             duration_ms: 12,
         }];
 
+        // recovers missing host result
         let merged = merge_edge_tool_rounds(Vec::new(), &consumed);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].request_id, consumed[0].request_id);
         assert_eq!(merged[0].tool, consumed[0].tool);
-        assert_eq!(merged[0].args, consumed[0].args);
         assert_eq!(merged[0].output, consumed[0].output);
         assert_eq!(merged[0].status, consumed[0].status);
-        assert_eq!(merged[0].duration_ms, consumed[0].duration_ms);
-    }
 
-    #[test]
-    fn merge_edge_tool_rounds_deduplicates_by_request_id() {
+        // deduplicates by request_id (host wins)
         let host = vec![EdgeToolExecResult {
             request_id: "call-exit".to_string(),
             tool: "exit_plan_mode".to_string(),
@@ -10717,24 +10440,10 @@ diff --git a/src/a.rs b/src/a.rs\n\
             status: "ok".to_string(),
             duration_ms: 8,
         }];
-        let consumed = vec![EdgeToolExecResult {
-            request_id: "call-exit".to_string(),
-            tool: "exit_plan_mode".to_string(),
-            args: serde_json::json!({"approved": true}),
-            output: "consumer output".to_string(),
-            tool_result_fields: None,
-            status: "ok".to_string(),
-            duration_ms: 9,
-        }];
-
         let merged = merge_edge_tool_rounds(host.clone(), &consumed);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].request_id, host[0].request_id);
-        assert_eq!(merged[0].tool, host[0].tool);
-        assert_eq!(merged[0].args, host[0].args);
         assert_eq!(merged[0].output, host[0].output);
-        assert_eq!(merged[0].status, host[0].status);
-        assert_eq!(merged[0].duration_ms, host[0].duration_ms);
     }
 
     #[serial_test::serial]
@@ -11193,64 +10902,59 @@ diff --git a/src/a.rs b/src/a.rs\n\
     }
 
     #[test]
-    fn sync_incremental_accum_updates_text_even_without_ids() {
+    fn sync_incremental_accum() {
         let state = IncrementalTurnState::default();
-        let accum = toy_accum("Hello SSE");
-        sync_incremental_accum_state(&state, &accum);
+        // updates text even without ids
+        sync_incremental_accum_state(&state, &toy_accum("Hello SSE"));
         assert_eq!(state.snapshot().partial_text, "Hello SSE");
-    }
 
-    #[test]
-    fn sync_incremental_accum_set_session_and_run_ids_first_wins() {
+        // set session and run ids: first wins
         let state = IncrementalTurnState::default();
-        let accum1 = toy_accum_with_ids("Hello", "sess-a", "run-1");
-        sync_incremental_accum_state(&state, &accum1);
-        // Second accum with different ids must be ignored (first-wins).
-        // update_text appends only the delta (new suffix), so use text that
-        // extends the first: "Hello, world!" appends ", world!" to "Hello".
-        let accum2 = toy_accum_with_ids("Hello, world!", "sess-b", "run-2");
-        sync_incremental_accum_state(&state, &accum2);
+        sync_incremental_accum_state(&state, &toy_accum_with_ids("Hello", "sess-a", "run-1"));
+        sync_incremental_accum_state(
+            &state,
+            &toy_accum_with_ids("Hello, world!", "sess-b", "run-2"),
+        );
         let snap = state.snapshot();
         assert_eq!(snap.session_id.as_deref(), Some("sess-a"));
         assert_eq!(snap.run_id.as_deref(), Some("run-1"));
         assert_eq!(snap.partial_text, "Hello, world!");
-    }
 
-    #[test]
-    fn sync_incremental_accum_empty_session_id_is_skipped() {
+        // empty session_id is skipped
         let state = IncrementalTurnState::default();
-        let accum = ChatTurnSseAccum {
-            session_id: Some(String::new()),
-            run_id: Some("run-1".into()),
-            full_text: "data".into(),
-            ..Default::default()
-        };
-        sync_incremental_accum_state(&state, &accum);
-        let snap = state.snapshot();
+        sync_incremental_accum_state(
+            &state,
+            &ChatTurnSseAccum {
+                session_id: Some(String::new()),
+                run_id: Some("run-1".into()),
+                full_text: "data".into(),
+                ..Default::default()
+            },
+        );
         assert!(
-            snap.session_id.is_none(),
+            state.snapshot().session_id.is_none(),
             "empty session_id must be filtered out"
         );
-        assert_eq!(snap.run_id.as_deref(), Some("run-1"));
-    }
+        assert_eq!(state.snapshot().run_id.as_deref(), Some("run-1"));
 
-    #[test]
-    fn sync_incremental_accum_empty_run_id_is_skipped() {
+        // empty run_id is skipped
         let state = IncrementalTurnState::default();
-        let accum = ChatTurnSseAccum {
-            session_id: Some("sess-a".into()),
-            run_id: Some(String::new()),
-            full_text: "data".into(),
-            ..Default::default()
-        };
-        sync_incremental_accum_state(&state, &accum);
-        let snap = state.snapshot();
-        assert_eq!(snap.session_id.as_deref(), Some("sess-a"));
-        assert!(snap.run_id.is_none(), "empty run_id must be filtered out");
-    }
+        sync_incremental_accum_state(
+            &state,
+            &ChatTurnSseAccum {
+                session_id: Some("sess-a".into()),
+                run_id: Some(String::new()),
+                full_text: "data".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.snapshot().session_id.as_deref(), Some("sess-a"));
+        assert!(
+            state.snapshot().run_id.is_none(),
+            "empty run_id must be filtered out"
+        );
 
-    #[test]
-    fn sync_incremental_accum_token_guarded_by_has_usage() {
+        // token guarded by has_usage
         let state = IncrementalTurnState::default();
         let mut accum = toy_accum("data");
         accum.prompt_tokens = 999;
@@ -11259,19 +10963,13 @@ diff --git a/src/a.rs b/src/a.rs\n\
         accum.cache_creation_tokens = 666;
         accum.has_usage = false;
         sync_incremental_accum_state(&state, &accum);
-
         let snap = state.snapshot();
-        assert_eq!(
-            snap.prompt_tokens, 0,
-            "has_usage=false must skip token setters"
-        );
+        assert_eq!(snap.prompt_tokens, 0);
         assert_eq!(snap.completion_tokens, 0);
         assert_eq!(snap.cache_read_tokens, 0);
         assert_eq!(snap.cache_creation_tokens, 0);
-    }
 
-    #[test]
-    fn sync_incremental_accum_sets_tokens_when_has_usage_true() {
+        // sets tokens when has_usage=true
         let state = IncrementalTurnState::default();
         let mut accum = toy_accum("data");
         accum.prompt_tokens = 300;
@@ -11280,7 +10978,6 @@ diff --git a/src/a.rs b/src/a.rs\n\
         accum.cache_creation_tokens = 0;
         accum.has_usage = true;
         sync_incremental_accum_state(&state, &accum);
-
         let snap = state.snapshot();
         assert_eq!(snap.prompt_tokens, 300);
         assert_eq!(snap.completion_tokens, 200);
@@ -11289,19 +10986,21 @@ diff --git a/src/a.rs b/src/a.rs\n\
     }
 
     #[test]
-    fn sync_incremental_tool_result_pushes_record_and_adds_tool_used() {
+    fn sync_incremental_tool_result() {
+        // pushes record and adds tool_used
         let state = IncrementalTurnState::default();
-        let result = EdgeToolExecResult {
-            request_id: "req-1".into(),
-            tool: "read_file".into(),
-            args: serde_json::json!({"path": "lib.rs"}),
-            output: "pub fn main() {}".into(),
-            tool_result_fields: None,
-            status: "ok".into(),
-            duration_ms: 42,
-        };
-        sync_incremental_tool_result_state(&state, &result);
-
+        sync_incremental_tool_result_state(
+            &state,
+            &EdgeToolExecResult {
+                request_id: "req-1".into(),
+                tool: "read_file".into(),
+                args: serde_json::json!({"path": "lib.rs"}),
+                output: "pub fn main() {}".into(),
+                tool_result_fields: None,
+                status: "ok".into(),
+                duration_ms: 42,
+            },
+        );
         let snap = state.snapshot();
         assert_eq!(snap.tool_call_records.len(), 1);
         assert_eq!(
@@ -11312,22 +11011,21 @@ diff --git a/src/a.rs b/src/a.rs\n\
         assert!(snap.tool_call_records[0].ok);
         assert_eq!(snap.tool_call_records[0].ms, 42);
         assert_eq!(snap.tools_used, vec!["read_file"]);
-    }
 
-    #[test]
-    fn sync_incremental_tool_result_error_status_records_error() {
+        // error status records error
         let state = IncrementalTurnState::default();
-        let result = EdgeToolExecResult {
-            request_id: "req-err".into(),
-            tool: "bash".into(),
-            args: serde_json::json!({"command": "rm -rf /"}),
-            output: "Permission denied".into(),
-            tool_result_fields: None,
-            status: "permission_denied".into(),
-            duration_ms: 1,
-        };
-        sync_incremental_tool_result_state(&state, &result);
-
+        sync_incremental_tool_result_state(
+            &state,
+            &EdgeToolExecResult {
+                request_id: "req-err".into(),
+                tool: "bash".into(),
+                args: serde_json::json!({"command": "rm -rf /"}),
+                output: "Permission denied".into(),
+                tool_result_fields: None,
+                status: "permission_denied".into(),
+                duration_ms: 1,
+            },
+        );
         let snap = state.snapshot();
         assert_eq!(snap.tool_call_records.len(), 1);
         assert!(!snap.tool_call_records[0].ok);

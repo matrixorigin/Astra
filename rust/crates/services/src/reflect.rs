@@ -1212,12 +1212,18 @@ mod tests {
         // high (critical, >=40%)
         let ov = make_overview(100, 40, vec![], 5, None);
         let ins = generate_insights(&ov, &[], &[]);
-        assert!(ins.iter().any(|i| i.severity == "critical" && i.category == "error_pattern"));
+        assert!(
+            ins.iter()
+                .any(|i| i.severity == "critical" && i.category == "error_pattern")
+        );
 
         // elevated (warning, 20%)
         let ov = make_overview(100, 20, vec![], 5, None);
         let ins = generate_insights(&ov, &[], &[]);
-        assert!(ins.iter().any(|i| i.severity == "warning" && i.category == "error_pattern"));
+        assert!(
+            ins.iter()
+                .any(|i| i.severity == "warning" && i.category == "error_pattern")
+        );
 
         // low (no warning)
         let ov = make_overview(100, 5, vec![], 5, None);
@@ -1227,7 +1233,10 @@ mod tests {
         // 100% (critical)
         let ov = make_overview(10, 10, vec![], 0, None);
         let ins = generate_insights(&ov, &[], &[]);
-        assert!(ins.iter().any(|i| i.severity == "critical" && i.category == "error_pattern"));
+        assert!(
+            ins.iter()
+                .any(|i| i.severity == "critical" && i.category == "error_pattern")
+        );
     }
 
     #[test]
@@ -1259,7 +1268,10 @@ mod tests {
             sample_error: "permission denied".into(),
         }];
         let ins = generate_insights(&ov, &patterns, &[]);
-        assert!(ins.iter().any(|i| i.category == "tool_usage" && i.message.contains("bash")));
+        assert!(
+            ins.iter()
+                .any(|i| i.category == "tool_usage" && i.message.contains("bash"))
+        );
 
         // low count does not trigger
         let patterns = vec![ErrorPattern {
@@ -1269,7 +1281,10 @@ mod tests {
             sample_error: "not found".into(),
         }];
         let ins = generate_insights(&ov, &patterns, &[]);
-        assert!(!ins.iter().any(|i| i.category == "tool_usage" && i.message.contains("bash")));
+        assert!(
+            !ins.iter()
+                .any(|i| i.category == "tool_usage" && i.message.contains("bash"))
+        );
     }
 
     #[test]
@@ -1280,7 +1295,13 @@ mod tests {
         assert!(ins.iter().any(|i| i.message.contains("Over-reliance")));
 
         // balanced usage — no warning
-        let ov = make_overview(100, 0, vec![("bash".into(), 30), ("grep".into(), 25)], 5, None);
+        let ov = make_overview(
+            100,
+            0,
+            vec![("bash".into(), 30), ("grep".into(), 25)],
+            5,
+            None,
+        );
         let ins = generate_insights(&ov, &[], &[]);
         assert!(!ins.iter().any(|i| i.message.contains("Over-reliance")));
     }

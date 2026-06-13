@@ -304,7 +304,7 @@ mod tests {
         captured: Arc<Mutex<Option<serde_json::Value>>>,
         response_content: &'static str,
     ) -> String {
-        use axum::{routing::post, Router};
+        use axum::{Router, routing::post};
 
         let handler = move |axum::Json(body): axum::Json<serde_json::Value>| {
             let captured = captured.clone();

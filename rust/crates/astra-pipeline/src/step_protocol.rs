@@ -1535,9 +1535,24 @@ mod tests {
         let cases: Vec<(u32, VersionPolicy, bool, &str)> = vec![
             (999, VersionPolicy::Strict, false, "strict rejects mismatch"),
             (0, VersionPolicy::Strict, false, "strict rejects zero"),
-            (0, VersionPolicy::Compatible, false, "compatible rejects zero"),
-            (2000, VersionPolicy::Compatible, false, "compatible rejects diff major"),
-            (1050, VersionPolicy::Compatible, true, "compatible accepts same major"),
+            (
+                0,
+                VersionPolicy::Compatible,
+                false,
+                "compatible rejects zero",
+            ),
+            (
+                2000,
+                VersionPolicy::Compatible,
+                false,
+                "compatible rejects diff major",
+            ),
+            (
+                1050,
+                VersionPolicy::Compatible,
+                true,
+                "compatible accepts same major",
+            ),
         ];
         for (ver, policy, expect_ok, desc) in cases {
             let result = check_protocol_version_with_policy(ver, policy);
@@ -1993,15 +2008,22 @@ mod tests {
     // ── Tool Idempotency Classification ──
 
     #[test]
-    #[test]
     fn tool_classification() {
         use serde_json::json;
 
         // PureRead tools
         for tool in [
-            "read_file", "grep", "glob", "list_dir",
-            "git_status", "git_log", "git_diff", "git_blame",
-            "github_list_prs", "github_ci_status", "mo_query",
+            "read_file",
+            "grep",
+            "glob",
+            "list_dir",
+            "git_status",
+            "git_log",
+            "git_diff",
+            "git_blame",
+            "github_list_prs",
+            "github_ci_status",
+            "mo_query",
         ] {
             assert_eq!(
                 classify_tool_idempotency(tool, None),
@@ -2035,7 +2057,13 @@ mod tests {
         );
 
         // NonIdempotent (including unknown tools)
-        for tool in ["bash", "str_replace", "github_create_issue", "mo_snapshot", "some_future_tool"] {
+        for tool in [
+            "bash",
+            "str_replace",
+            "github_create_issue",
+            "mo_snapshot",
+            "some_future_tool",
+        ] {
             assert_eq!(
                 classify_tool_idempotency(tool, None),
                 ToolIdempotency::NonIdempotent,
@@ -2047,36 +2075,54 @@ mod tests {
     // ── Retry Policy ──
 
     #[test]
-    #[test]
     fn retry_policy() {
         let policy = RetryPolicy::default();
 
         // Exponential backoff
         let backoff_expected = [(0, 500), (1, 1000), (2, 2000), (3, 4000)];
         for (attempt, expected_ms) in backoff_expected {
-            assert_eq!(policy.backoff_ms(attempt), expected_ms, "backoff at attempt {attempt}");
+            assert_eq!(
+                policy.backoff_ms(attempt),
+                expected_ms,
+                "backoff at attempt {attempt}"
+            );
         }
 
         // Capped backoff
-        let capped = RetryPolicy { backoff_max_ms: 5000, ..RetryPolicy::default() };
+        let capped = RetryPolicy {
+            backoff_max_ms: 5000,
+            ..RetryPolicy::default()
+        };
         assert_eq!(capped.backoff_ms(10), 5000, "backoff capped at max");
 
         // Should retry logic
         assert!(policy.should_retry(1, &ErrorCategory::Transient));
         assert!(policy.should_retry(2, &ErrorCategory::Timeout));
-        assert!(!policy.should_retry(3, &ErrorCategory::Transient), "max_attempts=3");
-        assert!(!policy.should_retry(1, &ErrorCategory::AuthFailure), "not in retry_on");
+        assert!(
+            !policy.should_retry(3, &ErrorCategory::Transient),
+            "max_attempts=3"
+        );
+        assert!(
+            !policy.should_retry(1, &ErrorCategory::AuthFailure),
+            "not in retry_on"
+        );
 
         // max_retries caps retries
-        let limited = RetryPolicy { max_attempts: 100, max_retries: 5, ..RetryPolicy::default() };
+        let limited = RetryPolicy {
+            max_attempts: 100,
+            max_retries: 5,
+            ..RetryPolicy::default()
+        };
         assert!(limited.should_retry(0, &ErrorCategory::Transient));
         assert!(limited.should_retry(4, &ErrorCategory::Transient));
-        assert!(!limited.should_retry(5, &ErrorCategory::Transient), "max_retries=5");
+        assert!(
+            !limited.should_retry(5, &ErrorCategory::Transient),
+            "max_retries=5"
+        );
     }
 
     // ── Tool Retry Policy ──
 
-    #[test]
     #[test]
     fn tool_retry_policy_by_tool_type() {
         // PureRead tools get 3 retries with 200ms base

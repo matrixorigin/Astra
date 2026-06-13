@@ -3429,7 +3429,7 @@ mod tests {
         ];
         for (name, expected) in cases {
             let cfg = SessionTraceConfig::from_cli(Some(name), None, None)
-                .expect(&format!("profile {name}"));
+                .unwrap_or_else(|_| panic!("profile {name}"));
             assert_eq!(cfg.profile, *expected, "profile={name}");
         }
     }
@@ -3452,7 +3452,7 @@ mod tests {
         ];
         for (name, expected) in cases {
             let cfg = SessionTraceConfig::from_cli(None, Some(name), None)
-                .expect(&format!("level {name}"));
+                .unwrap_or_else(|_| panic!("level {name}"));
             assert_eq!(cfg.min_level, *expected, "level={name}");
         }
         // Invalid level
@@ -3511,6 +3511,7 @@ mod tests {
         assert_eq!(cfg.enabled_categories, vec![TraceCategory::Budget]);
     }
 
+    #[test]
     fn runtime_config_merge_preserves_trace_when_overlay_is_default() {
         let base = RuntimeConfig {
             trace: SessionTraceConfig::default().apply_profile(TraceProfile::Dev),

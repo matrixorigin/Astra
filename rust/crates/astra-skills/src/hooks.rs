@@ -1939,8 +1939,11 @@ mod tests {
             ("git_*_*", "git_log_search", true),
             ("git_*_*", "git_status", false),
         ] {
-            assert_eq!(glob_match(pattern, text), expect,
-                "glob_match({pattern:?}, {text:?}) should be {expect}");
+            assert_eq!(
+                glob_match(pattern, text),
+                expect,
+                "glob_match({pattern:?}, {text:?}) should be {expect}"
+            );
         }
     }
 
@@ -2715,13 +2718,29 @@ mod tests {
     fn load_hooks_from_formats() {
         for (filename, content, expected_len) in [
             // JSON wrapper
-            ("hooks.json", r#"{"hooks": [{"event": "post_tool_use", "matcher": "write_*", "action": {"type": "shell", "command": "lint.sh"}}]}"#, 1),
+            (
+                "hooks.json",
+                r#"{"hooks": [{"event": "post_tool_use", "matcher": "write_*", "action": {"type": "shell", "command": "lint.sh"}}]}"#,
+                1,
+            ),
             // JSON array format → not wrapped → empty
-            ("hooks.json", r#"[{"event": "pre_tool_use", "matcher": "bash", "action": {"type": "shell", "command": "check-bash.sh"}, "timeout_secs": 5}]"#, 0),
+            (
+                "hooks.json",
+                r#"[{"event": "pre_tool_use", "matcher": "bash", "action": {"type": "shell", "command": "check-bash.sh"}, "timeout_secs": 5}]"#,
+                0,
+            ),
             // YAML wrapper
-            ("hooks.yaml", "hooks:\n  - event: pre_tool_use\n    matcher: \"*\"\n    action:\n      type: shell\n      command: audit-log.sh\n    timeout_secs: 2\n", 1),
+            (
+                "hooks.yaml",
+                "hooks:\n  - event: pre_tool_use\n    matcher: \"*\"\n    action:\n      type: shell\n      command: audit-log.sh\n    timeout_secs: 2\n",
+                1,
+            ),
             // YAML. yml extension
-            ("hooks.yml", "hooks:\n  - event: pre_tool_use\n    matcher: bash\n    action:\n      type: shell\n      command: validate.sh\n", 1),
+            (
+                "hooks.yml",
+                "hooks:\n  - event: pre_tool_use\n    matcher: bash\n    action:\n      type: shell\n      command: validate.sh\n",
+                1,
+            ),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let astra = dir.path().join(".astra");
@@ -2814,8 +2833,14 @@ mod tests {
             std::fs::write(astra.join("hooks.json"), json).unwrap();
             let registry = load_tool_event_hooks(dir.path());
             assert_eq!(registry.len(), 2);
-            assert_eq!(registry.matching(ToolEventKind::PreToolUse, "bash")[0].timeout_secs, 30);
-            assert_eq!(registry.matching(ToolEventKind::PreToolUse, "edit")[0].timeout_secs, 5);
+            assert_eq!(
+                registry.matching(ToolEventKind::PreToolUse, "bash")[0].timeout_secs,
+                30
+            );
+            assert_eq!(
+                registry.matching(ToolEventKind::PreToolUse, "edit")[0].timeout_secs,
+                5
+            );
         }
         // YAML: same pattern
         {
@@ -2826,8 +2851,14 @@ mod tests {
             std::fs::write(astra.join("hooks.yaml"), yaml).unwrap();
             let registry = load_tool_event_hooks(dir.path());
             assert_eq!(registry.len(), 2);
-            assert_eq!(registry.matching(ToolEventKind::PreToolUse, "bash")[0].timeout_secs, 20);
-            assert_eq!(registry.matching(ToolEventKind::PostToolUse, "anything")[0].timeout_secs, 3);
+            assert_eq!(
+                registry.matching(ToolEventKind::PreToolUse, "bash")[0].timeout_secs,
+                20
+            );
+            assert_eq!(
+                registry.matching(ToolEventKind::PostToolUse, "anything")[0].timeout_secs,
+                3
+            );
         }
     }
 
@@ -2898,7 +2929,9 @@ mod tests {
         let registry = SessionEventHookRegistry::new(vec![
             SessionEventHook {
                 event: SessionEvent::SessionStart,
-                action: HookAction::Shell { command: "greet".into() },
+                action: HookAction::Shell {
+                    command: "greet".into(),
+                },
                 timeout_secs: 5,
                 is_async: false,
                 condition: None,
@@ -2907,7 +2940,9 @@ mod tests {
             },
             SessionEventHook {
                 event: SessionEvent::SessionEnd,
-                action: HookAction::Shell { command: "cleanup".into() },
+                action: HookAction::Shell {
+                    command: "cleanup".into(),
+                },
                 timeout_secs: 5,
                 is_async: false,
                 condition: None,
@@ -2916,7 +2951,10 @@ mod tests {
             },
             SessionEventHook {
                 event: SessionEvent::SessionStart,
-                action: HookAction::SetEnv { key: "S".into(), value: "1".into() },
+                action: HookAction::SetEnv {
+                    key: "S".into(),
+                    value: "1".into(),
+                },
                 timeout_secs: 10,
                 is_async: false,
                 condition: None,
@@ -2938,7 +2976,8 @@ mod tests {
         assert!(out.env_vars.is_empty());
 
         // JSON env vars
-        let out = parse_session_hook_output(br#"{"context": "hi", "env": {"FOO": "bar", "BAZ": "qux"}}"#);
+        let out =
+            parse_session_hook_output(br#"{"context": "hi", "env": {"FOO": "bar", "BAZ": "qux"}}"#);
         assert_eq!(out.context.as_deref(), Some("hi"));
         assert_eq!(out.env_vars.len(), 2);
         assert!(out.env_vars.contains(&("FOO".into(), "bar".into())));
@@ -2958,16 +2997,32 @@ mod tests {
     fn load_session_hooks_from_config() {
         for (format, content, expected_len) in [
             // JSON
-            ("json", r#"{"hooks": [], "session_hooks": [{"event": "session_start", "action": {"type": "shell", "command": "echo greeting"}, "timeout_secs": 3}]}"#, 1),
+            (
+                "json",
+                r#"{"hooks": [], "session_hooks": [{"event": "session_start", "action": {"type": "shell", "command": "echo greeting"}, "timeout_secs": 3}]}"#,
+                1,
+            ),
             // YAML
-            ("yaml", "hooks: []\nsession_hooks:\n  - event: session_start\n    action:\n      type: shell\n      command: echo hi\n  - event: session_end\n    action:\n      type: shell\n      command: echo bye\n", 2),
+            (
+                "yaml",
+                "hooks: []\nsession_hooks:\n  - event: session_start\n    action:\n      type: shell\n      command: echo hi\n  - event: session_end\n    action:\n      type: shell\n      command: echo bye\n",
+                2,
+            ),
             // Plain array → no session_hooks key → empty
-            ("json", r#"[{"event": "pre_tool_use", "matcher": "bash", "action": {"type": "shell", "command": "x"}}]"#, 0),
+            (
+                "json",
+                r#"[{"event": "pre_tool_use", "matcher": "bash", "action": {"type": "shell", "command": "x"}}]"#,
+                0,
+            ),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let astra = dir.path().join(".astra");
             std::fs::create_dir_all(&astra).unwrap();
-            let filename = if format == "json" { "hooks.json" } else { "hooks.yaml" };
+            let filename = if format == "json" {
+                "hooks.json"
+            } else {
+                "hooks.yaml"
+            };
             std::fs::write(astra.join(filename), content).unwrap();
 
             let registry = load_session_event_hooks(dir.path());

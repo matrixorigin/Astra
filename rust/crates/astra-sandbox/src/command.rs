@@ -791,7 +791,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn env_manipulation_detection() {
         // "export" keyword triggers EnvManipulation
         let risks = analyze_command_risks("export PATH=/evil:$PATH && malicious");
@@ -888,7 +887,9 @@ mod tests {
         ] {
             let risks = analyze_command_risks(cmd);
             assert!(
-                risks.iter().any(|r| matches!(r, CommandRisk::ZshDangerous(_))),
+                risks
+                    .iter()
+                    .any(|r| matches!(r, CommandRisk::ZshDangerous(_))),
                 "ZshDangerous not detected for: {cmd}"
             );
         }
@@ -929,7 +930,9 @@ mod tests {
         // Heuristic scanner WILL flag zmodload in echo strings (conservative, false positives OK)
         let risks = analyze_command_risks("echo 'use zmodload to load modules'");
         assert!(
-            risks.iter().any(|r| matches!(r, CommandRisk::ZshDangerous(_)))
+            risks
+                .iter()
+                .any(|r| matches!(r, CommandRisk::ZshDangerous(_)))
         );
     }
 

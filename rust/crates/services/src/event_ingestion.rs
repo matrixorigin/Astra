@@ -891,7 +891,15 @@ mod tests {
     #[test]
     fn from_journal_event_redact_behavior() {
         let event = crate::session_journal::JournalEvent::turn(
-            Some("sess-r"), 1, Some("gpt-4"), "hello world", "ok", 0, 10, 5, 100,
+            Some("sess-r"),
+            1,
+            Some("gpt-4"),
+            "hello world",
+            "ok",
+            0,
+            10,
+            5,
+            100,
         );
         // Redact off
         let off = IngestionEvent::from_journal_event_with_redact(&event, "u1", false);
@@ -946,7 +954,10 @@ mod tests {
     fn test_iso8601_to_mysql_datetime() {
         let cases = vec![
             ("2025-01-15T10:30:00+00:00", "2025-01-15 10:30:00.000000"),
-            ("2025-01-15T10:30:00.123456+00:00", "2025-01-15 10:30:00.123456"),
+            (
+                "2025-01-15T10:30:00.123456+00:00",
+                "2025-01-15 10:30:00.123456",
+            ),
             ("2025-01-15T10:30:00Z", "2025-01-15 10:30:00.000000"),
             ("not-a-date", "not-a-date"),
         ];

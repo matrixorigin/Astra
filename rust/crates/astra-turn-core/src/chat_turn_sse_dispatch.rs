@@ -1059,7 +1059,10 @@ mod tests {
             ("reasoning_delta", ",\"content\":\"thinking...\""),
             ("reasoning_message_content", ",\"content\":\"thinking...\""),
             ("tool_call_start", ",\"id\":\"call-1\",\"name\":\"bash\""),
-            ("tool_call", ",\"id\":\"call-1\",\"name\":\"bash\",\"arguments\":\"{}\""),
+            (
+                "tool_call",
+                ",\"id\":\"call-1\",\"name\":\"bash\",\"arguments\":\"{}\"",
+            ),
         ];
         for (event_type, extra) in cases {
             let mut f = ChatTurnSseFramer::new();

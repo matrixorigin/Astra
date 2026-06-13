@@ -20,7 +20,10 @@ fn parse_memory_search_contents_all_formats() {
 
     // top-level array
     let raw = r#"[{"content":"matrixorigin = GitHub org"},{"text":"user follows MO"}]"#;
-    assert_eq!(parse_memory_search_contents(raw), vec!["matrixorigin = GitHub org", "user follows MO"]);
+    assert_eq!(
+        parse_memory_search_contents(raw),
+        vec!["matrixorigin = GitHub org", "user follows MO"]
+    );
 
     // error response
     assert!(parse_memory_search_contents(r#"{"error":"Memory unavailable"}"#).is_empty());
@@ -35,7 +38,10 @@ fn parse_memory_search_contents_all_formats() {
 
     // single object (not wrapped in array)
     let raw = r#"{"content":"single memory result"}"#;
-    assert_eq!(parse_memory_search_contents(raw), vec!["single memory result"]);
+    assert_eq!(
+        parse_memory_search_contents(raw),
+        vec!["single memory result"]
+    );
 
     // no content field
     let raw = r#"{"memories":[{"summary":"no content field"}]}"#;
@@ -69,7 +75,8 @@ fn parse_memory_search_hits_all_formats() {
     assert_eq!(hits[1].memory_id.as_deref(), Some("m-002"));
 
     // id field alias
-    let hits = memoria::parse_memory_search_hits(r#"{"memories":[{"id":"abc","content":"test memory"}]}"#);
+    let hits =
+        memoria::parse_memory_search_hits(r#"{"memories":[{"id":"abc","content":"test memory"}]}"#);
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].memory_id.as_deref(), Some("abc"));
 
@@ -80,12 +87,14 @@ fn parse_memory_search_hits_all_formats() {
     assert_eq!(hits[0].content, "no id here");
 
     // single object with id
-    let hits = memoria::parse_memory_search_hits(r#"{"memory_id":"single-1","content":"single hit"}"#);
+    let hits =
+        memoria::parse_memory_search_hits(r#"{"memory_id":"single-1","content":"single hit"}"#);
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].memory_id.as_deref(), Some("single-1"));
 
     // empty content filtered
-    let raw = r#"{"memories":[{"memory_id":"m1","content":""},{"memory_id":"m2","content":"valid"}]}"#;
+    let raw =
+        r#"{"memories":[{"memory_id":"m1","content":""},{"memory_id":"m2","content":"valid"}]}"#;
     let hits = memoria::parse_memory_search_hits(raw);
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].memory_id.as_deref(), Some("m2"));

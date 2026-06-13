@@ -150,17 +150,36 @@ mod tests {
     #[test]
     fn relevance_score_cases() {
         // (name, desc, extra, query_terms, expected)
+        #[allow(clippy::type_complexity)]
         let score_cases: &[(&str, &str, Option<&str>, &[&str], usize)] = &[
-            ("bash", "Execute commands", None, &["bash"], 28),                      // exact name(20)+exact part(8)
-            ("read_file", "Read file contents", None, &["read"], 20),                // name contains(10)+part exact(8)+desc(2)
-            ("git_log_search", "Search git log", None, &["log"], 20),                // name contains(10)+part exact(8)+desc(2)
-            ("readFile", "Read file contents", None, &["file"], 20),                 // camelCase part exact(8)+name contains(10)+desc(2)
-            ("xyz", "Deploy application to kubernetes cluster", None, &["kubernetes"], 2), // desc only
-            ("verify", "Run checks", Some("User wants to validate code quality"), &["validate"], 1), // extra only
-            ("bash", "Execute shell commands", None, &["kubernetes"], 0),            // no match
-            ("read_file", "Read file contents from workspace", None, &["read", "workspace"], 22), // multi-term
-            ("ReadFile", "Read file contents", None, &["readfile"], 20),             // case insensitive exact match
-            ("bash", "Execute commands", None, &[], 0),                              // empty query
+            ("bash", "Execute commands", None, &["bash"], 28), // exact name(20)+exact part(8)
+            ("read_file", "Read file contents", None, &["read"], 20), // name contains(10)+part exact(8)+desc(2)
+            ("git_log_search", "Search git log", None, &["log"], 20), // name contains(10)+part exact(8)+desc(2)
+            ("readFile", "Read file contents", None, &["file"], 20), // camelCase part exact(8)+name contains(10)+desc(2)
+            (
+                "xyz",
+                "Deploy application to kubernetes cluster",
+                None,
+                &["kubernetes"],
+                2,
+            ), // desc only
+            (
+                "verify",
+                "Run checks",
+                Some("User wants to validate code quality"),
+                &["validate"],
+                1,
+            ), // extra only
+            ("bash", "Execute shell commands", None, &["kubernetes"], 0), // no match
+            (
+                "read_file",
+                "Read file contents from workspace",
+                None,
+                &["read", "workspace"],
+                22,
+            ), // multi-term
+            ("ReadFile", "Read file contents", None, &["readfile"], 20), // case insensitive exact match
+            ("bash", "Execute commands", None, &[], 0),                  // empty query
         ];
         for (name, desc, extra, terms, expected) in score_cases {
             let item = if let Some(e) = extra {
@@ -168,8 +187,11 @@ mod tests {
             } else {
                 item(name, desc)
             };
-            assert_eq!(relevance_score(&item, terms), *expected,
-                "name={name}, terms={terms:?}");
+            assert_eq!(
+                relevance_score(&item, terms),
+                *expected,
+                "name={name}, terms={terms:?}"
+            );
         }
     }
 

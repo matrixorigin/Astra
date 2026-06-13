@@ -10,26 +10,28 @@ fn expand_sandbox_path_adds_and_resolves() {
     let exe = ToolExecutor::new(dir.path());
 
     // Before expansion: /etc is not allowed
-    assert!(!exe
-        .sandbox_policy
-        .read()
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .is_path_allowed(std::path::Path::new("/etc/passwd")));
+    assert!(
+        !exe.sandbox_policy
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .is_path_allowed(std::path::Path::new("/etc/passwd"))
+    );
     assert!(exe.resolve_checked("/etc/passwd").is_err());
 
     // Expand
     exe.expand_sandbox_path(PathBuf::from("/etc"));
 
     // After expansion: /etc is allowed via both APIs
-    assert!(exe
-        .sandbox_policy
-        .read()
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .is_path_allowed(std::path::Path::new("/etc/passwd")));
+    assert!(
+        exe.sandbox_policy
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .is_path_allowed(std::path::Path::new("/etc/passwd"))
+    );
     assert!(exe.resolve_checked("/etc/passwd").is_ok());
 }
 

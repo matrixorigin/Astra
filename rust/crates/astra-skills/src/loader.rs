@@ -1340,27 +1340,46 @@ Hooked body."#;
     #[test]
     fn parse_cc_fields() {
         // Parse individual & combined CC-compatible fields
+        #[allow(clippy::type_complexity)]
         let cases: Vec<(&str, fn(&SkillManifest))> = vec![
             // aliases
-            ("name: cc-1\ndescription: \"x\"\naliases:\n  - cr\n  - review\n",
-             |m: &SkillManifest| { assert_eq!(m.aliases, vec!["cr", "review"]); }),
+            (
+                "name: cc-1\ndescription: \"x\"\naliases:\n  - cr\n  - review\n",
+                |m: &SkillManifest| {
+                    assert_eq!(m.aliases, vec!["cr", "review"]);
+                },
+            ),
             // effort named
-            ("name: cc-2\ndescription: \"x\"\neffort: high\n",
-             |m: &SkillManifest| { assert!(matches!(m.effort, Some(EffortLevel::High))); }),
+            (
+                "name: cc-2\ndescription: \"x\"\neffort: high\n",
+                |m: &SkillManifest| {
+                    assert!(matches!(m.effort, Some(EffortLevel::High)));
+                },
+            ),
             // effort numeric
-            ("name: cc-3\ndescription: \"x\"\neffort: \"200\"\n",
-             |m: &SkillManifest| { assert!(matches!(m.effort, Some(EffortLevel::Custom(200)))); }),
+            (
+                "name: cc-3\ndescription: \"x\"\neffort: \"200\"\n",
+                |m: &SkillManifest| {
+                    assert!(matches!(m.effort, Some(EffortLevel::Custom(200))));
+                },
+            ),
             // agent_type
-            ("name: cc-4\ndescription: \"x\"\nagent_type: researcher\n",
-             |m: &SkillManifest| { assert_eq!(m.agent_type.as_deref(), Some("researcher")); }),
+            (
+                "name: cc-4\ndescription: \"x\"\nagent_type: researcher\n",
+                |m: &SkillManifest| {
+                    assert_eq!(m.agent_type.as_deref(), Some("researcher"));
+                },
+            ),
             // all CC fields together
-            ("name: cc-5\ndescription: \"x\"\naliases: [fc, full]\neffort: max\nagent_type: coder\nmodel: \"claude-sonnet-4-20250514\"\n",
-             |m: &SkillManifest| {
-                assert_eq!(m.aliases, vec!["fc", "full"]);
-                assert!(matches!(m.effort, Some(EffortLevel::Max)));
-                assert_eq!(m.agent_type.as_deref(), Some("coder"));
-                assert_eq!(m.model.as_deref(), Some("claude-sonnet-4-20250514"));
-            }),
+            (
+                "name: cc-5\ndescription: \"x\"\naliases: [fc, full]\neffort: max\nagent_type: coder\nmodel: \"claude-sonnet-4-20250514\"\n",
+                |m: &SkillManifest| {
+                    assert_eq!(m.aliases, vec!["fc", "full"]);
+                    assert!(matches!(m.effort, Some(EffortLevel::Max)));
+                    assert_eq!(m.agent_type.as_deref(), Some("coder"));
+                    assert_eq!(m.model.as_deref(), Some("claude-sonnet-4-20250514"));
+                },
+            ),
         ];
         for (content, check) in cases {
             let full = format!("---\n{content}---\nInstructions.");

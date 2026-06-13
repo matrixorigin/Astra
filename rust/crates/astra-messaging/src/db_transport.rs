@@ -56,8 +56,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sqlx::mysql::MySqlRow;
-use sqlx::{query, MySql, Pool, Row};
-use tokio::sync::{mpsc, watch, RwLock};
+use sqlx::{MySql, Pool, Row, query};
+use tokio::sync::{RwLock, mpsc, watch};
 
 use super::transport::{MessageStream, MessageTransport};
 use super::types::{AgentAddress, AgentMessage, MailboxError};
@@ -1321,11 +1321,6 @@ async fn release_claimed_for_consumer_in_pool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{AgentSignal, MessagePayload, MessageTarget};
-
-    fn addr(run: &str, agent: &str) -> AgentAddress {
-        AgentAddress::new(run, agent)
-    }
 
     #[test]
     fn abort_on_drop_aborts_task() {
@@ -1365,7 +1360,8 @@ mod tests {
         assert_eq!(DEFAULT_CLEANUP_INTERVAL, Duration::from_secs(300));
         assert_eq!(DEFAULT_MAX_AGE, Duration::from_secs(3600));
         // Backoff
-        assert!(CRITICAL_FAILURE_THRESHOLD >= 10);
+        let threshold: u32 = CRITICAL_FAILURE_THRESHOLD;
+        assert!(threshold >= 10);
         assert!(INITIAL_BACKOFF >= Duration::from_millis(100));
         assert!(MAX_BACKOFF <= Duration::from_secs(30));
         assert!(MAX_BACKOFF > INITIAL_BACKOFF);

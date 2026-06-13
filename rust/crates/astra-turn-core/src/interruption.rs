@@ -832,14 +832,38 @@ mod tests {
         // resumable mappings
         let cases: &[(astra_core::ErrorKind, InterruptionKind)] = &[
             (astra_core::ErrorKind::Auth, InterruptionKind::AuthFailure),
-            (astra_core::ErrorKind::RateLimit, InterruptionKind::RateLimited),
-            (astra_core::ErrorKind::ContextWindow, InterruptionKind::ContextOverflow),
-            (astra_core::ErrorKind::ServerError, InterruptionKind::ServerOverload),
-            (astra_core::ErrorKind::BudgetExhausted, InterruptionKind::BudgetExhausted),
-            (astra_core::ErrorKind::Cancelled, InterruptionKind::UserCancelled),
-            (astra_core::ErrorKind::StreamIdle, InterruptionKind::StreamIdle),
-            (astra_core::ErrorKind::StreamTransport, InterruptionKind::StreamTransport),
-            (astra_core::ErrorKind::Network, InterruptionKind::StreamTransport),
+            (
+                astra_core::ErrorKind::RateLimit,
+                InterruptionKind::RateLimited,
+            ),
+            (
+                astra_core::ErrorKind::ContextWindow,
+                InterruptionKind::ContextOverflow,
+            ),
+            (
+                astra_core::ErrorKind::ServerError,
+                InterruptionKind::ServerOverload,
+            ),
+            (
+                astra_core::ErrorKind::BudgetExhausted,
+                InterruptionKind::BudgetExhausted,
+            ),
+            (
+                astra_core::ErrorKind::Cancelled,
+                InterruptionKind::UserCancelled,
+            ),
+            (
+                astra_core::ErrorKind::StreamIdle,
+                InterruptionKind::StreamIdle,
+            ),
+            (
+                astra_core::ErrorKind::StreamTransport,
+                InterruptionKind::StreamTransport,
+            ),
+            (
+                astra_core::ErrorKind::Network,
+                InterruptionKind::StreamTransport,
+            ),
         ];
         for (ek, expected_kind) in cases {
             let (kind, _action) = interruption_from_error_kind(*ek)
@@ -851,7 +875,8 @@ mod tests {
         assert!(matches!(action, ResumeAction::RequiresIntervention { .. }));
         let (_, action) = interruption_from_error_kind(astra_core::ErrorKind::RateLimit).unwrap();
         assert!(matches!(action, ResumeAction::WaitAndRetry { .. }));
-        let (_, action) = interruption_from_error_kind(astra_core::ErrorKind::ContextWindow).unwrap();
+        let (_, action) =
+            interruption_from_error_kind(astra_core::ErrorKind::ContextWindow).unwrap();
         assert!(matches!(action, ResumeAction::CompactAndRetry));
         let (_, action) = interruption_from_error_kind(astra_core::ErrorKind::ServerError).unwrap();
         assert!(matches!(action, ResumeAction::WaitAndRetry { .. }));
@@ -866,7 +891,10 @@ mod tests {
             astra_core::ErrorKind::ToolRoundsExhausted,
         ];
         for ek in none_cases {
-            assert!(interruption_from_error_kind(ek).is_none(), "{ek:?} should be None");
+            assert!(
+                interruption_from_error_kind(ek).is_none(),
+                "{ek:?} should be None"
+            );
         }
     }
 
@@ -880,7 +908,10 @@ mod tests {
             ResumeMode::Settle
         );
         assert_eq!(
-            ResumeMode::from_json_value(Some(&serde_json::json!("not_a_known_mode")), "another_unknown_kind"),
+            ResumeMode::from_json_value(
+                Some(&serde_json::json!("not_a_known_mode")),
+                "another_unknown_kind"
+            ),
             ResumeMode::Settle
         );
         // known kinds use calibrated defaults
@@ -928,7 +959,10 @@ mod tests {
 
         // stall_signal serialization
         let record = record.with_stall_signal("single_tool_streak=18");
-        assert_eq!(record.stall_signal.as_deref(), Some("single_tool_streak=18"));
+        assert_eq!(
+            record.stall_signal.as_deref(),
+            Some("single_tool_streak=18")
+        );
         let json = record.to_json();
         assert_eq!(json["stall_signal"], "single_tool_streak=18");
 
@@ -962,7 +996,10 @@ mod tests {
         assert_eq!(record.resume_mode, ResumeMode::Settle);
         let json = record.to_json();
         assert_eq!(json["resume_mode"], "settle");
-        assert_eq!(json["resume_restricted_tools"], serde_json::json!(["agent", "bash"]));
+        assert_eq!(
+            json["resume_restricted_tools"],
+            serde_json::json!(["agent", "bash"])
+        );
         assert!(record.user_message.contains("without a final answer"));
         assert!(record.user_message.contains("continue"));
 
@@ -1016,7 +1053,11 @@ mod tests {
             },
         );
         assert!(record.user_message.contains("Cause:"));
-        assert!(record.user_message.contains("re-read overlapping file ranges 5 time(s)"));
+        assert!(
+            record
+                .user_message
+                .contains("re-read overlapping file ranges 5 time(s)")
+        );
         assert!(record.user_message.contains("You can continue"));
 
         // harness paused — actionable message
@@ -1035,7 +1076,11 @@ mod tests {
         );
         assert!(record.user_message.contains("read-heavy stall"));
         assert!(record.user_message.contains("Cause:"));
-        assert!(record.user_message.contains("re-read overlapping file ranges 6 time(s)"));
+        assert!(
+            record
+                .user_message
+                .contains("re-read overlapping file ranges 6 time(s)")
+        );
         assert!(record.user_message.contains("You can continue"));
     }
 
@@ -1253,4 +1298,3 @@ mod tests {
         assert!(build_resume_guidance(&serde_json::json!({})).is_none());
     }
 }
-

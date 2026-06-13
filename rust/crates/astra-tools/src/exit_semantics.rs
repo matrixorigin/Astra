@@ -344,10 +344,7 @@ mod tests {
 
     #[test]
     fn grep_no_match_is_informational_failure() {
-        for cmd in &[
-            "grep needle missing",
-            "grep missing src/main.rs",
-        ] {
+        for cmd in &["grep needle missing", "grep missing src/main.rs"] {
             let sem = classify_exit(cmd, 1);
             assert_eq!(sem, ExitSemantics::InformationalFailure, "cmd={cmd}");
             assert!(!sem.is_tool_error(), "cmd={cmd}");

@@ -336,29 +336,62 @@ mod tests {
             ("git push --force origin master", true),
         ] {
             let v = validate_git_command(cmd);
-            assert!(v.iter().any(|violation| matches!(violation, GitSafetyViolation::ForcePush)), "ForcePush for: {cmd}");
+            assert!(
+                v.iter()
+                    .any(|violation| matches!(violation, GitSafetyViolation::ForcePush)),
+                "ForcePush for: {cmd}"
+            );
             if is_protected {
-                assert!(v.iter().any(|violation| matches!(
-                    violation, GitSafetyViolation::ForcePushProtectedBranch { .. }
-                )), "ForcePushProtectedBranch for: {cmd}");
+                assert!(
+                    v.iter().any(|violation| matches!(
+                        violation,
+                        GitSafetyViolation::ForcePushProtectedBranch { .. }
+                    )),
+                    "ForcePushProtectedBranch for: {cmd}"
+                );
             }
         }
         // Feature branch NOT protected
         let v = validate_git_command("git push --force origin feature/my-feature");
-        assert!(!v.iter().any(|violation| matches!(violation, GitSafetyViolation::ForcePushProtectedBranch { .. })));
+        assert!(!v.iter().any(|violation| matches!(
+            violation,
+            GitSafetyViolation::ForcePushProtectedBranch { .. }
+        )));
         // Feature branches containing "main"/"develop" are NOT protected (false positive regression)
-        for cmd in ["git push --force origin feature/main-refactor", "git push -f origin feature/develop-ui"] {
+        for cmd in [
+            "git push --force origin feature/main-refactor",
+            "git push -f origin feature/develop-ui",
+        ] {
             let v = validate_git_command(cmd);
-            assert!(v.iter().any(|violation| matches!(violation, GitSafetyViolation::ForcePush)));
-            assert!(!v.iter().any(|violation| matches!(violation, GitSafetyViolation::ForcePushProtectedBranch { .. })), "false positive for {cmd}");
+            assert!(
+                v.iter()
+                    .any(|violation| matches!(violation, GitSafetyViolation::ForcePush))
+            );
+            assert!(
+                !v.iter().any(|violation| matches!(
+                    violation,
+                    GitSafetyViolation::ForcePushProtectedBranch { .. }
+                )),
+                "false positive for {cmd}"
+            );
         }
         // "origin/main" with remote prefix IS protected
         let v = validate_git_command("git push --force origin origin/main");
-        assert!(v.iter().any(|violation| matches!(violation, GitSafetyViolation::ForcePushProtectedBranch { .. })));
+        assert!(v.iter().any(|violation| matches!(
+            violation,
+            GitSafetyViolation::ForcePushProtectedBranch { .. }
+        )));
         // Non-force flags are NOT force push
-        for cmd in ["git push --follow-tags origin my-branch", "git push -ff origin my-branch"] {
+        for cmd in [
+            "git push --follow-tags origin my-branch",
+            "git push -ff origin my-branch",
+        ] {
             let v = validate_git_command(cmd);
-            assert!(!v.iter().any(|violation| matches!(violation, GitSafetyViolation::ForcePush)), "false positive: {cmd}");
+            assert!(
+                !v.iter()
+                    .any(|violation| matches!(violation, GitSafetyViolation::ForcePush)),
+                "false positive: {cmd}"
+            );
         }
         // --force-with-lease IS force push
         let v = validate_git_command("git push --force-with-lease");
@@ -371,7 +404,10 @@ mod tests {
     #[test]
     fn cd_git_compound_behavior() {
         let v = validate_git_command("cd /tmp/evil && git status");
-        assert!(v.iter().any(|v| matches!(v, GitSafetyViolation::CdGitCompound)));
+        assert!(
+            v.iter()
+                .any(|v| matches!(v, GitSafetyViolation::CdGitCompound))
+        );
         let v = validate_git_command("git status");
         assert!(v.is_empty());
     }
@@ -437,6 +473,7 @@ mod tests {
     }
 
     // --- violation display ---
+    #[test]
     fn violation_display_all_variants() {
         // Ensure Display impl doesn't panic for any variant
         let violations = vec![

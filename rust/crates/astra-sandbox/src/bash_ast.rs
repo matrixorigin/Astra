@@ -294,9 +294,16 @@ mod tests {
 
     #[test]
     fn redirection_detection() {
-        for cmd in ["echo hi >> out.txt", "echo err 2>err.log", "cmd > out.txt 2> err.log >> append.log"] {
+        for cmd in [
+            "echo hi >> out.txt",
+            "echo err 2>err.log",
+            "cmd > out.txt 2> err.log >> append.log",
+        ] {
             let risks = analyze_bash_risks_ast(cmd);
-            assert!(risks.contains(&CommandRisk::OutputRedirection), "redirect not detected: {cmd}");
+            assert!(
+                risks.contains(&CommandRisk::OutputRedirection),
+                "redirect not detected: {cmd}"
+            );
         }
     }
 
@@ -322,9 +329,16 @@ mod tests {
 
     #[test]
     fn chmod_setuid_variants() {
-        for cmd in ["chmod +s /usr/bin/passwd", "chmod u+s /usr/bin/file", "chmod g+s /usr/bin/file"] {
+        for cmd in [
+            "chmod +s /usr/bin/passwd",
+            "chmod u+s /usr/bin/file",
+            "chmod g+s /usr/bin/file",
+        ] {
             let risks = analyze_bash_risks_ast(cmd);
-            assert!(risks.contains(&CommandRisk::PrivilegeEscalation), "chmod not detected: {cmd}");
+            assert!(
+                risks.contains(&CommandRisk::PrivilegeEscalation),
+                "chmod not detected: {cmd}"
+            );
         }
     }
 

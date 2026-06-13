@@ -146,23 +146,35 @@ mod tests {
             // (raw, source_signal, confidence, expected_rule, expected_reason, expected_apply_when)
             (
                 r#"{"rule": "Use real DB in tests", "reason": "Mocks diverged from prod", "apply_when": "Integration tests"}"#,
-                "correction", 0.9,
-                "Use real DB in tests", "Mocks diverged from prod", "Integration tests",
+                "correction",
+                0.9,
+                "Use real DB in tests",
+                "Mocks diverged from prod",
+                "Integration tests",
             ),
             (
                 "```json\n{\"rule\": \"No mocks\", \"reason\": \"Past incident\", \"apply_when\": \"Tests\"}\n```",
-                "frustration", 0.7,
-                "No mocks", "Past incident", "Tests",
+                "frustration",
+                0.7,
+                "No mocks",
+                "Past incident",
+                "Tests",
             ),
             (
                 "```\n{\"rule\": \"Run clippy\"}\n```",
-                "correction", 0.8,
-                "Run clippy", "Not stated", "General",
+                "correction",
+                0.8,
+                "Run clippy",
+                "Not stated",
+                "General",
             ),
             (
                 "```json\n{\"rule\": \"Check types\"}\n```\n",
-                "correction", 0.8,
-                "Check types", "Not stated", "General",
+                "correction",
+                0.8,
+                "Check types",
+                "Not stated",
+                "General",
             ),
         ];
         for (raw, signal, conf, exp_rule, exp_reason, exp_when) in cases {

@@ -519,7 +519,11 @@ mod tests {
             surface: CapabilitySurface::CliRemote,
             sources,
         }));
-        assert_eq!(web, vec!["server", "server_mcp"], "web must expose only server tools");
+        assert_eq!(
+            web,
+            vec!["server", "server_mcp"],
+            "web must expose only server tools"
+        );
         assert_eq!(remote_names, web, "remote CLI must match web");
 
         // Local CLI: client-only tools
@@ -529,7 +533,11 @@ mod tests {
                 .with_source(ToolCapabilitySource::ClientBuiltin, vec![schema("client")])
                 .with_source(ToolCapabilitySource::ClientMcp, vec![schema("client_mcp")]),
         ));
-        assert_eq!(local, vec!["client", "client_mcp"], "local CLI must use client tools only");
+        assert_eq!(
+            local,
+            vec!["client", "client_mcp"],
+            "local CLI must use client tools only"
+        );
     }
 
     #[test]
@@ -593,9 +601,18 @@ mod tests {
         let web_plan = names(resolve(Surface::Web, &plan_caps, &pool));
         let remote_plan = names(resolve(Surface::CliRemote, &plan_caps, &pool));
 
-        assert!(!local_plan.contains(&"enter_plan_mode".to_string()), "plan lifecycle tools are server-only");
-        assert!(web_plan.contains(&"enter_plan_mode".to_string()), "web must expose plan lifecycle");
-        assert_eq!(remote_plan, web_plan, "remote CLI plan visibility must match web");
+        assert!(
+            !local_plan.contains(&"enter_plan_mode".to_string()),
+            "plan lifecycle tools are server-only"
+        );
+        assert!(
+            web_plan.contains(&"enter_plan_mode".to_string()),
+            "web must expose plan lifecycle"
+        );
+        assert_eq!(
+            remote_plan, web_plan,
+            "remote CLI plan visibility must match web"
+        );
 
         // ── Background task tools: local-only ──
         let server_caps = lifecycle_server_capabilities(true);
@@ -610,11 +627,23 @@ mod tests {
         let local_bg = names(resolve(Surface::CliLocal, &local_caps, &pool));
 
         for bg_tool in &["task_output", "task_stop", "task_list"] {
-            assert!(!web_bg.contains(&bg_tool.to_string()), "web must not advertise {bg_tool}");
-            assert!(!remote_bg.contains(&bg_tool.to_string()), "remote CLI must not advertise {bg_tool}");
-            assert!(local_bg.contains(&bg_tool.to_string()), "local CLI must advertise {bg_tool}");
+            assert!(
+                !web_bg.contains(&bg_tool.to_string()),
+                "web must not advertise {bg_tool}"
+            );
+            assert!(
+                !remote_bg.contains(&bg_tool.to_string()),
+                "remote CLI must not advertise {bg_tool}"
+            );
+            assert!(
+                local_bg.contains(&bg_tool.to_string()),
+                "local CLI must advertise {bg_tool}"
+            );
         }
-        assert!(!local_bg.contains(&"job".to_string()), "removed job tool must not appear");
+        assert!(
+            !local_bg.contains(&"job".to_string()),
+            "removed job tool must not appear"
+        );
     }
 
     #[test]
@@ -650,7 +679,10 @@ mod tests {
 
         // AgentSpawner is always included
         let caps = lifecycle_server_capabilities(true);
-        assert!(caps.has(Capability::AgentSpawner), "server lifecycle must include AgentSpawner");
+        assert!(
+            caps.has(Capability::AgentSpawner),
+            "server lifecycle must include AgentSpawner"
+        );
 
         // Database is gated on pool availability
         assert!(!lifecycle_server_capabilities(false).has(Capability::Database));
@@ -658,7 +690,10 @@ mod tests {
 
         // Web resolve with lifecycle caps advertises agent tool
         let tool_names = names(server_runtime_tool_schemas(&caps));
-        assert!(tool_names.contains(&"agent".to_string()), "production lifecycle must advertise agent tool");
+        assert!(
+            tool_names.contains(&"agent".to_string()),
+            "production lifecycle must advertise agent tool"
+        );
 
         // full_server_capabilities_for_tests also includes AgentSpawner
         assert!(full_server_capabilities_for_tests().has(Capability::AgentSpawner));
@@ -681,9 +716,12 @@ mod tests {
         assert!(matches!(err, SkillError::LoadFailed(m) if m.contains("metadata.instructions")));
 
         // Missing token → LoadFailed
-        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).expect("test api origin");
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
+            .expect("test api origin");
         let provider = RemoteSkillCatalogProvider::new(api, std::sync::Arc::new(|| None));
-        let err = provider.current_token().expect_err("missing token must fail");
+        let err = provider
+            .current_token()
+            .expect_err("missing token must fail");
         assert!(matches!(err, SkillError::LoadFailed(m) if m.contains("no valid access token")));
     }
 }

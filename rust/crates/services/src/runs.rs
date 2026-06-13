@@ -3195,11 +3195,13 @@ mod tests {
         let out = transform_run_event_for_client(make_event("text_delta", json!({})));
         assert_eq!(out["content"], "");
         // assistant_delta maps to text_delta
-        let out = transform_run_event_for_client(make_event("assistant_delta", json!({"text": "hi"})));
+        let out =
+            transform_run_event_for_client(make_event("assistant_delta", json!({"text": "hi"})));
         assert_eq!(out["type"], "text_delta");
         assert_eq!(out["content"], "hi");
         // text_done
-        let out = transform_run_event_for_client(make_event("text_done", json!({"full_text": "all"})));
+        let out =
+            transform_run_event_for_client(make_event("text_done", json!({"full_text": "all"})));
         assert_eq!(out["type"], "text_done");
         assert_eq!(out["full_text"], "all");
     }
@@ -3207,18 +3209,28 @@ mod tests {
     #[test]
     fn sse_thinking_events() {
         // reasoning_message_content
-        let out = transform_run_event_for_client(make_event("reasoning_message_content", json!({"content": "think"})));
+        let out = transform_run_event_for_client(make_event(
+            "reasoning_message_content",
+            json!({"content": "think"}),
+        ));
         assert_eq!(out["type"], "reasoning_message_content");
         assert_eq!(out["content"], "think");
         // thinking_delta
-        let out = transform_run_event_for_client(make_event("thinking_delta", json!({"chunk": "t"})));
+        let out =
+            transform_run_event_for_client(make_event("thinking_delta", json!({"chunk": "t"})));
         assert_eq!(out["type"], "thinking_delta");
         assert_eq!(out["content"], "t");
         // thinking_done
-        let out = transform_run_event_for_client(make_event("thinking_done", json!({"full_text": "all think"})));
+        let out = transform_run_event_for_client(make_event(
+            "thinking_done",
+            json!({"full_text": "all think"}),
+        ));
         assert_eq!(out["type"], "thinking_done");
         // reasoning_done
-        let out = transform_run_event_for_client(make_event("reasoning_done", json!({"full_text": "reason"})));
+        let out = transform_run_event_for_client(make_event(
+            "reasoning_done",
+            json!({"full_text": "reason"}),
+        ));
         assert_eq!(out["type"], "reasoning_done");
     }
 
@@ -3372,7 +3384,13 @@ mod tests {
     fn unknown_and_missing_events_are_dropped() {
         // unknown event_type (with and without data)
         assert!(transform_run_event_for_client(make_event("custom_event", json!({}))).is_null());
-        assert!(transform_run_event_for_client(make_event("team_prepare", json!({"delegation_id":"d1","phase":"prepare"}))).is_null());
+        assert!(
+            transform_run_event_for_client(make_event(
+                "team_prepare",
+                json!({"delegation_id":"d1","phase":"prepare"})
+            ))
+            .is_null()
+        );
 
         // missing event_type AND type
         assert!(transform_run_event_for_client(json!({"data": {}})).is_null());
@@ -3387,7 +3405,10 @@ mod tests {
     fn already_shaped_client_events_allowlist() {
         // not in allowlist → dropped
         let event = json!({"type": "injection_freshness", "channels": [{"tag":"self_awareness","hash":0u64,"bytes":0u64,"is_empty":true}]});
-        assert!(transform_run_event_for_client(event).is_null(), "client-shaped internal event must be dropped");
+        assert!(
+            transform_run_event_for_client(event).is_null(),
+            "client-shaped internal event must be dropped"
+        );
 
         // in allowlist → pass through
         let event = json!({"type": "text_delta", "content": "hello", "index": 3});

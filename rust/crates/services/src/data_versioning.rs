@@ -1,14 +1,15 @@
 use async_trait::async_trait;
-use axum::{http::StatusCode, Json};
+use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
-use sqlx::{query, Row};
+use sqlx::{Row, query};
 use std::collections::{HashMap, HashSet};
 
 use crate::SessionArtifactStore;
 
 use astra_core::{
+    ErrorResponse, MatrixOneSettings, SharedPool,
     composite_snapshot::{CompositeSnapshot, CompositeSnapshotIndex, StateDiff},
-    error_response, internal_error, ErrorResponse, MatrixOneSettings, SharedPool,
+    error_response, internal_error,
 };
 
 const MAX_CHECKPOINT_LIST_ROWS: i32 = 200;
@@ -923,8 +924,8 @@ mod tests {
     #[tokio::test]
     async fn unconfigured_service_returns_errors() {
         let svc = UnconfiguredDataVersioningService;
-        assert!(svc
-            .create_checkpoint(
+        assert!(
+            svc.create_checkpoint(
                 "u1".into(),
                 CreateCheckpointData {
                     name: "cp".into(),
@@ -932,19 +933,22 @@ mod tests {
                 }
             )
             .await
-            .is_err());
+            .is_err()
+        );
         assert!(svc.list_checkpoints("u1".into()).await.is_err());
-        assert!(svc
-            .get_events_at_checkpoint("u1".into(), "cp".into())
-            .await
-            .is_err());
-        assert!(svc
-            .get_causal_chain("u1".into(), "e1".into())
-            .await
-            .is_err());
+        assert!(
+            svc.get_events_at_checkpoint("u1".into(), "cp".into())
+                .await
+                .is_err()
+        );
+        assert!(
+            svc.get_causal_chain("u1".into(), "e1".into())
+                .await
+                .is_err()
+        );
         assert!(svc.trace_upstream("u1".into(), "e1".into()).await.is_err());
-        assert!(svc
-            .sandbox_checkpoint(
+        assert!(
+            svc.sandbox_checkpoint(
                 "u1".into(),
                 "sb".into(),
                 SandboxCheckpointData {
@@ -952,9 +956,10 @@ mod tests {
                 }
             )
             .await
-            .is_err());
-        assert!(svc
-            .sandbox_restore(
+            .is_err()
+        );
+        assert!(
+            svc.sandbox_restore(
                 "u1".into(),
                 "sb".into(),
                 SandboxCheckpointData {
@@ -962,7 +967,8 @@ mod tests {
                 }
             )
             .await
-            .is_err());
+            .is_err()
+        );
     }
 
     // ── Data type equality (2→1) ──

@@ -4196,13 +4196,15 @@ type Handler interface {
 
         // Missing file
         assert!(
-            exe.delete_file(&json!({"path": "nope.txt"})).contains("not found")
+            exe.delete_file(&json!({"path": "nope.txt"}))
+                .contains("not found")
         );
 
         // Directory
         std::fs::create_dir(tmpdir.path().join("subdir")).unwrap();
         assert!(
-            exe.delete_file(&json!({"path": "subdir"})).contains("refusing to delete a directory")
+            exe.delete_file(&json!({"path": "subdir"}))
+                .contains("refusing to delete a directory")
         );
 
         // Path inside .git
@@ -4210,7 +4212,8 @@ type Handler interface {
         std::fs::create_dir(&git_dir).unwrap();
         std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         assert!(
-            exe.delete_file(&json!({"path": ".git/HEAD"})).contains("refusing to delete .git")
+            exe.delete_file(&json!({"path": ".git/HEAD"}))
+                .contains("refusing to delete .git")
         );
     }
 

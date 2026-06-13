@@ -663,8 +663,13 @@ mod tests {
             assert_eq!(kind, back, "roundtrip failed for {kind:?}");
         }
         // ALL_VARIANTS must have no duplicates
-        let tags: std::collections::HashSet<&str> = ALL_VARIANTS.iter().map(|k| k.as_str()).collect();
-        assert_eq!(tags.len(), ALL_VARIANTS.len(), "ALL_VARIANTS has duplicates");
+        let tags: std::collections::HashSet<&str> =
+            ALL_VARIANTS.iter().map(|k| k.as_str()).collect();
+        assert_eq!(
+            tags.len(),
+            ALL_VARIANTS.len(),
+            "ALL_VARIANTS has duplicates"
+        );
         // parse_tag must round-trip
         for &kind in ALL_VARIANTS {
             assert_eq!(ErrorKind::parse_tag(kind.as_str()), Some(kind));
@@ -677,7 +682,10 @@ mod tests {
         for &kind in ALL_VARIANTS {
             assert!(!kind.guidance().is_empty(), "empty guidance for {kind:?}");
             assert!(!kind.as_str().is_empty(), "empty as_str for {kind:?}");
-            assert!(!kind.diagnosis_hint().is_empty(), "empty diagnosis_hint for {kind:?}");
+            assert!(
+                !kind.diagnosis_hint().is_empty(),
+                "empty diagnosis_hint for {kind:?}"
+            );
         }
         // display matches as_str
         for kind in [ErrorKind::RateLimit, ErrorKind::Auth, ErrorKind::Unknown] {
@@ -688,11 +696,23 @@ mod tests {
     #[test]
     fn retry_behavior() {
         // Known retryable
-        for kind in [ErrorKind::RateLimit, ErrorKind::ServerError, ErrorKind::StreamIdle, ErrorKind::StreamTransport, ErrorKind::Network] {
+        for kind in [
+            ErrorKind::RateLimit,
+            ErrorKind::ServerError,
+            ErrorKind::StreamIdle,
+            ErrorKind::StreamTransport,
+            ErrorKind::Network,
+        ] {
             assert!(kind.is_retryable(), "{kind:?} must be retryable");
         }
         // Known non-retryable
-        for kind in [ErrorKind::Auth, ErrorKind::ContextWindow, ErrorKind::Cancelled, ErrorKind::ResourceLimit, ErrorKind::ToolTimeout] {
+        for kind in [
+            ErrorKind::Auth,
+            ErrorKind::ContextWindow,
+            ErrorKind::Cancelled,
+            ErrorKind::ResourceLimit,
+            ErrorKind::ToolTimeout,
+        ] {
             assert!(!kind.is_retryable(), "{kind:?} must NOT be retryable");
         }
         // Exponential backoff for RateLimit
@@ -707,7 +727,10 @@ mod tests {
         // Invariant: delay ↔ retryable for all variants
         for &kind in ALL_VARIANTS {
             match kind.retry_delay_ms(0) {
-                Some(_) => assert!(kind.is_retryable(), "non-retryable {kind:?} returned a delay"),
+                Some(_) => assert!(
+                    kind.is_retryable(),
+                    "non-retryable {kind:?} returned a delay"
+                ),
                 None => assert!(!kind.is_retryable(), "retryable {kind:?} returned no delay"),
             }
         }
@@ -738,9 +761,14 @@ mod tests {
     fn classified_error_from_string_roundtrip() {
         // Recover kind from [prefix] in Display string
         for kind in [
-            ErrorKind::RateLimit, ErrorKind::ServerError, ErrorKind::Auth,
-            ErrorKind::ContextWindow, ErrorKind::InvalidRequest, ErrorKind::StreamIdle,
-            ErrorKind::BudgetExhausted, ErrorKind::Cancelled,
+            ErrorKind::RateLimit,
+            ErrorKind::ServerError,
+            ErrorKind::Auth,
+            ErrorKind::ContextWindow,
+            ErrorKind::InvalidRequest,
+            ErrorKind::StreamIdle,
+            ErrorKind::BudgetExhausted,
+            ErrorKind::Cancelled,
         ] {
             let original = ClassifiedError::new(kind, "test");
             let roundtrip = ClassifiedError::from(original.to_string());
@@ -933,7 +961,10 @@ mod tests {
     fn diagnosis_hint_specific_keywords() {
         // Operator-specific diagnosis_hint content (vs. LLM-facing guidance)
         assert!(
-            ErrorKind::ResourceLimit.diagnosis_hint().to_lowercase().contains("ulimit")
+            ErrorKind::ResourceLimit
+                .diagnosis_hint()
+                .to_lowercase()
+                .contains("ulimit")
         );
         let auth = ErrorKind::Auth.diagnosis_hint().to_lowercase();
         assert!(auth.contains("login") || auth.contains("credential") || auth.contains("token"));
@@ -943,8 +974,10 @@ mod tests {
         assert!(stall.contains("rewind") || stall.contains("model") || stall.contains("loop"));
         // Must differ from guidance for operator-relevant variants
         for kind in [
-            ErrorKind::ResourceLimit, ErrorKind::Auth,
-            ErrorKind::DatabaseError, ErrorKind::Stall,
+            ErrorKind::ResourceLimit,
+            ErrorKind::Auth,
+            ErrorKind::DatabaseError,
+            ErrorKind::Stall,
         ] {
             assert_ne!(kind.diagnosis_hint(), kind.guidance());
         }

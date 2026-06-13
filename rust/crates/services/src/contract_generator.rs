@@ -745,14 +745,18 @@ mod tests {
         }];
         let scope = cg.infer_scope("add a feature", &subtasks);
         assert!(scope.out_of_scope.iter().any(|s| s.contains("Deployment")));
-        assert!(scope
-            .out_of_scope
-            .iter()
-            .any(|s| s.contains("Documentation")));
-        assert!(scope
-            .assumptions
-            .iter()
-            .any(|s| s.contains("Rust toolchain")));
+        assert!(
+            scope
+                .out_of_scope
+                .iter()
+                .any(|s| s.contains("Documentation"))
+        );
+        assert!(
+            scope
+                .assumptions
+                .iter()
+                .any(|s| s.contains("Rust toolchain"))
+        );
     }
 
     #[test]

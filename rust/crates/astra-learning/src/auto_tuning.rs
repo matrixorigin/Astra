@@ -1962,8 +1962,8 @@ mod tests {
         // Long pause: 2 signals → triggers long-pause-expand-memory
         let cases: Vec<(
             SignalType,
-            usize,               // signal count to record
-            &str,                // expected rule id
+            usize, // signal count to record
+            &str,  // expected rule id
         )> = vec![
             (
                 SignalType::QuickFollowUp { delay_ms: 500 },
@@ -1971,9 +1971,7 @@ mod tests {
                 "quick-followup-trim-history",
             ),
             (
-                SignalType::LongPause {
-                    delay_ms: 120_000,
-                },
+                SignalType::LongPause { delay_ms: 120_000 },
                 2,
                 "long-pause-expand-memory",
             ),

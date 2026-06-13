@@ -2,10 +2,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::cloud::approval_policy::{
-    bash_command_is_read_only, cloud_gated_tool_kind_with_args, CloudGatedToolKind,
+    CloudGatedToolKind, bash_command_is_read_only, cloud_gated_tool_kind_with_args,
 };
 use crate::tool::result::semantics::is_resource_limit_output;
-use astra_sandbox::{analyze_command_risks, CommandRisk};
+use astra_sandbox::{CommandRisk, analyze_command_risks};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -998,22 +998,24 @@ mod tests {
             p.compensation_kind,
             Some(CompensationKind::RestoreOrDeleteFile)
         );
-        assert!(p
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("rollback_file_edits"));
+        assert!(
+            p.compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rollback_file_edits")
+        );
 
         // create_file: DeleteFile (no pre-state needed)
         let p = tool_action_profile("create_file", &json!({"path": "tmp.txt"}));
         assert_eq!(p.category, ActionCategory::Write);
         assert!(!p.requires_pre_state);
         assert_eq!(p.compensation_kind, Some(CompensationKind::DeleteFile));
-        assert!(p
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("rollback_file_edits"));
+        assert!(
+            p.compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rollback_file_edits")
+        );
 
         // multi_edit: RestoreFileContents
         let p = tool_action_profile("multi_edit", &json!({"path": "src/lib.rs"}));
@@ -1023,11 +1025,12 @@ mod tests {
             p.compensation_kind,
             Some(CompensationKind::RestoreFileContents)
         );
-        assert!(p
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("rollback_file_edits"));
+        assert!(
+            p.compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rollback_file_edits")
+        );
 
         // delete_file: destructive, RestoreFileContents
         let p = tool_action_profile("delete_file", &json!({"path": "src/lib.rs"}));
@@ -1039,11 +1042,12 @@ mod tests {
             p.compensation_kind,
             Some(CompensationKind::RestoreFileContents)
         );
-        assert!(p
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("rollback_file_edits"));
+        assert!(
+            p.compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rollback_file_edits")
+        );
     }
 
     #[test]
@@ -1082,11 +1086,13 @@ mod tests {
             adjust.compensation_kind,
             Some(CompensationKind::RestoreSessionState)
         );
-        assert!(adjust
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("rollback_session_state"));
+        assert!(
+            adjust
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rollback_session_state")
+        );
 
         let prioritize = tool_action_profile("prioritize_tool", &json!({"tool": "bash"}));
         assert!(prioritize.bounded);
@@ -1096,11 +1102,13 @@ mod tests {
             prioritize.compensation_kind,
             Some(CompensationKind::RestoreSessionState)
         );
-        assert!(prioritize
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("prior preference state"));
+        assert!(
+            prioritize
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("prior preference state")
+        );
 
         let set_goal = tool_action_profile("set_goal", &json!({"goal": "ship rollback shell"}));
         assert!(set_goal.bounded);
@@ -1110,11 +1118,13 @@ mod tests {
             set_goal.compensation_kind,
             Some(CompensationKind::RestoreSessionState)
         );
-        assert!(set_goal
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("previous_goal"));
+        assert!(
+            set_goal
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("previous_goal")
+        );
 
         let compress = tool_action_profile("compress_context", &json!({"turns": 4}));
         assert!(compress.bounded);
@@ -1124,11 +1134,13 @@ mod tests {
             compress.compensation_kind,
             Some(CompensationKind::RestoreSessionState)
         );
-        assert!(compress
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("session-local compression state"));
+        assert!(
+            compress
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("session-local compression state")
+        );
     }
 
     #[test]
@@ -1141,11 +1153,13 @@ mod tests {
             create.compensation_kind,
             Some(CompensationKind::RestoreSessionState)
         );
-        assert!(create
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("rollback_session_state"));
+        assert!(
+            create
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rollback_session_state")
+        );
 
         let update = tool_action_profile(
             "task",
@@ -1158,16 +1172,20 @@ mod tests {
             update.compensation_kind,
             Some(CompensationKind::RestoreSessionState)
         );
-        assert!(update
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("pre-update task snapshot"));
-        assert!(update
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("new_status='<previous_status>'"));
+        assert!(
+            update
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("pre-update task snapshot")
+        );
+        assert!(
+            update
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("new_status='<previous_status>'")
+        );
 
         let stop = tool_action_profile("task", &json!({"action": "stop", "task_id": "task-1"}));
         assert!(stop.bounded);
@@ -1177,16 +1195,18 @@ mod tests {
             stop.compensation_kind,
             Some(CompensationKind::RestoreSessionState)
         );
-        assert!(stop
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("previous_status"));
-        assert!(stop
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("new_status='<previous_status>'"));
+        assert!(
+            stop.compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("previous_status")
+        );
+        assert!(
+            stop.compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("new_status='<previous_status>'")
+        );
     }
 
     #[test]
@@ -1225,11 +1245,12 @@ mod tests {
         assert_eq!(p.category, ActionCategory::Execute);
         assert!(p.reversible);
         assert_eq!(p.compensation_kind, Some(CompensationKind::GitRevertCommit));
-        assert!(p
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("git_revert_commit"));
+        assert!(
+            p.compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("git_revert_commit")
+        );
     }
 
     #[test]
@@ -1252,11 +1273,12 @@ mod tests {
             p.compensation_kind,
             Some(CompensationKind::GitRestoreWorktree)
         );
-        assert!(p
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("rollback_turn_actions"));
+        assert!(
+            p.compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rollback_turn_actions")
+        );
 
         // add: same compensation
         let p = tool_action_profile("git_worktree", &json!({"action": "add", "branch": "demo"}));
@@ -1284,11 +1306,12 @@ mod tests {
         assert_eq!(p.category, ActionCategory::Execute);
         assert!(p.reversible);
         assert_eq!(p.compensation_kind, Some(CompensationKind::GitApplyStash));
-        assert!(p
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("stash_ref"));
+        assert!(
+            p.compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("stash_ref")
+        );
 
         // checkout file: destructive but bounded + reversible
         let p = tool_action_profile("git_checkout_file", &json!({"path": "src/lib.rs"}));
@@ -1311,11 +1334,13 @@ mod tests {
             profile.compensation_kind,
             Some(CompensationKind::GitRevertCommit)
         );
-        assert!(profile
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("git_revert_commit"));
+        assert!(
+            profile
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("git_revert_commit")
+        );
     }
 
     #[test]
@@ -1348,11 +1373,13 @@ mod tests {
             profile.compensation_kind,
             Some(CompensationKind::GitRestoreWorktree)
         );
-        assert!(profile
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("rollback_turn_actions"));
+        assert!(
+            profile
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rollback_turn_actions")
+        );
     }
 
     #[test]
@@ -1361,11 +1388,13 @@ mod tests {
             "rename_symbol",
             &json!({"path": "src/lib.rs", "old_name": "foo", "new_name": "bar"}),
         );
-        assert!(profile
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("rollback_turn_actions"));
+        assert!(
+            profile
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rollback_turn_actions")
+        );
     }
 
     #[test]
@@ -1377,11 +1406,12 @@ mod tests {
             p.compensation_kind,
             Some(CompensationKind::RestoreDatabaseSnapshot)
         );
-        assert!(p
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("snapshot"));
+        assert!(
+            p.compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("snapshot")
+        );
 
         // read-only tools: no compensation prompt
         for tool in ["read_file", "list_dir", "glob", "grep", "lsp"] {
@@ -1400,22 +1430,24 @@ mod tests {
             "notebook_edit",
             &json!({"cell_id": "cell-1", "content": "x"}),
         );
-        assert!(p
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("rollback_turn_actions"));
+        assert!(
+            p.compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rollback_turn_actions")
+        );
 
         // rename_symbol: uses turn rollback hint
         let p = tool_action_profile(
             "rename_symbol",
             &json!({"path": "src/lib.rs", "old_name": "foo", "new_name": "bar"}),
         );
-        assert!(p
-            .compensation_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("rollback_turn_actions"));
+        assert!(
+            p.compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rollback_turn_actions")
+        );
     }
 
     #[test]

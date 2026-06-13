@@ -2522,12 +2522,6 @@ mod tests {
     }
 
     #[test]
-    fn manager_find_tool_when_empty() {
-        let manager = McpClientManager::new();
-        assert!(manager.find_tool("nonexistent").is_none());
-    }
-
-    #[test]
     fn mcp_tool_schema_conversion() {
         use std::sync::Arc;
         let schema_map: serde_json::Map<String, serde_json::Value> =
@@ -2564,19 +2558,6 @@ transport:
     // ============================================================================
     // Integration Tests - MCP Configuration and Schema Handling
     // ============================================================================
-
-    #[test]
-    fn manager_operations() {
-        let mut manager = McpClientManager::new();
-
-        // Empty manager should have no servers
-        assert!(manager.connected_servers().is_empty());
-        assert!(manager.all_tools().is_empty());
-        assert!(manager.find_tool("any_tool").is_none());
-
-        // Disconnect non-existent server should return false
-        assert!(!manager.disconnect("nonexistent"));
-    }
 
     #[test]
     fn transport_stdio_config_parsing() {
@@ -2750,25 +2731,19 @@ mcp_servers:
     }
 
     #[test]
-    fn extract_result_text_multiple_contents() {
+    fn extract_result_text_basic() {
         use rmcp::model::{Content, RawContent};
 
+        // multiple text contents joined with newline
         let result = CallToolResult::success(vec![
             Content::new(RawContent::text("Line 1"), None),
             Content::new(RawContent::text("Line 2"), None),
             Content::new(RawContent::text("Line 3"), None),
         ]);
+        assert_eq!(extract_result_text(&result), "Line 1\nLine 2\nLine 3");
 
-        let text = extract_result_text(&result);
-        assert_eq!(text, "Line 1\nLine 2\nLine 3");
-    }
-
-    #[test]
-    fn extract_result_text_empty() {
-        let result = CallToolResult::success(vec![]);
-
-        let text = extract_result_text(&result);
-        assert!(text.is_empty());
+        // empty result
+        assert!(extract_result_text(&CallToolResult::success(vec![])).is_empty());
     }
 
     #[test]
@@ -2833,18 +2808,25 @@ mcp_servers:
         assert_eq!(ConnectionState::Connected.to_string(), "connected");
         assert_eq!(ConnectionState::Reconnecting.to_string(), "reconnecting");
         assert_eq!(ConnectionState::Failed.to_string(), "failed");
+        // Copy + Eq
+        let state = ConnectionState::Connected;
+        let copied = state;
+        assert_eq!(state, copied);
+        assert_eq!(ConnectionState::Connected, ConnectionState::Connected);
+        assert_ne!(ConnectionState::Connected, ConnectionState::Disconnected);
+        assert_eq!(ConnectionState::Failed, ConnectionState::Failed);
+        assert_ne!(ConnectionState::Connecting, ConnectionState::Reconnecting);
     }
 
     #[test]
-    fn retry_config_defaults() {
-        let config = RetryConfig::default();
-        assert_eq!(config.max_retries, 5);
-        assert_eq!(config.initial_delay_ms, 1000);
-        assert_eq!(config.max_delay_ms, 30_000);
-    }
+    fn retry_config_and_backoff() {
+        // defaults
+        let rc = RetryConfig::default();
+        assert_eq!(rc.max_retries, 5);
+        assert_eq!(rc.initial_delay_ms, 1000);
+        assert_eq!(rc.max_delay_ms, 30_000);
 
-    #[test]
-    fn retry_config_from_yaml() {
+        // from yaml
         let yaml = r#"
 name: test
 transport:
@@ -2859,10 +2841,8 @@ retry:
         assert_eq!(config.retry.max_retries, 3);
         assert_eq!(config.retry.initial_delay_ms, 500);
         assert_eq!(config.retry.max_delay_ms, 10_000);
-    }
 
-    #[test]
-    fn retry_config_defaults_when_omitted() {
+        // defaults when omitted
         let yaml = r#"
 name: test
 transport:
@@ -2873,16 +2853,13 @@ transport:
         assert_eq!(config.retry.max_retries, 5);
         assert_eq!(config.retry.initial_delay_ms, 1000);
         assert_eq!(config.retry.max_delay_ms, 30_000);
-    }
 
-    #[test]
-    fn exponential_backoff_calculation() {
+        // exponential backoff calculation
         let retry = RetryConfig {
             max_retries: 5,
             initial_delay_ms: 1000,
             max_delay_ms: 30_000,
         };
-
         let delays: Vec<u64> = (1..=5)
             .map(|attempt| {
                 std::cmp::min(
@@ -2891,29 +2868,19 @@ transport:
                 )
             })
             .collect();
-
         assert_eq!(delays, vec![1000, 2000, 4000, 8000, 16000]);
-    }
 
-    #[test]
-    fn exponential_backoff_caps_at_max() {
+        // caps at max
         let retry = RetryConfig {
             max_retries: 10,
             initial_delay_ms: 1000,
             max_delay_ms: 5000,
         };
-
         let delay_at_10 = std::cmp::min(
             retry.initial_delay_ms * 2u64.saturating_pow(9),
             retry.max_delay_ms,
         );
         assert_eq!(delay_at_10, 5000);
-    }
-
-    #[test]
-    fn server_states_empty_manager() {
-        let manager = McpClientManager::new();
-        assert!(manager.server_states().is_empty());
     }
 
     #[test]
@@ -2986,14 +2953,12 @@ transport:
     // ============================================================================
 
     #[test]
-    fn sanitize_tool_name_valid() {
+    fn sanitize_tool_name_cases() {
+        // valid names pass through
         assert_eq!(sanitize_tool_name("read_file"), "read_file");
         assert_eq!(sanitize_tool_name("mcp_fs_read-file"), "mcp_fs_read-file");
         assert_eq!(sanitize_tool_name("abc123"), "abc123");
-    }
-
-    #[test]
-    fn sanitize_tool_name_special_chars() {
+        // special characters replaced
         assert_eq!(sanitize_tool_name("read file"), "read_file");
         assert_eq!(sanitize_tool_name("tool.name"), "tool_name");
         assert_eq!(sanitize_tool_name("ns::func"), "ns__func");
@@ -3001,62 +2966,51 @@ transport:
     }
 
     #[test]
-    fn mcp_tool_to_schema_truncates_description() {
+    fn mcp_tool_to_schema_edge_cases() {
         use std::sync::Arc;
         let empty_schema: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-        let long_desc = "x".repeat(5000);
 
-        let tool = Tool::new("test_tool", long_desc, Arc::new(empty_schema));
+        // truncates long description
+        let long_desc = "x".repeat(5000);
+        let tool = Tool::new("test_tool", long_desc, Arc::new(empty_schema.clone()));
         let schema = mcp_tool_to_schema("server", &tool);
         let desc = schema["function"]["description"].as_str().unwrap();
-
         assert!(
             desc.len() <= MAX_DESCRIPTION_LENGTH,
             "truncated desc should not exceed max"
         );
         assert!(desc.ends_with("… [truncated]"));
-    }
 
-    #[test]
-    fn mcp_tool_to_schema_sanitizes_name() {
-        use std::sync::Arc;
-        let empty_schema: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        // sanitizes tool name with spaces in server or tool
         let tool = Tool::new(
             "read file".to_string(),
             "desc".to_string(),
             Arc::new(empty_schema),
         );
         let schema = mcp_tool_to_schema("my.server", &tool);
-
         let name = schema["function"]["name"].as_str().unwrap();
         assert_eq!(name, "mcp__my_server__read_file");
     }
 
     #[test]
-    fn extract_result_text_truncation() {
+    fn extract_result_text_truncation_cases() {
         use rmcp::model::{Content, RawContent};
 
+        // truncates when content exceeds limit
         let big_text = "a".repeat(200);
         let result = CallToolResult::success(vec![
             Content::new(RawContent::text(&big_text), None),
             Content::new(RawContent::text(&big_text), None),
         ]);
-
-        // With a small limit
         let text = extract_result_text_with_limit(&result, 250);
         assert!(text.contains("[OUTPUT TRUNCATED"));
         assert!(text.len() < 500);
-    }
 
-    #[test]
-    fn extract_result_text_no_truncation_when_small() {
-        use rmcp::model::{Content, RawContent};
-
+        // no truncation for small content
         let result = CallToolResult::success(vec![
             Content::new(RawContent::text("hello"), None),
             Content::new(RawContent::text("world"), None),
         ]);
-
         let text = extract_result_text_with_limit(&result, 1000);
         assert_eq!(text, "hello\nworld");
         assert!(!text.contains("[OUTPUT TRUNCATED"));
@@ -3341,53 +3295,11 @@ mcp_servers:
         assert!(handler.resources_changed.load(Ordering::Acquire));
     }
 
-    #[test]
-    fn manager_refresh_changed_tools_empty() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let mut manager = McpClientManager::new();
-            let refreshed = manager.refresh_changed_tools().await;
-            assert!(refreshed.is_empty());
-        });
-    }
-
-    #[test]
-    fn manager_all_prompts_empty() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let manager = McpClientManager::new();
-            let prompts = manager.all_prompts().await;
-            assert!(prompts.is_empty());
-        });
-    }
-
-    #[test]
-    fn manager_get_prompt_no_server() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let manager = McpClientManager::new();
-            let result = manager.get_prompt("nonexistent", "test", None).await;
-            assert!(result.is_err());
-            assert!(matches!(
-                result.unwrap_err(),
-                McpError::ServerNotConnected(_)
-            ));
-        });
-    }
-
     // ── Sampling tests ────────────────────────────────────────────────────
 
     #[test]
-    fn sampling_messages_text_only() {
+    fn sampling_messages_to_openai_cases() {
+        // text messages
         let msgs = vec![
             SamplingMessage::user_text("Hello"),
             SamplingMessage::assistant_text("Hi there"),
@@ -3398,10 +3310,8 @@ mcp_servers:
         assert_eq!(openai[0]["content"], "Hello");
         assert_eq!(openai[1]["role"], "assistant");
         assert_eq!(openai[1]["content"], "Hi there");
-    }
 
-    #[test]
-    fn sampling_messages_image_content() {
+        // image content
         use rmcp::model::RawImageContent;
         let img = SamplingMessageContent::Image(RawImageContent {
             mime_type: "image/png".into(),
@@ -3416,10 +3326,8 @@ mcp_servers:
         let part = &content[0];
         assert_eq!(part["type"], "image_url");
         assert_eq!(part["image_url"]["url"], "data:image/png;base64,abc123");
-    }
 
-    #[test]
-    fn sampling_messages_empty() {
+        // empty messages
         let openai = sampling_messages_to_openai(&[]);
         assert!(openai.is_empty());
     }
@@ -3483,20 +3391,13 @@ mcp_servers:
     // ── Elicitation Tests ────────────────────────────────────────────────
 
     #[test]
-    fn enum_schema_values_legacy() {
-        // Legacy schema has "enum" array at top level.
-        let json = serde_json::json!({
-            "type": "string",
-            "enum": ["red", "green", "blue"]
-        });
+    fn enum_schema_value_extraction() {
+        // Legacy schema with "enum" array at top level
+        let json = serde_json::json!({"type": "string", "enum": ["red", "green", "blue"]});
         let schema: rmcp::model::EnumSchema = serde_json::from_value(json).unwrap();
-        let vals = enum_schema_values(&schema);
-        assert_eq!(vals, vec!["red", "green", "blue"]);
-    }
+        assert_eq!(enum_schema_values(&schema), vec!["red", "green", "blue"]);
 
-    #[test]
-    fn enum_schema_values_titled_single() {
-        // Titled single-select uses oneOf with const + title.
+        // Titled single-select uses oneOf with const + title
         let json = serde_json::json!({
             "type": "string",
             "oneOf": [
@@ -3505,19 +3406,12 @@ mcp_servers:
             ]
         });
         let schema: rmcp::model::EnumSchema = serde_json::from_value(json).unwrap();
-        let vals = enum_schema_values(&schema);
-        assert_eq!(vals, vec!["a", "b"]);
-    }
+        assert_eq!(enum_schema_values(&schema), vec!["a", "b"]);
 
-    #[test]
-    fn enum_schema_values_empty_fallback() {
-        // If we can't extract any values, return empty vec.
-        let _json = serde_json::json!({"type": "string"});
-        // This may fail to parse as EnumSchema, so test the function with a valid but empty enum.
-        let json2 = serde_json::json!({"type": "string", "enum": []});
-        let schema: rmcp::model::EnumSchema = serde_json::from_value(json2).unwrap();
-        let vals = enum_schema_values(&schema);
-        assert!(vals.is_empty());
+        // Empty enum returns empty vec
+        let json = serde_json::json!({"type": "string", "enum": []});
+        let schema: rmcp::model::EnumSchema = serde_json::from_value(json).unwrap();
+        assert!(enum_schema_values(&schema).is_empty());
     }
 
     #[test]
@@ -3751,14 +3645,10 @@ mcp_servers:
     // --- McpClientManager unit tests (no real server needed) ---
 
     #[test]
-    fn manager_has_sampling_false_by_default() {
-        let mgr = McpClientManager::new();
-        assert!(!mgr.has_sampling());
-    }
-
-    #[test]
-    fn manager_has_sampling_after_set() {
+    fn manager_sampling_lifecycle() {
+        // has_sampling: false by default, true after set, false after clear
         let mut mgr = McpClientManager::new();
+        assert!(!mgr.has_sampling(), "false by default");
         let config = SamplingConfig {
             api: Arc::new(
                 astra_thin_client::ThinClient::new("http://localhost:8000", None).unwrap(),
@@ -3768,124 +3658,65 @@ mcp_servers:
             max_tokens_cap: DEFAULT_SAMPLING_MAX_TOKENS_CAP,
         };
         mgr.set_sampling_config(Some(config));
-        assert!(mgr.has_sampling());
+        assert!(mgr.has_sampling(), "true after set");
         mgr.set_sampling_config(None);
-        assert!(!mgr.has_sampling());
+        assert!(!mgr.has_sampling(), "false after clear");
     }
 
     #[test]
-    fn manager_connection_count_empty() {
+    fn manager_empty_checks() {
         let mgr = McpClientManager::new();
         assert_eq!(mgr.connection_count(), 0);
-    }
-
-    #[test]
-    fn manager_connected_servers_empty() {
-        let mgr = McpClientManager::new();
         assert!(mgr.connected_servers().is_empty());
-    }
-
-    #[test]
-    fn manager_server_state_not_found() {
-        let mgr = McpClientManager::new();
+        assert!(mgr.server_states().is_empty());
         assert!(mgr.server_state("nonexistent").is_none());
-    }
-
-    #[test]
-    fn manager_get_not_found() {
-        let mgr = McpClientManager::new();
         assert!(mgr.get("nonexistent").is_none());
-    }
-
-    #[test]
-    fn manager_all_tools_empty() {
-        let mgr = McpClientManager::new();
         assert!(mgr.all_tools().is_empty());
-    }
-
-    #[test]
-    fn manager_all_tool_schemas_empty() {
-        let mgr = McpClientManager::new();
         assert!(mgr.all_tool_schemas().is_empty());
-    }
-
-    #[test]
-    fn manager_find_tool_by_mcp_name_empty() {
-        let mgr = McpClientManager::new();
         assert!(mgr.find_tool_by_mcp_name("mcp_server_tool").is_none());
-    }
-
-    #[test]
-    fn manager_consume_prompt_changes_empty() {
-        let mgr = McpClientManager::new();
         assert!(mgr.consume_prompt_changes().is_empty());
-    }
-
-    #[test]
-    fn manager_consume_resource_changes_empty() {
-        let mgr = McpClientManager::new();
         assert!(mgr.consume_resource_changes().is_empty());
-    }
-
-    #[test]
-    fn manager_disconnect_nonexistent() {
         let mut mgr = McpClientManager::new();
         assert!(!mgr.disconnect("nonexistent"));
     }
 
     #[tokio::test]
-    async fn manager_all_resources_empty() {
+    async fn manager_empty_checks_async() {
         let mgr = McpClientManager::new();
         assert!(mgr.all_resources().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn manager_ping_nonexistent_server() {
         let mut mgr = McpClientManager::new();
-        let result = mgr.ping("nonexistent").await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+        // ping: ServerNotConnected for nonexistent, ping_all empty
+        let err = mgr.ping("nonexistent").await.unwrap_err();
         assert!(matches!(err, McpError::ServerNotConnected(_)));
-    }
-
-    #[tokio::test]
-    async fn manager_ping_all_empty() {
-        let mut mgr = McpClientManager::new();
-        let results = mgr.ping_all().await;
-        assert!(results.is_empty());
-    }
-
-    #[tokio::test]
-    async fn manager_complete_nonexistent_server() {
-        let mgr = McpClientManager::new();
+        assert!(mgr.ping_all().await.is_empty());
+        // complete
         let ref_ = rmcp::model::Reference::for_prompt("test");
-        let result = mgr.complete("nonexistent", ref_, "arg", "").await;
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            McpError::ServerNotConnected(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn manager_call_tool_not_found() {
-        let mgr = McpClientManager::new();
-        let result = mgr
+        let err = mgr
+            .complete("nonexistent", ref_, "arg", "")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McpError::ServerNotConnected(_)));
+        // call_tool: ToolNotFound for nonexistent tool
+        let err = mgr
             .call_tool("nonexistent_tool", serde_json::json!({}))
-            .await;
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), McpError::ToolNotFound(_)));
-    }
-
-    #[tokio::test]
-    async fn manager_reconnect_nonexistent() {
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McpError::ToolNotFound(_)));
+        // reconnect
+        let err = mgr.reconnect("nonexistent").await.unwrap_err();
+        assert!(matches!(err, McpError::ServerNotConnected(_)));
+        // refresh_changed_tools empty
         let mut mgr = McpClientManager::new();
-        let result = mgr.reconnect("nonexistent").await;
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            McpError::ServerNotConnected(_)
-        ));
+        assert!(mgr.refresh_changed_tools().await.is_empty());
+        // all_prompts empty
+        let mgr = McpClientManager::new();
+        assert!(mgr.all_prompts().await.is_empty());
+        // get_prompt: ServerNotConnected
+        let err = mgr
+            .get_prompt("nonexistent", "test", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McpError::ServerNotConnected(_)));
     }
 
     // --- do_sampling response parsing tests ---
@@ -3954,29 +3785,22 @@ mcp_servers:
     }
 
     #[test]
-    fn service_error_requires_reconnect_detects_closed_transport() {
-        let err = ServiceError::TransportClosed;
-        assert!(service_error_requires_reconnect(&err));
-    }
+    fn service_error_and_ping_detection() {
+        // service_error_requires_reconnect
+        assert!(service_error_requires_reconnect(
+            &ServiceError::TransportClosed
+        ));
+        assert!(!service_error_requires_reconnect(
+            &ServiceError::UnexpectedResponse
+        ));
 
-    #[test]
-    fn service_error_requires_reconnect_ignores_unrelated_errors() {
-        let err = ServiceError::UnexpectedResponse;
-        assert!(!service_error_requires_reconnect(&err));
-    }
-
-    #[test]
-    fn mcp_error_is_ping_unsupported_detects_method_not_found() {
+        // mcp_error_is_ping_unsupported
         let err = rmcp::model::ErrorData::new(
             rmcp::model::ErrorCode::METHOD_NOT_FOUND,
             "Method not found: ping",
             None,
         );
         assert!(mcp_error_is_ping_unsupported(&err));
-    }
-
-    #[test]
-    fn mcp_error_is_ping_unsupported_ignores_other_rpc_errors() {
         let err = rmcp::model::ErrorData::new(
             rmcp::model::ErrorCode::INVALID_PARAMS,
             "invalid params",
@@ -3988,99 +3812,76 @@ mcp_servers:
     // --- Argument normalization tests (call_tool logic) ---
 
     #[test]
-    fn call_tool_argument_normalization_object() {
-        // Object arguments pass through as-is
-        let args = serde_json::json!({"key": "value"});
-        let normalized = match args {
-            serde_json::Value::Object(map) => Some(map),
-            serde_json::Value::Null => None,
-            other => Some(serde_json::Map::from_iter([("input".to_string(), other)])),
-        };
-        assert!(normalized.is_some());
-        assert_eq!(normalized.unwrap().get("key").unwrap(), "value");
-    }
+    fn call_tool_argument_normalization() {
+        // Helper that mirrors the match logic in call_tool
+        fn normalize(
+            args: serde_json::Value,
+        ) -> Option<serde_json::Map<String, serde_json::Value>> {
+            match args {
+                serde_json::Value::Object(map) => Some(map),
+                serde_json::Value::Null => None,
+                other => Some(serde_json::Map::from_iter([("input".to_string(), other)])),
+            }
+        }
 
-    #[test]
-    fn call_tool_argument_normalization_null() {
-        let args = serde_json::Value::Null;
-        let normalized = match args {
-            serde_json::Value::Object(map) => Some(map),
-            serde_json::Value::Null => None,
-            other => Some(serde_json::Map::from_iter([("input".to_string(), other)])),
-        };
-        assert!(normalized.is_none());
-    }
+        // Object passes through as-is
+        let map = normalize(serde_json::json!({"key": "value"})).unwrap();
+        assert_eq!(map.get("key").unwrap(), "value");
 
-    #[test]
-    fn call_tool_argument_normalization_string() {
-        // Non-object/non-null wraps in {"input": value}
-        let args = serde_json::json!("hello");
-        let normalized = match args {
-            serde_json::Value::Object(map) => Some(map),
-            serde_json::Value::Null => None,
-            other => Some(serde_json::Map::from_iter([("input".to_string(), other)])),
-        };
-        assert!(normalized.is_some());
-        let map = normalized.unwrap();
+        // Null becomes None
+        assert!(normalize(serde_json::Value::Null).is_none());
+
+        // String wraps in {"input": value}
+        let map = normalize(serde_json::json!("hello")).unwrap();
         assert_eq!(map.get("input").unwrap(), "hello");
-    }
 
-    #[test]
-    fn call_tool_argument_normalization_array() {
-        let args = serde_json::json!([1, 2, 3]);
-        let normalized = match args {
-            serde_json::Value::Object(map) => Some(map),
-            serde_json::Value::Null => None,
-            other => Some(serde_json::Map::from_iter([("input".to_string(), other)])),
-        };
-        assert!(normalized.is_some());
-        let map = normalized.unwrap();
+        // Array wraps in {"input": [1,2,3]}
+        let map = normalize(serde_json::json!([1, 2, 3])).unwrap();
         assert!(map.get("input").unwrap().is_array());
     }
 
     // --- MCP Security Tests ---
 
     #[test]
-    fn dangerous_env_vars_blocked() {
-        // LD_PRELOAD family
-        assert!(is_dangerous_env_var("LD_PRELOAD"));
-        assert!(is_dangerous_env_var("LD_LIBRARY_PATH"));
-        // DYLD family
-        assert!(is_dangerous_env_var("DYLD_INSERT_LIBRARIES"));
-        // SUDO family
-        assert!(is_dangerous_env_var("SUDO_ASKPASS"));
-        // SSH
-        assert!(is_dangerous_env_var("SSH_AUTH_SOCK"));
-        // Exact matches
-        assert!(is_dangerous_env_var("IFS"));
-        assert!(is_dangerous_env_var("BASH_ENV"));
-        assert!(is_dangerous_env_var("ENV"));
-        assert!(is_dangerous_env_var("CDPATH"));
-        assert!(is_dangerous_env_var("GLOBIGNORE"));
-        assert!(is_dangerous_env_var("SHELLOPTS"));
-        assert!(is_dangerous_env_var("BASHOPTS"));
-        assert!(is_dangerous_env_var("PROMPT_COMMAND"));
-        assert!(is_dangerous_env_var("PYTHONPATH"));
-        assert!(is_dangerous_env_var("NODE_PATH"));
-        assert!(is_dangerous_env_var("JAVA_TOOL_OPTIONS"));
-        assert!(is_dangerous_env_var("HOME"));
-        assert!(is_dangerous_env_var("XDG_CONFIG_HOME"));
-        assert!(is_dangerous_env_var("XDG_DATA_HOME"));
-        assert!(is_dangerous_env_var("DISPLAY"));
-        assert!(is_dangerous_env_var("RUST_BACKTRACE"));
-    }
-
-    #[test]
-    fn safe_env_vars_allowed() {
-        assert!(!is_dangerous_env_var("USER"));
-        assert!(!is_dangerous_env_var("TERM"));
-        assert!(!is_dangerous_env_var("LANG"));
-        assert!(!is_dangerous_env_var("MY_APP_TOKEN"));
-        assert!(!is_dangerous_env_var("NODE_ENV"));
-        // PATH is intentionally allowed — MCP servers need it
-        assert!(!is_dangerous_env_var("PATH"));
-        // Not prefix match — must be exact for non-prefix entries
-        assert!(!is_dangerous_env_var("PATHINFO"));
+    fn dangerous_and_safe_env_vars() {
+        // Dangerous env vars (blocked)
+        for var in [
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "SUDO_ASKPASS",
+            "SSH_AUTH_SOCK",
+            "IFS",
+            "BASH_ENV",
+            "ENV",
+            "CDPATH",
+            "GLOBIGNORE",
+            "SHELLOPTS",
+            "BASHOPTS",
+            "PROMPT_COMMAND",
+            "PYTHONPATH",
+            "NODE_PATH",
+            "JAVA_TOOL_OPTIONS",
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "DISPLAY",
+            "RUST_BACKTRACE",
+        ] {
+            assert!(is_dangerous_env_var(var), "{var} should be blocked");
+        }
+        // Safe env vars (allowed)
+        for var in [
+            "USER",
+            "TERM",
+            "LANG",
+            "MY_APP_TOKEN",
+            "NODE_ENV",
+            "PATH",
+            "PATHINFO",
+        ] {
+            assert!(!is_dangerous_env_var(var), "{var} should be allowed");
+        }
     }
 
     #[test]
@@ -4098,35 +3899,27 @@ mcp_servers:
         assert_eq!(small.min(SAMPLING_MAX_TOKENS_CAP), 256);
     }
 
-    #[test]
-    fn timeout_constants_reasonable() {
-        const { assert!(MCP_CONNECT_TIMEOUT_SECS >= 10) };
-        const { assert!(MCP_CONNECT_TIMEOUT_SECS <= 120) };
-        const { assert!(MCP_TOOL_CALL_TIMEOUT_SECS >= 30) };
-        const { assert!(MCP_TOOL_CALL_TIMEOUT_SECS <= 600) };
-    }
+    // ── extract_result_text: non-text & truncation handling ────────────────
 
     #[test]
-    fn extract_result_truncation_warning() {
-        use rmcp::model::{Content, RawContent};
-        // Create a result that exceeds the limit
+    fn extract_result_text_edge_cases() {
+        use rmcp::model::{
+            Content, RawContent, RawEmbeddedResource, RawImageContent, ResourceContents,
+        };
+
+        // truncation warning when exceeding limit
         let long_text = "x".repeat(500);
         let result =
             CallToolResult::success(vec![Content::new(RawContent::text(&long_text), None)]);
         let text = extract_result_text_with_limit(&result, 100);
         assert!(text.contains("[OUTPUT TRUNCATED"));
         assert!(text.len() < 500);
-    }
 
-    // ── extract_result_text: non-text content handling ─────────────────────
-
-    #[test]
-    fn extract_result_text_skips_image_content() {
-        use rmcp::model::{Content, RawContent};
+        // skips image content, returns only text
         let result = CallToolResult::success(vec![
             Content::new(RawContent::text("text output"), None),
             Content::new(
-                RawContent::Image(rmcp::model::RawImageContent {
+                RawContent::Image(RawImageContent {
                     mime_type: "image/png".into(),
                     data: "base64data".into(),
                     meta: None,
@@ -4134,14 +3927,9 @@ mcp_servers:
                 None,
             ),
         ]);
-        let text = extract_result_text(&result);
-        // Image content should be skipped; only text is returned
-        assert_eq!(text, "text output");
-    }
+        assert_eq!(extract_result_text(&result), "text output");
 
-    #[test]
-    fn extract_result_text_image_only_returns_empty() {
-        use rmcp::model::{Content, RawContent, RawImageContent};
+        // image-only returns empty
         let result = CallToolResult::success(vec![Content::new(
             RawContent::Image(RawImageContent {
                 mime_type: "image/png".into(),
@@ -4150,14 +3938,9 @@ mcp_servers:
             }),
             None,
         )]);
-        let text = extract_result_text(&result);
-        assert!(text.is_empty());
-    }
+        assert!(extract_result_text(&result).is_empty());
 
-    #[test]
-    fn extract_result_text_mixed_audio_content_skipped() {
-        use rmcp::model::{Content, RawContent};
-        // Audio content should also be skipped (non-text)
+        // skips audio content
         let result = CallToolResult::success(vec![
             Content::new(RawContent::text("line 1"), None),
             Content::new(
@@ -4169,13 +3952,9 @@ mcp_servers:
             ),
             Content::new(RawContent::text("line 2"), None),
         ]);
-        let text = extract_result_text(&result);
-        assert_eq!(text, "line 1\nline 2");
-    }
+        assert_eq!(extract_result_text(&result), "line 1\nline 2");
 
-    #[test]
-    fn extract_result_text_embedded_resource_skipped() {
-        use rmcp::model::{Content, RawContent, RawEmbeddedResource, ResourceContents};
+        // skips embedded resource
         let result = CallToolResult::success(vec![
             Content::new(RawContent::text("before"), None),
             Content::new(
@@ -4192,17 +3971,13 @@ mcp_servers:
             ),
             Content::new(RawContent::text("after"), None),
         ]);
-        let text = extract_result_text(&result);
-        assert_eq!(text, "before\nafter");
-    }
+        assert_eq!(extract_result_text(&result), "before\nafter");
 
-    #[test]
-    fn extract_result_text_with_limit_skips_non_text() {
-        use rmcp::model::{Content, RawContent};
+        // with_limit skips non-text, no truncation for small text
         let result = CallToolResult::success(vec![
             Content::new(RawContent::text("a"), None),
             Content::new(
-                RawContent::Image(rmcp::model::RawImageContent {
+                RawContent::Image(RawImageContent {
                     mime_type: "image/png".into(),
                     data: "x".repeat(1000),
                     meta: None,
@@ -4212,7 +3987,6 @@ mcp_servers:
             Content::new(RawContent::text("b"), None),
         ]);
         let text = extract_result_text_with_limit(&result, 100);
-        // Image skipped, only text a\nb should appear
         assert_eq!(text, "a\nb");
         assert!(!text.contains("[OUTPUT TRUNCATED"));
     }
@@ -4220,7 +3994,8 @@ mcp_servers:
     // ── WebSocket transport with headers ───────────────────────────────────
 
     #[test]
-    fn ws_transport_with_custom_headers() {
+    fn ws_transport_config() {
+        // with custom headers and auth token
         let yaml = r#"
 name: ws-headers
 transport:
@@ -4245,12 +4020,8 @@ transport:
             }
             _ => panic!("expected Ws transport"),
         }
-    }
 
-    #[test]
-    fn ws_transport_wss_alias() {
-        // "wss" is NOT a valid alias — only "ws" and "websocket" are accepted.
-        // Verify that "wss" URLs must use type: ws instead.
+        // wss:// URL uses type: ws (NOT a separate alias)
         let yaml = r#"
 name: wss-test
 transport:
@@ -4269,105 +4040,52 @@ transport:
     // ── McpClientManager tool lookup with populated state ─────────────────
 
     #[test]
-    fn find_tool_by_mcp_name_exact_match() {
-        // We can't inject tools without a real connection, but we can verify
-        // the sanitized-name resolution logic directly.
-        let server = "my-server";
-        let tool_name = "read file";
-        let sanitized = sanitize_tool_name(&format!("mcp_{}_{}", server, tool_name));
-        assert_eq!(sanitized, "mcp_my-server_read_file");
-    }
-
-    #[test]
-    fn find_tool_by_mcp_name_special_chars_in_server() {
-        let server = "api.example.com";
-        let tool_name = "getData";
-        let sanitized = sanitize_tool_name(&format!("mcp_{}_{}", server, tool_name));
+    fn find_tool_by_mcp_name_sanitization() {
+        // Standard server + tool with spaces
+        let s = sanitize_tool_name(&format!("mcp_{}_{}", "my-server", "read file"));
+        assert_eq!(s, "mcp_my-server_read_file");
         // Dots in server name become underscores
-        assert_eq!(sanitized, "mcp_api_example_com_getData");
-    }
-
-    // ── McpClientManager sampling config ──────────────────────────────────
-
-    #[test]
-    fn manager_has_sampling_returns_false_by_default() {
-        let manager = McpClientManager::new();
-        assert!(!manager.has_sampling());
-    }
-
-    #[test]
-    fn manager_has_sampling_returns_true_after_set() {
-        let mut manager = McpClientManager::new();
-        let config = SamplingConfig {
-            api: Arc::new(
-                astra_thin_client::ThinClient::new("http://localhost:8000", None).unwrap(),
-            ),
-            token: "tok".to_string(),
-            model: "m".to_string(),
-            max_tokens_cap: DEFAULT_SAMPLING_MAX_TOKENS_CAP,
-        };
-        manager.set_sampling_config(Some(config));
-        assert!(manager.has_sampling());
-    }
-
-    #[test]
-    fn manager_has_sampling_returns_false_after_clear() {
-        let mut manager = McpClientManager::new();
-        let config = SamplingConfig {
-            api: Arc::new(
-                astra_thin_client::ThinClient::new("http://localhost:8000", None).unwrap(),
-            ),
-            token: "tok".to_string(),
-            model: "m".to_string(),
-            max_tokens_cap: DEFAULT_SAMPLING_MAX_TOKENS_CAP,
-        };
-        manager.set_sampling_config(Some(config));
-        manager.set_sampling_config(None);
-        assert!(!manager.has_sampling());
+        let s = sanitize_tool_name(&format!("mcp_{}_{}", "api.example.com", "getData"));
+        assert_eq!(s, "mcp_api_example_com_getData");
     }
 
     // ── McpError conversion from ServiceError ──────────────────────────────
 
     #[test]
     fn mcp_error_from_service_error() {
-        let svc_err = ServiceError::TransportClosed;
-        let mcp_err = McpError::from(svc_err);
-        assert!(matches!(mcp_err, McpError::Service(_)));
-    }
-
-    #[test]
-    fn mcp_error_from_service_error_mcp_error() {
-        let svc_err = ServiceError::McpError(rmcp::model::ErrorData::new(
+        // TransportClosed maps to McpError::Service
+        let err = McpError::from(ServiceError::TransportClosed);
+        assert!(matches!(err, McpError::Service(_)));
+        // McpError wraps and preserves message
+        let err = McpError::from(ServiceError::McpError(rmcp::model::ErrorData::new(
             rmcp::model::ErrorCode::INTERNAL_ERROR,
             "internal failure",
             None,
-        ));
-        let mcp_err = McpError::from(svc_err);
-        assert!(mcp_err.to_string().contains("internal failure"));
+        )));
+        assert!(err.to_string().contains("internal failure"));
     }
 
     // ── Transport enum round-trip ──────────────────────────────────────────
 
     #[test]
-    fn transport_stdio_roundtrip_yaml() {
-        let transport = Transport::Stdio {
+    fn transport_roundtrip_yaml() {
+        // Stdio
+        let t = Transport::Stdio {
             command: vec!["node".into(), "server.js".into()],
             args: vec!["--debug".into()],
             env: [("NODE_ENV".into(), "production".into())].into(),
         };
-        let yaml = serde_yaml_ng::to_string(&transport).unwrap();
+        let yaml = serde_yaml_ng::to_string(&t).unwrap();
         let back: Transport = serde_yaml_ng::from_str(&yaml).unwrap();
         assert!(matches!(back, Transport::Stdio { .. }));
-    }
 
-    #[test]
-    fn transport_sse_roundtrip_yaml() {
-        let transport = Transport::Sse {
+        // Sse
+        let t = Transport::Sse {
             url: "https://api.example.com/mcp".into(),
             auth_token: Some("secret".into()),
             headers: [("X-Key".into(), "val".into())].into(),
         };
-        let yaml = serde_yaml_ng::to_string(&transport).unwrap();
+        let yaml = serde_yaml_ng::to_string(&t).unwrap();
         let back: Transport = serde_yaml_ng::from_str(&yaml).unwrap();
         match back {
             Transport::Sse {
@@ -4381,42 +4099,22 @@ transport:
             }
             _ => panic!("expected Sse"),
         }
-    }
 
-    #[test]
-    fn transport_ws_roundtrip_yaml() {
-        let transport = Transport::Ws {
+        // Ws
+        let t = Transport::Ws {
             url: "wss://api.example.com/ws".into(),
             auth_token: Some("token".into()),
             headers: Default::default(),
         };
-        let yaml = serde_yaml_ng::to_string(&transport).unwrap();
+        let yaml = serde_yaml_ng::to_string(&t).unwrap();
         let back: Transport = serde_yaml_ng::from_str(&yaml).unwrap();
         assert!(matches!(back, Transport::Ws { .. }));
-    }
-
-    // ── ConnectionState Copy + Eq verification ────────────────────────────
-
-    #[test]
-    fn connection_state_is_copy() {
-        // Verify ConnectionState implements Copy (compile-time check)
-        let state = ConnectionState::Connected;
-        let copied = state;
-        assert_eq!(state, copied);
-    }
-
-    #[test]
-    fn connection_state_eq() {
-        assert_eq!(ConnectionState::Connected, ConnectionState::Connected);
-        assert_ne!(ConnectionState::Connected, ConnectionState::Disconnected);
-        assert_eq!(ConnectionState::Failed, ConnectionState::Failed);
-        assert_ne!(ConnectionState::Connecting, ConnectionState::Reconnecting);
     }
 
     // ── McpServerConfig defaults ──────────────────────────────────────────
 
     #[test]
-    fn mcp_server_config_defaults() {
+    fn mcp_server_config_defaults_and_disabled() {
         let config = McpServerConfig {
             name: "test".into(),
             transport: Transport::Stdio {
@@ -4432,36 +4130,27 @@ transport:
         assert_eq!(config.retry.max_retries, 5);
         assert_eq!(config.retry.initial_delay_ms, 1000);
         assert_eq!(config.retry.max_delay_ms, 30_000);
-    }
 
-    #[test]
-    fn mcp_server_config_disabled_server() {
+        // disabled server
         let config = McpServerConfig {
-            name: "off".into(),
-            transport: Transport::Stdio {
-                command: vec!["echo".into()],
-                args: vec![],
-                env: Default::default(),
-            },
-            description: Default::default(),
             enabled: false,
-            retry: Default::default(),
+            ..config
         };
         assert!(!config.enabled);
     }
 
-    // ── Max constants sanity ──────────────────────────────────────────────
+    // ── Constants sanity ──────────────────────────────────────────────────
 
     #[test]
-    fn max_description_length_reasonable() {
+    fn constants_reasonable() {
         const { assert!(MAX_DESCRIPTION_LENGTH > 0) };
         const { assert!(MAX_DESCRIPTION_LENGTH <= 4096) };
-    }
-
-    #[test]
-    fn max_result_content_length_reasonable() {
         const { assert!(MAX_RESULT_CONTENT_LENGTH > 0) };
         const { assert!(MAX_RESULT_CONTENT_LENGTH <= 1_000_000) };
+        const { assert!(MCP_CONNECT_TIMEOUT_SECS >= 10) };
+        const { assert!(MCP_CONNECT_TIMEOUT_SECS <= 120) };
+        const { assert!(MCP_TOOL_CALL_TIMEOUT_SECS >= 30) };
+        const { assert!(MCP_TOOL_CALL_TIMEOUT_SECS <= 600) };
     }
 
     // ── Integration tests with mock MCP server (stdio) ──────────────────

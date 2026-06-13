@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// Shared sentinel tag identifying tool results whose original content was
 /// recovered as an empty JSON object placeholder (the upstream serialization
@@ -620,20 +620,24 @@ mod tests {
         assert!(consumed.is_empty());
         // Healing should add placeholder for missing c1
         assert_eq!(history.len(), original_len + 1);
-        assert!(history[2]["content"]
-            .as_str()
-            .unwrap()
-            .contains("not executed"));
+        assert!(
+            history[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("not executed")
+        );
 
         // Empty slice case
         let mut history2 = vec![user_msg("q"), assistant_with_tool_calls(&["c1"])];
         let consumed2 = merge_tool_results_into_history(&mut history2, Some(&[]));
         assert!(consumed2.is_empty());
         // Healing again
-        assert!(history2[2]["content"]
-            .as_str()
-            .unwrap()
-            .contains("not executed"));
+        assert!(
+            history2[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("not executed")
+        );
     }
 
     #[test]

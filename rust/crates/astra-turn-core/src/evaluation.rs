@@ -1344,32 +1344,41 @@ mod tests {
         // all tools succeed → high quality
         let all_ok = evaluate_turn(
             &[ok_call("bash"), ok_call("grep"), ok_call("read_file")],
-            0, false, 0.3, false,
+            0,
+            false,
+            0.3,
+            false,
         );
         assert!(all_ok.success);
         assert!(all_ok.quality > 0.7);
         assert!(all_ok.signals.contains(&EvalSignal::AllToolsHealthy));
 
         // all tools fail → low quality
-        let all_err = evaluate_turn(
-            &[err_call("bash"), err_call("grep")],
-            0, false, 0.3, false,
-        );
+        let all_err = evaluate_turn(&[err_call("bash"), err_call("grep")], 0, false, 0.3, false);
         assert!(!all_err.success);
         assert!(all_err.quality < 0.4);
-        assert!(all_err.signals.iter().any(
-            |s| matches!(s, EvalSignal::ToolErrorRate(r) if *r > 0.9)
-        ));
+        assert!(
+            all_err
+                .signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::ToolErrorRate(r) if *r > 0.9))
+        );
 
         // mixed success → moderate
         let mixed = evaluate_turn(
             &[ok_call("bash"), err_call("grep"), ok_call("read_file")],
-            0, false, 0.3, false,
+            0,
+            false,
+            0.3,
+            false,
         );
         assert!(mixed.success);
-        assert!(mixed.signals.iter().any(
-            |s| matches!(s, EvalSignal::ToolErrorRate(_))
-        ));
+        assert!(
+            mixed
+                .signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::ToolErrorRate(_)))
+        );
     }
 
     #[test]
@@ -1408,17 +1417,31 @@ mod tests {
 
         // repeat tool calls detected
         let repeat = evaluate_turn(
-            &[ok_call("bash"), ok_call("bash"), ok_call("bash"), ok_call("grep")],
-            0, false, 0.3, false,
+            &[
+                ok_call("bash"),
+                ok_call("bash"),
+                ok_call("bash"),
+                ok_call("grep"),
+            ],
+            0,
+            false,
+            0.3,
+            false,
         );
-        assert!(repeat.signals.iter().any(
-            |s| matches!(s, EvalSignal::RepeatToolCall(n) if n == "bash")
-        ));
+        assert!(
+            repeat
+                .signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::RepeatToolCall(n) if n == "bash"))
+        );
 
         // empty output penalizes more than all-ok
         let empty = evaluate_turn(
             &[empty_call("read_file"), ok_call("bash")],
-            0, false, 0.3, false,
+            0,
+            false,
+            0.3,
+            false,
         );
         assert!(empty.signals.contains(&EvalSignal::EmptyToolOutput));
         assert!(empty.quality < base.quality);
@@ -1426,16 +1449,16 @@ mod tests {
         // quality clamped to [0, 1]
         let worst = evaluate_turn(
             &[err_call("a"), err_call("b"), err_call("c")],
-            5, true, 0.9, true,
+            5,
+            true,
+            0.9,
+            true,
         );
         assert!(worst.quality >= 0.0 && worst.quality <= 1.0);
         assert!(worst.confidence >= 0.0 && worst.confidence <= 1.0);
 
         // confidence increases with more signals
-        let complex = evaluate_turn(
-            &[err_call("bash"), err_call("grep")],
-            2, true, 0.9, false,
-        );
+        let complex = evaluate_turn(&[err_call("bash"), err_call("grep")], 2, true, 0.9, false);
         assert!(complex.confidence > base.confidence);
     }
 

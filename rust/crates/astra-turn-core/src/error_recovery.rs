@@ -622,7 +622,9 @@ mod tests {
         assert!(suggest_alternatives("bash", &[]).is_empty());
 
         // github alternatives
-        assert!(suggest_alternatives("github_list_prs", &[]).contains(&"github_get_pr".to_string()));
+        assert!(
+            suggest_alternatives("github_list_prs", &[]).contains(&"github_get_pr".to_string())
+        );
 
         // multi-edit alternatives
         let alts = suggest_alternatives("multi_edit", &[]);

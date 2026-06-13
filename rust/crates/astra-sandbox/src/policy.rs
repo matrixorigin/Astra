@@ -309,9 +309,15 @@ mod tests {
     fn env_baseline_and_allowlist_rules() {
         let p = SandboxPolicy::strict("/proj");
         let baseline: &[&str] = &[
-            "PATH", "HOME", "CARGO_HOME", "MATRIXONE_HOST",
-            "MATRIXONE_PORT", "MATRIXONE_USER", "MATRIXONE_PASSWORD",
-            "ASTRA_DATABASE", "ASTRA_DATABASE_PREFIX",
+            "PATH",
+            "HOME",
+            "CARGO_HOME",
+            "MATRIXONE_HOST",
+            "MATRIXONE_PORT",
+            "MATRIXONE_USER",
+            "MATRIXONE_PASSWORD",
+            "ASTRA_DATABASE",
+            "ASTRA_DATABASE_PREFIX",
         ];
         for var in baseline {
             assert!(p.is_env_allowed(var), "Baseline missing: {var}");
@@ -353,5 +359,4 @@ mod tests {
             );
         }
     }
-
 }

@@ -246,18 +246,34 @@ mod tests {
 
     #[test]
     fn parse_success_variants() {
+        #[allow(clippy::type_complexity)]
         let cases: Vec<(&str, &[&str], &[(&str, &str)])> = vec![
             // (input, expected_goals, expected_facts)
-            (r#"{"summary":{"goals":["finish feature"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}"#,
-             &["finish feature"][..], &[]),
-            (r#"{"summary":{"goals":[],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[{"fact":"Uses Rust","type":"procedural"}]}"#,
-             &[], &[("Uses Rust", "procedural")]),
-            ("```json\n{\"summary\":{\"goals\":[],\"decisions\":[],\"actions\":[],\"status\":[],\"key_facts\":[]},\"facts\":[]}\n```",
-             &[], &[]),
-            ("```\n{\"summary\":{\"goals\":[],\"decisions\":[],\"actions\":[],\"status\":[],\"key_facts\":[]},\"facts\":[]}\n```",
-             &[], &[]),
-            ("Here is the compact output:\n{\"summary\":{\"goals\":[\"fix bug\"],\"decisions\":[],\"actions\":[],\"status\":[],\"key_facts\":[]},\"facts\":[]}",
-             &["fix bug"][..], &[]),
+            (
+                r#"{"summary":{"goals":["finish feature"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}"#,
+                &["finish feature"][..],
+                &[],
+            ),
+            (
+                r#"{"summary":{"goals":[],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[{"fact":"Uses Rust","type":"procedural"}]}"#,
+                &[],
+                &[("Uses Rust", "procedural")],
+            ),
+            (
+                "```json\n{\"summary\":{\"goals\":[],\"decisions\":[],\"actions\":[],\"status\":[],\"key_facts\":[]},\"facts\":[]}\n```",
+                &[],
+                &[],
+            ),
+            (
+                "```\n{\"summary\":{\"goals\":[],\"decisions\":[],\"actions\":[],\"status\":[],\"key_facts\":[]},\"facts\":[]}\n```",
+                &[],
+                &[],
+            ),
+            (
+                "Here is the compact output:\n{\"summary\":{\"goals\":[\"fix bug\"],\"decisions\":[],\"actions\":[],\"status\":[],\"key_facts\":[]},\"facts\":[]}",
+                &["fix bug"][..],
+                &[],
+            ),
         ];
         for (input, expected_goals, expected_facts) in cases {
             let resp = parse_compact_response(input).unwrap();
@@ -274,10 +290,14 @@ mod tests {
     fn parse_bracket_matching_edge_cases() {
         let cases: Vec<(&str, &str)> = vec![
             // (input, expected_first_goal)
-            (r#"The output is {"nested": "value"} and here is the real result: {"summary":{"goals":["correct"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}"#,
-             "correct"),
-            (r#"Preamble {"a":{"b":{"c":1}}} and result: {"summary":{"goals":["nested ok"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[{"fact":"deep","type":"semantic"}]} trailing"#,
-             "nested ok"),
+            (
+                r#"The output is {"nested": "value"} and here is the real result: {"summary":{"goals":["correct"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[]}"#,
+                "correct",
+            ),
+            (
+                r#"Preamble {"a":{"b":{"c":1}}} and result: {"summary":{"goals":["nested ok"],"decisions":[],"actions":[],"status":[],"key_facts":[]},"facts":[{"fact":"deep","type":"semantic"}]} trailing"#,
+                "nested ok",
+            ),
         ];
         for (input, expected_goal) in cases {
             let resp = parse_compact_response(input).unwrap();
@@ -287,13 +307,12 @@ mod tests {
 
     #[test]
     fn parse_none_and_error_cases() {
-        let none_cases = [
-            "not json at all",
-            "",
-            "just some text without braces",
-        ];
+        let none_cases = ["not json at all", "", "just some text without braces"];
         for input in none_cases {
-            assert!(parse_compact_response(input).is_none(), "expected None for: {input}");
+            assert!(
+                parse_compact_response(input).is_none(),
+                "expected None for: {input}"
+            );
         }
 
         // Stray closing brace must not panic
@@ -340,8 +359,14 @@ Final: {"summary":{"goals":["final goal"],"decisions":[],"actions":[],"status":[
         let resp = CompactResponse {
             summary: base(),
             facts: vec![
-                CompactFact { fact: "a".into(), fact_type: "semantic".into() },
-                CompactFact { fact: "b".into(), fact_type: "invalid".into() },
+                CompactFact {
+                    fact: "a".into(),
+                    fact_type: "semantic".into(),
+                },
+                CompactFact {
+                    fact: "b".into(),
+                    fact_type: "invalid".into(),
+                },
             ],
         };
         let facts = resp.valid_facts();
@@ -352,7 +377,10 @@ Final: {"summary":{"goals":["final goal"],"decisions":[],"actions":[],"status":[
         for t in &["semantic", "profile", "procedural", "working"] {
             let resp = CompactResponse {
                 summary: base(),
-                facts: vec![CompactFact { fact: "test".into(), fact_type: t.to_string() }],
+                facts: vec![CompactFact {
+                    fact: "test".into(),
+                    fact_type: t.to_string(),
+                }],
             };
             let facts = resp.valid_facts();
             assert_eq!(facts.len(), 1, "failed for type: {t}");
@@ -362,7 +390,10 @@ Final: {"summary":{"goals":["final goal"],"decisions":[],"actions":[],"status":[
         // Filters empty facts
         let resp = CompactResponse {
             summary: base(),
-            facts: vec![CompactFact { fact: "".into(), fact_type: "semantic".into() }],
+            facts: vec![CompactFact {
+                fact: "".into(),
+                fact_type: "semantic".into(),
+            }],
         };
         assert!(resp.valid_facts().is_empty());
     }
@@ -379,9 +410,16 @@ Final: {"summary":{"goals":["final goal"],"decisions":[],"actions":[],"status":[
             status: vec!["s1".into()],
             key_facts: vec!["k1".into()],
         };
-        let rendered = CompactResponse { summary: all, facts: vec![] }.render_summary();
+        let rendered = CompactResponse {
+            summary: all,
+            facts: vec![],
+        }
+        .render_summary();
         for section in &["Goals", "Decisions", "Actions", "Status", "Key Facts"] {
-            assert!(rendered.contains(&format!("### {section}")), "missing section: {section}");
+            assert!(
+                rendered.contains(&format!("### {section}")),
+                "missing section: {section}"
+            );
         }
 
         // Empty sections omitted
@@ -392,7 +430,11 @@ Final: {"summary":{"goals":["final goal"],"decisions":[],"actions":[],"status":[
             status: vec![],
             key_facts: vec![],
         };
-        let rendered = CompactResponse { summary: partial, facts: vec![] }.render_summary();
+        let rendered = CompactResponse {
+            summary: partial,
+            facts: vec![],
+        }
+        .render_summary();
         assert!(rendered.contains("### Goals"));
         assert!(!rendered.contains("### Decisions"));
     }

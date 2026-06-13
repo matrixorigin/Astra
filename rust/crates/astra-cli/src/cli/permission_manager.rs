@@ -4849,19 +4849,13 @@ mod tests {
     // ── Dangerous file paths ──────────────────────────────────────────────────
 
     #[test]
-    fn dangerous_path_detected_for_git_internal() {
+    fn dangerous_path_detection() {
         let args = serde_json::json!({"path": ".git/config"});
         assert!(PermissionManager::check_dangerous_path("write_file", &args).is_some());
-    }
 
-    #[test]
-    fn dangerous_path_detected_for_shell_config() {
         let args = serde_json::json!({"path": "/home/user/.bashrc"});
         assert!(PermissionManager::check_dangerous_path("write_file", &args).is_some());
-    }
 
-    #[test]
-    fn normal_path_not_flagged() {
         let args = serde_json::json!({"path": "src/main.rs"});
         assert!(PermissionManager::check_dangerous_path("write_file", &args).is_none());
     }
@@ -4869,24 +4863,15 @@ mod tests {
     // ── Git safety ────────────────────────────────────────────────────────────
 
     #[test]
-    fn git_safety_detects_force_push() {
+    fn git_safety_checks() {
         let args = serde_json::json!({"command": "git push --force origin main"});
-        let violations = PermissionManager::check_git_safety(&args);
-        assert!(!violations.is_empty());
-    }
+        assert!(!PermissionManager::check_git_safety(&args).is_empty());
 
-    #[test]
-    fn git_safety_allows_normal_push() {
         let args = serde_json::json!({"command": "git push origin main"});
-        let violations = PermissionManager::check_git_safety(&args);
-        assert!(violations.is_empty());
-    }
+        assert!(PermissionManager::check_git_safety(&args).is_empty());
 
-    #[test]
-    fn git_safety_detects_no_verify() {
         let args = serde_json::json!({"command": "git commit --no-verify -m 'skip hooks'"});
-        let violations = PermissionManager::check_git_safety(&args);
-        assert!(!violations.is_empty());
+        assert!(!PermissionManager::check_git_safety(&args).is_empty());
     }
 
     // ── Permission mode ──────────────────────────────────────────────────────
@@ -6297,7 +6282,8 @@ mod tests {
     // ── resolve_cloud_approval_async: early-return parity with sync version ──
 
     #[tokio::test]
-    async fn cloud_approval_async_quiet_denies_without_auto() {
+    async fn cloud_approval_async_quiet() {
+        // quiet without auto mode → deny
         let mut pm = PermissionManager::new(false);
         let decision = pm
             .resolve_cloud_approval_async(
@@ -6309,10 +6295,8 @@ mod tests {
             )
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
-    }
 
-    #[tokio::test]
-    async fn cloud_approval_async_quiet_allows_when_auto() {
+        // quiet with auto mode → allow
         let mut pm = PermissionManager::new(true);
         let decision = pm
             .resolve_cloud_approval_async(
@@ -6327,18 +6311,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cloud_approval_async_auto_mode_allows() {
+    async fn cloud_approval_async_standard_routing() {
         let dir = tempfile::tempdir().unwrap();
+
+        // Auto mode → allow
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
         let decision = pm
             .resolve_cloud_approval_async("bash", Some("/tmp"), None, ApprovalKind::Standard, false)
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
-    }
 
-    #[tokio::test]
-    async fn cloud_approval_async_deny_mode_denies() {
-        let dir = tempfile::tempdir().unwrap();
+        // Deny mode → deny
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
         let decision = pm
             .resolve_cloud_approval_async("bash", Some("/tmp"), None, ApprovalKind::Standard, false)
@@ -6346,10 +6329,12 @@ mod tests {
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
     }
 
-    /// Regression: async Explicit + Auto must auto-allow without prompting.
+    /// Regression: async Explicit + Auto must auto-allow without prompting;
+    /// Explicit + Deny must deny without prompting.
     #[tokio::test]
-    async fn cloud_approval_async_explicit_auto_allows() {
+    async fn cloud_approval_async_explicit_routing() {
         let dir = tempfile::tempdir().unwrap();
+
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
         let decision = pm
             .resolve_cloud_approval_async(
@@ -6361,12 +6346,7 @@ mod tests {
             )
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
-    }
 
-    /// Regression: async Explicit + Deny must deny without prompting.
-    #[tokio::test]
-    async fn cloud_approval_async_explicit_deny_denies() {
-        let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
         let decision = pm
             .resolve_cloud_approval_async(
@@ -6381,19 +6361,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cloud_approval_async_session_override_allows() {
+    async fn cloud_approval_async_session_overrides() {
         let dir = tempfile::tempdir().unwrap();
+
+        // positive override → allow
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         pm.session_overrides.insert(bare_fp("bash"), true);
         let decision = pm
             .resolve_cloud_approval_async("bash", Some("/tmp"), None, ApprovalKind::Standard, false)
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
-    }
 
-    #[tokio::test]
-    async fn cloud_approval_async_session_override_denies() {
-        let dir = tempfile::tempdir().unwrap();
+        // negative override → deny
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         pm.session_overrides.insert(bare_fp("bash"), false);
         let decision = pm
@@ -6735,15 +6714,41 @@ mod tests {
     /// Data-driven: explicit cloud approval respects auto-run / deny / quiet combos.
     #[test]
     fn explicit_cloud_approval_respects_mode_and_quiet() {
-        let cases: Vec<(&str, fn() -> PermissionManager, bool, astra_thin_client::ApprovalDecision)> = vec![
-            ("Auto", || PermissionManager::new(true), false, astra_thin_client::ApprovalDecision::Allow),
-            ("Deny", || {
-                let mut pm = PermissionManager::new(false);
-                pm.set_mode(PermissionMode::Deny);
-                pm
-            }, false, astra_thin_client::ApprovalDecision::Deny),
-            ("quiet+Auto", || PermissionManager::new(true), true, astra_thin_client::ApprovalDecision::Allow),
-            ("quiet+Prompt", || PermissionManager::new(false), true, astra_thin_client::ApprovalDecision::Deny),
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(
+            &str,
+            fn() -> PermissionManager,
+            bool,
+            astra_thin_client::ApprovalDecision,
+        )> = vec![
+            (
+                "Auto",
+                || PermissionManager::new(true),
+                false,
+                astra_thin_client::ApprovalDecision::Allow,
+            ),
+            (
+                "Deny",
+                || {
+                    let mut pm = PermissionManager::new(false);
+                    pm.set_mode(PermissionMode::Deny);
+                    pm
+                },
+                false,
+                astra_thin_client::ApprovalDecision::Deny,
+            ),
+            (
+                "quiet+Auto",
+                || PermissionManager::new(true),
+                true,
+                astra_thin_client::ApprovalDecision::Allow,
+            ),
+            (
+                "quiet+Prompt",
+                || PermissionManager::new(false),
+                true,
+                astra_thin_client::ApprovalDecision::Deny,
+            ),
         ];
 
         for (label, setup, quiet, expected) in &cases {
@@ -6766,7 +6771,8 @@ mod tests {
     // ── apply_cloud_approval_choice ────────────────────────────────────────────
 
     #[test]
-    fn cloud_approval_auto_run_sets_auto_mode() {
+    fn cloud_approval_choice_modes_and_overrides() {
+        // '!' auto-run: sets mode to Auto
         let mut pm = PermissionManager::new(false);
         assert_eq!(pm.mode, PermissionMode::Prompt);
         let decision = pm.apply_cloud_approval_choice("str_replace", Some("src/foo.rs"), '!');
@@ -6775,22 +6781,17 @@ mod tests {
             astra_thin_client::ApprovalDecision::Allow
         ));
         assert_eq!(pm.mode, PermissionMode::Auto);
-    }
 
-    #[test]
-    fn cloud_approval_allow_session_records_override() {
+        // 'a' allow session: records override
         let mut pm = PermissionManager::new(false);
         let decision = pm.apply_cloud_approval_choice("str_replace", Some("src/foo.rs"), 'a');
         assert!(matches!(
             decision,
             astra_thin_client::ApprovalDecision::AllowSession
         ));
-        // The fingerprint should be recorded as a session override.
         assert!(!pm.session_overrides.is_empty());
-    }
 
-    #[test]
-    fn cloud_approval_skip_records_denial() {
+        // 's' skip: records denial
         let mut pm = PermissionManager::new(false);
         let decision = pm.apply_cloud_approval_choice("str_replace", Some("src/foo.rs"), 's');
         assert!(matches!(
@@ -7721,7 +7722,8 @@ mod tests {
     // directions of the contract.
 
     #[test]
-    fn mode_mirror_encode_decode_covers_all_modes_without_collisions() {
+    fn mode_mirror_encode_and_current() {
+        // All modes encode/decode without collisions
         let all_modes = [
             PermissionMode::Prompt,
             PermissionMode::Auto,
@@ -7730,7 +7732,6 @@ mod tests {
             PermissionMode::Deny,
         ];
         let mut seen = std::collections::HashSet::new();
-
         for mode in all_modes {
             let encoded = encode_mode_for_mirror(mode);
             assert!(
@@ -7743,66 +7744,44 @@ mod tests {
                 "mode mirror encoding must round-trip for {mode:?}"
             );
         }
-    }
 
-    #[test]
-    fn mode_mirror_reflects_set_mode() {
+        // mirror.current() reflects live mode after set_mode
         let mut pm = PermissionManager::new(false);
         let mirror = pm.mode_mirror_handle();
         assert_eq!(mirror.current(), PermissionMode::Prompt);
-
         pm.set_mode(PermissionMode::Plan);
-        assert_eq!(
-            mirror.current(),
-            PermissionMode::Plan,
-            "set_mode must publish to the mirror so chip readers see it instantly"
-        );
-
+        assert_eq!(mirror.current(), PermissionMode::Plan);
         pm.set_mode(PermissionMode::Auto);
         assert_eq!(mirror.current(), PermissionMode::Auto);
     }
 
     #[test]
-    fn mode_mirror_stage_then_pull_round_trips() {
-        // Mid-turn Shift+Tab path: TUI calls stage() while the
-        // agentic loop holds &mut state. The host calls
-        // pull_mode_from_mirror() at the next turn boundary, and
-        // self.mode catches up.
+    fn mode_mirror_stage_pull_lifecycle() {
         let mut pm = PermissionManager::new(false);
         let mirror = pm.mode_mirror_handle();
-        assert_eq!(pm.mode(), PermissionMode::Prompt);
 
+        // stage() does NOT mutate pm.mode(); only pull does
+        assert_eq!(pm.mode(), PermissionMode::Prompt);
         mirror.stage(PermissionMode::Plan);
-        // pm.mode() hasn't been pulled yet — the field still holds Prompt.
         assert_eq!(
             pm.mode(),
             PermissionMode::Prompt,
             "stage alone must not mutate self.mode; the host must pull explicitly"
         );
-
         pm.pull_mode_from_mirror();
         assert_eq!(
             pm.mode(),
             PermissionMode::Plan,
             "pull_mode_from_mirror must adopt the staged mode"
         );
-    }
 
-    #[test]
-    fn mode_mirror_pull_is_noop_when_already_in_sync() {
-        let mut pm = PermissionManager::new(false);
-        // Without any stage(), pull is a no-op and leaves state
-        // untouched. Idempotent.
+        // pull is a no-op when nothing was staged (idempotent)
         pm.pull_mode_from_mirror();
-        assert_eq!(pm.mode(), PermissionMode::Prompt);
-    }
+        assert_eq!(pm.mode(), PermissionMode::Plan);
 
-    #[test]
-    fn mode_mirror_handle_is_clonable_and_independent() {
-        let pm = PermissionManager::new(false);
+        // handles are clonable and share the same mirror
         let h1 = pm.mode_mirror_handle();
         let h2 = pm.mode_mirror_handle();
-        // Both handles see the same mirror.
         h1.stage(PermissionMode::Auto);
         assert_eq!(h2.current(), PermissionMode::Auto);
     }

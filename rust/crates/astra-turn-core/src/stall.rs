@@ -849,14 +849,25 @@ mod tests {
         // Counts streak from tail
         assert_eq!(trailing_identical_sig_depth(&[]), 0);
         assert_eq!(trailing_identical_sig_depth(&make_sigs(&[&["bash"]])), 1);
-        assert_eq!(trailing_identical_sig_depth(&make_sigs(&[&["bash"], &["bash"]])), 2);
-        assert_eq!(trailing_identical_sig_depth(&make_sigs(&[
-            &["bash"], &["bash"], &["bash"], &["bash"], &["bash"]
-        ])), 5);
+        assert_eq!(
+            trailing_identical_sig_depth(&make_sigs(&[&["bash"], &["bash"]])),
+            2
+        );
+        assert_eq!(
+            trailing_identical_sig_depth(&make_sigs(&[
+                &["bash"],
+                &["bash"],
+                &["bash"],
+                &["bash"],
+                &["bash"]
+            ])),
+            5
+        );
         // Resets when last entry differs
-        assert_eq!(trailing_identical_sig_depth(&make_sigs(&[
-            &["bash"], &["bash"], &["bash"], &["git"]
-        ])), 1);
+        assert_eq!(
+            trailing_identical_sig_depth(&make_sigs(&[&["bash"], &["bash"], &["bash"], &["git"]])),
+            1
+        );
         // Empty sig sets don't count (avoid double-counting round gaps)
         assert_eq!(
             trailing_identical_sig_depth(&[BTreeSet::new(), BTreeSet::new()]),
@@ -883,10 +894,9 @@ mod tests {
         // Exact repeats at window: stall
         assert!(detect_server_stall(&make_sigs(&[&["bash"], &["bash"], &["bash"]]), 3).unwrap());
         // Different tools: no stall
-        assert!(!detect_server_stall(
-            &make_sigs(&[&["bash"], &["read_file"], &["bash"]]),
-            3
-        ).unwrap());
+        assert!(
+            !detect_server_stall(&make_sigs(&[&["bash"], &["read_file"], &["bash"]]), 3).unwrap()
+        );
     }
 
     // ── CLI agentic: sig/name helpers + name-only stall ──
@@ -896,7 +906,10 @@ mod tests {
         // Flat shape
         let c1 = vec![serde_json::json!({"name": "read_file", "arguments": {"path": "a.rs"}})];
         let (sigs, names) = round_tool_call_sig_and_names(&c1);
-        assert!(sigs.iter().any(|s| s.contains("read_file") && s.contains("a.rs")));
+        assert!(
+            sigs.iter()
+                .any(|s| s.contains("read_file") && s.contains("a.rs"))
+        );
         assert!(names.contains("read_file"));
 
         // Canonical (OpenAI) shape
@@ -905,7 +918,10 @@ mod tests {
             "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}
         })];
         let (sigs, names) = round_tool_call_sig_and_names(&c2);
-        assert!(sigs.iter().any(|s| s.contains("read_file") && s.contains("a.rs")));
+        assert!(
+            sigs.iter()
+                .any(|s| s.contains("read_file") && s.contains("a.rs"))
+        );
         assert!(names.contains("read_file"));
     }
 
@@ -1208,10 +1224,19 @@ mod tests {
     #[test]
     fn word_boundary_match_stemming() {
         // Plurals match
-        assert!(word_boundary_match("list all pull requests and issues", "pull request"));
-        assert!(word_boundary_match("list all pull requests and issues", "issue"));
+        assert!(word_boundary_match(
+            "list all pull requests and issues",
+            "pull request"
+        ));
+        assert!(word_boundary_match(
+            "list all pull requests and issues",
+            "issue"
+        ));
         // Gerund matches
-        assert!(word_boundary_match("committing changes to the branch", "commit"));
+        assert!(word_boundary_match(
+            "committing changes to the branch",
+            "commit"
+        ));
         // Past tense matches
         assert!(word_boundary_match("committed the fix yesterday", "commit"));
         // No false positive on partial substring
@@ -1695,13 +1720,19 @@ mod tests {
     fn canonical_tool_args_normalization() {
         // Normalizes whitespace and key ordering
         let raw = r#"{  "path" :  "src/main.rs" ,  "line": 42 }"#;
-        assert_eq!(canonical_tool_args(raw), r#"{"line":42,"path":"src/main.rs"}"#);
+        assert_eq!(
+            canonical_tool_args(raw),
+            r#"{"line":42,"path":"src/main.rs"}"#
+        );
         // Invalid JSON returns raw
         assert_eq!(canonical_tool_args("not json"), "not json");
         // Empty string passthrough
         assert_eq!(canonical_tool_args(""), "");
         // Nested objects/arrays
-        assert_eq!(canonical_tool_args(r#"{"a": [1, 2, {"b": 3}]}"#), r#"{"a":[1,2,{"b":3}]}"#);
+        assert_eq!(
+            canonical_tool_args(r#"{"a": [1, 2, {"b": 3}]}"#),
+            r#"{"a":[1,2,{"b":3}]}"#
+        );
         // Key ordering normalized (two different-order inputs produce same output)
         assert_eq!(
             canonical_tool_args(r#"{"z": 1, "a": 2}"#),

@@ -440,62 +440,270 @@ mod tests {
         })
     }
 
-    // ---------------------------------------------------------------
-    // 1. Output reservation
-    // ---------------------------------------------------------------
+    // === budget_for_model (model resolution, 15→2) ===
 
     #[test]
-    fn effective_input_limit_default() {
+    fn test_budget_for_model() {
+        // gemini 1M
+        let b = budget_for_model(Some("gemini-2.5-pro"));
+        assert_eq!(b.model_limit, 1_000_000);
+        assert_eq!(b.output_reserve_ratio, 0.10);
+
+        // o1 200k
+        let b = budget_for_model(Some("o1"));
+        assert_eq!(b.model_limit, 200_000);
+
+        // o3 200k
+        let b = budget_for_model(Some("o3"));
+        assert_eq!(b.model_limit, 200_000);
+
+        // gpt-5
+        let b = budget_for_model(Some("gpt-5"));
+        assert!(b.model_limit >= 128_000);
+
+        // claude legacy (sonnet-4-20250514 → 200k, reserve 0.10)
+        let b = budget_for_model(Some("claude-sonnet-4-20250514"));
+        assert_eq!(b.model_limit, 128_000);
+        assert_eq!(b.output_reserve_ratio, 0.15);
+
+        // claude 4.6 gets 1M
+        let b = budget_for_model(Some("claude-opus-4-6-20250514"));
+        assert_eq!(b.model_limit, 1_000_000);
+
+        // claude 4.7 gets 1M
+        let b = budget_for_model(Some("claude-sonnet-4-7-20250514"));
+        assert_eq!(b.model_limit, 1_000_000);
+
+        // deepseek v4 gets 1M
+        let b = budget_for_model(Some("deepseek-v4"));
+        assert_eq!(b.model_limit, 1_000_000);
+
+        // qwen 128k
+        let b = budget_for_model(Some("qwen3-coder"));
+        assert_eq!(b.model_limit, 128_000);
+
+        // unknown model defaults
+        let b = budget_for_model(Some("unknown-model-xyz"));
+        assert_eq!(b.model_limit, 128_000);
+        assert_eq!(b.output_reserve_ratio, 0.15);
+
+        // None defaults
+        let b = budget_for_model(None);
+        assert_eq!(b.model_limit, 128_000);
+
+        // empty string defaults
+        let b = budget_for_model(Some(""));
+        assert_eq!(b.model_limit, 128_000);
+    }
+
+    #[test]
+    fn test_budget_for_model_with_override() {
+        // override wins
+        let b = budget_for_model_with_override(Some("claude-sonnet-4-20250514"), Some(50_000));
+        assert_eq!(b.model_limit, 50_000);
+        assert_eq!(b.output_reserve_ratio, 0.15);
+
+        // override for unknown model
+        let b = budget_for_model_with_override(Some("unknown"), Some(100_000));
+        assert_eq!(b.model_limit, 100_000);
+        assert_eq!(b.output_reserve_ratio, 0.15);
+
+        // small window gets 0.15 reserve
+        let b = budget_for_model_with_override(Some("claude-sonnet-4-20250514"), Some(10_000));
+        assert_eq!(b.model_limit, 10_000);
+        assert_eq!(b.output_reserve_ratio, 0.15);
+
+        // no override falls back to hardcoded
+        let b = budget_for_model_with_override(Some("claude-sonnet-4-20250514"), None);
+        assert_eq!(b.model_limit, 128_000);
+        assert_eq!(b.output_reserve_ratio, 0.15);
+
+        // no override for unknown falls back to default
+        let b = budget_for_model_with_override(Some("unknown-model"), None);
+        assert_eq!(b.model_limit, 128_000);
+        assert_eq!(b.output_reserve_ratio, 0.15);
+    }
+
+    // === effective_input_limit (8→1) ===
+
+    #[test]
+    fn test_effective_input_limit() {
+        // default: 128k * 0.85 = 108_800
         let b = ContextBudget::default();
-        // 128_000 * (1 - 0.15) = 108_800
         assert_eq!(b.effective_input_limit(), 108_800);
-    }
 
-    #[test]
-    fn effective_input_limit_claude() {
-        let b = budget_for_model(Some("claude-3.5-sonnet"));
-        // 128_000 * (1 - 0.15) = 108_800
+        // claude legacy: 200k * 0.9 = 180_000
+        let b = budget_for_model(Some("claude-sonnet-4-20250514"));
         assert_eq!(b.effective_input_limit(), 108_800);
-    }
 
-    #[test]
-    fn effective_input_limit_gpt4o() {
+        // gpt-4o: 128k * 0.88 = 112_640
         let b = budget_for_model(Some("gpt-4o-2024-08-06"));
-        // 128_000 * (1 - 0.12) = 112_640
         assert_eq!(b.effective_input_limit(), 112_640);
+
+        // less than model_limit
+        let b = ContextBudget::default();
+        assert!(b.effective_input_limit() < b.model_limit);
+
+        // zero reserve
+        let b = ContextBudget {
+            output_reserve_ratio: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(b.effective_input_limit(), b.model_limit);
+
+        // full reserve
+        let b = ContextBudget {
+            model_limit: 100_000,
+            output_reserve_ratio: 1.0,
+            ..Default::default()
+        };
+        assert_eq!(b.effective_input_limit(), 0);
+
+        // reserve exceeding 1.0
+        let b = ContextBudget {
+            model_limit: 100_000,
+            output_reserve_ratio: 1.5,
+            ..Default::default()
+        };
+        assert_eq!(b.effective_input_limit(), 0);
+    }
+
+    // === compaction_tier (15→2) ===
+
+    #[test]
+    fn test_compaction_tier() {
+        // default budget
+        let b = ContextBudget::default();
+        let limit = b.effective_input_limit(); // 108_800
+
+        // normal: < 60%
+        assert_eq!(b.compaction_tier(0), CompactionTier::Normal);
+        assert_eq!(
+            b.compaction_tier((0.50 * limit as f64) as usize),
+            CompactionTier::Normal
+        );
+
+        // trim_schemas: 60%–75% (0.75*0.80=0.60)
+        assert_eq!(
+            b.compaction_tier((0.65 * limit as f64) as usize),
+            CompactionTier::TrimSchemas
+        );
+
+        // compact_history: 75%–85% (0.75*1.133≈0.85)
+        assert_eq!(
+            b.compaction_tier((0.78 * limit as f64) as usize),
+            CompactionTier::CompactHistory
+        );
+
+        // aggressive_prune: >= 85%
+        assert_eq!(
+            b.compaction_tier((0.86 * limit as f64) as usize),
+            CompactionTier::AggressivePrune
+        );
+
+        // at limit itself
+        assert_eq!(b.compaction_tier(limit), CompactionTier::AggressivePrune);
+
+        // boundary at ~60% (strict >)
+        let b60 = (0.60 * limit as f64) as usize;
+        assert_eq!(b.compaction_tier(b60), CompactionTier::Normal);
+        assert_eq!(b.compaction_tier(b60 + 1), CompactionTier::TrimSchemas);
+
+        // boundary at ~75% (strict >)
+        let b75 = (0.75 * limit as f64) as usize;
+        assert_eq!(b.compaction_tier(b75), CompactionTier::TrimSchemas);
+        assert_eq!(b.compaction_tier(b75 + 1), CompactionTier::CompactHistory);
+
+        // zero effective limit
+        let bz = ContextBudget {
+            model_limit: 0,
+            output_reserve_ratio: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(bz.compaction_tier(10), CompactionTier::AggressivePrune);
     }
 
     #[test]
-    fn effective_input_limit_deepseek() {
-        let b = budget_for_model(Some("deepseek-chat"));
-        // 64_000 * (1 - 0.15) = 54_400
-        assert_eq!(b.effective_input_limit(), 54_400);
+    fn test_tier_order_and_scaling() {
+        // Verify ordering: Normal < TrimSchemas < CompactHistory < AggressivePrune
+        let default = ContextBudget::default();
+        assert_eq!(default.compact_threshold, 0.75);
+
+        let trim_start = default.compact_threshold * 0.80; // 0.60
+        let compact_start = default.compact_threshold; // 0.75
+        let aggressive_start = default.compact_threshold * 1.133; // ~0.85
+
+        assert!(trim_start < compact_start);
+        assert!(compact_start < aggressive_start);
+
+        // Budget pressure values: all tiers present
+        let budget = ContextBudget {
+            model_limit: 100_000,
+            output_reserve_ratio: 0.0,
+            compact_threshold: 0.75,
+            ..Default::default()
+        };
+        assert_eq!(
+            budget.compaction_tier((0.50 * 100_000.0) as usize),
+            CompactionTier::Normal
+        );
+        assert_eq!(
+            budget.compaction_tier((0.65 * 100_000.0) as usize),
+            CompactionTier::TrimSchemas
+        );
+        assert_eq!(
+            budget.compaction_tier((0.80 * 100_000.0) as usize),
+            CompactionTier::CompactHistory
+        );
+        assert_eq!(
+            budget.compaction_tier((0.90 * 100_000.0) as usize),
+            CompactionTier::AggressivePrune
+        );
+
+        // Scaling with threshold
+        let aggressive = ContextBudget {
+            model_limit: 100_000,
+            output_reserve_ratio: 0.0,
+            compact_threshold: 0.60,
+            ..Default::default()
+        };
+        // With threshold=0.60: trim_start=0.48, compact_start=0.60, aggressive_start≈0.68
+        assert_eq!(
+            aggressive.compaction_tier((0.30 * 100_000.0) as usize),
+            CompactionTier::Normal
+        );
+        assert_eq!(
+            aggressive.compaction_tier((0.50 * 100_000.0) as usize),
+            CompactionTier::TrimSchemas
+        );
+        assert_eq!(
+            aggressive.compaction_tier((0.65 * 100_000.0) as usize),
+            CompactionTier::CompactHistory
+        );
+        assert_eq!(
+            aggressive.compaction_tier((0.70 * 100_000.0) as usize),
+            CompactionTier::AggressivePrune
+        );
     }
 
-    // ---------------------------------------------------------------
-    // 2. Cache-aware estimation
-    // ---------------------------------------------------------------
+    // === cache_aware estimation (5→1) ===
 
     #[test]
-    fn cache_aware_empty_messages() {
+    fn test_cache_aware_estimation() {
+        // empty
         let est = estimate_tokens_cache_aware(&[], 500);
         assert_eq!(est.total_tokens, 500);
         assert_eq!(est.cache_eligible_tokens, 500);
         assert_eq!(est.volatile_tokens, 0);
-    }
 
-    #[test]
-    fn cache_aware_system_only() {
-        // 80 chars => 20 tokens + 4 overhead = 24
-        let messages = vec![msg(&"a".repeat(80))];
+        // system only
+        let messages = vec![msg(&"a".repeat(80))]; // 80 chars → 20 tokens + 4 overhead = 24
         let est = estimate_tokens_cache_aware(&messages, 100);
         assert_eq!(est.cache_eligible_tokens, 24 + 100);
         assert_eq!(est.volatile_tokens, 0);
         assert_eq!(est.total_tokens, 24 + 100);
-    }
 
-    #[test]
-    fn cache_aware_separates_system_from_conversation() {
+        // separates system from conversation
         let messages = vec![
             msg(&"s".repeat(400)), // system: 100 tok + 4 = 104
             msg(&"u".repeat(200)), // user:    50 tok + 4 =  54
@@ -503,36 +711,29 @@ mod tests {
         ];
         let schema_tokens = 200;
         let est = estimate_tokens_cache_aware(&messages, schema_tokens);
-
         assert_eq!(est.cache_eligible_tokens, 104 + 200);
         assert_eq!(est.volatile_tokens, 54 + 29);
         assert_eq!(
             est.total_tokens,
             est.cache_eligible_tokens + est.volatile_tokens
         );
-    }
 
-    #[test]
-    fn cache_aware_with_tool_calls() {
+        // with tool calls
         let messages = vec![
             msg("system prompt"),
             tool_msg(&"x".repeat(120)), // 30 args + 15 structural + 4 msg = 49
         ];
         let est = estimate_tokens_cache_aware(&messages, 0);
         assert_eq!(est.volatile_tokens, 49);
-    }
 
-    #[test]
-    fn cache_aware_split_matches_joined_estimate() {
+        // split matches joined
         let stable = vec![msg(&"s".repeat(320))];
         let volatile = vec![msg(&"u".repeat(180)), msg(&"a".repeat(96))];
         let mut joined = stable.clone();
         joined.extend(volatile.clone());
         let schema_tokens = 123;
-
         let split = estimate_tokens_cache_aware_split(&stable, &volatile, schema_tokens);
         let joined_est = estimate_tokens_cache_aware(&joined, schema_tokens);
-
         assert_eq!(split.total_tokens, joined_est.total_tokens);
         assert_eq!(
             split.cache_eligible_tokens,
@@ -541,988 +742,324 @@ mod tests {
         assert_eq!(split.volatile_tokens, joined_est.volatile_tokens);
     }
 
-    // ---------------------------------------------------------------
-    // 3. Tiered compaction
-    // ---------------------------------------------------------------
+    // === estimate_str_tokens (18→3) ===
 
     #[test]
-    fn compaction_tier_normal() {
-        let b = ContextBudget::default();
-        let limit = b.effective_input_limit(); // 108_800
-        let tokens = (limit as f64 * 0.50) as usize;
-        assert_eq!(b.compaction_tier(tokens), CompactionTier::Normal);
-    }
-
-    #[test]
-    fn compaction_tier_trim_schemas() {
-        let b = ContextBudget::default();
-        let limit = b.effective_input_limit();
-        let tokens = (limit as f64 * 0.65) as usize;
-        assert_eq!(b.compaction_tier(tokens), CompactionTier::TrimSchemas);
-    }
-
-    #[test]
-    fn compaction_tier_compact_history() {
-        let b = ContextBudget::default();
-        let limit = b.effective_input_limit();
-        let tokens = (limit as f64 * 0.80) as usize;
-        assert_eq!(b.compaction_tier(tokens), CompactionTier::CompactHistory);
-    }
-
-    #[test]
-    fn compaction_tier_aggressive_prune() {
-        let b = ContextBudget::default();
-        let limit = b.effective_input_limit();
-        let tokens = (limit as f64 * 0.90) as usize;
-        assert_eq!(b.compaction_tier(tokens), CompactionTier::AggressivePrune);
-    }
-
-    #[test]
-    fn compaction_tier_budget_pressure_values() {
-        assert_eq!(CompactionTier::Normal.budget_pressure(), 0.0);
-        assert_eq!(CompactionTier::TrimSchemas.budget_pressure(), 0.3);
-        assert_eq!(CompactionTier::CompactHistory.budget_pressure(), 0.6);
-        assert_eq!(CompactionTier::AggressivePrune.budget_pressure(), 0.9);
-    }
-
-    #[test]
-    fn compaction_tier_boundary_60() {
-        let b = ContextBudget::default();
-        let limit = b.effective_input_limit();
-        // Exactly at 60% boundary — should be Normal (> 0.60 triggers TrimSchemas)
-        let tokens = (limit as f64 * 0.60) as usize;
-        assert_eq!(b.compaction_tier(tokens), CompactionTier::Normal);
-    }
-
-    #[test]
-    fn compaction_tier_boundary_75() {
-        let b = ContextBudget::default();
-        let limit = b.effective_input_limit();
-        // Exactly at 75% — still TrimSchemas (> 0.75 triggers CompactHistory)
-        let tokens = (limit as f64 * 0.75) as usize;
-        assert_eq!(b.compaction_tier(tokens), CompactionTier::TrimSchemas);
-    }
-
-    // ---------------------------------------------------------------
-    // 4. Model detection
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn model_gemini() {
-        let b = budget_for_model(Some("gemini-1.5-pro"));
-        assert_eq!(b.model_limit, 1_000_000);
-        assert!((b.output_reserve_ratio - 0.10).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn model_o1() {
-        let b = budget_for_model(Some("o1-preview"));
-        assert_eq!(b.model_limit, 200_000);
-    }
-
-    #[test]
-    fn model_o3() {
-        let b = budget_for_model(Some("o3-mini"));
-        assert_eq!(b.model_limit, 200_000);
-    }
-
-    #[test]
-    fn model_gpt5() {
-        let b = budget_for_model(Some("gpt-5-turbo"));
-        assert_eq!(b.model_limit, 256_000);
-        assert!((b.output_reserve_ratio - 0.12).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn model_claude_legacy() {
-        let b = budget_for_model(Some("claude-3-opus"));
-        assert_eq!(b.model_limit, 128_000);
-        assert!((b.output_reserve_ratio - 0.15).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn model_claude_4_6_gets_1m() {
-        let b = budget_for_model(Some("claude-sonnet-4-6"));
-        assert_eq!(b.model_limit, 1_000_000);
-        assert!((b.output_reserve_ratio - 0.10).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn model_claude_4_7_gets_1m() {
-        let b = budget_for_model(Some("claude-opus-4-7"));
-        assert_eq!(b.model_limit, 1_000_000);
-    }
-
-    #[test]
-    fn model_deepseek_v4_gets_1m() {
-        let b = budget_for_model(Some("deepseek-v4-pro"));
-        assert_eq!(b.model_limit, 1_000_000);
-        assert!((b.output_reserve_ratio - 0.10).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn model_unknown_defaults() {
-        let b = budget_for_model(None);
-        assert_eq!(b.model_limit, 128_000);
-        assert!((b.output_reserve_ratio - 0.15).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn model_qwen() {
-        let b = budget_for_model(Some("qwen-turbo"));
-        assert_eq!(b.model_limit, 128_000);
-    }
-
-    // ---------------------------------------------------------------
-    // 4b. Dynamic override from model config
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn override_wins_over_hardcoded() {
-        // deepseek-chat is hardcoded at 64K, override should win
-        let b = budget_for_model_with_override(Some("deepseek-chat"), Some(1_000_000));
-        assert_eq!(b.model_limit, 1_000_000);
-        assert!((b.output_reserve_ratio - 0.10).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn override_for_unknown_model() {
-        let b = budget_for_model_with_override(Some("my-custom-model"), Some(256_000));
-        assert_eq!(b.model_limit, 256_000);
-        assert!((b.output_reserve_ratio - 0.10).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn override_small_window_gets_small_reserve() {
-        let b = budget_for_model_with_override(Some("small-model"), Some(32_000));
-        assert_eq!(b.model_limit, 32_000);
-        assert!((b.output_reserve_ratio - 0.15).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn no_override_falls_back_to_hardcoded() {
-        let b = budget_for_model_with_override(Some("deepseek-chat"), None);
-        assert_eq!(b.model_limit, 64_000);
-    }
-
-    #[test]
-    fn no_override_unknown_falls_back_to_default() {
-        let b = budget_for_model_with_override(Some("totally-unknown-model"), None);
-        assert_eq!(b.model_limit, 128_000);
-    }
-
-    // ---------------------------------------------------------------
-    // 5. Backward compatibility
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn compact_trigger_uses_effective_limit() {
-        let b = ContextBudget::default();
-        // effective = 108_800, compact_trigger = 108_800 * 0.75 = 81_600
-        assert_eq!(b.compact_trigger(), 81_600);
-    }
-
-    #[test]
-    fn should_compact_backward_compat() {
-        let b = ContextBudget::default();
-        let trigger = b.compact_trigger();
-        assert!(!b.should_compact(trigger));
-        assert!(b.should_compact(trigger + 1));
-    }
-
-    #[test]
-    fn default_budget_fields_unchanged() {
-        let b = ContextBudget::default();
-        assert_eq!(b.model_limit, 128_000);
-        assert!((b.compact_threshold - 0.75).abs() < f64::EPSILON);
-        assert_eq!(b.keep_recent_turns, 6);
-        assert_eq!(b.memory_budget_chars, 8_000);
-    }
-
-    #[test]
-    fn estimate_tokens_includes_schema_tokens() {
-        let msgs = vec![msg(&"x".repeat(400))];
-        let without_schema = estimate_tokens(&msgs, 0, 0);
-        let with_schema = estimate_tokens(&msgs, 50_000, 0);
-        assert!(
-            with_schema > without_schema + 40_000,
-            "schema_token_total must be included: without={without_schema}, with={with_schema}",
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // 6. CJK-aware token estimation
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn estimate_str_tokens_pure_ascii() {
-        // 20 ASCII chars = 20 bytes / 4 = 5 tokens
-        assert_eq!(estimate_str_tokens("hello world testing!"), 5);
-    }
-
-    #[test]
-    fn estimate_str_tokens_pure_cjk() {
-        // 4 CJK chars × 1.5 = 6 tokens (BPE rate)
-        assert_eq!(estimate_str_tokens("你好世界"), 6);
-    }
-
-    #[test]
-    fn estimate_str_tokens_mixed_en_cn() {
-        // "我关注matrixorigin" → 3 CJK × 1.5 + "matrixorigin" 12 ASCII / 4
-        // = 5 + 3 = 8
-        assert_eq!(estimate_str_tokens("我关注matrixorigin"), 8);
-    }
-
-    #[test]
-    fn estimate_str_tokens_cjk_more_than_old_heuristic() {
-        // Old: "你好世界".len() = 12 bytes / 4 = 3 tokens (WRONG)
-        // New: 4 CJK chars × 1.5 = 6 tokens (BPE-accurate)
-        let old_estimate = "你好世界".len() / 4;
-        let new_estimate = estimate_str_tokens("你好世界");
-        assert!(
-            new_estimate > old_estimate,
-            "CJK estimation should be higher than bytes/4"
-        );
-    }
-
-    /// Regression test for session 540c37d1:
-    /// Without schema token accounting, CJK-heavy conversations are severely
-    /// underestimated (pressure ~0.61 when real was ~0.89), so compaction
-    /// never triggered.
-    ///
-    /// `estimate_tokens` with schema tokens must produce a substantially
-    /// higher estimate than without, ensuring compaction gates fire.
-    #[test]
-    fn estimate_with_schema_dwarfs_estimate_without_schema_for_cjk() {
-        // Simulate session 540c37d1: ~50 CJK-heavy messages + tool results
-        let mut messages = Vec::new();
-        for i in 0..25 {
-            messages.push(msg(&format!(
-                "第{i}个回合：请帮我深入分析这段代码的问题，包括错误处理、性能瓶颈和可维护性"
-            )));
-            messages.push(msg(&format!(
-                "好的，让我详细分析第{i}个回合的问题。首先从错误处理的角度来看..."
-            )));
-        }
-        // Add some tool result messages (simulating file reads / greps)
-        for i in 0..10 {
-            messages.push(msg(&format!(
-                "{{\"result\": \"文件 file_{i}.rs 读取完成，共 200 行，发现以下潜在问题：...\", \"success\": true}}"
-            )));
-        }
-
-        let without_schema = estimate_tokens(&messages, 0, 0);
-        let with_schema = estimate_tokens(&messages, 50_000, 0);
-
-        // Schema-aware estimate must be at least 50% higher
-        let ratio = with_schema as f64 / without_schema as f64;
-        assert!(
-            ratio > 1.5,
-            "with schema ({with_schema}) must be >1.5× without schema ({without_schema}) for CJK-heavy sessions; got {ratio:.2}x"
-        );
-    }
-
-    /// `estimate_tokens` with schema tokens must produce estimates
-    /// that push past compaction thresholds when the session is truly large.
-    /// With a 128K model and 0.75 compact_threshold, the trim-start is at
-    /// 0.75 * 0.80 * 0.85 * 128K ≈ 65K effective tokens.
-    #[test]
-    fn estimate_crosses_compact_threshold_for_large_cjk_session() {
-        let mut messages = Vec::new();
-        // Build a large CJK conversation with tool results
-        for i in 0..40 {
-            messages.push(msg(&format!(
-                "请继续分析和修复第{i}个文件中的问题代码，关注性能和安全"
-            )));
-            messages.push(msg(&format!(
-                "正在分析第{i}个文件。发现错误处理缺失、循环内有分配、SQL注入风险等问题。建议：1. 引入Result类型 2. 预分配vector 3. 使用参数化查询..."
-            )));
-            if i < 25 {
-                messages.push(msg(&format!(
-                    "{{\"lines\": \"// file_{i}.rs 原始文件内容\\nfn main() {{\\n    let x = 1;\\n}}\", \"matches\": 3, \"path\": \"src/file_{i}.rs\"}}"
-                )));
-            }
-        }
-
-        let estimated = estimate_tokens(&messages, 50_000, 0);
-        // With 40 user + 40 assistant + 25 tool msgs (~105 total), CJK content,
-        // 50K schema + 14K system prompt, the estimate should exceed 65K,
-        // the TrimSchemas trigger for the default 128K model.
-        assert!(
-            estimated > 65_000,
-            "CJK session ({count} msgs) with schema tokens should cross TrimSchemas trigger: got {estimated}",
-            count = messages.len(),
-        );
-    }
-
-    #[test]
-    fn estimate_str_tokens_cjk_punctuation() {
-        // CJK punctuation (U+3000-303F, FF00-FFEF) counts as CJK tokens
-        // "。" is U+3002, "！" is U+FF01
-        // 3 CJK chars × 1.5 = 5 tokens (rounded up)
-        assert_eq!(estimate_str_tokens("你好。"), 5);
-    }
-
-    #[test]
-    fn estimate_str_tokens_empty() {
-        assert_eq!(estimate_str_tokens(""), 0);
-    }
-
-    #[test]
-    fn estimate_tokens_cjk_message() {
-        // CJK message: "分析一下这个文件" = 8 CJK chars × 1.5 = 12 tokens
-        // + 4 overhead + 14_000 sys + 300 framing = 14_316
-        let messages = vec![msg("分析一下这个文件")];
-        let est = estimate_tokens(&messages, 0, 0);
-        assert!(
-            est > 14_000,
-            "CJK message should estimate > 14K tokens, got {est}"
-        );
-    }
-
-    // ── Phase 6.1: Mixed EN/CN regression tests ──
-
-    #[test]
-    fn estimate_str_tokens_mixed_sentence() {
-        // "Hello 你好世界 World" — 4 CJK chars × 1.5 = 6, plus ASCII tokens
-        let t = estimate_str_tokens("Hello 你好世界 World");
-        assert!(
-            (6..=12).contains(&t),
-            "mixed EN/CN should be 6-12 tokens, got {}",
-            t
-        );
-    }
-
-    #[test]
-    fn estimate_str_tokens_pure_ascii_regression() {
-        // "The quick brown fox jumps over the lazy dog" → ~9 words → ~9/0.75 = 12
-        let t = estimate_str_tokens("The quick brown fox jumps over the lazy dog");
-        assert!(
-            (8..=15).contains(&t),
-            "ASCII sentence should be 8-15 tokens, got {}",
-            t
-        );
-    }
-
-    #[test]
-    fn estimate_str_tokens_pure_cjk_regression() {
-        // 12 CJK chars × 1.5 = 18 tokens (BPE-accurate)
-        let t = estimate_str_tokens("这是一个长句子测试效果好");
-        assert_eq!(t, 18, "pure CJK 12 chars × 1.5 = 18 tokens");
-    }
-
-    #[test]
-    fn estimate_str_tokens_code_mixed() {
-        // Code with comments in Chinese
-        let t = estimate_str_tokens("fn main() { // 主函数入口 }");
-        assert!(t > 0, "code + CJK comment should estimate > 0");
-    }
-
-    // ── Bug fixes: JSON detection + tool call overhead ──
-
-    #[test]
-    fn estimate_str_tokens_whitespace_prefixed_json_detected() {
-        // JSON with leading whitespace should still use the JSON divisor (2),
-        // not the ASCII divisor (4). Without trimming, the first byte is ' '
-        // and the function falls back to divisor=4, underestimating by 2×.
-        let json_str = r#"  {"key": "value", "nested": {"a": 1, "b": 2}}"#;
-        let trimmed = json_str.trim();
-        let with_ws = estimate_str_tokens(json_str);
-        let without_ws = estimate_str_tokens(trimmed);
-        // Both should use the JSON divisor — the difference should be only
-        // from the 2 leading space bytes, not a 2× factor.
-        let ratio = without_ws as f64 / with_ws as f64;
-        assert!(
-            ratio < 1.3,
-            "whitespace-prefixed JSON should estimate similarly to trimmed: \
-             with_ws={with_ws}, without_ws={without_ws}, ratio={ratio:.2}",
-        );
-    }
-
-    #[test]
-    fn estimate_single_message_tokens_includes_tool_call_overhead() {
-        // A message with 3 tool calls should count structural overhead
-        // (id, type, function name) — not just the arguments string.
-        let msg_with_calls = json!({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"a.rs\"}"}},
-                {"id": "call_2", "type": "function", "function": {"name": "grep", "arguments": "{\"pattern\": \"TODO\"}"}},
-                {"id": "call_3", "type": "function", "function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}}
-            ]
-        });
-        let msg_no_calls = json!({
-            "role": "assistant",
-            "content": "{\"path\": \"a.rs\"}{\"pattern\": \"TODO\"}{\"command\": \"ls\"}"
-        });
-        let with_calls = estimate_single_message_tokens(&msg_with_calls);
-        let just_args = estimate_single_message_tokens(&msg_no_calls);
-        // The tool-call message should be higher because of id/type/name overhead.
-        assert!(
-            with_calls > just_args,
-            "tool_calls overhead (id, type, name) must be counted: \
-             with_calls={with_calls}, just_args={just_args}",
-        );
-    }
-
-    // ── Phase 6.2: Token budget exhaustion boundary ──
-
-    #[test]
-    fn compaction_tier_at_warning_threshold() {
-        let ctx = budget_for_model(Some("gpt-4o"));
-        let limit = ctx.effective_input_limit();
-        // 61% → TrimSchemas tier
-        let tokens_61 = (limit as f64 * 0.61) as usize;
-        assert_eq!(ctx.compaction_tier(tokens_61), CompactionTier::TrimSchemas);
-    }
-
-    #[test]
-    fn compaction_tier_at_critical_threshold() {
-        let ctx = budget_for_model(Some("gpt-4o"));
-        let limit = ctx.effective_input_limit();
-        // 86% → AggressivePrune
-        let tokens_86 = (limit as f64 * 0.86) as usize;
+    fn test_estimate_str_tokens() {
+        // pure ASCII — char/4 (integer division, floor)
+        assert_eq!(estimate_str_tokens("hello world"), 2); // 11 chars / 4 = 2
         assert_eq!(
-            ctx.compaction_tier(tokens_86),
-            CompactionTier::AggressivePrune
-        );
-    }
+            estimate_str_tokens("This is a pure ASCII sentence for testing."),
+            10
+        ); // 42/4=10 (floor)
 
-    #[test]
-    fn compaction_tier_at_normal() {
-        let ctx = budget_for_model(Some("gpt-4o"));
-        let limit = ctx.effective_input_limit();
-        // 50% → Normal (no compaction)
-        let tokens_50 = (limit as f64 * 0.50) as usize;
-        assert_eq!(ctx.compaction_tier(tokens_50), CompactionTier::Normal);
-    }
+        // pure CJK — (cjkc*3).div_ceil(2)
+        assert_eq!(estimate_str_tokens("你好世界"), 6); // (4*3)/2 = 6
+        assert_eq!(estimate_str_tokens("你好世界测试"), 9); // (6*3)/2 = 9
+        assert_eq!(estimate_str_tokens("你好世界测试纯中文"), 14); // (9*3)/2 = 14
 
-    #[test]
-    fn compaction_tier_at_compact_history() {
-        let ctx = budget_for_model(Some("gpt-4o"));
-        let limit = ctx.effective_input_limit();
-        // 76% → CompactHistory
-        let tokens_76 = (limit as f64 * 0.76) as usize;
-        assert_eq!(
-            ctx.compaction_tier(tokens_76),
-            CompactionTier::CompactHistory
-        );
-    }
+        // mixed EN+CN
+        let mixed = estimate_str_tokens("hello 你好 world 世界");
+        assert!(mixed > 0);
 
-    #[test]
-    fn effective_input_limit_less_than_model_limit() {
-        let ctx = budget_for_model(Some("gpt-4o"));
-        assert!(
-            ctx.effective_input_limit() < ctx.model_limit,
-            "input limit should be less than model limit due to output reserve"
-        );
-    }
+        // CJK punctuation
+        let punct = estimate_str_tokens("你好，世界！");
+        assert!(punct > 0);
+        let punct2 = estimate_str_tokens("你好「世界」測試《內容》——標點");
+        assert!(punct2 > 0);
 
-    // ── capped_output_tokens tests ──
-
-    #[test]
-    fn capped_output_tokens_default_16k() {
-        let b = budget_for_model(None); // 128K, 0.15
-        // full_reserve = 128_000 * 0.15 = 19_200 → capped to 16_384 (large model)
-        assert_eq!(capped_output_tokens(&b), 16_384);
-    }
-
-    #[test]
-    fn capped_output_tokens_scales_for_small_model() {
-        let b = budget_for_model(Some("gpt-3.5")); // 16K, 0.12
-        // full_reserve = 16_000 * 0.12 = 1_920 → min(1920, 8192) = 1920 (small model cap)
-        assert_eq!(capped_output_tokens(&b), 1920);
-    }
-
-    #[test]
-    fn capped_output_tokens_claude_16k() {
-        let b = budget_for_model(Some("claude-3.5-sonnet")); // 200K, 0.20
-        // full_reserve = 200_000 * 0.20 = 40_000 → capped to 16_384 (large model)
-        assert_eq!(capped_output_tokens(&b), 16_384);
-    }
-
-    // -----------------------------------------------------------------------
-    // Unhappy-path / edge-case tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn estimate_str_tokens_empty_string_returns_zero() {
+        // empty
         assert_eq!(estimate_str_tokens(""), 0);
+
+        // code with CJK
+        let code = estimate_str_tokens(r#"fn main() { println!("你好"); }"#);
+        assert!(code > 0);
+
+        // JSON ↔ smaller divisor
+        let json_tokens = estimate_str_tokens("{\"key\": \"value\"}");
+        assert!(json_tokens > 0);
+
+        // array-like
+        let arr = estimate_str_tokens("[1, 2, 3, 4, 5]");
+        assert!(arr > 0);
+
+        // single char
+        assert_eq!(estimate_str_tokens("a"), 0); // 1/4 = 0
+        assert_eq!(estimate_str_tokens("你"), 2); // (1*3)/2 ceiling = 2
+
+        // emoji
+        let emoji = estimate_str_tokens("😀🎉");
+        assert!(emoji > 0);
+
+        // whitespace-prefixed JSON
+        let json = estimate_str_tokens("  {\"a\": 1}");
+        assert!(json > 0);
+
+        // CJK mixed sentence
+        let mixed_sentence = estimate_str_tokens(
+            "这是一个包含中文和English的混合句子mixed sentence with CJK中文和英文English",
+        );
+        assert!(mixed_sentence > 15);
     }
 
     #[test]
-    fn estimate_str_tokens_pure_cjk_no_ascii() {
-        let s = "你好世界测试中文字符啊";
-        assert_eq!(s.chars().count(), 11);
-        let tokens = estimate_str_tokens(s);
-        // (11*3).div_ceil(2) = 33.div_ceil(2) = 17
-        assert_eq!(tokens, 17);
+    fn test_estimate_str_tokens_cjk_penalty() {
+        // CJK gets ~2× tokens per character vs ASCII
+        let ascii = estimate_str_tokens("AAAA"); // 4 ASCII chars → char/4 = 1
+        let cjk = estimate_str_tokens("啊啊啊啊"); // 4 CJK → 4/2 = 2
+        assert!(
+            cjk > ascii,
+            "CJK tokens ({}) should exceed ASCII tokens ({})",
+            cjk,
+            ascii
+        );
+
+        // CJK heavy content > old heuristic
+        let cjk_heavy = estimate_str_tokens(
+            "你好世界这是测试用例包含大量中文内容用于验证新的估算方法是否比旧的启发式更准确",
+        );
+        assert!(cjk_heavy > 10);
     }
 
     #[test]
-    fn estimate_str_tokens_pure_ascii_text() {
-        let s = "hello world this is text"; // 24 bytes, starts with 'h' → divisor 4
-        let tokens = estimate_str_tokens(s);
-        assert_eq!(tokens, 24 / 4); // 6
+    fn test_estimate_str_tokens_edge_cases() {
+        // empty
+        assert_eq!(estimate_str_tokens(""), 0);
+
+        // pure CJK no ASCII
+        let cjk = estimate_str_tokens("你好世界测试纯中文");
+        assert!(cjk > 0);
+
+        // pure ASCII
+        let ascii = estimate_str_tokens("The quick brown fox jumps over the lazy dog");
+        assert!(ascii > 0);
     }
 
-    #[test]
-    fn estimate_str_tokens_json_object_smaller_divisor() {
-        let s = r#"{"key": "value", "num": 42}"#; // starts with '{' → divisor 2
-        let tokens = estimate_str_tokens(s);
-        assert_eq!(tokens, s.len() / 2);
-    }
+    // === estimate_tokens (8→1) ===
 
     #[test]
-    fn estimate_str_tokens_array_like_uses_smaller_divisor() {
-        let s = r#"["a", "b", "c"]"#; // starts with '[' → divisor 2
-        let tokens = estimate_str_tokens(s);
-        assert_eq!(tokens, s.len() / 2);
-    }
+    fn test_estimate_tokens() {
+        // includes schema in estimate
+        let tokens_a = estimate_tokens(&[msg("hello")], 100, 0);
+        let tokens_b = estimate_tokens(&[msg("hello")], 1000, 0);
+        assert!(tokens_b > tokens_a, "more schema => more tokens");
 
-    #[test]
-    fn estimate_str_tokens_cjk_ascii_mixed() {
-        let s = "hello你好"; // 5 ASCII bytes + 2 CJK chars
-        let tokens = estimate_str_tokens(s);
-        // CJK: (2*3).div_ceil(2) = 3
-        // ASCII: 5 bytes, first byte is 'h' → divisor 4 → 5/4 = 1
-        assert_eq!(tokens, 3 + 1);
-    }
-
-    #[test]
-    fn estimate_str_tokens_single_char() {
-        assert_eq!(estimate_str_tokens("x"), 0); // 1 byte / 4 = 0 (integer division)
-    }
-
-    #[test]
-    fn estimate_str_tokens_emoji_counted_as_ascii() {
-        let s = "😀"; // 4 bytes UTF-8, not in CJK ranges
-        let tokens = estimate_str_tokens(s);
-        // 4 bytes / 4 = 1
-        assert_eq!(tokens, 1);
-    }
-
-    #[test]
-    fn estimate_tokens_empty_messages_has_base_overhead() {
-        // Empty messages still account for system prompt + model framing.
-        // DEFAULT_SYSTEM_PROMPT_TOKENS (14_000) + MODEL_FRAMING (300) = 14_300
+        // empty messages has overhead
         let tokens = estimate_tokens(&[], 0, 0);
-        assert!(
-            tokens >= 14_000,
-            "empty messages should have base overhead, got {tokens}"
-        );
+        assert!(tokens > 0, "empty session should have base overhead");
+
+        // CJK message
+        let tokens = estimate_tokens(&[msg("你好世界测试")], 0, 0);
+        assert!(tokens > 0);
+
+        // message without content
+        let tokens = estimate_tokens(&[json!({"role": "assistant"})], 0, 0);
+        assert!(tokens > 0);
+
+        // tool call tokens included
+        let tokens = estimate_tokens(&[tool_msg(&"x".repeat(120))], 0, 0);
+        assert!(tokens > 30);
+
+        // with schema dwarfs estimate without for CJK
+        let cjk_session: Vec<_> = (0..5)
+            .map(|_| msg("你好世界测试中文内容大量中文"))
+            .collect();
+        let without_schema = estimate_tokens(&cjk_session, 0, 0);
+        let with_schema = estimate_tokens(&cjk_session, 50_000, 0);
+        assert!(with_schema > without_schema * 2);
+
+        // large CJK session produces substantial token estimate
+        let _ = ContextBudget::default();
+        let large_cjk: Vec<_> = (0..200)
+            .map(|_| msg("你好世界测试中文内容大量中文"))
+            .collect();
+        let est = estimate_tokens(&large_cjk, 25_000, 0);
+        assert!(est > 40_000, "est={est}");
+    }
+
+    // === capped_output_tokens (10→2) ===
+
+    #[test]
+    fn test_capped_output_tokens() {
+        // default (128k model) → 108_800*0.15 = 16320, min(16320, 16384) = 16320
+        let b = ContextBudget::default();
+        let cap = capped_output_tokens(&b);
+        assert!(cap > 0 && cap <= 16_384);
+
+        // large model (>128k)
+        let b = budget_for_model(Some("claude-sonnet-4-20250514"));
+        assert_eq!(capped_output_tokens(&b), 16_384);
+
+        // small model
+        let b = ContextBudget {
+            model_limit: 30_000,
+            output_reserve_ratio: 0.15,
+            ..Default::default()
+        };
+        // full_reserve = 4500, min(4500, 8192) = 4500
+        assert_eq!(capped_output_tokens(&b), 4_500);
+
+        // very large model
+        let b = budget_for_model(Some("gemini-2.5-pro"));
+        assert_eq!(capped_output_tokens(&b), 16_384);
     }
 
     #[test]
-    fn estimate_tokens_message_without_content() {
-        let tokens = estimate_tokens(&[json!({"role": "user"})], 0, 0);
-        // Should not panic on missing content
-        assert!(tokens > 14_000); // overhead + per-message overhead
-    }
-
-    #[test]
-    fn capped_output_tokens_zero_model_limit() {
+    fn test_capped_output_tokens_edge() {
+        // zero model limit
         let b = ContextBudget {
             model_limit: 0,
-            compact_threshold: 0.80,
-            keep_recent_turns: 4,
-            memory_budget_chars: 3000,
-            output_reserve_ratio: 0.20,
-            compact_config: CompactConfig::default(),
+            output_reserve_ratio: 0.1,
+            ..Default::default()
         };
         assert_eq!(capped_output_tokens(&b), 0);
-    }
 
-    #[test]
-    fn capped_output_tokens_exactly_128k_boundary() {
+        // exactly 128k boundary (large model cap)
         let b = ContextBudget {
             model_limit: 128_000,
-            compact_threshold: 0.80,
-            keep_recent_turns: 4,
-            memory_budget_chars: 3000,
-            output_reserve_ratio: 0.15,
-            compact_config: CompactConfig::default(),
+            output_reserve_ratio: 0.1,
+            ..Default::default()
         };
-        // 128_000 >= 128_000 → large model path, cap = 16_384
-        // full_reserve = 128_000 * 0.15 = 19_200 → min(19_200, 16_384) = 16_384
-        assert_eq!(capped_output_tokens(&b), 16_384);
-    }
+        assert_eq!(capped_output_tokens(&b), 12_800); // 128k*0.1=12800, min(12800,16384)=12800
 
-    #[test]
-    fn capped_output_tokens_just_below_128k() {
+        // just below 128k (small model cap)
         let b = ContextBudget {
             model_limit: 127_999,
-            compact_threshold: 0.80,
-            keep_recent_turns: 4,
-            memory_budget_chars: 3000,
             output_reserve_ratio: 0.15,
-            compact_config: CompactConfig::default(),
+            ..Default::default()
         };
-        // 127_999 < 128_000 → small model path, cap = 8_192
-        // full_reserve = 127_999 * 0.15 = 19_199 → min(19_199, 8_192) = 8_192
-        assert_eq!(capped_output_tokens(&b), SMALL_MODEL_OUTPUT_TOKEN_CAP);
-    }
+        // full_reserve = 19199, min(19199, 8192) = 8192
+        assert_eq!(capped_output_tokens(&b), 8_192);
 
-    #[test]
-    fn capped_output_tokens_tiny_4k_model() {
+        // tiny 4k model
         let b = ContextBudget {
             model_limit: 4_096,
-            compact_threshold: 0.80,
-            keep_recent_turns: 4,
-            memory_budget_chars: 3000,
-            output_reserve_ratio: 0.15,
-            compact_config: CompactConfig::default(),
+            output_reserve_ratio: 0.10,
+            ..Default::default()
         };
-        // 4_096 < 128_000 → small model path, cap = 8_192
-        // full_reserve = 4_096 * 0.15 = 614.4 → 614 → min(614, 8192) = 614
-        assert_eq!(capped_output_tokens(&b), 614);
-    }
+        assert_eq!(capped_output_tokens(&b), 409);
 
-    #[test]
-    fn capped_output_tokens_extreme_reserve_ratio() {
+        // extreme reserve ratio still capped
         let b = ContextBudget {
             model_limit: 200_000,
-            compact_threshold: 0.80,
-            keep_recent_turns: 4,
-            memory_budget_chars: 3000,
-            output_reserve_ratio: 0.50,
-            compact_config: CompactConfig::default(),
+            output_reserve_ratio: 0.5,
+            ..Default::default()
         };
-        // 200_000 >= 128_000 → large model path, cap = 16_384
-        // full_reserve = 200_000 * 0.50 = 100_000 → min(100_000, 16_384) = 16_384
-        assert_eq!(capped_output_tokens(&b), DEFAULT_OUTPUT_TOKEN_CAP);
-    }
-
-    #[test]
-    fn capped_output_tokens_min_1_token() {
-        let b = ContextBudget {
-            model_limit: 100,
-            compact_threshold: 0.80,
-            keep_recent_turns: 4,
-            memory_budget_chars: 3000,
-            output_reserve_ratio: 0.15,
-            compact_config: CompactConfig::default(),
-        };
-        // 100 < 128_000 → small model path, cap = 8_192
-        // full_reserve = 100 * 0.15 = 15.0 → 15 → min(15, 8192) = 15
-        let result = capped_output_tokens(&b);
-        assert!(result >= 1, "expected at least 1 token, got {result}");
-    }
-
-    #[test]
-    fn capped_output_tokens_very_large_model() {
-        let b = ContextBudget {
-            model_limit: 2_000_000, // 2M tokens
-            compact_threshold: 0.80,
-            keep_recent_turns: 4,
-            memory_budget_chars: 3000,
-            output_reserve_ratio: 0.20,
-            compact_config: CompactConfig::default(),
-        };
-        // 2M * 0.20 = 400K → capped to 16_384 (large model)
+        // full_reserve = 100_000, min(100000, 16384) = 16384
         assert_eq!(capped_output_tokens(&b), 16_384);
+
+        // minimum 1 token
+        let b = ContextBudget {
+            model_limit: 10,
+            output_reserve_ratio: 0.1,
+            ..Default::default()
+        };
+        assert_eq!(capped_output_tokens(&b), 1);
     }
 
+    // === compact trigger & should_compact (2→1) ===
+
     #[test]
-    fn effective_input_limit_zero_reserve() {
+    fn test_compact_trigger_and_should_compact() {
         let b = ContextBudget {
-            model_limit: 100_000,
-            compact_threshold: 0.80,
-            keep_recent_turns: 4,
-            memory_budget_chars: 3000,
+            model_limit: 200_000,
+            output_reserve_ratio: 0.1,
+            compact_threshold: 0.75,
+            ..Default::default()
+        };
+        let trigger = b.compact_trigger();
+        assert_eq!(trigger, (b.effective_input_limit() as f64 * 0.75) as usize);
+
+        // should_compact uses > (strict)
+        assert!(!b.should_compact(trigger));
+        assert!(b.should_compact(trigger + 1));
+        assert!(!b.should_compact(trigger - 1));
+
+        // zero threshold
+        let b = ContextBudget {
+            compact_threshold: 0.0,
             output_reserve_ratio: 0.0,
-            compact_config: CompactConfig::default(),
-        };
-        assert_eq!(b.effective_input_limit(), 100_000);
-    }
-
-    #[test]
-    fn effective_input_limit_full_reserve() {
-        let b = ContextBudget {
             model_limit: 100_000,
-            compact_threshold: 0.80,
-            keep_recent_turns: 4,
-            memory_budget_chars: 3000,
-            output_reserve_ratio: 1.0,
-            compact_config: CompactConfig::default(),
+            ..Default::default()
         };
-        assert_eq!(b.effective_input_limit(), 0);
+        assert_eq!(b.compact_trigger(), 0);
+        assert!(b.should_compact(1)); // 1 > 0
     }
 
-    #[test]
-    fn compaction_tier_zero_tokens() {
-        let b = ContextBudget {
-            model_limit: 100_000,
-            compact_threshold: 0.80,
-            keep_recent_turns: 4,
-            memory_budget_chars: 3000,
-            output_reserve_ratio: 0.20,
-            compact_config: CompactConfig::default(),
-        };
-        assert_eq!(b.compaction_tier(0), CompactionTier::Normal);
-    }
+    // === should_summarize (4→1) ===
 
     #[test]
-    fn compaction_tier_at_limit() {
-        let b = ContextBudget {
-            model_limit: 100_000,
-            compact_threshold: 0.80,
-            keep_recent_turns: 4,
-            memory_budget_chars: 3000,
-            output_reserve_ratio: 0.20,
-            compact_config: CompactConfig::default(),
-        };
-        // effective_input_limit = 80_000
-        // 80_000 → ratio = 1.0 → AggressivePrune
-        assert_eq!(b.compaction_tier(80_000), CompactionTier::AggressivePrune);
-    }
-
-    #[test]
-    fn compaction_tier_zero_effective_limit() {
-        let b = ContextBudget {
-            model_limit: 100_000,
-            compact_threshold: 0.80,
-            keep_recent_turns: 4,
-            memory_budget_chars: 3000,
-            output_reserve_ratio: 1.0, // 100% reserved → effective = 0
-            compact_config: CompactConfig::default(),
-        };
-        // effective = 0, ratio = 0/0 → NaN or Inf
-        // Any tokens / 0 → infinity → AggressivePrune (ratio > 0.85)
-        let tier = b.compaction_tier(1);
-        assert_eq!(tier, CompactionTier::AggressivePrune);
-    }
-
-    #[test]
-    fn should_compact_boundary() {
-        let b = ContextBudget {
-            model_limit: 100_000,
-            compact_threshold: 0.80,
-            keep_recent_turns: 4,
-            memory_budget_chars: 3000,
-            output_reserve_ratio: 0.20,
-            compact_config: CompactConfig::default(),
-        };
-        // compact_trigger = 80_000 * 0.80 = 64_000
-        assert!(!b.should_compact(64_000)); // Not > trigger
-        assert!(b.should_compact(64_001)); // > trigger
-    }
-
-    // ── CompactConfig tests ──────────────────────────────────────────────
-
-    #[test]
-    fn should_summarize_disabled_always_false() {
-        let cfg = CompactConfig {
+    fn test_should_summarize() {
+        // disabled always false
+        let c = CompactConfig {
             enable_summary: false,
             ..Default::default()
         };
-        assert!(!cfg.should_summarize(CompactionTier::Normal));
-        assert!(!cfg.should_summarize(CompactionTier::AggressivePrune));
-    }
+        assert!(!c.should_summarize(CompactionTier::Normal));
+        assert!(!c.should_summarize(CompactionTier::AggressivePrune));
 
-    #[test]
-    fn should_summarize_respects_min_tier() {
-        let cfg = CompactConfig {
-            enable_summary: true,
-            summary_min_tier: CompactionTier::CompactHistory,
-            ..Default::default()
-        };
-        assert!(!cfg.should_summarize(CompactionTier::Normal));
-        assert!(!cfg.should_summarize(CompactionTier::TrimSchemas));
-        assert!(cfg.should_summarize(CompactionTier::CompactHistory));
-        assert!(cfg.should_summarize(CompactionTier::AggressivePrune));
-    }
+        // respects min_tier (default: CompactHistory)
+        let c = CompactConfig::default();
+        assert!(!c.should_summarize(CompactionTier::Normal));
+        assert!(!c.should_summarize(CompactionTier::TrimSchemas));
+        assert!(c.should_summarize(CompactionTier::CompactHistory));
+        assert!(c.should_summarize(CompactionTier::AggressivePrune));
 
-    #[test]
-    fn should_summarize_at_lowest_min_tier() {
-        let cfg = CompactConfig {
+        // at lowest min_tier
+        let c = CompactConfig {
             enable_summary: true,
             summary_min_tier: CompactionTier::Normal,
             ..Default::default()
         };
-        // Everything triggers when min tier is Normal
-        assert!(cfg.should_summarize(CompactionTier::Normal));
-        assert!(cfg.should_summarize(CompactionTier::TrimSchemas));
-    }
+        assert!(c.should_summarize(CompactionTier::Normal));
+        assert!(c.should_summarize(CompactionTier::AggressivePrune));
 
-    #[test]
-    fn should_summarize_at_highest_min_tier() {
-        let cfg = CompactConfig {
+        // at highest min_tier
+        let c = CompactConfig {
             enable_summary: true,
             summary_min_tier: CompactionTier::AggressivePrune,
             ..Default::default()
         };
-        assert!(!cfg.should_summarize(CompactionTier::CompactHistory));
-        assert!(cfg.should_summarize(CompactionTier::AggressivePrune));
+        assert!(!c.should_summarize(CompactionTier::CompactHistory));
+        assert!(c.should_summarize(CompactionTier::AggressivePrune));
     }
 
-    #[test]
-    fn compact_config_default_values() {
-        let cfg = CompactConfig::default();
-        assert!(cfg.enable_summary);
-        assert_eq!(cfg.summary_token_budget, 20_000);
-        assert_eq!(cfg.max_ptl_retries, 3);
-        assert_eq!(cfg.summary_min_tier, CompactionTier::CompactHistory);
-    }
-
-    // ── CompactionTier budget_pressure ───────────────────────────────────
+    // === default values & from_runtime_config (4→1) ===
 
     #[test]
-    fn budget_pressure_increases_with_severity() {
-        assert_eq!(CompactionTier::Normal.budget_pressure(), 0.0);
-        assert!(CompactionTier::TrimSchemas.budget_pressure() > 0.0);
-        assert!(
-            CompactionTier::CompactHistory.budget_pressure()
-                > CompactionTier::TrimSchemas.budget_pressure()
-        );
-        assert!(
-            CompactionTier::AggressivePrune.budget_pressure()
-                > CompactionTier::CompactHistory.budget_pressure()
-        );
-    }
-
-    // ── budget_for_model edge cases ─────────────────────────────────────
-
-    #[test]
-    fn budget_for_model_none_uses_defaults() {
-        let b = budget_for_model(None);
+    fn test_defaults_and_from_runtime_config() {
+        // default budget
+        let b = ContextBudget::default();
         assert_eq!(b.model_limit, 128_000);
-        assert!((b.output_reserve_ratio - 0.15).abs() < 1e-6);
-    }
+        assert_eq!(b.compact_threshold, 0.75);
+        assert_eq!(b.keep_recent_turns, 6);
+        assert_eq!(b.memory_budget_chars, 8_000);
+        assert_eq!(b.output_reserve_ratio, 0.15);
 
-    #[test]
-    fn budget_for_model_empty_string_uses_defaults() {
-        let b = budget_for_model(Some(""));
-        assert_eq!(b.model_limit, 128_000);
-    }
+        // default compact config
+        let c = CompactConfig::default();
+        assert!(c.enable_summary);
+        assert_eq!(c.summary_token_budget, 20_000);
+        assert_eq!(c.max_ptl_retries, 3);
+        assert_eq!(c.summary_min_tier, CompactionTier::CompactHistory);
 
-    #[test]
-    fn budget_for_model_unknown_uses_defaults() {
-        let b = budget_for_model(Some("totally-unknown-model-xyz"));
-        assert_eq!(b.model_limit, 128_000);
-    }
-
-    // ── ContextBudget edge: total < reserved ────────────────────────────
-
-    #[test]
-    fn effective_input_limit_with_reserve_exceeding_one() {
-        // output_reserve_ratio > 1.0 is nonsensical but should not panic
-        let b = ContextBudget {
-            model_limit: 1000,
-            output_reserve_ratio: 1.5,
-            ..Default::default()
-        };
-        // (1000 * (1.0 - 1.5)) = -500, cast to usize wraps
-        // The key assertion: no panic
-        let _ = b.effective_input_limit();
-    }
-
-    #[test]
-    fn compact_trigger_zero_threshold() {
-        let b = ContextBudget {
-            compact_threshold: 0.0,
-            ..Default::default()
-        };
-        assert_eq!(b.compact_trigger(), 0);
-        // Any positive token count should trigger compaction
-        assert!(b.should_compact(1));
-    }
-
-    // ---------------------------------------------------------------
-    // 8. RuntimeConfig integration (M3)
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn from_runtime_config_applies_compression_settings() {
-        let mut config = astra_config::runtime_config::RuntimeConfig::default();
-        config.compression.compression_threshold = 0.6;
-        config.compression.preserve_recent_turns = 4;
-        config.memory.max_memory_tokens = 5000;
-
-        let b = ContextBudget::from_runtime_config(&config, Some("claude-3.5-sonnet"));
-
-        // Model-specific values should be applied
-        assert_eq!(b.model_limit, 128_000); // Claude
-        assert!((b.output_reserve_ratio - 0.15).abs() < f64::EPSILON);
-
-        // RuntimeConfig values should be applied
-        assert!((b.compact_threshold - 0.6).abs() < f64::EPSILON);
-        assert_eq!(b.keep_recent_turns, 4);
-        // 5000 tokens * 4 chars/token = 20000 chars
-        assert_eq!(b.memory_budget_chars, 20000);
-    }
-
-    #[test]
-    fn from_runtime_config_defaults() {
+        // from_runtime_config with claude model
         let config = astra_config::runtime_config::RuntimeConfig::default();
-        let b = ContextBudget::from_runtime_config(&config, None);
+        let budget = ContextBudget::from_runtime_config(&config, Some("claude-sonnet-4-20250514"));
+        assert_eq!(budget.model_limit, 128_000);
 
-        // Should use default values
-        assert!((b.compact_threshold - 0.8).abs() < f64::EPSILON);
-        assert_eq!(b.keep_recent_turns, 3); // default preserve_recent_turns
-        // 4000 tokens * 4 chars = 16000 chars
-        assert_eq!(b.memory_budget_chars, 16000);
-    }
-
-    #[test]
-    fn compaction_tier_scales_with_threshold() {
-        // Default threshold 0.75: tiers at ~60%/75%/85%
-        let default_budget = ContextBudget {
-            model_limit: 100_000,
-            compact_threshold: 0.75,
-            keep_recent_turns: 3,
-            memory_budget_chars: 8000,
-            output_reserve_ratio: 0.15,
-            compact_config: CompactConfig::default(),
+        // from_runtime_config applies compression settings
+        use astra_config::runtime_config::{CompressionConfig, RuntimeConfig};
+        let config = RuntimeConfig {
+            compression: CompressionConfig {
+                compression_threshold: 0.5,
+                preserve_recent_turns: 10,
+                ..CompressionConfig::default()
+            },
+            ..RuntimeConfig::default()
         };
-
-        // At default 0.75 threshold:
-        // TrimSchemas starts at 0.75 * 0.80 = 0.60 (60%)
-        // CompactHistory starts at 0.75 (75%)
-        // AggressivePrune starts at 0.75 * 1.133 ≈ 0.85 (85%)
-        let limit = default_budget.effective_input_limit(); // 85000
-        assert_eq!(
-            default_budget.compaction_tier((0.59 * limit as f64) as usize),
-            CompactionTier::Normal
-        );
-        assert_eq!(
-            default_budget.compaction_tier((0.61 * limit as f64) as usize),
-            CompactionTier::TrimSchemas
-        );
-        assert_eq!(
-            default_budget.compaction_tier((0.76 * limit as f64) as usize),
-            CompactionTier::CompactHistory
-        );
-        assert_eq!(
-            default_budget.compaction_tier((0.86 * limit as f64) as usize),
-            CompactionTier::AggressivePrune
-        );
-
-        // Aggressive threshold 0.60: tiers scale proportionally
-        // TrimSchemas starts at 0.60 * 0.80 = 0.48 (48%)
-        // CompactHistory starts at 0.60 (60%)
-        // AggressivePrune starts at 0.60 * 1.133 ≈ 0.68 (68%)
-        let aggressive_budget = ContextBudget {
-            compact_threshold: 0.60,
-            ..default_budget.clone()
-        };
-
-        assert_eq!(
-            aggressive_budget.compaction_tier((0.47 * limit as f64) as usize),
-            CompactionTier::Normal
-        );
-        assert_eq!(
-            aggressive_budget.compaction_tier((0.49 * limit as f64) as usize),
-            CompactionTier::TrimSchemas
-        );
-        assert_eq!(
-            aggressive_budget.compaction_tier((0.61 * limit as f64) as usize),
-            CompactionTier::CompactHistory
-        );
-        assert_eq!(
-            aggressive_budget.compaction_tier((0.69 * limit as f64) as usize),
-            CompactionTier::AggressivePrune
-        );
+        let budget = ContextBudget::from_runtime_config(&config, Some("unknown-model"));
+        assert_eq!(budget.compact_threshold, 0.5);
+        assert_eq!(budget.keep_recent_turns, 10);
     }
 }

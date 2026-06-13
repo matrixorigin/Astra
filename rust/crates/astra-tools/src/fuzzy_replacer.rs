@@ -894,12 +894,14 @@ mod tests {
         );
 
         // replace_all with distinct curly-quote forms → abort
-        assert!(fuzzy_find_replacement(
-            "say \u{201C}a\u{201D} and \u{201C}a\u{201C} done",
-            "\"a\"",
-            true
-        )
-        .is_none());
+        assert!(
+            fuzzy_find_replacement(
+                "say \u{201C}a\u{201D} and \u{201C}a\u{201C} done",
+                "\"a\"",
+                true
+            )
+            .is_none()
+        );
 
         // replace_all with duplicate identical strategy results → succeeds
         let content = "  foo()\n  bar()\n\n  foo()\n  bar()";

@@ -298,5 +298,4 @@ mod tests {
         let desc = parsed["matches"][0]["description"].as_str().unwrap();
         assert!(desc.len() <= 200);
     }
-
 }

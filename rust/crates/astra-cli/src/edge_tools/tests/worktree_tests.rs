@@ -1,4 +1,4 @@
-use super::{detect_git_remote_repos, extract_github_owner_repo, test_executor, ToolExecutor};
+use super::{ToolExecutor, detect_git_remote_repos, extract_github_owner_repo, test_executor};
 use serde_json::json;
 
 fn init_temp_git_repo() -> tempfile::TempDir {

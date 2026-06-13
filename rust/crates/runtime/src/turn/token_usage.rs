@@ -537,16 +537,18 @@ mod tests {
         // Empty usage returns None.
         assert!(extract_usage(UsageDialect::AnthropicMessages, &obj(json!({}))).is_none());
         // All-zero returns None.
-        assert!(extract_usage(
-            UsageDialect::AnthropicMessages,
-            &obj(json!({
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "cache_creation_input_tokens": 0
-            }))
-        )
-        .is_none());
+        assert!(
+            extract_usage(
+                UsageDialect::AnthropicMessages,
+                &obj(json!({
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0
+                }))
+            )
+            .is_none()
+        );
         // Cache-only should still be Some.
         let t = extract_usage(
             UsageDialect::AnthropicMessages,

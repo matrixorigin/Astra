@@ -2085,16 +2085,25 @@ mod tests {
         );
         // Path traversal
         assert!(
-            git_checkout_file(&root, &json!({"path": "../../../etc/passwd"})).contains("path traversal"),
+            git_checkout_file(&root, &json!({"path": "../../../etc/passwd"}))
+                .contains("path traversal"),
             "should reject traversal"
         );
         // Dangerous ref injection
         assert!(
-            git_checkout_file(&root, &json!({"path": "README.md", "ref": "HEAD; rm -rf /"})).contains("invalid ref"),
+            git_checkout_file(
+                &root,
+                &json!({"path": "README.md", "ref": "HEAD; rm -rf /"})
+            )
+            .contains("invalid ref"),
             "should reject shell injection in ref"
         );
         assert!(
-            git_checkout_file(&root, &json!({"path": "README.md", "ref": "main|cat /etc/passwd"})).contains("invalid ref"),
+            git_checkout_file(
+                &root,
+                &json!({"path": "README.md", "ref": "main|cat /etc/passwd"})
+            )
+            .contains("invalid ref"),
             "should reject pipe in ref"
         );
     }
