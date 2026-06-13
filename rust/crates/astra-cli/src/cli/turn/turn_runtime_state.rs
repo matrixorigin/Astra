@@ -20,6 +20,7 @@ fn clear_runtime_checkpoint_state(state: &mut SessionState) {
     state.runtime_pipeline_state = None;
     state.runtime_compaction_state = None;
     state.runtime_consecutive_context_window_errors = 0;
+    state.runtime_idempotency_cache = None;
 }
 
 pub(crate) fn update_from_stream_result(state: &mut SessionState, result: &crate::StreamResult) {
@@ -32,6 +33,8 @@ pub(crate) fn update_from_stream_result(state: &mut SessionState, result: &crate
 
     if !apply_heavy_checkpoint_runtime_state(state, checkpoint) {
         clear_runtime_checkpoint_state(state);
+    } else {
+        state.runtime_idempotency_cache = None;
     }
 }
 
@@ -40,5 +43,14 @@ pub(crate) fn update_from_turn_failure(state: &mut SessionState, failure: &crate
     // durable recovery point; keep the previous runtime state intact.
     if let Some(checkpoint) = failure.partial.last_heavy_checkpoint.as_ref() {
         apply_heavy_checkpoint_runtime_state(state, checkpoint);
+        if let Some(session_id) = failure.partial.session_id.as_deref() {
+            state.runtime_idempotency_cache =
+                astra_pipeline::step_restore::restore_session(session_id)
+                    .ok()
+                    .flatten()
+                    .map(|restored| restored.idempotency_cache);
+        } else {
+            state.runtime_idempotency_cache = None;
+        }
     }
 }

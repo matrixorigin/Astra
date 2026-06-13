@@ -671,7 +671,9 @@ pub(crate) async fn stream_chat_sse(
         boosted_tools: HashSet::new(),
         widen_selection_pending: false,
         step_recorder,
-        idempotency_cache: InMemoryIdempotencyCache::new(),
+        idempotency_cache: p
+            .idempotency_cache
+            .unwrap_or_else(InMemoryIdempotencyCache::new),
         semantic_dedup: SemanticDedup::new(
             astra_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
         ),

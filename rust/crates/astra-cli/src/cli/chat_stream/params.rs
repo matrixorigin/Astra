@@ -461,6 +461,8 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) compaction_state: Option<serde_json::Value>,
     /// Restored consecutive context-window failures from a checkpoint.
     pub(crate) consecutive_context_window_errors: u32,
+    /// Restored tool replay guard rebuilt from step events on resume.
+    pub(crate) idempotency_cache: Option<astra_pipeline::step_protocol::InMemoryIdempotencyCache>,
     /// When present, these are used instead of converting history pairs.
     pub(crate) pre_loaded_messages: Option<Vec<serde_json::Value>>,
     /// Extra context appended to the system prompt (gateway injects cron/session context here).
@@ -615,6 +617,7 @@ impl<'a> ChatTurnParams<'a> {
             pipeline_state: None,
             compaction_state: None,
             consecutive_context_window_errors: 0,
+            idempotency_cache: None,
             pre_loaded_messages: None,
             append_system_prompt: None,
             session_memory_extractor: None,

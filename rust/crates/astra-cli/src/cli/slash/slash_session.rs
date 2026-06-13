@@ -5670,6 +5670,7 @@ async fn apply_restored_session(
         if let Some(ref ao_json) = step_restored.approval_overrides {
             state.perm_manager.merge_restored_overrides(ao_json);
         }
+        state.runtime_idempotency_cache = Some(step_restored.idempotency_cache);
         eprintln!("  {} {}", "↻".magenta(), summary.dim());
     } else if has_cloud_heavy_fallback {
         apply_restored_cloud_heavy_state(state, &restored);
@@ -6503,6 +6504,31 @@ mod resume_tests {
         crate::cli::cli_config::cli_utils::save_credentials(&creds).unwrap();
     }
 
+    fn write_completed_read_step_event(session_id: &str, turn_count: u32, created_at: u64) {
+        let args = serde_json::json!({"path": "src/lib.rs"});
+        let idem_key = astra_pipeline::step_protocol::IdempotencyKey::semantic("read_file", &args);
+        let mut event_store =
+            astra_pipeline::step_checkpoint::FileBackedEventStore::empty(session_id);
+        <astra_pipeline::step_checkpoint::FileBackedEventStore as astra_pipeline::step_protocol::StepEventStore>::append(
+            &mut event_store,
+            astra_pipeline::step_protocol::StepEvent {
+                event_id: format!("completed-read-{turn_count}"),
+                canonical_event_id: None,
+                step_id: format!("step-{turn_count}"),
+                event_type: astra_pipeline::step_protocol::StepEventType::ToolCallCompleted,
+                agent_id: None,
+                caused_by: vec![],
+                payload: Some(serde_json::json!({
+                    "tool_name": "read_file",
+                    "idempotency_key": idem_key.cache_key(),
+                    "output": "cached src/lib.rs",
+                    "is_error": false,
+                })),
+                created_at,
+            },
+        );
+    }
+
     fn write_local_step_checkpoint_with_compaction_state(session_id: &str, turn_count: u32) {
         let mut heavy = match astra_pipeline::step_protocol::StepCheckpoint::heavy(
             format!("step-{turn_count}"),
@@ -6536,12 +6562,14 @@ mod resume_tests {
             "recovery": {"ptl_error_count": 2},
         }));
         heavy.consecutive_context_window_errors = 2;
+        let completed_event_created_at = heavy.light.created_at.saturating_add(1);
         astra_pipeline::step_checkpoint::write_step_checkpoint(
             session_id,
             turn_count,
             &astra_pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy)),
         )
         .unwrap();
+        write_completed_read_step_event(session_id, turn_count, completed_event_created_at);
     }
 
     fn write_invalid_local_step_checkpoint(session_id: &str, turn_count: u32) {
@@ -6716,6 +6744,23 @@ mod resume_tests {
             }))
         );
         assert_eq!(state.runtime_consecutive_context_window_errors, 2);
+        assert!(
+            state.runtime_idempotency_cache.is_some(),
+            "step restore should carry a replay guard cache into the next turn"
+        );
+        let idem_key = astra_pipeline::step_protocol::IdempotencyKey::semantic(
+            "read_file",
+            &serde_json::json!({"path": "src/lib.rs"}),
+        );
+        assert_eq!(
+            state
+                .runtime_idempotency_cache
+                .as_ref()
+                .and_then(|cache| cache.check(&idem_key))
+                .expect("restored replay guard cache should include completed tool")
+                .output,
+            "cached src/lib.rs"
+        );
     }
 
     #[serial_test::serial]

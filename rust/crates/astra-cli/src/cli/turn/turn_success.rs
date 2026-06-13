@@ -87,6 +87,7 @@ struct TurnSuccessLiveSnapshot {
     runtime_pipeline_state: Option<serde_json::Value>,
     runtime_compaction_state: Option<serde_json::Value>,
     runtime_consecutive_context_window_errors: u32,
+    runtime_idempotency_cache: Option<astra_pipeline::step_protocol::InMemoryIdempotencyCache>,
     last_turn_event: Option<session_journal::JournalEvent>,
     observability_session: Option<
         std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
@@ -122,6 +123,7 @@ impl TurnSuccessLiveSnapshot {
             runtime_compaction_state: state.runtime_compaction_state.clone(),
             runtime_consecutive_context_window_errors: state
                 .runtime_consecutive_context_window_errors,
+            runtime_idempotency_cache: state.runtime_idempotency_cache.clone(),
             last_turn_event: state.last_turn_event.clone(),
             observability_session: state.observability_session.clone(),
             pending_adaptive_state: state.pending_adaptive_state.clone(),
@@ -162,6 +164,7 @@ impl TurnSuccessLiveSnapshot {
         state.runtime_compaction_state = self.runtime_compaction_state;
         state.runtime_consecutive_context_window_errors =
             self.runtime_consecutive_context_window_errors;
+        state.runtime_idempotency_cache = self.runtime_idempotency_cache;
         state.last_turn_event = self.last_turn_event;
         state.observability_session = self.observability_session;
         state.pending_adaptive_state = self.pending_adaptive_state;
@@ -405,6 +408,9 @@ mod tests {
             runtime_pipeline_state: Some(serde_json::json!({"old": true})),
             runtime_compaction_state: Some(serde_json::json!({"old": true})),
             runtime_consecutive_context_window_errors: 9,
+            runtime_idempotency_cache: Some(
+                astra_pipeline::step_protocol::InMemoryIdempotencyCache::new(),
+            ),
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("done");
@@ -436,6 +442,7 @@ mod tests {
             }))
         );
         assert_eq!(state.runtime_consecutive_context_window_errors, 2);
+        assert!(state.runtime_idempotency_cache.is_none());
     }
 
     #[test]
@@ -447,6 +454,9 @@ mod tests {
             runtime_pipeline_state: Some(serde_json::json!({"old": true})),
             runtime_compaction_state: Some(serde_json::json!({"old": true})),
             runtime_consecutive_context_window_errors: 9,
+            runtime_idempotency_cache: Some(
+                astra_pipeline::step_protocol::InMemoryIdempotencyCache::new(),
+            ),
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("done");
@@ -457,6 +467,7 @@ mod tests {
         assert!(state.runtime_pipeline_state.is_none());
         assert!(state.runtime_compaction_state.is_none());
         assert_eq!(state.runtime_consecutive_context_window_errors, 0);
+        assert!(state.runtime_idempotency_cache.is_none());
     }
 
     #[test]

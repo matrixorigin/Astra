@@ -1252,7 +1252,7 @@ pub trait IdempotencyCache {
 /// In-memory idempotency cache (v2-v3; v4 uses MatrixOne).
 ///
 /// **Safety**: Capacity-bounded to prevent OOM. LRU eviction when full.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct InMemoryIdempotencyCache {
     cache: HashMap<String, CachedToolResult>,
     max_entries: usize,

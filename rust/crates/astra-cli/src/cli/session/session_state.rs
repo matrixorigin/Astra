@@ -344,6 +344,8 @@ pub(crate) struct SessionState {
     pub runtime_compaction_state: Option<serde_json::Value>,
     /// Consecutive context-window failures restored from the latest heavy checkpoint.
     pub runtime_consecutive_context_window_errors: u32,
+    /// Tool replay guard rebuilt from step events on resume.
+    pub runtime_idempotency_cache: Option<astra_pipeline::step_protocol::InMemoryIdempotencyCache>,
     /// Unified skill registry (single source of truth for all skill resolution).
     pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     /// Session-scoped skill quality tracker for learning loop.
@@ -652,6 +654,7 @@ impl Default for SessionState {
             runtime_pipeline_state: None,
             runtime_compaction_state: None,
             runtime_consecutive_context_window_errors: 0,
+            runtime_idempotency_cache: None,
             unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
             skill_quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
             skill_search: astra_core::SkillSearchSettings::default(),
@@ -815,6 +818,7 @@ impl SessionState {
         self.runtime_pipeline_state = None;
         self.runtime_compaction_state = None;
         self.runtime_consecutive_context_window_errors = 0;
+        self.runtime_idempotency_cache = None;
         self.durable_task_state = None;
         self.last_delivery_report = None;
         self.plan_execution_last_error = None;

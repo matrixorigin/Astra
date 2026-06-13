@@ -127,6 +127,7 @@ impl<'a> CompactCtx<'a> {
             pipeline_state: None,
             compaction_state: None,
             consecutive_context_window_errors: 0,
+            idempotency_cache: None,
             pre_loaded_messages,
             append_system_prompt: None,
             session_memory_extractor: None,
