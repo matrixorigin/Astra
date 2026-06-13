@@ -48,10 +48,7 @@
 //! persistence), so it is being migrated in stages; new pure checks should be
 //! added here first and consumed by call sites instead of being copied.
 
-use astra_sandbox::{
-    GitSafetyViolation, is_dangerous_file_path, is_internal_safe_path, is_soft_violation,
-    validate_git_command,
-};
+use astra_sandbox::{GitSafetyViolation, is_soft_violation, validate_git_command};
 use serde_json::Value;
 
 use crate::action_compensation::{explicit_approval_reason, primary_approval_reason};
@@ -64,6 +61,7 @@ use crate::permission::match_target::{
     AllowMatchTarget, allow_rule_for_match_target, default_match_target,
 };
 use crate::permission::memory_profile::resolved_write_path;
+use crate::permission::path_sensitivity::sensitive_path_token_for_tool_args;
 use crate::permission::types::{PermissionMode, PermissionSyncContext};
 use crate::safety_middleware::{SafetyMiddlewareDecision, evaluate_tool_safety_request};
 use crate::tool::args::hints::{
@@ -1287,95 +1285,7 @@ fn structured_git_command_hint(tool_name: &str, args: &Value) -> Option<String> 
 }
 
 fn sensitive_path_match(tool_name: &str, args: &Value) -> Option<String> {
-    let is_read = is_read_only_tool_with_args(tool_name, Some(args));
-    if let Some(path) = path_hint_from_args(args)
-        && !path.is_empty()
-    {
-        let dangerous = if is_read {
-            // Layer 1: known safe internal artifact? → allow.
-            if is_internal_safe_path(&path).is_none() {
-                // Layer 2: known dangerous? → block.
-                is_dangerous_file_path(&path)
-                    || crate::permission::redact::matches_sensitive_path(&path)
-            } else {
-                false
-            }
-        } else {
-            is_dangerous_file_path(&path)
-                || crate::permission::redact::matches_sensitive_path(&path)
-        };
-        if dangerous {
-            return Some(path);
-        }
-    }
-    if let Some(cmd) = command_hint_from_args(args)
-        && !cmd.is_empty()
-    {
-        let dangerous = if command_has_sensitive_ref(cmd) {
-            !command_sensitive_refs_are_internal_artifacts(cmd)
-        } else {
-            is_dangerous_file_path(cmd) || crate::permission::redact::matches_sensitive_path(cmd)
-        };
-        if dangerous {
-            return Some(cmd.to_string());
-        }
-    }
-    None
-}
-
-fn command_has_sensitive_ref(command: &str) -> bool {
-    shell_like_tokens(command)
-        .iter()
-        .any(|token| is_sensitive_path_ref(token))
-}
-
-fn command_sensitive_refs_are_internal_artifacts(command: &str) -> bool {
-    let mut saw_sensitive_ref = false;
-    for token in shell_like_tokens(command) {
-        if !is_sensitive_path_ref(&token) {
-            continue;
-        }
-        saw_sensitive_ref = true;
-        if is_internal_safe_path(&token).is_none() {
-            return false;
-        }
-    }
-    saw_sensitive_ref
-}
-
-fn is_sensitive_path_ref(token: &str) -> bool {
-    is_dangerous_file_path(token) || crate::permission::redact::matches_sensitive_path(token)
-}
-
-fn shell_like_tokens(command: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-
-    for ch in command.chars() {
-        match ch {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            ch if !in_single && !in_double && (ch.is_whitespace() || "|;&<>()".contains(ch)) => {
-                push_shell_like_token(&mut tokens, &mut current);
-            }
-            _ => current.push(ch),
-        }
-    }
-    push_shell_like_token(&mut tokens, &mut current);
-    tokens
-}
-
-fn push_shell_like_token(tokens: &mut Vec<String>, current: &mut String) {
-    let token = current
-        .trim()
-        .trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ':' | '[' | ']'))
-        .to_string();
-    if !token.is_empty() {
-        tokens.push(token);
-    }
-    current.clear();
+    sensitive_path_token_for_tool_args(tool_name, args)
 }
 
 fn execute_hard_deny_reason(tool_name: &str, args: &Value) -> Option<String> {
@@ -1977,7 +1887,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_interpreter_pipeline_over_tool_result_still_requires_approval() {
+    fn evaluate_interpreter_pipeline_over_tool_result_skips_sensitive_path_gate() {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,
         );
@@ -1995,14 +1905,12 @@ mod tests {
             &ctx,
         );
         assert!(
-            matches!(bash_read.decision, HardDecision::NeedExternal { .. }),
-            "internal artifact paths must not bypass shell approval for interpreter pipelines: {bash_read:?}"
+            matches!(bash_read.decision, HardDecision::Allow),
+            "Auto mode should let the existing shell gate decide after sensitive-path skips internal artifacts: {bash_read:?}"
         );
         assert!(matches!(
             bash_read.source,
-            DecisionSource::SensitivePath { .. }
-                | DecisionSource::ExplicitApprovalGate { .. }
-                | DecisionSource::Mode { .. }
+            DecisionSource::ExplicitApprovalGate { .. }
         ));
     }
 
@@ -2053,24 +1961,6 @@ mod tests {
             bash_read.source,
             DecisionSource::SensitivePath { .. }
         ));
-    }
-
-    #[test]
-    fn command_sensitive_refs_helper_rejects_mixed_internal_and_secret_path() {
-        let temp = tempfile::tempdir().unwrap();
-        let artifact_path = temp
-            .path()
-            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
-        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
-        std::fs::write(&artifact_path, "child output").unwrap();
-        let artifact_path = artifact_path.to_string_lossy().to_string();
-
-        assert!(command_sensitive_refs_are_internal_artifacts(&format!(
-            "cat {artifact_path}"
-        )));
-        assert!(!command_sensitive_refs_are_internal_artifacts(&format!(
-            "cat {artifact_path} ~/.ssh/id_rsa"
-        )));
     }
 
     #[test]

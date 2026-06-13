@@ -12,6 +12,7 @@ pub mod match_target;
 pub mod memory_profile;
 pub mod notice;
 pub mod path_glob;
+pub mod path_sensitivity;
 pub mod redact;
 pub mod rule_grammar;
 pub mod scope;

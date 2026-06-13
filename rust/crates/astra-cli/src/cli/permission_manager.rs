@@ -6,15 +6,13 @@ use crate::cli::workspace_trust::{
     evaluate_workspace_trust, project_permissions_hash,
 };
 use astra_runtime::tool_sandbox::{
-    CommandRisk, GitSafetyViolation, analyze_command_risks, is_dangerous_file_path,
-    is_internal_safe_path, validate_git_command,
+    CommandRisk, GitSafetyViolation, analyze_command_risks, validate_git_command,
 };
 use astra_thin_client::ApprovalKind;
 use astra_turn_core::cloud_approval_policy::{
     CloudGatedToolKind, bash_command_approval_reason, cloud_gated_tool_kind,
     cloud_gated_tool_kind_with_args,
 };
-use astra_turn_core::parallel_tool_exec::is_read_only_tool_with_args;
 use astra_turn_core::permission::engine::{
     DecisionEnvelope, DecisionSource, HardDecision, allow_rule_preview,
     allow_rule_preview_for_match_target,
@@ -23,6 +21,7 @@ use astra_turn_core::permission::match_target::{
     AllowMatchTarget, default_match_target, fingerprint_for_match_target,
 };
 use astra_turn_core::permission::memory_profile::resolved_write_path;
+use astra_turn_core::permission::path_sensitivity::sensitive_path_token_for_tool_args;
 use astra_turn_core::tool_argument_hints::{
     command_hint_from_args, path_hint_from_args, permission_prompt_display_label,
 };
@@ -570,97 +569,7 @@ fn sensitive_path_match(args: &serde_json::Value) -> Option<String> {
 }
 
 fn sensitive_path_match_for_request(tool_name: &str, args: &serde_json::Value) -> Option<String> {
-    let is_read = is_read_only_tool_with_args(tool_name, Some(args));
-    if let Some(path) = path_hint_from_args(args)
-        && !path.is_empty()
-    {
-        let dangerous = if is_read {
-            // Layer 1: known safe internal artifact? → allow.
-            if is_internal_safe_path(&path).is_none() {
-                // Layer 2: known dangerous? → block.
-                is_dangerous_file_path(&path)
-                    || astra_turn_core::permission::redact::matches_sensitive_path(&path)
-            } else {
-                false
-            }
-        } else {
-            is_dangerous_file_path(&path)
-                || astra_turn_core::permission::redact::matches_sensitive_path(&path)
-        };
-        if dangerous {
-            return Some(path);
-        }
-    }
-    if let Some(cmd) = command_hint_from_args(args)
-        && !cmd.is_empty()
-    {
-        let dangerous = if command_has_sensitive_ref(cmd) {
-            !command_sensitive_refs_are_internal_artifacts(cmd)
-        } else {
-            is_dangerous_file_path(cmd)
-                || astra_turn_core::permission::redact::matches_sensitive_path(cmd)
-        };
-        if dangerous {
-            return Some(cmd.to_string());
-        }
-    }
-    None
-}
-
-fn command_has_sensitive_ref(command: &str) -> bool {
-    shell_like_tokens(command)
-        .iter()
-        .any(|token| is_sensitive_path_ref(token))
-}
-
-fn command_sensitive_refs_are_internal_artifacts(command: &str) -> bool {
-    let mut saw_sensitive_ref = false;
-    for token in shell_like_tokens(command) {
-        if !is_sensitive_path_ref(&token) {
-            continue;
-        }
-        saw_sensitive_ref = true;
-        if is_internal_safe_path(&token).is_none() {
-            return false;
-        }
-    }
-    saw_sensitive_ref
-}
-
-fn is_sensitive_path_ref(token: &str) -> bool {
-    is_dangerous_file_path(token)
-        || astra_turn_core::permission::redact::matches_sensitive_path(token)
-}
-
-fn shell_like_tokens(command: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-
-    for ch in command.chars() {
-        match ch {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            ch if !in_single && !in_double && (ch.is_whitespace() || "|;&<>()".contains(ch)) => {
-                push_shell_like_token(&mut tokens, &mut current);
-            }
-            _ => current.push(ch),
-        }
-    }
-    push_shell_like_token(&mut tokens, &mut current);
-    tokens
-}
-
-fn push_shell_like_token(tokens: &mut Vec<String>, current: &mut String) {
-    let token = current
-        .trim()
-        .trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ':' | '[' | ']'))
-        .to_string();
-    if !token.is_empty() {
-        tokens.push(token);
-    }
-    current.clear();
+    sensitive_path_token_for_tool_args(tool_name, args)
 }
 
 // ─── Permission types: re-exports from astra-turn-core ──────────────
