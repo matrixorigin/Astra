@@ -348,6 +348,13 @@ fn persist_remote_composite_snapshot_index_blocking(
     }
 }
 
+fn checkpoint_blocked_tools(restricted_tools: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut blocked_tools: Vec<String> = restricted_tools.iter().cloned().collect();
+    blocked_tools.sort();
+    blocked_tools.dedup();
+    blocked_tools
+}
+
 /// Best-effort heavy checkpoint write.
 ///
 /// Several early-exit paths in the agentic loop (text-only responses, stop-hook
@@ -369,19 +376,14 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         .as_ref()
         .and_then(|ao| ao.to_json());
 
+    let checkpoint_blocked_tools = checkpoint_blocked_tools(&state.restricted_tools);
     let Some(mut heavy) = state
         .step_recorder
         .build_heavy_checkpoint_with_interruption(
             &state.messages,
             0,
             state.remaining_turns as u32,
-            &state
-                .turn_guard
-                .health
-                .deprioritized_tools()
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>(),
+            &checkpoint_blocked_tools,
             &state.recent_tools,
             interruption_json,
             approval_overrides_json,
@@ -931,6 +933,20 @@ mod tests {
         ));
     }
 
+    struct SessionDirGuard(std::path::PathBuf);
+
+    impl SessionDirGuard {
+        fn new(session_id: &str) -> Self {
+            Self(astra_services::session_journal::local_sessions_dir().join(session_id))
+        }
+    }
+
+    impl Drop for SessionDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     // E2E: full execution-retry guard lifecycle through the production loop.
     // Round 1: model defers ("需要我直接执行这些修改吗？") on a mutating-profile
     // task → guard fires, corrective user message is injected into
@@ -1435,6 +1451,27 @@ mod tests {
         );
         assert!(rendered.contains("auth_failure"));
         assert!(!rendered.contains("Next action:"));
+    }
+
+    #[test]
+    fn heavy_checkpoint_blocked_tools_do_not_include_soft_deprioritized_health() {
+        let session_id = format!("wm-checkpoint-{}", uuid::Uuid::new_v4());
+        let _guard = SessionDirGuard::new(&session_id);
+        let mut state = make_state();
+        state.current_session_id = Some(session_id.clone());
+        state.step_recorder.begin_turn(0);
+        state.restricted_tools.insert("write_file".to_string());
+        for _ in 0..3 {
+            state.turn_guard.health.record_failure("flaky_soft_tool");
+        }
+        assert!(state.turn_guard.health.is_deprioritized("flaky_soft_tool"));
+
+        try_write_heavy_checkpoint(&mut state);
+
+        let heavy = astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(&session_id)
+            .expect("read checkpoint")
+            .expect("heavy checkpoint");
+        assert_eq!(heavy.blocked_tools, vec!["write_file".to_string()]);
     }
 
     #[tokio::test]
