@@ -880,7 +880,7 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     state: &mut AgenticLoopState,
 ) {
     apply_open_ended_exploration_budget(state);
-    apply_user_correction_to_working_memory(state);
+    apply_user_correction_reanchor(state);
 
     if state
         .skills
@@ -931,16 +931,21 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     // See `context_pipeline_adapter::build_session_context` + `bind_project_context`.
 }
 
-fn apply_user_correction_to_working_memory(state: &mut AgenticLoopState) -> bool {
+fn apply_user_correction_reanchor(state: &mut AgenticLoopState) -> bool {
     if !astra_turn_core::input_classifier::is_correction_signal(&state.message) {
         return false;
     }
-    let Some(session) = state.pipeline_session.as_mut() else {
-        return false;
-    };
-    session
-        .working_memory_mut()
-        .apply_user_correction(&state.message);
+
+    state.turn_guard.begin_fresh_user_turn();
+    state.restricted_tools.clear();
+    state.boosted_tools.clear();
+    state.widen_selection_pending = true;
+
+    if let Some(session) = state.pipeline_session.as_mut() {
+        session
+            .working_memory_mut()
+            .apply_user_correction(&state.message);
+    }
     true
 }
 
@@ -3069,7 +3074,7 @@ mod tests {
             memory.set_next_action("retry stale path");
         }
 
-        assert!(apply_user_correction_to_working_memory(&mut state));
+        assert!(apply_user_correction_reanchor(&mut state));
 
         let rendered = state
             .pipeline_session
@@ -3103,7 +3108,7 @@ mod tests {
             memory.set_next_action("continue current path");
         }
 
-        assert!(!apply_user_correction_to_working_memory(&mut state));
+        assert!(!apply_user_correction_reanchor(&mut state));
 
         let rendered = state
             .pipeline_session
@@ -3113,6 +3118,54 @@ mod tests {
             .render_prompt_section();
         assert!(rendered.contains("current blocker"));
         assert!(rendered.contains("continue current path"));
+    }
+
+    #[test]
+    fn user_correction_reanchors_transient_runtime_state_before_turn() {
+        let mut state = make_state();
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        state.message = "不是修修补补，我要的是第一性原则系统性修复。".into();
+
+        state.turn_guard.nudge_count = 4;
+        state.turn_guard.record_tool_calls(&[
+            json!({"function": {"name": "bash", "arguments": "{\"cmd\":\"cargo test\"}"}}),
+            json!({"function": {"name": "bash", "arguments": "{\"cmd\":\"cargo test\"}"}}),
+        ]);
+        for _ in 0..3 {
+            state
+                .turn_guard
+                .record_tool_result("bash", "Error: command timed out");
+        }
+        assert!(state.turn_guard.health.is_deprioritized("bash"));
+        assert!(!state.turn_guard.tool_sigs.is_empty());
+        assert!(state.turn_guard.errors.recent_error_pressure() > 0);
+
+        state.restricted_tools.insert("bash".into());
+        state.boosted_tools.insert("grep".into());
+
+        assert!(apply_user_correction_reanchor(&mut state));
+
+        assert_eq!(state.turn_guard.nudge_count, 0);
+        assert!(state.turn_guard.tool_sigs.is_empty());
+        assert_eq!(state.turn_guard.errors.recent_error_pressure(), 0);
+        assert!(
+            state.turn_guard.health.is_deprioritized("bash"),
+            "durable tool diagnostics should remain available"
+        );
+        assert!(
+            state.restricted_tools.is_empty(),
+            "stale hard restrictions must not leak into the reanchored turn"
+        );
+        assert!(
+            state.boosted_tools.is_empty(),
+            "stale auto-reflection boosts belong to the previous episode"
+        );
+        assert!(
+            state.widen_selection_pending,
+            "the next assembly should expose the full tool catalogue once"
+        );
     }
 
     // ── Full pipeline integration test ─────────────────────────────
