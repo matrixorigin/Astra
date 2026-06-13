@@ -148,7 +148,9 @@ pub fn apply_agentic_post_tool_policy(
             });
         }
 
-        append_openai_user_content_messages(messages, &verdict.injections);
+        if verdict.severity >= VerdictSeverity::Warning {
+            append_openai_user_content_messages(messages, &verdict.injections);
+        }
 
         // Inject TurnGuard avoid_tools into same-turn restricted_tools
         // so the model cannot re-use flagged tools within the current turn
@@ -347,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_waste_warning_retries_and_restricts_tools() {
+    fn cache_waste_info_records_without_retry_or_restriction() {
         let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();
         let mut stall_events = Vec::new();
@@ -382,13 +384,19 @@ mod tests {
             interaction_mode: TurnInteractionMode::Prompt,
         });
 
-        assert_eq!(out, AgenticPostToolPolicyOutcome::RetryLlmClearToolResults);
+        assert_eq!(out, AgenticPostToolPolicyOutcome::ProceedEndTurn);
+        assert!(
+            messages.is_empty(),
+            "info-level cache guidance must not pollute model messages"
+        );
         // read_file is read-only — the filter prevents it from entering restricted_tools.
         assert!(
             !restricted_tools.contains("read_file"),
             "read-only tools must not be added to restricted_tools"
         );
+        assert_eq!(remaining_turns, 10);
         assert_eq!(verdict_events.len(), 1);
+        assert_eq!(verdict_events[0].severity, "info");
     }
 
     #[test]

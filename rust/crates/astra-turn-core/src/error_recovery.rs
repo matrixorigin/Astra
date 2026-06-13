@@ -312,8 +312,7 @@ pub fn escalation_level(
     // force-stopping when the agent is actually making progress with 0 errors),
     // or many errors with deprioritized tools,
     // or very high total errors (scattered failures are still broken),
-    // or very high nudge count alone (the agent is spinning even without errors,
-    //   e.g. cache-hit loops reading the same files repeatedly).
+    // or very high nudge count alone (the agent is spinning even without errors).
     //
     // Previously nudge_count >= 3 alone triggered Critical, which meant a session
     // with repeated exploration patterns (grep→read→grep) and ZERO tool errors
@@ -327,7 +326,7 @@ pub fn escalation_level(
     // - Single-tool loops should not escalate; genuine stuck-ness requires
     //   failures across multiple tools or high error counts.
     // - nudge_count alone requires 10 (not 6) to avoid false Critical on
-    //   normal sessions where cache-hit nudges accumulate without errors.
+    //   normal sessions with repeated exploration but no tool errors.
     if (nudge_count >= 4 && total_errors >= 3)
         || (total_errors >= 12 && deprioritized_count >= 2)
         || total_errors >= 15
@@ -412,6 +411,12 @@ impl SessionErrorSummary {
 
     pub fn record_success(&mut self) {
         self.discard_oldest_recent_error();
+    }
+
+    pub fn clear_recent_pressure(&mut self) {
+        self.recent_total_errors = 0;
+        self.recent_errors_by_category.clear();
+        self.recent_errors.clear();
     }
 
     pub fn recent_error_pressure(&self) -> usize {

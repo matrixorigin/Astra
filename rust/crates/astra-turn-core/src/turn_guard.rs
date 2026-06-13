@@ -146,6 +146,31 @@ pub fn merge_deprioritized_tools_into_restricted(
     }
 }
 
+fn insert_avoid_tool(avoid_tools: &mut HashSet<String>, tool: &str) {
+    if !is_read_only_never_restrict(tool) {
+        avoid_tools.insert(tool.to_string());
+    }
+}
+
+fn avoidable_deprioritized_tools(health: &ToolHealthTracker) -> Vec<String> {
+    health
+        .deprioritized_tools()
+        .into_iter()
+        .filter(|tool| !is_read_only_never_restrict(tool))
+        .map(str::to_string)
+        .collect()
+}
+
+fn deprioritize_warning_for_tools(tools: &[String]) -> Option<String> {
+    if tools.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "⚠ The following tools have repeatedly failed and should be avoided: [{}].",
+        tools.join(", ")
+    ))
+}
+
 impl TurnGuard {
     pub fn new() -> Self {
         Self::with_profile(TaskExecutionProfile::default())
@@ -305,6 +330,33 @@ impl TurnGuard {
             .record_cache_hit_for_signature(tool_name, signature);
     }
 
+    /// Clear episode-scoped pressure while preserving durable diagnostics.
+    ///
+    /// Tool health and lifetime error counters describe facts that may still
+    /// be useful later. Nudge pressure, pending corrections, critical streaks,
+    /// and recent error pressure describe the current failure episode; carrying
+    /// them after recovery makes long sessions increasingly brittle.
+    pub fn clear_transient_pressure(&mut self) {
+        self.nudge_count = 0;
+        self.last_reflection = None;
+        self.critical_turns = 0;
+        self.critical_recovery_turns = 0;
+        self.consecutive_warnings = 0;
+        self.round_had_error = false;
+        self.pending_correction = None;
+        self.errors.clear_recent_pressure();
+    }
+
+    /// Start a logically fresh user turn in the same session.
+    ///
+    /// Keeps durable tool health but drops stall signatures and transient
+    /// pressure from the previous user request.
+    pub fn begin_fresh_user_turn(&mut self) {
+        self.clear_transient_pressure();
+        self.tool_sigs.clear();
+        self.latest_tool_calls.clear();
+    }
+
     /// Append a `ToolOutcome` to the per-`(tool, args)` outcome cache.
     ///
     /// This is a cross-turn session-local record of what happened when this
@@ -402,7 +454,7 @@ impl TurnGuard {
             );
             injections.push(reflection.to_nudge_message());
             for tool in &reflection.avoid_tools {
-                avoid_tools.insert(tool.clone());
+                insert_avoid_tool(&mut avoid_tools, tool);
             }
             self.nudge_count += 1;
             self.last_reflection = Some(reflection);
@@ -448,7 +500,7 @@ impl TurnGuard {
                 &reward_hacking_avoid,
             ));
             for tool in reward_hacking_avoid {
-                avoid_tools.insert(tool);
+                insert_avoid_tool(&mut avoid_tools, &tool);
             }
             if !stall_detected && !divergence_detected {
                 self.nudge_count += 1;
@@ -470,7 +522,11 @@ impl TurnGuard {
                         .collect()
                 })
                 .unwrap_or_default();
-            let violated = stall::detect_nudge_ignored(&reflection.avoid_tools, &current_tools);
+            let violated: Vec<String> =
+                stall::detect_nudge_ignored(&reflection.avoid_tools, &current_tools)
+                    .into_iter()
+                    .filter(|tool| !is_read_only_never_restrict(tool))
+                    .collect();
             if !violated.is_empty() {
                 injections.push(format!(
                     "⚠ You were told to avoid [{}] but used them anyway. \
@@ -478,7 +534,7 @@ impl TurnGuard {
                     violated.join(", ")
                 ));
                 for t in violated {
-                    avoid_tools.insert(t);
+                    insert_avoid_tool(&mut avoid_tools, &t);
                 }
                 severity = severity.max(VerdictSeverity::Warning);
             }
@@ -486,14 +542,15 @@ impl TurnGuard {
 
         // 5. Tool health warnings
         let mut fresh_deprioritize_warning = false;
-        let deprioritized_tools = self.health.deprioritized_tools();
-        let deprioritized_fingerprint = tool_fingerprint(deprioritized_tools.iter().copied());
+        let deprioritized_tools = avoidable_deprioritized_tools(&self.health);
+        let deprioritized_fingerprint =
+            tool_fingerprint(deprioritized_tools.iter().map(String::as_str));
         if let Some(fingerprint) = deprioritized_fingerprint {
             if self.last_deprioritize_warning_fingerprint.as_deref() != Some(fingerprint.as_str()) {
-                if let Some(warning) = self.health.deprioritize_warning() {
+                if let Some(warning) = deprioritize_warning_for_tools(&deprioritized_tools) {
                     injections.push(warning);
                     for tool in &deprioritized_tools {
-                        avoid_tools.insert((*tool).to_string());
+                        insert_avoid_tool(&mut avoid_tools, tool);
                     }
                     severity = severity.max(VerdictSeverity::Warning);
                     fresh_deprioritize_warning = true;
@@ -506,9 +563,9 @@ impl TurnGuard {
 
         // 5a. Cache duplication warning
         // When the LLM keeps making identical tool calls, flag token waste.
-        // High cache-hit counts also contribute to nudge_count so the escalation
-        // path can reach Critical even when there are zero tool errors (the model
-        // is spinning on reads, not failing).
+        // Cache hits are guidance-only: the tool did not execute, so they must
+        // not degrade tool health, hide observation tools, or build escalation
+        // pressure in long sessions.
         let mut cache_warning_emitted = false;
         let cache_wasteful = self.health.cache_wasteful_tools(3);
         let current_total = self.health.total_cache_hits();
@@ -545,31 +602,21 @@ impl TurnGuard {
                         _ => {}
                     }
                 }
-                for (tool_name, _) in &cache_wasteful {
-                    avoid_tools.insert((*tool_name).to_string());
-                }
                 cache_warning_emitted = true;
-                severity = severity.max(VerdictSeverity::Warning);
+                severity = severity.max(VerdictSeverity::Info);
                 self.last_cache_warning_fingerprint = Some(fingerprint);
-            }
-            if new_cache_hits && !stall_detected && !divergence_detected {
-                // Treat cache waste as a nudge signal so escalation can fire
-                // even with zero tool errors. Add 1 nudge per evaluation where
-                // NEW cache hits occurred (not just stale waste from earlier).
-                self.nudge_count += 1;
             }
         } else {
             self.last_cache_warning_fingerprint = None;
         }
         self.last_cache_hit_total = current_total;
 
-        if !stall_detected
+        let recovered_this_round = !stall_detected
             && !divergence_detected
             && !reward_hacking_detected
-            && !cache_warning_emitted
-            && !self.round_had_error
-        {
-            self.nudge_count = self.nudge_count.saturating_sub(1);
+            && !self.round_had_error;
+        if recovered_this_round {
+            self.clear_transient_pressure();
         }
 
         // 5. Escalation
@@ -589,7 +636,7 @@ impl TurnGuard {
         let escalation = error_recovery::escalation_level(
             self.nudge_count,
             actionable_errors,
-            self.health.deprioritized_tools().len(),
+            deprioritized_tools.len(),
         );
         let mut escalation_message_emitted = false;
         if let Some(fingerprint) = escalation_fingerprint(escalation, &avoid_tools) {
@@ -634,7 +681,7 @@ impl TurnGuard {
             } else {
                 // First Critical: restrict to read-only tools
                 for &t in CLOUD_APPROVAL_REQUIRED_TOOLS.iter() {
-                    avoid_tools.insert(t.to_string());
+                    insert_avoid_tool(&mut avoid_tools, t);
                 }
                 injections.push(
                     "🚨 SESSION CRITICAL: Restricting to read-only tools for this turn. \
@@ -659,7 +706,11 @@ impl TurnGuard {
 
         let is_diverging = divergence_detected;
 
-        let avoid_tools_vec: Vec<String> = avoid_tools.into_iter().collect();
+        let mut avoid_tools_vec: Vec<String> = avoid_tools
+            .into_iter()
+            .filter(|tool| !is_read_only_never_restrict(tool))
+            .collect();
+        avoid_tools_vec.sort();
 
         // Resolve next_turn_succeeded on the most recent unresolved CorrectionOutcome.
         // Only resolve once (on the immediate next turn). Once resolved, the
@@ -680,8 +731,10 @@ impl TurnGuard {
                 .adjust_from_effectiveness(eff.follow_rate, eff.effective_rate);
         }
 
-        // Store a CorrectionRecord when the verdict carries actionable corrections.
-        if !injections.is_empty() {
+        // Store a CorrectionRecord only when the verdict carries actionable
+        // corrections. Info-level guidance is audit/UI feedback, not a
+        // commitment the next turn must satisfy.
+        if !injections.is_empty() && severity >= VerdictSeverity::Warning {
             let correction_type =
                 if escalation == EscalationLevel::Critical || escalation_message_emitted {
                     "error_escalation"
@@ -1052,6 +1105,7 @@ mod tests {
         guard
             .errors
             .record_error(error_recovery::ErrorCategory::Network);
+        guard.round_had_error = true;
 
         let verdict = guard.evaluate();
         assert_eq!(verdict.severity, VerdictSeverity::Critical);
@@ -1303,16 +1357,17 @@ mod tests {
     }
 
     #[test]
-    fn force_stop_nudges_alone_no_longer_sufficient() {
+    fn stale_nudge_pressure_alone_is_cleared_on_calm_evaluate() {
         // Regression test: previously 3 nudges alone triggered Critical + force_stop.
         // Sessions 62fee584 and 2c701822 showed this was too aggressive — exploration
         // patterns (grep→read→grep) with zero errors got force-stopped.
-        // Now nudge_count >= 3 requires total_errors >= 2 for Critical.
+        // Stale nudge pressure without a current stall/error signal is cleared.
         let mut guard = TurnGuard::new();
         guard.nudge_count = 5; // many nudges
         let v = guard.evaluate();
         assert!(!v.force_stop, "5 nudges + 0 errors must NOT force_stop");
-        assert_eq!(v.severity, VerdictSeverity::Warning);
+        assert_eq!(v.severity, VerdictSeverity::Healthy);
+        assert_eq!(guard.nudge_count, 0);
     }
 
     // ── Error counting: single-count per tool result ─────────────────────────
@@ -1370,20 +1425,20 @@ mod tests {
     }
 
     #[test]
-    fn five_errors_triggers_warning() {
+    fn mutating_tool_errors_trigger_warning() {
         let mut guard = TurnGuard::new();
-        for _ in 0..5 {
-            guard.record_tool_result("read_file", "Error: file not found");
+        for _ in 0..3 {
+            guard.record_tool_result("bash", "Error: command failed");
         }
 
         let verdict = guard.evaluate();
         assert!(
             verdict.severity >= VerdictSeverity::Warning,
-            "5 errors should trigger Warning"
+            "repeated mutating tool errors should trigger Warning"
         );
         assert!(
             !verdict.force_stop,
-            "5 errors without nudges should not force_stop"
+            "mutating tool errors without nudges should not force_stop"
         );
     }
 
@@ -1469,18 +1524,56 @@ mod tests {
     }
 
     #[test]
-    fn calm_turns_decay_nudge_pressure() {
+    fn calm_turn_clears_transient_nudge_pressure() {
         let mut guard = TurnGuard::new();
         guard.nudge_count = 3;
 
         let verdict = guard.evaluate();
-        assert_eq!(guard.nudge_count, 2);
+        assert_eq!(guard.nudge_count, 0);
         assert_eq!(
             verdict.severity,
             VerdictSeverity::Healthy,
-            "old nudge pressure should decay on a calm turn"
+            "old nudge pressure should not outlive a calm recovery turn"
         );
         assert!(verdict.injections.is_empty());
+    }
+
+    #[test]
+    fn fresh_user_turn_clears_episode_pressure_but_keeps_diagnostics() {
+        let mut guard = TurnGuard::new();
+        guard.nudge_count = 5;
+        guard.critical_turns = 1;
+        guard.critical_recovery_turns = 1;
+        guard.consecutive_warnings = 3;
+        guard.pending_correction = Some(CorrectionRecord {
+            turn: 7,
+            correction_type: "stall_nudge".to_string(),
+            avoid_tools: vec!["bash".to_string()],
+            suggested_alternatives: Vec::new(),
+        });
+        guard.record_tool_calls(&[make_tool_call("bash", r#"{"command":"ls"}"#)]);
+        guard.record_tool_result("bash", "Error: command failed");
+        guard.record_tool_result("bash", "Error: command failed");
+        guard.health.record_failure("bash");
+
+        guard.begin_fresh_user_turn();
+
+        assert_eq!(guard.nudge_count, 0);
+        assert_eq!(guard.critical_turns, 0);
+        assert_eq!(guard.critical_recovery_turns, 0);
+        assert_eq!(guard.consecutive_warnings, 0);
+        assert!(guard.pending_correction.is_none());
+        assert!(guard.tool_sigs.is_empty());
+        assert!(guard.latest_tool_calls.is_empty());
+        assert_eq!(guard.errors.recent_error_pressure(), 0);
+        assert_eq!(
+            guard.errors.total_errors, 2,
+            "lifetime diagnostics should survive the reset"
+        );
+        assert!(
+            guard.health.get("bash").is_some(),
+            "durable tool health should survive the reset"
+        );
     }
 
     #[test]
@@ -1493,7 +1586,7 @@ mod tests {
         }
 
         let first = guard.evaluate();
-        assert_eq!(first.severity, VerdictSeverity::Warning);
+        assert_eq!(first.severity, VerdictSeverity::Info);
         assert!(
             !first.injections.is_empty(),
             "new duplicate cache hits should emit guidance"
@@ -1522,7 +1615,65 @@ mod tests {
     }
 
     #[test]
-    fn critical_state_requires_sustained_recovery_to_clear() {
+    fn cache_waste_guidance_does_not_avoid_or_escalate_read_tools() {
+        let mut guard = TurnGuard::new();
+        for _ in 0..3 {
+            guard
+                .health
+                .record_cache_hit_for_signature("read_file", "read_file:path=a.txt");
+        }
+
+        let verdict = guard.evaluate();
+
+        assert_eq!(
+            verdict.severity,
+            VerdictSeverity::Info,
+            "duplicate cache hits are guidance, not a tool-health warning"
+        );
+        assert!(
+            !verdict.injections.is_empty(),
+            "new duplicate cache hits should still surface guidance"
+        );
+        assert!(
+            verdict.avoid_tools.is_empty(),
+            "cache guidance must not hide observation tools: {:?}",
+            verdict.avoid_tools
+        );
+        assert_eq!(
+            guard.nudge_count, 0,
+            "cache guidance must not accumulate stall/escalation pressure"
+        );
+        assert!(!verdict.force_stop);
+    }
+
+    #[test]
+    fn repeated_cache_hits_do_not_accumulate_nudge_pressure_or_force_stop() {
+        let mut guard = TurnGuard::new();
+
+        for _ in 0..16 {
+            guard
+                .health
+                .record_cache_hit_for_signature("read_file", "read_file:path=a.txt");
+            let verdict = guard.evaluate();
+            assert!(
+                !verdict.force_stop,
+                "cache-only sessions must not force-stop"
+            );
+            assert!(
+                verdict.severity <= VerdictSeverity::Info,
+                "cache-only sessions must not escalate: {:?}",
+                verdict.severity
+            );
+        }
+
+        assert_eq!(
+            guard.nudge_count, 0,
+            "cache-only loops should not build hidden escalation pressure"
+        );
+    }
+
+    #[test]
+    fn calm_recovery_clears_critical_episode_pressure() {
         let mut guard = TurnGuard::new();
         guard.nudge_count = 4;
         for _ in 0..3 {
@@ -1533,17 +1684,18 @@ mod tests {
         assert_eq!(first.severity, VerdictSeverity::Critical);
         assert!(!first.force_stop);
 
-        // A warning turn is not enough to clear the prior critical state.
+        // The next evaluate has no new stall/error signal. The previous
+        // critical episode must not keep poisoning the session.
         let second = guard.evaluate();
-        assert_eq!(second.severity, VerdictSeverity::Warning);
+        assert_eq!(second.severity, VerdictSeverity::Healthy);
         assert!(!second.force_stop);
-        assert_eq!(guard.critical_turns, 1);
-
-        // Two genuinely calm turns are required before the critical memory clears.
-        guard.evaluate();
-        assert_eq!(guard.critical_turns, 1);
-        guard.evaluate();
         assert_eq!(guard.critical_turns, 0);
+        assert_eq!(guard.nudge_count, 0);
+        assert_eq!(guard.errors.recent_error_pressure(), 0);
+
+        let third = guard.evaluate();
+        assert_eq!(third.severity, VerdictSeverity::Healthy);
+        assert!(!third.force_stop);
     }
 
     /// Regression test for resource-limit overwrite bug.
@@ -1664,7 +1816,10 @@ mod tests {
                 .iter()
                 .any(|message| message.contains("Reward-hacking guard"))
         );
-        assert!(verdict.avoid_tools.contains(&"read_file".to_string()));
+        assert!(
+            verdict.avoid_tools.is_empty(),
+            "reward-hacking guidance must not hide read-only observation tools"
+        );
         assert_eq!(guard.nudge_count, initial_nudges + 1);
     }
 
@@ -2255,6 +2410,57 @@ mod tests {
         assert!(
             restricted.contains("bash"),
             "non-read-only tool bash should be restricted"
+        );
+    }
+
+    #[test]
+    fn never_restrict_deprioritized_tools_do_not_enter_verdict_avoid_tools() {
+        let mut guard = TurnGuard::new();
+        deprioritize_tool(&mut guard, "read_file", 8);
+
+        let verdict = guard.evaluate();
+
+        assert_eq!(
+            verdict.severity,
+            VerdictSeverity::Healthy,
+            "read-only depriority alone should not degrade the session"
+        );
+        assert!(
+            !verdict.avoid_tools.contains(&"read_file".to_string()),
+            "read_file must stay out of avoid_tools: {:?}",
+            verdict.avoid_tools
+        );
+        assert!(
+            verdict.injections.is_empty(),
+            "never-restrict tools should not produce avoid guidance: {:?}",
+            verdict.injections
+        );
+    }
+
+    #[test]
+    fn deprioritize_guidance_filters_never_restrict_tools_from_mixed_sets() {
+        let mut guard = TurnGuard::new();
+        deprioritize_tool(&mut guard, "read_file", 8);
+        deprioritize_tool(&mut guard, "bash", 8);
+
+        let verdict = guard.evaluate();
+
+        assert_eq!(verdict.avoid_tools, vec!["bash".to_string()]);
+        assert!(
+            verdict
+                .injections
+                .iter()
+                .any(|message| message.contains("bash")),
+            "mutating failed tool should still produce guidance: {:?}",
+            verdict.injections
+        );
+        assert!(
+            verdict
+                .injections
+                .iter()
+                .all(|message| !message.contains("read_file")),
+            "never-restrict tools must not be listed as avoid guidance: {:?}",
+            verdict.injections
         );
     }
 

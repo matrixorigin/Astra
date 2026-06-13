@@ -699,6 +699,7 @@ fn reset_per_turn_corrective_state(state: &mut AgenticLoopState) {
     // Clear tool restrictions injected by exploration-family correctives so
     // they don't leak into the next user turn.
     state.restricted_tools.clear();
+    state.turn_guard.begin_fresh_user_turn();
     // Task #43 wrap-up state also belongs to the just-completed turn —
     // next user turn starts fresh. Without this reset, the lockout/abort
     // hybrid in `agentic_loop_tool_phase::execute_tool_phase` short-
@@ -1006,6 +1007,20 @@ mod tests {
         state.stall.exploration_family_corrective_family = Some("diff".into());
         state.restricted_tools.insert("git_diff".into());
         state.restricted_tools.insert("git_log".into());
+        state.turn_guard.nudge_count = 5;
+        state
+            .turn_guard
+            .record_tool_calls(&[serde_json::json!({"name": "bash", "arguments": {}})]);
+        state
+            .turn_guard
+            .record_tool_result("bash", "Error: command failed");
+        state.turn_guard.pending_correction = Some(astra_turn_core::turn_guard::CorrectionRecord {
+            turn: 3,
+            correction_type: "stall_nudge".into(),
+            avoid_tools: vec!["bash".into()],
+            suggested_alternatives: Vec::new(),
+        });
+        state.turn_guard.health.record_failure("bash");
         // Task #43 wrap-up hybrid state: must also reset across turns
         // so the NEXT user turn doesn't see a stale "already-wrapped-up"
         // shortcut. Code-review called this out as Important #3.
@@ -1035,6 +1050,31 @@ mod tests {
         assert!(
             state.restricted_tools.is_empty(),
             "restricted_tools must be cleared across turns"
+        );
+        assert_eq!(
+            state.turn_guard.nudge_count, 0,
+            "TurnGuard nudge pressure must not leak across finalized turns"
+        );
+        assert!(
+            state.turn_guard.pending_correction.is_none(),
+            "pending TurnGuard corrections must not leak across finalized turns"
+        );
+        assert!(
+            state.turn_guard.tool_sigs.is_empty(),
+            "stall signatures must reset for the next user turn"
+        );
+        assert_eq!(
+            state.turn_guard.errors.recent_error_pressure(),
+            0,
+            "recent error pressure must reset after turn finalization"
+        );
+        assert_eq!(
+            state.turn_guard.errors.total_errors, 1,
+            "lifetime diagnostics should remain available after reset"
+        );
+        assert!(
+            state.turn_guard.health.get("bash").is_some(),
+            "durable tool health should remain available after reset"
         );
         assert!(
             !state.budget_wrapup_injected,
