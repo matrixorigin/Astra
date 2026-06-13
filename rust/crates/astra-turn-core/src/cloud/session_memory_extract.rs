@@ -9,6 +9,10 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use astra_turn_types::{
+    has_durable_correction_directive, is_runtime_scaffolding_message, is_user_correction_signal,
+};
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -171,7 +175,12 @@ pub fn build_extraction_prompt(current_memory: &str, recent_messages: &[Value]) 
 
 fn render_recent(messages: &[Value]) -> String {
     let mut out = String::new();
-    let recent: Vec<_> = messages.iter().rev().take(20).collect();
+    let recent: Vec<_> = messages
+        .iter()
+        .rev()
+        .filter(|msg| !is_ephemeral_for_memory_extraction(msg))
+        .take(20)
+        .collect();
     for msg in recent.into_iter().rev() {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("?");
         let content = if let Some(text) = msg.get("content").and_then(Value::as_str) {
@@ -218,6 +227,20 @@ fn render_recent(messages: &[Value]) -> String {
         }
     }
     out
+}
+
+fn is_ephemeral_for_memory_extraction(message: &Value) -> bool {
+    is_runtime_scaffolding_message(message) || is_vague_reanchor_for_memory_extraction(message)
+}
+
+fn is_vague_reanchor_for_memory_extraction(message: &Value) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("user")
+        && message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| {
+                is_user_correction_signal(content) && !has_durable_correction_directive(content)
+            })
 }
 
 // ---------------------------------------------------------------------------
@@ -511,6 +534,26 @@ mod tests {
     }
 
     #[test]
+    fn build_extraction_prompt_filters_ephemeral_recent_messages() {
+        let msgs = vec![
+            json!({"role": "user", "content": "Preserve long-running session goals"}),
+            json!({"role": "user", "content": "[Active task attachment]\nResume hidden task board state"}),
+            json!({"role": "assistant", "content": "✓ Previous round: 3 tools executed in parallel"}),
+            json!({"role": "user", "content": "What I asked for is a durable fix, not a workaround"}),
+            json!({"role": "user", "content": "wrong, never use mocks in integration tests"}),
+        ];
+
+        let result = build_extraction_prompt("", &msgs);
+        let user_content = result[1]["content"].as_str().unwrap();
+
+        assert!(user_content.contains("Preserve long-running session goals"));
+        assert!(user_content.contains("never use mocks in integration tests"));
+        assert!(!user_content.contains("Active task attachment"));
+        assert!(!user_content.contains("Previous round"));
+        assert!(!user_content.contains("durable fix, not a workaround"));
+    }
+
+    #[test]
     fn session_memory_template_has_all_sections() {
         let sections = [
             "## Session Title",
@@ -622,6 +665,27 @@ mod tests {
         assert!(system.contains("NONE"));
         let user = result[1]["content"].as_str().unwrap();
         assert!(user.contains("Session memory"));
+    }
+
+    #[test]
+    fn build_learnings_extraction_prompt_filters_ephemeral_recent_messages() {
+        let msgs = vec![
+            json!({"role": "user", "content": "Document reusable memory extraction invariant"}),
+            json!({"role": "user", "content": "## Already Fetched (do NOT re-read)\nrust/crates/astra-turn-core/src/cloud/session_memory_extract.rs"}),
+            json!({"role": "assistant", "content": "✓ Previous round: 3 tools executed in parallel"}),
+            json!({"role": "user", "content": "我要的是长久健康运行，不是临时补丁"}),
+            json!({"role": "user", "content": "我重新说一次，不要用case-by-case修补"}),
+        ];
+
+        let result = build_learnings_extraction_prompt("## Session memory content", &msgs);
+        let user_content = result[1]["content"].as_str().unwrap();
+
+        assert!(user_content.contains("Document reusable memory extraction invariant"));
+        assert!(user_content.contains("不要用case-by-case修补"));
+        assert!(!user_content.contains("Already Fetched"));
+        assert!(!user_content.contains("Previous round"));
+        assert!(!user_content.contains("长久健康运行"));
+        assert!(!user_content.contains("临时补丁"));
     }
 
     #[test]
