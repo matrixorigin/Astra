@@ -5003,6 +5003,17 @@ fn apply_resume_recovery_state(
         .unwrap_or_default();
 }
 
+fn apply_runtime_recovery_state(
+    state: &mut SessionState,
+    pipeline_state: Option<&serde_json::Value>,
+    compaction_state: Option<&serde_json::Value>,
+    consecutive_context_window_errors: u32,
+) {
+    state.runtime_pipeline_state = pipeline_state.cloned();
+    state.runtime_compaction_state = compaction_state.cloned();
+    state.runtime_consecutive_context_window_errors = consecutive_context_window_errors;
+}
+
 /// Baseline row for a blocked tool when we have no persisted health metrics yet (same defaults as
 /// cloud preference seeding in `cloud_sync.rs`).
 fn blocked_tool_health_entry(
@@ -5650,6 +5661,12 @@ async fn apply_restored_session(
             step_restored.interruption.as_ref(),
             step_restored.compaction_state.as_ref(),
         );
+        apply_runtime_recovery_state(
+            state,
+            step_restored.pipeline_state.as_ref(),
+            step_restored.compaction_state.as_ref(),
+            step_restored.consecutive_context_window_errors,
+        );
         if let Some(ref ao_json) = step_restored.approval_overrides {
             state.perm_manager.merge_restored_overrides(ao_json);
         }
@@ -5660,6 +5677,12 @@ async fn apply_restored_session(
             state,
             restored.interruption.as_ref(),
             restored.compaction_state.as_ref(),
+        );
+        apply_runtime_recovery_state(
+            state,
+            restored.pipeline_state.as_ref(),
+            restored.compaction_state.as_ref(),
+            0,
         );
         eprintln!("  {} Restored step checkpoint from cloud", "☁".magenta());
     }
@@ -6508,6 +6531,11 @@ mod resume_tests {
             "last_tokens_freed": 4000,
             "last_was_insufficient": true,
         }));
+        heavy.pipeline_state = Some(serde_json::json!({
+            "stats": {"cache_hit_ratio_ema": 0.42},
+            "recovery": {"ptl_error_count": 2},
+        }));
+        heavy.consecutive_context_window_errors = 2;
         astra_pipeline::step_checkpoint::write_step_checkpoint(
             session_id,
             turn_count,
@@ -6671,6 +6699,23 @@ mod resume_tests {
         assert!(guidance.contains("3 attempt(s)"), "{guidance}");
         assert!(guidance.contains("15000 tokens freed"), "{guidance}");
         assert!(guidance.contains("insufficient"), "{guidance}");
+        assert_eq!(
+            state.runtime_compaction_state,
+            Some(serde_json::json!({
+                "attempt_count": 3,
+                "cumulative_tokens_freed": 15000,
+                "last_tokens_freed": 4000,
+                "last_was_insufficient": true,
+            }))
+        );
+        assert_eq!(
+            state.runtime_pipeline_state,
+            Some(serde_json::json!({
+                "stats": {"cache_hit_ratio_ema": 0.42},
+                "recovery": {"ptl_error_count": 2},
+            }))
+        );
+        assert_eq!(state.runtime_consecutive_context_window_errors, 2);
     }
 
     #[serial_test::serial]
@@ -7075,6 +7120,14 @@ mod resume_tests {
         assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
         let guidance = state.resume_guidance.expect("resume guidance");
         assert!(guidance.contains("3 attempt(s)"), "{guidance}");
+        assert_eq!(
+            state.runtime_compaction_state,
+            Some(serde_json::json!({
+                "attempt_count": 3,
+                "cumulative_tokens_freed": 15000,
+                "last_was_insufficient": true,
+            }))
+        );
     }
 
     #[serial_test::serial]

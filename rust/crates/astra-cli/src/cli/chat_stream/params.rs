@@ -457,6 +457,10 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Pre-loaded CSL messages (from CslManager.load() in chat_turn).
     /// Restored pipeline state from a checkpoint (enables warm-start on resume).
     pub(crate) pipeline_state: Option<serde_json::Value>,
+    /// Restored compaction-effectiveness tracker from a checkpoint.
+    pub(crate) compaction_state: Option<serde_json::Value>,
+    /// Restored consecutive context-window failures from a checkpoint.
+    pub(crate) consecutive_context_window_errors: u32,
     /// When present, these are used instead of converting history pairs.
     pub(crate) pre_loaded_messages: Option<Vec<serde_json::Value>>,
     /// Extra context appended to the system prompt (gateway injects cron/session context here).
@@ -609,6 +613,8 @@ impl<'a> ChatTurnParams<'a> {
             bash_detach_slot: ctx.bash_detach_slot.clone(),
             turn_index: 0,
             pipeline_state: None,
+            compaction_state: None,
+            consecutive_context_window_errors: 0,
             pre_loaded_messages: None,
             append_system_prompt: None,
             session_memory_extractor: None,

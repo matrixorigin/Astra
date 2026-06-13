@@ -84,6 +84,9 @@ struct TurnSuccessLiveSnapshot {
     latest_turn_quality_feedback: Option<astra_runtime::self_model::TurnQualityFeedback>,
     latest_context_assembly_trace:
         Option<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>,
+    runtime_pipeline_state: Option<serde_json::Value>,
+    runtime_compaction_state: Option<serde_json::Value>,
+    runtime_consecutive_context_window_errors: u32,
     last_turn_event: Option<session_journal::JournalEvent>,
     observability_session: Option<
         std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
@@ -115,6 +118,10 @@ impl TurnSuccessLiveSnapshot {
             tool_health_entries: state.tool_health_entries.clone(),
             latest_turn_quality_feedback: state.latest_turn_quality_feedback.clone(),
             latest_context_assembly_trace: state.latest_context_assembly_trace.clone(),
+            runtime_pipeline_state: state.runtime_pipeline_state.clone(),
+            runtime_compaction_state: state.runtime_compaction_state.clone(),
+            runtime_consecutive_context_window_errors: state
+                .runtime_consecutive_context_window_errors,
             last_turn_event: state.last_turn_event.clone(),
             observability_session: state.observability_session.clone(),
             pending_adaptive_state: state.pending_adaptive_state.clone(),
@@ -151,6 +158,10 @@ impl TurnSuccessLiveSnapshot {
         state.tool_health_entries = self.tool_health_entries;
         state.latest_turn_quality_feedback = self.latest_turn_quality_feedback;
         state.latest_context_assembly_trace = self.latest_context_assembly_trace;
+        state.runtime_pipeline_state = self.runtime_pipeline_state;
+        state.runtime_compaction_state = self.runtime_compaction_state;
+        state.runtime_consecutive_context_window_errors =
+            self.runtime_consecutive_context_window_errors;
         state.last_turn_event = self.last_turn_event;
         state.observability_session = self.observability_session;
         state.pending_adaptive_state = self.pending_adaptive_state;
@@ -182,6 +193,21 @@ fn initialize_post_commit_session_state(
     if session_rebound || state.csl_manager.is_none() {
         state.csl_manager = build_csl_manager(session_id);
     }
+}
+
+fn update_runtime_checkpoint_state_from_result(state: &mut SessionState, result: &StreamResult) {
+    let Some(astra_pipeline::step_protocol::StepCheckpoint::Heavy(heavy)) =
+        result.last_heavy_checkpoint.as_ref()
+    else {
+        state.runtime_pipeline_state = None;
+        state.runtime_compaction_state = None;
+        state.runtime_consecutive_context_window_errors = 0;
+        return;
+    };
+
+    state.runtime_pipeline_state = heavy.pipeline_state.clone();
+    state.runtime_compaction_state = heavy.compaction_state.clone();
+    state.runtime_consecutive_context_window_errors = heavy.consecutive_context_window_errors;
 }
 
 fn clear_rebound_observability_session(state: &mut SessionState) {
@@ -247,6 +273,7 @@ fn apply_turn_success_sync(
         .as_ref()
         .map(astra_turn_core::interruption::resume_restricted_tools_from_interruption_json)
         .unwrap_or_default();
+    update_runtime_checkpoint_state_from_result(state, &result);
 
     if !result.tool_health_export.is_empty() {
         state.tool_health_entries = result.tool_health_export.clone();
@@ -321,8 +348,29 @@ mod tests {
     use super::{apply_turn_success, apply_turn_success_async, apply_turn_success_sync};
     use crate::cli::session::session_state::PersistedAdaptiveState;
     use crate::cli::session::session_state::SessionState;
+    use astra_pipeline::step_protocol::{ExecutionCursor, StepCheckpoint};
     use astra_services::session_journal;
     use std::time::Instant;
+
+    fn heavy_checkpoint_with_runtime_state(
+        pipeline_state: serde_json::Value,
+        compaction_state: serde_json::Value,
+        consecutive_context_window_errors: u32,
+    ) -> StepCheckpoint {
+        let mut heavy = match StepCheckpoint::heavy(
+            "session-turn-1".to_string(),
+            "task-1".to_string(),
+            "agent-1".to_string(),
+            ExecutionCursor::default(),
+        ) {
+            StepCheckpoint::Heavy(heavy) => *heavy,
+            StepCheckpoint::Light(_) => unreachable!("heavy checkpoint constructor returned light"),
+        };
+        heavy.pipeline_state = Some(pipeline_state);
+        heavy.compaction_state = Some(compaction_state);
+        heavy.consecutive_context_window_errors = consecutive_context_window_errors;
+        StepCheckpoint::Heavy(Box::new(heavy))
+    }
 
     #[test]
     #[serial_test::serial]
@@ -361,6 +409,69 @@ mod tests {
         apply_turn_success(&mut state, None, "continue", result, Instant::now());
 
         assert!(state.pending_followup_suggestion.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_turn_success_updates_runtime_recovery_state_from_heavy_checkpoint() {
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let sid = format!("turn-runtime-state-{}", uuid::Uuid::new_v4());
+        let mut state = SessionState {
+            runtime_pipeline_state: Some(serde_json::json!({"old": true})),
+            runtime_compaction_state: Some(serde_json::json!({"old": true})),
+            runtime_consecutive_context_window_errors: 9,
+            ..Default::default()
+        };
+        let mut result = crate::tests::stub_stream_result("done");
+        result.session_id = Some(sid);
+        result.last_heavy_checkpoint = Some(heavy_checkpoint_with_runtime_state(
+            serde_json::json!({"stats": {"ema": 0.8}}),
+            serde_json::json!({
+                "attempt_count": 3,
+                "cumulative_tokens_freed": 15000,
+                "last_tokens_freed": 4000,
+                "last_was_insufficient": true,
+            }),
+            2,
+        ));
+
+        apply_turn_success(&mut state, None, "continue", result, Instant::now());
+
+        assert_eq!(
+            state.runtime_pipeline_state,
+            Some(serde_json::json!({"stats": {"ema": 0.8}}))
+        );
+        assert_eq!(
+            state.runtime_compaction_state,
+            Some(serde_json::json!({
+                "attempt_count": 3,
+                "cumulative_tokens_freed": 15000,
+                "last_tokens_freed": 4000,
+                "last_was_insufficient": true,
+            }))
+        );
+        assert_eq!(state.runtime_consecutive_context_window_errors, 2);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_turn_success_clears_runtime_recovery_state_without_checkpoint() {
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let sid = format!("turn-runtime-state-clear-{}", uuid::Uuid::new_v4());
+        let mut state = SessionState {
+            runtime_pipeline_state: Some(serde_json::json!({"old": true})),
+            runtime_compaction_state: Some(serde_json::json!({"old": true})),
+            runtime_consecutive_context_window_errors: 9,
+            ..Default::default()
+        };
+        let mut result = crate::tests::stub_stream_result("done");
+        result.session_id = Some(sid);
+
+        apply_turn_success(&mut state, None, "continue", result, Instant::now());
+
+        assert!(state.runtime_pipeline_state.is_none());
+        assert!(state.runtime_compaction_state.is_none());
+        assert_eq!(state.runtime_consecutive_context_window_errors, 0);
     }
 
     #[test]

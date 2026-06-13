@@ -1590,6 +1590,8 @@ async fn plan_executor_task(
                     bash_detach_slot: ctx.bash_detach_slot.clone(),
                     turn_index: ctx.turn,
                     pipeline_state: None,
+                    compaction_state: None,
+                    consecutive_context_window_errors: 0,
                     pre_loaded_messages: None,
                     append_system_prompt: None,
                     session_memory_extractor: None,

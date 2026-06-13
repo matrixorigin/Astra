@@ -1313,6 +1313,8 @@ pub(crate) async fn handle_info_command(
                 bash_detach_slot: None,
                 turn_index: 0,
                 pipeline_state: None,
+                compaction_state: None,
+                consecutive_context_window_errors: 0,
                 pre_loaded_messages: None,
                 append_system_prompt: None,
                 session_memory_extractor: None,

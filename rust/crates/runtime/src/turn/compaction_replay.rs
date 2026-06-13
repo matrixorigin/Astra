@@ -94,6 +94,38 @@ pub struct CompactionEffectivenessTracker {
 }
 
 impl CompactionEffectivenessTracker {
+    /// Restore tracker state from a heavy-checkpoint JSON blob.
+    ///
+    /// The checkpoint is advisory runtime state, not user content. Missing or
+    /// malformed fields degrade to zero so resume can continue while preserving
+    /// every field that is present and well-typed.
+    pub fn from_json_lossy(value: &serde_json::Value) -> Self {
+        fn u32_field(value: &serde_json::Value, key: &str) -> u32 {
+            value
+                .get(key)
+                .and_then(|v| v.as_u64())
+                .map(|n| n.min(u32::MAX as u64) as u32)
+                .unwrap_or(0)
+        }
+
+        Self {
+            last_tokens_freed: value
+                .get("last_tokens_freed")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            last_was_insufficient: value
+                .get("last_was_insufficient")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            cumulative_tokens_freed: value
+                .get("cumulative_tokens_freed")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            attempt_count: u32_field(value, "attempt_count"),
+            consecutive_futile_attempts: u32_field(value, "consecutive_futile_attempts"),
+        }
+    }
+
     /// Record a compaction result.
     ///
     /// `tokens_freed == 0` is treated as a futile attempt and increments the
@@ -473,6 +505,34 @@ mod tests {
         assert_eq!(json["cumulative_tokens_freed"], 5000);
         assert_eq!(json["attempt_count"], 1);
         assert_eq!(json["last_was_insufficient"], true);
+    }
+
+    #[test]
+    fn effectiveness_tracker_restores_from_checkpoint_json() {
+        let tracker = CompactionEffectivenessTracker::from_json_lossy(&json!({
+            "last_tokens_freed": 4000,
+            "last_was_insufficient": true,
+            "cumulative_tokens_freed": 15000,
+            "attempt_count": 3,
+            "consecutive_futile_attempts": 2,
+        }));
+
+        assert_eq!(tracker.last_tokens_freed, 4000);
+        assert!(tracker.last_was_insufficient);
+        assert_eq!(tracker.cumulative_tokens_freed, 15000);
+        assert_eq!(tracker.attempt_count, 3);
+        assert_eq!(tracker.consecutive_futile_attempts, 2);
+    }
+
+    #[test]
+    fn effectiveness_tracker_clamps_malformed_checkpoint_counts() {
+        let tracker = CompactionEffectivenessTracker::from_json_lossy(&json!({
+            "attempt_count": u64::MAX,
+            "consecutive_futile_attempts": u64::MAX,
+        }));
+
+        assert_eq!(tracker.attempt_count, u32::MAX);
+        assert_eq!(tracker.consecutive_futile_attempts, u32::MAX);
     }
 
     #[test]

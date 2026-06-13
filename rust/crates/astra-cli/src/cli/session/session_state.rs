@@ -338,6 +338,12 @@ pub(crate) struct SessionState {
     /// Full context-assembly trace from the last successfully committed turn.
     pub latest_context_assembly_trace:
         Option<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>,
+    /// Serialized context-pipeline state restored from the latest heavy checkpoint.
+    pub runtime_pipeline_state: Option<serde_json::Value>,
+    /// Serialized compaction effectiveness tracker restored from the latest heavy checkpoint.
+    pub runtime_compaction_state: Option<serde_json::Value>,
+    /// Consecutive context-window failures restored from the latest heavy checkpoint.
+    pub runtime_consecutive_context_window_errors: u32,
     /// Unified skill registry (single source of truth for all skill resolution).
     pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     /// Session-scoped skill quality tracker for learning loop.
@@ -643,6 +649,9 @@ impl Default for SessionState {
             last_turn_event: None,
             session_persistence_error: None,
             latest_context_assembly_trace: None,
+            runtime_pipeline_state: None,
+            runtime_compaction_state: None,
+            runtime_consecutive_context_window_errors: 0,
             unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
             skill_quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
             skill_search: astra_core::SkillSearchSettings::default(),
@@ -803,6 +812,9 @@ impl SessionState {
         self.last_turn_event = None;
         self.session_persistence_error = None;
         self.latest_context_assembly_trace = None;
+        self.runtime_pipeline_state = None;
+        self.runtime_compaction_state = None;
+        self.runtime_consecutive_context_window_errors = 0;
         self.durable_task_state = None;
         self.last_delivery_report = None;
         self.plan_execution_last_error = None;
