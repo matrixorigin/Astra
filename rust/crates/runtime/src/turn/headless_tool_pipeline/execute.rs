@@ -11,6 +11,7 @@ use astra_turn_core::headless_tool_postprocess::{
 };
 use astra_turn_core::headless_tool_stderr_lines::{
     headless_stderr_resource_limit_blocked, headless_stderr_resource_limit_in_output,
+    headless_stderr_resource_limit_observed,
 };
 use astra_turn_core::hydrate_reflect::hydrate_reflect_placeholder_if_needed;
 
@@ -138,6 +139,12 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         term.emit_line(
                             HeadlessStderrStyle::Yellow,
                             headless_stderr_resource_limit_blocked(&tool),
+                        );
+                    }
+                    HeadlessOutputEnrichSignal::ResourceLimitObserved { tool } => {
+                        term.emit_line(
+                            HeadlessStderrStyle::Dim,
+                            headless_stderr_resource_limit_observed(&tool),
                         );
                     }
                     HeadlessOutputEnrichSignal::ResourceLimitDetectedInOutput { tool } => {

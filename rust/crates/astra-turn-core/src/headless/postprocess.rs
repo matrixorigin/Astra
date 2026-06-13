@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crate::guardrails::error_recovery::{ErrorCategory, build_recovery_message, classify_error};
-use crate::guardrails::turn_guard::TurnGuard;
+use crate::guardrails::turn_guard::{TurnGuard, is_read_only_never_restrict};
 use crate::headless_tool_assembly::{HeadlessRoundToolIdx, headless_timeout_aborted_tool_names};
 use crate::result_quality::ResultQuality;
 use crate::tool::result::semantics::is_resource_limit_output;
@@ -21,6 +21,7 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeadlessOutputEnrichSignal {
     ResourceLimitBlocked { tool: String },
+    ResourceLimitObserved { tool: String },
     ResourceLimitDetectedInOutput { tool: String },
 }
 
@@ -42,11 +43,16 @@ pub fn enrich_headless_tool_output_for_errors_and_limits(
         if matches!(category, ErrorCategory::ResourceLimit) {
             turn_guard.health.record_resource_limit_failure(name);
             turn_guard.errors.record_error(category);
-            restricted_tools.insert(name.to_string());
             resource_limit_recorded = true;
-            on_signal(HeadlessOutputEnrichSignal::ResourceLimitBlocked {
-                tool: name.to_string(),
-            });
+            if restrict_resource_limited_tool(name, restricted_tools) {
+                on_signal(HeadlessOutputEnrichSignal::ResourceLimitBlocked {
+                    tool: name.to_string(),
+                });
+            } else {
+                on_signal(HeadlessOutputEnrichSignal::ResourceLimitObserved {
+                    tool: name.to_string(),
+                });
+            }
         }
 
         if category.is_retryable() {
@@ -62,15 +68,28 @@ pub fn enrich_headless_tool_output_for_errors_and_limits(
     if !*is_err && !tool_already_restricted && is_resource_limit_output(result_str.as_str()) {
         turn_guard.health.record_resource_limit_failure(name);
         turn_guard.errors.record_error(ErrorCategory::ResourceLimit);
-        restricted_tools.insert(name.to_string());
         *is_err = true;
         resource_limit_recorded = true;
-        on_signal(HeadlessOutputEnrichSignal::ResourceLimitDetectedInOutput {
-            tool: name.to_string(),
-        });
+        if restrict_resource_limited_tool(name, restricted_tools) {
+            on_signal(HeadlessOutputEnrichSignal::ResourceLimitDetectedInOutput {
+                tool: name.to_string(),
+            });
+        } else {
+            on_signal(HeadlessOutputEnrichSignal::ResourceLimitObserved {
+                tool: name.to_string(),
+            });
+        }
     }
 
     resource_limit_recorded
+}
+
+fn restrict_resource_limited_tool(name: &str, restricted_tools: &mut HashSet<String>) -> bool {
+    if is_read_only_never_restrict(name) {
+        return false;
+    }
+    restricted_tools.insert(name.to_string());
+    true
 }
 
 /// Record tool result quality and append optional TurnGuard feedback into `result_str`.
@@ -250,6 +269,37 @@ mod tests {
             }]
         );
         assert!(out.contains("out of memory"));
+    }
+
+    #[test]
+    fn enrich_resource_limit_does_not_hard_restrict_read_only_tools() {
+        let mut tg = TurnGuard::new();
+        let mut restricted = HashSet::new();
+        let mut out = "read failed: Resource temporarily unavailable".to_string();
+        let mut is_err = true;
+        let mut signals = Vec::new();
+
+        let rec = enrich_headless_tool_output_for_errors_and_limits(
+            "read_file",
+            &mut out,
+            &mut is_err,
+            false,
+            &mut tg,
+            &mut restricted,
+            |s| signals.push(s),
+        );
+
+        assert!(rec);
+        assert!(
+            restricted.is_empty(),
+            "read-only observation tools must not become hard restricted by a transient resource limit"
+        );
+        assert_eq!(
+            signals,
+            vec![HeadlessOutputEnrichSignal::ResourceLimitObserved {
+                tool: "read_file".into()
+            }]
+        );
     }
 
     #[test]

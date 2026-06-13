@@ -99,6 +99,11 @@ pub fn headless_stderr_resource_limit_blocked(tool: &str) -> String {
 }
 
 #[must_use]
+pub fn headless_stderr_resource_limit_observed(tool: &str) -> String {
+    format!("  ⚠ {tool}: resource limit detected — tool remains available")
+}
+
+#[must_use]
 pub fn headless_stderr_resource_limit_in_output(tool: &str) -> String {
     format!("  ⚠ {tool}: resource limit detected in output — tool blocked")
 }
@@ -244,6 +249,13 @@ mod tests {
         let s = headless_stderr_resource_limit_blocked("bash");
         assert!(s.contains("bash"));
         assert!(s.contains("blocked"));
+    }
+
+    #[test]
+    fn resource_limit_observed() {
+        let s = headless_stderr_resource_limit_observed("read_file");
+        assert!(s.contains("read_file"));
+        assert!(s.contains("remains available"));
     }
 
     #[test]
