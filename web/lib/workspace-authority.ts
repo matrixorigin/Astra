@@ -1,3 +1,4 @@
+import type { WorkspaceBinding, ExecutorBinding } from "@astra/sdk";
 import type { WorkspaceSelection } from "@/lib/api/types";
 
 export type WorkspaceAuthorityError = {
@@ -8,7 +9,7 @@ export type WorkspaceAuthorityError = {
   message: string;
 };
 
-export function defaultWorkspaceBinding() {
+export function defaultWorkspaceBinding(): WorkspaceBinding {
   return {
     kind: "server_sandbox",
     display_name: "Server sandbox",
@@ -17,7 +18,7 @@ export function defaultWorkspaceBinding() {
   };
 }
 
-export function defaultExecutorBinding() {
+export function defaultExecutorBinding(): ExecutorBinding {
   return {
     kind: "server_local",
     executor_id: "server-local",
@@ -29,7 +30,7 @@ export function defaultExecutorBinding() {
 
 export function edgeWorkspaceBinding(
   selection: Extract<WorkspaceSelection, { kind: "edge_workspace" }>,
-) {
+): WorkspaceBinding {
   return {
     kind: "edge_workspace",
     display_name: selection.displayName ?? selection.edgeAgentId,
@@ -41,7 +42,7 @@ export function edgeWorkspaceBinding(
 
 export function edgeExecutorBinding(
   selection: Extract<WorkspaceSelection, { kind: "edge_workspace" }>,
-) {
+): ExecutorBinding {
   return {
     kind: "edge_agent",
     executor_id: selection.edgeAgentId,

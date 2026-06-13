@@ -1,7 +1,13 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useCallback, useRef, type Dispatch, type SetStateAction } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  type Dispatch,
+  type SetStateAction,
+} from "react";
 import {
   getChat,
   getEdgeStatus,
@@ -14,6 +20,7 @@ import {
   streamExistingChatRun,
   updateChatModel,
 } from "@/lib/api/chats";
+import { mergeStreamRunUpdate } from "@/lib/api/web-store";
 import { createAssistantPatchController } from "@/lib/api/assistant-patch-controller";
 import {
   WebApiError,
@@ -93,24 +100,6 @@ export function canAttachRunStream(status: string | undefined | null) {
   return status ? ATTACHABLE_RUN_STATUSES.has(status) : false;
 }
 
-function streamRunUpdate(
-  run: {
-    runId: string;
-    status: string;
-    waitingFor?: string | null;
-    nextEventIndex?: number | null;
-  },
-  assistantMessageId: string,
-): NonNullable<ChatDetail["activeRun"]> {
-  return {
-    runId: run.runId,
-    status: run.status,
-    waitingFor: run.waitingFor ?? null,
-    assistantMessageId,
-    nextEventIndex: run.nextEventIndex ?? null,
-  };
-}
-
 function findStreamingAssistantMessageId(messages: ChatMessage[]) {
   return [...messages]
     .reverse()
@@ -154,13 +143,13 @@ function withClientTimeout<T>(
   timeoutMs: number,
   message: string,
 ): Promise<T> {
-  let timeoutId: ReturnType<typeof window.setTimeout> | undefined;
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timeoutId = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+    timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs);
   });
   return Promise.race([promise, timeout]).finally(() => {
     if (timeoutId !== undefined) {
-      window.clearTimeout(timeoutId);
+      clearTimeout(timeoutId);
     }
   });
 }
@@ -475,7 +464,10 @@ export function useStreamLifecycle(
           onRunUpdated: (run) => {
             setDetail((current) => ({
               ...current,
-              activeRun: streamRunUpdate(run, assistantMessageId),
+              activeRun: mergeStreamRunUpdate(
+                { ...run, assistantMessageId },
+                current.activeRun,
+              ),
             }));
           },
           onRunFinished: () => {
@@ -776,7 +768,10 @@ export function useStreamLifecycle(
           onRunUpdated: (run) => {
             setDetail((current) => ({
               ...current,
-              activeRun: streamRunUpdate(run, currentAssistantId),
+              activeRun: mergeStreamRunUpdate(
+                { ...run, assistantMessageId: currentAssistantId },
+                current.activeRun,
+              ),
             }));
           },
           onRunFinished: () => {
@@ -977,7 +972,10 @@ export function useStreamLifecycle(
             onRunUpdated: (run) => {
               setDetail((current) => ({
                 ...current,
-                activeRun: streamRunUpdate(run, assistantMessageId),
+                activeRun: mergeStreamRunUpdate(
+                  { ...run, assistantMessageId },
+                  current.activeRun,
+                ),
               }));
             },
             onRunFinished: () => {
@@ -1347,7 +1345,10 @@ export function useStreamLifecycle(
             onRunUpdated: (run) => {
               setDetail((current) => ({
                 ...current,
-                activeRun: streamRunUpdate(run, assistantMessageId),
+                activeRun: mergeStreamRunUpdate(
+                  { ...run, assistantMessageId },
+                  current.activeRun,
+                ),
               }));
             },
             onRunFinished: () => {
@@ -1457,7 +1458,11 @@ export function useStreamLifecycle(
         try {
           const refreshed = await getChat(detail.chat.id);
           setDetail(refreshed);
-        } catch {
+        } catch (refreshError) {
+          console.warn(
+            "[stream-lifecycle] failed to refresh chat after stream error:",
+            refreshError,
+          );
           // Keep the local running state if refresh also fails; the alert still
           // tells the user that stream reconnection did not attach.
         }
@@ -1551,6 +1556,29 @@ export function useStreamLifecycle(
     },
     [detail.chat.id, detail.chat.model, setDetail],
   );
+
+  // -- Cleanup on unmount --
+  useEffect(() => {
+    return () => {
+      streamAbortRef.current?.abort();
+      if (autoAttachRetryTimerRef.current) {
+        window.clearTimeout(autoAttachRetryTimerRef.current);
+      }
+      if (reconcileTimerRef.current) {
+        window.clearTimeout(reconcileTimerRef.current);
+      }
+      if (reconcileIntervalRef.current) {
+        window.clearInterval(reconcileIntervalRef.current);
+      }
+      stopReconcileRef.current();
+    };
+  }, [
+    streamAbortRef,
+    autoAttachRetryTimerRef,
+    reconcileTimerRef,
+    reconcileIntervalRef,
+    stopReconcileRef,
+  ]);
 
   return {
     nextStreamAbortSignal,
