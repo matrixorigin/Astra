@@ -998,6 +998,14 @@ impl CrashRecoveryManager {
 
     /// Force recovery even with pending user decisions (operator override).
     pub fn force_complete(&mut self) -> Result<(), RecoveryError> {
+        // Operator override can accept side-effect uncertainty, but it must not
+        // bless a corrupted or incomplete recovery journal. A journal gap means
+        // the replay input itself is not trustworthy.
+        if let Some(ref ctx) = self.context
+            && let Some(ref gap) = ctx.journal_gap
+        {
+            return Err(gap.clone());
+        }
         self.transition_to(RecoveryState::Recovered)?;
         Ok(())
     }
@@ -1723,6 +1731,31 @@ mod tests {
         mgr.begin_replay().unwrap();
         mgr.force_complete().unwrap();
         assert_eq!(mgr.state(), RecoveryState::Recovered);
+    }
+
+    #[test]
+    fn force_complete_refuses_journal_gap() {
+        let mut mgr = CrashRecoveryManager::new();
+        mgr.begin_recovery().unwrap();
+
+        let events = vec![
+            tool_started_event("e1", "step-1", "read_file", 0, 1000),
+            tool_completed_event("e2", "step-1", "read_file", 0, 2000),
+            tool_started_event("e3", "step-1", "bash", 1, 500_000),
+        ];
+
+        let json = checkpoint_json();
+        mgr.scan_journal("sess-1", 5, Some(&json), 3, events)
+            .unwrap();
+        mgr.begin_replay().unwrap();
+
+        let result = mgr.force_complete();
+        assert!(matches!(result, Err(RecoveryError::JournalGap { .. })));
+        assert_eq!(
+            mgr.state(),
+            RecoveryState::Replaying,
+            "journal integrity failures must not be promoted to recovered"
+        );
     }
 
     // =======================================================================
