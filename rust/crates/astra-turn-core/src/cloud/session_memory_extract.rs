@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use astra_turn_types::{
-    has_durable_correction_directive, is_runtime_scaffolding_message, is_user_correction_signal,
+    has_durable_correction_directive, is_runtime_scaffolding_message,
+    is_transient_runtime_status_text, is_user_correction_signal,
 };
 
 // ---------------------------------------------------------------------------
@@ -230,7 +231,12 @@ fn render_recent(messages: &[Value]) -> String {
 }
 
 fn is_ephemeral_for_memory_extraction(message: &Value) -> bool {
-    is_runtime_scaffolding_message(message) || is_vague_reanchor_for_memory_extraction(message)
+    is_runtime_scaffolding_message(message)
+        || is_vague_reanchor_for_memory_extraction(message)
+        || message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(is_transient_runtime_status_text)
 }
 
 fn is_vague_reanchor_for_memory_extraction(message: &Value) -> bool {
@@ -290,13 +296,68 @@ pub fn extract_section(memory_md: &str, section_name: &str) -> Option<String> {
 /// These sections have cross-session reuse value and should be stored as semantic memory.
 pub fn extract_learnings_for_backflow(memory_md: &str) -> Vec<(String, String)> {
     let mut results = Vec::new();
-    if let Some(content) = extract_section(memory_md, "Learnings") {
+    if let Some(content) =
+        extract_section(memory_md, "Learnings").and_then(sanitize_backflow_section)
+    {
         results.push(("learnings".to_string(), content));
     }
-    if let Some(content) = extract_section(memory_md, "Errors & Corrections") {
+    if let Some(content) =
+        extract_section(memory_md, "Errors & Corrections").and_then(sanitize_backflow_section)
+    {
         results.push(("error-corrections".to_string(), content));
     }
     results
+}
+
+fn sanitize_backflow_section(content: String) -> Option<String> {
+    let mut kept_lines = Vec::new();
+    let mut skipping_ephemeral_list_item = false;
+
+    for line in content.lines() {
+        if let Some(item_text) = strip_backflow_list_marker(line) {
+            skipping_ephemeral_list_item = is_ephemeral_backflow_text(item_text);
+            if !skipping_ephemeral_list_item {
+                kept_lines.push(line.trim_end());
+            }
+            continue;
+        }
+
+        if skipping_ephemeral_list_item && is_backflow_list_continuation(line) {
+            continue;
+        }
+
+        skipping_ephemeral_list_item = false;
+        if !is_ephemeral_backflow_text(line.trim_start()) {
+            kept_lines.push(line.trim_end());
+        }
+    }
+
+    let kept = kept_lines.join("\n").trim().to_string();
+    (!kept.is_empty()).then_some(kept)
+}
+
+fn strip_backflow_list_marker(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+        .or_else(|| strip_ordered_backflow_list_marker(trimmed))
+        .map(str::trim_start)
+}
+
+fn strip_ordered_backflow_list_marker(line: &str) -> Option<&str> {
+    let (marker, rest) = line.split_once(". ").or_else(|| line.split_once(") "))?;
+    (!marker.is_empty() && marker.chars().all(|c| c.is_ascii_digit())).then_some(rest)
+}
+
+fn is_backflow_list_continuation(line: &str) -> bool {
+    line.trim().is_empty() || line.starts_with(' ') || line.starts_with('\t')
+}
+
+fn is_ephemeral_backflow_text(text: &str) -> bool {
+    let message = serde_json::json!({"role": "user", "content": text});
+    is_ephemeral_for_memory_extraction(&message)
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +683,89 @@ mod tests {
         assert!(sections[0].1.contains("clippy"));
         assert_eq!(sections[1].0, "error-corrections");
         assert!(sections[1].1.contains("lifetime"));
+    }
+
+    #[test]
+    fn extract_learnings_for_backflow_filters_ephemeral_lines() {
+        let md = "\
+## Learnings\n<!-- patterns -->\n\
+- Use `cargo test -p astra-runtime` for focused runtime checks\n\
+- [Active task attachment] Resume hidden task board state\n\
+- What I asked for is a durable fix, not a workaround\n\
+- wrong, never use mocks in integration tests\n\n\
+## Errors & Corrections\n<!-- errors -->\n\
+- ## Already Fetched (do NOT re-read)\n\
+- 我想要的是长久健康运行，不是临时补丁\n\
+- 我重新说一次，不要用case-by-case修补\n\n\
+## Worklog\n<!-- log -->\n";
+
+        let sections = extract_learnings_for_backflow(md);
+
+        assert_eq!(sections.len(), 2);
+        let learnings = &sections[0].1;
+        assert!(learnings.contains("cargo test -p astra-runtime"));
+        assert!(learnings.contains("never use mocks in integration tests"));
+        assert!(!learnings.contains("Active task attachment"));
+        assert!(!learnings.contains("durable fix, not a workaround"));
+
+        let corrections = &sections[1].1;
+        assert!(corrections.contains("不要用case-by-case修补"));
+        assert!(!corrections.contains("Already Fetched"));
+        assert!(!corrections.contains("长久健康运行"));
+        assert!(!corrections.contains("临时补丁"));
+    }
+
+    #[test]
+    fn extract_learnings_for_backflow_drops_ephemeral_list_item_continuations() {
+        let md = concat!(
+            "## Learnings\n<!-- patterns -->\n",
+            "- [Active task attachment] Resume hidden task board state\n",
+            "  stale file: /tmp/transient-tool-output.txt\n",
+            "  stale advice: retry the already failed command forever\n",
+            "1. Tool web_search timed out while waiting for the server\n",
+            "   stale query result that must not be replayed later\n",
+            "- Keep the explicit invariant for future turns\n\n",
+            "## Errors & Corrections\n<!-- errors -->\n",
+            "* What I asked for is a durable fix, not a workaround\n",
+            "  temporary frustration text that should not become policy\n",
+            "* wrong, never use mocks in integration tests\n",
+            "  integration coverage must exercise the real boundary\n\n",
+            "## Worklog\n<!-- log -->\n",
+        );
+
+        let sections = extract_learnings_for_backflow(md);
+
+        assert_eq!(sections.len(), 2);
+        let learnings = &sections[0].1;
+        assert!(learnings.contains("Keep the explicit invariant"));
+        assert!(!learnings.contains("stale file"));
+        assert!(!learnings.contains("web_search timed out"));
+        assert!(!learnings.contains("stale query result"));
+        assert!(!learnings.contains("retry the already failed command"));
+
+        let corrections = &sections[1].1;
+        assert!(corrections.contains("never use mocks in integration tests"));
+        assert!(corrections.contains("integration coverage"));
+        assert!(!corrections.contains("temporary frustration text"));
+    }
+
+    #[test]
+    fn extract_learnings_for_backflow_drops_sections_that_become_empty() {
+        let md = "\
+## Learnings\n<!-- patterns -->\n\
+- [Active task attachment] Resume hidden task board state\n\
+- What I asked for is a durable fix, not a workaround\n\n\
+## Errors & Corrections\n<!-- errors -->\n\
+- ## Already Fetched (do NOT re-read)\n\
+- 我想要的是长久健康运行，不是临时补丁\n\n\
+## Worklog\n<!-- log -->\n";
+
+        let sections = extract_learnings_for_backflow(md);
+
+        assert!(
+            sections.is_empty(),
+            "ephemeral-only sections must not be promoted: {sections:?}"
+        );
     }
 
     #[test]

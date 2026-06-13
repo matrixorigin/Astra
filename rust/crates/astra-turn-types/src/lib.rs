@@ -29,7 +29,7 @@ pub use memory_structure::{
     PERSISTENT_MEMORY_TYPES, PersistentStoreRejection, is_persistent_memory_type,
     should_store_persistent_memory, validate_persistent_memory_content,
 };
-pub use memory_writability::should_store_in_memory;
+pub use memory_writability::{is_transient_runtime_status_text, should_store_in_memory};
 pub use result_quality::{ResultQuality, classify_result, quality_feedback};
 pub use runtime_scaffolding::{SCAFFOLDING_BODY_PREFIXES, is_runtime_scaffolding_message};
 pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};

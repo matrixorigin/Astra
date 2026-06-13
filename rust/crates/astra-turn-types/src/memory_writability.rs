@@ -30,11 +30,14 @@
 //! L3 (replace Memoria with a directory + frontmatter) are follow-up
 //! projects.
 //!
-//! What we reject (observed live in session `c6e18730`):
+//! What we reject as non-durable runtime state:
 //!   - bare user acknowledgments / imperatives under a length threshold
 //!     ("继续", "修复啊！", "hi", "好", "ok")
 //!   - runtime scaffolding (delegated to
 //!     [`crate::runtime_scaffolding::is_runtime_scaffolding_message`])
+//!   - transient runtime/tool status text (tool read failures, timeouts,
+//!     waiting/running status) that should not follow the user into later
+//!     turns or sessions
 //!
 //! What we keep:
 //!   - assistant messages — the model's own output is expensive to
@@ -111,6 +114,10 @@ pub fn should_store_in_memory(message: &Value) -> bool {
         return false;
     }
 
+    if is_transient_runtime_status_text(content) {
+        return false;
+    }
+
     match role {
         // Assistant text output is expensive to regenerate; always keep.
         "assistant" => true,
@@ -125,6 +132,109 @@ pub fn should_store_in_memory(message: &Value) -> bool {
         // entirely); system messages are runtime-injected by contract.
         _ => false,
     }
+}
+
+/// True when text is a runtime/tool status update rather than durable memory.
+///
+/// This intentionally requires both a status-like shape and runtime/tool
+/// vocabulary. A normal engineering explanation may mention "failed tests";
+/// that can be worth remembering. A line like "Read failed before returning
+/// output" or "Tool web_search timed out" is an execution episode and should
+/// stay in the journal, not in ambient recall.
+#[must_use]
+pub fn is_transient_runtime_status_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let lower = trimmed.to_lowercase();
+    if lower.contains("sensitive path requires explicit opt-in") {
+        return true;
+    }
+
+    let has_runtime_subject = contains_any(
+        &lower,
+        &[
+            "agent",
+            "approval",
+            "bash",
+            "edge",
+            "executor",
+            "read",
+            "run",
+            "search",
+            "server",
+            "session",
+            "sse",
+            "tool",
+            "transport",
+            "web_search",
+            "websocket",
+            "workspace",
+            "write",
+        ],
+    );
+    if !has_runtime_subject {
+        return false;
+    }
+
+    let has_transient_state = contains_any(
+        &lower,
+        &[
+            "blocked",
+            "disconnected",
+            "failed",
+            "failed before returning output",
+            "failure",
+            "interrupted",
+            "requires explicit opt-in",
+            "retry",
+            "running",
+            "stopping",
+            "timed out",
+            "timeout",
+            "waiting",
+        ],
+    );
+    if !has_transient_state {
+        return false;
+    }
+
+    starts_with_any(
+        &lower,
+        &[
+            "all ",
+            "approval ",
+            "bash ",
+            "error:",
+            "failed before ",
+            "ran ",
+            "read failed",
+            "reading:",
+            "run ",
+            "running ",
+            "server ",
+            "stopping",
+            "tool ",
+            "tools ",
+            "waiting ",
+            "web review ",
+            "write failed",
+        ],
+    ) || looks_like_runtime_event_line(trimmed)
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn starts_with_any(haystack: &str, prefixes: &[&str]) -> bool {
+    prefixes.iter().any(|prefix| haystack.starts_with(prefix))
+}
+
+fn looks_like_runtime_event_line(text: &str) -> bool {
+    text.contains('·') || text.contains('├') || text.contains('└')
 }
 
 #[cfg(test)]
@@ -242,6 +352,21 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn rejects_transient_runtime_status_text() {
+        for msg in [
+            "Read failed before returning output: Reading: .../tool-results/call.txt",
+            "Tool web_search timed out while waiting for the server",
+            "All 3 agents still working — deep review takes time. Waiting for completion...",
+            "Sensitive path requires explicit opt-in in Auto mode",
+        ] {
+            assert!(
+                !should_store_in_memory(&assistant(msg)),
+                "should reject transient status {msg:?}"
+            );
+        }
+    }
+
     // ── Keep: real user intent ─────────────────────────────────────────
 
     #[test]
@@ -257,6 +382,13 @@ mod tests {
     fn keeps_user_constraint() {
         assert!(should_store_in_memory(&user(
             "don't mock the database in these tests — we got burned last quarter"
+        )));
+    }
+
+    #[test]
+    fn keeps_durable_retry_policy_even_when_it_mentions_failure() {
+        assert!(should_store_in_memory(&user(
+            "never retry failed destructive commands without checking the working tree first"
         )));
     }
 
