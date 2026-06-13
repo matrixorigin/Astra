@@ -1095,7 +1095,11 @@ fn extract_session_state_compact(
     state: &AgenticLoopState,
 ) -> astra_turn_core::conversation_log::SessionStateCompact {
     astra_turn_core::conversation_log::SessionStateCompact {
-        blocked_tools: state.restricted_tools.iter().cloned().collect(),
+        // CSL is conversation materialization, not execution policy. Persisting
+        // transient tool restrictions here makes old compaction state hard-block
+        // later turns. Runtime restrictions are restored only from explicit
+        // runtime checkpoints/interruption contracts.
+        blocked_tools: Vec::new(),
         recent_tools: state.recent_tools.clone(),
         approval_overrides: state
             .approval_overrides
@@ -1117,9 +1121,6 @@ fn restore_session_state_compact(
     ss: astra_turn_core::conversation_log::SessionStateCompact,
     loop_state: &mut AgenticLoopState,
 ) {
-    if !ss.blocked_tools.is_empty() {
-        loop_state.restricted_tools.extend(ss.blocked_tools);
-    }
     if !ss.recent_tools.is_empty() {
         loop_state.recent_tools = ss.recent_tools;
     }
@@ -7583,6 +7584,45 @@ mod tests {
             state.compaction_effectiveness.consecutive_futile_attempts,
             2
         );
+    }
+
+    #[test]
+    fn csl_session_state_does_not_persist_transient_restricted_tools() {
+        let svc = test_service();
+        let request = test_request("resume");
+        let mut state =
+            svc.build_initial_state("test-user", &request, "session-1", "run-1", None, None);
+        state.restricted_tools.insert("write_file".to_string());
+
+        let compact = extract_session_state_compact(&state);
+
+        assert!(
+            compact.blocked_tools.is_empty(),
+            "conversation-log state must not persist transient runtime restrictions"
+        );
+    }
+
+    #[test]
+    fn csl_session_state_restore_ignores_legacy_blocked_tools() {
+        let svc = test_service();
+        let request = test_request("resume");
+        let mut state =
+            svc.build_initial_state("test-user", &request, "session-1", "run-1", None, None);
+
+        restore_session_state_compact(
+            astra_turn_core::conversation_log::SessionStateCompact {
+                blocked_tools: vec!["legacy_stale_tool".into()],
+                recent_tools: vec!["read_file".into()],
+                ..Default::default()
+            },
+            &mut state,
+        );
+
+        assert!(
+            state.restricted_tools.is_empty(),
+            "legacy CSL blocked_tools must not restore as hard runtime restrictions"
+        );
+        assert_eq!(state.recent_tools, vec!["read_file"]);
     }
 
     #[test]
