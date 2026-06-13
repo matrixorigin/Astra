@@ -56,7 +56,8 @@ use crate::server::tool_transport::{
 };
 use crate::tool_sandbox::{
     IsolatedOutput, IsolationConfig, SandboxMode, SandboxPolicy, ToolTier, effective_tier,
-    execute_isolated, filter_environment, wrap_command_with_limits,
+    execute_isolated, extract_local_workspace_path_mentions, filter_environment,
+    is_shell_home_path, is_windows_drive_path, wrap_command_with_limits,
 };
 use astra_turn_core::file_edit_journal::{EditType, FileEditJournal};
 
@@ -84,123 +85,6 @@ fn unique_path_variants(path: &Path) -> Vec<PathBuf> {
         variants.push(canonical);
     }
     variants
-}
-
-fn shell_path_hard_delimiter(ch: char) -> bool {
-    matches!(
-        ch,
-        '\'' | '"' | '`' | ';' | '|' | '&' | '<' | '>' | '{' | '}' | '[' | ']'
-    )
-}
-
-fn shell_path_start_boundary(ch: Option<char>) -> bool {
-    ch.is_none_or(|ch| {
-        ch.is_whitespace()
-            || matches!(
-                ch,
-                '\'' | '"' | '`' | '=' | ':' | '(' | '{' | '[' | ',' | '<' | '>'
-            )
-    })
-}
-
-fn windows_drive_path_at(input: &str, index: usize) -> bool {
-    let bytes = input.as_bytes();
-    bytes.get(index).is_some_and(u8::is_ascii_alphabetic)
-        && bytes.get(index + 1) == Some(&b':')
-        && matches!(bytes.get(index + 2), Some(b'\\' | b'/'))
-}
-
-fn collect_shell_path_token(input: &str, start: usize) -> String {
-    let mut end = input.len();
-    for (offset, ch) in input[start..].char_indices() {
-        let index = start + offset;
-        if shell_path_hard_delimiter(ch) {
-            end = index;
-            break;
-        }
-        if ch.is_whitespace() {
-            let after_whitespace = index + ch.len_utf8();
-            if !whitespace_continues_path(input, after_whitespace) {
-                end = index;
-                break;
-            }
-        }
-    }
-    trim_shell_path_token_end(&input[start..end])
-}
-
-fn whitespace_continues_path(input: &str, mut index: usize) -> bool {
-    while let Some(ch) = input[index..].chars().next() {
-        if ch.is_whitespace() {
-            index += ch.len_utf8();
-        } else {
-            break;
-        }
-    }
-    for ch in input[index..].chars() {
-        if ch.is_whitespace() || shell_path_hard_delimiter(ch) {
-            return false;
-        }
-        if ch == '/' || ch == '\\' {
-            return true;
-        }
-    }
-    false
-}
-
-fn trim_shell_path_token_end(token: &str) -> String {
-    let mut trimmed = token.trim_end_matches(['.', ',', ':']).to_string();
-    loop {
-        let closes = trimmed.chars().filter(|ch| *ch == ')').count();
-        let opens = trimmed.chars().filter(|ch| *ch == '(').count();
-        if closes > opens && trimmed.ends_with(')') {
-            trimmed.pop();
-            continue;
-        }
-        break;
-    }
-    trimmed
-}
-
-fn shell_home_path_at(input: &str, index: usize) -> bool {
-    input[index..].starts_with("~/")
-        || input[index..].starts_with("$HOME/")
-        || input[index..].starts_with("${HOME}/")
-}
-
-fn collect_local_workspace_path_token(input: &str, start: usize) -> String {
-    const BRACED_HOME: &str = "${HOME}/";
-    if input[start..].starts_with(BRACED_HOME) {
-        let suffix_start = start + BRACED_HOME.len();
-        return format!(
-            "{BRACED_HOME}{}",
-            collect_shell_path_token(input, suffix_start)
-        );
-    }
-    collect_shell_path_token(input, start)
-}
-
-fn extract_local_workspace_path_mentions(command: &str) -> Vec<String> {
-    let mut mentions = Vec::new();
-    let mut previous = None;
-    for (index, ch) in command.char_indices() {
-        let at_boundary = shell_path_start_boundary(previous);
-        let rest = &command[index..];
-        let is_local_path = at_boundary
-            && (shell_home_path_at(command, index)
-                || rest.starts_with("/Users/")
-                || rest.starts_with("/home/")
-                || rest.starts_with("/Volumes/")
-                || windows_drive_path_at(command, index));
-        if is_local_path {
-            let token = collect_local_workspace_path_token(command, index);
-            if !token.is_empty() && !mentions.iter().any(|existing| existing == &token) {
-                mentions.push(token);
-            }
-        }
-        previous = Some(ch);
-    }
-    mentions
 }
 
 fn workspace_owns_absolute_path(workspace_root: &Path, raw_path: &str) -> bool {
@@ -243,8 +127,8 @@ fn server_sandbox_local_path_mismatch_in_text(
     extract_local_workspace_path_mentions(text)
         .into_iter()
         .find(|path| {
-            shell_home_path_at(path, 0)
-                || windows_drive_path_at(path, 0)
+            is_shell_home_path(path)
+                || is_windows_drive_path(path)
                 || !workspace_owns_absolute_path(workspace_root, path)
         })
         .map(|path| {
@@ -273,8 +157,8 @@ fn server_sandbox_path_argument_mismatch(
         return None;
     }
     let candidate = Path::new(path);
-    let mismatched = shell_home_path_at(path, 0)
-        || windows_drive_path_at(path, 0)
+    let mismatched = is_shell_home_path(path)
+        || is_windows_drive_path(path)
         || (candidate.is_absolute() && !workspace_owns_absolute_path(workspace_root, path));
     if !mismatched {
         return None;

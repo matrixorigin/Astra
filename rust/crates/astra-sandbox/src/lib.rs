@@ -34,7 +34,8 @@ pub use process_isolation::{
 };
 pub use shell_hardening::{
     DANGEROUS_FILE_PATHS, InternalPathKind, SENSITIVE_ENV_VARS, ShellHardeningConfig,
-    build_hardened_command, is_dangerous_file_path, is_dangerous_read_path, is_internal_safe_path,
-    is_session_tool_result_artifact_reference, scrub_secrets_from_env,
+    build_hardened_command, extract_local_workspace_path_mentions, is_dangerous_file_path,
+    is_dangerous_read_path, is_internal_safe_path, is_session_tool_result_artifact_reference,
+    is_shell_home_path, is_windows_drive_path, scrub_secrets_from_env,
 };
 pub use tier::{ToolTier, classify_tool, effective_tier};

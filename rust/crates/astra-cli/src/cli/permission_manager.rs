@@ -594,17 +594,8 @@ fn sensitive_path_match_for_request(tool_name: &str, args: &serde_json::Value) -
     if let Some(cmd) = command_hint_from_args(args)
         && !cmd.is_empty()
     {
-        // For commands, we can't reliably parse read vs write from a string,
-        // so use the tool-level read/write classification as a conservative proxy.
-        let dangerous = if is_read {
-            // Layer 1: known safe internal artifact? → allow.
-            if is_internal_safe_path(cmd).is_none() {
-                // Layer 2: known dangerous? → block.
-                is_dangerous_file_path(cmd)
-                    || astra_turn_core::permission::redact::matches_sensitive_path(cmd)
-            } else {
-                false
-            }
+        let dangerous = if command_has_sensitive_ref(cmd) {
+            !command_sensitive_refs_are_internal_artifacts(cmd)
         } else {
             is_dangerous_file_path(cmd)
                 || astra_turn_core::permission::redact::matches_sensitive_path(cmd)
@@ -614,6 +605,62 @@ fn sensitive_path_match_for_request(tool_name: &str, args: &serde_json::Value) -
         }
     }
     None
+}
+
+fn command_has_sensitive_ref(command: &str) -> bool {
+    shell_like_tokens(command)
+        .iter()
+        .any(|token| is_sensitive_path_ref(token))
+}
+
+fn command_sensitive_refs_are_internal_artifacts(command: &str) -> bool {
+    let mut saw_sensitive_ref = false;
+    for token in shell_like_tokens(command) {
+        if !is_sensitive_path_ref(&token) {
+            continue;
+        }
+        saw_sensitive_ref = true;
+        if is_internal_safe_path(&token).is_none() {
+            return false;
+        }
+    }
+    saw_sensitive_ref
+}
+
+fn is_sensitive_path_ref(token: &str) -> bool {
+    is_dangerous_file_path(token)
+        || astra_turn_core::permission::redact::matches_sensitive_path(token)
+}
+
+fn shell_like_tokens(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+
+    for ch in command.chars() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            ch if !in_single && !in_double && (ch.is_whitespace() || "|;&<>()".contains(ch)) => {
+                push_shell_like_token(&mut tokens, &mut current);
+            }
+            _ => current.push(ch),
+        }
+    }
+    push_shell_like_token(&mut tokens, &mut current);
+    tokens
+}
+
+fn push_shell_like_token(tokens: &mut Vec<String>, current: &mut String) {
+    let token = current
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ':' | '[' | ']'))
+        .to_string();
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    current.clear();
 }
 
 // ─── Permission types: re-exports from astra-turn-core ──────────────
@@ -6882,6 +6929,45 @@ mod tests {
         assert!(
             matches!(d3, PermissionDecision::Allow),
             "allow_sensitive_path_writes opt-in should let Auto mode proceed, got {d3:?}"
+        );
+    }
+
+    #[test]
+    fn sensitive_path_gate_ignores_internal_tool_result_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact_path = dir
+            .path()
+            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, "{\"ok\":true}").unwrap();
+        let artifact_path = artifact_path.to_string_lossy().to_string();
+        let args = serde_json::json!({
+            "command": format!("cat {artifact_path} | python3 -c 'import sys, json; print(json.load(sys.stdin))'")
+        });
+
+        assert_eq!(
+            super::sensitive_path_match_for_request("bash", &args),
+            None,
+            "agent-generated tool-result artifacts must not trip the sensitive-path opt-in gate"
+        );
+    }
+
+    #[test]
+    fn sensitive_path_gate_rejects_internal_artifact_mixed_with_secret_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact_path = dir
+            .path()
+            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, "child output").unwrap();
+        let artifact_path = artifact_path.to_string_lossy().to_string();
+        let args = serde_json::json!({
+            "command": format!("cat {artifact_path} ~/.ssh/id_rsa")
+        });
+
+        assert!(
+            super::sensitive_path_match_for_request("bash", &args).is_some(),
+            "a safe internal artifact must not mask a separate sensitive path"
         );
     }
 

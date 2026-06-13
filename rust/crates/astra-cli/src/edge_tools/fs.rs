@@ -5,7 +5,7 @@ use super::{
     AGGREGATE_OUTPUT_BUDGET, AGGREGATE_SOFT_LIMIT, ReadDedupKey, SANDBOX_DENIED_PREFIX,
     ToolExecutor, code_intel, fuzzy_replacer, tool_output_limit, truncate_output,
 };
-use astra_runtime::tool_sandbox::{SandboxMode, validate_path};
+use astra_runtime::tool_sandbox::{SandboxMode, is_internal_safe_path, validate_path};
 use astra_tools::fs_ops::{
     check_anchor_vs_replacement_size, read_to_string_lossy, str_replace_fail,
 };
@@ -238,9 +238,10 @@ impl ToolExecutor {
         } else {
             ReadDedupKey::Full
         };
+        let is_internal_artifact_read = is_internal_safe_path(&path.to_string_lossy()).is_some();
 
         // Consecutive identical outline/range request + unchanged file → stub before I/O.
-        if self.can_dedup_identical_partial_read(&path, &dedup_key) {
+        if !is_internal_artifact_read && self.can_dedup_identical_partial_read(&path, &dedup_key) {
             return format!(
                 "[Same read_file request as immediately before — file unchanged. \
                  Refer to the earlier read_file result for {path_str}.]"
@@ -254,7 +255,7 @@ impl ToolExecutor {
         if has_range {
             let s = start_raw.unwrap_or(1);
             let e = end_raw.unwrap_or(u64::MAX);
-            if self.is_range_already_read(&path, s, e) {
+            if !is_internal_artifact_read && self.is_range_already_read(&path, s, e) {
                 return format!(
                     "[Lines {s}–{e} of {path_str} were already read in earlier requests \
                      and the file is unchanged. Refer to those earlier read_file results \
@@ -489,7 +490,7 @@ impl ToolExecutor {
         // Dedup: if file was fully read earlier in this turn and hasn't
         // changed, return a stub. Later turns may need the content again after
         // prompt compaction, so cross-turn reads still return the file body.
-        if self.can_dedup_read(&path) {
+        if !is_internal_artifact_read && self.can_dedup_read(&path) {
             let msg = if is_ranged {
                 format!(
                     "[File already fully read earlier in this turn and unchanged — \
@@ -3804,6 +3805,36 @@ type Handler interface {
         assert!(
             next_turn.contains("earlier read"),
             "later turn with unchanged mtime must still stub (prior tool_result is still in prompt): {next_turn}"
+        );
+    }
+
+    #[test]
+    fn read_file_internal_tool_result_artifacts_bypass_dedup_stubs() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact_path = dir
+            .path()
+            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, "AGENT_RESULT\nline 2\n").unwrap();
+
+        let executor = test_executor_in(dir.path());
+        let args = serde_json::json!({
+            "path": ".astra/sessions/session-1/tool-results/call_abc.txt",
+            "start_line": 1,
+            "end_line": 2,
+        });
+
+        let first = executor.read_file(&args);
+        let second = executor.read_file(&args);
+
+        assert!(first.contains("AGENT_RESULT"), "first read: {first}");
+        assert!(
+            second.contains("AGENT_RESULT"),
+            "internal tool-result artifacts must re-emit content instead of a stale-context stub: {second}"
+        );
+        assert!(
+            !second.contains("already read") && !second.contains("earlier read_file"),
+            "internal tool-result read must not return a dedup stub: {second}"
         );
     }
 

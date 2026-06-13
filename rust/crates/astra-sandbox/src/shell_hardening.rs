@@ -116,6 +116,139 @@ pub fn build_hardened_command(config: &ShellHardeningConfig, user_command: &str)
     parts.join(" && ")
 }
 
+fn shell_path_hard_delimiter(ch: char) -> bool {
+    matches!(
+        ch,
+        '\'' | '"' | '`' | ';' | '|' | '&' | '<' | '>' | '{' | '}' | '[' | ']'
+    )
+}
+
+fn shell_path_start_boundary(ch: Option<char>) -> bool {
+    ch.is_none_or(|ch| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '\'' | '"' | '`' | '=' | ':' | '(' | '{' | '[' | ',' | '<' | '>'
+            )
+    })
+}
+
+fn windows_drive_path_at(input: &str, index: usize) -> bool {
+    let bytes = input.as_bytes();
+    bytes.get(index).is_some_and(u8::is_ascii_alphabetic)
+        && bytes.get(index + 1) == Some(&b':')
+        && matches!(bytes.get(index + 2), Some(b'\\' | b'/'))
+}
+
+/// Return true when `input` starts with a Windows drive absolute path.
+pub fn is_windows_drive_path(input: &str) -> bool {
+    windows_drive_path_at(input, 0)
+}
+
+fn shell_home_path_at(input: &str, index: usize) -> bool {
+    input[index..].starts_with("~/")
+        || input[index..].starts_with("$HOME/")
+        || input[index..].starts_with("${HOME}/")
+}
+
+/// Return true when `input` starts with a shell home path form.
+pub fn is_shell_home_path(input: &str) -> bool {
+    !input.is_empty() && shell_home_path_at(input, 0)
+}
+
+fn collect_shell_path_token(input: &str, start: usize) -> String {
+    let mut end = input.len();
+    for (offset, ch) in input[start..].char_indices() {
+        let index = start + offset;
+        if shell_path_hard_delimiter(ch) {
+            end = index;
+            break;
+        }
+        if ch.is_whitespace() {
+            let after_whitespace = index + ch.len_utf8();
+            if !whitespace_continues_path(input, after_whitespace) {
+                end = index;
+                break;
+            }
+        }
+    }
+    trim_shell_path_token_end(&input[start..end])
+}
+
+fn whitespace_continues_path(input: &str, mut index: usize) -> bool {
+    while let Some(ch) = input[index..].chars().next() {
+        if ch.is_whitespace() {
+            index += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    for ch in input[index..].chars() {
+        if ch.is_whitespace() || shell_path_hard_delimiter(ch) {
+            return false;
+        }
+        if ch == '/' || ch == '\\' {
+            return true;
+        }
+    }
+    false
+}
+
+fn trim_shell_path_token_end(token: &str) -> String {
+    let mut trimmed = token.trim_end_matches(['.', ',', ':']).to_string();
+    loop {
+        let closes = trimmed.chars().filter(|ch| *ch == ')').count();
+        let opens = trimmed.chars().filter(|ch| *ch == '(').count();
+        if closes > opens && trimmed.ends_with(')') {
+            trimmed.pop();
+            continue;
+        }
+        break;
+    }
+    trimmed
+}
+
+fn collect_local_workspace_path_token(input: &str, start: usize) -> String {
+    const BRACED_HOME: &str = "${HOME}/";
+    if input[start..].starts_with(BRACED_HOME) {
+        let suffix_start = start + BRACED_HOME.len();
+        return format!(
+            "{BRACED_HOME}{}",
+            collect_shell_path_token(input, suffix_start)
+        );
+    }
+    collect_shell_path_token(input, start)
+}
+
+/// Extract absolute local workspace path mentions from shell-ish user text.
+///
+/// This intentionally recognizes user-machine paths (`~/`, `$HOME`, `/Users`,
+/// `/home`, `/Volumes`, Windows drive paths), not arbitrary relative paths.
+/// It is used before deciding whether a server-sandbox run can safely own a
+/// request or must be routed to an edge workspace.
+pub fn extract_local_workspace_path_mentions(command: &str) -> Vec<String> {
+    let mut mentions = Vec::new();
+    let mut previous = None;
+    for (index, ch) in command.char_indices() {
+        let at_boundary = shell_path_start_boundary(previous);
+        let rest = &command[index..];
+        let is_local_path = at_boundary
+            && (shell_home_path_at(command, index)
+                || rest.starts_with("/Users/")
+                || rest.starts_with("/home/")
+                || rest.starts_with("/Volumes/")
+                || windows_drive_path_at(command, index));
+        if is_local_path {
+            let token = collect_local_workspace_path_token(command, index);
+            if !token.is_empty() && !mentions.iter().any(|existing| existing == &token) {
+                mentions.push(token);
+            }
+        }
+        previous = Some(ch);
+    }
+    mentions
+}
+
 /// Scrub secret environment variables from a subprocess environment map.
 ///
 /// Returns the scrubbed map. Also removes `INPUT_<NAME>` variants
@@ -639,5 +772,30 @@ mod tests {
             is_internal_safe_path("/Users/test/.astra/config.toml"),
             None
         );
+    }
+
+    #[test]
+    fn local_workspace_path_mentions_preserve_spaces_and_parentheses() {
+        assert_eq!(
+            extract_local_workspace_path_mentions("fix /Users/test/project (v2)/src/main.rs"),
+            vec!["/Users/test/project (v2)/src/main.rs"]
+        );
+        assert_eq!(
+            extract_local_workspace_path_mentions(
+                "compare /Users/test/My Project/src/lib.rs with README"
+            ),
+            vec!["/Users/test/My Project/src/lib.rs"]
+        );
+    }
+
+    #[test]
+    fn local_workspace_path_helpers_detect_home_and_windows_paths() {
+        assert!(is_shell_home_path("~/repo"));
+        assert!(is_shell_home_path("$HOME/repo"));
+        assert!(is_shell_home_path("${HOME}/repo"));
+        assert!(!is_shell_home_path(""));
+        assert!(is_windows_drive_path("C:\\Users\\test\\repo"));
+        assert!(is_windows_drive_path("D:/Users/test/repo"));
+        assert!(!is_windows_drive_path("/Users/test/repo"));
     }
 }

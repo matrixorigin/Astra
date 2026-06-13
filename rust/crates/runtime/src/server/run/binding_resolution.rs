@@ -463,6 +463,33 @@ fn non_empty_string(value: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::path::Path;
+
+    fn test_request(message: &str) -> astra_services::runs::ChatRequestData {
+        astra_services::runs::ChatRequestData {
+            message: message.to_string(),
+            session_id: None,
+            full_llm_capture: false,
+            agent_id: None,
+            model: None,
+            llm_token_service: None,
+            skill_search: None,
+            allow_skills: None,
+            allow_skill_sources: None,
+            allow_tools: None,
+            workspace_binding: None,
+            executor_binding: None,
+            runtime_mcp_bindings: Vec::new(),
+            mcp_binding_ids: None,
+            context: None,
+            forward_headers: std::collections::HashMap::new(),
+            execution_budget: None,
+            explain: false,
+            interaction_mode: None,
+            interactive_client: false,
+        }
+    }
 
     #[test]
     fn fallback_policy_request_maps_all_runtime_variants() {
@@ -470,5 +497,113 @@ mod tests {
             fallback_policy_from_request(astra_services::runs::FallbackPolicyRequest::Disabled),
             FallbackPolicy::Disabled
         );
+    }
+
+    #[test]
+    fn request_uses_server_workspace_only_when_no_edge_workspace_is_available() {
+        let request = test_request("hello");
+
+        assert!(request_uses_server_workspace(&request, false));
+        assert!(!request_uses_server_workspace(&request, true));
+    }
+
+    #[test]
+    fn request_execution_bindings_ignore_client_cwd_for_server_sandbox() {
+        let mut request = test_request("hello");
+        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+            kind: astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox,
+            display_name: Some("Requested server".to_string()),
+            cwd: Some("/client/claimed/path".to_string()),
+            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
+        });
+        request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+            kind: astra_services::runs::ExecutorBindingRequestKind::ServerLocal,
+            executor_id: Some("server-local-2".to_string()),
+            display_name: Some("Requested executor".to_string()),
+            transport: Some(astra_services::runs::ToolTransportKindRequest::ServerLocal),
+            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+        });
+
+        let server_workspace = Path::new("/tmp/astra-runtime-workspace");
+        let (workspace, executor) = resolve_request_execution_bindings(&request, server_workspace);
+
+        assert_eq!(workspace.kind, WorkspaceBindingKind::ServerSandbox);
+        assert_eq!(
+            workspace.cwd.as_deref(),
+            Some("/tmp/astra-runtime-workspace")
+        );
+        assert_eq!(workspace.display_name, "Requested server");
+        assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
+        assert_eq!(executor.executor_id, "server-local-2");
+        assert_eq!(executor.display_name, "Requested executor");
+    }
+
+    #[test]
+    fn request_bindings_without_server_workspace_use_edge_profile_for_default_request() {
+        let mut edge_profile = Map::new();
+        edge_profile.insert("cwd".to_string(), Value::String("/repo".to_string()));
+        edge_profile.insert(
+            "edge_agent_id".to_string(),
+            Value::String("edge-1".to_string()),
+        );
+        edge_profile.insert("hostname".to_string(), Value::String("devbox".to_string()));
+        let request = test_request("hello");
+
+        let (workspace, executor) =
+            resolve_request_execution_bindings_without_server_workspace(&request, &edge_profile)
+                .expect("edge profile should resolve");
+
+        assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
+        assert_eq!(workspace.cwd.as_deref(), Some("/repo"));
+        assert_eq!(workspace.display_name, "devbox");
+        assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
+        assert_eq!(executor.executor_id, "edge-1");
+        assert_eq!(executor.transport, ToolTransportKind::EdgeLedger);
+    }
+
+    #[test]
+    fn request_bindings_without_server_workspace_reject_server_sandbox_binding() {
+        let mut request = test_request("hello");
+        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+            kind: astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox,
+            display_name: None,
+            cwd: None,
+            authority: None,
+            fallback_policy: None,
+        });
+
+        assert!(
+            resolve_request_execution_bindings_without_server_workspace(&request, &Map::new())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn metadata_server_sandbox_binding_rewrites_cwd_to_current_workspace() {
+        let metadata = json!({
+            "workspace": {
+                "kind": "server_sandbox",
+                "display_name": "Server sandbox",
+                "cwd": "/stale/workspace",
+                "authority": "read_write",
+                "fallback_policy": "disabled"
+            },
+            "executor": {
+                "kind": "server_local",
+                "executor_id": "server-local",
+                "display_name": "Server sandbox",
+                "transport": "server_local",
+                "status": "online"
+            }
+        });
+
+        let (workspace, executor) =
+            execution_bindings_from_metadata(Some(&metadata), Path::new("/current/workspace"))
+                .expect("metadata should resolve");
+
+        assert_eq!(workspace.kind, WorkspaceBindingKind::ServerSandbox);
+        assert_eq!(workspace.cwd.as_deref(), Some("/current/workspace"));
+        assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
     }
 }

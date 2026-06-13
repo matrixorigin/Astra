@@ -1,7 +1,7 @@
-'use client';
+"use client";
 
-import { useRouter } from 'next/navigation';
-import { useCallback, useRef, type Dispatch, type SetStateAction } from 'react';
+import { useRouter } from "next/navigation";
+import { useCallback, useRef, type Dispatch, type SetStateAction } from "react";
 import {
   getChat,
   getEdgeStatus,
@@ -13,19 +13,20 @@ import {
   streamChatMessage,
   streamExistingChatRun,
   updateChatModel,
-} from '@/lib/api/chats';
+} from "@/lib/api/chats";
+import { createAssistantPatchController } from "@/lib/api/assistant-patch-controller";
 import {
   WebApiError,
   isAuthRequiredError,
   isNotFoundError,
-} from '@/lib/api/errors';
+} from "@/lib/api/errors";
 import type {
   ChatDetail,
   ChatMessage,
   ComposerOptions,
   WorkSurfaceRunResponse,
   WorkspaceSelection,
-} from '@/lib/api/types';
+} from "@/lib/api/types";
 import {
   applyWorkSurfaceEvent,
   beginWorkSurfaceLoad,
@@ -34,8 +35,8 @@ import {
   hydrateWorkSurface,
   resetWorkSurfaceForRun,
   type WorkSurfaceResponse as WorkSurfaceProjection,
-} from '@/lib/work-surface';
-import { useToast } from '@/components/ui/toast';
+} from "@/lib/work-surface";
+import { useToast } from "@/components/ui/toast";
 
 const STREAM_RECONCILE_INITIAL_DELAY_MS = 3_000;
 const STREAM_RECONCILE_INTERVAL_MS = 5_000;
@@ -44,26 +45,26 @@ const STOP_RECONCILE_INTERVAL_MS = 1_000;
 const STOP_RECONCILE_NOTICE_MS = 15_000;
 const RUN_ATTACH_MAX_RETRIES = 4;
 const ATTACHABLE_RUN_STATUSES = new Set([
-  'running',
-  'blocked',
-  'input-queued',
-  'waiting',
-  'cancelling',
+  "running",
+  "blocked",
+  "input-queued",
+  "waiting",
+  "cancelling",
 ]);
 
 // Re-exported helpers
 export { ATTACHABLE_RUN_STATUSES };
 
 function isAbortError(error: unknown) {
-  return error instanceof DOMException && error.name === 'AbortError';
+  return error instanceof DOMException && error.name === "AbortError";
 }
 
 function isWorkspaceSelectionError(error: unknown): error is WebApiError {
   return (
     error instanceof WebApiError &&
     error.status === 409 &&
-    typeof error.code === 'string' &&
-    error.code.startsWith('workspace_')
+    typeof error.code === "string" &&
+    error.code.startsWith("workspace_")
   );
 }
 
@@ -76,8 +77,8 @@ function hasCompletedAssistantAfterUser(
   for (let i = userIndex + 1; i < detail.messages.length; i++) {
     const message = detail.messages[i];
     if (
-      message.role === 'assistant' &&
-      message.status !== 'streaming' &&
+      message.role === "assistant" &&
+      message.status !== "streaming" &&
       message.content.trim()
     ) {
       return true;
@@ -98,7 +99,7 @@ function streamRunUpdate(
     nextEventIndex?: number | null;
   },
   assistantMessageId: string,
-): NonNullable<ChatDetail['activeRun']> {
+): NonNullable<ChatDetail["activeRun"]> {
   return {
     runId: run.runId,
     status: run.status,
@@ -108,71 +109,14 @@ function streamRunUpdate(
   };
 }
 
-function createAssistantPatchController(params: {
-  setDetail: Dispatch<SetStateAction<ChatDetail>>;
-  getAssistantId: () => string;
-}) {
-  let framePatch: Partial<ChatMessage> | null = null;
-  let frameRaf: number | null = null;
-  let mounted = true;
-
-  const applyPatch = (assistantId: string, patch: Partial<ChatMessage>) => {
-    if (!mounted) return;
-    params.setDetail((current) => ({
-      ...current,
-      messages: current.messages.map((message) =>
-        message.id === assistantId ? { ...message, ...patch } : message,
-      ),
-    }));
-  };
-
-  const flush = () => {
-    const patch = framePatch;
-    const assistantId = params.getAssistantId();
-    framePatch = null;
-    frameRaf = null;
-    if (patch) {
-      applyPatch(assistantId, patch);
-    }
-  };
-
-  return {
-    patchNow(patch: Partial<ChatMessage>) {
-      applyPatch(params.getAssistantId(), patch);
-    },
-    patchBatched(patch: Partial<ChatMessage>) {
-      if (!mounted) return;
-      framePatch = { ...framePatch, ...patch };
-      if (frameRaf === null) {
-        frameRaf = requestAnimationFrame(flush);
-      }
-    },
-    flushNow() {
-      if (frameRaf !== null) {
-        cancelAnimationFrame(frameRaf);
-        frameRaf = null;
-      }
-      flush();
-    },
-    cancel() {
-      mounted = false;
-      if (frameRaf !== null) {
-        cancelAnimationFrame(frameRaf);
-        frameRaf = null;
-      }
-      framePatch = null;
-    },
-  };
-}
-
 function findStreamingAssistantMessageId(messages: ChatMessage[]) {
   return [...messages]
     .reverse()
     .find(
       (message) =>
-        message.role === 'assistant' &&
-        (message.status === 'streaming' ||
-          message.reasoningStatus === 'streaming'),
+        message.role === "assistant" &&
+        (message.status === "streaming" ||
+          message.reasoningStatus === "streaming"),
     )?.id;
 }
 
@@ -181,9 +125,9 @@ function completeLatestStreamingAssistantAsStopped(messages: ChatMessage[]) {
     .reverse()
     .findIndex(
       (message) =>
-        message.role === 'assistant' &&
-        (message.status === 'streaming' ||
-          message.reasoningStatus === 'streaming'),
+        message.role === "assistant" &&
+        (message.status === "streaming" ||
+          message.reasoningStatus === "streaming"),
     );
   if (index < 0) {
     return messages;
@@ -193,11 +137,11 @@ function completeLatestStreamingAssistantAsStopped(messages: ChatMessage[]) {
     i === actualIndex
       ? {
           ...message,
-          status: 'complete' as const,
+          status: "complete" as const,
           content: message.content.trim()
-            ? `${message.content}${message.content.endsWith('\n') ? '' : '\n'}\nStopped.`
-            : 'Stopped.',
-          reasoningStatus: 'complete' as const,
+            ? `${message.content}${message.content.endsWith("\n") ? "" : "\n"}\nStopped.`
+            : "Stopped.",
+          reasoningStatus: "complete" as const,
         }
       : message,
   );
@@ -375,7 +319,7 @@ export function useStreamLifecycle(
         preferredMessageId &&
         detail.messages.some(
           (message) =>
-            message.id === preferredMessageId && message.role === 'assistant',
+            message.id === preferredMessageId && message.role === "assistant",
         )
       ) {
         return preferredMessageId;
@@ -390,7 +334,7 @@ export function useStreamLifecycle(
       setDetail((current) =>
         current.messages.some(
           (message) =>
-            message.id === assistantMessageId && message.role === 'assistant',
+            message.id === assistantMessageId && message.role === "assistant",
         ) || findStreamingAssistantMessageId(current.messages)
           ? current
           : {
@@ -399,12 +343,12 @@ export function useStreamLifecycle(
                 ...current.messages,
                 {
                   id: assistantMessageId,
-                  role: 'assistant' as const,
-                  content: '',
+                  role: "assistant" as const,
+                  content: "",
                   createdAt: new Date().toISOString(),
-                  status: 'streaming' as const,
-                  reasoning: '',
-                  reasoningStatus: 'streaming' as const,
+                  status: "streaming" as const,
+                  reasoning: "",
+                  reasoningStatus: "streaming" as const,
                 },
               ],
             },
@@ -461,7 +405,7 @@ export function useStreamLifecycle(
             current,
             error instanceof Error
               ? error.message
-              : 'Failed to load work surface.',
+              : "Failed to load work surface.",
           ),
         );
       }
@@ -522,19 +466,19 @@ export function useStreamLifecycle(
           onReasoning: (reasoning) => {
             assistantPatcher.patchBatched({
               reasoning,
-              reasoningStatus: 'streaming',
-              status: 'streaming',
+              reasoningStatus: "streaming",
+              status: "streaming",
             });
           },
           onReasoningDone: (reasoning) => {
             assistantPatcher.patchBatched({
               reasoning,
-              reasoningStatus: 'complete',
-              status: 'streaming',
+              reasoningStatus: "complete",
+              status: "streaming",
             });
           },
           onText: (content) => {
-            assistantPatcher.patchBatched({ content, status: 'streaming' });
+            assistantPatcher.patchBatched({ content, status: "streaming" });
           },
           onArtifacts: (artifacts) => {
             assistantPatcher.patchBatched({ artifacts });
@@ -545,25 +489,25 @@ export function useStreamLifecycle(
             assistantPatcher.patchNow({
               content:
                 content ||
-                'Astra completed the run without returning visible text.',
-              reasoningStatus: 'complete',
-              status: 'complete',
+                "Astra completed the run without returning visible text.",
+              reasoningStatus: "complete",
+              status: "complete",
             });
           },
           onCancelled: (content) => {
             assistantPatcher.flushNow();
             clearActiveRun();
             assistantPatcher.patchNow({
-              content: content || 'Stopped.',
-              reasoningStatus: 'complete',
-              status: 'complete',
+              content: content || "Stopped.",
+              reasoningStatus: "complete",
+              status: "complete",
             });
           },
           onPaused: (content) => {
             assistantPatcher.flushNow();
             assistantPatcher.patchNow({
               content,
-              status: 'streaming',
+              status: "streaming",
             });
           },
         },
@@ -591,8 +535,8 @@ export function useStreamLifecycle(
           }
           if (options?.scheduleRetry?.()) {
             assistantPatcher.patchNow({
-              status: 'streaming',
-              reasoningStatus: 'streaming',
+              status: "streaming",
+              reasoningStatus: "streaming",
             });
             return;
           }
@@ -601,8 +545,8 @@ export function useStreamLifecycle(
               streamError instanceof Error
                 ? `${failureMessage} (${streamError.message})`
                 : failureMessage,
-            reasoningStatus: 'complete',
-            status: 'failed',
+            reasoningStatus: "complete",
+            status: "failed",
           });
         })
         .finally(() => {
@@ -647,20 +591,20 @@ export function useStreamLifecycle(
       let currentUserId = pendingMessageId ?? crypto.randomUUID();
       const userMessage: ChatMessage = {
         id: currentUserId,
-        role: 'user',
+        role: "user",
         content: text,
         activeSkills: options.activeSkills,
         createdAt: timestamp,
-        status: 'complete',
+        status: "complete",
       };
       const assistantMessage: ChatMessage = {
         id: assistantId,
-        role: 'assistant',
-        content: '',
+        role: "assistant",
+        content: "",
         createdAt: timestamp,
-        status: 'streaming',
-        reasoning: '',
-        reasoningStatus: 'streaming',
+        status: "streaming",
+        reasoning: "",
+        reasoningStatus: "streaming",
       };
 
       const assistantPatcher = createAssistantPatchController({
@@ -783,7 +727,7 @@ export function useStreamLifecycle(
               ...current,
               activeRun: {
                 runId,
-                status: 'running',
+                status: "running",
                 waitingFor: null,
                 assistantMessageId: currentAssistantId,
                 nextEventIndex: null,
@@ -829,19 +773,19 @@ export function useStreamLifecycle(
           onReasoning: (reasoning) => {
             assistantPatcher.patchBatched({
               reasoning,
-              reasoningStatus: 'streaming',
-              status: 'streaming',
+              reasoningStatus: "streaming",
+              status: "streaming",
             });
           },
           onReasoningDone: (reasoning) => {
             assistantPatcher.patchBatched({
               reasoning,
-              reasoningStatus: 'complete',
-              status: 'streaming',
+              reasoningStatus: "complete",
+              status: "streaming",
             });
           },
           onText: (content) => {
-            assistantPatcher.patchBatched({ content, status: 'streaming' });
+            assistantPatcher.patchBatched({ content, status: "streaming" });
           },
           onArtifacts: (artifacts) => {
             assistantPatcher.patchBatched({ artifacts });
@@ -860,9 +804,9 @@ export function useStreamLifecycle(
             assistantPatcher.patchNow({
               content:
                 content ||
-                'Astra completed the run without returning visible text.',
-              reasoningStatus: 'complete',
-              status: 'complete',
+                "Astra completed the run without returning visible text.",
+              reasoningStatus: "complete",
+              status: "complete",
             });
           },
           onCancelled: (content) => {
@@ -878,16 +822,16 @@ export function useStreamLifecycle(
                 : current,
             );
             assistantPatcher.patchNow({
-              content: content || 'Stopped.',
-              reasoningStatus: 'complete',
-              status: 'complete',
+              content: content || "Stopped.",
+              reasoningStatus: "complete",
+              status: "complete",
             });
           },
           onPaused: (content) => {
             assistantPatcher.flushNow();
             assistantPatcher.patchNow({
               content,
-              status: 'streaming',
+              status: "streaming",
             });
           },
         });
@@ -920,16 +864,16 @@ export function useStreamLifecycle(
           void refreshEdgeWorkspaces();
           assistantPatcher.patchNow({
             content: error.detail,
-            reasoningStatus: 'complete',
-            status: 'failed',
+            reasoningStatus: "complete",
+            status: "failed",
           });
           return;
         }
         const message =
-          error instanceof Error ? error.message : 'Astra stream failed.';
+          error instanceof Error ? error.message : "Astra stream failed.";
         assistantPatcher.patchNow({
           content: `I could not reach the Astra runtime from the web UI. (${message})`,
-          status: 'failed',
+          status: "failed",
         });
       } finally {
         if (streamRunId && streamRunLease !== null) {
@@ -1029,19 +973,19 @@ export function useStreamLifecycle(
             onReasoning: (reasoning) => {
               assistantPatcher.patchBatched({
                 reasoning,
-                reasoningStatus: 'streaming',
-                status: 'streaming',
+                reasoningStatus: "streaming",
+                status: "streaming",
               });
             },
             onReasoningDone: (reasoning) => {
               assistantPatcher.patchBatched({
                 reasoning,
-                reasoningStatus: 'complete',
-                status: 'streaming',
+                reasoningStatus: "complete",
+                status: "streaming",
               });
             },
             onText: (content) => {
-              assistantPatcher.patchBatched({ content, status: 'streaming' });
+              assistantPatcher.patchBatched({ content, status: "streaming" });
             },
             onArtifacts: (artifacts) => {
               assistantPatcher.patchBatched({ artifacts });
@@ -1059,9 +1003,9 @@ export function useStreamLifecycle(
               assistantPatcher.patchNow({
                 content:
                   content ||
-                  'Astra completed the run without returning visible text.',
-                reasoningStatus: 'complete',
-                status: 'complete',
+                  "Astra completed the run without returning visible text.",
+                reasoningStatus: "complete",
+                status: "complete",
               });
             },
             onCancelled: (content) => {
@@ -1075,16 +1019,16 @@ export function useStreamLifecycle(
                   : current,
               );
               assistantPatcher.patchNow({
-                content: content || 'Stopped.',
-                reasoningStatus: 'complete',
-                status: 'complete',
+                content: content || "Stopped.",
+                reasoningStatus: "complete",
+                status: "complete",
               });
             },
             onPaused: (content) => {
               assistantPatcher.flushNow();
               assistantPatcher.patchNow({
                 content,
-                status: 'streaming',
+                status: "streaming",
               });
             },
           },
@@ -1111,8 +1055,8 @@ export function useStreamLifecycle(
               content:
                 streamError instanceof Error
                   ? `The input was queued, but the web UI could not reconnect to the run stream. (${streamError.message})`
-                  : 'The input was queued, but the web UI could not reconnect to the run stream.',
-              status: 'failed',
+                  : "The input was queued, but the web UI could not reconnect to the run stream.",
+              status: "failed",
             });
           })
           .finally(() => {
@@ -1143,8 +1087,8 @@ export function useStreamLifecycle(
         addToast(
           error instanceof Error
             ? error.message
-            : 'Failed to queue input for the active run.',
-          'error',
+            : "Failed to queue input for the active run.",
+          "error",
         );
       } finally {
         runControlMutationRef.current = false;
@@ -1189,8 +1133,8 @@ export function useStreamLifecycle(
         current.activeRun?.runId === runId
           ? {
               ...current.activeRun,
-              status: 'cancelling',
-              waitingFor: 'cancel_requested',
+              status: "cancelling",
+              waitingFor: "cancel_requested",
             }
           : current.activeRun,
       messages: completeLatestStreamingAssistantAsStopped(current.messages),
@@ -1215,7 +1159,7 @@ export function useStreamLifecycle(
             void hydrateWorkSurfaceForChat({ silent: true });
             const activeRun = refreshed.activeRun;
             const stillCancelling =
-              activeRun?.runId === runId && activeRun.status === 'cancelling';
+              activeRun?.runId === runId && activeRun.status === "cancelling";
             if (!stillCancelling) {
               stopReconcileRef.current();
               return;
@@ -1226,8 +1170,8 @@ export function useStreamLifecycle(
             ) {
               noticeShown = true;
               addToast(
-                'Stop request is still being processed by the runtime.',
-                'info',
+                "Stop request is still being processed by the runtime.",
+                "info",
               );
             }
           };
@@ -1260,8 +1204,8 @@ export function useStreamLifecycle(
         addToast(
           error instanceof Error
             ? error.message
-            : 'Failed to stop the active run.',
-          'error',
+            : "Failed to stop the active run.",
+          "error",
         );
       })
       .finally(() => {
@@ -1297,9 +1241,9 @@ export function useStreamLifecycle(
       .reverse()
       .find(
         (message) =>
-          message.role === 'assistant' &&
-          (message.status === 'streaming' ||
-            message.reasoningStatus === 'streaming'),
+          message.role === "assistant" &&
+          (message.status === "streaming" ||
+            message.reasoningStatus === "streaming"),
       )?.id;
     const assistantMessageId =
       existingAssistantMessageId ?? crypto.randomUUID();
@@ -1308,7 +1252,7 @@ export function useStreamLifecycle(
     try {
       const result = await resumeChatRun(detail.chat.id);
       if (!result.activeRun?.runId) {
-        throw new Error('Resume response did not include an active run.');
+        throw new Error("Resume response did not include an active run.");
       }
       const resumedActiveRun = result.activeRun;
       const runId = resumedActiveRun.runId;
@@ -1334,12 +1278,12 @@ export function useStreamLifecycle(
                 ...current.messages,
                 {
                   id: assistantMessageId,
-                  role: 'assistant',
-                  content: '',
+                  role: "assistant",
+                  content: "",
                   createdAt: new Date().toISOString(),
-                  status: 'streaming',
-                  reasoning: '',
-                  reasoningStatus: 'streaming',
+                  status: "streaming",
+                  reasoning: "",
+                  reasoningStatus: "streaming",
                 },
               ],
       }));
@@ -1374,19 +1318,19 @@ export function useStreamLifecycle(
             onReasoning: (reasoning) => {
               assistantPatcher.patchBatched({
                 reasoning,
-                reasoningStatus: 'streaming',
-                status: 'streaming',
+                reasoningStatus: "streaming",
+                status: "streaming",
               });
             },
             onReasoningDone: (reasoning) => {
               assistantPatcher.patchBatched({
                 reasoning,
-                reasoningStatus: 'complete',
-                status: 'streaming',
+                reasoningStatus: "complete",
+                status: "streaming",
               });
             },
             onText: (content) => {
-              assistantPatcher.patchBatched({ content, status: 'streaming' });
+              assistantPatcher.patchBatched({ content, status: "streaming" });
             },
             onArtifacts: (artifacts) => {
               assistantPatcher.patchBatched({ artifacts });
@@ -1404,9 +1348,9 @@ export function useStreamLifecycle(
               assistantPatcher.patchNow({
                 content:
                   content ||
-                  'Astra completed the run without returning visible text.',
-                reasoningStatus: 'complete',
-                status: 'complete',
+                  "Astra completed the run without returning visible text.",
+                reasoningStatus: "complete",
+                status: "complete",
               });
             },
             onCancelled: (content) => {
@@ -1420,16 +1364,16 @@ export function useStreamLifecycle(
                   : current,
               );
               assistantPatcher.patchNow({
-                content: content || 'Stopped.',
-                reasoningStatus: 'complete',
-                status: 'complete',
+                content: content || "Stopped.",
+                reasoningStatus: "complete",
+                status: "complete",
               });
             },
             onPaused: (content) => {
               assistantPatcher.flushNow();
               assistantPatcher.patchNow({
                 content,
-                status: 'streaming',
+                status: "streaming",
               });
             },
           },
@@ -1474,8 +1418,8 @@ export function useStreamLifecycle(
         addToast(
           streamError instanceof Error
             ? `The run resumed, but the web UI could not reconnect to its stream. (${streamError.message})`
-            : 'The run resumed, but the web UI could not reconnect to its stream.',
-          'warning',
+            : "The run resumed, but the web UI could not reconnect to its stream.",
+          "warning",
         );
       } finally {
         clearAttachedRun(runId, attachLease);
@@ -1507,8 +1451,8 @@ export function useStreamLifecycle(
       addToast(
         error instanceof Error
           ? error.message
-          : 'Failed to resume the paused run.',
-        'error',
+          : "Failed to resume the paused run.",
+        "error",
       );
     } finally {
       runControlMutationRef.current = false;

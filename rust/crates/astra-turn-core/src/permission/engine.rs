@@ -1311,10 +1311,8 @@ fn sensitive_path_match(tool_name: &str, args: &Value) -> Option<String> {
     if let Some(cmd) = command_hint_from_args(args)
         && !cmd.is_empty()
     {
-        let dangerous = if is_read {
-            command_has_sensitive_ref(cmd) && !command_sensitive_refs_are_internal_artifacts(cmd)
-        } else if command_has_sensitive_ref(cmd) {
-            true
+        let dangerous = if command_has_sensitive_ref(cmd) {
+            !command_sensitive_refs_are_internal_artifacts(cmd)
         } else {
             is_dangerous_file_path(cmd) || crate::permission::redact::matches_sensitive_path(cmd)
         };
@@ -2006,6 +2004,27 @@ mod tests {
                 | DecisionSource::ExplicitApprovalGate { .. }
                 | DecisionSource::Mode { .. }
         ));
+    }
+
+    #[test]
+    fn sensitive_path_match_ignores_internal_artifact_refs_inside_shell_pipelines() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact_path = temp
+            .path()
+            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, "{\"ok\":true}").unwrap();
+        let artifact_path = artifact_path.to_string_lossy().to_string();
+
+        let args = serde_json::json!({
+            "command": format!("cat {artifact_path} | python3 -c 'import sys, json; print(json.load(sys.stdin))'")
+        });
+
+        assert_eq!(
+            sensitive_path_match("bash", &args),
+            None,
+            "internal tool-result artifacts must not trigger the sensitive-path opt-in gate"
+        );
     }
 
     #[test]

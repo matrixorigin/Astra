@@ -1,5 +1,6 @@
 import {
   blockedRunMessage,
+  projectRunWaitingState,
   runWaitingStatusMessage,
 } from "@/lib/run-status-messages";
 
@@ -11,7 +12,9 @@ describe("run status messages", () => {
     expect(runWaitingStatusMessage("fallback_disabled", true)).toBe(
       "Run paused because server fallback is disabled for this workspace.",
     );
-    expect(runWaitingStatusMessage("workspace_executor_unavailable", true)).toBe(
+    expect(
+      runWaitingStatusMessage("workspace_executor_unavailable", true),
+    ).toBe(
       "Run paused because the selected workspace is not connected to an available executor. Choose Server sandbox or a connected edge workspace.",
     );
   });
@@ -23,6 +26,24 @@ describe("run status messages", () => {
     expect(runWaitingStatusMessage("custom_runtime_signal", false)).toBe(
       "Waiting for custom runtime signal.",
     );
+  });
+
+  it("projects ordinary waiting events without promoting them to blocked", () => {
+    expect(
+      projectRunWaitingState({ reason: "waiting: tool_approval" }),
+    ).toEqual({
+      status: "waiting",
+      waitingFor: "tool_approval",
+      blocked: false,
+    });
+  });
+
+  it("projects execution-boundary waiting events as blocked", () => {
+    expect(projectRunWaitingState({ error_kind: "executor_offline" })).toEqual({
+      status: "blocked",
+      waitingFor: "executor_offline",
+      blocked: true,
+    });
   });
 
   it("maps blocked reasons to actionable work-surface messages", () => {
