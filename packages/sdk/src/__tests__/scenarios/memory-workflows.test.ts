@@ -22,7 +22,7 @@ function jsonResponse(body: unknown, status = 200): Response {
 describe('scenarios / memory workflows', () => {
   it('stores session-scoped memories, searches by score order, retrieves topK, and purges by topic', async () => {
     const stored: Array<MemoryEntry & { id: string }> = [];
-    const fetchImpl = jest.fn().mockImplementation((url: string, init?: RequestInit) => {
+    const fetchImpl = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
       const path = new URL(url).pathname;
       const body = init?.body ? JSON.parse(String(init.body)) : {};
 

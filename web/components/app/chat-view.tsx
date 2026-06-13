@@ -407,6 +407,8 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     setRunAttachRetrySignal,
     refreshEdgeWorkspaces: ws.refreshEdgeWorkspaces,
   });
+  const hydrateWorkSurfaceForChat = stream.hydrateWorkSurfaceForChat;
+  const startStream = stream.startStream;
 
   // ── ui state derived from work surface ─────────────────────────────────────
   const showRunStatusPanel = Boolean(detail.activeRun?.runId && canResumeRun);
@@ -470,8 +472,8 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
 
   // Hydrate work surface
   useEffect(() => {
-    void stream.hydrateWorkSurfaceForChat();
-  }, [stream.hydrateWorkSurfaceForChat]);
+    void hydrateWorkSurfaceForChat();
+  }, [hydrateWorkSurfaceForChat]);
 
   // Auto-attach to an existing run stream
   useEffect(() => {
@@ -546,7 +548,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         return;
       }
       pendingStartedRef.current = pendingTurn.messageId;
-      void stream.startStream({
+      void startStream({
         text: pendingTurn.content,
         options: pendingTurn.options,
         pendingMessageId: pendingTurn.messageId,
@@ -554,7 +556,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       });
     }, 0);
     return () => window.clearTimeout(timer);
-  }, [detail.pendingTurn, isArchived, stream.startStream]);
+  }, [detail.pendingTurn, isArchived, startStream]);
 
   // Chat lifecycle subscription
   useEffect(

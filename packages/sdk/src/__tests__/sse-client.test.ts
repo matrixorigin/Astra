@@ -28,7 +28,7 @@ function createMockStream(chunks: string[]): ReadableStream<Uint8Array> {
 }
 
 function mockFetchStream(chunks: string[], status = 200) {
-  return jest.fn().mockResolvedValue({
+  return vi.fn().mockResolvedValue({
     ok: status >= 200 && status < 300,
     status,
     statusText: status === 200 ? "OK" : "Error",
@@ -38,7 +38,7 @@ function mockFetchStream(chunks: string[], status = 200) {
 }
 
 function mockFetchNoBody(status = 200) {
-  return jest.fn().mockResolvedValue({
+  return vi.fn().mockResolvedValue({
     ok: status >= 200 && status < 300,
     status,
     statusText: "OK",
@@ -70,7 +70,7 @@ describe("SSEClient — Connection", () => {
     });
     await client.connect();
 
-    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(call[0]).toBe("http://localhost/stream");
     expect(call[1].headers["Accept"]).toBe("text/event-stream");
     expect(call[1].headers["Authorization"]).toBe("Bearer my-token");
@@ -87,7 +87,7 @@ describe("SSEClient — Connection", () => {
     });
     await client.connect();
 
-    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(call[1].headers["Authorization"]).toBeUndefined();
   });
 
@@ -102,7 +102,7 @@ describe("SSEClient — Connection", () => {
     });
     await client.connect();
 
-    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(call[1].headers["X-Custom"]).toBe("value");
   });
 
@@ -119,7 +119,7 @@ describe("SSEClient — Connection", () => {
     });
     await client.connect();
 
-    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(call[1].method).toBe("POST");
     expect(call[1].body).toBe(body);
     expect(call[1].headers["Content-Type"]).toBe("application/json");
@@ -313,7 +313,7 @@ describe("SSEClient — Close", () => {
 
   test("close() during connect aborts fetch", async () => {
     let fetchAborted = false;
-    globalThis.fetch = jest
+    globalThis.fetch = vi
       .fn()
       .mockImplementation((_url: string, opts: { signal: AbortSignal }) => {
         opts.signal.addEventListener("abort", () => {
@@ -351,7 +351,7 @@ describe("SSEClient — AbortSignal", () => {
     // Abort immediately
     controller.abort();
 
-    globalThis.fetch = jest
+    globalThis.fetch = vi
       .fn()
       .mockRejectedValue(new DOMException("aborted", "AbortError"));
 

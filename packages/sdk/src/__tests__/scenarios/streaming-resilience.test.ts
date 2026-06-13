@@ -79,7 +79,7 @@ describe('scenarios / streaming resilience', () => {
       bytes.slice(17, bytes.length - 11),
       bytes.slice(bytes.length - 11),
     ];
-    globalThis.fetch = jest.fn().mockResolvedValue(streamResponse(byteStream(chunks)));
+    globalThis.fetch = vi.fn().mockResolvedValue(streamResponse(byteStream(chunks)));
 
     const events: StreamEvent[] = [];
     const client = new SSEClient({
@@ -93,7 +93,7 @@ describe('scenarios / streaming resilience', () => {
   });
 
   it('emits an error for a stream that ends after tool_call_start without tool_call_end', async () => {
-    globalThis.fetch = jest.fn().mockResolvedValue(streamResponse(streamFromText([
+    globalThis.fetch = vi.fn().mockResolvedValue(streamResponse(streamFromText([
       'data: {"type":"tool_call_start","call_id":"c1","tool":"bash","arguments":"{}"}\n\n',
       'data: {"type":"error","message":"edge executor disconnected","retryable":true}\n\n',
     ])));
@@ -116,7 +116,7 @@ describe('scenarios / streaming resilience', () => {
   it('retries one transient HTTP failure and then streams successfully', async () => {
     const states: ConnectionState[] = [];
     const events: StreamEvent[] = [];
-    globalThis.fetch = jest
+    globalThis.fetch = vi
       .fn()
       .mockResolvedValueOnce(streamResponse(streamFromText([]), 503))
       .mockResolvedValueOnce(streamResponse(streamFromText([
@@ -145,7 +145,7 @@ describe('scenarios / streaming resilience', () => {
 
   it('stops after maxRetries instead of resetting retry count on every reconnect', async () => {
     const events: StreamEvent[] = [];
-    globalThis.fetch = jest
+    globalThis.fetch = vi
       .fn()
       .mockResolvedValue(streamResponse(streamFromText([]), 503));
 

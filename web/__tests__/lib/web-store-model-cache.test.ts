@@ -1,24 +1,21 @@
-/**
- * @jest-environment node
- *
- * Tests for resolveBackendModelName cache behavior.
- */
+// @vitest-environment node
 
-import { WebRuntimeClient } from "@/lib/runtime-client";
+import { WebRuntimeClient } from "@/lib/runtime-client/server";
 import { resolveBackendModelName } from "@/lib/api/web-store";
 import { resetModelCacheForTests } from "@/lib/api/model-cache";
 
-jest.mock("@/lib/runtime-client", () => {
-  const actual = jest.requireActual("@/lib/runtime-client");
-  return { ...actual, WebRuntimeClient: jest.fn() };
+vi.mock("@/lib/runtime-client/server", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/lib/runtime-client/server")>();
+  return { ...actual, WebRuntimeClient: vi.fn() };
 });
 
-const MockedWRC = WebRuntimeClient as jest.Mock;
+const MockedWRC = WebRuntimeClient as ReturnType<typeof vi.fn>;
 
 let tokenCounter = 0;
 
 function makeRuntime(overrides: Partial<{ accessToken: string | null }> = {}) {
-  const mockListModels = jest.fn();
+  const mockListModels = vi.fn();
   const mockConfig = {
     mode: "live" as const,
     apiUrl: "http://test.test",
@@ -30,10 +27,12 @@ function makeRuntime(overrides: Partial<{ accessToken: string | null }> = {}) {
     tokenExpiresAtMs: null as number | null,
   };
 
-  MockedWRC.mockImplementation(() => ({
-    config: mockConfig,
-    sdk: { listModels: mockListModels },
-  }));
+  MockedWRC.mockImplementation(function () {
+    return {
+      config: mockConfig,
+      sdk: { listModels: mockListModels },
+    };
+  });
 
   const client = new WebRuntimeClient(mockConfig as any);
   return { client, mockListModels };

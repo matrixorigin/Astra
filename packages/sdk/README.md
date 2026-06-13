@@ -236,7 +236,7 @@ npm test
 npm run build
 ```
 
-Jest config: `jest.config.mjs` (no `ts-node` required). Suites cover `AstraClient`, SSE/WebSocket helpers, React hooks, and **`paths`** (`buildQueryString`, `joinApiPath`, path encoders).
+Vitest config: `vitest.config.ts`. Suites cover `AstraClient`, SSE/WebSocket helpers, React hooks, and **`paths`** (`buildQueryString`, `joinApiPath`, path encoders).
 
 ## License
 

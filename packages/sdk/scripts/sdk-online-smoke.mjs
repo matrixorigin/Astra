@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Mode B quick smoke: GET {base}/health, optional /auth/me, /sessions, run routes.
- * Uses global fetch only (no SDK build). Mirrors env vars for Jest Mode B.
+ * Uses global fetch only (no SDK build). Mirrors env vars for Vitest Mode B.
  *
  * Usage:
  *   ASTRA_SDK_BASE_URL=http://127.0.0.1:8080 node scripts/sdk-online-smoke.mjs

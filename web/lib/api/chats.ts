@@ -7,7 +7,7 @@ import {
   eventMessage,
   explicitEventMessage,
   isRunBlockedEvent,
-} from "@/lib/api/stream-event-handler";
+} from "@/lib/api/stream-event-helpers";
 import type {
   ChatDetail,
   ChatMessage,

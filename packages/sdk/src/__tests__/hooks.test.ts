@@ -1,5 +1,5 @@
 /**
- * @jest-environment jsdom
+ * @vitest-environment jsdom
  */
 import { renderHook, act } from "@testing-library/react";
 import { useAstraChat, useAstraRun } from "../hooks";
@@ -13,12 +13,12 @@ function createMockClient() {
   const client = new AstraClient({ baseUrl: "http://localhost" });
 
   // Mock streamChat to call onEvent callbacks synchronously
-  const streamChatMock = jest.fn();
+  const streamChatMock = vi.fn();
   client.streamChat = streamChatMock;
 
   // Mock run polling
-  const getRunStatusMock = jest.fn();
-  const getRunEventsMock = jest.fn();
+  const getRunStatusMock = vi.fn();
+  const getRunEventsMock = vi.fn();
   client.getRunStatus = getRunStatusMock;
   client.getRunEvents = getRunEventsMock;
 
@@ -29,8 +29,8 @@ function createMockClient() {
  * Helper: set up streamChat mock to fire a sequence of events.
  * Returns a fake SSEClient with a close() spy.
  */
-function mockStreamEvents(streamChatMock: jest.Mock, events: StreamEvent[]) {
-  const closeSpy = jest.fn();
+function mockStreamEvents(streamChatMock: ReturnType<typeof vi.fn>, events: StreamEvent[]) {
+  const closeSpy = vi.fn();
 
   streamChatMock.mockImplementation(
     (
@@ -170,7 +170,7 @@ describe("useAstraChat", () => {
 
   test("ignores late events from superseded streams", () => {
     const { client, streamChatMock } = createMockClient();
-    const closeSpy = jest.fn();
+    const closeSpy = vi.fn();
     const callbacks: Array<(event: StreamEvent) => void> = [];
     streamChatMock.mockImplementation(
       (
@@ -830,10 +830,10 @@ describe("useAstraChat", () => {
 
 describe("useAstraRun", () => {
   beforeEach(() => {
-    jest.useFakeTimers();
+    vi.useFakeTimers();
   });
   afterEach(() => {
-    jest.useRealTimers();
+    vi.useRealTimers();
   });
 
   test("polls run status on mount", async () => {
@@ -847,7 +847,7 @@ describe("useAstraRun", () => {
 
     // Flush the initial refresh
     await act(async () => {
-      await jest.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(0);
     });
 
     expect(getRunStatusMock).toHaveBeenCalledWith("run-1");
@@ -868,13 +868,13 @@ describe("useAstraRun", () => {
 
     // First poll
     await act(async () => {
-      await jest.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(0);
     });
     expect(result.current.events).toHaveLength(1);
 
     // Second poll
     await act(async () => {
-      await jest.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(1000);
     });
     expect(result.current.events).toHaveLength(2);
   });
@@ -889,7 +889,7 @@ describe("useAstraRun", () => {
     );
 
     await act(async () => {
-      await jest.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(0);
     });
 
     expect(result.current.error).toBe("Network error");

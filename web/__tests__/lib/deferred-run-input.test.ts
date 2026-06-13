@@ -1,12 +1,7 @@
-jest.mock('@/lib/runtime-client', () => ({
-  RuntimeClientError: class RuntimeClientError extends Error {},
+vi.mock('@/lib/runtime-client/server', () => ({
   WebRuntimeClient: class WebRuntimeClient {},
-  requireRuntimeClient: jest.fn(),
-  getRuntimeClient: jest.fn(),
-  readRuntimeErrorDetail: jest.fn(),
-  runtimeErrorDetail: jest.fn((error: unknown) =>
-    error instanceof Error ? error.message : String(error),
-  ),
+  requireRuntimeClient: vi.fn(),
+  getRuntimeClient: vi.fn(),
 }));
 
 import {
@@ -17,14 +12,13 @@ import {
   resumeActiveRun,
   stopActiveRun,
 } from '@/lib/api/web-store';
-import { getRuntimeClient, requireRuntimeClient } from '@/lib/runtime-client';
+import {
+  getRuntimeClient,
+  requireRuntimeClient,
+} from '@/lib/runtime-client/server';
 
-const mockGetRuntimeClient = getRuntimeClient as jest.MockedFunction<
-  typeof getRuntimeClient
->;
-const mockRequireRuntimeClient = requireRuntimeClient as jest.MockedFunction<
-  typeof requireRuntimeClient
->;
+const mockGetRuntimeClient = vi.mocked(getRuntimeClient);
+const mockRequireRuntimeClient = vi.mocked(requireRuntimeClient);
 
 describe('queueDeferredRunInput', () => {
   beforeEach(() => {
@@ -34,12 +28,12 @@ describe('queueDeferredRunInput', () => {
   });
 
   it('sends an explicit empty active_skills array so deferred turns can clear prior skill hints', async () => {
-    const submitRunInput = jest.fn().mockResolvedValue({
+    const submitRunInput = vi.fn().mockResolvedValue({
       runId: 'run-1',
       accepted: true,
       duplicate: false,
     });
-    const getRunStatus = jest.fn().mockResolvedValue({
+    const getRunStatus = vi.fn().mockResolvedValue({
       runId: 'run-1',
       sessionId: 'chat-1',
       status: 'running',
@@ -102,12 +96,12 @@ describe('queueDeferredRunInput', () => {
   });
 
   it('does not resubmit or duplicate messages for the same deferred input action', async () => {
-    const submitRunInput = jest.fn().mockResolvedValue({
+    const submitRunInput = vi.fn().mockResolvedValue({
       runId: 'run-1',
       accepted: true,
       duplicate: false,
     });
-    const getRunStatus = jest.fn().mockResolvedValue({
+    const getRunStatus = vi.fn().mockResolvedValue({
       runId: 'run-1',
       sessionId: 'chat-1',
       status: 'running',
@@ -159,10 +153,10 @@ describe('queueDeferredRunInput', () => {
   });
 
   it('does not orphan a local queued message when submitRunInput fails', async () => {
-    const submitRunInput = jest
+    const submitRunInput = vi
       .fn()
       .mockRejectedValue(new Error('runtime unavailable'));
-    const getRunStatus = jest.fn().mockResolvedValue({
+    const getRunStatus = vi.fn().mockResolvedValue({
       runId: 'run-1',
       sessionId: 'chat-1',
       status: 'running',
@@ -220,8 +214,8 @@ describe('queueDeferredRunInput', () => {
   });
 
   it('clears stale active runs before submitting deferred input', async () => {
-    const submitRunInput = jest.fn();
-    const getRunStatus = jest.fn().mockResolvedValue({
+    const submitRunInput = vi.fn();
+    const getRunStatus = vi.fn().mockResolvedValue({
       runId: 'run-1',
       sessionId: 'chat-1',
       status: 'completed',
@@ -266,7 +260,7 @@ describe('queueDeferredRunInput', () => {
   });
 
   it('rejects oversized deferred input before calling the runtime', async () => {
-    const submitRunInput = jest.fn();
+    const submitRunInput = vi.fn();
     mockRequireRuntimeClient.mockResolvedValue({
       sdk: {
         submitRunInput,
@@ -309,7 +303,7 @@ describe('queueDeferredRunInput', () => {
   });
 
   it('hydrates a lost in-memory active run before submitting deferred input', async () => {
-    const listRuntimeSessions = jest.fn().mockResolvedValue({
+    const listRuntimeSessions = vi.fn().mockResolvedValue({
       sessions: [
         {
           session_id: 'chat-1',
@@ -325,7 +319,7 @@ describe('queueDeferredRunInput', () => {
       limit: 200,
       offset: 0,
     });
-    const listRuns = jest.fn().mockResolvedValue({
+    const listRuns = vi.fn().mockResolvedValue({
       runs: [
         {
           runId: 'run-recovered',
@@ -338,12 +332,12 @@ describe('queueDeferredRunInput', () => {
       limit: 200,
       offset: 0,
     });
-    const submitRunInput = jest.fn().mockResolvedValue({
+    const submitRunInput = vi.fn().mockResolvedValue({
       runId: 'run-recovered',
       accepted: true,
       duplicate: false,
     });
-    const getRunStatus = jest.fn().mockResolvedValue({
+    const getRunStatus = vi.fn().mockResolvedValue({
       runId: 'run-recovered',
       sessionId: 'chat-1',
       status: 'running',
@@ -406,7 +400,7 @@ describe('queueDeferredRunInput', () => {
   });
 
   it('hydrates active runs when opening chat detail after in-memory store loss', async () => {
-    const listRuntimeSessions = jest.fn().mockResolvedValue({
+    const listRuntimeSessions = vi.fn().mockResolvedValue({
       sessions: [
         {
           session_id: 'chat-open',
@@ -425,7 +419,7 @@ describe('queueDeferredRunInput', () => {
       limit: 200,
       offset: 0,
     });
-    const listRuns = jest.fn().mockResolvedValue({
+    const listRuns = vi.fn().mockResolvedValue({
       runs: [
         {
           runId: 'run-open',
@@ -438,7 +432,7 @@ describe('queueDeferredRunInput', () => {
       limit: 200,
       offset: 0,
     });
-    const getSessionTranscript = jest.fn().mockResolvedValue({
+    const getSessionTranscript = vi.fn().mockResolvedValue({
       items: [],
       total: 0,
       limit: 200,
@@ -470,7 +464,7 @@ describe('queueDeferredRunInput', () => {
   });
 
   it('hydrates a lost active run before stopping it', async () => {
-    const listRuntimeSessions = jest.fn().mockResolvedValue({
+    const listRuntimeSessions = vi.fn().mockResolvedValue({
       sessions: [
         {
           session_id: 'chat-stop',
@@ -486,7 +480,7 @@ describe('queueDeferredRunInput', () => {
       limit: 200,
       offset: 0,
     });
-    const listRuns = jest.fn().mockResolvedValue({
+    const listRuns = vi.fn().mockResolvedValue({
       runs: [
         {
           runId: 'run-stop',
@@ -499,7 +493,7 @@ describe('queueDeferredRunInput', () => {
       limit: 200,
       offset: 0,
     });
-    const cancelRun = jest.fn().mockResolvedValue(undefined);
+    const cancelRun = vi.fn().mockResolvedValue(undefined);
 
     mockGetRuntimeClient.mockResolvedValue({
       sdk: { listRuntimeSessions, listRuns },
@@ -531,7 +525,7 @@ describe('queueDeferredRunInput', () => {
   });
 
   it('keeps a cancelling active run before runtime cancellation resolves', async () => {
-    const cancelRun = jest.fn(
+    const cancelRun = vi.fn(
       () =>
         new Promise<void>(() => {
           // Keep the runtime request pending to model a slow network/tool cancel.
@@ -582,7 +576,7 @@ describe('queueDeferredRunInput', () => {
   });
 
   it('persists the stopped assistant message while runtime cancellation is pending', async () => {
-    const cancelRun = jest.fn(
+    const cancelRun = vi.fn(
       () =>
         new Promise<void>(() => {
           // Keep cancellation pending so stopActiveRun returns from its timeout path.
@@ -646,7 +640,7 @@ describe('queueDeferredRunInput', () => {
 
   it('restores the assistant message if a pending runtime cancellation later fails', async () => {
     let rejectCancel!: (error: Error) => void;
-    const cancelRun = jest.fn(
+    const cancelRun = vi.fn(
       () =>
         new Promise<void>((_resolve, reject) => {
           rejectCancel = reject;
@@ -712,13 +706,13 @@ describe('queueDeferredRunInput', () => {
 
   it('clears cancelling state when a late runtime cancellation reaches terminal status', async () => {
     let resolveCancel!: () => void;
-    const cancelRun = jest.fn(
+    const cancelRun = vi.fn(
       () =>
         new Promise<void>((resolve) => {
           resolveCancel = resolve;
         }),
     );
-    const getRunStatus = jest.fn().mockResolvedValue({
+    const getRunStatus = vi.fn().mockResolvedValue({
       runId: 'run-stop',
       sessionId: 'chat-stop',
       status: 'cancelled',
@@ -773,7 +767,7 @@ describe('queueDeferredRunInput', () => {
   });
 
   it('does not resurrect a cancelling run as running while backend polling still reports it running', async () => {
-    const cancelRun = jest.fn(
+    const cancelRun = vi.fn(
       () =>
         new Promise<void>(() => {
           // Keep cancellation pending so the next backend sync still sees running.
@@ -782,7 +776,7 @@ describe('queueDeferredRunInput', () => {
     mockRequireRuntimeClient.mockResolvedValue({
       sdk: { cancelRun },
     } as never);
-    const listRuntimeSessions = jest.fn().mockResolvedValue({
+    const listRuntimeSessions = vi.fn().mockResolvedValue({
       sessions: [
         {
           session_id: 'chat-stop',
@@ -798,7 +792,7 @@ describe('queueDeferredRunInput', () => {
       limit: 200,
       offset: 0,
     });
-    const listRuns = jest.fn().mockResolvedValue({
+    const listRuns = vi.fn().mockResolvedValue({
       runs: [
         {
           runId: 'run-stop',
@@ -811,7 +805,7 @@ describe('queueDeferredRunInput', () => {
       limit: 200,
       offset: 0,
     });
-    const getSessionTranscript = jest.fn().mockResolvedValue({
+    const getSessionTranscript = vi.fn().mockResolvedValue({
       items: [],
       total: 0,
       limit: 200,
@@ -855,7 +849,7 @@ describe('queueDeferredRunInput', () => {
   });
 
   it('hydrates a lost paused run before resuming it', async () => {
-    const listRuntimeSessions = jest.fn().mockResolvedValue({
+    const listRuntimeSessions = vi.fn().mockResolvedValue({
       sessions: [
         {
           session_id: 'chat-resume',
@@ -871,7 +865,7 @@ describe('queueDeferredRunInput', () => {
       limit: 200,
       offset: 0,
     });
-    const listRuns = jest.fn().mockResolvedValue({
+    const listRuns = vi.fn().mockResolvedValue({
       runs: [
         {
           runId: 'run-resume',
@@ -884,7 +878,7 @@ describe('queueDeferredRunInput', () => {
       limit: 200,
       offset: 0,
     });
-    const resumeRun = jest.fn().mockResolvedValue(undefined);
+    const resumeRun = vi.fn().mockResolvedValue(undefined);
 
     mockGetRuntimeClient.mockResolvedValue({
       sdk: { listRuntimeSessions, listRuns },

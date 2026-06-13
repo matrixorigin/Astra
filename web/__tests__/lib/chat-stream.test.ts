@@ -15,8 +15,8 @@ function sseBody(frames: string[]) {
   const encoder = new TextEncoder();
   const chunks = frames.map((frame) => encoder.encode(frame));
   let index = 0;
-  const cancel = jest.fn();
-  const releaseLock = jest.fn();
+  const cancel = vi.fn();
+  const releaseLock = vi.fn();
 
   return {
     cancel,
@@ -40,12 +40,12 @@ function sseBody(frames: string[]) {
 
 function pendingSseBody() {
   let releasePendingRead: (() => void) | null = null;
-  const cancel = jest.fn(() => {
+  const cancel = vi.fn(() => {
     releasePendingRead?.();
     return Promise.resolve();
   });
-  const releaseLock = jest.fn();
-  const read = jest.fn(
+  const releaseLock = vi.fn();
+  const read = vi.fn(
     () =>
       new Promise<{ value?: Uint8Array; done: boolean }>((resolve) => {
         releasePendingRead = () => resolve({ value: undefined, done: true });
@@ -67,16 +67,16 @@ function pendingSseBody() {
 
 describe('streamChatMessage cancellation semantics', () => {
   beforeEach(() => {
-    globalThis.fetch = jest.fn();
+    globalThis.fetch = vi.fn();
     globalThis.TextDecoder = TextDecoder as typeof globalThis.TextDecoder;
   });
 
   it('treats a cancelled run as a clean stop instead of a failed stream', async () => {
-    const onCancelled = jest.fn();
-    const onDone = jest.fn();
-    const onWorkSurfaceEvent = jest.fn();
+    const onCancelled = vi.fn();
+    const onDone = vi.fn();
+    const onWorkSurfaceEvent = vi.fn();
 
-    (globalThis.fetch as jest.Mock).mockResolvedValue({
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body: sseBody([
         'data: {"type":"run_started","run_id":"run-123"}\n\n',
@@ -106,12 +106,12 @@ describe('streamChatMessage cancellation semantics', () => {
   });
 
   it('treats a paused run as paused and does not complete the assistant message', async () => {
-    const onPaused = jest.fn();
-    const onDone = jest.fn();
-    const onRunUpdated = jest.fn();
-    const onWorkSurfaceEvent = jest.fn();
+    const onPaused = vi.fn();
+    const onDone = vi.fn();
+    const onRunUpdated = vi.fn();
+    const onWorkSurfaceEvent = vi.fn();
 
-    (globalThis.fetch as jest.Mock).mockResolvedValue({
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body: sseBody([
         'data: {"type":"run_started","run_id":"run-123"}\n\n',
@@ -145,14 +145,14 @@ describe('streamChatMessage cancellation semantics', () => {
   });
 
   it('treats an interrupted run as paused and keeps the work surface current', async () => {
-    const onPaused = jest.fn();
-    const onDone = jest.fn();
-    const onRunUpdated = jest.fn();
-    const onRunFinished = jest.fn();
-    const onWorkSurfaceEvent = jest.fn();
-    const onText = jest.fn();
+    const onPaused = vi.fn();
+    const onDone = vi.fn();
+    const onRunUpdated = vi.fn();
+    const onRunFinished = vi.fn();
+    const onWorkSurfaceEvent = vi.fn();
+    const onText = vi.fn();
 
-    (globalThis.fetch as jest.Mock).mockResolvedValue({
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body: sseBody([
         'data: {"type":"run_started","run_id":"run-123"}\n\n',
@@ -200,13 +200,13 @@ describe('streamChatMessage cancellation semantics', () => {
   });
 
   it('projects blocked run events into the main active-run state', async () => {
-    const onPaused = jest.fn();
-    const onDone = jest.fn();
-    const onRunUpdated = jest.fn();
-    const onWorkSurfaceEvent = jest.fn();
-    const onText = jest.fn();
+    const onPaused = vi.fn();
+    const onDone = vi.fn();
+    const onRunUpdated = vi.fn();
+    const onWorkSurfaceEvent = vi.fn();
+    const onText = vi.fn();
 
-    (globalThis.fetch as jest.Mock).mockResolvedValue({
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body: sseBody([
         'data: {"type":"run_started","run_id":"run-123"}\n\n',
@@ -248,13 +248,13 @@ describe('streamChatMessage cancellation semantics', () => {
   });
 
   it('projects generic run_waiting events into waiting active-run state', async () => {
-    const onPaused = jest.fn();
-    const onDone = jest.fn();
-    const onRunUpdated = jest.fn();
-    const onWorkSurfaceEvent = jest.fn();
-    const onText = jest.fn();
+    const onPaused = vi.fn();
+    const onDone = vi.fn();
+    const onRunUpdated = vi.fn();
+    const onWorkSurfaceEvent = vi.fn();
+    const onText = vi.fn();
 
-    (globalThis.fetch as jest.Mock).mockResolvedValue({
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body: sseBody([
         'data: {"type":"run_started","run_id":"run-123"}\n\n',
@@ -288,13 +288,13 @@ describe('streamChatMessage cancellation semantics', () => {
   });
 
   it('projects blocked run events into active-run state from reason fields', async () => {
-    const onPaused = jest.fn();
-    const onDone = jest.fn();
-    const onRunUpdated = jest.fn();
-    const onWorkSurfaceEvent = jest.fn();
-    const onText = jest.fn();
+    const onPaused = vi.fn();
+    const onDone = vi.fn();
+    const onRunUpdated = vi.fn();
+    const onWorkSurfaceEvent = vi.fn();
+    const onText = vi.fn();
 
-    (globalThis.fetch as jest.Mock).mockResolvedValue({
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body: sseBody([
         'data: {"type":"run_started","run_id":"run-123"}\n\n',
@@ -336,7 +336,7 @@ describe('streamChatMessage cancellation semantics', () => {
       'data: {"type":"run_started","run_id":"run-123"}\n\n',
     ]);
     const signal = new AbortController().signal;
-    (globalThis.fetch as jest.Mock).mockResolvedValue({
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body,
     });
@@ -351,17 +351,17 @@ describe('streamChatMessage cancellation semantics', () => {
   });
 
   it('dispatches run, message, reasoning, artifact, and text completion events', async () => {
-    const onLocalMessages = jest.fn();
-    const onRunStarted = jest.fn();
-    const onRunUpdated = jest.fn();
-    const onArtifacts = jest.fn();
-    const onReasoning = jest.fn();
-    const onReasoningDone = jest.fn();
-    const onText = jest.fn();
-    const onDone = jest.fn();
-    const onRunFinished = jest.fn();
+    const onLocalMessages = vi.fn();
+    const onRunStarted = vi.fn();
+    const onRunUpdated = vi.fn();
+    const onArtifacts = vi.fn();
+    const onReasoning = vi.fn();
+    const onReasoningDone = vi.fn();
+    const onText = vi.fn();
+    const onDone = vi.fn();
+    const onRunFinished = vi.fn();
 
-    (globalThis.fetch as jest.Mock).mockResolvedValue({
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body: sseBody([
         'data: {"type":"session_info","run_id":"run-session"}\n\n',
@@ -424,9 +424,9 @@ describe('streamChatMessage cancellation semantics', () => {
   });
 
   it('forwards workspace, executor, and transport events to the work surface while streaming', async () => {
-    const onWorkSurfaceEvent = jest.fn();
+    const onWorkSurfaceEvent = vi.fn();
 
-    (globalThis.fetch as jest.Mock).mockResolvedValue({
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body: sseBody([
         'data: {"type":"workspace_bound","workspace":{"kind":"server_sandbox","display_name":"Server sandbox","cwd":"/tmp/astra-workspaces/run-1","authority":"read_write","fallback_policy":"disabled"}}\n\n',
@@ -463,11 +463,11 @@ describe('streamChatMessage cancellation semantics', () => {
   });
 
   it('forwards run_started bindings to the work surface without dropping run state updates', async () => {
-    const onWorkSurfaceEvent = jest.fn();
-    const onRunStarted = jest.fn();
-    const onRunUpdated = jest.fn();
+    const onWorkSurfaceEvent = vi.fn();
+    const onRunStarted = vi.fn();
+    const onRunUpdated = vi.fn();
 
-    (globalThis.fetch as jest.Mock).mockResolvedValue({
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body: sseBody([
         'data: {"type":"run_started","run_id":"run-123","session_id":"session-123","workspace":{"kind":"edge_workspace","display_name":"MacBook Pro","cwd":"/Users/xupeng/github/astra","authority":"read_write","fallback_policy":"disabled"},"executor":{"kind":"edge_agent","executor_id":"edge-macbook-1","display_name":"MacBook Pro","transport":"edge_ws","status":"online"},"transport":"edge_ws","fallback_policy":"disabled"}\n\n',
@@ -501,10 +501,10 @@ describe('streamChatMessage cancellation semantics', () => {
   });
 
   it('uses turn_complete text as the final assistant text', async () => {
-    const onText = jest.fn();
-    const onDone = jest.fn();
+    const onText = vi.fn();
+    const onDone = vi.fn();
 
-    (globalThis.fetch as jest.Mock).mockResolvedValue({
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body: sseBody([
         'data: {"type":"text_delta","content":"draft"}\n\n',
@@ -524,12 +524,12 @@ describe('streamChatMessage cancellation semantics', () => {
   });
 
   it('throws stream error events and failed run_finished errors instead of calling done', async () => {
-    const onDone = jest.fn();
-    const onRunFinished = jest.fn();
-    const onRunUpdated = jest.fn();
-    const onWorkSurfaceEvent = jest.fn();
+    const onDone = vi.fn();
+    const onRunFinished = vi.fn();
+    const onRunUpdated = vi.fn();
+    const onWorkSurfaceEvent = vi.fn();
 
-    (globalThis.fetch as jest.Mock).mockResolvedValueOnce({
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
       ok: true,
       body: sseBody([
         'data: {"type":"error","message":"runtime disconnected"}\n\n',
@@ -543,7 +543,7 @@ describe('streamChatMessage cancellation semantics', () => {
     ).rejects.toThrow('runtime disconnected');
     expect(onDone).not.toHaveBeenCalled();
 
-    (globalThis.fetch as jest.Mock).mockResolvedValueOnce({
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
       ok: true,
       body: sseBody([
         'data: {"type":"run_finished","run_id":"run-123","status":"failed","error":"tool crashed"}\n\n',
@@ -563,7 +563,7 @@ describe('streamChatMessage cancellation semantics', () => {
     });
     expect(onDone).not.toHaveBeenCalled();
 
-    (globalThis.fetch as jest.Mock).mockResolvedValueOnce({
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
       ok: true,
       body: sseBody([
         'data: {"type":"run_error","run_id":"run-456","message":"loop crashed","error_kind":"runtime"}\n\n',
@@ -597,7 +597,7 @@ describe('streamChatMessage cancellation semantics', () => {
     ]);
     const controller = new AbortController();
     controller.abort();
-    (globalThis.fetch as jest.Mock).mockResolvedValue({
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body,
     });
@@ -615,7 +615,7 @@ describe('streamChatMessage cancellation semantics', () => {
   it('cancels the reader when the signal aborts during a pending read', async () => {
     const body = pendingSseBody();
     const controller = new AbortController();
-    (globalThis.fetch as jest.Mock).mockResolvedValue({
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body,
     });
@@ -635,7 +635,7 @@ describe('streamChatMessage cancellation semantics', () => {
   });
 
   it('streams an existing run with an encoded GET URL', async () => {
-    (globalThis.fetch as jest.Mock).mockResolvedValue({
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body: sseBody(['data: {"type":"text_done","full_text":"resumed"}\n\n']),
     });
@@ -651,7 +651,7 @@ describe('streamChatMessage cancellation semantics', () => {
   });
 
   it('streams an existing run from the stored cursor into the bound assistant message', async () => {
-    (globalThis.fetch as jest.Mock).mockResolvedValue({
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body: sseBody(['data: {"type":"text_done","full_text":"resumed"}\n\n']),
     });

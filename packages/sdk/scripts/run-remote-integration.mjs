@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Run Jest Mode B (remote) with defaults for local dev: E2E=1 and
+ * Run Vitest Mode B (remote) with defaults for local dev: E2E=1 and
  * ASTRA_SDK_BASE_URL=http://127.0.0.1:8000 when unset (matches Makefile dev-start).
  *
  *   npm run test:integration:remote
@@ -13,7 +13,7 @@ import { dirname, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pkgRoot = join(here, '..');
-const jestBin = join(pkgRoot, 'node_modules', 'jest', 'bin', 'jest.js');
+const vitestBin = join(pkgRoot, 'node_modules', 'vitest', 'vitest.mjs');
 
 process.env.ASTRA_SDK_E2E = '1';
 if (!process.env.ASTRA_SDK_BASE_URL) {
@@ -23,7 +23,7 @@ if (!process.env.ASTRA_SDK_BASE_URL) {
 const code =
   spawnSync(
     process.execPath,
-    [jestBin, '--config', 'jest.config.mjs', '--testPathPatterns=integration/online'],
+    [vitestBin, 'run', 'src/__tests__/integration/online'],
     { stdio: 'inherit', env: process.env, cwd: pkgRoot },
   ).status ?? 1;
 process.exit(code === 0 ? 0 : code);

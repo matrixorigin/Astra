@@ -1,4 +1,3 @@
-import { cookies } from 'next/headers';
 import {
   AstraClient,
   PATH_AUTH_REFRESH,
@@ -6,7 +5,7 @@ import {
   headersInitToRecord,
   joinApiPath,
   methodCanHaveJson,
-} from '@astra/sdk';
+} from "@astra/sdk";
 import {
   ACCESS_TOKEN_COOKIE,
   API_URL_COOKIE,
@@ -15,12 +14,12 @@ import {
   getRuntimeConfig,
   getWebConfigurationMessage,
   type RuntimeConfig,
-} from '@/lib/runtime-config';
-import { RuntimeClientError, readRuntimeErrorDetail } from './errors';
+} from "@/lib/runtime-config";
+import { RuntimeClientError, readRuntimeErrorDetail } from "./errors";
 
-export type RuntimeAuthMode = 'required' | 'optional' | 'none';
+export type RuntimeAuthMode = "required" | "optional" | "none";
 
-export type RuntimeRequestInit = Omit<RequestInit, 'body'> & {
+export type RuntimeRequestInit = Omit<RequestInit, "body"> & {
   auth?: RuntimeAuthMode;
   json?: unknown;
   operation?: string;
@@ -39,10 +38,10 @@ export class WebRuntimeClient {
   private refreshToken?: string;
 
   constructor(config: RuntimeConfig) {
-    if (config.mode !== 'live' || !config.apiUrl) {
+    if (config.mode !== "live" || !config.apiUrl) {
       throw new RuntimeClientError({
-        operation: 'initialize runtime client',
-        path: '/',
+        operation: "initialize runtime client",
+        path: "/",
         status: 503,
         detail: getWebConfigurationMessage(),
       });
@@ -55,7 +54,7 @@ export class WebRuntimeClient {
       baseUrl: config.apiUrl,
       accessToken: config.accessToken,
       refreshToken: config.refreshToken,
-      headers: this.baseAuthHeaders('optional'),
+      headers: this.baseAuthHeaders("optional"),
       onTokenRefresh: async (tokens) => {
         this.accessToken = tokens.accessToken;
         this.refreshToken = tokens.refreshToken;
@@ -69,32 +68,43 @@ export class WebRuntimeClient {
   }
 
   async get<T>(path: string, init?: RuntimeRequestInit): Promise<T> {
-    return this.request<T>(path, { ...init, method: 'GET' });
+    return this.request<T>(path, { ...init, method: "GET" });
   }
 
-  async post<T>(path: string, json?: unknown, init?: RuntimeRequestInit): Promise<T> {
-    return this.request<T>(path, { ...init, method: 'POST', json });
+  async post<T>(
+    path: string,
+    json?: unknown,
+    init?: RuntimeRequestInit,
+  ): Promise<T> {
+    return this.request<T>(path, { ...init, method: "POST", json });
   }
 
-  async put<T>(path: string, json?: unknown, init?: RuntimeRequestInit): Promise<T> {
-    return this.request<T>(path, { ...init, method: 'PUT', json });
+  async put<T>(
+    path: string,
+    json?: unknown,
+    init?: RuntimeRequestInit,
+  ): Promise<T> {
+    return this.request<T>(path, { ...init, method: "PUT", json });
   }
 
   async delete<T>(path: string, init?: RuntimeRequestInit): Promise<T> {
-    return this.request<T>(path, { ...init, method: 'DELETE' });
+    return this.request<T>(path, { ...init, method: "DELETE" });
   }
 
   async request<T>(path: string, init: RuntimeRequestInit = {}): Promise<T> {
     const response = await this.fetchResponse(path, init);
     if (!response.ok) {
       throw new RuntimeClientError({
-        operation: init.operation ?? `${init.method ?? 'GET'} ${path}`,
+        operation: init.operation ?? `${init.method ?? "GET"} ${path}`,
         path,
         status: response.status,
         detail: await readRuntimeErrorDetail(response),
       });
     }
-    if (response.status === 204 || response.headers.get('content-length') === '0') {
+    if (
+      response.status === 204 ||
+      response.headers.get("content-length") === "0"
+    ) {
       return undefined as T;
     }
     const text = await response.text();
@@ -105,7 +115,7 @@ export class WebRuntimeClient {
       return JSON.parse(text) as T;
     } catch (error) {
       throw new RuntimeClientError({
-        operation: init.operation ?? `${init.method ?? 'GET'} ${path}`,
+        operation: init.operation ?? `${init.method ?? "GET"} ${path}`,
         path,
         status: response.status,
         detail: `Runtime returned invalid JSON for ${path}.`,
@@ -114,17 +124,23 @@ export class WebRuntimeClient {
     }
   }
 
-  async fetchResponse(path: string, init: RuntimeRequestInit = {}): Promise<Response> {
-    const operation = init.operation ?? `${init.method ?? 'GET'} ${path}`;
-    const auth = init.auth ?? 'optional';
+  async fetchResponse(
+    path: string,
+    init: RuntimeRequestInit = {},
+  ): Promise<Response> {
+    const operation = init.operation ?? `${init.method ?? "GET"} ${path}`;
+    const auth = init.auth ?? "optional";
     const url = this.url(path);
     const request = this.toRequestInit(init, auth, operation, path);
 
     let response = await fetch(url, request);
-    if (response.status === 401 && auth !== 'none' && this.refreshToken) {
+    if (response.status === 401 && auth !== "none" && this.refreshToken) {
       const refreshed = await this.refreshTokens();
       if (refreshed) {
-        response = await fetch(url, this.toRequestInit(init, auth, operation, path));
+        response = await fetch(
+          url,
+          this.toRequestInit(init, auth, operation, path),
+        );
       }
     }
     return response;
@@ -140,19 +156,23 @@ export class WebRuntimeClient {
     operation: string,
     path: string,
   ): RequestInit {
-    const method = (init.method ?? 'GET').toUpperCase();
-    const body = init.json !== undefined ? JSON.stringify(init.json) : init.body;
+    const method = (init.method ?? "GET").toUpperCase();
+    const body =
+      init.json !== undefined ? JSON.stringify(init.json) : init.body;
     const headers = headersInitToRecord(
-      this.baseAuthHeaders(auth, { hasJsonBody: init.json !== undefined, method }),
+      this.baseAuthHeaders(auth, {
+        hasJsonBody: init.json !== undefined,
+        method,
+      }),
       init.headers,
     );
 
-    if (auth === 'required' && !this.accessToken) {
+    if (auth === "required" && !this.accessToken) {
       throw new RuntimeClientError({
         operation,
         path,
         status: 401,
-        detail: 'Runtime authentication is missing.',
+        detail: "Runtime authentication is missing.",
       });
     }
 
@@ -162,7 +182,7 @@ export class WebRuntimeClient {
       method,
       headers,
       body,
-      cache: init.cache ?? 'no-store',
+      cache: init.cache ?? "no-store",
     };
   }
 
@@ -172,13 +192,13 @@ export class WebRuntimeClient {
   ): Record<string, string> {
     const headers: Record<string, string> = {};
     if (request?.hasJsonBody && methodCanHaveJson(request.method)) {
-      headers['Content-Type'] = 'application/json';
+      headers["Content-Type"] = "application/json";
     }
-    if (auth !== 'none' && this.accessToken) {
+    if (auth !== "none" && this.accessToken) {
       headers.Authorization = `Bearer ${this.accessToken}`;
       const userId = extractJwtSubject(this.accessToken);
       if (userId) {
-        headers['X-User-Id'] = userId;
+        headers["X-User-Id"] = userId;
       }
     }
     return headers;
@@ -190,10 +210,10 @@ export class WebRuntimeClient {
     }
 
     const response = await fetch(this.url(PATH_AUTH_REFRESH), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ refresh_token: this.refreshToken }),
-      cache: 'no-store',
+      cache: "no-store",
     });
     if (!response.ok) {
       return false;
@@ -203,7 +223,10 @@ export class WebRuntimeClient {
       access_token?: unknown;
       refresh_token?: unknown;
     };
-    if (typeof payload.access_token !== 'string' || typeof payload.refresh_token !== 'string') {
+    if (
+      typeof payload.access_token !== "string" ||
+      typeof payload.refresh_token !== "string"
+    ) {
       return false;
     }
 
@@ -214,17 +237,21 @@ export class WebRuntimeClient {
     return true;
   }
 
-  private async persistTokens(accessToken: string, refreshToken: string): Promise<void> {
+  private async persistTokens(
+    accessToken: string,
+    refreshToken: string,
+  ): Promise<void> {
+    const { cookies } = await import("next/headers");
     const cookieStore = await cookies();
     cookieStore.set(ACCESS_TOKEN_COOKIE, accessToken, {
       httpOnly: true,
-      sameSite: 'lax',
-      path: '/',
+      sameSite: "lax",
+      path: "/",
     });
     cookieStore.set(REFRESH_TOKEN_COOKIE, refreshToken, {
       httpOnly: true,
-      sameSite: 'lax',
-      path: '/',
+      sameSite: "lax",
+      path: "/",
     });
   }
 }
@@ -233,10 +260,10 @@ export async function getRuntimeClient(
   options: RuntimeClientOptions = {},
 ): Promise<WebRuntimeClient | null> {
   const config = await getRuntimeConfig();
-  if (config.mode !== 'live' || !config.apiUrl) {
+  if (config.mode !== "live" || !config.apiUrl) {
     return null;
   }
-  if (options.auth === 'required' && !config.accessToken) {
+  if (options.auth === "required" && !config.accessToken) {
     return null;
   }
   return new WebRuntimeClient(config);
@@ -246,21 +273,21 @@ export async function requireRuntimeClient(
   options: RuntimeClientOptions = {},
 ): Promise<WebRuntimeClient> {
   const config = await getRuntimeConfig();
-  const auth = options.auth ?? 'optional';
-  if (config.mode !== 'live' || !config.apiUrl) {
+  const auth = options.auth ?? "optional";
+  if (config.mode !== "live" || !config.apiUrl) {
     throw new RuntimeClientError({
-      operation: options.operation ?? 'initialize runtime client',
-      path: '/',
+      operation: options.operation ?? "initialize runtime client",
+      path: "/",
       status: 503,
       detail: config.message || getWebConfigurationMessage(),
     });
   }
-  if (auth === 'required' && !config.accessToken) {
+  if (auth === "required" && !config.accessToken) {
     throw new RuntimeClientError({
-      operation: options.operation ?? 'initialize runtime client',
-      path: '/',
+      operation: options.operation ?? "initialize runtime client",
+      path: "/",
       status: 401,
-      detail: 'Runtime authentication is missing.',
+      detail: "Runtime authentication is missing.",
     });
   }
   return new WebRuntimeClient(config);
@@ -269,21 +296,27 @@ export async function requireRuntimeClient(
 export async function getRuntimeClientFromCookies(
   options: RuntimeClientOptions = {},
 ): Promise<WebRuntimeClient> {
+  const { cookies } = await import("next/headers");
   const cookieStore = await cookies();
-  const apiUrl = cookieStore.get(API_URL_COOKIE)?.value ?? process.env.ASTRA_API_URL ?? DEFAULT_API_URL;
-  const accessToken = cookieStore.get(ACCESS_TOKEN_COOKIE)?.value ?? process.env.ASTRA_ACCESS_TOKEN;
+  const apiUrl =
+    cookieStore.get(API_URL_COOKIE)?.value ??
+    process.env.ASTRA_API_URL ??
+    DEFAULT_API_URL;
+  const accessToken =
+    cookieStore.get(ACCESS_TOKEN_COOKIE)?.value ??
+    process.env.ASTRA_ACCESS_TOKEN;
   const refreshToken = cookieStore.get(REFRESH_TOKEN_COOKIE)?.value;
-  if (options.auth === 'required' && !accessToken) {
+  if (options.auth === "required" && !accessToken) {
     throw new RuntimeClientError({
-      operation: options.operation ?? 'initialize runtime client',
-      path: '/',
+      operation: options.operation ?? "initialize runtime client",
+      path: "/",
       status: 401,
-      detail: 'Runtime authentication is missing.',
+      detail: "Runtime authentication is missing.",
     });
   }
   return new WebRuntimeClient({
-    mode: 'live',
-    source: cookieStore.get(API_URL_COOKIE)?.value ? 'cookie' : 'env',
+    mode: "live",
+    source: cookieStore.get(API_URL_COOKIE)?.value ? "cookie" : "env",
     apiUrl,
     accessToken,
     refreshToken,

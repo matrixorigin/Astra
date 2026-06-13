@@ -1,6 +1,6 @@
 import type { RuntimeArtifactResponse } from "@astra/sdk";
 import type { ChatArtifactRef } from "@/lib/api/types";
-import type { WebRuntimeClient } from "@/lib/runtime-client";
+import type { WebRuntimeClient } from "@/lib/runtime-client/server";
 
 function stringField(value: unknown) {
   return typeof value === "string" && value.trim() ? value : null;

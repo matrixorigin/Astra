@@ -1,4 +1,5 @@
 import type { NextConfig } from 'next';
+import path from 'node:path';
 
 // Ensure server-side fetch bypasses HTTP proxy for local backend
 if (!process.env.no_proxy?.includes('localhost')) {
@@ -11,6 +12,7 @@ if (!process.env.no_proxy?.includes('localhost')) {
 
 const nextConfig: NextConfig = {
   distDir: process.env.ASTRA_NEXT_DIST_DIR ?? '.next',
+  outputFileTracingRoot: path.join(process.cwd(), '..'),
   reactStrictMode: true,
 };
 

@@ -22,7 +22,7 @@ function ToastHarness() {
 
 describe("ToastProvider", () => {
   it("auto-dismisses toasts even while children re-render frequently", () => {
-    jest.useFakeTimers();
+    vi.useFakeTimers();
     try {
       render(
         <ToastProvider>
@@ -32,12 +32,12 @@ describe("ToastProvider", () => {
 
       expect(screen.getByText("Saved")).toBeInTheDocument();
       act(() => {
-        jest.advanceTimersByTime(1300);
+        vi.advanceTimersByTime(1300);
       });
 
       expect(screen.queryByText("Saved")).not.toBeInTheDocument();
     } finally {
-      jest.useRealTimers();
+      vi.useRealTimers();
     }
   });
 });

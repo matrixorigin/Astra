@@ -25,9 +25,9 @@ import {
   updateChatWorkspaceSelection,
 } from "@/lib/api/chats";
 
-const pushMock = jest.fn();
-const replaceMock = jest.fn();
-const refreshMock = jest.fn();
+const pushMock = vi.fn();
+const replaceMock = vi.fn();
+const refreshMock = vi.fn();
 
 let composerPayload: {
   text: string;
@@ -42,7 +42,7 @@ let composerPayload: {
   },
 };
 
-jest.mock("next/navigation", () => ({
+vi.mock("next/navigation", () => ({
   useRouter: () => ({
     push: pushMock,
     replace: replaceMock,
@@ -50,57 +50,72 @@ jest.mock("next/navigation", () => ({
   }),
 }));
 
-jest.mock("next/link", () => ({
+vi.mock("next/link", () => ({
   __esModule: true,
   default: ({ children, href }: { children: ReactNode; href: string }) => (
     <a href={href}>{children}</a>
   ),
 }));
 
-jest.mock("lucide-react", () => {
+vi.mock("lucide-react", () => {
   const Icon = () => null;
-  return new Proxy(
-    { __esModule: true },
-    {
-      get: (_target, prop) => (prop === "__esModule" ? true : Icon),
-    },
-  );
+  return {
+    __esModule: true,
+    Activity: Icon,
+    AlertTriangle: Icon,
+    Bot: Icon,
+    ChevronRight: Icon,
+    CheckCircle2: Icon,
+    Circle: Icon,
+    ClipboardList: Icon,
+    HardDrive: Icon,
+    Loader2: Icon,
+    MessageSquare: Icon,
+    MoreVertical: Icon,
+    Monitor: Icon,
+    Pause: Icon,
+    RefreshCw: Icon,
+    RotateCw: Icon,
+    Terminal: Icon,
+    Wrench: Icon,
+    X: Icon,
+  };
 });
 
-jest.mock("@/components/app/chat-actions-menu", () => ({
+vi.mock("@/components/app/chat-actions-menu", () => ({
   ChatActionsMenu: () => null,
 }));
 
-jest.mock("@/components/app/chat-dot-navigator", () => ({
+vi.mock("@/components/app/chat-dot-navigator", () => ({
   ChatDotNavigator: () => null,
 }));
 
-jest.mock("@/components/app/move-chat-modal", () => ({
+vi.mock("@/components/app/move-chat-modal", () => ({
   MoveChatModal: () => null,
 }));
 
-jest.mock("@/components/app/message-bubble", () => ({
+vi.mock("@/components/app/message-bubble", () => ({
   MessageBubble: ({ message }: { message: { content: string } }) => (
     <div>{message.content}</div>
   ),
 }));
 
-jest.mock("@/components/ui/icon-button", () => ({
+vi.mock("@/components/ui/icon-button", () => ({
   IconButton: () => null,
 }));
 
-jest.mock("@/hooks/use-chat-lifecycle-actions", () => ({
+vi.mock("@/hooks/use-chat-lifecycle-actions", () => ({
   useChatLifecycleActions: () => ({
     busyChatId: null,
-    unarchive: jest.fn(),
+    unarchive: vi.fn(),
   }),
 }));
 
-jest.mock("@/lib/chat-lifecycle-events", () => ({
+vi.mock("@/lib/chat-lifecycle-events", () => ({
   subscribeChatLifecycleChange: () => () => {},
 }));
 
-jest.mock("@/components/app/composer", () => ({
+vi.mock("@/components/app/composer", () => ({
   Composer: ({
     disabled,
     onSubmit,
@@ -141,50 +156,31 @@ jest.mock("@/components/app/composer", () => ({
   ),
 }));
 
-jest.mock("@/lib/api/chats", () => ({
-  getEdgeStatus: jest.fn(),
-  getChat: jest.fn(),
-  getChatWorkSurface: jest.fn(),
-  getChatWorkSurfaceRun: jest.fn(),
-  queueChatRunInput: jest.fn(),
-  resumeChatRun: jest.fn(),
-  stopChatRun: jest.fn(),
-  streamChatMessage: jest.fn(),
-  streamExistingChatRun: jest.fn(),
-  updateChatModel: jest.fn(),
-  updateChatWorkspaceSelection: jest.fn(),
+vi.mock("@/lib/api/chats", () => ({
+  getEdgeStatus: vi.fn(),
+  getChat: vi.fn(),
+  getChatWorkSurface: vi.fn(),
+  getChatWorkSurfaceRun: vi.fn(),
+  queueChatRunInput: vi.fn(),
+  resumeChatRun: vi.fn(),
+  stopChatRun: vi.fn(),
+  streamChatMessage: vi.fn(),
+  streamExistingChatRun: vi.fn(),
+  updateChatModel: vi.fn(),
+  updateChatWorkspaceSelection: vi.fn(),
 }));
 
-const mockGetEdgeStatus = getEdgeStatus as jest.MockedFunction<
-  typeof getEdgeStatus
->;
-const mockGetChat = getChat as jest.MockedFunction<typeof getChat>;
-const mockGetChatWorkSurface = getChatWorkSurface as jest.MockedFunction<
-  typeof getChatWorkSurface
->;
-const mockGetChatWorkSurfaceRun = getChatWorkSurfaceRun as jest.MockedFunction<
-  typeof getChatWorkSurfaceRun
->;
-const mockQueueChatRunInput = queueChatRunInput as jest.MockedFunction<
-  typeof queueChatRunInput
->;
-const mockResumeChatRun = resumeChatRun as jest.MockedFunction<
-  typeof resumeChatRun
->;
-const mockStopChatRun = stopChatRun as jest.MockedFunction<typeof stopChatRun>;
-const mockStreamChatMessage = streamChatMessage as jest.MockedFunction<
-  typeof streamChatMessage
->;
-const mockStreamExistingChatRun = streamExistingChatRun as jest.MockedFunction<
-  typeof streamExistingChatRun
->;
-const mockUpdateChatModel = updateChatModel as jest.MockedFunction<
-  typeof updateChatModel
->;
-const mockUpdateChatWorkspaceSelection =
-  updateChatWorkspaceSelection as jest.MockedFunction<
-    typeof updateChatWorkspaceSelection
-  >;
+const mockGetEdgeStatus = vi.mocked(getEdgeStatus);
+const mockGetChat = vi.mocked(getChat);
+const mockGetChatWorkSurface = vi.mocked(getChatWorkSurface);
+const mockGetChatWorkSurfaceRun = vi.mocked(getChatWorkSurfaceRun);
+const mockQueueChatRunInput = vi.mocked(queueChatRunInput);
+const mockResumeChatRun = vi.mocked(resumeChatRun);
+const mockStopChatRun = vi.mocked(stopChatRun);
+const mockStreamChatMessage = vi.mocked(streamChatMessage);
+const mockStreamExistingChatRun = vi.mocked(streamExistingChatRun);
+const mockUpdateChatModel = vi.mocked(updateChatModel);
+const mockUpdateChatWorkspaceSelection = vi.mocked(updateChatWorkspaceSelection);
 
 const defaultActiveRun: NonNullable<ChatDetail["activeRun"]> = {
   runId: "run-123",
@@ -254,8 +250,8 @@ describe("ChatView deferred-input unhappy paths", () => {
     mockUpdateChatWorkspaceSelection.mockReset();
     mockUpdateChatWorkspaceSelection.mockResolvedValue(makeDetail(null));
     window.localStorage.clear();
-    window.alert = jest.fn();
-    HTMLElement.prototype.scrollTo = jest.fn();
+    window.alert = vi.fn();
+    HTMLElement.prototype.scrollTo = vi.fn();
   });
 
   it("does not start a fresh stream when queueing fails for a non-conflict error", async () => {
@@ -408,7 +404,7 @@ describe("ChatView deferred-input unhappy paths", () => {
   });
 
   it("does not start pending first-turn streams during an immediate effect cleanup", () => {
-    jest.useFakeTimers();
+    vi.useFakeTimers();
     try {
       const { unmount } = render(
         <ChatView
@@ -438,11 +434,11 @@ describe("ChatView deferred-input unhappy paths", () => {
       );
 
       unmount();
-      jest.runOnlyPendingTimers();
+      vi.runOnlyPendingTimers();
 
       expect(mockStreamChatMessage).not.toHaveBeenCalled();
     } finally {
-      jest.useRealTimers();
+      vi.useRealTimers();
     }
   });
 
@@ -682,7 +678,7 @@ describe("ChatView deferred-input unhappy paths", () => {
   });
 
   it("does not replace follow-up streaming text with stale hydrated transcript", async () => {
-    jest.useFakeTimers();
+    vi.useFakeTimers();
     try {
       let streamSignal: AbortSignal | undefined;
       mockGetChat.mockResolvedValue({
@@ -740,19 +736,22 @@ describe("ChatView deferred-input unhappy paths", () => {
         text: "second turn",
         options: composerPayload.options,
       };
-      fireEvent.click(screen.getByRole("button", { name: "Submit composer" }));
-
-      await waitFor(() => {
-        expect(screen.getByText("live second reply")).toBeInTheDocument();
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Submit composer" }));
+        vi.advanceTimersByTime(16);
+        await Promise.resolve();
       });
-      jest.advanceTimersByTime(3_100);
-      await Promise.resolve();
+      expect(screen.getByText("live second reply")).toBeInTheDocument();
+      await act(async () => {
+        vi.advanceTimersByTime(3_100);
+        await Promise.resolve();
+      });
 
       expect(mockGetChat).not.toHaveBeenCalled();
       expect(streamSignal?.aborted).toBe(false);
       expect(screen.getByText("live second reply")).toBeInTheDocument();
     } finally {
-      jest.useRealTimers();
+      vi.useRealTimers();
     }
   });
 
@@ -1137,9 +1136,8 @@ describe("ChatView deferred-input unhappy paths", () => {
   });
 
   it("restores the active run when stop hangs and refresh fails", async () => {
-    jest.useFakeTimers();
+    vi.useFakeTimers();
     try {
-      const user = userEvent.setup({ advanceTimers: jest.advanceTimersByTime });
       mockStopChatRun.mockReturnValue(new Promise(() => {}));
       mockGetChat.mockRejectedValue(new Error("refresh failed"));
 
@@ -1166,33 +1164,32 @@ describe("ChatView deferred-input unhappy paths", () => {
         </ToastProvider>,
       );
 
-      await user.click(screen.getByRole("button", { name: "Stop run" }));
-
-      await waitFor(() => {
-        expect(mockStopChatRun).toHaveBeenCalledWith("chat-123");
-      });
       await act(async () => {
-        jest.advanceTimersByTime(10_000);
+        fireEvent.click(screen.getByRole("button", { name: "Stop run" }));
         await Promise.resolve();
       });
-      await waitFor(() => {
-        expect(mockGetChat).toHaveBeenCalledWith("chat-123");
+
+      expect(mockStopChatRun).toHaveBeenCalledWith("chat-123");
+      await act(async () => {
+        vi.advanceTimersByTime(10_000);
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
       });
-      await waitFor(() => {
-        expect(screen.queryByText("Stopping")).not.toBeInTheDocument();
-      });
+      expect(mockGetChat).toHaveBeenCalledWith("chat-123");
+      expect(screen.queryByText("Stopping")).not.toBeInTheDocument();
       expect(screen.getAllByText("Running").length).toBeGreaterThan(0);
       expect(screen.getByText("working...")).toBeInTheDocument();
       expect(screen.queryByText(/Stopped\./)).not.toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Stop run" })).not.toBeDisabled();
       expect(screen.getByText("Stop request timed out.")).toBeInTheDocument();
     } finally {
-      jest.useRealTimers();
+      vi.useRealTimers();
     }
   });
 
   it("retries active run stream reattach after a transient failure", async () => {
-    jest.useFakeTimers();
+    vi.useFakeTimers();
     try {
       mockStreamExistingChatRun
         .mockRejectedValueOnce(new Error("temporary stream failure"))
@@ -1200,20 +1197,21 @@ describe("ChatView deferred-input unhappy paths", () => {
 
       render(<ChatView initial={makeDetail()} />);
 
-      await waitFor(() => {
-        expect(mockStreamExistingChatRun).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
       });
+      expect(mockStreamExistingChatRun).toHaveBeenCalledTimes(1);
 
       await act(async () => {
-        jest.advanceTimersByTime(1_000);
+        vi.advanceTimersByTime(1_000);
+        await Promise.resolve();
         await Promise.resolve();
       });
 
-      await waitFor(() => {
-        expect(mockStreamExistingChatRun).toHaveBeenCalledTimes(2);
-      });
+      expect(mockStreamExistingChatRun).toHaveBeenCalledTimes(2);
     } finally {
-      jest.useRealTimers();
+      vi.useRealTimers();
     }
   });
 
@@ -1307,7 +1305,7 @@ describe("ChatView deferred-input unhappy paths", () => {
 
   it("does not auto-scroll deferred messages over manual scrollback", async () => {
     const user = userEvent.setup();
-    const scrollTo = jest.fn();
+    const scrollTo = vi.fn();
     mockQueueChatRunInput.mockResolvedValue({
       userMessage: {
         id: "queued-user-1",
@@ -1368,7 +1366,7 @@ describe("ChatView deferred-input unhappy paths", () => {
 
   it("auto-scrolls deferred messages when the user is pinned to the bottom", async () => {
     const user = userEvent.setup();
-    const scrollTo = jest.fn();
+    const scrollTo = vi.fn();
     mockQueueChatRunInput.mockResolvedValue({
       userMessage: {
         id: "queued-user-1",

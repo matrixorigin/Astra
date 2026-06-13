@@ -17,12 +17,14 @@ import {
 } from "@/lib/chat-run-state";
 import {
   RuntimeClientError,
+  readRuntimeErrorDetail,
+  runtimeErrorDetail,
+} from "@/lib/runtime-client/errors";
+import {
   WebRuntimeClient,
   getRuntimeClient,
-  readRuntimeErrorDetail,
   requireRuntimeClient,
-  runtimeErrorDetail,
-} from "@/lib/runtime-client";
+} from "@/lib/runtime-client/server";
 import {
   normalizeWorkspaceSelection,
   sameWorkspaceSelection,

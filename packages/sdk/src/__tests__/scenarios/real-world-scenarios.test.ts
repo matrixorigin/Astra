@@ -35,7 +35,7 @@ describe('scenarios / workspace stream', () => {
   it('streamChat receives session_info → text_deltas → usage → turn_complete in order', async () => {
     const order: string[] = [];
     const body = sseChunksForStreamMock(readSseFixture('workspace-stream.txt'));
-    globalThis.fetch = jest.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       body: streamFrom(body),
@@ -59,7 +59,7 @@ describe('scenarios / tool loop', () => {
       'data: {"type":"tool_call_end","call_id":"c1","result":"ok"}\n\n',
       'data: {"type":"turn_complete"}\n\n',
     ];
-    const fetchImpl = jest
+    const fetchImpl = vi
       .fn()
       // stream chat
       .mockResolvedValueOnce({
@@ -85,7 +85,7 @@ describe('scenarios / tool loop', () => {
     expect(seq).toEqual(['text_delta', 'tool_call_start', 'tool_call_end', 'turn_complete']);
 
     await client.postToolResult({ request_id: 'r1', status: 'ok', output: 'out' });
-    const toolUrl = (fetchImpl as jest.Mock).mock.calls[1][0] as string;
+    const toolUrl = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls[1][0] as string;
     expect(toolUrl).toContain('/tools/result');
   });
 });
@@ -94,7 +94,7 @@ describe('scenarios / getRunEvents (buffered SSE) + last_index', () => {
   it('parses run replay body as StreamEvent list', async () => {
     const text =
       'data: {"type":"text_delta","content":"A"}\n\n' + 'data: {"type":"turn_complete"}\n\n';
-    globalThis.fetch = jest.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       text: () => Promise.resolve(text),
@@ -103,7 +103,7 @@ describe('scenarios / getRunEvents (buffered SSE) + last_index', () => {
 
     const client = new AstraClient({ baseUrl: 'http://localhost:8000', accessToken: 't' });
     const evs = await client.getRunEvents('run-1', 7);
-    const url = (globalThis.fetch as jest.Mock).mock.calls[0][0] as string;
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
     expect(url).toContain(chatRunStreamPath('run-1'));
     expect(url).toContain('last_index=7');
     expect(evs.map((e: StreamEvent) => e.type)).toEqual(['text_delta', 'turn_complete']);
@@ -128,7 +128,7 @@ describe('scenarios / getRunEvents 401 + refresh (second fetch)', () => {
     const sseText =
       'data: {"type":"text_delta","content":"x"}\n\n' + 'data: {"type":"turn_complete"}\n\n';
     let runStreamCalls = 0;
-    globalThis.fetch = jest.fn().mockImplementation((url: string) => {
+    globalThis.fetch = vi.fn().mockImplementation((url: string) => {
       const u = String(url);
       if (u.includes('/auth/refresh')) {
         return Promise.resolve({
@@ -160,7 +160,7 @@ describe('scenarios / getRunEvents 401 + refresh (second fetch)', () => {
       throw new Error(`unexpected fetch ${u}`);
     });
 
-    const onRefresh = jest.fn();
+    const onRefresh = vi.fn();
     const client = new AstraClient({
       baseUrl: 'http://localhost:8000',
       accessToken: 'old',
@@ -170,7 +170,7 @@ describe('scenarios / getRunEvents 401 + refresh (second fetch)', () => {
     const evs = await client.getRunEvents('run-reauth', 3);
     expect(evs.map((e) => e.type)).toEqual(['text_delta', 'turn_complete']);
     expect(onRefresh).toHaveBeenCalled();
-    const fetchMock = globalThis.fetch as jest.Mock;
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
     expect(fetchMock.mock.calls.length).toBe(3);
     const secondRunUrl = fetchMock.mock.calls[2][0] as string;
     expect(secondRunUrl).toContain('last_index=3');
@@ -198,7 +198,7 @@ describe('scenarios / auth 401 + refresh (session happy path)', () => {
       expires_in: 3600,
     };
     let sessionHits = 0;
-    globalThis.fetch = jest.fn().mockImplementation((url: string) => {
+    globalThis.fetch = vi.fn().mockImplementation((url: string) => {
       const u = String(url);
       if (u.includes('/auth/refresh')) {
         return Promise.resolve({
@@ -231,7 +231,7 @@ describe('scenarios / auth 401 + refresh (session happy path)', () => {
       throw new Error(`unexpected fetch ${u}`);
     });
 
-    const onRefresh = jest.fn();
+    const onRefresh = vi.fn();
     const client = new AstraClient({
       baseUrl: 'http://localhost:8000',
       accessToken: 'old',
@@ -251,7 +251,7 @@ describe('scenarios / error ordering (turn_complete then error)', () => {
       'data: {"type":"turn_complete"}\n\n',
       'data: {"type":"error","message":"limit"}\n\n',
     ];
-    globalThis.fetch = jest.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       body: streamFrom(body),
@@ -268,7 +268,7 @@ describe('scenarios / error ordering (turn_complete then error)', () => {
 
 describe('scenarios / getRunEvents HTTP error', () => {
   it('non-OK buffered stream throws AstraApiError', async () => {
-    globalThis.fetch = jest.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: false,
       status: 503,
       text: () => Promise.resolve('unavailable'),

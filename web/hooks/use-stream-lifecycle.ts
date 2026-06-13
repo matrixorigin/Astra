@@ -20,7 +20,7 @@ import {
   streamExistingChatRun,
   updateChatModel,
 } from "@/lib/api/chats";
-import { mergeStreamRunUpdate } from "@/lib/api/web-store";
+import { mergeStreamRunUpdate } from "@/lib/api/active-run-merge";
 import { createAssistantPatchController } from "@/lib/api/assistant-patch-controller";
 import {
   WebApiError,

@@ -2,7 +2,7 @@ export {
   RuntimeClientError,
   readRuntimeErrorDetail,
   runtimeErrorDetail,
-} from './errors';
+} from "./errors";
 export {
   WebRuntimeClient,
   getRuntimeClient,
@@ -10,4 +10,4 @@ export {
   requireRuntimeClient,
   type RuntimeAuthMode,
   type RuntimeRequestInit,
-} from './server';
+} from "./server";

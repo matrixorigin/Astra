@@ -2,25 +2,25 @@ import { render, screen } from "@testing-library/react";
 import { MessageBubble } from "@/components/app/message-bubble";
 import type { ChatMessage } from "@/lib/api/types";
 
-jest.mock("react-markdown", () => ({
+vi.mock("react-markdown", () => ({
   __esModule: true,
   default: ({ children }: { children: string }) => <div>{children}</div>,
 }));
-jest.mock("rehype-highlight", () => ({
+vi.mock("rehype-highlight", () => ({
   __esModule: true,
-  default: jest.fn(),
+  default: vi.fn(),
 }));
-jest.mock("rehype-katex", () => ({
+vi.mock("rehype-katex", () => ({
   __esModule: true,
-  default: jest.fn(),
+  default: vi.fn(),
 }));
-jest.mock("remark-gfm", () => ({
+vi.mock("remark-gfm", () => ({
   __esModule: true,
-  default: jest.fn(),
+  default: vi.fn(),
 }));
-jest.mock("remark-math", () => ({
+vi.mock("remark-math", () => ({
   __esModule: true,
-  default: jest.fn(),
+  default: vi.fn(),
 }));
 
 function assistantMessage(overrides: Partial<ChatMessage> = {}): ChatMessage {
@@ -38,7 +38,7 @@ function assistantMessage(overrides: Partial<ChatMessage> = {}): ChatMessage {
 
 describe("MessageBubble", () => {
   beforeEach(() => {
-    HTMLElement.prototype.scrollTo = jest.fn();
+    HTMLElement.prototype.scrollTo = vi.fn();
   });
 
   it("shows only the typing indicator while a response has no visible content yet", () => {

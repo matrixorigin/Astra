@@ -87,7 +87,7 @@ describe('scenarios / multi-turn context wire contract', () => {
   });
 
   it('streamChat sends consecutive turns with the same session id and updated context', async () => {
-    const fetchImpl = jest.fn().mockResolvedValue(okSseResponse());
+    const fetchImpl = vi.fn().mockResolvedValue(okSseResponse());
     globalThis.fetch = fetchImpl;
 
     const client = new AstraClient({

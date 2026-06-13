@@ -65,7 +65,7 @@ describe('ui primitives', () => {
 
   it('renders Modal content when open', () => {
     render(
-      <Modal open onOpenChange={jest.fn()} title="Dialog title">
+      <Modal open onOpenChange={vi.fn()} title="Dialog title">
         <p>Dialog body</p>
       </Modal>,
     );

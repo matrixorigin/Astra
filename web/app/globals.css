@@ -1,14 +1,68 @@
-@import url("/fonts/fz-pingxian-yasong/wght.css");
-@import url("/fonts/newsreader/wght.css");
-@import url("/fonts/inconsolata/wght.css");
+@import "highlight.js/styles/github-dark-dimmed.css";
+@import "katex/dist/katex.min.css";
+
+@font-face {
+  font-family: "FZ PingXian YaSong";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url("/fonts/fz-pingxian-yasong/FZPingXianYaSong.ttf") format("truetype");
+  unicode-range: U+4E00-9FFF, U+3000-303F, U+FF00-FFEF, U+2000-206F;
+}
+
+@font-face {
+  font-family: "Newsreader";
+  src: url("/fonts/newsreader/Newsreader-opsz-wght.ttf") format("truetype");
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+0000-00FF, U+0100-024F, U+2000-206F, U+20A0-20CF, U+2100-214F;
+}
+
+@font-face {
+  font-family: "Newsreader";
+  src: url("/fonts/newsreader/Newsreader-Italic-opsz-wght.ttf") format("truetype");
+  font-weight: 400 700;
+  font-style: italic;
+  font-display: swap;
+  unicode-range: U+0000-00FF, U+0100-024F, U+2000-206F, U+20A0-20CF, U+2100-214F;
+}
+
+@font-face {
+  font-family: "Inconsolata";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url("/fonts/inconsolata/files/inconsolata-400.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Inconsolata";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 500;
+  src: url("/fonts/inconsolata/files/inconsolata-500.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Inconsolata";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 600;
+  src: url("/fonts/inconsolata/files/inconsolata-600.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Inconsolata";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 700;
+  src: url("/fonts/inconsolata/files/inconsolata-700.ttf") format("truetype");
+}
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
-
-/* highlight.js dark theme for code blocks */
-@import "highlight.js/styles/github-dark-dimmed.css";
-@import "katex/dist/katex.min.css";
 
 :root {
   color-scheme: light;

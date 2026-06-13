@@ -23,7 +23,7 @@ function renderNavigator(
 
 function makeScrollableContainer() {
   const container = document.createElement('div');
-  const scrollTo = jest.fn();
+  const scrollTo = vi.fn();
 
   Object.defineProperties(container, {
     clientHeight: { configurable: true, value: 400 },
@@ -31,7 +31,7 @@ function makeScrollableContainer() {
     scrollTop: { configurable: true, writable: true, value: 100 },
     scrollTo: { configurable: true, value: scrollTo },
   });
-  container.getBoundingClientRect = jest.fn(() => ({ top: 20 }) as DOMRect);
+  container.getBoundingClientRect = vi.fn(() => ({ top: 20 }) as DOMRect);
 
   return { container, scrollTo };
 }
@@ -39,7 +39,7 @@ function makeScrollableContainer() {
 function appendMessageAnchor(container: HTMLElement, index: number, top: number) {
   const element = document.createElement('div');
   element.dataset.chatMessageIndex = String(index);
-  element.getBoundingClientRect = jest.fn(() => ({ top }) as DOMRect);
+  element.getBoundingClientRect = vi.fn(() => ({ top }) as DOMRect);
   container.appendChild(element);
   return element;
 }

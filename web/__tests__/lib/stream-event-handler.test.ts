@@ -1,6 +1,6 @@
-jest.mock("@/lib/api/web-store", () => ({
-  setChatActiveRun: jest.fn(),
-  updateStreamingAssistantMessage: jest.fn(),
+vi.mock("@/lib/api/web-store", () => ({
+  setChatActiveRun: vi.fn(),
+  updateStreamingAssistantMessage: vi.fn(),
 }));
 
 import {
@@ -12,13 +12,8 @@ import {
   updateStreamingAssistantMessage,
 } from "@/lib/api/web-store";
 
-const mockSetChatActiveRun = setChatActiveRun as jest.MockedFunction<
-  typeof setChatActiveRun
->;
-const mockUpdateStreamingAssistantMessage =
-  updateStreamingAssistantMessage as jest.MockedFunction<
-    typeof updateStreamingAssistantMessage
-  >;
+const mockSetChatActiveRun = vi.mocked(setChatActiveRun);
+const mockUpdateStreamingAssistantMessage = vi.mocked(updateStreamingAssistantMessage);
 
 function makeState(): StreamEventState {
   return {
@@ -40,7 +35,7 @@ const ctx = {
 
 describe("applyStreamEvent", () => {
   beforeEach(() => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
   });
 
   it("clears active run before throwing on session mismatch", () => {

@@ -1,22 +1,20 @@
-/**
- * @jest-environment node
- */
+// @vitest-environment node
 
-jest.mock("@/lib/api/auth-guard", () => ({
-  requireRuntimeUser: jest.fn(),
+vi.mock("@/lib/api/auth-guard", () => ({
+  requireRuntimeUser: vi.fn(),
 }));
 
-jest.mock("@/lib/api/web-store", () => ({
-  beginStreamingMessage: jest.fn(),
-  ensureChatBackendSession: jest.fn(),
-  getChat: jest.fn(),
-  resolveBackendModelName: jest.fn(),
-  setChatActiveRun: jest.fn(),
-  updateChatWorkspaceSelection: jest.fn(),
-  updateStreamingAssistantMessage: jest.fn(),
+vi.mock("@/lib/api/web-store", () => ({
+  beginStreamingMessage: vi.fn(),
+  ensureChatBackendSession: vi.fn(),
+  getChat: vi.fn(),
+  resolveBackendModelName: vi.fn(),
+  setChatActiveRun: vi.fn(),
+  updateChatWorkspaceSelection: vi.fn(),
+  updateStreamingAssistantMessage: vi.fn(),
 }));
 
-jest.mock("@/lib/runtime-client", () => ({
+vi.mock("@/lib/runtime-client", () => ({
   RuntimeClientError: class RuntimeClientError extends Error {
     status?: number;
     detail: string;
@@ -28,8 +26,8 @@ jest.mock("@/lib/runtime-client", () => ({
     }
   },
   WebRuntimeClient: class WebRuntimeClient {},
-  readRuntimeErrorDetail: jest.fn(),
-  requireRuntimeClient: jest.fn(),
+  readRuntimeErrorDetail: vi.fn(),
+  requireRuntimeClient: vi.fn(),
 }));
 
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
@@ -45,44 +43,24 @@ import {
 import { requireRuntimeClient } from "@/lib/runtime-client";
 import { PATH_EDGES_STATUS } from "@astra/sdk";
 
-const mockRequireRuntimeUser = requireRuntimeUser as jest.MockedFunction<
-  typeof requireRuntimeUser
->;
-const mockGetChat = getChat as jest.MockedFunction<typeof getChat>;
-const mockResolveBackendModelName =
-  resolveBackendModelName as jest.MockedFunction<
-    typeof resolveBackendModelName
-  >;
-const mockBeginStreamingMessage = beginStreamingMessage as jest.MockedFunction<
-  typeof beginStreamingMessage
->;
-const mockEnsureChatBackendSession =
-  ensureChatBackendSession as jest.MockedFunction<
-    typeof ensureChatBackendSession
-  >;
-const mockSetChatActiveRun = setChatActiveRun as jest.MockedFunction<
-  typeof setChatActiveRun
->;
-const mockUpdateChatWorkspaceSelection =
-  updateChatWorkspaceSelection as jest.MockedFunction<
-    typeof updateChatWorkspaceSelection
-  >;
-const mockUpdateStreamingAssistantMessage =
-  updateStreamingAssistantMessage as jest.MockedFunction<
-    typeof updateStreamingAssistantMessage
-  >;
-const mockRequireRuntimeClient = requireRuntimeClient as jest.MockedFunction<
-  typeof requireRuntimeClient
->;
+const mockRequireRuntimeUser = vi.mocked(requireRuntimeUser);
+const mockGetChat = vi.mocked(getChat);
+const mockResolveBackendModelName = vi.mocked(resolveBackendModelName);
+const mockBeginStreamingMessage = vi.mocked(beginStreamingMessage);
+const mockEnsureChatBackendSession = vi.mocked(ensureChatBackendSession);
+const mockSetChatActiveRun = vi.mocked(setChatActiveRun);
+const mockUpdateChatWorkspaceSelection = vi.mocked(updateChatWorkspaceSelection);
+const mockUpdateStreamingAssistantMessage = vi.mocked(updateStreamingAssistantMessage);
+const mockRequireRuntimeClient = vi.mocked(requireRuntimeClient);
 
 function makeBackendStream() {
   let releasePendingRead: (() => void) | null = null;
-  const cancel = jest.fn(() => {
+  const cancel = vi.fn(() => {
     releasePendingRead?.();
     return Promise.resolve();
   });
-  const releaseLock = jest.fn();
-  const read = jest.fn(
+  const releaseLock = vi.fn();
+  const read = vi.fn(
     () =>
       new Promise<{ value?: Uint8Array; done: boolean }>((resolve) => {
         releasePendingRead = () => resolve({ value: undefined, done: true });
@@ -106,8 +84,8 @@ function makeBackendFrameStream(frames: string[]) {
   const encoder = new TextEncoder();
   const chunks = frames.map((frame) => encoder.encode(frame));
   let index = 0;
-  const releaseLock = jest.fn();
-  const cancel = jest.fn();
+  const releaseLock = vi.fn();
+  const cancel = vi.fn();
 
   return {
     body: {
@@ -156,11 +134,11 @@ function makeRuntimeWithEdgeStatus(
 ) {
   return {
     sdk: {
-      getRuntimeSession: jest.fn().mockResolvedValue({}),
-      listSessionArtifacts: jest.fn().mockResolvedValue({ artifacts: [] }),
+      getRuntimeSession: vi.fn().mockResolvedValue({}),
+      listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
     },
-    get: jest.fn().mockResolvedValue({ edges }),
-    fetchResponse: jest.fn().mockResolvedValue({
+    get: vi.fn().mockResolvedValue({ edges }),
+    fetchResponse: vi.fn().mockResolvedValue({
       ok: true,
       body: backend.body,
     }),
@@ -169,7 +147,7 @@ function makeRuntimeWithEdgeStatus(
 
 describe("chat stream route proxy cancellation", () => {
   beforeEach(() => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
     mockRequireRuntimeUser.mockResolvedValue({
       user: { user_id: "user-a" },
       response: null,
@@ -225,10 +203,10 @@ describe("chat stream route proxy cancellation", () => {
     const backend = makeBackendStream();
     const runtime = {
       sdk: {
-        getRuntimeSession: jest.fn().mockResolvedValue({}),
-        listSessionArtifacts: jest.fn().mockResolvedValue({ artifacts: [] }),
+        getRuntimeSession: vi.fn().mockResolvedValue({}),
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
       },
-      fetchResponse: jest.fn().mockResolvedValue({
+      fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         body: backend.body,
       }),
@@ -280,10 +258,10 @@ describe("chat stream route proxy cancellation", () => {
     ]);
     mockRequireRuntimeClient.mockResolvedValue({
       sdk: {
-        getRuntimeSession: jest.fn().mockResolvedValue({}),
-        listSessionArtifacts: jest.fn().mockResolvedValue({ artifacts: [] }),
+        getRuntimeSession: vi.fn().mockResolvedValue({}),
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
       },
-      fetchResponse: jest.fn().mockResolvedValue({
+      fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         body: backend.body,
       }),
@@ -344,10 +322,10 @@ describe("chat stream route proxy cancellation", () => {
     ]);
     mockRequireRuntimeClient.mockResolvedValue({
       sdk: {
-        getRuntimeSession: jest.fn().mockResolvedValue({}),
-        listSessionArtifacts: jest.fn().mockResolvedValue({ artifacts: [] }),
+        getRuntimeSession: vi.fn().mockResolvedValue({}),
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
       },
-      fetchResponse: jest.fn().mockResolvedValue({
+      fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         body: backend.body,
       }),
@@ -410,8 +388,8 @@ describe("chat stream route proxy cancellation", () => {
       ok: boolean;
       body: ReturnType<typeof makeBackendStream>["body"];
     }) => void = () => {};
-    const fetchResponse = jest.fn(
-      () =>
+    const fetchResponse = vi.fn(
+      (_path: string, init: { signal?: AbortSignal }) =>
         new Promise<{
           ok: boolean;
           body: ReturnType<typeof makeBackendStream>["body"];
@@ -421,8 +399,8 @@ describe("chat stream route proxy cancellation", () => {
     );
     const runtime = {
       sdk: {
-        getRuntimeSession: jest.fn().mockResolvedValue({}),
-        listSessionArtifacts: jest.fn().mockResolvedValue({ artifacts: [] }),
+        getRuntimeSession: vi.fn().mockResolvedValue({}),
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
       },
       fetchResponse,
     };
@@ -449,7 +427,7 @@ describe("chat stream route proxy cancellation", () => {
     const first = await reader!.read();
     const text = new TextDecoder().decode(first.value);
     expect(text).toContain('"type":"local_messages"');
-    expect(fetchResponse).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchResponse).toHaveBeenCalledTimes(1));
 
     const backend = makeBackendStream();
     resolveFetch({ ok: true, body: backend.body });
@@ -463,9 +441,9 @@ describe("chat stream route proxy cancellation", () => {
     ]);
     const runtime = {
       sdk: {
-        listSessionArtifacts: jest.fn().mockResolvedValue({ artifacts: [] }),
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
       },
-      fetchResponse: jest.fn().mockResolvedValue({
+      fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         body: backend.body,
       }),
@@ -537,6 +515,86 @@ describe("chat stream route proxy cancellation", () => {
       "assistant-queued",
       expect.objectContaining({ content: "resumed output" }),
     );
+  });
+
+  it("returns an existing-run SSE response before the backend stream connection resolves", async () => {
+    const { GET } = await import("@/app/api/chats/[chatId]/stream/route");
+    let fetchResolved = false;
+    let resolveFetch: (
+      value: {
+        ok: boolean;
+        body: ReturnType<typeof makeBackendStream>["body"];
+      },
+    ) => void = () => {};
+    const fetchResponse = vi.fn(
+      (_path: string, _init: { signal?: AbortSignal }) =>
+        new Promise<{
+          ok: boolean;
+          body: ReturnType<typeof makeBackendStream>["body"];
+        }>((resolve) => {
+          resolveFetch = (value) => {
+            fetchResolved = true;
+            resolve(value);
+          };
+        }),
+    );
+    const runtime = {
+      sdk: {
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
+      },
+      fetchResponse,
+    };
+    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    mockGetChat.mockReturnValue({
+      chat: {
+        id: "chat-1",
+        title: "Chat",
+        projectId: null,
+        createdAt: "2026-06-07T00:00:00.000Z",
+        updatedAt: "2026-06-07T00:00:00.000Z",
+        archivedAt: null,
+        model: "sonnet-4.6-adaptive",
+      },
+      session: {
+        chatId: "chat-1",
+        backendSessionId: "runtime-session-1",
+        persisted: true,
+        messageCount: 2,
+      },
+      messages: [
+        {
+          id: "assistant-queued",
+          role: "assistant",
+          content: "",
+          createdAt: "2026-06-07T00:00:01.000Z",
+          status: "streaming",
+        },
+      ],
+      activeRun: {
+        runId: "run-1",
+        status: "running",
+        waitingFor: null,
+        assistantMessageId: "assistant-queued",
+      },
+    } as never);
+
+    const url = new URL("http://web.test/api/chats/chat-1/stream?runId=run-1");
+    const response = await GET({ nextUrl: url } as never, {
+      params: Promise.resolve({ chatId: "chat-1" }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(fetchResponse).toHaveBeenCalledTimes(1);
+    expect(fetchResolved).toBe(false);
+    const signal = fetchResponse.mock.calls[0]?.[1]?.signal as
+      | AbortSignal
+      | undefined;
+    expect(signal?.aborted).toBe(false);
+
+    const reader = response.body?.getReader();
+    await reader?.cancel();
+    expect(signal?.aborted).toBe(true);
+    resolveFetch({ ok: true, body: makeBackendStream().body });
   });
 
   it("rejects local code prompts without workspace authority before creating stream messages", async () => {
@@ -726,9 +784,9 @@ describe("chat stream route proxy cancellation", () => {
     mockResolveBackendModelName.mockImplementation(() => new Promise(() => {}));
     const runtime = {
       sdk: {
-        listSessionArtifacts: jest.fn().mockResolvedValue({ artifacts: [] }),
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
       },
-      fetchResponse: jest.fn(),
+      fetchResponse: vi.fn(),
     };
     mockRequireRuntimeClient.mockResolvedValue(runtime as never);
 
@@ -828,10 +886,10 @@ describe("chat stream route proxy cancellation", () => {
     const backend = makeBackendStream();
     mockRequireRuntimeClient.mockResolvedValue({
       sdk: {
-        getRuntimeSession: jest.fn().mockResolvedValue({}),
-        listSessionArtifacts: jest.fn().mockResolvedValue({ artifacts: [] }),
+        getRuntimeSession: vi.fn().mockResolvedValue({}),
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
       },
-      fetchResponse: jest.fn().mockResolvedValue({
+      fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         body: backend.body,
       }),
@@ -962,7 +1020,7 @@ describe("chat stream route proxy cancellation", () => {
 
 describe("chat stream route artifact fetch optimization", () => {
   beforeEach(() => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
     mockRequireRuntimeUser.mockResolvedValue({
       user: { user_id: "user-a" },
       response: null,
@@ -1004,13 +1062,13 @@ describe("chat stream route artifact fetch optimization", () => {
 
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendStream();
-    const listSessionArtifacts = jest.fn().mockResolvedValue({ artifacts: [] });
+    const listSessionArtifacts = vi.fn().mockResolvedValue({ artifacts: [] });
     const runtime = {
       sdk: {
-        getRuntimeSession: jest.fn().mockResolvedValue({}),
+        getRuntimeSession: vi.fn().mockResolvedValue({}),
         listSessionArtifacts,
       },
-      fetchResponse: jest.fn().mockResolvedValue({
+      fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         body: backend.body,
       }),
@@ -1070,13 +1128,13 @@ describe("chat stream route artifact fetch optimization", () => {
 
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendStream();
-    const listSessionArtifacts = jest.fn().mockResolvedValue({ artifacts: [] });
+    const listSessionArtifacts = vi.fn().mockResolvedValue({ artifacts: [] });
     const runtime = {
       sdk: {
-        getRuntimeSession: jest.fn().mockResolvedValue({}),
+        getRuntimeSession: vi.fn().mockResolvedValue({}),
         listSessionArtifacts,
       },
-      fetchResponse: jest.fn().mockResolvedValue({
+      fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         body: backend.body,
       }),
@@ -1127,13 +1185,13 @@ describe("chat stream route artifact fetch optimization", () => {
 
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendStream();
-    const listSessionArtifacts = jest.fn().mockResolvedValue({ artifacts: [] });
+    const listSessionArtifacts = vi.fn().mockResolvedValue({ artifacts: [] });
     const runtime = {
       sdk: {
-        getRuntimeSession: jest.fn().mockResolvedValue({}),
+        getRuntimeSession: vi.fn().mockResolvedValue({}),
         listSessionArtifacts,
       },
-      fetchResponse: jest.fn().mockResolvedValue({
+      fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         body: backend.body,
       }),
@@ -1201,9 +1259,9 @@ describe("chat stream route artifact fetch optimization", () => {
 
     const runtime = {
       sdk: {
-        listSessionArtifacts: jest.fn().mockResolvedValue({ artifacts: [] }),
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
       },
-      fetchResponse: jest.fn().mockResolvedValue({
+      fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         body: backend.body,
       }),
@@ -1252,7 +1310,7 @@ describe("chat stream route artifact fetch optimization", () => {
 
 describe("chat existing run stream route", () => {
   beforeEach(() => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
     mockRequireRuntimeUser.mockResolvedValue({
       user: { user_id: "user-a" },
       response: null,
@@ -1299,12 +1357,12 @@ describe("chat existing run stream route", () => {
       'data: {"type":"text_delta","content":"reply"}\n\n',
       'data: {"type":"run_finished","run_id":"run-1","status":"completed"}\n\n',
     ]);
-    const listSessionArtifacts = jest.fn().mockResolvedValue({ artifacts: [] });
+    const listSessionArtifacts = vi.fn().mockResolvedValue({ artifacts: [] });
     mockRequireRuntimeClient.mockResolvedValue({
       sdk: {
         listSessionArtifacts,
       },
-      fetchResponse: jest.fn().mockResolvedValue({
+      fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         body: backend.body,
       }),
@@ -1363,9 +1421,9 @@ describe("chat existing run stream route", () => {
     ]);
     mockRequireRuntimeClient.mockResolvedValue({
       sdk: {
-        listSessionArtifacts: jest.fn().mockResolvedValue({ artifacts: [] }),
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
       },
-      fetchResponse: jest.fn().mockResolvedValue({
+      fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         body: backend.body,
       }),

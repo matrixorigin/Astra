@@ -2,93 +2,100 @@
 // Stream event types matching the Rust backend's SSE/WebSocket protocol.
 
 export type StreamEventType =
-  | 'session_info'
-  | 'run_started'
-  | 'run_paused'
-  | 'run_resumed'
-  | 'run_finished'
-  | 'run_cancelled'
-  | 'run_waiting'
-  | 'run_error'
-  | 'run_interrupted'
-  | 'text_delta'
-  | 'text_done'
-  | 'reasoning_delta'
-  | 'reasoning_done'
-  | 'tool_call'
-  | 'tool_call_start'
-  | 'tool_call_end'
-  | 'usage'
-  | 'turn_complete'
-  | 'error'
-  | 'warning'
-  | 'explain'
-  | 'plan_created'
-  | 'plan_revised'
-  | 'plan_step_start'
-  | 'plan_step_done'
-  | 'workspace_bound'
-  | 'executor_bound'
-  | 'executor_status_changed'
-  | 'tool_routing_decision'
-  | 'tool_transport_started'
-  | 'tool_transport_completed'
-  | 'tool_transport_failed'
-  | 'run_blocked'
-  | 'agent_delegated'
-  | 'agent_spawned'
-  | 'agent_waiting'
-  | 'agent_progress'
-  | 'agent_completed'
-  | 'agent_failed'
-  | 'agent_cancelled'
-  | 'agent_interrupted'
-  | 'task_board_snapshot'
-  | 'tool_approval_request'
-  | 'ping'
-  | 'device_revoked'
-  | 'device_lease_expired'
-  | 'tool_execution_started'
-  | 'tool_output_delta'
-  | 'tool_execution_completed';
+  | "session_info"
+  | "run_started"
+  | "run_paused"
+  | "run_resumed"
+  | "run_finished"
+  | "run_cancelled"
+  | "run_waiting"
+  | "run_error"
+  | "run_interrupted"
+  | "run_input_queued"
+  | "text_delta"
+  | "text_done"
+  | "reasoning_delta"
+  | "reasoning_done"
+  | "thinking_delta"
+  | "thinking_done"
+  | "reasoning_message_content"
+  | "tool_call"
+  | "tool_call_start"
+  | "tool_call_end"
+  | "usage"
+  | "turn_complete"
+  | "error"
+  | "warning"
+  | "explain"
+  | "plan_created"
+  | "plan_revised"
+  | "plan_step_start"
+  | "plan_step_done"
+  | "workspace_bound"
+  | "executor_bound"
+  | "executor_status_changed"
+  | "tool_routing_decision"
+  | "tool_transport_started"
+  | "tool_transport_completed"
+  | "tool_transport_failed"
+  | "run_blocked"
+  | "agent_delegated"
+  | "agent_spawned"
+  | "agent_waiting"
+  | "agent_progress"
+  | "agent_completed"
+  | "agent_failed"
+  | "agent_cancelled"
+  | "agent_interrupted"
+  | "task_board_snapshot"
+  | "tool_approval_request"
+  | "ping"
+  | "device_revoked"
+  | "device_lease_expired"
+  | "tool_execution_started"
+  | "tool_output_delta"
+  | "tool_execution_completed";
 
 export type SessionInfoEvent = {
-  type: 'session_info';
+  type: "session_info";
   session_id: string;
   run_id?: string;
 };
 
 export type RunStartedEvent = {
-  type: 'run_started';
+  type: "run_started";
   run_id?: string;
   session_id?: string;
 } & ExecutionBindingFields;
 
 export type RunPausedEvent = {
-  type: 'run_paused';
+  type: "run_paused";
   run_id?: string;
   waiting_for?: string | null;
 } & ExecutionBindingFields;
 
 export type RunResumedEvent = {
-  type: 'run_resumed';
+  type: "run_resumed";
   run_id?: string;
 } & ExecutionBindingFields;
 
 export type RunFinishedEvent = {
-  type: 'run_finished';
+  type: "run_finished";
   run_id?: string;
   status?: string;
   error?: string | null;
+  interrupted?: boolean;
+  resumable?: boolean;
+  waiting_for?: string | null;
 } & ExecutionBindingFields;
 
 export type RunCancelledEvent = {
-  type: 'run_cancelled';
+  type: "run_cancelled";
   run_id: string;
 } & ExecutionBindingFields;
 
 export type RunWaitingEvent = {
-  type: 'run_waiting';
+  type: "run_waiting";
   run_id?: string;
   reason?: string;
   waiting_for?: string | null;
@@ -96,15 +103,16 @@ export type RunWaitingEvent = {
 } & ExecutionBindingFields;
 
 export type RunErrorEvent = {
-  type: 'run_error';
+  type: "run_error";
   run_id?: string;
   message?: string;
   error?: string;
   code?: string;
+  error_kind?: string;
 } & ExecutionBindingFields;
 
 export type RunInterruptedEvent = {
-  type: 'run_interrupted';
+  type: "run_interrupted";
   run_id?: string;
   kind?: string;
   message?: string;
@@ -113,59 +121,59 @@ export type RunInterruptedEvent = {
 } & ExecutionBindingFields;
 
 export type TextDeltaEvent = {
-  type: 'text_delta';
+  type: "text_delta";
   content: string;
 };
 
 export type TextDoneEvent = {
-  type: 'text_done';
+  type: "text_done";
   full_text: string;
 };
 
 export type ThinkingDeltaEvent = {
-  type: 'reasoning_delta';
+  type: "reasoning_delta";
   content: string;
 };
 
 export type ThinkingDoneEvent = {
-  type: 'reasoning_done';
+  type: "reasoning_done";
 };
 
 export type WorkspaceBinding = {
   kind:
-    | 'server_sandbox'
-    | 'edge_workspace'
-    | 'uploaded_snapshot'
-    | 'git_checkout'
-    | 'none'
-    | 'unknown'
+    | "server_sandbox"
+    | "edge_workspace"
+    | "uploaded_snapshot"
+    | "git_checkout"
+    | "none"
+    | "unknown"
     | string;
   display_name?: string;
   cwd?: string | null;
-  authority?: 'read_only' | 'read_write' | string;
-  fallback_policy?: 'disabled';
+  authority?: "read_only" | "read_write" | string;
+  fallback_policy?: "disabled";
 };
 
 export type ExecutorBinding = {
   kind:
-    | 'server_local'
-    | 'edge_agent'
-    | 'thin_client'
-    | 'mcp'
-    | 'hosted_runner'
-    | 'unknown'
+    | "server_local"
+    | "edge_agent"
+    | "thin_client"
+    | "mcp"
+    | "hosted_runner"
+    | "unknown"
     | string;
   executor_id?: string;
   display_name?: string;
   transport?:
-    | 'server_local'
-    | 'edge_ws'
-    | 'edge_ledger'
-    | 'mcp_http'
-    | 'runner_rpc'
-    | 'unknown'
+    | "server_local"
+    | "edge_ws"
+    | "edge_ledger"
+    | "mcp_http"
+    | "runner_rpc"
+    | "unknown"
     | string;
-  status?: 'online' | 'offline' | 'degraded' | 'unknown' | string;
+  status?: "online" | "offline" | "degraded" | "unknown" | string;
 };
 
 export type ExecutionBindingFields = {
@@ -177,14 +185,14 @@ export type ExecutionBindingFields = {
 };
 
 export type ToolCallStartEvent = {
-  type: 'tool_call_start';
+  type: "tool_call_start";
   tool: string;
   call_id: string;
   arguments?: string;
 } & ExecutionBindingFields;
 
 export type ToolCallEvent = {
-  type: 'tool_call';
+  type: "tool_call";
   tool_call: {
     id?: string;
     call_id?: string;
@@ -202,7 +210,7 @@ export type ToolCallEvent = {
 } & ExecutionBindingFields;
 
 export type ToolCallEndEvent = {
-  type: 'tool_call_end';
+  type: "tool_call_end";
   call_id: string;
   result?: string;
   success?: boolean;
@@ -212,7 +220,7 @@ export type ToolCallEndEvent = {
 } & ExecutionBindingFields;
 
 export type UsageEvent = {
-  type: 'usage';
+  type: "usage";
   prompt_tokens: number;
   completion_tokens: number;
   cache_creation_tokens?: number;
@@ -223,14 +231,14 @@ export type UsageEvent = {
 };
 
 export type TurnCompleteEvent = {
-  type: 'turn_complete';
+  type: "turn_complete";
   /** Some runtime paths include final visible assistant text on turn completion. */
   assistant_text?: string;
   followup_suggestion?: string;
 };
 
 export type StreamErrorEvent = {
-  type: 'error';
+  type: "error";
   code?: string;
   message: string;
   retryable?: boolean;
@@ -238,18 +246,18 @@ export type StreamErrorEvent = {
 };
 
 export type WarningEvent = {
-  type: 'warning';
+  type: "warning";
   message: string;
   claims_failed?: number;
 };
 
 export type ExplainEvent = {
-  type: 'explain';
+  type: "explain";
   content: string;
 };
 
 export type PlanCreatedEvent = {
-  type: 'plan_created';
+  type: "plan_created";
   plan: {
     plan_id?: string;
     title?: string;
@@ -258,7 +266,7 @@ export type PlanCreatedEvent = {
 };
 
 export type PlanRevisedEvent = {
-  type: 'plan_revised';
+  type: "plan_revised";
   plan: {
     plan_id?: string;
     title?: string;
@@ -267,26 +275,26 @@ export type PlanRevisedEvent = {
 };
 
 export type PlanStepStartEvent = {
-  type: 'plan_step_start';
+  type: "plan_step_start";
   step: string;
   subtask_id?: string;
 };
 
 export type PlanStepDoneEvent = {
-  type: 'plan_step_done';
+  type: "plan_step_done";
   step: string;
   subtask_id?: string;
   result?: string;
 };
 
 export type AgentDelegatedEvent = {
-  type: 'agent_delegated';
+  type: "agent_delegated";
   agent_id: string;
   task: string;
 } & ExecutionBindingFields;
 
 export type AgentSpawnedEvent = {
-  type: 'agent_spawned';
+  type: "agent_spawned";
   agent_id: string;
   run_id: string;
   parent_run_id: string;
@@ -296,18 +304,18 @@ export type AgentSpawnedEvent = {
 } & ExecutionBindingFields;
 
 export type AgentWaitingEvent = {
-  type: 'agent_waiting';
+  type: "agent_waiting";
   agent_id: string;
   run_id?: string;
   parent_run_id?: string;
-  status?: 'waiting' | string;
+  status?: "waiting" | string;
   reason?: string;
   waiting_for?: string | null;
   timestamp?: number;
 } & ExecutionBindingFields;
 
 export type AgentProgressEvent = {
-  type: 'agent_progress';
+  type: "agent_progress";
   agent_id: string;
   status: string;
   description?: string;
@@ -321,9 +329,9 @@ export type AgentProgressEvent = {
 } & ExecutionBindingFields;
 
 export type AgentCompletedEvent = {
-  type: 'agent_completed';
+  type: "agent_completed";
   agent_id: string;
-  status: 'completed' | 'failed' | 'cancelled';
+  status: "completed" | "failed" | "cancelled";
   result_summary?: string;
   error?: string;
   reason?: string;
@@ -334,25 +342,25 @@ export type AgentCompletedEvent = {
 } & ExecutionBindingFields;
 
 export type AgentFailedEvent = {
-  type: 'agent_failed';
+  type: "agent_failed";
   agent_id: string;
-  status?: 'failed';
+  status?: "failed";
   error?: string;
   timestamp?: number;
 } & ExecutionBindingFields;
 
 export type AgentCancelledEvent = {
-  type: 'agent_cancelled';
+  type: "agent_cancelled";
   agent_id: string;
-  status?: 'cancelled';
+  status?: "cancelled";
   reason?: string;
   timestamp?: number;
 } & ExecutionBindingFields;
 
 export type AgentInterruptedEvent = {
-  type: 'agent_interrupted';
+  type: "agent_interrupted";
   agent_id: string;
-  status?: 'interrupted';
+  status?: "interrupted";
   reason?: string;
   partial_summary?: string;
   total_tool_calls?: number;
@@ -387,41 +395,41 @@ export type SessionTask = {
 };
 
 export type TaskBoardSnapshotEvent = {
-  type: 'task_board_snapshot';
+  type: "task_board_snapshot";
   session_id: string;
   reason?: string;
   tasks: SessionTask[];
 };
 
 export type WorkspaceBoundEvent = {
-  type: 'workspace_bound';
+  type: "workspace_bound";
   session_id?: string;
   workspace: WorkspaceBinding;
   executor?: ExecutorBinding;
 } & ExecutionBindingFields;
 
 export type ExecutorBoundEvent = {
-  type: 'executor_bound' | 'executor_status_changed';
+  type: "executor_bound" | "executor_status_changed";
   session_id?: string;
   executor: ExecutorBinding;
   workspace?: WorkspaceBinding;
 } & ExecutionBindingFields;
 
 export type ToolRoutingDecisionEvent = {
-  type: 'tool_routing_decision';
+  type: "tool_routing_decision";
   call_id: string;
   tool?: string;
 } & ExecutionBindingFields;
 
 export type ToolTransportStartedEvent = {
-  type: 'tool_transport_started';
+  type: "tool_transport_started";
   call_id: string;
   tool: string;
   arguments?: unknown;
 } & ExecutionBindingFields;
 
 export type ToolTransportCompletedEvent = {
-  type: 'tool_transport_completed';
+  type: "tool_transport_completed";
   call_id: string;
   tool?: string;
   result?: unknown;
@@ -430,7 +438,7 @@ export type ToolTransportCompletedEvent = {
 } & ExecutionBindingFields;
 
 export type ToolTransportFailedEvent = {
-  type: 'tool_transport_failed';
+  type: "tool_transport_failed";
   call_id: string;
   tool?: string;
   error?: string;
@@ -440,7 +448,29 @@ export type ToolTransportFailedEvent = {
   duration_ms?: number;
 } & ExecutionBindingFields;
 
+export type RunInputQueuedEvent = {
+  type: "run_input_queued";
+  run_id?: string;
+  session_id?: string;
+} & ExecutionBindingFields;
+
+export type ThinkingAliasDeltaEvent = {
+  type: "thinking_delta";
+  content: string;
+};
+
+export type ThinkingAliasDoneEvent = {
+  type: "thinking_done";
+};
+
+export type ReasoningMessageContentEvent = {
+  type: "reasoning_message_content";
+  content: string;
+};
+
 type RunBlockedBaseEvent = {
+  run_id?: string;
+  session_id?: string;
   reason?: string;
   message?: string;
   call_id?: string;
@@ -449,25 +479,29 @@ type RunBlockedBaseEvent = {
 } & ExecutionBindingFields;
 
 export type RunBlockedEvent = RunBlockedBaseEvent & {
-  type: 'run_blocked';
-  reason: 'executor_offline' | 'transport_disconnected' | 'fallback_disabled' | 'workspace_executor_unavailable';
+  type: "run_blocked";
+  reason:
+    | "executor_offline"
+    | "transport_disconnected"
+    | "fallback_disabled"
+    | "workspace_executor_unavailable";
 };
 
 export type ToolApprovalRequestEvent = {
-  type: 'tool_approval_request';
+  type: "tool_approval_request";
   request_id: string;
   tool: string;
   args: Record<string, unknown>;
 };
 
 export type PingEvent = {
-  type: 'ping';
+  type: "ping";
   run_id?: string;
   heartbeat_interval_ms?: number;
 };
 
 export type DeviceLeaseEndedEvent = {
-  type: 'device_revoked' | 'device_lease_expired';
+  type: "device_revoked" | "device_lease_expired";
   lease_id: string;
   session_id: string;
   device_id: string;
@@ -477,19 +511,19 @@ export type DeviceLeaseEndedEvent = {
 };
 
 export type ToolExecutionStartedEvent = {
-  type: 'tool_execution_started';
+  type: "tool_execution_started";
   call_id: string;
   tool: string;
 };
 
 export type ToolOutputDeltaEvent = {
-  type: 'tool_output_delta';
+  type: "tool_output_delta";
   call_id: string;
   content: string;
 };
 
 export type ToolExecutionCompletedEvent = {
-  type: 'tool_execution_completed';
+  type: "tool_execution_completed";
   call_id: string;
   success: boolean;
 };
@@ -504,10 +538,14 @@ export type StreamEvent = (
   | RunWaitingEvent
   | RunErrorEvent
   | RunInterruptedEvent
+  | RunInputQueuedEvent
   | TextDeltaEvent
   | TextDoneEvent
   | ThinkingDeltaEvent
   | ThinkingDoneEvent
+  | ThinkingAliasDeltaEvent
+  | ThinkingAliasDoneEvent
+  | ReasoningMessageContentEvent
   | ToolCallEvent
   | ToolCallStartEvent
   | ToolCallEndEvent
@@ -541,20 +579,25 @@ export type StreamEvent = (
   | DeviceLeaseEndedEvent
   | ToolExecutionStartedEvent
   | ToolOutputDeltaEvent
-  | ToolExecutionCompletedEvent) & { index?: number };
+  | ToolExecutionCompletedEvent
+) & { index?: number };
 
-export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error';
+export type ConnectionState =
+  | "disconnected"
+  | "connecting"
+  | "connected"
+  | "error";
 
 // ─── Chat / Workspace Types ────────────────────────────────────────
 
-export type ChatRole = 'user' | 'assistant' | 'system';
+export type ChatRole = "user" | "assistant" | "system";
 
 export type ToolCall = {
   callId: string;
   tool: string;
   arguments?: string;
   result?: string;
-  status: 'running' | 'done' | 'error';
+  status: "running" | "done" | "error";
   errorKind?: string;
   blocked?: boolean;
   workspace?: WorkspaceBinding;
@@ -575,7 +618,7 @@ export type ThinkingBlock = {
 export type PlanSubtask = {
   id: string;
   title: string;
-  status: 'pending' | 'running' | 'done' | 'error';
+  status: "pending" | "running" | "done" | "error";
 };
 
 export type PlanState = {
@@ -656,7 +699,10 @@ export type AstraClientConfig = {
   pathPrefix?: string;
   accessToken?: string;
   refreshToken?: string;
-  onTokenRefresh?: (tokens: { accessToken: string; refreshToken: string }) => void | Promise<void>;
+  onTokenRefresh?: (tokens: {
+    accessToken: string;
+    refreshToken: string;
+  }) => void | Promise<void>;
   headers?: Record<string, string>;
 };
 
@@ -673,7 +719,7 @@ export type SSEClientOptions = {
   heartbeatTimeoutMs?: number;
   signal?: AbortSignal;
   /** HTTP method. Defaults to 'GET'. Use 'POST' for streaming chat endpoints. */
-  method?: 'GET' | 'POST';
+  method?: "GET" | "POST";
   /** Request body for POST requests. */
   body?: string;
 };
@@ -709,14 +755,14 @@ export type RunStatus = {
   runId: string;
   sessionId: string;
   status:
-    | 'running'
-    | 'input-queued'
-    | 'completed'
-    | 'failed'
-    | 'cancelled'
-    | 'paused'
-    | 'waiting'
-    | 'blocked'
+    | "running"
+    | "input-queued"
+    | "completed"
+    | "failed"
+    | "cancelled"
+    | "paused"
+    | "waiting"
+    | "blocked"
     | string;
   eventsCount: number;
   waitingFor?: string | null;
@@ -919,7 +965,7 @@ export type UserInfo = {
 
 export type MemoryEntry = {
   content: string;
-  memory_type?: 'semantic' | 'episodic' | 'procedural';
+  memory_type?: "semantic" | "episodic" | "procedural";
   session_id?: string;
   trust_tier?: string;
 };
@@ -1179,9 +1225,9 @@ export type ToolResultRequestBody = {
   duration_ms?: number;
 };
 
-export type ApprovalDecision = 'allow' | 'deny' | 'allow_session';
+export type ApprovalDecision = "allow" | "deny" | "allow_session";
 
-export type ApprovalKind = 'standard' | 'explicit';
+export type ApprovalKind = "standard" | "explicit";
 
 export type ApprovalRespondRequestBody = {
   request_id: string;

@@ -8,7 +8,7 @@ function mockFetch(
   body: unknown = {},
   headers?: Record<string, string>,
 ) {
-  return jest.fn().mockResolvedValue({
+  return vi.fn().mockResolvedValue({
     ok: status >= 200 && status < 300,
     status,
     json: () => Promise.resolve(body),
@@ -51,7 +51,7 @@ describe("AstraClient — Auth", () => {
     const result = await client.login("alice", "pass");
 
     expect(result).toEqual(authResult);
-    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(call[0]).toBe("http://localhost:8000/auth/login");
     expect(JSON.parse(call[1].body)).toEqual({
       username: "alice",
@@ -75,7 +75,7 @@ describe("AstraClient — Auth", () => {
     const result = await client.register("bob", "pass");
 
     expect(result).toEqual(authResult);
-    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(call[0]).toBe("http://localhost:8000/auth/register");
     const regBody = JSON.parse(call[1].body);
     expect(regBody.username).toBe("bob");
@@ -98,7 +98,7 @@ describe("AstraClient — Auth", () => {
       display_name: null,
     });
     await client.getMe().catch(() => {});
-    const headers = (globalThis.fetch as jest.Mock).mock.calls[0][1].headers;
+    const headers = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].headers;
     expect(headers["Authorization"]).toBeUndefined();
   });
 
@@ -162,7 +162,7 @@ describe("AstraClient — Sessions", () => {
     });
     expect(result.metadata?.source).toBe("web_v1");
     const body = JSON.parse(
-      (globalThis.fetch as jest.Mock).mock.calls[0][1].body,
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body,
     );
     expect(body.metadata.source).toBe("web_v1");
   });
@@ -184,7 +184,7 @@ describe("AstraClient — Sessions", () => {
 
     const result = await createClient().getSession("s2");
     expect(result.sessionId).toBe("s2");
-    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toContain(
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
       "/sessions/s2",
     );
   });
@@ -230,7 +230,7 @@ describe("AstraClient — Sessions", () => {
       offset: 1,
     });
     expect(result.total).toBe(3);
-    const url = (globalThis.fetch as jest.Mock).mock.calls[0][0] as string;
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
     expect(url).toContain("limit=2");
     expect(url).toContain("offset=1");
   });
@@ -238,7 +238,7 @@ describe("AstraClient — Sessions", () => {
   test("deleteSession", async () => {
     globalThis.fetch = mockFetch(204);
     await createClient().deleteSession("s3");
-    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(call[0]).toContain("/sessions/s3");
     expect(call[1].method).toBe("DELETE");
   });
@@ -284,7 +284,7 @@ describe("AstraClient — Runs", () => {
     const result = await createClient().createRun({ message: "hello" });
     expect(result.runId).toBe("r1");
     expect(result.sessionId).toBe("s1");
-    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(call[0]).toContain("/chat");
     expect(call[1].method).toBe("POST");
   });
@@ -368,10 +368,10 @@ describe("AstraClient — Runs", () => {
   test("cancelRun", async () => {
     globalThis.fetch = mockFetch(200);
     await createClient().cancelRun("r1");
-    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toContain(
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
       "/chat/runs/r1",
     );
-    expect((globalThis.fetch as jest.Mock).mock.calls[0][1].method).toBe(
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].method).toBe(
       "DELETE",
     );
   });
@@ -379,7 +379,7 @@ describe("AstraClient — Runs", () => {
   test("pauseRun", async () => {
     globalThis.fetch = mockFetch(200);
     await createClient().pauseRun("r1");
-    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toContain(
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
       "/chat/runs/r1/pause",
     );
   });
@@ -387,7 +387,7 @@ describe("AstraClient — Runs", () => {
   test("resumeRun", async () => {
     globalThis.fetch = mockFetch(200);
     await createClient().resumeRun("r1");
-    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toContain(
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
       "/chat/runs/r1/resume",
     );
   });
@@ -400,7 +400,7 @@ describe("AstraClient — Runs", () => {
 
     const events = await createClient().getRunEvents("r1", 5);
     expect(events).toHaveLength(2);
-    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toContain(
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
       "last_index=5",
     );
   });
@@ -453,7 +453,7 @@ describe("AstraClient — Runs", () => {
     expect(projection.executor?.executor_id).toBe("edge-1");
     expect(projection.transport).toBe("edge_ws");
     expect(projection.fallback_policy).toBe("disabled");
-    const url = (globalThis.fetch as jest.Mock).mock.calls[0][0];
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(url).toContain("/chat/runs/r1/projection");
     expect(url).toContain("recent_limit=25");
   });
@@ -496,7 +496,7 @@ describe("AstraClient — Runs", () => {
     expect(r.runs[0].executor?.kind).toBe("server_local");
     expect(r.runs[0].transport).toBe("server_local");
     expect(r.runs[0].fallbackPolicy).toBe("disabled");
-    const url = (globalThis.fetch as jest.Mock).mock.calls[0][0];
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(url).toContain("/runs");
   });
 
@@ -526,7 +526,7 @@ describe("AstraClient — Runs", () => {
     };
     const res = await createClient().delegateRun("r0", body);
     expect(res.delegation_id).toBe("d1");
-    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(call[0]).toContain("/chat/runs/r0/delegate");
     expect(JSON.parse(call[1].body).task).toBe("do work");
   });
@@ -538,7 +538,7 @@ describe("AstraClient — Runs", () => {
     });
     const r = await createClient().listDelegations("r0");
     expect(r.sub_run_ids).toEqual(["sr1"]);
-    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toContain(
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
       "/delegations",
     );
   });
@@ -547,7 +547,7 @@ describe("AstraClient — Runs", () => {
     globalThis.fetch = mockFetch(200, { parent_run_id: "r0", affected: 2 });
     const r = await createClient().pauseDelegations("r0");
     expect(r.affected).toBe(2);
-    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toContain(
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
       "/delegations/pause",
     );
   });
@@ -555,7 +555,7 @@ describe("AstraClient — Runs", () => {
   test("resumeDelegations", async () => {
     globalThis.fetch = mockFetch(200, { parent_run_id: "r0", affected: 1 });
     await createClient().resumeDelegations("r0");
-    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toContain(
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
       "/delegations/resume",
     );
   });
@@ -580,7 +580,7 @@ describe("AstraClient — Session lifecycle and reflect", () => {
   test("updateSession uses PUT", async () => {
     globalThis.fetch = mockFetch(200, sessWire);
     await createClient().updateSession("sx", { title: "New" });
-    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(call[1].method).toBe("PUT");
     expect(JSON.parse(call[1].body).title).toBe("New");
     expect(call[0]).toContain("/sessions/sx");
@@ -599,7 +599,7 @@ describe("AstraClient — Session lifecycle and reflect", () => {
     expect(result.status).toBe("archived");
     expect(result.metadata?.current_model).toBe("m2");
     const body = JSON.parse(
-      (globalThis.fetch as jest.Mock).mock.calls[0][1].body,
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body,
     );
     expect(body.status).toBe("archived");
   });
@@ -616,7 +616,7 @@ describe("AstraClient — Session lifecycle and reflect", () => {
       limit: 5,
     });
     expect(result.items).toEqual([]);
-    const url = (globalThis.fetch as jest.Mock).mock.calls[0][0] as string;
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
     expect(url).toContain("/sessions/sx/transcript");
     expect(url).toContain("before_seq=10");
     expect(url).toContain("limit=5");
@@ -629,7 +629,7 @@ describe("AstraClient — Session lifecycle and reflect", () => {
       offset: 5,
     });
     expect(result.artifacts).toEqual([]);
-    const url = (globalThis.fetch as jest.Mock).mock.calls[0][0] as string;
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
     expect(url).toContain("/sessions/sx/artifacts");
     expect(url).toContain("limit=50");
     expect(url).toContain("offset=5");
@@ -638,7 +638,7 @@ describe("AstraClient — Session lifecycle and reflect", () => {
   test("closeSession", async () => {
     globalThis.fetch = mockFetch(200, sessWire);
     await createClient().closeSession("sx");
-    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toContain(
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
       "/sessions/sx/close",
     );
   });
@@ -646,7 +646,7 @@ describe("AstraClient — Session lifecycle and reflect", () => {
   test("resumeSession", async () => {
     globalThis.fetch = mockFetch(200, sessWire);
     await createClient().resumeSession("sx");
-    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toContain(
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
       "/sessions/sx/resume",
     );
   });
@@ -654,7 +654,7 @@ describe("AstraClient — Session lifecycle and reflect", () => {
   test("cancelSession", async () => {
     globalThis.fetch = mockFetch(200, sessWire);
     await createClient().cancelSession("sx");
-    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toContain(
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
       "/sessions/sx/cancel",
     );
   });
@@ -667,7 +667,7 @@ describe("AstraClient — Session lifecycle and reflect", () => {
     });
     const r = await createClient().getSessionActivity("sx", { limit: 5 });
     expect(r.total).toBe(0);
-    const url = (globalThis.fetch as jest.Mock).mock.calls[0][0];
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(url).toContain("/activity");
     expect(url).toContain("limit=5");
   });
@@ -682,7 +682,7 @@ describe("AstraClient — Session lifecycle and reflect", () => {
       recommendations: [],
     });
     await createClient().getSessionReflect("sx", { focus: "tools", last_n: 5 });
-    const url = (globalThis.fetch as jest.Mock).mock.calls[0][0];
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(url).toContain("/chat/session/sx/reflect");
     expect(url).toContain("focus=tools");
     expect(url).toContain("last_n=5");
@@ -698,7 +698,7 @@ describe("AstraClient — Session lifecycle and reflect", () => {
       recommendations: [],
     });
     await createClient().getSessionDecisionTrace("sx");
-    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toContain(
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
       "decision-trace",
     );
   });
@@ -715,7 +715,7 @@ describe("AstraClient — Events and edges", () => {
       offset: 0,
     });
     await createClient().getSessionEvents("sid", { offset: 1 });
-    const url = (globalThis.fetch as jest.Mock).mock.calls[0][0];
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(url).toContain("/events/session/sid");
     expect(url).toContain("offset=1");
   });
@@ -728,7 +728,7 @@ describe("AstraClient — Events and edges", () => {
       offset: 0,
     });
     await createClient().listEvents({ sessionId: "s1", limit: 20 });
-    const url = (globalThis.fetch as jest.Mock).mock.calls[0][0];
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(url).toContain("/events?");
     expect(url).toContain("session_id=s1");
     expect(url).toContain("limit=20");
@@ -738,7 +738,7 @@ describe("AstraClient — Events and edges", () => {
     globalThis.fetch = mockFetch(200, []);
     const r = await createClient().getCausalChain("cc1");
     expect(r).toEqual([]);
-    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toContain(
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
       "/events/causal-chain/cc1",
     );
   });
@@ -747,7 +747,7 @@ describe("AstraClient — Events and edges", () => {
     globalThis.fetch = mockFetch(200, { edges: [] });
     const r = await createClient().getEdgesStatus();
     expect(r.edges).toEqual([]);
-    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toContain(
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
       "/edges/status",
     );
   });
@@ -761,7 +761,7 @@ describe("AstraClient — Memory", () => {
     const result = await createClient().memoryStore({ content: "hello" });
     expect(result.id).toBe("m1");
     const body = JSON.parse(
-      (globalThis.fetch as jest.Mock).mock.calls[0][1].body,
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body,
     );
     expect(body.content).toBe("hello");
   });
@@ -773,7 +773,7 @@ describe("AstraClient — Memory", () => {
     const result = await createClient().memorySearch("hello");
     expect(result).toHaveLength(1);
     const body = JSON.parse(
-      (globalThis.fetch as jest.Mock).mock.calls[0][1].body,
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body,
     );
     expect(body.query).toBe("hello");
     expect(body.top_k).toBe(10);
@@ -783,7 +783,7 @@ describe("AstraClient — Memory", () => {
     globalThis.fetch = mockFetch(200, []);
     await createClient().memoryRetrieve("query", 3);
     const body = JSON.parse(
-      (globalThis.fetch as jest.Mock).mock.calls[0][1].body,
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body,
     );
     expect(body.top_k).toBe(3);
   });
@@ -792,7 +792,7 @@ describe("AstraClient — Memory", () => {
     globalThis.fetch = mockFetch(200);
     await createClient().memoryPurge("old-topic");
     const body = JSON.parse(
-      (globalThis.fetch as jest.Mock).mock.calls[0][1].body,
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body,
     );
     expect(body.topic).toBe("old-topic");
   });
@@ -810,7 +810,7 @@ describe("AstraClient — Models", () => {
     const result = await createClient().listModels();
     expect(result).toHaveLength(1);
     expect(result[0].name).toBe("m1");
-    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toContain(
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
       "/models",
     );
   });
@@ -845,7 +845,7 @@ describe("AstraClient — Skills", () => {
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("id1");
     expect(result[0].name).toBe("bash");
-    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toContain(
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
       "/skills",
     );
   });
@@ -874,7 +874,7 @@ describe("AstraClient — Skills", () => {
     });
     expect(result.total).toBe(11);
     expect(result.skills?.[0]?.source).toBe("database");
-    const url = (globalThis.fetch as jest.Mock).mock.calls[0][0] as string;
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
     expect(url).toContain("/skills");
     expect(url).toContain("limit=1");
     expect(url).toContain("offset=10");
@@ -896,7 +896,7 @@ describe("AstraClient — pathPrefix", () => {
       pathPrefix: "/api",
     });
     await client.login("u", "p");
-    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toBe(
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe(
       "http://localhost:8000/api/auth/login",
     );
   });
@@ -906,7 +906,7 @@ describe("AstraClient — pathPrefix", () => {
 
 describe("AstraClient — thin protocol", () => {
   test("postToolResult sends JSON and edge header", async () => {
-    globalThis.fetch = jest.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       text: () => Promise.resolve("{}"),
@@ -917,7 +917,7 @@ describe("AstraClient — thin protocol", () => {
       { request_id: "req1", status: "ok", output: "out" },
       { edgeExecutorId: "edge-1" },
     );
-    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(call[0]).toContain("/tools/result");
     expect((call[1].headers as Record<string, string>)["X-Astra-Edge-Id"]).toBe(
       "edge-1",
@@ -925,7 +925,7 @@ describe("AstraClient — thin protocol", () => {
   });
 
   test("postTaskLeaseClaim sends edge header", async () => {
-    globalThis.fetch = jest.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       text: () => Promise.resolve("{}"),
@@ -936,7 +936,7 @@ describe("AstraClient — thin protocol", () => {
       { edge_agent_id: "e1" },
       { edgeTransportId: "transport-1" },
     );
-    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(call[0]).toContain("/tasks/task-1/lease/claim");
     expect((call[1].headers as Record<string, string>)["X-Astra-Edge-Id"]).toBe(
       "transport-1",
@@ -973,7 +973,7 @@ describe("AstraClient — Errors", () => {
   });
 
   test("merges RequestInit headers (plain record)", async () => {
-    globalThis.fetch = jest.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       text: () =>
@@ -987,13 +987,13 @@ describe("AstraClient — Errors", () => {
       headers: { "X-Plain": "from-record" },
     });
 
-    const headersArg = (globalThis.fetch as jest.Mock).mock.calls[0][1]
+    const headersArg = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1]
       .headers as Record<string, string>;
     expect(headersArg["X-Plain"]).toBe("from-record");
   });
 
   test("merges RequestInit headers when value is a Headers object", async () => {
-    globalThis.fetch = jest.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       text: () =>
@@ -1006,7 +1006,7 @@ describe("AstraClient — Errors", () => {
     h.set("X-Custom", "from-headers-object");
     await client.fetch(PATH_SESSIONS, { method: "GET", headers: h });
 
-    const headersArg = (globalThis.fetch as jest.Mock).mock.calls[0][1]
+    const headersArg = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1]
       .headers as Record<string, string>;
     // Undici/Node may normalize names; value must be present.
     expect(Object.values(headersArg)).toContain("from-headers-object");
@@ -1024,7 +1024,7 @@ describe("AstraClient — Errors", () => {
     };
     let callCount = 0;
 
-    globalThis.fetch = jest.fn().mockImplementation((url: string) => {
+    globalThis.fetch = vi.fn().mockImplementation((url: string) => {
       callCount++;
       if (callCount === 1) {
         // First call: 401
@@ -1068,7 +1068,7 @@ describe("AstraClient — Errors", () => {
       });
     });
 
-    const onRefresh = jest.fn();
+    const onRefresh = vi.fn();
     const client = new AstraClient({
       baseUrl: "http://localhost:8000",
       accessToken: "expired",
@@ -1213,7 +1213,7 @@ describe("AstraClient — Skills lifecycle", () => {
       skill_code: "code",
     });
     expect(out).toEqual(rec);
-    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(call[0]).toBe("http://localhost:8000/skills");
     expect(call[1].method).toBe("POST");
     expect(JSON.parse(call[1].body)).toEqual({
@@ -1231,7 +1231,7 @@ describe("AstraClient — Skills lifecycle", () => {
       version: "1",
       description: "desc",
     });
-    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(call[0]).toBe("http://localhost:8000/skills/publish");
     expect(JSON.parse(call[1].body)).toMatchObject({
       name: "n",
@@ -1253,7 +1253,7 @@ describe("AstraClient — Skills lifecycle", () => {
     const client = createClient();
     const out = await client.getSkill("n@1.0.0", { version: "1.0.0" });
     expect(out).toEqual(rec);
-    const url = (globalThis.fetch as jest.Mock).mock.calls[0][0] as string;
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
     expect(url).toContain("/skills/");
     expect(url).toContain(encodeURIComponent("n@1.0.0"));
     expect(url).toContain("version=1.0.0");
@@ -1263,7 +1263,7 @@ describe("AstraClient — Skills lifecycle", () => {
     globalThis.fetch = mockFetch(200, {});
     const client = createClient();
     await client.unpublishSkill("my-skill");
-    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(call[0]).toBe(
       `http://localhost:8000/skills/${encodeURIComponent("my-skill")}/unpublish`,
     );

@@ -51,7 +51,7 @@ describe('scenarios / multi-agent delegation', () => {
       'data: {"type":"agent_completed","agent_id":"researcher","status":"completed","result_summary":"context mapped","total_tool_calls":5}\n\n',
       'data: {"type":"turn_complete"}\n\n',
     ];
-    globalThis.fetch = jest.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       body: streamFrom(chunks),
@@ -97,7 +97,7 @@ describe('scenarios / multi-agent delegation', () => {
   });
 
   it('delegates, lists, pauses, and resumes a parent run with stable paths and bodies', async () => {
-    const fetchImpl = jest.fn().mockImplementation((url: string, init?: RequestInit) => {
+    const fetchImpl = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
       const path = new URL(url).pathname;
       if (path === chatRunDelegatePath('run-parent')) {
         expect(init?.method).toBe('POST');

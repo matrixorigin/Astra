@@ -1,17 +1,15 @@
-/**
- * @jest-environment node
- */
+// @vitest-environment node
 
-jest.mock("@/lib/api/auth-guard", () => ({
-  requireRuntimeUser: jest.fn(),
+vi.mock("@/lib/api/auth-guard", () => ({
+  requireRuntimeUser: vi.fn(),
 }));
 
-jest.mock("@/lib/api/web-store", () => ({
-  getChat: jest.fn(),
-  stopActiveRun: jest.fn(),
+vi.mock("@/lib/api/web-store", () => ({
+  getChat: vi.fn(),
+  stopActiveRun: vi.fn(),
 }));
 
-jest.mock("@/lib/runtime-client", () => ({
+vi.mock("@/lib/runtime-client", () => ({
   RuntimeClientError: class RuntimeClientError extends Error {
     status?: number;
     detail: string;
@@ -27,13 +25,9 @@ jest.mock("@/lib/runtime-client", () => ({
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
 import { getChat, stopActiveRun } from "@/lib/api/web-store";
 
-const mockRequireRuntimeUser = requireRuntimeUser as jest.MockedFunction<
-  typeof requireRuntimeUser
->;
-const mockGetChat = getChat as jest.MockedFunction<typeof getChat>;
-const mockStopActiveRun = stopActiveRun as jest.MockedFunction<
-  typeof stopActiveRun
->;
+const mockRequireRuntimeUser = vi.mocked(requireRuntimeUser);
+const mockGetChat = vi.mocked(getChat);
+const mockStopActiveRun = vi.mocked(stopActiveRun);
 
 describe("chat stop route", () => {
   beforeEach(() => {

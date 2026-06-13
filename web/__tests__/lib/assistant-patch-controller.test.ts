@@ -45,13 +45,13 @@ describe("createAssistantPatchController", () => {
     nextRafId = 1;
     originalRequestAnimationFrame = globalThis.requestAnimationFrame;
     originalCancelAnimationFrame = globalThis.cancelAnimationFrame;
-    globalThis.requestAnimationFrame = jest.fn((callback) => {
+    globalThis.requestAnimationFrame = vi.fn((callback) => {
       const id = nextRafId;
       nextRafId += 1;
       rafCallbacks.set(id, callback);
       return id;
     });
-    globalThis.cancelAnimationFrame = jest.fn((id) => {
+    globalThis.cancelAnimationFrame = vi.fn((id) => {
       rafCallbacks.delete(id);
     });
   });

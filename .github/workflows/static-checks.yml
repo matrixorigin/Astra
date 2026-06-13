@@ -46,8 +46,31 @@ jobs:
           cache-dependency-path: packages/sdk/package-lock.json
       - name: Install, typecheck, test with coverage gates, build
         working-directory: packages/sdk
+        env:
+          ASTRA_SDK_E2E: "1"
         run: |
           npm ci
-          npm run typecheck
-          ASTRA_SDK_E2E=1 npm run test:coverage
+          npm run ci
+
+  web:
+    name: "web (typecheck, test, build)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: |
+            packages/sdk/package-lock.json
+            web/package-lock.json
+      - name: Build local SDK dependency
+        working-directory: packages/sdk
+        run: |
+          npm ci --ignore-scripts
           npm run build
+      - name: Install, typecheck, test, build
+        working-directory: web
+        run: |
+          npm ci
+          npm run ci

@@ -3,14 +3,24 @@ import userEvent from "@testing-library/user-event";
 import { WorkSurfacePanel } from "@/components/app/work-surface-panel";
 import { createEmptyWorkSurface } from "@/lib/work-surface";
 
-jest.mock("lucide-react", () => {
+vi.mock("lucide-react", () => {
   const Icon = () => null;
-  return new Proxy(
-    { __esModule: true },
-    {
-      get: (_target, prop) => (prop === "__esModule" ? true : Icon),
-    },
-  );
+  return {
+    __esModule: true,
+    Activity: Icon,
+    AlertTriangle: Icon,
+    Bot: Icon,
+    ChevronRight: Icon,
+    CheckCircle2: Icon,
+    Circle: Icon,
+    ClipboardList: Icon,
+    Loader2: Icon,
+    Pause: Icon,
+    RotateCw: Icon,
+    Terminal: Icon,
+    Wrench: Icon,
+    X: Icon,
+  };
 });
 
 describe("WorkSurfacePanel", () => {
@@ -24,9 +34,9 @@ describe("WorkSurfacePanel", () => {
         }}
         activeRun={{ runId: "run-1", status: "running" }}
         tab="tasks"
-        onTabChange={jest.fn()}
-        onRefresh={jest.fn()}
-        onLoadAgentRun={jest.fn()}
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={vi.fn()}
       />,
     );
 
@@ -59,9 +69,9 @@ describe("WorkSurfacePanel", () => {
         }}
         activeRun={{ runId: "run-1", status: "running" }}
         tab="tasks"
-        onTabChange={jest.fn()}
-        onRefresh={jest.fn()}
-        onLoadAgentRun={jest.fn()}
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={vi.fn()}
       />,
     );
 
@@ -100,9 +110,9 @@ describe("WorkSurfacePanel", () => {
         }}
         activeRun={{ runId: "run-1", status: "running" }}
         tab="tools"
-        onTabChange={jest.fn()}
-        onRefresh={jest.fn()}
-        onLoadAgentRun={jest.fn()}
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={vi.fn()}
       />,
     );
 
@@ -148,9 +158,9 @@ describe("WorkSurfacePanel", () => {
         activeRun={{ runId: "run-1", status: "running" }}
         tab="tasks"
         openSignal={0}
-        onTabChange={jest.fn()}
-        onRefresh={jest.fn()}
-        onLoadAgentRun={jest.fn()}
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={vi.fn()}
       />,
     );
 
@@ -160,9 +170,9 @@ describe("WorkSurfacePanel", () => {
         activeRun={{ runId: "run-1", status: "running" }}
         tab="tools"
         openSignal={1}
-        onTabChange={jest.fn()}
-        onRefresh={jest.fn()}
-        onLoadAgentRun={jest.fn()}
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={vi.fn()}
       />,
     );
 
@@ -172,12 +182,14 @@ describe("WorkSurfacePanel", () => {
       expect(screen.queryByText("read_file")).not.toBeInTheDocument();
     });
 
-    await user.click(screen.getAllByRole("button", { name: /All tools 2/ })[0]);
+    await user.click(
+      screen.getAllByRole("button", { name: /All\s*tools\s*2/ })[0],
+    );
     expect(screen.getAllByText("read_file").length).toBeGreaterThan(0);
   });
 
   it("orders subagent cards by most recent update and opens the latest details", async () => {
-    const loadAgentRun = jest.fn().mockResolvedValue({
+    const loadAgentRun = vi.fn().mockResolvedValue({
       runId: "run-new",
       sessionId: "session-1",
       status: "running",
@@ -243,8 +255,8 @@ describe("WorkSurfacePanel", () => {
         }}
         activeRun={{ runId: "run-1", status: "running" }}
         tab="agents"
-        onTabChange={jest.fn()}
-        onRefresh={jest.fn()}
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
         onLoadAgentRun={loadAgentRun}
       />,
     );
@@ -289,9 +301,9 @@ describe("WorkSurfacePanel", () => {
         }}
         activeRun={{ runId: "run-1", status: "cancelled" }}
         tab="tools"
-        onTabChange={jest.fn()}
-        onRefresh={jest.fn()}
-        onLoadAgentRun={jest.fn()}
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={vi.fn()}
       />,
     );
 
@@ -340,9 +352,9 @@ describe("WorkSurfacePanel", () => {
         }}
         activeRun={{ runId: "run-1", status: "blocked" }}
         tab="tools"
-        onTabChange={jest.fn()}
-        onRefresh={jest.fn()}
-        onLoadAgentRun={jest.fn()}
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={vi.fn()}
       />,
     );
 
@@ -391,9 +403,9 @@ describe("WorkSurfacePanel", () => {
         }}
         activeRun={{ runId: "run-1", status: "running" }}
         tab="agents"
-        onTabChange={jest.fn()}
-        onRefresh={jest.fn()}
-        onLoadAgentRun={jest.fn()}
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={vi.fn()}
       />,
     );
 

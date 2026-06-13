@@ -36,7 +36,7 @@ describe('AstraClient — streamChat', () => {
       'data: {"type":"session_info","session_id":"s1"}\n\n',
       'data: {"type":"text_delta","content":"hi"}\n\n',
     ];
-    globalThis.fetch = jest.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       statusText: 'OK',
@@ -60,7 +60,7 @@ describe('AstraClient — streamChat', () => {
     await new Promise((r) => setTimeout(r, 80));
     sse.close();
 
-    const [url, init] = (globalThis.fetch as jest.Mock).mock.calls[0] as [string, RequestInit];
+    const [url, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
     expect(String(url).endsWith(PATH_CHAT_STREAM)).toBe(true);
     expect(init.method).toBe('POST');
     const headers = init.headers as Record<string, string>;
@@ -77,7 +77,7 @@ describe('AstraClient — streamChat', () => {
   });
 
   it('applies pathPrefix to stream URL', async () => {
-    globalThis.fetch = jest.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       body: createMockStream([]),
@@ -92,14 +92,14 @@ describe('AstraClient — streamChat', () => {
     const sse = client.streamChat({ message: 'a' }, { onEvent: () => {} });
     await new Promise((r) => setTimeout(r, 30));
     sse.close();
-    const url = (globalThis.fetch as jest.Mock).mock.calls[0][0] as string;
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
     expect(url).toBe('http://localhost:8000' + joinApiPath('/api', PATH_CHAT_STREAM));
   });
 });
 
 describe('AstraClient — thin edge / approval / task lease', () => {
   function okFetch() {
-    return jest.fn().mockResolvedValue({
+    return vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       text: () => Promise.resolve('{}'),
@@ -112,7 +112,7 @@ describe('AstraClient — thin edge / approval / task lease', () => {
     globalThis.fetch = okFetch();
     const c = new AstraClient({ baseUrl: 'http://localhost:8000', accessToken: 't' });
     await c.postApprovalRespond({ request_id: 'r1', decision: 'allow' });
-    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(String(call[0]).endsWith(PATH_APPROVAL_RESPOND)).toBe(true);
     expect((call[1] as { method: string }).method).toBe('POST');
     expect(JSON.parse((call[1] as { body: string }).body as string)).toEqual({ request_id: 'r1', decision: 'allow' });
@@ -125,7 +125,7 @@ describe('AstraClient — thin edge / approval / task lease', () => {
       { edge_agent_id: 'e1' },
       { edgeTransportId: 'transport-z' },
     );
-    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(String(call[0]).endsWith(PATH_AGENTS_EDGE)).toBe(true);
     expect((call[1] as { headers: Record<string, string> }).headers[ASTRA_EDGE_ID_HEADER]).toBe('transport-z');
   });
@@ -134,7 +134,7 @@ describe('AstraClient — thin edge / approval / task lease', () => {
     globalThis.fetch = okFetch();
     const c = new AstraClient({ baseUrl: 'http://localhost:8000', accessToken: 't' });
     await c.postEdgeHeartbeat({ edge_agent_id: 'e1' }, { edgeTransportId: 'tr' });
-    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(String(call[0]).endsWith(PATH_AGENTS_EDGE_HEARTBEAT)).toBe(true);
     expect((call[1] as { headers: Record<string, string> }).headers[ASTRA_EDGE_ID_HEADER]).toBe('tr');
   });
@@ -143,7 +143,7 @@ describe('AstraClient — thin edge / approval / task lease', () => {
     globalThis.fetch = okFetch();
     const c = new AstraClient({ baseUrl: 'http://localhost:8000', accessToken: 't' });
     await c.getTaskLease('task-9');
-    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(String(call[0]).endsWith(taskLeasePath('task-9'))).toBe(true);
   });
 
@@ -155,7 +155,7 @@ describe('AstraClient — thin edge / approval / task lease', () => {
       { edge_agent_id: 'ea' },
       { edgeTransportId: 'tport' },
     );
-    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(String(call[0]).endsWith(taskLeaseReleasePath('task-a'))).toBe(true);
     expect((call[1] as { method: string }).method).toBe('POST');
     expect((call[1] as { headers: Record<string, string> }).headers[ASTRA_EDGE_ID_HEADER]).toBe('tport');
@@ -165,7 +165,7 @@ describe('AstraClient — thin edge / approval / task lease', () => {
     globalThis.fetch = okFetch();
     const c = new AstraClient({ baseUrl: 'http://localhost:8000', accessToken: 't' });
     await c.postTaskLeaseRenew('task-b', { edge_agent_id: 'eb', ttl_sec: 30 }, { edgeTransportId: 't2' });
-    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(String(call[0]).endsWith(taskLeaseRenewPath('task-b'))).toBe(true);
     expect(JSON.parse((call[1] as { body: string }).body as string)).toEqual({ edge_agent_id: 'eb', ttl_sec: 30 });
   });

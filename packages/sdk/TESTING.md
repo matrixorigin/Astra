@@ -8,7 +8,7 @@
 cd packages/sdk
 npm install
 npm run ci          # typecheck → test → build (matches CI)
-npm test            # Jest only
+npm test            # Vitest unit tests
 npm run test:coverage
 npm run typecheck
 npm run build
@@ -31,9 +31,9 @@ The GitHub **Static Checks** workflow (`.github/workflows/static-checks.yml`) ru
 
 ## Online smoke (optional)
 
-Not run in default CI. Set `ASTRA_SDK_E2E=1` to enable Jest integration tests in [`src/__tests__/integration/online-smoke.test.ts`](src/__tests__/integration/online-smoke.test.ts).
+Not run in default CI. Set `ASTRA_SDK_E2E=1` to enable Vitest integration tests in [`src/__tests__/integration/online-smoke.test.ts`](src/__tests__/integration/online-smoke.test.ts).
 
-**Mode A — local HTTP harness (no real Astra):** omit `ASTRA_SDK_BASE_URL`. Jest starts an in-process server ([`local-e2e-server.ts`](src/__tests__/integration/local-e2e-server.ts)) and runs real `fetch` + `AstraClient` against it: health, `login` + `getMe`, bearer `getMe`, `listSessions`, `getRunStatus`, `getRunEvents` (buffered SSE + `last_index`), and `pathPrefix: '/api'`.
+**Mode A — local HTTP harness (no real Astra):** omit `ASTRA_SDK_BASE_URL`. Vitest starts an in-process server ([`local-e2e-server.ts`](src/__tests__/integration/local-e2e-server.ts)) and runs real `fetch` + `AstraClient` against it: health, `login` + `getMe`, bearer `getMe`, `listSessions`, `getRunStatus`, `getRunEvents` (buffered SSE + `last_index`), and `pathPrefix: '/api'`.
 
 **Mode B — your running API (real server):** set `ASTRA_SDK_BASE_URL` to the **HTTP API origin** (e.g. `http://127.0.0.1:PORT` from `make dev-start`). The harness (Mode A) is skipped. You need **either** a bearer token **or** username/password for authenticated API tests; otherwise only **GET /health** runs.
 
@@ -46,20 +46,20 @@ Not run in default CI. Set `ASTRA_SDK_E2E=1` to enable Jest integration tests in
 | `ASTRA_SDK_PATH_PREFIX` | — | Optional (e.g. `/api`); same meaning as `AstraClient` `pathPrefix`. Health stays `GET {base}/health` on the **root** origin. |
 | `ASTRA_SDK_TEST_RUN_ID` | — | Optional; if set, runs `getRunStatus` and `getRunEvents` for that run id. |
 
-**Health URL:** `GET {baseUrl}/health` is at the **server root**; it is not the same as routes under `pathPrefix`. The Jest suite and [`scripts/sdk-online-smoke.mjs`](./scripts/sdk-online-smoke.mjs) use this explicitly (see [TEST-MATRIX.md](./TEST-MATRIX.md)).
+**Health URL:** `GET {baseUrl}/health` is at the **server root**; it is not the same as routes under `pathPrefix`. The Vitest suite and [`scripts/sdk-online-smoke.mjs`](./scripts/sdk-online-smoke.mjs) use this explicitly (see [TEST-MATRIX.md](./TEST-MATRIX.md)).
 
 ```bash
 # Real fetch + in-process stub server (no Astra)
 npm run test:integration:local
-# equivalent: ASTRA_SDK_E2E=1 npm test -- --testPathPatterns=integration/online
+# equivalent: ASTRA_SDK_E2E=1 npm test -- src/__tests__/integration/online
 
-# Jest + your real API (Mode B; **BASE_URL 默认 http://127.0.0.1:8000** 与 `make dev-start` 一致)
+# Vitest + your real API (Mode B; **BASE_URL 默认 http://127.0.0.1:8000** 与 `make dev-start` 一致)
 ASTRA_SDK_ACCESS_TOKEN=... npm run test:integration:remote
 # 或: ASTRA_SDK_USERNAME=u ASTRA_SDK_PASSWORD=p  npm run test:integration:remote
 # 非 8000 时:  ASTRA_SDK_BASE_URL=http://127.0.0.1:9xxx npm run test:integration:remote
 # 可选: ASTRA_SDK_PATH_PREFIX=/api  ASTRA_SDK_TEST_RUN_ID=run-xxx
 
-# Standalone script (no Jest; 默认同样指向 :8000)
+# Standalone script (no test runner; 默认同样指向 :8000)
 npm run test:online
 # 或: ASTRA_SDK_BASE_URL=http://127.0.0.1:9xxx npm run test:online
 # Optional: ASTRA_SDK_ACCESS_TOKEN=... npm run test:online
@@ -83,7 +83,7 @@ Wire helper: `chatRequestToWire` — see `chatRequestToWire` tests in [`client.t
 
 ## Coverage
 
-`npm run test:coverage` enforces global thresholds in [`jest.config.mjs`](jest.config.mjs). Re-export files (`index.ts`, `react.ts`) are excluded from coverage collection.
+`npm run test:coverage` enforces global thresholds in [`vitest.config.ts`](vitest.config.ts). Re-export files (`index.ts`, `react.ts`) are excluded from coverage collection.
 
 ## Contract with runtime
 

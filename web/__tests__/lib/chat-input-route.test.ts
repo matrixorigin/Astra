@@ -1,18 +1,16 @@
-/**
- * @jest-environment node
- */
+// @vitest-environment node
 
-jest.mock("@/lib/api/auth-guard", () => ({
-  requireRuntimeUser: jest.fn(),
+vi.mock("@/lib/api/auth-guard", () => ({
+  requireRuntimeUser: vi.fn(),
 }));
 
-jest.mock("@/lib/api/web-store", () => ({
+vi.mock("@/lib/api/web-store", () => ({
   StaleDeferredRunError: class StaleDeferredRunError extends Error {},
-  getChatHydrated: jest.fn(),
-  queueDeferredRunInput: jest.fn(),
+  getChatHydrated: vi.fn(),
+  queueDeferredRunInput: vi.fn(),
 }));
 
-jest.mock("@/lib/runtime-client", () => ({
+vi.mock("@/lib/runtime-client", () => ({
   RuntimeClientError: class RuntimeClientError extends Error {
     status?: number;
     detail: string;
@@ -31,14 +29,10 @@ import {
   queueDeferredRunInput,
 } from "@/lib/api/web-store";
 
-const mockRequireRuntimeUser = requireRuntimeUser as jest.MockedFunction<
-  typeof requireRuntimeUser
->;
-const mockGetChatHydrated = getChatHydrated as jest.MockedFunction<
-  typeof getChatHydrated
->;
+const mockRequireRuntimeUser = vi.mocked(requireRuntimeUser);
+const mockGetChatHydrated = vi.mocked(getChatHydrated);
 const mockQueueDeferredRunInput =
-  queueDeferredRunInput as jest.MockedFunction<typeof queueDeferredRunInput>;
+  vi.mocked(queueDeferredRunInput);
 
 function activeChat(workspaceSelection?: unknown) {
   return {
@@ -77,7 +71,7 @@ function postInput(body: Record<string, unknown>) {
 
 describe("chat deferred input route workspace authority", () => {
   beforeEach(() => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
     mockRequireRuntimeUser.mockResolvedValue({
       user: { user_id: "user-a" },
       response: null,

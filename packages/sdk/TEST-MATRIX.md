@@ -2,8 +2,8 @@
 
 This document catalogs **what** we care to verify and **how** we verify it without conflating layers.
 
-- **Offline** — Jest + mock `fetch` / WebSocket / jsdom. Runs in default CI (`npm run test` / `npm run test:coverage`).
-- **Online** — Real `fetch` to a process (your API or the **in-Jest local harness**). **Opt-in** via `ASTRA_SDK_E2E=1`. **Mode A:** omit `ASTRA_SDK_BASE_URL` → Jest uses [`local-e2e-server.ts`](src/__tests__/integration/local-e2e-server.ts) (`npm run test:integration:local`). **Mode B:** set `ASTRA_SDK_BASE_URL` plus token or `USERNAME`+`PASSWORD`, optionally `ASTRA_SDK_PATH_PREFIX` and `ASTRA_SDK_TEST_RUN_ID` (`npm run test:integration:remote`). See [TESTING.md](./TESTING.md#online-smoke-optional).
+- **Offline** — Vitest + mock `fetch` / WebSocket / jsdom. Runs in default CI (`npm run test` / `npm run test:coverage`).
+- **Online** — Real `fetch` to a process (your API or the **in-Vitest local harness**). **Opt-in** via `ASTRA_SDK_E2E=1`. **Mode A:** omit `ASTRA_SDK_BASE_URL` → Vitest uses [`local-e2e-server.ts`](src/__tests__/integration/local-e2e-server.ts) (`npm run test:integration:local`). **Mode B:** set `ASTRA_SDK_BASE_URL` plus token or `USERNAME`+`PASSWORD`, optionally `ASTRA_SDK_PATH_PREFIX` and `ASTRA_SDK_TEST_RUN_ID` (`npm run test:integration:remote`). See [TESTING.md](./TESTING.md#online-smoke-optional).
 
 **Not the same as** repo root `make test-online`, which runs Rust `#[ignore]` integration tests (MatrixOne, etc.). SDK online only needs a reachable HTTP base URL.
 
@@ -75,9 +75,9 @@ Sample SSE payloads live under [`src/__tests__/__fixtures__/sse/`](./src/__tests
 ```mermaid
 flowchart LR
   subgraph offline [Offline default CI]
-    Jest[Jest]
+    Vitest[Vitest]
     Mock[Mock fetch / WS]
-    Jest --> Mock
+    Vitest --> Mock
   end
   subgraph onlineG [Online opt-in]
     Env[ASTRA_SDK_E2E]

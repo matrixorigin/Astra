@@ -46,7 +46,9 @@ function sseFrame(event: unknown) {
   return encoder.encode(`data: ${JSON.stringify(event)}\n\n`);
 }
 
-function eventFromSseFrame(frame: string) {
+function eventFromSseFrame(
+  frame: string,
+): import("@astra/sdk").StreamEvent | null {
   const data = frame
     .split(/\r?\n/)
     .filter((line) => line.startsWith("data:"))
@@ -58,7 +60,7 @@ function eventFromSseFrame(frame: string) {
   }
 
   try {
-    return JSON.parse(data) as Record<string, unknown>;
+    return JSON.parse(data) as import("@astra/sdk").StreamEvent;
   } catch {
     return null;
   }
@@ -226,14 +228,49 @@ function proxyRunStream(params: {
 
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
+      const enqueueFrame = (event: unknown) => {
+        if (clientCancelled) {
+          return false;
+        }
+        try {
+          controller.enqueue(sseFrame(event));
+          return true;
+        } catch {
+          clientCancelled = true;
+          backendAbortController.abort();
+          return false;
+        }
+      };
+      const enqueueChunk = (chunk: Uint8Array) => {
+        if (clientCancelled) {
+          return false;
+        }
+        try {
+          controller.enqueue(chunk);
+          return true;
+        } catch {
+          clientCancelled = true;
+          backendAbortController.abort();
+          return false;
+        }
+      };
+      const closeController = () => {
+        if (clientCancelled) {
+          return;
+        }
+        try {
+          controller.close();
+        } catch {
+          clientCancelled = true;
+        }
+      };
+
       if (localMessages) {
-        controller.enqueue(
-          sseFrame({
-            type: "local_messages",
-            user_message: localMessages.userMessage,
-            assistant_message: localMessages.assistantMessage,
-          }),
-        );
+        enqueueFrame({
+          type: "local_messages",
+          user_message: localMessages.userMessage,
+          assistant_message: localMessages.assistantMessage,
+        });
       }
 
       void (async () => {
@@ -242,10 +279,13 @@ function proxyRunStream(params: {
           resolvedBackendResponse =
             typeof backendResponse === "function"
               ? await backendResponse((event) => {
-                  controller.enqueue(sseFrame(event));
+                  enqueueFrame(event);
                 })
               : backendResponse;
         } catch (error) {
+          if (clientCancelled) {
+            return;
+          }
           const message =
             error instanceof Error ? error.message : "Astra stream failed.";
           updateStreamingAssistantMessage(
@@ -258,12 +298,18 @@ function proxyRunStream(params: {
             },
           );
           setChatActiveRun(ownerUserId, chatId, undefined);
-          controller.enqueue(sseFrame({ type: "error", message }));
-          controller.close();
+          enqueueFrame({ type: "error", message });
+          closeController();
+          return;
+        }
+        if (clientCancelled) {
           return;
         }
         if (!resolvedBackendResponse.ok || !resolvedBackendResponse.body) {
           const detail = await readErrorDetail(resolvedBackendResponse);
+          if (clientCancelled) {
+            return;
+          }
           updateStreamingAssistantMessage(
             ownerUserId,
             chatId,
@@ -274,20 +320,18 @@ function proxyRunStream(params: {
             },
           );
           setChatActiveRun(ownerUserId, chatId, undefined);
-          controller.enqueue(sseFrame({ type: "error", message: detail }));
-          controller.close();
+          enqueueFrame({ type: "error", message: detail });
+          closeController();
           return;
         }
 
         const reader = resolvedBackendResponse.body.getReader();
         if (!reader) {
-          controller.enqueue(
-            sseFrame({
-              type: "error",
-              message: "Astra stream body is unavailable.",
-            }),
-          );
-          controller.close();
+          enqueueFrame({
+            type: "error",
+            message: "Astra stream body is unavailable.",
+          });
+          closeController();
           return;
         }
         backendReader = reader;
@@ -320,7 +364,9 @@ function proxyRunStream(params: {
             if (done) {
               break;
             }
-            controller.enqueue(value);
+            if (!enqueueChunk(value)) {
+              return;
+            }
             buffer += decoder.decode(value, { stream: true });
 
             const frames = buffer.split(/\r?\n\r?\n/);
@@ -332,9 +378,7 @@ function proxyRunStream(params: {
                   applyStreamEvent(event, ctx, state);
                 } catch (error) {
                   if (error instanceof Error) {
-                    controller.enqueue(
-                      sseFrame({ type: "error", message: error.message }),
-                    );
+                    enqueueFrame({ type: "error", message: error.message });
                   }
                 }
               }
@@ -352,9 +396,7 @@ function proxyRunStream(params: {
                 applyStreamEvent(event, ctx, state);
               } catch (error) {
                 if (error instanceof Error) {
-                  controller.enqueue(
-                    sseFrame({ type: "error", message: error.message }),
-                  );
+                  enqueueFrame({ type: "error", message: error.message });
                 }
               }
             }
@@ -407,6 +449,9 @@ function proxyRunStream(params: {
             const artifacts = (
               await fetchSessionArtifacts(runtimeClient, currentSessionId())
             ).filter((artifact) => !knownArtifactIds.has(artifact.id));
+            if (clientCancelled) {
+              return;
+            }
             if (artifacts.length > 0) {
               updateStreamingAssistantMessage(
                 ownerUserId,
@@ -416,7 +461,7 @@ function proxyRunStream(params: {
                   artifacts,
                 },
               );
-              controller.enqueue(sseFrame({ type: "artifacts", artifacts }));
+              enqueueFrame({ type: "artifacts", artifacts });
             }
           }
         } catch (error) {
@@ -435,12 +480,12 @@ function proxyRunStream(params: {
               status: "failed",
             },
           );
-          controller.enqueue(sseFrame({ type: "error", message }));
+          enqueueFrame({ type: "error", message });
         } finally {
           backendReader = null;
           reader.releaseLock();
           if (!clientCancelled) {
-            controller.close();
+            closeController();
           }
         }
       })();
@@ -725,32 +770,18 @@ export async function GET(
   const lastIndex = normalizedLastIndex(
     request.nextUrl.searchParams.get("last_index"),
   );
-  const backendResponse = await runtime.fetchResponse(
-    `${chatRunStreamPath(runId)}${buildQueryString(
-      lastIndex === null ? {} : { last_index: lastIndex },
-    )}`,
-    {
-      method: "GET",
-      auth: "required",
-      operation: `stream existing web run ${runId}`,
-      signal: backendAbortController.signal,
-    },
-  );
-
-  if (!backendResponse.ok || !backendResponse.body) {
-    const detail = await readErrorDetail(backendResponse);
-    updateStreamingAssistantMessage(ownerUserId, chatId, assistantMessageId, {
-      content: detail,
-      status: "failed",
-    });
-    return NextResponse.json(
-      { error: detail },
-      { status: backendResponse.status || 502 },
-    );
-  }
+  const backendStreamPath = `${chatRunStreamPath(runId)}${buildQueryString(
+    lastIndex === null ? {} : { last_index: lastIndex },
+  )}`;
 
   return proxyRunStream({
-    backendResponse,
+    backendResponse: () =>
+      runtime.fetchResponse(backendStreamPath, {
+        method: "GET",
+        auth: "required",
+        operation: `stream existing web run ${runId}`,
+        signal: backendAbortController.signal,
+      }),
     backendAbortController,
     ownerUserId,
     chatId,
