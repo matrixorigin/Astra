@@ -35,6 +35,7 @@ pub(crate) async fn settle_interrupted_turn(
         dispatch.ui,
     )
     .await;
+    clear_recovery_scoped_turn_restrictions(state);
 }
 
 pub(crate) async fn settle_successful_turn(
@@ -52,6 +53,7 @@ pub(crate) async fn settle_successful_turn(
         dispatch.ui,
     )
     .await;
+    clear_recovery_scoped_turn_restrictions(state);
 }
 
 pub(crate) fn settle_failed_turn(
@@ -67,12 +69,17 @@ pub(crate) fn settle_failed_turn(
         dispatch.turn_start,
         dispatch.ui,
     );
+    clear_recovery_scoped_turn_restrictions(state);
+}
+
+fn clear_recovery_scoped_turn_restrictions(state: &mut SessionState) {
+    state.resume_restricted_tools.clear();
 }
 
 #[cfg(test)]
 mod tests {
     use super::TurnContext;
-    use super::{TurnDispatch, settle_successful_turn};
+    use super::{TurnDispatch, settle_failed_turn, settle_successful_turn};
     use crate::cli::session::session_state::SessionState;
     use std::time::Instant;
 
@@ -86,6 +93,7 @@ mod tests {
         let mut ui = crate::tests::TestUi::default();
         let mut state = SessionState {
             last_turn_interrupted: true,
+            resume_restricted_tools: vec!["bash".into()],
             ..SessionState::default()
         };
         let mut dispatch = TurnDispatch {
@@ -107,6 +115,39 @@ mod tests {
         .await;
 
         assert!(!state.last_turn_interrupted);
+        assert!(state.resume_restricted_tools.is_empty());
         assert_eq!(state.history.len(), 1);
+    }
+
+    #[test]
+    fn settle_failed_turn_consumes_resume_restricted_tools() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let ctx = TurnContext {
+            api: &api,
+            profile: None,
+        };
+        let mut ui = crate::tests::TestUi::default();
+        let mut state = SessionState {
+            resume_restricted_tools: vec!["bash".into(), "write_file".into()],
+            ..SessionState::default()
+        };
+        let mut dispatch = TurnDispatch {
+            ctx: &ctx,
+            line: "continue",
+            effective_line: "continue",
+            token: "token",
+            session_id: None,
+            semantic_query_override: None,
+            turn_start: Instant::now(),
+            ui: &mut ui,
+        };
+        let failure = crate::TurnFailure {
+            error: "boom".into(),
+            partial: crate::PartialTurnData::default(),
+        };
+
+        settle_failed_turn(&mut state, &mut dispatch, &failure);
+
+        assert!(state.resume_restricted_tools.is_empty());
     }
 }
