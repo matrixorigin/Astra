@@ -46,14 +46,15 @@ import type {
   UserSummary,
   WorkspaceSelection,
 } from "@/lib/api/types";
+import {
+  makeActiveRunRecord,
+  maxNextEventIndex,
+  mergeRunStreamBinding,
+  normalizeNextEventIndex,
+  type ChatActiveRunRecord,
+} from "@/lib/api/active-run-merge";
 import { modelCache } from "@/lib/api/model-cache";
-
-type ChatActiveRunSource = "backend_poll" | "stream" | "local_mutation";
-
-type ChatActiveRunRecord = NonNullable<ChatDetail["activeRun"]> & {
-  source: ChatActiveRunSource;
-  observedAt: string;
-};
+import { settleRuntimeCancel } from "@/lib/api/runtime-cancel-settlement";
 
 type ChatRecord = ChatSummary & {
   createdAt: string;
@@ -76,16 +77,6 @@ export class StaleDeferredRunError extends Error {
     this.name = "StaleDeferredRunError";
   }
 }
-
-type RuntimeCancelSettlement =
-  | { status: "completed" }
-  | { status: "failed"; error: unknown };
-
-type ChatMessageSnapshot = {
-  message: ChatMessage;
-  lastMessageAt: string;
-  lastMessagePreview?: string;
-};
 
 type ProjectRecord = ProjectDetail["project"];
 
@@ -114,50 +105,6 @@ type StreamResult = {
 
 function runtimeOperationError(operation: string, error: unknown) {
   return new Error(`${operation}: ${runtimeErrorDetail(error)}`);
-}
-
-async function settleRuntimeCancel(
-  cancelPromise: Promise<unknown>,
-  timeoutMs?: number,
-  onLateSettled?: (settled: RuntimeCancelSettlement) => void,
-) {
-  if (!timeoutMs || timeoutMs <= 0) {
-    await cancelPromise;
-    return false;
-  }
-
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
-  const handledCancel = cancelPromise.then(
-    () => ({ status: "completed" as const }),
-    (error: unknown) => ({ status: "failed" as const, error }),
-  );
-  const timeout = new Promise<{ status: "pending" }>((resolve) => {
-    timeoutId = setTimeout(() => resolve({ status: "pending" }), timeoutMs);
-  });
-  const result = await Promise.race([handledCancel, timeout]);
-  if (timeoutId) {
-    clearTimeout(timeoutId);
-  }
-  if (result.status === "failed") {
-    throw result.error;
-  }
-  if (result.status === "pending") {
-    void handledCancel.then((settled) => {
-      if (settled.status === "failed") {
-        console.warn(
-          "Runtime cancel failed after Web stop response:",
-          runtimeErrorDetail(settled.error),
-        );
-      }
-      try {
-        onLateSettled?.(settled);
-      } catch (error) {
-        console.error("Late cancel settlement callback error:", error);
-      }
-    });
-    return true;
-  }
-  return false;
 }
 
 declare global {
@@ -217,56 +164,55 @@ function cloneChatMessage(message: ChatMessage): ChatMessage {
   };
 }
 
-function snapshotStoppableAssistantMessage(
+function stoppedAssistantMessageController(
   chat: ChatRecord,
   assistantMessageId?: string | null,
-): ChatMessageSnapshot | null {
+): {
+  complete: (currentChat: ChatRecord) => boolean;
+  restore: (currentChat: ChatRecord) => void;
+} {
   const message = findStoppableAssistantMessage(chat, assistantMessageId);
-  if (!message) {
-    return null;
-  }
+  const snapshot = message
+    ? {
+        message: cloneChatMessage(message),
+        lastMessageAt: chat.lastMessageAt,
+        lastMessagePreview: chat.lastMessagePreview,
+      }
+    : null;
   return {
-    message: cloneChatMessage(message),
-    lastMessageAt: chat.lastMessageAt,
-    lastMessagePreview: chat.lastMessagePreview,
+    complete(currentChat) {
+      const currentMessage = findStoppableAssistantMessage(
+        currentChat,
+        assistantMessageId,
+      );
+      if (!currentMessage) {
+        return false;
+      }
+
+      currentMessage.content = currentMessage.content.trim()
+        ? `${currentMessage.content}${currentMessage.content.endsWith("\n") ? "" : "\n"}\nStopped.`
+        : "Stopped.";
+      currentMessage.status = "complete";
+      currentMessage.reasoningStatus = "complete";
+      currentChat.lastMessageAt = nowIso();
+      currentChat.lastMessagePreview = currentMessage.content;
+      return true;
+    },
+    restore(currentChat) {
+      if (!snapshot) {
+        return;
+      }
+      const messageIndex = currentChat.messages.findIndex(
+        (message) => message.id === snapshot.message.id,
+      );
+      if (messageIndex === -1) {
+        return;
+      }
+      currentChat.messages[messageIndex] = cloneChatMessage(snapshot.message);
+      currentChat.lastMessageAt = snapshot.lastMessageAt;
+      currentChat.lastMessagePreview = snapshot.lastMessagePreview;
+    },
   };
-}
-
-function restoreAssistantMessageSnapshot(
-  chat: ChatRecord,
-  snapshot: ChatMessageSnapshot | null,
-) {
-  if (!snapshot) {
-    return;
-  }
-  const messageIndex = chat.messages.findIndex(
-    (message) => message.id === snapshot.message.id,
-  );
-  if (messageIndex === -1) {
-    return;
-  }
-  chat.messages[messageIndex] = cloneChatMessage(snapshot.message);
-  chat.lastMessageAt = snapshot.lastMessageAt;
-  chat.lastMessagePreview = snapshot.lastMessagePreview;
-}
-
-function completeStoppedAssistantMessage(
-  chat: ChatRecord,
-  assistantMessageId?: string | null,
-) {
-  const message = findStoppableAssistantMessage(chat, assistantMessageId);
-  if (!message) {
-    return false;
-  }
-
-  message.content = message.content.trim()
-    ? `${message.content}${message.content.endsWith("\n") ? "" : "\n"}\nStopped.`
-    : "Stopped.";
-  message.status = "complete";
-  message.reasoningStatus = "complete";
-  chat.lastMessageAt = nowIso();
-  chat.lastMessagePreview = message.content;
-  return true;
 }
 
 function titleFromMessage(message: string) {
@@ -284,70 +230,6 @@ function normalizedActiveSkills(skills?: string[]) {
   return [...new Set(skills.map((skill) => skill.trim()).filter(Boolean))].sort(
     (left, right) => left.localeCompare(right),
   );
-}
-
-function normalizeNextEventIndex(value: unknown): number | null {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    return null;
-  }
-  return Math.trunc(value);
-}
-
-function maxNextEventIndex(
-  left: number | null | undefined,
-  right: number | null | undefined,
-): number | null {
-  const normalizedLeft = normalizeNextEventIndex(left);
-  const normalizedRight = normalizeNextEventIndex(right);
-  if (normalizedLeft === null) {
-    return normalizedRight;
-  }
-  if (normalizedRight === null) {
-    return normalizedLeft;
-  }
-  return Math.max(normalizedLeft, normalizedRight);
-}
-
-function mergeRunStreamBinding(
-  activeRun: ChatActiveRunRecord,
-  existing?: NonNullable<ChatDetail["activeRun"]>,
-): ChatActiveRunRecord {
-  if (!existing || existing.runId !== activeRun.runId) {
-    return activeRun;
-  }
-  const assistantMessageId =
-    activeRun.assistantMessageId ?? existing.assistantMessageId;
-  const nextEventIndex = maxNextEventIndex(
-    activeRun.nextEventIndex,
-    existing.nextEventIndex,
-  );
-  return {
-    ...activeRun,
-    ...(assistantMessageId ? { assistantMessageId } : {}),
-    ...(nextEventIndex !== null ? { nextEventIndex } : {}),
-  };
-}
-
-function makeActiveRunRecord(
-  activeRun: NonNullable<ChatDetail["activeRun"]>,
-  source: ChatActiveRunSource,
-  observedAt = nowIso(),
-): ChatActiveRunRecord {
-  const assistantMessageId =
-    typeof activeRun.assistantMessageId === "string" &&
-    activeRun.assistantMessageId.trim()
-      ? activeRun.assistantMessageId
-      : null;
-  const nextEventIndex = normalizeNextEventIndex(activeRun.nextEventIndex);
-  return {
-    runId: activeRun.runId,
-    status: activeRun.status,
-    waitingFor: activeRun.waitingFor ?? null,
-    ...(assistantMessageId ? { assistantMessageId } : {}),
-    ...(nextEventIndex !== null ? { nextEventIndex } : {}),
-    source,
-    observedAt,
-  };
 }
 
 function isFreshLocalActiveRun(
@@ -1391,7 +1273,7 @@ export async function stopActiveRun(
 
   const previousActiveRun = chat.activeRun;
   const runId = previousActiveRun.runId;
-  const stoppedMessageSnapshot = snapshotStoppableAssistantMessage(
+  const stoppedMessage = stoppedAssistantMessageController(
     chat,
     previousActiveRun.assistantMessageId ?? null,
   );
@@ -1410,10 +1292,7 @@ export async function stopActiveRun(
     if (!currentChat) {
       return;
     }
-    stoppedMessageCompleted = completeStoppedAssistantMessage(
-      currentChat,
-      previousActiveRun.assistantMessageId ?? null,
-    );
+    stoppedMessageCompleted = stoppedMessage.complete(currentChat);
     if (stoppedMessageCompleted && currentChat.projectId) {
       touchProjectInStore(currentStore, currentChat.projectId);
     }
@@ -1440,7 +1319,7 @@ export async function stopActiveRun(
     }
     forgetLocallyStoppedRun(currentChat, runId);
     if (stoppedMessageCompleted) {
-      restoreAssistantMessageSnapshot(currentChat, stoppedMessageSnapshot);
+      stoppedMessage.restore(currentChat);
     }
     currentChat.activeRun = makeActiveRunRecord(
       {

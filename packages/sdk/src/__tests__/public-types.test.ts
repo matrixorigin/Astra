@@ -60,8 +60,6 @@ describe('public SDK types', () => {
       type: 'run_error',
       run_id: 'run-1',
       message: 'failed',
-      workspace,
-      executor,
     };
     const interrupted: RunInterruptedEvent = {
       type: 'run_interrupted',
@@ -73,13 +71,11 @@ describe('public SDK types', () => {
       type: 'agent_failed',
       agent_id: 'agent-1',
       error: 'failed',
-      workspace,
     };
     const cancelledAgent: AgentCancelledEvent = {
       type: 'agent_cancelled',
       agent_id: 'agent-2',
       reason: 'parent stopped',
-      executor,
     };
     const interruptedAgent: AgentInterruptedEvent = {
       type: 'agent_interrupted',
@@ -90,18 +86,18 @@ describe('public SDK types', () => {
     expect([
       state.workspace?.kind,
       toolCall.workspace?.kind,
-      runError.executor?.kind,
+      runError.message,
       interrupted.waiting_for,
-      failedAgent.workspace?.kind,
-      cancelledAgent.executor?.kind,
+      failedAgent.error,
+      cancelledAgent.reason,
       interruptedAgent.type,
     ]).toEqual([
       'edge_workspace',
       'edge_workspace',
-      'edge_agent',
+      'failed',
       'user_resume',
-      'edge_workspace',
-      'edge_agent',
+      'failed',
+      'parent stopped',
       'agent_interrupted',
     ]);
   });

@@ -103,7 +103,7 @@ pub(crate) fn report_turn_failure(
 mod tests {
     use super::report_turn_failure;
     use crate::cli::session::session_state::SessionState;
-    use astra_pipeline::step_protocol::{ExecutionCursor, StepCheckpoint};
+    use crate::tests::heavy_checkpoint_with_runtime_state;
     use astra_services::session_journal;
     use std::time::Instant;
 
@@ -126,26 +126,6 @@ mod tests {
             original_tool_name: None,
             ..Default::default()
         }
-    }
-
-    fn heavy_checkpoint_with_runtime_state(
-        pipeline_state: serde_json::Value,
-        compaction_state: serde_json::Value,
-        consecutive_context_window_errors: u32,
-    ) -> StepCheckpoint {
-        let mut heavy = match StepCheckpoint::heavy(
-            "session-turn-1".to_string(),
-            "task-1".to_string(),
-            "agent-1".to_string(),
-            ExecutionCursor::default(),
-        ) {
-            StepCheckpoint::Heavy(heavy) => *heavy,
-            StepCheckpoint::Light(_) => unreachable!("heavy checkpoint constructor returned light"),
-        };
-        heavy.pipeline_state = Some(pipeline_state);
-        heavy.compaction_state = Some(compaction_state);
-        heavy.consecutive_context_window_errors = consecutive_context_window_errors;
-        StepCheckpoint::Heavy(Box::new(heavy))
     }
 
     #[test]

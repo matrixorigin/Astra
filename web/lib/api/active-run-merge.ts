@@ -11,14 +11,14 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function normalizeNextEventIndex(value: unknown): number | null {
+export function normalizeNextEventIndex(value: unknown): number | null {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
     return null;
   }
   return Math.trunc(value);
 }
 
-function maxNextEventIndex(
+export function maxNextEventIndex(
   left: number | null | undefined,
   right: number | null | undefined,
 ): number | null {

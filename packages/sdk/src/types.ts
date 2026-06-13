@@ -72,12 +72,12 @@ export type RunPausedEvent = {
   type: "run_paused";
   run_id?: string;
   waiting_for?: string | null;
-} & ExecutionBindingFields;
+};
 
 export type RunResumedEvent = {
   type: "run_resumed";
   run_id?: string;
-} & ExecutionBindingFields;
+};
 
 export type RunFinishedEvent = {
   type: "run_finished";
@@ -87,12 +87,12 @@ export type RunFinishedEvent = {
   interrupted?: boolean;
   resumable?: boolean;
   waiting_for?: string | null;
-} & ExecutionBindingFields;
+};
 
 export type RunCancelledEvent = {
   type: "run_cancelled";
   run_id: string;
-} & ExecutionBindingFields;
+};
 
 export type RunWaitingEvent = {
   type: "run_waiting";
@@ -109,7 +109,7 @@ export type RunErrorEvent = {
   error?: string;
   code?: string;
   error_kind?: string;
-} & ExecutionBindingFields;
+};
 
 export type RunInterruptedEvent = {
   type: "run_interrupted";
@@ -118,7 +118,7 @@ export type RunInterruptedEvent = {
   message?: string;
   waiting_for?: string | null;
   resumable?: boolean;
-} & ExecutionBindingFields;
+};
 
 export type TextDeltaEvent = {
   type: "text_delta";
@@ -183,6 +183,11 @@ export type ExecutionBindingFields = {
   fallback_policy?: string;
   route?: string;
 };
+
+type ExecutionRouteFields = Pick<
+  ExecutionBindingFields,
+  "transport" | "fallback_policy" | "route"
+>;
 
 export type ToolCallStartEvent = {
   type: "tool_call_start";
@@ -326,7 +331,7 @@ export type AgentProgressEvent = {
   total_completion_tokens?: number;
   total_tool_calls?: number;
   timestamp?: number;
-} & ExecutionBindingFields;
+};
 
 export type AgentCompletedEvent = {
   type: "agent_completed";
@@ -339,7 +344,7 @@ export type AgentCompletedEvent = {
   total_tokens?: { prompt: number; completion: number };
   duration_ms?: number;
   timestamp?: number;
-} & ExecutionBindingFields;
+};
 
 export type AgentFailedEvent = {
   type: "agent_failed";
@@ -347,7 +352,7 @@ export type AgentFailedEvent = {
   status?: "failed";
   error?: string;
   timestamp?: number;
-} & ExecutionBindingFields;
+};
 
 export type AgentCancelledEvent = {
   type: "agent_cancelled";
@@ -355,7 +360,7 @@ export type AgentCancelledEvent = {
   status?: "cancelled";
   reason?: string;
   timestamp?: number;
-} & ExecutionBindingFields;
+};
 
 export type AgentInterruptedEvent = {
   type: "agent_interrupted";
@@ -367,7 +372,7 @@ export type AgentInterruptedEvent = {
   total_tokens?: { prompt: number; completion: number };
   duration_ms?: number;
   timestamp?: number;
-} & ExecutionBindingFields;
+};
 
 export type SessionSubtask = {
   id: string;
@@ -406,14 +411,14 @@ export type WorkspaceBoundEvent = {
   session_id?: string;
   workspace: WorkspaceBinding;
   executor?: ExecutorBinding;
-} & ExecutionBindingFields;
+} & ExecutionRouteFields;
 
 export type ExecutorBoundEvent = {
   type: "executor_bound" | "executor_status_changed";
   session_id?: string;
   executor: ExecutorBinding;
   workspace?: WorkspaceBinding;
-} & ExecutionBindingFields;
+} & ExecutionRouteFields;
 
 export type ToolRoutingDecisionEvent = {
   type: "tool_routing_decision";
@@ -452,7 +457,7 @@ export type RunInputQueuedEvent = {
   type: "run_input_queued";
   run_id?: string;
   session_id?: string;
-} & ExecutionBindingFields;
+};
 
 export type ThinkingAliasDeltaEvent = {
   type: "thinking_delta";

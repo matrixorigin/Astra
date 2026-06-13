@@ -19,12 +19,8 @@ pub(crate) fn resolve_request_execution_bindings(
     request: &astra_services::runs::ChatRequestData,
     server_workspace: &Path,
 ) -> (WorkspaceBinding, ExecutorBinding) {
-    let workspace = match request.workspace_binding.as_ref() {
-        Some(binding) => workspace_binding_from_request(binding, server_workspace),
-        None => WorkspaceBinding::server_sandbox(server_workspace),
-    };
-    let executor = executor_binding_from_request(request.executor_binding.as_ref(), &workspace);
-    (workspace, executor)
+    resolve_request_execution_bindings_from_request(request, Some(server_workspace), None)
+        .expect("server workspace binding resolution should always succeed")
 }
 
 pub(crate) fn request_uses_server_workspace(
@@ -46,16 +42,21 @@ pub(crate) fn resolve_request_execution_bindings_without_server_workspace(
     request: &astra_services::runs::ChatRequestData,
     edge_profile: &Map<String, Value>,
 ) -> Option<(WorkspaceBinding, ExecutorBinding)> {
-    let Some(binding) = request.workspace_binding.as_ref() else {
-        return Some(execution_bindings_from_edge_profile(edge_profile));
+    resolve_request_execution_bindings_from_request(request, None, Some(edge_profile))
+}
+
+fn resolve_request_execution_bindings_from_request(
+    request: &astra_services::runs::ChatRequestData,
+    server_workspace: Option<&Path>,
+    edge_profile: Option<&Map<String, Value>>,
+) -> Option<(WorkspaceBinding, ExecutorBinding)> {
+    let workspace = match request.workspace_binding.as_ref() {
+        Some(binding) => workspace_binding_from_request(binding, server_workspace)?,
+        None => match server_workspace {
+            Some(server_workspace) => WorkspaceBinding::server_sandbox(server_workspace),
+            None => return edge_profile.map(execution_bindings_from_edge_profile),
+        },
     };
-    if matches!(
-        binding.kind,
-        astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox
-    ) {
-        return None;
-    }
-    let workspace = workspace_binding_from_request(binding, Path::new(""));
     let executor = executor_binding_from_request(request.executor_binding.as_ref(), &workspace);
     Some((workspace, executor))
 }
@@ -251,11 +252,11 @@ pub(crate) fn executor_binding_from_request(
 
 fn workspace_binding_from_request(
     binding: &astra_services::runs::WorkspaceBindingRequest,
-    server_workspace: &Path,
-) -> WorkspaceBinding {
+    server_workspace: Option<&Path>,
+) -> Option<WorkspaceBinding> {
     match binding.kind {
         astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox => {
-            let mut workspace = WorkspaceBinding::server_sandbox(server_workspace);
+            let mut workspace = WorkspaceBinding::server_sandbox(server_workspace?);
             if let Some(display_name) = non_empty_string(binding.display_name.as_deref()) {
                 workspace.display_name = display_name;
             }
@@ -265,37 +266,41 @@ fn workspace_binding_from_request(
             if let Some(fallback_policy) = binding.fallback_policy {
                 workspace.fallback_policy = fallback_policy_from_request(fallback_policy);
             }
-            workspace
+            Some(workspace)
         }
-        astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace => WorkspaceBinding {
-            kind: WorkspaceBindingKind::EdgeWorkspace,
-            display_name: non_empty_string(binding.display_name.as_deref())
-                .unwrap_or_else(|| "Edge workspace".to_string()),
-            cwd: non_empty_string(binding.cwd.as_deref()),
-            authority: binding
-                .authority
-                .map(workspace_authority_from_request)
-                .unwrap_or(WorkspaceAuthority::ReadWrite),
-            fallback_policy: binding
-                .fallback_policy
-                .map(fallback_policy_from_request)
-                .unwrap_or(FallbackPolicy::Disabled),
-        },
-        astra_services::runs::WorkspaceBindingRequestKind::UploadedSnapshot => WorkspaceBinding {
-            kind: WorkspaceBindingKind::UploadedSnapshot,
-            display_name: non_empty_string(binding.display_name.as_deref())
-                .unwrap_or_else(|| "Uploaded snapshot".to_string()),
-            cwd: non_empty_string(binding.cwd.as_deref()),
-            authority: binding
-                .authority
-                .map(workspace_authority_from_request)
-                .unwrap_or(WorkspaceAuthority::ReadOnly),
-            fallback_policy: binding
-                .fallback_policy
-                .map(fallback_policy_from_request)
-                .unwrap_or(FallbackPolicy::Disabled),
-        },
-        astra_services::runs::WorkspaceBindingRequestKind::GitCheckout => WorkspaceBinding {
+        astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace => {
+            Some(WorkspaceBinding {
+                kind: WorkspaceBindingKind::EdgeWorkspace,
+                display_name: non_empty_string(binding.display_name.as_deref())
+                    .unwrap_or_else(|| "Edge workspace".to_string()),
+                cwd: non_empty_string(binding.cwd.as_deref()),
+                authority: binding
+                    .authority
+                    .map(workspace_authority_from_request)
+                    .unwrap_or(WorkspaceAuthority::ReadWrite),
+                fallback_policy: binding
+                    .fallback_policy
+                    .map(fallback_policy_from_request)
+                    .unwrap_or(FallbackPolicy::Disabled),
+            })
+        }
+        astra_services::runs::WorkspaceBindingRequestKind::UploadedSnapshot => {
+            Some(WorkspaceBinding {
+                kind: WorkspaceBindingKind::UploadedSnapshot,
+                display_name: non_empty_string(binding.display_name.as_deref())
+                    .unwrap_or_else(|| "Uploaded snapshot".to_string()),
+                cwd: non_empty_string(binding.cwd.as_deref()),
+                authority: binding
+                    .authority
+                    .map(workspace_authority_from_request)
+                    .unwrap_or(WorkspaceAuthority::ReadOnly),
+                fallback_policy: binding
+                    .fallback_policy
+                    .map(fallback_policy_from_request)
+                    .unwrap_or(FallbackPolicy::Disabled),
+            })
+        }
+        astra_services::runs::WorkspaceBindingRequestKind::GitCheckout => Some(WorkspaceBinding {
             kind: WorkspaceBindingKind::GitCheckout,
             display_name: non_empty_string(binding.display_name.as_deref())
                 .unwrap_or_else(|| "Git checkout".to_string()),
@@ -308,8 +313,8 @@ fn workspace_binding_from_request(
                 .fallback_policy
                 .map(fallback_policy_from_request)
                 .unwrap_or(FallbackPolicy::Disabled),
-        },
-        astra_services::runs::WorkspaceBindingRequestKind::None => WorkspaceBinding {
+        }),
+        astra_services::runs::WorkspaceBindingRequestKind::None => Some(WorkspaceBinding {
             kind: WorkspaceBindingKind::None,
             display_name: non_empty_string(binding.display_name.as_deref())
                 .unwrap_or_else(|| "No workspace".to_string()),
@@ -319,7 +324,7 @@ fn workspace_binding_from_request(
                 .fallback_policy
                 .map(fallback_policy_from_request)
                 .unwrap_or(FallbackPolicy::Disabled),
-        },
+        }),
     }
 }
 

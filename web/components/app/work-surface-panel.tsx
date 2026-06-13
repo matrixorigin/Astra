@@ -20,8 +20,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ACTIVE_AGENT_SURFACE_STATUSES } from "@/lib/work-surface";
 import type {
   AgentSurfaceItem,
+  ExecutorBinding,
   SessionTask,
   ToolSurfaceItem,
+  WorkspaceBinding,
   WorkSurfaceState,
 } from "@/lib/work-surface";
 import type { WorkSurfaceRunResponse } from "@/lib/api/types";
@@ -47,27 +49,8 @@ type AgentRunProjectionState = {
   projection: WorkSurfaceRunResponse | null;
 };
 
-type WorkspaceBindingLike =
-  | {
-      kind?: string | null;
-      display_name?: string | null;
-      cwd?: string | null;
-      authority?: string | null;
-      fallback_policy?: string | null;
-    }
-  | null
-  | undefined;
-
-type ExecutorBindingLike =
-  | {
-      kind?: string | null;
-      executor_id?: string | null;
-      display_name?: string | null;
-      transport?: string | null;
-      status?: string | null;
-    }
-  | null
-  | undefined;
+type WorkspaceBindingLike = Partial<WorkspaceBinding> | null | undefined;
+type ExecutorBindingLike = Partial<ExecutorBinding> | null | undefined;
 
 export function WorkSurfacePanel({
   state,
@@ -1070,9 +1053,13 @@ function AgentRunBindingSummary({
   const rawWs = projection.workspace;
   const rawEx = projection.executor;
   const workspace: WorkspaceBindingLike =
-    rawWs && typeof rawWs === "object" && !Array.isArray(rawWs) ? rawWs : null;
+    rawWs && typeof rawWs === "object" && !Array.isArray(rawWs)
+      ? (rawWs as Partial<WorkspaceBinding>)
+      : null;
   const executor: ExecutorBindingLike =
-    rawEx && typeof rawEx === "object" && !Array.isArray(rawEx) ? rawEx : null;
+    rawEx && typeof rawEx === "object" && !Array.isArray(rawEx)
+      ? (rawEx as Partial<ExecutorBinding>)
+      : null;
   if (
     !workspace &&
     !executor &&

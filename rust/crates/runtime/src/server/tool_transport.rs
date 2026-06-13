@@ -164,14 +164,14 @@ pub const TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH: &str = "workspace_path_mismat
 pub const TOOL_ERROR_KIND_AGENT_WAITING: &str = "agent_waiting";
 pub const TOOL_ERROR_KIND_FALLBACK_DISABLED: &str = "fallback_disabled";
 pub const TOOL_ERROR_KIND_EXECUTOR_OFFLINE: &str = "executor_offline";
-pub const RUN_BLOCKED_REASON_EXECUTOR_OFFLINE: &str = "executor_offline";
+pub const RUN_BLOCKED_REASON_EXECUTOR_OFFLINE: &str = TOOL_ERROR_KIND_EXECUTOR_OFFLINE;
 pub const TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED: &str = "transport_disconnected";
 pub const TOOL_ERROR_KIND_CANCELLED: &str = "cancelled";
-pub const RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED: &str = "transport_disconnected";
-pub const RUN_BLOCKED_REASON_FALLBACK_DISABLED: &str = "fallback_disabled";
+pub const RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED: &str = TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED;
+pub const RUN_BLOCKED_REASON_FALLBACK_DISABLED: &str = TOOL_ERROR_KIND_FALLBACK_DISABLED;
 pub const TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE: &str = "workspace_executor_unavailable";
 pub const RUN_BLOCKED_REASON_WORKSPACE_EXECUTOR_UNAVAILABLE: &str =
-    "workspace_executor_unavailable";
+    TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE;
 
 enum EdgeTransportAttempt {
     Delivered(astra_tools::ToolResult),
@@ -265,7 +265,7 @@ where
     }
 }
 
-fn cancelled_tool_result(tool_name: &str) -> astra_tools::ToolResult {
+pub(crate) fn cancelled_tool_result(tool_name: &str) -> astra_tools::ToolResult {
     let mut result =
         astra_tools::ToolResult::error(format!("Tool '{tool_name}' cancelled before completion"));
     result.metadata = Some(Map::from_iter([

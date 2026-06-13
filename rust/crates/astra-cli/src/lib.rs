@@ -63,6 +63,7 @@ pub(crate) use cli::cloud_sync::post_auth_cloud_resync;
 pub(crate) mod tests {
     pub(crate) use super::test_utils::HomeGuard;
     pub(crate) use super::test_utils::TestUi;
+    pub(crate) use super::test_utils::heavy_checkpoint_with_runtime_state;
     pub(crate) use super::test_utils::isolate_credentials;
     pub(crate) use super::test_utils::isolated_sessions_dir;
     pub(crate) use super::test_utils::stub_stream_result;

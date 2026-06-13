@@ -202,6 +202,28 @@ pub(crate) fn stub_stream_result_with_records(
     }
 }
 
+pub(crate) fn heavy_checkpoint_with_runtime_state(
+    pipeline_state: serde_json::Value,
+    compaction_state: serde_json::Value,
+    consecutive_context_window_errors: u32,
+) -> astra_pipeline::step_protocol::StepCheckpoint {
+    use astra_pipeline::step_protocol::{ExecutionCursor, StepCheckpoint};
+
+    let mut heavy = match StepCheckpoint::heavy(
+        "session-turn-1".to_string(),
+        "task-1".to_string(),
+        "agent-1".to_string(),
+        ExecutionCursor::default(),
+    ) {
+        StepCheckpoint::Heavy(heavy) => *heavy,
+        StepCheckpoint::Light(_) => unreachable!("heavy checkpoint constructor returned light"),
+    };
+    heavy.pipeline_state = Some(pipeline_state);
+    heavy.compaction_state = Some(compaction_state);
+    heavy.consecutive_context_window_errors = consecutive_context_window_errors;
+    StepCheckpoint::Heavy(Box::new(heavy))
+}
+
 // ── Async Test Waits ─────────────────────────────────────────────────
 
 pub(crate) async fn wait_until(

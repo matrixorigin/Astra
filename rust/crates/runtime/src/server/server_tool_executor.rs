@@ -52,7 +52,7 @@ use crate::server::tool_transport::{
     TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE, TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH,
     ToolExecutionRequest, ToolExecutionRouteKind, ToolExecutionService, ToolPolicySnapshot,
     ToolTransportKind, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
-    binding_event_fields, route_binding_event_fields,
+    binding_event_fields, cancelled_tool_result, route_binding_event_fields,
 };
 use crate::tool_sandbox::{
     IsolatedOutput, IsolationConfig, SandboxMode, SandboxPolicy, ToolTier, effective_tier,
@@ -5902,23 +5902,6 @@ fn tool_timeout_tool_result(message: String) -> astra_tools::ToolResult {
             "reason".to_string(),
             Value::String(TOOL_ERROR_KIND_TOOL_TIMEOUT.to_string()),
         ),
-    ]));
-    result
-}
-
-fn cancelled_tool_result(tool_name: &str) -> astra_tools::ToolResult {
-    let mut result =
-        astra_tools::ToolResult::error(format!("Tool '{tool_name}' cancelled before completion"));
-    result.metadata = Some(Map::from_iter([
-        (
-            "error_kind".to_string(),
-            Value::String(TOOL_ERROR_KIND_CANCELLED.to_string()),
-        ),
-        (
-            "reason".to_string(),
-            Value::String(TOOL_ERROR_KIND_CANCELLED.to_string()),
-        ),
-        ("cancelled".to_string(), Value::Bool(true)),
     ]));
     result
 }
