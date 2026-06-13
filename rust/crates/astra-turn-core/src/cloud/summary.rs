@@ -40,9 +40,18 @@ discard the old turns and continue with just the summary in context. Preserve: \
 the user's original goals and any constraints they stated, decisions we made \
 and why, files read or modified (with paths), tools invoked and their key \
 results, errors encountered and their fixes, and any pending work. Omit \
-chit-chat, redundant acknowledgements, and exploration that did not change \
-the outcome. Format the summary as sections: **Goals**, **Decisions**, \
-**Actions**, **Status**, **Key Facts**. Target under 800 words.";
+chit-chat, redundant acknowledgements, and exploration that did not change the outcome.\n\n\
+Use exactly these section headers so the compacted context can be validated and resumed:\n\
+### Primary Request\n\
+### Key Technical Concepts\n\
+### Files & Code Modified\n\
+### Problem Solving\n\
+### Errors & Fixes\n\
+### All User Messages\n\
+### Pending Tasks\n\
+### Current Work\n\
+### Current State\n\n\
+Target under 800 words.";
 
 // ---------------------------------------------------------------------------
 // LLM client abstraction (for testability)
@@ -590,6 +599,25 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("some conversation")
+        );
+    }
+
+    #[test]
+    fn inline_compact_instruction_uses_canonical_summary_schema() {
+        for section in [
+            "### Primary Request",
+            "### Pending Tasks",
+            "### Current Work",
+            "### Current State",
+        ] {
+            assert!(
+                INLINE_COMPACT_INSTRUCTION.contains(section),
+                "inline compaction prompt must include required section {section}"
+            );
+        }
+        assert!(
+            !INLINE_COMPACT_INSTRUCTION.contains("**Goals**"),
+            "inline compaction must not use a parallel summary schema"
         );
     }
 
