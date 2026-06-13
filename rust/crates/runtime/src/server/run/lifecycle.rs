@@ -1141,8 +1141,35 @@ fn restore_session_state_compact(
     if ss.budget_remaining_rounds > 0 {
         loop_state.remaining_turns = ss.budget_remaining_rounds as usize;
     }
-    if ss.consecutive_ctx_errors > 0 {
-        loop_state.consecutive_context_window_errors = ss.consecutive_ctx_errors;
+    loop_state.consecutive_context_window_errors = ss.consecutive_ctx_errors;
+    if let Some(compaction_tracker) = ss.compaction_tracker.as_ref() {
+        loop_state.compaction_effectiveness =
+            crate::turn::compaction_replay::CompactionEffectivenessTracker::from_json_lossy(
+                compaction_tracker,
+            );
+    }
+}
+
+fn restore_step_checkpoint_runtime_state(
+    restored: &astra_pipeline::step_restore::RestoredSession,
+    current_date: &str,
+    loop_state: &mut AgenticLoopState,
+) {
+    loop_state.consecutive_context_window_errors = restored.consecutive_context_window_errors;
+    if let Some(compaction_state) = restored.compaction_state.as_ref() {
+        loop_state.compaction_effectiveness =
+            crate::turn::compaction_replay::CompactionEffectivenessTracker::from_json_lossy(
+                compaction_state,
+            );
+    }
+    if restored.pipeline_state.is_some() {
+        loop_state.pipeline_session = Some(
+            astra_turn_core::pipeline_session_serde::restore_or_new_with_current_date(
+                astra_turn_core::pipeline_config::PipelineConfig::default(),
+                restored.pipeline_state.as_ref(),
+                current_date,
+            ),
+        );
     }
 }
 
@@ -4863,22 +4890,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 crate::turn::session_current_date::resolve_session_current_date(&session_id)
             });
 
-        // ── Pipeline warm-start: restore PipelineSession from checkpoint ──
-        // Overwrites the fresh `PipelineSession::new()` with a snapshot that
-        // carries cache hit ratios, reserve estimates, latches, and escalation
-        // counters from the last checkpoint. Without this, every server-side
-        // session resume starts with cold pipeline state — the write side
-        // (agentic_loop::finalization) persists it, but nothing was reading it
-        // back until now.
-        if let Ok(Some(restored)) = astra_pipeline::step_restore::restore_session(&session_id)
-            && restored.pipeline_state.is_some()
-        {
-            loop_state.pipeline_session = Some(
-                astra_turn_core::pipeline_session_serde::restore_or_new_with_current_date(
-                    astra_turn_core::pipeline_config::PipelineConfig::default(),
-                    restored.pipeline_state.as_ref(),
-                    &fresh_session_current_date,
-                ),
+        // ── Runtime warm-start: restore loop state from checkpoint ──
+        // Overwrites fresh advisory state with checkpointed pipeline,
+        // compaction, and context-window counters. Without this, server-side
+        // session resume starts cold even though finalization persisted the
+        // state needed for long-running sessions.
+        if let Ok(Some(restored)) = astra_pipeline::step_restore::restore_session(&session_id) {
+            restore_step_checkpoint_runtime_state(
+                &restored,
+                &fresh_session_current_date,
+                &mut loop_state,
             );
         }
 
@@ -5409,18 +5430,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 crate::turn::session_current_date::resolve_session_current_date(&session_id)
             });
 
-        // ── Pipeline warm-start from step checkpoint ────────────────
+        // ── Runtime warm-start from step checkpoint ────────────────
         if request.session_id.is_some() {
             if let Ok(Some(restored)) = astra_pipeline::step_restore::restore_session(&session_id) {
-                if restored.pipeline_state.is_some() {
-                    state.pipeline_session = Some(
-                        astra_turn_core::pipeline_session_serde::restore_or_new_with_current_date(
-                            astra_turn_core::pipeline_config::PipelineConfig::default(),
-                            restored.pipeline_state.as_ref(),
-                            &fresh_session_current_date,
-                        ),
-                    );
-                }
+                restore_step_checkpoint_runtime_state(
+                    &restored,
+                    &fresh_session_current_date,
+                    &mut state,
+                );
             }
         }
 
@@ -7525,6 +7542,87 @@ mod tests {
                 fanout_slot: None,
             },
         )
+    }
+
+    #[test]
+    fn restore_session_state_compact_restores_compaction_tracker_and_context_errors() {
+        let svc = test_service();
+        let request = test_request("resume");
+        let mut state =
+            svc.build_initial_state("test-user", &request, "session-1", "run-1", None, None);
+
+        restore_session_state_compact(
+            astra_turn_core::conversation_log::SessionStateCompact {
+                consecutive_ctx_errors: 3,
+                compaction_tracker: Some(json!({
+                    "attempt_count": 4,
+                    "cumulative_tokens_freed": 18_000,
+                    "last_tokens_freed": 2_000,
+                    "last_was_insufficient": true,
+                    "consecutive_futile_attempts": 2,
+                })),
+                ..Default::default()
+            },
+            &mut state,
+        );
+
+        assert_eq!(state.consecutive_context_window_errors, 3);
+        assert_eq!(state.compaction_effectiveness.attempt_count, 4);
+        assert_eq!(
+            state.compaction_effectiveness.cumulative_tokens_freed,
+            18_000
+        );
+        assert_eq!(state.compaction_effectiveness.last_tokens_freed, 2_000);
+        assert!(state.compaction_effectiveness.last_was_insufficient);
+        assert_eq!(
+            state.compaction_effectiveness.consecutive_futile_attempts,
+            2
+        );
+    }
+
+    #[test]
+    fn restore_step_checkpoint_runtime_state_restores_compaction_tracker_and_context_errors() {
+        let svc = test_service();
+        let request = test_request("resume");
+        let mut state =
+            svc.build_initial_state("test-user", &request, "session-1", "run-1", None, None);
+        let restored = astra_pipeline::step_restore::RestoredSession {
+            messages: Vec::new(),
+            budget_remaining_tokens: 0,
+            budget_remaining_rounds: 0,
+            blocked_tools: Vec::new(),
+            recent_tools: Vec::new(),
+            idempotency_cache: astra_pipeline::step_protocol::InMemoryIdempotencyCache::new(),
+            resume_turn: 0,
+            protocol_version: astra_pipeline::step_protocol::PROTOCOL_VERSION,
+            completed_tool_results: HashMap::new(),
+            interruption: None,
+            approval_overrides: None,
+            consecutive_context_window_errors: 5,
+            compaction_state: Some(json!({
+                "attempt_count": 6,
+                "cumulative_tokens_freed": 24_000,
+                "last_tokens_freed": 1_500,
+                "last_was_insufficient": false,
+                "consecutive_futile_attempts": 1,
+            })),
+            pipeline_state: None,
+        };
+
+        restore_step_checkpoint_runtime_state(&restored, "2026-06-13", &mut state);
+
+        assert_eq!(state.consecutive_context_window_errors, 5);
+        assert_eq!(state.compaction_effectiveness.attempt_count, 6);
+        assert_eq!(
+            state.compaction_effectiveness.cumulative_tokens_freed,
+            24_000
+        );
+        assert_eq!(state.compaction_effectiveness.last_tokens_freed, 1_500);
+        assert!(!state.compaction_effectiveness.last_was_insufficient);
+        assert_eq!(
+            state.compaction_effectiveness.consecutive_futile_attempts,
+            1
+        );
     }
 
     #[test]
