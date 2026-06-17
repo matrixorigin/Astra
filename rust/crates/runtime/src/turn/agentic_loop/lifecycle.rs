@@ -3399,15 +3399,13 @@ mod tests {
             state.messages.len()
         );
 
-        // Verify a compaction boundary marker was inserted.
-        let has_boundary = state
-            .messages
-            .iter()
-            .any(|m| m.get("_compact_boundary").is_some());
-        assert!(
-            has_boundary,
-            "compaction must insert a boundary marker in the message list"
-        );
+        // Compaction is already proven by message-count reduction above.
+        // The `_compact_boundary` marker lives in `Message.extra` and is
+        // intentionally stripped by `From<Message> for Value` to keep
+        // prompt-cache prefixes stable on the provider wire — it does NOT
+        // survive into `state.messages` (Vec<Value>). Asserting on it here
+        // would test the wrong layer. See compaction_engine_tests.rs for
+        // typed-level boundary marker assertions.
 
         // Emissions are suppressed when quiet=true, but the pipeline
         // itself must execute without panicking — that's the contract.
