@@ -366,6 +366,7 @@ impl DatabaseWorkspaceRecordStore {
             "ALTER TABLE workspace_records ADD COLUMN source_key VARCHAR(512) NULL",
         )
         .await?;
+        ensure_workspace_records_source_key_unique(self.pool.get()).await?;
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS workspace_cleanup_debts (
@@ -398,9 +399,14 @@ async fn ensure_workspace_records_column(
         Ok(_) => Ok(()),
         Err(error) => {
             let message = error.to_string();
+            // 1060: duplicate column, 1061: duplicate key name (index exists).
+            // Both are benign for idempotent DDL.
             if message.contains("1060")
+                || message.contains("1061")
                 || message.contains("Duplicate column")
                 || message.contains("duplicate column")
+                || message.contains("Duplicate key name")
+                || message.contains("duplicate key name")
             {
                 Ok(())
             } else {
@@ -408,6 +414,22 @@ async fn ensure_workspace_records_column(
             }
         }
     }
+}
+
+/// Enforce a UNIQUE index on `source_key` so that two workspaces cannot bind
+/// to the same volume/source concurrently. Without this, the cross-owner
+/// conflict check in `upsert_workspace_record` is a racy SELECT-then-INSERT and
+/// two concurrent upserts can both succeed.
+/// MySQL permits multiple NULLs in a UNIQUE index, so nullable source_key is
+/// safe.
+async fn ensure_workspace_records_source_key_unique(
+    pool: &sqlx::Pool<sqlx::MySql>,
+) -> Result<(), sqlx::Error> {
+    ensure_workspace_records_column(
+        pool,
+        "ALTER TABLE workspace_records ADD UNIQUE INDEX ux_source_key (source_key)",
+    )
+    .await
 }
 
 #[async_trait]
