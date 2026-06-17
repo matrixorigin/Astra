@@ -491,12 +491,16 @@ impl WorkspaceRecordStore for DatabaseWorkspaceRecordStore {
             }
         }
 
-        sqlx::query(
+        // Guard the UPDATE with `owner_id = ?` so that a concurrent owner change
+        // between the SELECT above and this UPDATE cannot silently clobber the
+        // new owner. If `rows_affected == 0`, either the row was deleted or
+        // another owner now holds it — treat both as a conflict.
+        let result = sqlx::query(
             "UPDATE workspace_records \
              SET owner_id = ?, session_id = ?, run_id = ?, kind = ?, authority = ?, \
                  persistence = ?, root_or_volume_ref = ?, source_json = ?, revision = ?, \
                  display_name = ?, source_key = ?, record_json = ?, updated_at = NOW(6) \
-             WHERE workspace_id = ?",
+             WHERE workspace_id = ? AND owner_id = ?",
         )
         .bind(&entry.owner_id)
         .bind(entry.session_id.as_deref())
@@ -511,8 +515,16 @@ impl WorkspaceRecordStore for DatabaseWorkspaceRecordStore {
         .bind(source_key.as_deref())
         .bind(&record_json)
         .bind(&entry.record.workspace_id)
+        .bind(&entry.owner_id)
         .execute(self.pool.get())
         .await?;
+        if result.rows_affected() == 0 {
+            // Row vanished or was re-owned concurrently — surface as conflict so
+            // callers do not assume the upsert succeeded.
+            return Err(WorkspaceRecordStoreError::WorkspaceOwnerConflict {
+                workspace_id: entry.record.workspace_id,
+            });
+        }
         Ok(())
     }
 
