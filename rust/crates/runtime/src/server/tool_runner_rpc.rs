@@ -25,6 +25,12 @@ pub trait RunnerRpcTransport: Send + Sync {
         executor_id: &str,
         request: astra_runtime_env::RunnerExecuteToolRequest,
     ) -> Result<astra_runtime_env::RunnerExecuteToolResponse, astra_runtime_env::RuntimeError>;
+
+    async fn destroy_session(
+        &self,
+        executor_id: &str,
+        request: astra_runtime_env::RunnerDestroySessionRequest,
+    ) -> Result<astra_runtime_env::RunnerDestroySessionResponse, astra_runtime_env::RuntimeError>;
 }
 
 pub(crate) async fn execute_runner_rpc(
@@ -111,6 +117,7 @@ pub(crate) async fn execute_runner_rpc(
             false,
         );
     }
+    let session_id = handle.session_id.clone();
     let execute_request = plan.execute_request(*handle);
 
     let execute_response = if let Some(token) = cancel_token.as_ref() {
@@ -139,9 +146,25 @@ pub(crate) async fn execute_runner_rpc(
 
     match execute_response {
         Ok(astra_runtime_env::RunnerExecuteToolResponse::Completed { outcome }) => {
+            // Best-effort session cleanup after tool execution
+            destroy_session_best_effort(
+                &request,
+                transport.as_ref(),
+                plan.executor_id(),
+                &session_id,
+            )
+            .await;
             runner_outcome_tool_result(&request, binding, outcome)
         }
         Ok(astra_runtime_env::RunnerExecuteToolResponse::Rejected { error }) | Err(error) => {
+            // Best-effort session cleanup even on failure
+            destroy_session_best_effort(
+                &request,
+                transport.as_ref(),
+                plan.executor_id(),
+                &session_id,
+            )
+            .await;
             runner_error_tool_result(&request, binding, error)
         }
     }
@@ -236,5 +259,46 @@ fn runner_error_tool_result(
         metadata: Some(metadata),
         is_error: true,
         exit_semantics: None,
+    }
+}
+
+async fn destroy_session_best_effort(
+    request: &ToolExecutionRequest,
+    transport: &dyn RunnerRpcTransport,
+    executor_id: &str,
+    session_id: &str,
+) {
+    use astra_runtime_env::RunnerDestroySessionRequest;
+
+    let destroy_request = RunnerDestroySessionRequest {
+        request_id: format!("destroy:{}", uuid::Uuid::new_v4()),
+        session_id: session_id.to_string(),
+        reason: "tool execution completed".to_string(),
+    };
+
+    // Best-effort with short timeout to avoid blocking the main response
+    let timeout_duration = std::time::Duration::from_secs(5);
+    let result = tokio::time::timeout(
+        timeout_duration,
+        transport.destroy_session(executor_id, destroy_request),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(_)) => {
+            // Success, nothing to do
+        }
+        Ok(Err(error)) => {
+            eprintln!(
+                "[runner-rpc] destroy_session failed for tool '{}' on executor '{}': {}",
+                request.tool_name, request.executor.display_name, error.message
+            );
+        }
+        Err(_) => {
+            eprintln!(
+                "[runner-rpc] destroy_session timed out for tool '{}' on executor '{}'",
+                request.tool_name, request.executor.display_name
+            );
+        }
     }
 }

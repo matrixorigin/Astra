@@ -8,14 +8,15 @@ use sqlx::Row;
 use astra_runtime_env::{
     ExecutorBinding, ExecutorBindingKind, PolicyIntent, RunBinding, RunnerAckResponse,
     RunnerCapacity, RunnerDenial, RunnerDenialReason, RunnerDeploymentKind,
-    RunnerExecuteToolRequest, RunnerExecuteToolResponse, RunnerHeartbeat, RunnerIdentity,
-    RunnerPoolEntry, RunnerPrepareSessionRequest, RunnerPrepareSessionResponse,
-    RunnerRegisterRequest, RunnerRegisterResponse, RunnerRpcEndpoint, RunnerScheduleDecision,
-    RunnerScheduleDenial, RunnerScheduleDenialReason, RunnerScheduleRequest, RunnerScheduler,
-    RunnerStatus, RuntimeBinding, RuntimeEnvironmentAdvertisement, RuntimeError,
-    RuntimeIsolationBackend, RuntimeSessionManager, ToolRegistry, WorkspaceAuthority,
-    WorkspaceBinding, WorkspaceBindingKind, WorkspaceOwnerScope, WorkspacePersistence,
-    WorkspaceRecord, WorkspaceSource,
+    RunnerDestroySessionRequest, RunnerDestroySessionResponse, RunnerExecuteToolRequest,
+    RunnerExecuteToolResponse, RunnerHeartbeat, RunnerIdentity, RunnerPoolEntry,
+    RunnerPrepareSessionRequest, RunnerPrepareSessionResponse, RunnerRegisterRequest,
+    RunnerRegisterResponse, RunnerRpcEndpoint, RunnerScheduleDecision, RunnerScheduleDenial,
+    RunnerScheduleDenialReason, RunnerScheduleRequest, RunnerScheduler, RunnerStatus,
+    RuntimeBinding, RuntimeEnvironmentAdvertisement, RuntimeError, RuntimeIsolationBackend,
+    RuntimeSessionManager, ToolRegistry, WorkspaceAuthority, WorkspaceBinding,
+    WorkspaceBindingKind, WorkspaceOwnerScope, WorkspacePersistence, WorkspaceRecord,
+    WorkspaceSource,
 };
 use astra_services::{
     DatabaseWorkspaceRecordStore, WorkspaceCleanupDebtEntry, WorkspaceCleanupDebtStore,
@@ -955,6 +956,33 @@ impl crate::server::tool_transport::RunnerRpcTransport for ServerRunnerPool {
                 ))
             })
     }
+
+    async fn destroy_session(
+        &self,
+        executor_id: &str,
+        request: RunnerDestroySessionRequest,
+    ) -> Result<RunnerDestroySessionResponse, RuntimeError> {
+        let endpoint = self.runner_endpoint(executor_id).await?;
+        self.http_client
+            .post(format!("{endpoint}/v1/sessions/destroy"))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|error| {
+                RuntimeError::runner_protocol(format!("runner destroy request failed: {error}"))
+            })?
+            .error_for_status()
+            .map_err(|error| {
+                RuntimeError::runner_protocol(format!("runner destroy HTTP error: {error}"))
+            })?
+            .json::<RunnerDestroySessionResponse>()
+            .await
+            .map_err(|error| {
+                RuntimeError::runner_protocol(format!(
+                    "runner destroy response decode failed: {error}"
+                ))
+            })
+    }
 }
 
 impl Default for ServerRunnerPool {
@@ -1848,10 +1876,10 @@ mod tests {
     use astra_services::{InMemoryWorkspaceRecordStore, WorkspaceCleanupDebtStore};
     use async_trait::async_trait;
     use axum::{
-        Json, Router,
         body::{self, Body},
         http::{HeaderMap, Request, StatusCode},
         routing::post,
+        Json, Router,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -2572,18 +2600,14 @@ mod tests {
             "*.trusted.example.com",
         ]);
 
-        assert!(
-            policy
-                .validate(&RunnerRpcEndpoint::new("https://runners.example.com"))
-                .is_ok()
-        );
-        assert!(
-            policy
-                .validate(&RunnerRpcEndpoint::new(
-                    "https://pool-a.trusted.example.com/"
-                ))
-                .is_ok()
-        );
+        assert!(policy
+            .validate(&RunnerRpcEndpoint::new("https://runners.example.com"))
+            .is_ok());
+        assert!(policy
+            .validate(&RunnerRpcEndpoint::new(
+                "https://pool-a.trusted.example.com/"
+            ))
+            .is_ok());
         let root_denial = policy
             .validate(&RunnerRpcEndpoint::new("https://trusted.example.com"))
             .expect_err("suffix pattern should not match root domain");
@@ -2898,13 +2922,11 @@ mod tests {
 
         assert_eq!(deleted, 1);
         assert!(list(&pool, "user-1").await.is_empty());
-        assert!(
-            cleanup_store
-                .list_cleanup_debts("user-1", 10)
-                .await
-                .expect("list cleanup debts")
-                .is_empty()
-        );
+        assert!(cleanup_store
+            .list_cleanup_debts("user-1", 10)
+            .await
+            .expect("list cleanup debts")
+            .is_empty());
     }
 
     struct FailingCleanupDebtStore;

@@ -4,23 +4,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use astra_runtime_env::{
-    CapabilityResolver, CompiledRuntimePolicy, EffectiveCapabilitySet, ExecutorBinding,
-    RunnerAckResponse, RunnerCapacity, RunnerDenial, RunnerDenialReason,
-    RunnerDestroySessionRequest, RunnerDestroySessionResponse, RunnerExecuteToolRequest,
-    RunnerExecuteToolResponse, RunnerHeartbeat, RunnerIdentity, RunnerPrepareSessionRequest,
-    RunnerPrepareSessionResponse, RunnerProtocol, RunnerRegisterRequest, RunnerRegisterResponse,
-    RunnerRpcEndpoint, RunnerStatus, RuntimeBinding, RuntimeEnvironment,
-    RuntimeEnvironmentAdvertisement, RuntimeError, RuntimeErrorKind, RuntimeIsolationBackend,
-    RuntimeSessionHandle, RuntimeSessionManager, RuntimeSessionSpec, RuntimeSessionStatus,
-    RuntimeToolInvocation, RuntimeToolOutcome, ToolRegistry, WorkspaceAuthority, WorkspaceBinding,
-    runtime_result_fields_with_policy_evidence, validate_runtime_session_spec,
+    runtime_result_fields_with_policy_evidence, validate_runtime_session_spec, CapabilityResolver,
+    CompiledRuntimePolicy, EffectiveCapabilitySet, ExecutorBinding, RunnerAckResponse,
+    RunnerCapacity, RunnerDenial, RunnerDenialReason, RunnerDestroySessionRequest,
+    RunnerDestroySessionResponse, RunnerExecuteToolRequest, RunnerExecuteToolResponse,
+    RunnerHeartbeat, RunnerIdentity, RunnerPrepareSessionRequest, RunnerPrepareSessionResponse,
+    RunnerProtocol, RunnerRegisterRequest, RunnerRegisterResponse, RunnerRpcEndpoint, RunnerStatus,
+    RuntimeBinding, RuntimeEnvironment, RuntimeEnvironmentAdvertisement, RuntimeError,
+    RuntimeErrorKind, RuntimeIsolationBackend, RuntimeSessionHandle, RuntimeSessionManager,
+    RuntimeSessionSpec, RuntimeSessionStatus, RuntimeToolInvocation, RuntimeToolOutcome,
+    ToolRegistry, WorkspaceAuthority, WorkspaceBinding,
 };
-use astra_tools::{ToolExecutor, executor::DefaultToolExecutor};
+use astra_tools::{executor::DefaultToolExecutor, ToolExecutor};
 use async_trait::async_trait;
 use axum::{
-    Json, Router,
     extract::State,
     routing::{get, post},
+    Json, Router,
 };
 
 #[derive(Debug, Clone)]
@@ -550,12 +550,12 @@ mod tests {
     use astra_runtime_env::{
         RunnerExecuteToolRequest, RunnerExecuteToolResponse, RunnerPrepareSessionRequest,
         RunnerPrepareSessionResponse, RuntimeEnvironmentAdvertisement, RuntimeToolInvocation,
-        TOOL_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT, TOOL_RESULT_RUNTIME_POLICY_EVIDENCE,
-        ToolUnavailableReason,
+        ToolUnavailableReason, TOOL_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT,
+        TOOL_RESULT_RUNTIME_POLICY_EVIDENCE,
     };
     use axum::{
-        body::{Body, to_bytes},
-        http::{Request, header},
+        body::{to_bytes, Body},
+        http::{header, Request},
     };
     use serde_json::json;
     use tower::ServiceExt;
@@ -635,11 +635,13 @@ mod tests {
             "runner-1"
         );
         assert_eq!(
-            outcome.metadata[TOOL_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT]["binding"]["runtime"]["session_manager"],
+            outcome.metadata[TOOL_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT]["binding"]["runtime"]
+                ["session_manager"],
             "host_process"
         );
         assert_eq!(
-            outcome.metadata[TOOL_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT]["binding"]["runtime"]["launch_driver"],
+            outcome.metadata[TOOL_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT]["binding"]["runtime"]
+                ["launch_driver"],
             "in_process"
         );
         assert_eq!(
