@@ -107,6 +107,27 @@ struct BashCacheEntry {
 /// visible on the next read-only probe.
 pub const DEFAULT_BASH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Recover a poisoned `Mutex` while logging the recovery. A panic that
+/// poisoned the lock is a real bug — callers should not silently swallow it.
+/// We keep the recovery (continuing is better than propagating panic across
+/// an await boundary in a tool executor), but emit an `error!` so operators
+/// can correlate the root cause.
+fn recover_poisoned_lock<'a, T>(
+    result: std::sync::LockResult<std::sync::MutexGuard<'a, T>>,
+    lock_name: &'static str,
+) -> std::sync::MutexGuard<'a, T> {
+    match result {
+        Ok(guard) => guard,
+        Err(poison) => {
+            tracing::error!(
+                lock = lock_name,
+                "mutex poisoned by a panicking thread; recovering to keep tool executor available"
+            );
+            poison.into_inner()
+        }
+    }
+}
+
 impl DefaultToolExecutor {
     pub fn new(ctx: ToolContext) -> Self {
         let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
@@ -281,7 +302,7 @@ impl ToolExecutor for DefaultToolExecutor {
                 let mut map = self
                     .bash_cache
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .unwrap_or_else(|e| recover_poisoned_lock(Err(e), "bash_cache"));
                 let now = std::time::Instant::now();
                 let ttl = self.bash_cache_ttl;
                 match map.get(&key) {
@@ -352,7 +373,7 @@ impl ToolExecutor for DefaultToolExecutor {
         {
             self.bash_cache
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(|e| recover_poisoned_lock(Err(e), "bash_cache"))
                 .insert(
                     key,
                     BashCacheEntry {
