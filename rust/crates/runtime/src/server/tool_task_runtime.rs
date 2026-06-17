@@ -35,6 +35,7 @@ const TASK_ACTIONS: &[&str] = &[
     "get",
     "update",
     "stop",
+    "cancel",
     "list_user",
     "adopt",
     "archive",
@@ -72,7 +73,7 @@ fn task_action_allowed_fields(action: &str) -> Option<&'static [&'static str]> {
             "reason",
             "error_message",
         ]),
-        "stop" => Some(&["action", "task_id", "reason"]),
+        "stop" | "cancel" => Some(&["action", "task_id", "reason"]),
         "list_user" => Some(&["action", "user_status"]),
         "adopt" => Some(&["action", "source_session_id", "task_id"]),
         "archive" => Some(&["action", "task_id", "older_than_days", "reason"]),
@@ -326,7 +327,7 @@ pub(crate) async fn execute_task_tool(task_manager: &TaskManager, args: &Value) 
         }
         None => {
             return task_tool_result(
-                "Error: missing required parameter `action` for `task`. Use one of: create, update, list, get, stop, list_user, adopt, archive.".to_string(),
+                "Error: missing required parameter `action` for `task`. Use one of: create, update, list, get, stop (or cancel), list_user, adopt, archive.".to_string(),
                 None,
             );
         }
@@ -341,7 +342,9 @@ pub(crate) async fn execute_task_tool(task_manager: &TaskManager, args: &Value) 
         "update" => {
             execute_validated_task_mutation(task_manager, args, TaskMutationKind::Update).await
         }
-        "stop" => execute_validated_task_mutation(task_manager, args, TaskMutationKind::Stop).await,
+        "stop" | "cancel" => {
+            execute_validated_task_mutation(task_manager, args, TaskMutationKind::Stop).await
+        }
         "list_user" => execute_validated_task_read(task_manager, args, "list_user").await,
         "adopt" => match validate_task_tool_args_for_action("adopt", args) {
             Ok(()) => task_tool_result(task_adopt_requires_http_endpoint_result(), None),
@@ -352,7 +355,7 @@ pub(crate) async fn execute_task_tool(task_manager: &TaskManager, args: &Value) 
         }
         other => task_tool_result(
             format!(
-                "Error: unknown `task` action '{other}'. Valid: create, update, list, get, stop, list_user, adopt, archive."
+                "Error: unknown `task` action '{other}'. Valid: create, update, list, get, stop (or cancel), list_user, adopt, archive."
             ),
             None,
         ),

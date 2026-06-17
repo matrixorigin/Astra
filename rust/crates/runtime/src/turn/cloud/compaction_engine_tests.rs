@@ -1211,7 +1211,7 @@ fn tool_truncation_skips_results_in_protected_head() {
 }
 
 #[test]
-fn tiered_boundary_includes_user_queries_from_dropped_messages() {
+fn tiered_boundary_has_stable_content_for_cache_friendliness() {
     let mut msgs = vec![
         json!({"role": "system", "content": "System"}),
         json!({"role": "user", "content": "Turn 1: fix bug"}),
@@ -1225,7 +1225,6 @@ fn tiered_boundary_includes_user_queries_from_dropped_messages() {
         json!({"role": "assistant", "content": "OK"}),
     ];
     let budget = budget(64000, 100000);
-    // Use TieredCompaction directly to test boundary metadata in isolation
     let layer = TieredCompaction::new(1, 0.0);
     let _ = compress_layer_values(&layer, &mut msgs, &budget);
     let boundary = msgs
@@ -1234,8 +1233,12 @@ fn tiered_boundary_includes_user_queries_from_dropped_messages() {
     assert!(boundary.is_some(), "boundary marker must exist");
     let content = boundary.unwrap()["content"].as_str().unwrap();
     assert!(
-        content.contains("fix bug") || content.contains("check tests"),
-        "boundary must mention dropped user queries"
+        content.contains("Context compacted"),
+        "boundary content must use stable prefix"
+    );
+    assert!(
+        !content.contains("fix bug") && !content.contains("check tests"),
+        "boundary content must NOT include dynamic data (breaks prompt cache)"
     );
 }
 

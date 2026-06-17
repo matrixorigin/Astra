@@ -81,6 +81,7 @@ impl ToolFlags {
     pub const MATRIXONE: Self = Self(1 << 10);
     pub const ORCHESTRATION: Self = Self(1 << 11);
     pub const FILE_OP: Self = Self(1 << 12);
+    pub const TASK_MGMT: Self = Self(1 << 13);
 
     pub const fn empty() -> Self {
         Self(0)
@@ -287,11 +288,11 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("deprioritize_tool", MU, OR),
     tool("compress_context", MU, OR),
     tool("env", MU, OR),
-    // ── Mutating — task management ───────────────────────────────────
-    tool("task", MU, OR),
-    tool("task_output", RO, OR),
-    tool("task_list", RO, OR),
-    tool("task_stop", MU, OR),
+    // ── Mutating — task management (immune to deprioritization) ───────
+    tool("task", MU, OR.union(ToolFlags::TASK_MGMT)),
+    tool("task_output", RO, OR.union(ToolFlags::TASK_MGMT)),
+    tool("task_list", RO, OR.union(ToolFlags::TASK_MGMT)),
+    tool("task_stop", MU, OR.union(ToolFlags::TASK_MGMT)),
     // ── Shell execution (highest risk) ───────────────────────────────
     tool("bash", SH, AE.union(EX)),
     tool("BashTool", SH, AE.union(AL)),
@@ -379,6 +380,7 @@ impl ToolRegistry {
 
     pub fn is_never_restrict(&self, name: &str) -> bool {
         self.category(name).is_never_restrict()
+            || self.flags(name).contains(ToolFlags::TASK_MGMT)
     }
 
     pub fn is_parallelizable(&self, name: &str) -> bool {

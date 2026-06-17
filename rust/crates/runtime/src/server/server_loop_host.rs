@@ -2553,6 +2553,11 @@ impl ServerAgenticLoopHost {
         for boosted in &state.boosted_tools {
             effective_restricted.remove(boosted);
         }
+        if let Some(executor) = state.server_tool_executor.as_deref() {
+            for name in executor.activated_deferred_tool_names() {
+                effective_restricted.remove(&name);
+            }
+        }
         let visible = self.filtered_turn_tools(&effective_restricted);
         self.sync_valid_tools_to_visible_for_state(&visible, state);
         visible
@@ -3029,6 +3034,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         effective_restricted.extend(interaction_scoped_tool_restrictions(interaction_mode));
         for boosted in &state.boosted_tools {
             effective_restricted.remove(boosted);
+        }
+        if let Some(executor) = state.server_tool_executor.as_deref() {
+            for name in executor.activated_deferred_tool_names() {
+                effective_restricted.remove(&name);
+            }
         }
         let visible_tools = self.filtered_turn_tools(&effective_restricted);
         self.sync_valid_tools_to_visible_for_state(&visible_tools, state);
@@ -3693,6 +3703,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         effective_restricted.extend(interaction_scoped_tool_restrictions(interaction_mode));
         for boosted in &state.boosted_tools {
             effective_restricted.remove(boosted);
+        }
+        if let Some(executor) = state.server_tool_executor.as_deref() {
+            for name in executor.activated_deferred_tool_names() {
+                effective_restricted.remove(&name);
+            }
         }
         let visible_tools = self.filtered_turn_tools(&effective_restricted);
         // We only need the system messages here — the inline summary call
