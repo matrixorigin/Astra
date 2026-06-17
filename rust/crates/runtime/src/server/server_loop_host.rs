@@ -2532,25 +2532,46 @@ impl ServerAgenticLoopHost {
         self.admissible_extras = extras;
     }
 
-    /// Compute the effective restricted-tool set for a turn from a base
-    /// (already-merged) restricted set. Applies runtime allowlist
-    /// restrictions, optional interaction-scoped restrictions, boosts, and
-    /// health-gated rescue of activated deferred tools.
+    /// Compute the effective restricted-tool set for a turn by running the
+    /// full restriction pipeline:
+    ///
+    /// 1. widen check + deprioritized-tool merge
+    /// 2. runtime allowlist restrictions
+    /// 3. interaction-scoped restrictions (always applied)
+    /// 4. boost rescue
+    /// 5. activated-deferred-tool rescue (health-gated)
+    ///
+    /// `consume_widen` controls whether the `widen_selection_pending` flag is
+    /// consumed (authoritative path: main turn / test helper) or merely
+    /// peeked (preview path: pre-turn summary, which must not steal the flag
+    /// from the main turn that follows it). This is the only legitimate
+    /// caller-policy divergence; every other step is identical across sites.
     ///
     /// Single source of truth shared by `visible_turn_tools`, `execute_turn`,
-    /// and the summary path so the four-step recipe cannot drift between
-    /// call sites.
+    /// and the summary path so the recipe cannot drift between call sites.
     fn compute_effective_restricted(
         &self,
-        state: &AgenticLoopState,
-        mut effective: HashSet<String>,
-        include_interaction_scope: bool,
+        state: &mut AgenticLoopState,
+        consume_widen: bool,
     ) -> HashSet<String> {
-        effective.extend(self.runtime_allowlist_restrictions(state));
-        if include_interaction_scope {
-            let interaction_mode = self.turn_interaction_mode();
-            effective.extend(interaction_scoped_tool_restrictions(interaction_mode));
+        // 1. widen + merge deprioritized tools into the persistent set.
+        let widen = if consume_widen {
+            std::mem::take(&mut state.widen_selection_pending)
+        } else {
+            state.widen_selection_pending
+        };
+        if !widen {
+            merge_deprioritized_tools_into_restricted(
+                &state.turn_guard,
+                &mut state.restricted_tools,
+            );
         }
+        // 2-5. layered restrictions from the merged base.
+        let mut effective = state.restricted_tools.clone();
+        effective.extend(self.runtime_allowlist_restrictions(state));
+        effective.extend(interaction_scoped_tool_restrictions(
+            self.turn_interaction_mode(),
+        ));
         // Boosted tools are never hidden, even if they landed in the restricted
         // set earlier (e.g., via stall-based deprioritization).
         for boosted in &state.boosted_tools {
@@ -2575,17 +2596,7 @@ impl ServerAgenticLoopHost {
     /// CLI's deny-at-assembly behavior.
     #[cfg(test)]
     fn visible_turn_tools(&mut self, state: &mut AgenticLoopState) -> Vec<Value> {
-        if std::mem::take(&mut state.widen_selection_pending) {
-            // Pipeline-requested widen: skip health-based deprioritization
-            // merge for this turn so the full catalogue is re-exposed.
-        } else {
-            merge_deprioritized_tools_into_restricted(
-                &state.turn_guard,
-                &mut state.restricted_tools,
-            );
-        }
-        let effective_restricted =
-            self.compute_effective_restricted(state, state.restricted_tools.clone(), false);
+        let effective_restricted = self.compute_effective_restricted(state, true);
         let visible = self.filtered_turn_tools(&effective_restricted);
         self.sync_valid_tools_to_visible_for_state(&visible, state);
         visible
@@ -3048,17 +3059,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .unwrap_or("")
             .to_string();
 
-        if std::mem::take(&mut state.widen_selection_pending) {
-            // Pipeline-requested widen: skip deprioritized-merge for this turn.
-        } else {
-            merge_deprioritized_tools_into_restricted(
-                &state.turn_guard,
-                &mut state.restricted_tools,
-            );
-        }
-        let interaction_mode = self.turn_interaction_mode();
-        let effective_restricted =
-            self.compute_effective_restricted(state, state.restricted_tools.clone(), true);
+        let effective_restricted = self.compute_effective_restricted(state, true);
         let visible_tools = self.filtered_turn_tools(&effective_restricted);
         self.sync_valid_tools_to_visible_for_state(&visible_tools, state);
 
@@ -3223,7 +3224,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         );
         state.pinned_tool_schema_tokens = estimate_tool_schema_tokens(&final_tools);
         state.last_turn_policy =
-            TurnInteractionPolicy::from_tool_schemas(interaction_mode, &final_tools);
+            TurnInteractionPolicy::from_tool_schemas(self.turn_interaction_mode(), &final_tools);
 
         // Output token escalation: if finish_reason is "length", retry once
         // with a higher max_output_tokens (up to 4× the initial budget).
@@ -3713,11 +3714,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .unwrap_or("")
             .to_string();
 
-        let mut base = state.restricted_tools.clone();
-        if !state.widen_selection_pending {
-            merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut base);
-        }
-        let effective_restricted = self.compute_effective_restricted(state, base, true);
+        let effective_restricted = self.compute_effective_restricted(state, false);
         let visible_tools = self.filtered_turn_tools(&effective_restricted);
         // We only need the system messages here — the inline summary call
         // reuses the main turn's system prefix, not its tools.
