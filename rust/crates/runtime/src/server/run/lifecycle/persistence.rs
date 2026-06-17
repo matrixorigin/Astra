@@ -6,15 +6,15 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use tracing;
 use uuid::Uuid;
 
-use astra_core::{ErrorResponse, SharedPool, connect_matrixone};
+use astra_core::{connect_matrixone, ErrorResponse, SharedPool};
 use astra_services::coordination::AgentProfile;
-use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
+use astra_services::session_audit::{RuntimePromotionEventData, RUNTIME_PROMOTION_EVENT_TYPE};
 use astra_services::skills::SkillService;
 use astra_services::{
     DatabaseContextManifestStore, DatabaseStateProjectionStore, RetrievalStage, StateItemUpsert,
@@ -32,8 +32,8 @@ use astra_turn_core::contracts::{
 };
 use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
 
-use crate::MatrixOneSettings;
 use crate::turn::agentic_loop::host::AgenticLoopState;
+use crate::MatrixOneSettings;
 use crate::{
     DatabaseEvaluationService, DatabaseEventService, DatabaseTraceEventWriter,
     EventCreateRequestData, EventService,
@@ -247,7 +247,11 @@ impl PostLoopPersistContext {
         };
 
         // Core events (user_query + llm_response) + transcript items.
-        persist_server_loop_core_events_in_tx(
+        //
+        // `persist_server_loop_core_events_in_tx` now returns `Result`; on Err the
+        // transaction is poisoned (partial writes may be staged) and we MUST
+        // rollback instead of continuing to write detail events into the same tx.
+        match persist_server_loop_core_events_in_tx(
             &mut tx,
             &self.user_id,
             &self.session_id,
@@ -260,10 +264,22 @@ impl PostLoopPersistContext {
             state,
             self.model_name.as_deref(),
         )
-        .await;
+        .await
+        {
+            Ok(()) => {}
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    error = %error,
+                    "post-loop: core events tx failed, rolling back MO transaction"
+                );
+                let _ = tx.rollback().await;
+                return;
+            }
+        }
 
         // Trace detail events (LLM rounds, tool calls).
-        persist_server_loop_trace_events_in_tx(
+        if let Err(error) = persist_server_loop_trace_events_in_tx(
             &mut tx,
             &self.user_id,
             &self.session_id,
@@ -275,7 +291,16 @@ impl PostLoopPersistContext {
             state,
             self.model_name.as_deref(),
         )
-        .await;
+        .await
+        {
+            tracing::warn!(
+                session_id = %self.session_id,
+                error = %error,
+                "post-loop: detail events tx failed, rolling back MO transaction"
+            );
+            let _ = tx.rollback().await;
+            return;
+        }
 
         // Best-effort commit: on failure, rollback naturally drops the tx.
         if let Err(error) = tx.commit().await {
@@ -700,6 +725,7 @@ pub(crate) async fn persist_server_loop_core_events(
         model_name,
     )
     .await
+    .ok();
 }
 
 /// Transactional variant: uses the provided transaction for all writes instead
@@ -716,7 +742,7 @@ pub(crate) async fn persist_server_loop_core_events_in_tx(
     user_message: &str,
     state: &AgenticLoopState,
     model_name: Option<&str>,
-) {
+) -> Result<(), String> {
     persist_server_loop_core_events_impl(
         &MatrixOneSettings::default(),
         None,
@@ -749,9 +775,9 @@ async fn persist_server_loop_core_events_impl(
     user_message: &str,
     state: &AgenticLoopState,
     model_name: Option<&str>,
-) {
+) -> Result<(), String> {
     if user_message.is_empty() && state.final_text.is_empty() {
-        return;
+        return Ok(());
     }
 
     let pool_owned = if external_tx.is_some() {
@@ -762,7 +788,7 @@ async fn persist_server_loop_core_events_impl(
                 session_id,
                 "persistence skipped: shared_pool not configured"
             );
-            return;
+            return Ok(());
         };
         Some(p.clone())
     };
@@ -891,6 +917,9 @@ async fn persist_server_loop_core_events_impl(
                     "server-loop",
                     "failed to persist core events (in tx) for session {session_id}: {e}"
                 );
+                // Transaction is poisoned; caller must rollback. Do not keep
+                // writing transcript items into a dirty transaction.
+                return Err(e.to_string());
             }
             persist_session_transcript_items_in_tx(tx, user_id, session_id, &transcript_items)
                 .await;
@@ -918,6 +947,7 @@ async fn persist_server_loop_core_events_impl(
             }
         }
     }
+    Ok(())
 }
 
 pub(crate) struct TranscriptPersistItem {
@@ -1282,6 +1312,7 @@ pub(crate) async fn persist_server_loop_trace_events(
         model_name,
     )
     .await
+    .ok();
 }
 
 /// Transactional variant: uses the provided transaction for all writes.
@@ -1297,7 +1328,7 @@ pub(crate) async fn persist_server_loop_trace_events_in_tx(
     trace_context: Option<TraceContext>,
     state: &AgenticLoopState,
     model_name: Option<&str>,
-) {
+) -> Result<(), String> {
     persist_server_loop_trace_events_impl(
         &MatrixOneSettings::default(),
         None,
@@ -1328,12 +1359,12 @@ async fn persist_server_loop_trace_events_impl(
     trace_context: Option<TraceContext>,
     state: &AgenticLoopState,
     model_name: Option<&str>,
-) {
+) -> Result<(), String> {
     let pool_owned = if external_tx.is_some() {
         None
     } else {
         let Some(p) = shared_pool else {
-            return;
+            return Ok(());
         };
         Some(p.clone())
     };
@@ -1365,7 +1396,7 @@ async fn persist_server_loop_trace_events_impl(
         &state.stall.tool_call_records,
     ));
     if events.is_empty() {
-        return;
+        return Ok(());
     }
 
     match external_tx {
@@ -1375,6 +1406,7 @@ async fn persist_server_loop_trace_events_impl(
                     "server-loop",
                     "failed to persist trace detail events (in tx) for session {session_id}: {e}"
                 );
+                return Err(e.to_string());
             }
         }
         None => {
@@ -1397,6 +1429,7 @@ async fn persist_server_loop_trace_events_impl(
             }
         }
     }
+    Ok(())
 }
 
 /// Variant that uses an existing transaction instead of creating its own.
