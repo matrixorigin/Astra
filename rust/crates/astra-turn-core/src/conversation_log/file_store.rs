@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
-use super::{materialize, validate_session_id, CslEntry, CslStore, CslStoreError};
+use super::{CslEntry, CslStore, CslStoreError, materialize, validate_session_id};
 
 const LOG_FILENAME: &str = "conversation_log.jsonl";
 
@@ -231,7 +231,7 @@ impl CslStore for FileCslStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation_log::{materialize, AppendMeta, SessionStateCompact};
+    use crate::conversation_log::{AppendMeta, SessionStateCompact, materialize};
     use serde_json::json;
     use tempfile::TempDir;
 

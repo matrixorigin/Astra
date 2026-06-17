@@ -247,8 +247,8 @@ fn single_statement_requires_snapshot(stmt: &str, allow_destructive: bool) -> bo
         // LOAD is mutating (LOAD DATA [LOCAL] INFILE inserts rows into a
         // table); it must not be classified as a pure read.
         Some(
-            "INSERT" | "UPDATE" | "REPLACE" | "CREATE" | "DROP" | "DELETE" | "TRUNCATE"
-            | "ALTER" | "GRANT" | "REVOKE" | "LOAD",
+            "INSERT" | "UPDATE" | "REPLACE" | "CREATE" | "DROP" | "DELETE" | "TRUNCATE" | "ALTER"
+            | "GRANT" | "REVOKE" | "LOAD",
         ) => true,
         // Pure reads / transaction control — never mutate state; skip the
         // snapshot cost regardless of allow_destructive (the flag gates
@@ -712,7 +712,10 @@ mod tests {
         assert!(!mo_query_requires_pre_state_snapshot("SELECT 1", true));
         assert!(!mo_query_requires_pre_state_snapshot("SELECT 1", false));
         assert!(!mo_query_requires_pre_state_snapshot("SHOW TABLES", true));
-        assert!(!mo_query_requires_pre_state_snapshot("EXPLAIN SELECT 1", true));
+        assert!(!mo_query_requires_pre_state_snapshot(
+            "EXPLAIN SELECT 1",
+            true
+        ));
         // Unknown keyword still covered when destructive ops are permitted.
         assert!(mo_query_requires_pre_state_snapshot(
             "MERGE INTO t USING ...",
@@ -750,10 +753,7 @@ mod tests {
             true
         ));
         // Trailing semicolon / whitespace tolerated by a pure read.
-        assert!(!mo_query_requires_pre_state_snapshot(
-            "SELECT 1; ",
-            false
-        ));
+        assert!(!mo_query_requires_pre_state_snapshot("SELECT 1; ", false));
         // Empty batch is non-mutating.
         assert!(!mo_query_requires_pre_state_snapshot("", false));
         assert!(!mo_query_requires_pre_state_snapshot(";", false));

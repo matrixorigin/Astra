@@ -1848,10 +1848,10 @@ mod tests {
     use astra_services::{InMemoryWorkspaceRecordStore, WorkspaceCleanupDebtStore};
     use async_trait::async_trait;
     use axum::{
+        Json, Router,
         body::{self, Body},
         http::{HeaderMap, Request, StatusCode},
         routing::post,
-        Json, Router,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -2572,14 +2572,18 @@ mod tests {
             "*.trusted.example.com",
         ]);
 
-        assert!(policy
-            .validate(&RunnerRpcEndpoint::new("https://runners.example.com"))
-            .is_ok());
-        assert!(policy
-            .validate(&RunnerRpcEndpoint::new(
-                "https://pool-a.trusted.example.com/"
-            ))
-            .is_ok());
+        assert!(
+            policy
+                .validate(&RunnerRpcEndpoint::new("https://runners.example.com"))
+                .is_ok()
+        );
+        assert!(
+            policy
+                .validate(&RunnerRpcEndpoint::new(
+                    "https://pool-a.trusted.example.com/"
+                ))
+                .is_ok()
+        );
         let root_denial = policy
             .validate(&RunnerRpcEndpoint::new("https://trusted.example.com"))
             .expect_err("suffix pattern should not match root domain");
@@ -2894,11 +2898,13 @@ mod tests {
 
         assert_eq!(deleted, 1);
         assert!(list(&pool, "user-1").await.is_empty());
-        assert!(cleanup_store
-            .list_cleanup_debts("user-1", 10)
-            .await
-            .expect("list cleanup debts")
-            .is_empty());
+        assert!(
+            cleanup_store
+                .list_cleanup_debts("user-1", 10)
+                .await
+                .expect("list cleanup debts")
+                .is_empty()
+        );
     }
 
     struct FailingCleanupDebtStore;

@@ -14,32 +14,32 @@ use std::any::Any;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
-use axum::http::StatusCode;
 use axum::Json;
+use axum::http::StatusCode;
 use futures_util::FutureExt;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex as TokioMutex, RwLock};
+use tokio::sync::{Mutex as TokioMutex, RwLock, broadcast, mpsc, oneshot};
 
 use astra_server_types::ws_progress_callback::ProgressEvent;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::turn::run_control::RunInputProvider;
-use astra_core::{connect_matrixone, error_response, ErrorResponse, SharedPool};
+use astra_core::{ErrorResponse, SharedPool, connect_matrixone, error_response};
 use astra_services::coordination::{AgentProfile, AgentTier};
 use astra_services::runs::{
-    durable_run_status_kind, CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord,
-    DurableRunRecord, DurableRunStatusKind, RunInputData, RunInputRecord, RunLifecycleService,
-    RunListRecord, RunMutationRecord, RunProjectionCheckpointRecord, RunProjectionRecord,
-    RunStatusRecord,
+    CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunRecord,
+    DurableRunStatusKind, RunInputData, RunInputRecord, RunLifecycleService, RunListRecord,
+    RunMutationRecord, RunProjectionCheckpointRecord, RunProjectionRecord, RunStatusRecord,
+    durable_run_status_kind,
 };
-use astra_services::session_audit::{RuntimePromotionEventData, RUNTIME_PROMOTION_EVENT_TYPE};
+use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 use astra_services::skills::SkillService;
 use astra_services::{
     DatabaseContextManifestStore, DatabaseStateProjectionStore, RetrievalStage, StateItemUpsert,
@@ -53,6 +53,8 @@ use astra_tools::task_mgmt::{SessionTask, TaskManager, TaskStore};
 use astra_tools::task_mgmt_matrixone::MatrixOneTaskStore;
 use sqlx::Row;
 
+use crate::FernetTokenEncryptor;
+use crate::MatrixOneSettings;
 use crate::observability::ObservabilityHub;
 use crate::orchestration::{
     AgentProgressEvent, AgentToolContext, DynamicAgentSpawner, InheritedPermissions,
@@ -65,12 +67,10 @@ use crate::server::run::workspace_provisioning::{
 };
 use crate::server::runner_pool::ServerRunnerScheduler;
 use crate::turn::agentic_loop::host::{
-    run_agentic_loop_with_host, AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState,
-    CancellationState, ContextTracePersistenceContext, EvaluationPersistenceContext,
-    MessagingState, RequestConstraints, SkillState, StopHookState,
+    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CancellationState,
+    ContextTracePersistenceContext, EvaluationPersistenceContext, MessagingState,
+    RequestConstraints, SkillState, StopHookState, run_agentic_loop_with_host,
 };
-use crate::FernetTokenEncryptor;
-use crate::MatrixOneSettings;
 use crate::{
     DatabaseEvaluationService, DatabaseEventService, DatabaseTraceEventWriter,
     EventCreateRequestData, EventService,
@@ -112,9 +112,9 @@ use crate::server::run::handlers as run_handlers;
 use crate::server::runtime_mcp;
 use crate::server::server_loop_host::{self, ServerAgenticLoopHostBuilder};
 use crate::server::tool_transport::{
-    binding_event_fields, ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind,
-    ExecutorStatus, FallbackPolicy, RunnerRpcTransport, ToolExecutionService, ToolTransportKind,
-    WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
+    ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy,
+    RunnerRpcTransport, ToolExecutionService, ToolTransportKind, WorkspaceAuthority,
+    WorkspaceBinding, WorkspaceBindingKind, binding_event_fields,
 };
 use crate::server::{server_skill_subrun, server_tool_executor};
 
@@ -176,11 +176,11 @@ impl astra_tools::ToolApprovalGate for NonInteractiveApprovalGate {
 }
 
 use crate::server::run::binding_resolution::{
-    agent_working_dir_for_bindings, binding_snapshot_events, execution_bindings_from_edge_profile,
-    execution_bindings_from_metadata, executor_binding_from_request, request_uses_server_workspace,
+    RunExecutionBindingSnapshot, agent_working_dir_for_bindings, binding_snapshot_events,
+    execution_bindings_from_edge_profile, execution_bindings_from_metadata,
+    executor_binding_from_request, request_uses_server_workspace,
     resolve_request_execution_bindings,
     resolve_request_execution_bindings_without_server_workspace, run_start_context_from_request,
-    RunExecutionBindingSnapshot,
 };
 
 fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
@@ -888,11 +888,11 @@ fn should_emit_stream_turn_complete(final_status: &RunStatus) -> bool {
 }
 
 pub(crate) use persistence::{
-    build_run_turn_complete_event_with_interruption, format_task_board_resume_hint,
-    infer_session_turn, persist_server_loop_core_events, persist_server_loop_trace_events,
-    persist_session_transcript_items, restore_session_state_compact,
-    restore_step_checkpoint_runtime_state, server_trace_context, trace_context_from_subrun_context,
-    PostLoopPersistContext, TranscriptPersistItem,
+    PostLoopPersistContext, TranscriptPersistItem, build_run_turn_complete_event_with_interruption,
+    format_task_board_resume_hint, infer_session_turn, persist_server_loop_core_events,
+    persist_server_loop_trace_events, persist_session_transcript_items,
+    restore_session_state_compact, restore_step_checkpoint_runtime_state, server_trace_context,
+    trace_context_from_subrun_context,
 };
 use run_state::*;
 
@@ -2975,7 +2975,7 @@ impl AgenticRunLifecycleService {
                 &record,
                 format!(
                     "workspace record persistence failed before runner scheduling: {}",
-                    error.1 .0.detail
+                    error.1.0.detail
                 ),
             )
             .await;
@@ -3963,7 +3963,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             record,
                             format!(
                                 "runner scheduling failed before agentic loop start: {}",
-                                error.1 .0.detail
+                                error.1.0.detail
                             ),
                         )
                         .await;
@@ -4044,7 +4044,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     record,
                     format!(
                         "durable run start failed after cloud workspace provisioning: {}",
-                        error.1 .0.detail
+                        error.1.0.detail
                     ),
                 )
                 .await;
@@ -4388,7 +4388,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         spawn_observed(
             async move {
                 let _permit = permit; // RAII: released when this task completes
-                                      // RAII guard: decrement counter when this task exits (normal or panic).
+                // RAII guard: decrement counter when this task exits (normal or panic).
                 struct TaskCountGuard(Arc<AtomicUsize>);
                 impl Drop for TaskCountGuard {
                     fn drop(&mut self) {
@@ -4682,7 +4682,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             record,
                             format!(
                                 "runner scheduling failed before streaming agentic loop start: {}",
-                                error.1 .0.detail
+                                error.1.0.detail
                             ),
                         )
                         .await;
@@ -4890,7 +4890,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     record,
                     format!(
                         "durable streaming run start failed after cloud workspace provisioning: {}",
-                        error.1 .0.detail
+                        error.1.0.detail
                     ),
                 )
                 .await;
@@ -6259,11 +6259,13 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         );
         subrun_context.insert(
             "parent_agent_id".to_string(),
-            json!(config
-                .parent_address
-                .as_ref()
-                .map(|address| address.agent_id.clone())
-                .unwrap_or_else(|| "root-agent".to_string())),
+            json!(
+                config
+                    .parent_address
+                    .as_ref()
+                    .map(|address| address.agent_id.clone())
+                    .unwrap_or_else(|| "root-agent".to_string())
+            ),
         );
         subrun_context.insert(
             "trace_session_id".to_string(),
@@ -7321,16 +7323,18 @@ mod tests {
             server_loop_host::RunScopedAgentProgressFilter::new("root-run".to_string());
 
         for timestamp in 1..=10 {
-            assert!(filter
-                .accept(test_agent_progress_event(
-                    "agent-a",
-                    timestamp,
-                    ProgressEventType::ToolExecuting {
-                        tool_name: format!("tool-{timestamp}"),
-                        turn: timestamp as u32,
-                    },
-                ))
-                .is_empty());
+            assert!(
+                filter
+                    .accept(test_agent_progress_event(
+                        "agent-a",
+                        timestamp,
+                        ProgressEventType::ToolExecuting {
+                            tool_name: format!("tool-{timestamp}"),
+                            turn: timestamp as u32,
+                        },
+                    ))
+                    .is_empty()
+            );
         }
 
         let accepted = filter.accept(test_agent_spawned("agent-a", "child-run", "root-run", 11));
@@ -7348,18 +7352,22 @@ mod tests {
     fn run_scoped_agent_progress_filter_blocks_foreign_root_events() {
         let mut filter = server_loop_host::RunScopedAgentProgressFilter::new("root-a".to_string());
 
-        assert!(filter
-            .accept(test_agent_progress_event(
-                "agent-b",
-                1,
-                ProgressEventType::Started {
-                    description: "other run".to_string(),
-                },
-            ))
-            .is_empty());
-        assert!(filter
-            .accept(test_agent_spawned("agent-b", "child-b", "root-b", 2))
-            .is_empty());
+        assert!(
+            filter
+                .accept(test_agent_progress_event(
+                    "agent-b",
+                    1,
+                    ProgressEventType::Started {
+                        description: "other run".to_string(),
+                    },
+                ))
+                .is_empty()
+        );
+        assert!(
+            filter
+                .accept(test_agent_spawned("agent-b", "child-b", "root-b", 2))
+                .is_empty()
+        );
         assert!(
             !filter.agent_ids.contains("agent-b"),
             "foreign agent must not be admitted"
@@ -7730,10 +7738,12 @@ mod tests {
         assert_eq!(redacted["nested"]["api_key"], "[REDACTED]");
         assert_eq!(redacted["nested"]["safe"], "visible");
         assert_eq!(redacted["items"][0]["cookie"], "[REDACTED]");
-        assert!(redacted["items"][1]["text"]
-            .as_str()
-            .expect("string")
-            .ends_with("..."));
+        assert!(
+            redacted["items"][1]["text"]
+                .as_str()
+                .expect("string")
+                .ends_with("...")
+        );
     }
 
     #[test]
@@ -8545,11 +8555,11 @@ mod tests {
         assert!(
             error
                 .1
-                 .0
+                .0
                 .detail
                 .contains("Failed to persist workspace record"),
             "{}",
-            error.1 .0.detail
+            error.1.0.detail
         );
     }
 
@@ -8574,9 +8584,9 @@ mod tests {
 
         assert_eq!(error.0, StatusCode::CONFLICT);
         assert!(
-            error.1 .0.detail.contains("Workspace ownership conflict"),
+            error.1.0.detail.contains("Workspace ownership conflict"),
             "{}",
-            error.1 .0.detail
+            error.1.0.detail
         );
     }
 
@@ -9078,11 +9088,11 @@ mod tests {
         assert!(
             error
                 .1
-                 .0
+                .0
                 .detail
                 .contains("absolute materialized source path"),
             "{}",
-            error.1 .0.detail
+            error.1.0.detail
         );
     }
 
@@ -9109,9 +9119,9 @@ mod tests {
 
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
         assert!(
-            error.1 .0.detail.contains("non-empty source.dataset_id"),
+            error.1.0.detail.contains("non-empty source.dataset_id"),
             "{}",
-            error.1 .0.detail
+            error.1.0.detail
         );
     }
 
@@ -9138,11 +9148,11 @@ mod tests {
         assert!(
             error
                 .1
-                 .0
+                .0
                 .detail
                 .contains("Git checkout workspace requires a non-empty source.repository"),
             "{}",
-            error.1 .0.detail
+            error.1.0.detail
         );
     }
 
@@ -9167,11 +9177,11 @@ mod tests {
         assert!(
             error
                 .1
-                 .0
+                .0
                 .detail
                 .contains("Cloud workspace requires an explicit source"),
             "{}",
-            error.1 .0.detail
+            error.1.0.detail
         );
     }
 
@@ -9415,11 +9425,12 @@ mod tests {
             .expect_err("legacy mcp_binding_ids must be rejected on chat stream");
 
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert!(err
-            .1
-             .0
-            .detail
-            .contains("mcp_binding_ids is no longer supported"));
+        assert!(
+            err.1
+                .0
+                .detail
+                .contains("mcp_binding_ids is no longer supported")
+        );
     }
 
     #[tokio::test]
@@ -9657,7 +9668,7 @@ mod tests {
             .await
             .expect_err("unknown allow_skills entry should be rejected");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert!(err.1 .0.detail.contains("allow_skills"));
+        assert!(err.1.0.detail.contains("allow_skills"));
     }
 
     #[test]
@@ -9912,9 +9923,11 @@ mod tests {
         );
 
         assert_eq!(status, RunStatus::Paused);
-        assert!(error
-            .as_deref()
-            .is_some_and(|msg| msg.to_ascii_lowercase().contains("budget")));
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|msg| msg.to_ascii_lowercase().contains("budget"))
+        );
         assert_eq!(events[0]["event_type"], "text_done");
         assert_eq!(events[0]["data"]["partial"], true);
         assert_eq!(
@@ -10017,7 +10030,7 @@ mod tests {
 
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(
-            err.1 .0.detail,
+            err.1.0.detail,
             "Invalid session_id for server workspace provisioning"
         );
     }
@@ -10040,7 +10053,7 @@ mod tests {
 
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(
-            err.1 .0.detail,
+            err.1.0.detail,
             "Invalid session_id for server workspace provisioning"
         );
     }
@@ -10066,7 +10079,7 @@ mod tests {
         second.session_id = Some("shared-session".into());
         let err = err(svc.create_run("user-1".into(), second).await);
         assert_eq!(err.0, StatusCode::CONFLICT);
-        assert_eq!(err.1 .0.detail, "session already has an active run");
+        assert_eq!(err.1.0.detail, "session already has an active run");
     }
 
     #[tokio::test]
@@ -10080,7 +10093,7 @@ mod tests {
         second.session_id = Some("shared-session".into());
         let err = err(svc.stream_chat("user-1".into(), second).await);
         assert_eq!(err.0, StatusCode::CONFLICT);
-        assert_eq!(err.1 .0.detail, "session already has an active run");
+        assert_eq!(err.1.0.detail, "session already has an active run");
     }
 
     #[tokio::test]
@@ -10140,11 +10153,12 @@ mod tests {
         let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
 
         assert!(!svc.approval_channels.lock().await.contains_key(&run.run_id));
-        assert!(!svc
-            .user_prompt_channels
-            .lock()
-            .await
-            .contains_key(&run.run_id));
+        assert!(
+            !svc.user_prompt_channels
+                .lock()
+                .await
+                .contains_key(&run.run_id)
+        );
         assert!(!svc.progress_channels.lock().await.contains_key(&run.run_id));
     }
 
@@ -10327,10 +10341,11 @@ mod tests {
     async fn cancel_run_schedules_in_memory_eviction() {
         let svc = test_service();
         let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-        assert!(svc
-            .test_llm_cancel_token_is_cancelled(&run.run_id)
-            .await
-            .is_some());
+        assert!(
+            svc.test_llm_cancel_token_is_cancelled(&run.run_id)
+                .await
+                .is_some()
+        );
 
         ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
         tokio::time::advance(std::time::Duration::from_secs(301)).await;
@@ -10428,14 +10443,18 @@ mod tests {
         assert!(ids.contains(u1_a.run_id.as_str()));
         assert!(ids.contains(u1_c.run_id.as_str()));
         assert!(!ids.contains(u2_b.run_id.as_str()));
-        assert!(for_u1
-            .runs
-            .iter()
-            .all(|run| run.workspace.as_ref().unwrap()["kind"] == "server_sandbox"));
-        assert!(for_u1
-            .runs
-            .iter()
-            .all(|run| run.executor.as_ref().unwrap()["kind"] == "server_local"));
+        assert!(
+            for_u1
+                .runs
+                .iter()
+                .all(|run| run.workspace.as_ref().unwrap()["kind"] == "server_sandbox")
+        );
+        assert!(
+            for_u1
+                .runs
+                .iter()
+                .all(|run| run.executor.as_ref().unwrap()["kind"] == "server_local")
+        );
 
         let for_u2 = ok(svc.list_runs("user-2".into(), 10, 0).await);
         assert_eq!(for_u2.total, 1);
@@ -11285,7 +11304,7 @@ mod tests {
 
         let e = err(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
         assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(e.1 .0.detail.contains("pause event"));
+        assert!(e.1.0.detail.contains("pause event"));
 
         let durable = svc.run_engine.load_run(&run.run_id).await.unwrap().unwrap();
         assert_eq!(durable.status, STATUS_RUNNING);
@@ -11311,7 +11330,7 @@ mod tests {
 
         let e = err(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
         assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(e.1 .0.detail.contains("resume event"));
+        assert!(e.1.0.detail.contains("resume event"));
 
         let durable = svc.run_engine.load_run(&run.run_id).await.unwrap().unwrap();
         assert_eq!(durable.status, STATUS_PAUSED);

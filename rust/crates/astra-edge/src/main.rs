@@ -215,6 +215,12 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
                             Ok(EdgeServerMessage::Pong) => {
                                 // heartbeat ack
                             }
+                            Ok(EdgeServerMessage::ToolCancel { request_id }) => {
+                                tracing::warn!(
+                                    request_id = %request_id,
+                                    "Server cancelled tool request; edge has no in-flight cancel hook yet — ignoring"
+                                );
+                            }
                             Ok(EdgeServerMessage::Closing { reason }) => {
                                 tracing::info!(reason = %reason, "Server closing connection");
                                 break;

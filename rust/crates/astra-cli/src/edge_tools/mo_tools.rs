@@ -42,8 +42,7 @@ fn mo_current_account() -> &'static str {
         }
     }
 
-    let out =
-        mo_execute_sql("SELECT current_account_name() AS name", None).unwrap_or_else(|e| e);
+    let out = mo_execute_sql("SELECT current_account_name() AS name", None).unwrap_or_else(|e| e);
     // Parse the value from mysql --table output.
     let parsed = out
         .lines()
@@ -906,7 +905,10 @@ mod tests {
         ));
         // Pure reads never snapshot, even with allow_destructive.
         assert!(!mo_query_requires_pre_state_snapshot("SELECT 1", true));
-        assert!(!mo_query_requires_pre_state_snapshot("EXPLAIN SELECT 1", true));
+        assert!(!mo_query_requires_pre_state_snapshot(
+            "EXPLAIN SELECT 1",
+            true
+        ));
         // Unknown keyword covered when destructive ops are permitted.
         assert!(mo_query_requires_pre_state_snapshot("MERGE INTO t", true));
         assert!(!mo_query_requires_pre_state_snapshot("MERGE INTO t", false));
