@@ -384,30 +384,44 @@ impl EdgeConnectionPool {
 
     /// Insert a dispatched request into the pending set, enforcing the capacity
     /// limit by evicting the oldest entry if necessary.
+    ///
+    /// Holds `pending_request_order` across the global capacity check AND all
+    /// three structural inserts so that concurrent inserters are serialized:
+    /// they cannot both observe `len < max_pending` and then both push, which
+    /// would overshoot the cap. It also keeps the order deque consistent with
+    /// `pending_requests` under panic (the push_back happens last, under the
+    /// same critical section that decided capacity).
     fn insert_pending_request(&self, user_id: &str, request_id: &str, req: DispatchedToolRequest) {
+        // Per-user cap: evict first, OUTSIDE the order lock —
+        // `evict_oldest_pending_for_user` itself locks `pending_request_order`,
+        // so holding it here would re-enter and deadlock.
         while self.pending_count_for_user(user_id) >= self.max_pending_per_user.max(1) {
             if !self.evict_oldest_pending_for_user(user_id) {
                 break;
             }
         }
 
-        let mut eviction_attempts = 0usize;
-        while self.pending_requests.len() >= self.max_pending
-            && eviction_attempts < self.max_pending.max(1)
-        {
-            eviction_attempts += 1;
-            let oldest_request_id = self
-                .pending_request_order
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .pop_front();
-            let Some(oldest_request_id) = oldest_request_id else {
+        // Critical section: serialize all concurrent inserters w.r.t. the
+        // global capacity invariant and the three-structure consistency.
+        let mut order = self
+            .pending_request_order
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Global capacity eviction under the lock. `pending_request_order` may
+        // contain stale ids (entries already removed via remove_pending_request,
+        // which does not pop the order deque); pop_front until we evict a live
+        // entry or the deque empties.
+        while self.pending_requests.len() >= self.max_pending {
+            let Some(oldest_request_id) = order.pop_front() else {
                 break;
             };
             if self.remove_pending_request(&oldest_request_id).is_some() {
                 break;
             }
+            // Stale id already gone from pending_requests; keep evicting.
         }
+
         self.pending_requests.insert(
             request_id.to_string(),
             PendingRequestEntry {
@@ -419,10 +433,9 @@ impl EdgeConnectionPool {
             .entry(user_id.to_string())
             .or_default()
             .push_back(request_id.to_string());
-        self.pending_request_order
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_back(request_id.to_string());
+        // Order deque push is last, while still holding the lock that
+        // authorized the insert — no window for another inserter to sneak in.
+        order.push_back(request_id.to_string());
     }
 
     fn pending_count_for_user(&self, user_id: &str) -> usize {
