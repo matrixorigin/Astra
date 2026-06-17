@@ -759,6 +759,11 @@ pub async fn execute_isolated(
         match child.try_wait() {
             Ok(Some(status)) => {
                 exit_code = status.code();
+                // Abort I/O reader tasks immediately — grandchild processes may
+                // still hold the pipes open (e.g. a daemon surviving shell exit),
+                // which would otherwise block the pump_task.await below forever.
+                stdout_task.abort();
+                stderr_task.abort();
                 break;
             }
             Ok(None) => {}
