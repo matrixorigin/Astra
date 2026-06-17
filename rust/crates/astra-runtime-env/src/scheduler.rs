@@ -527,10 +527,12 @@ impl RunnerScheduler {
             }
         }
 
-        // Only resolve the full binding on success — the expensive
-        // registry scan is deferred until we know this candidate passes.
+        // Resolve the binding using the request's desired workspace, not the
+        // runner's advertised workspace. Using advertised bindings would escalate
+        // authority: a runner advertising ReadWrite should not grant ReadWrite to
+        // a session that only requested ReadOnly.
         let binding = RunBinding::resolve(
-            advertised.workspace.clone(),
+            desired_workspace.clone(),
             advertised.executor.clone(),
             advertised.runtime.clone(),
             request.policy.clone(),
@@ -567,8 +569,9 @@ fn tool_denial_message(tool_name: &str, reason: ToolUnavailableReason) -> String
 }
 
 fn workspace_satisfies(desired: &WorkspaceBinding, advertised: &WorkspaceBinding) -> bool {
+    // If the request doesn't require a workspace, any runner satisfies it.
     if desired.kind == WorkspaceBindingKind::None {
-        return advertised.kind == WorkspaceBindingKind::None;
+        return true;
     }
     if advertised.kind == WorkspaceBindingKind::None {
         return false;
@@ -594,7 +597,8 @@ fn workspace_satisfies(desired: &WorkspaceBinding, advertised: &WorkspaceBinding
 
 fn authority_satisfies(desired: WorkspaceAuthority, advertised: WorkspaceAuthority) -> bool {
     match desired {
-        WorkspaceAuthority::None => true,
+        // None or Unknown means "no specific authority required" — any advertised authority satisfies
+        WorkspaceAuthority::None | WorkspaceAuthority::Unknown => true,
         WorkspaceAuthority::ReadOnly => {
             matches!(
                 advertised,
@@ -602,7 +606,6 @@ fn authority_satisfies(desired: WorkspaceAuthority, advertised: WorkspaceAuthori
             )
         }
         WorkspaceAuthority::ReadWrite => advertised == WorkspaceAuthority::ReadWrite,
-        WorkspaceAuthority::Unknown => false,
     }
 }
 
@@ -798,7 +801,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_does_not_infer_workspace_for_no_workspace_request() {
+    fn scheduler_accepts_any_runner_when_no_workspace_required() {
         let scheduler = RunnerScheduler::default();
         let request = RunnerScheduleRequest::new(
             "session-1",
@@ -818,10 +821,10 @@ mod tests {
 
         let decision = scheduler.schedule(&request, &[runner]);
 
-        assert!(decision.selected.is_none());
-        assert_eq!(
-            decision.denials[0].reason,
-            RunnerScheduleDenialReason::WorkspaceIncompatible
+        // A "no workspace" request should be satisfied by any runner
+        assert!(
+            decision.selected.is_some(),
+            "any runner should satisfy a request that doesn't need a workspace"
         );
     }
 
