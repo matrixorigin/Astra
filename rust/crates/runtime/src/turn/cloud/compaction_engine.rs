@@ -20,7 +20,7 @@ use astra_config::runtime_config::CompressionConfig;
 use serde_json::Value;
 use std::time::Duration;
 
-use super::compaction::{compact_tiered_impl, CompactResult};
+use super::compaction::{CompactResult, compact_tiered_impl};
 use super::layers::{
     DuplicateReadElimination, ReactiveCompact, TieredCompaction, ToolResultTruncation,
 };

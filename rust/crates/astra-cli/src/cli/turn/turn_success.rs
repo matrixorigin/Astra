@@ -308,7 +308,7 @@ fn apply_turn_success_sync(
     }
 
     state.last_turn_interrupted = false;
-    print_turn_status_line(state, &result, turn_start);
+    print_turn_status_line(state, &result, Some(&learning_snap.eval), turn_start);
     if state.tui_render_policy.is_none() {
         if let Some(suggestion) = state.pending_followup_suggestion.as_ref() {
             eprintln!(

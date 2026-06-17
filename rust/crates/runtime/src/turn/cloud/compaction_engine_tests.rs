@@ -393,10 +393,12 @@ fn duplicate_read_uses_file_path_arg_key() {
     let budget = budget(64000, 100000);
     let engine = CompactionEngine::default_pipeline_for(64000);
     engine.compress_if_needed(&mut msgs, &budget);
-    assert!(msgs[3]["content"]
-        .as_str()
-        .unwrap()
-        .contains("[duplicate read"));
+    assert!(
+        msgs[3]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[duplicate read")
+    );
 }
 
 #[test]
@@ -448,10 +450,12 @@ fn duplicate_read_skips_protected_head() {
     engine.compress_if_needed(&mut msgs, &budget);
     // Protected head (system + first user + first read) is untouched.
     // The first read at index 3 should be stubbed, last at index 6 intact.
-    assert!(msgs[3]["content"]
-        .as_str()
-        .unwrap()
-        .contains("[duplicate read"));
+    assert!(
+        msgs[3]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[duplicate read")
+    );
     assert!(msgs[6]["content"].as_str().unwrap().contains("fn main()"));
 }
 
@@ -481,14 +485,18 @@ fn duplicate_read_stubs_all_but_last_with_triple_reads() {
     ];
     let b = budget(80_000, 60_000);
     let _ = compress_layer_values(&DuplicateReadElimination::new(0.0), &mut msgs, &b);
-    assert!(msgs[3]["content"]
-        .as_str()
-        .unwrap()
-        .contains("[duplicate read"));
-    assert!(msgs[6]["content"]
-        .as_str()
-        .unwrap()
-        .contains("[duplicate read"));
+    assert!(
+        msgs[3]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[duplicate read")
+    );
+    assert!(
+        msgs[6]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[duplicate read")
+    );
     assert!(msgs[9]["content"].as_str().unwrap().contains("fn main()"));
 }
 
@@ -536,10 +544,12 @@ fn duplicate_read_recognizes_grep_and_git_log() {
     let budget = budget(64000, 100000);
     let engine = CompactionEngine::default_pipeline_for(64000);
     engine.compress_if_needed(&mut msgs, &budget);
-    assert!(msgs[3]["content"]
-        .as_str()
-        .unwrap()
-        .contains("[duplicate read"));
+    assert!(
+        msgs[3]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[duplicate read")
+    );
 }
 
 #[test]
@@ -631,10 +641,12 @@ fn duplicate_read_recognizes_path_less_git_log() {
     let budget = budget(64000, 100000);
     let engine = CompactionEngine::default_pipeline_for(64000);
     engine.compress_if_needed(&mut msgs, &budget);
-    assert!(msgs[3]["content"]
-        .as_str()
-        .unwrap()
-        .contains("[duplicate read"));
+    assert!(
+        msgs[3]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[duplicate read")
+    );
 }
 
 #[test]
@@ -709,18 +721,24 @@ fn duplicate_read_recognizes_list_dir_glob_symbols() {
     // Indices 3, 9, 15 get stubbed; 6, 12, 18 remain as latest.
     // NOTE: estimated_tokens_freed may be 0 for short content because the
     // stub prefix `[` triggers the JSON divisor (2) in estimate_str_tokens.
-    assert!(msgs[3]["content"]
-        .as_str()
-        .unwrap()
-        .contains("[duplicate read of `src`"));
-    assert!(msgs[9]["content"]
-        .as_str()
-        .unwrap()
-        .contains("[duplicate read of `**/*.rs`"));
-    assert!(msgs[15]["content"]
-        .as_str()
-        .unwrap()
-        .contains("[duplicate read of `src/main.rs`"));
+    assert!(
+        msgs[3]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[duplicate read of `src`")
+    );
+    assert!(
+        msgs[9]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[duplicate read of `**/*.rs`")
+    );
+    assert!(
+        msgs[15]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[duplicate read of `src/main.rs`")
+    );
 }
 
 #[test]
@@ -788,22 +806,30 @@ fn duplicate_read_recognizes_git_show_diff_blame_file_history() {
     // git_show/git_diff are path-less here, so the human-facing stub falls back
     // to the tool name; git_blame/git_file_history show the file path.
     // NOTE: see comment above about estimated_tokens_freed for short content.
-    assert!(msgs[3]["content"]
-        .as_str()
-        .unwrap()
-        .contains("[duplicate read of `git_show`"));
-    assert!(msgs[9]["content"]
-        .as_str()
-        .unwrap()
-        .contains("[duplicate read of `git_diff`"));
-    assert!(msgs[15]["content"]
-        .as_str()
-        .unwrap()
-        .contains("[duplicate read of `src/main.rs`"));
-    assert!(msgs[21]["content"]
-        .as_str()
-        .unwrap()
-        .contains("[duplicate read of `src/main.rs`"));
+    assert!(
+        msgs[3]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[duplicate read of `git_show`")
+    );
+    assert!(
+        msgs[9]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[duplicate read of `git_diff`")
+    );
+    assert!(
+        msgs[15]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[duplicate read of `src/main.rs`")
+    );
+    assert!(
+        msgs[21]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[duplicate read of `src/main.rs`")
+    );
 }
 
 #[test]
@@ -901,10 +927,12 @@ fn tiered_preserves_current_turn_user_query_in_multi_turn_session() {
         .rev()
         .find(|msg| msg["role"].as_str() == Some("user"));
     assert!(last_user.is_some());
-    assert!(last_user.unwrap()["content"]
-        .as_str()
-        .unwrap()
-        .contains("module_9"));
+    assert!(
+        last_user.unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("module_9")
+    );
 }
 
 #[test]
@@ -1100,10 +1128,12 @@ fn reactive_preserves_current_turn_user_query() {
         .rev()
         .find(|msg| msg["role"].as_str() == Some("user"));
     assert!(last_user.is_some());
-    assert!(last_user.unwrap()["content"]
-        .as_str()
-        .unwrap()
-        .contains("module_7"));
+    assert!(
+        last_user.unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("module_7")
+    );
 }
 
 #[test]
@@ -1159,7 +1189,7 @@ fn scenario_long_debugging_session() {
 fn scenario_escalation_default_to_aggressive() {
     let mut msgs = make_agentic_session_msgs(10, 3, 500);
     let budget = budget(64000, 64001); // just barely over
-                                       // Default pipeline first
+    // Default pipeline first
 
     let engine_def = CompactionEngine::default_pipeline_for(64000);
     let outcome = engine_def.compress_if_needed(&mut msgs, &budget);

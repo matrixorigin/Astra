@@ -846,10 +846,7 @@ fn cleanup_debt_from_row(
     // counters. Surface it so the caller can fail loudly.
     let attempts = u32::try_from(attempts).map_err(|_| {
         WorkspaceCleanupDebtStoreError::Database(sqlx::Error::Decode(
-            format!(
-                "cleanup_debt attempts is negative/corrupt: {attempts}"
-            )
-            .into(),
+            format!("cleanup_debt attempts is negative/corrupt: {attempts}").into(),
         ))
     })?;
     // `created_at` drives the debt processing order. The previous

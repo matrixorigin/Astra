@@ -102,6 +102,12 @@ pub(crate) fn turn_quality_feedback_from_eval(
                         .to_string(),
                 );
             }
+            EvalSignal::ToolOutcomeFailure { class, count } => {
+                saw_stall_issue = true;
+                findings.push(format!(
+                    "Unresolved tool outcome failure: {class} x{count}; do not report completion until a matching validation command succeeds."
+                ));
+            }
             EvalSignal::ExplorationFamilyChurn { streak, .. } => {
                 saw_batching_issue = true;
                 findings.push(format!(
@@ -232,6 +238,10 @@ mod tests {
                 EvalSignal::RepeatToolCall("read_file".to_string()),
                 EvalSignal::StallDetected,
                 EvalSignal::VerdictWarning,
+                EvalSignal::ToolOutcomeFailure {
+                    class: "test_failure".to_string(),
+                    count: 1,
+                },
             ],
             thresholds: EvaluationThresholds::default(),
         };
@@ -249,6 +259,12 @@ mod tests {
                 .findings
                 .iter()
                 .any(|finding| finding.contains("bash") && finding.contains("read_file"))
+        );
+        assert!(
+            feedback
+                .findings
+                .iter()
+                .any(|finding| finding.contains("test_failure"))
         );
         assert!(feedback.recommended_action.contains("Batch independent"));
     }

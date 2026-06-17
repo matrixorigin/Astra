@@ -25,6 +25,8 @@ pub enum GitSafetyViolation {
     GitExecPathFlag,
     /// `git commit --amend` without explicit user request.
     CommitAmend,
+    /// Command can discard tracked or untracked worktree changes.
+    WorktreeDestructive { operation: &'static str },
     /// Current directory looks like a bare git repo (potential hook execution trap).
     BareRepoDetected,
 }
@@ -65,6 +67,12 @@ impl std::fmt::Display for GitSafetyViolation {
             }
             Self::CommitAmend => {
                 write!(f, "git commit --amend requires explicit user approval")
+            }
+            Self::WorktreeDestructive { operation } => {
+                write!(
+                    f,
+                    "{operation} can discard worktree changes and requires explicit user approval"
+                )
             }
             Self::BareRepoDetected => {
                 write!(f, "current directory appears to be a bare git repo")
@@ -107,6 +115,7 @@ pub fn validate_git_command(command: &str) -> Vec<GitSafetyViolation> {
     check_cd_git_compound(&lower, &mut violations);
     check_git_config_flags(command, &mut violations);
     check_commit_amend(&lower, &mut violations);
+    check_worktree_destructive(&lower, &mut violations);
 
     violations
 }
@@ -260,6 +269,144 @@ fn check_commit_amend(lower: &str, violations: &mut Vec<GitSafetyViolation>) {
     }
 }
 
+fn check_worktree_destructive(lower: &str, violations: &mut Vec<GitSafetyViolation>) {
+    let words: Vec<String> = lower
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|ch: char| matches!(ch, ';' | '(' | ')' | '{' | '}'))
+                .to_string()
+        })
+        .collect();
+
+    for (idx, word) in words.iter().enumerate() {
+        if !word_is_git(word) {
+            continue;
+        }
+        let Some(subcommand_idx) = first_git_subcommand(&words, idx + 1) else {
+            continue;
+        };
+        let args_end = command_segment_end(&words, subcommand_idx + 1);
+        let args = &words[subcommand_idx + 1..args_end];
+        match words[subcommand_idx].as_str() {
+            "reset" if args.iter().any(|word| word == "--hard") => {
+                violations.push(GitSafetyViolation::WorktreeDestructive {
+                    operation: "git reset --hard",
+                })
+            }
+            "restore" if git_restore_touches_worktree(args) => {
+                violations.push(GitSafetyViolation::WorktreeDestructive {
+                    operation: "git restore",
+                })
+            }
+            "checkout" if git_checkout_discards_worktree(args) => {
+                violations.push(GitSafetyViolation::WorktreeDestructive {
+                    operation: "git checkout",
+                })
+            }
+            "clean" if git_clean_deletes_worktree(args) => {
+                violations.push(GitSafetyViolation::WorktreeDestructive {
+                    operation: "git clean",
+                })
+            }
+            _ => {}
+        }
+    }
+}
+
+fn word_is_git(word: &str) -> bool {
+    word == "git" || word.ends_with("/git")
+}
+
+fn is_shell_boundary(word: &str) -> bool {
+    matches!(word, "&&" | "||" | "|" | ";")
+}
+
+fn command_segment_end(words: &[String], start: usize) -> usize {
+    words[start..]
+        .iter()
+        .position(|word| is_shell_boundary(word))
+        .map(|offset| start + offset)
+        .unwrap_or(words.len())
+}
+
+fn first_git_subcommand(words: &[String], mut idx: usize) -> Option<usize> {
+    while idx < words.len() {
+        let word = words[idx].as_str();
+        if is_shell_boundary(word) {
+            return None;
+        }
+        if matches!(word, "-c" | "--git-dir" | "--work-tree") {
+            idx += 2;
+            continue;
+        }
+        if word.starts_with("-c=")
+            || word.starts_with("--git-dir=")
+            || word.starts_with("--work-tree=")
+        {
+            idx += 1;
+            continue;
+        }
+        if word.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        return Some(idx);
+    }
+    None
+}
+
+fn short_git_flag_contains(word: &str, flag: char) -> bool {
+    word.starts_with('-') && !word.starts_with("--") && word.chars().skip(1).any(|ch| ch == flag)
+}
+
+fn args_request_help(args: &[String]) -> bool {
+    args.iter()
+        .any(|word| matches!(word.as_str(), "-h" | "--help" | "help"))
+}
+
+fn git_restore_touches_worktree(args: &[String]) -> bool {
+    if args_request_help(args) {
+        return false;
+    }
+    let has_staged = args
+        .iter()
+        .any(|word| word == "--staged" || short_git_flag_contains(word, 'S'));
+    let has_worktree = args
+        .iter()
+        .any(|word| word == "--worktree" || short_git_flag_contains(word, 'W'));
+    has_worktree || !has_staged
+}
+
+fn git_checkout_discards_worktree(args: &[String]) -> bool {
+    if args_request_help(args) {
+        return false;
+    }
+    if args.iter().any(|word| {
+        word == "--force"
+            || word == "-f"
+            || short_git_flag_contains(word, 'f')
+            || short_git_flag_contains(word, 'F')
+    }) {
+        return true;
+    }
+    args.windows(2)
+        .any(|window| window[0] == "--" && !window[1].is_empty())
+}
+
+fn git_clean_deletes_worktree(args: &[String]) -> bool {
+    if args_request_help(args) {
+        return false;
+    }
+    let dry_run = args
+        .iter()
+        .any(|word| word == "--dry-run" || word == "-n" || short_git_flag_contains(word, 'n'));
+    if dry_run {
+        return false;
+    }
+    args.iter()
+        .any(|word| word == "--force" || word == "-f" || short_git_flag_contains(word, 'f'))
+}
+
 /// Extract content between matching quote characters (simple, non-recursive).
 fn extract_quoted(s: &str, quote: char) -> &str {
     if !s.starts_with(quote) {
@@ -325,6 +472,49 @@ mod tests {
             v.iter()
                 .any(|v| matches!(v, GitSafetyViolation::CommitAmend))
         );
+    }
+
+    #[test]
+    fn worktree_destructive_operations_require_approval() {
+        for (cmd, operation) in [
+            ("git reset --hard HEAD~1", "git reset --hard"),
+            (
+                "git restore --staged --worktree rust/crates/foo/src/lib.rs",
+                "git restore",
+            ),
+            ("git restore -- .", "git restore"),
+            ("git checkout -- .", "git checkout"),
+            ("git checkout -f main", "git checkout"),
+            ("git clean -fd", "git clean"),
+            ("git stash && git checkout origin/main -- .", "git checkout"),
+        ] {
+            let v = validate_git_command(cmd);
+            assert!(
+                v.iter().any(|v| matches!(
+                    v,
+                    GitSafetyViolation::WorktreeDestructive { operation: op } if *op == operation
+                )),
+                "should flag {operation}: {cmd}; got {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_destructive_worktree_queries_remain_allowed() {
+        for cmd in [
+            "git status --short",
+            "git restore --staged rust/crates/foo/src/lib.rs",
+            "git checkout main",
+            "git clean -nfd",
+            "git restore --help",
+        ] {
+            let v = validate_git_command(cmd);
+            assert!(
+                !v.iter()
+                    .any(|v| matches!(v, GitSafetyViolation::WorktreeDestructive { .. })),
+                "false positive for {cmd}: {v:?}"
+            );
+        }
     }
 
     #[test]
@@ -490,6 +680,9 @@ mod tests {
             GitSafetyViolation::GitConfigFlag,
             GitSafetyViolation::GitExecPathFlag,
             GitSafetyViolation::CommitAmend,
+            GitSafetyViolation::WorktreeDestructive {
+                operation: "git reset --hard",
+            },
             GitSafetyViolation::BareRepoDetected,
         ];
         for v in &violations {

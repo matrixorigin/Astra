@@ -25,9 +25,8 @@ pub enum PathSensitivity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathAccess {
-    DirectRead,
-    DirectWrite,
-    ShellReference,
+    Read,
+    Write,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,11 +138,8 @@ pub fn path_requires_sensitive_gate(path: &str, access: PathAccess) -> Option<Se
     let gated = match (sensitivity, access) {
         (PathSensitivity::Normal, _) => false,
         (PathSensitivity::Sensitive, _) => true,
-        (PathSensitivity::InternalArtifactReadOnly(_), PathAccess::DirectWrite) => true,
-        (
-            PathSensitivity::InternalArtifactReadOnly(_),
-            PathAccess::DirectRead | PathAccess::ShellReference,
-        ) => false,
+        (PathSensitivity::InternalArtifactReadOnly(_), PathAccess::Write) => true,
+        (PathSensitivity::InternalArtifactReadOnly(_), PathAccess::Read) => false,
     };
     gated.then(|| SensitivePathMatch {
         token: path.to_string(),
@@ -162,9 +158,9 @@ pub fn sensitive_path_match_for_tool_args(
         && !path.is_empty()
     {
         let access = if is_direct_read {
-            PathAccess::DirectRead
+            PathAccess::Read
         } else {
-            PathAccess::DirectWrite
+            PathAccess::Write
         };
         if let Some(hit) = path_requires_sensitive_gate(&path, access) {
             return Some(hit);
@@ -177,16 +173,15 @@ pub fn sensitive_path_match_for_tool_args(
         for token in shell_like_tokens(command) {
             let extracted = shell_token_path_candidates(&token);
             if extracted.is_empty() {
-                if let Some(hit) = path_requires_sensitive_gate(&token, PathAccess::ShellReference)
-                {
+                let access = classify_shell_token_access(command, &token);
+                if let Some(hit) = path_requires_sensitive_gate(&token, access) {
                     return Some(hit);
                 }
                 continue;
             }
             for candidate in extracted {
-                if let Some(hit) =
-                    path_requires_sensitive_gate(&candidate, PathAccess::ShellReference)
-                {
+                let access = classify_shell_token_access(command, &candidate);
+                if let Some(hit) = path_requires_sensitive_gate(&candidate, access) {
                     return Some(hit);
                 }
             }
@@ -198,6 +193,126 @@ pub fn sensitive_path_match_for_tool_args(
 
 pub fn sensitive_path_token_for_tool_args(tool_name: &str, args: &Value) -> Option<String> {
     sensitive_path_match_for_tool_args(tool_name, args).map(|hit| hit.token)
+}
+
+/// Classify whether a path token extracted from a shell command is being read
+/// or written by that command.
+///
+/// The read/write distinction only matters for internal artifact paths
+/// (agent-owned tool-results / journals): reading those is permitted, mutating
+/// them trips the gate. Secrets and other `Sensitive` paths gate on any access,
+/// so a conservative `Read` default is safe for them.
+///
+/// This replaces the previous coarse whole-command read-only check, which
+/// misclassified read references embedded in non-read-only commands (pipes to
+/// interpreters, `python3 -c`, etc.) as writes and tripped the gate on the
+/// agent's own artifacts.
+fn classify_shell_token_access(command: &str, candidate: &str) -> PathAccess {
+    if shell_token_is_write_target(command, candidate) {
+        PathAccess::Write
+    } else {
+        PathAccess::Read
+    }
+}
+
+/// True when `candidate` is the target of an output redirection or an argument
+/// to a file-mutating shell verb within `command`.
+fn shell_token_is_write_target(command: &str, candidate: &str) -> bool {
+    for (start, _) in command.match_indices(candidate) {
+        if !is_word_boundary_match(command, start, candidate) {
+            continue;
+        }
+        if preceded_by_output_redirection(&command[..start]) {
+            return true;
+        }
+        if segment_has_mutating_verb(command, start, candidate) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_word_boundary_match(command: &str, start: usize, candidate: &str) -> bool {
+    let before_ok = start == 0
+        || command[..start]
+            .chars()
+            .next_back()
+            .map(|ch| !is_path_char(ch))
+            .unwrap_or(true);
+    let end = start + candidate.len();
+    let after_ok = command[end..]
+        .chars()
+        .next()
+        .map(|ch| !is_path_char(ch))
+        .unwrap_or(true);
+    before_ok && after_ok
+}
+
+fn is_path_char(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '~' | '$' | '{' | '}')
+}
+
+fn preceded_by_output_redirection(prefix: &str) -> bool {
+    let trimmed = prefix.trim_end_matches(|c: char| c.is_whitespace());
+    const OPS: &[&str] = &[
+        "&>>", "&>", "1>>", "2>>", ">&", "1>", "2>", "&1>", "&2>", ">>", ">",
+    ];
+    OPS.iter().any(|op| trimmed.ends_with(op))
+}
+
+/// Verbs whose file arguments are mutated (truncated, removed, created, or
+/// rewritten).
+const SHELL_MUTATING_VERBS: &[&str] = &[
+    "rm", "rmdir", "mv", "cp", "ln", "truncate", "chmod", "chown", "chgrp", "unlink", "shred",
+    "tee", "install", "dd", "mkdir", "mkfifo", "mknod",
+];
+
+/// Inspect the pipeline/sequence segment containing `pos` and report whether its
+/// leading verb mutates its file arguments.
+fn segment_has_mutating_verb(command: &str, pos: usize, candidate: &str) -> bool {
+    let seg_start = command[..pos]
+        .rfind(|c| matches!(c, '|' | ';' | '\n' | '&'))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let seg_end = command[pos..]
+        .find(|c| matches!(c, '|' | ';' | '\n' | '&'))
+        .map(|i| pos + i)
+        .unwrap_or(command.len());
+    let segment = &command[seg_start..seg_end];
+    if !segment.contains(candidate) {
+        return false;
+    }
+    let Some(verb) = leading_shell_verb(segment) else {
+        return false;
+    };
+    if SHELL_MUTATING_VERBS.contains(&verb.as_str()) {
+        return true;
+    }
+    // sed is mutating only with -i / --in-place.
+    if verb == "sed" && (segment.contains(" -i") || segment.contains("--in-place")) {
+        return true;
+    }
+    false
+}
+
+fn leading_shell_verb(segment: &str) -> Option<String> {
+    for word in segment.split_whitespace() {
+        let word = word.trim_matches(|c: char| matches!(c, '"' | '\'' | '`'));
+        // Skip env assignments (FOO=bar) and command-modifier prefixes.
+        if matches!(
+            word,
+            "sudo" | "env" | "command" | "exec" | "nice" | "nohup" | "time"
+        ) {
+            continue;
+        }
+        if word.is_empty() || (word.contains('=') && !word.starts_with('=')) {
+            continue;
+        }
+        // Handle absolute paths to binaries: /usr/bin/rm -> rm.
+        let basename = word.rsplit('/').next().unwrap_or(word);
+        return Some(basename.to_string());
+    }
+    None
 }
 
 pub fn shell_like_tokens(command: &str) -> Vec<String> {
@@ -354,9 +469,8 @@ mod tests {
             classify_path_sensitivity(&artifact_path),
             PathSensitivity::InternalArtifactReadOnly(InternalPathKind::SessionToolResult)
         );
-        assert!(path_requires_sensitive_gate(&artifact_path, PathAccess::DirectRead).is_none());
-        assert!(path_requires_sensitive_gate(&artifact_path, PathAccess::ShellReference).is_none());
-        assert!(path_requires_sensitive_gate(&artifact_path, PathAccess::DirectWrite).is_some());
+        assert!(path_requires_sensitive_gate(&artifact_path, PathAccess::Read).is_none());
+        assert!(path_requires_sensitive_gate(&artifact_path, PathAccess::Write).is_some());
     }
 
     #[test]
@@ -368,9 +482,8 @@ mod tests {
             classify_path_sensitivity(&journal_path),
             PathSensitivity::InternalArtifactReadOnly(InternalPathKind::SessionJournal)
         );
-        assert!(path_requires_sensitive_gate(&journal_path, PathAccess::DirectRead).is_none());
-        assert!(path_requires_sensitive_gate(&journal_path, PathAccess::ShellReference).is_none());
-        assert!(path_requires_sensitive_gate(&journal_path, PathAccess::DirectWrite).is_some());
+        assert!(path_requires_sensitive_gate(&journal_path, PathAccess::Read).is_none());
+        assert!(path_requires_sensitive_gate(&journal_path, PathAccess::Write).is_some());
 
         let grep_args = serde_json::json!({
             "pattern": "str_replace|str replace",
@@ -393,8 +506,7 @@ mod tests {
             classify_path_sensitivity(&artifact_path),
             PathSensitivity::Sensitive
         );
-        let hit =
-            path_requires_sensitive_gate(&artifact_path, PathAccess::DirectRead).expect("gate");
+        let hit = path_requires_sensitive_gate(&artifact_path, PathAccess::Read).expect("gate");
         assert_eq!(hit.sensitivity, PathSensitivity::Sensitive);
     }
 
@@ -412,8 +524,7 @@ mod tests {
             classify_path_sensitivity(&journal_path),
             PathSensitivity::Sensitive
         );
-        let hit =
-            path_requires_sensitive_gate(&journal_path, PathAccess::DirectRead).expect("gate");
+        let hit = path_requires_sensitive_gate(&journal_path, PathAccess::Read).expect("gate");
         assert_eq!(hit.sensitivity, PathSensitivity::Sensitive);
     }
 
@@ -487,7 +598,7 @@ mod tests {
         let hit = sensitive_path_match_for_tool_args("bash", &args).expect("sensitive path");
         assert_eq!(hit.token, "~/.ssh/id_rsa");
         assert_eq!(hit.sensitivity, PathSensitivity::Sensitive);
-        assert_eq!(hit.access, PathAccess::ShellReference);
+        assert_eq!(hit.access, PathAccess::Read);
     }
 
     #[test]
@@ -502,6 +613,22 @@ mod tests {
             hit.sensitivity,
             PathSensitivity::InternalArtifactReadOnly(InternalPathKind::SessionToolResult)
         );
-        assert_eq!(hit.access, PathAccess::DirectWrite);
+        assert_eq!(hit.access, PathAccess::Write);
+    }
+
+    #[test]
+    fn mutating_shell_reference_to_internal_artifact_is_sensitive() {
+        let (_temp, _guard, artifact_path) = create_current_session_artifact();
+        let artifact_path = artifact_path.to_string_lossy();
+        let args = serde_json::json!({
+            "command": format!("rm -f {artifact_path}")
+        });
+
+        let hit = sensitive_path_match_for_tool_args("bash", &args).expect("internal write gate");
+        assert_eq!(
+            hit.sensitivity,
+            PathSensitivity::InternalArtifactReadOnly(InternalPathKind::SessionToolResult)
+        );
+        assert_eq!(hit.access, PathAccess::Write);
     }
 }

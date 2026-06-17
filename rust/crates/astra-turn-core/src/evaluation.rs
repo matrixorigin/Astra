@@ -78,6 +78,11 @@ pub enum EvalSignal {
         tool_calls: usize,
         llm_rounds: Option<u32>,
     },
+    /// A tool command completed at the transport/execution layer but its
+    /// classified outcome still represents an unresolved task failure
+    /// (`test_failure`, `env_failure`, `execution_error`). Carries the
+    /// normalized result class and number of unresolved streams.
+    ToolOutcomeFailure { class: String, count: usize },
 }
 
 /// Default threshold for [`EvalSignal::RedundantOverlappingReads`]: minimum
@@ -521,6 +526,7 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
 
     revoke_all_tools_healthy_when_quality_signals_disagree(&mut eval, &tool_calls);
     align_high_cost_low_yield_verdict(&mut eval, &tool_calls, telemetry);
+    apply_unresolved_tool_outcome_failures(&mut eval, tool_call_records);
 
     eval
 }
@@ -541,6 +547,7 @@ fn is_negative_quality_signal(signal: &EvalSignal) -> bool {
             | EvalSignal::PromptGrowthChurn { .. }
             | EvalSignal::ExplorationFamilyChurn { .. }
             | EvalSignal::HighCostLowYield { .. }
+            | EvalSignal::ToolOutcomeFailure { .. }
     )
 }
 
@@ -636,6 +643,95 @@ fn align_high_cost_low_yield_verdict(
     let error_count = tool_calls.iter().filter(|tc| !tc.ok).count();
     let error_rate = error_count as f64 / tool_calls.len().max(1) as f64;
     eval.success = error_rate < 0.5 && eval.quality > 0.35;
+}
+
+fn result_class_is_outcome_failure(class: &str) -> bool {
+    matches!(class, "test_failure" | "env_failure" | "execution_error")
+}
+
+fn result_class_resolves_outcome_failure(class: &str) -> bool {
+    matches!(class, "success" | "domain_negative")
+}
+
+fn hash_bounded_key(value: &str) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn outcome_resolution_key(record: &ToolCallRecord) -> Option<String> {
+    let class = record.result_class.as_deref()?.trim();
+    if !result_class_is_outcome_failure(class) && !result_class_resolves_outcome_failure(class) {
+        return None;
+    }
+
+    let args = record.args_full.as_deref().unwrap_or("").trim();
+    if let Some(prefix) = normalize_validation_prefix(&record.name, args) {
+        return Some(format!("validation::{prefix}"));
+    }
+
+    let args_key = if !args.is_empty() {
+        args
+    } else {
+        record.args_preview.as_deref().unwrap_or("").trim()
+    };
+    Some(format!(
+        "tool::{}::{}",
+        record.name,
+        hash_bounded_key(args_key)
+    ))
+}
+
+fn unresolved_tool_outcome_failure_counts(
+    records: &[ToolCallRecord],
+) -> std::collections::BTreeMap<String, usize> {
+    let mut unresolved_by_key = std::collections::BTreeMap::<String, String>::new();
+
+    for record in records {
+        if record.is_synthetic_placeholder() || record.was_blocked_by_policy() {
+            continue;
+        }
+        let Some(class) = record.result_class.as_deref().map(str::trim) else {
+            continue;
+        };
+        let Some(key) = outcome_resolution_key(record) else {
+            continue;
+        };
+
+        if result_class_is_outcome_failure(class) {
+            unresolved_by_key.insert(key, class.to_string());
+        } else if result_class_resolves_outcome_failure(class) {
+            unresolved_by_key.remove(&key);
+        }
+    }
+
+    let mut counts = std::collections::BTreeMap::new();
+    for class in unresolved_by_key.values() {
+        *counts.entry(class.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn apply_unresolved_tool_outcome_failures(eval: &mut TurnEvaluation, records: &[ToolCallRecord]) {
+    let counts = unresolved_tool_outcome_failure_counts(records);
+    let total: usize = counts.values().sum();
+    if total == 0 {
+        return;
+    }
+
+    eval.signals
+        .retain(|signal| !matches!(signal, EvalSignal::AllToolsHealthy));
+    for (class, count) in counts {
+        eval.signals
+            .push(EvalSignal::ToolOutcomeFailure { class, count });
+    }
+
+    let penalty = (0.25 + 0.08 * total.saturating_sub(1) as f64).clamp(0.25, 0.50);
+    eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
+    eval.confidence = (eval.confidence + 0.15).clamp(0.0, 1.0);
+    eval.success = false;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1186,6 +1282,14 @@ pub fn eval_signal_to_json_with_thresholds(
                 ),
             },
         }),
+        EvalSignal::ToolOutcomeFailure { class, count } => json!({
+            "kind": "tool_outcome_failure",
+            "class": class,
+            "count": count,
+            "message": format!(
+                "Detected {count} unresolved tool outcome failure(s) classified as `{class}`"
+            ),
+        }),
     }
 }
 pub fn eval_signals_to_json_with_thresholds(
@@ -1476,6 +1580,73 @@ mod tests {
                 .any(|signal| matches!(signal, EvalSignal::AllToolsHealthy)),
             "{:?}",
             eval.signals
+        );
+    }
+
+    #[test]
+    fn evaluate_tool_call_records_marks_unresolved_outcome_failure_unsuccessful() {
+        let mut record = journal_ok_call("bash");
+        record.args_full = Some(
+            serde_json::json!({"command": "cargo test -p astra-runtime 2>&1 | tail -20"})
+                .to_string(),
+        );
+        record.result_class = Some("test_failure".to_string());
+        record.exit_semantics = Some("domain_negative".to_string());
+
+        let eval = evaluate_tool_call_records("run the tests", &[], &[record], 0, false, 0.2);
+
+        assert!(!eval.success, "{eval:?}");
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::AllToolsHealthy)),
+            "{:?}",
+            eval.signals
+        );
+        assert!(eval.signals.iter().any(|signal| matches!(
+            signal,
+            EvalSignal::ToolOutcomeFailure { class, count }
+                if class == "test_failure" && *count == 1
+        )));
+        let json = eval_signals_to_json_with_thresholds(&eval.signals, eval.thresholds);
+        assert!(
+            json.iter()
+                .any(|signal| signal["kind"] == "tool_outcome_failure"
+                    && signal["class"] == "test_failure")
+        );
+    }
+
+    #[test]
+    fn later_matching_success_resolves_tool_outcome_failure() {
+        let mut failed = journal_ok_call("bash");
+        failed.args_full = Some(
+            serde_json::json!({"command": "cargo test -p astra-runtime | tail -20"}).to_string(),
+        );
+        failed.result_class = Some("test_failure".to_string());
+        failed.exit_semantics = Some("domain_negative".to_string());
+
+        let mut passed = journal_ok_call("bash");
+        passed.args_full =
+            Some(serde_json::json!({"command": "cargo test -p astra-runtime"}).to_string());
+        passed.result_class = Some("success".to_string());
+        passed.exit_semantics = Some("success".to_string());
+
+        let eval = evaluate_tool_call_records(
+            "fix and rerun the tests",
+            &[],
+            &[failed, passed],
+            0,
+            false,
+            0.2,
+        );
+
+        assert!(eval.success, "{eval:?}");
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::ToolOutcomeFailure { .. }))
         );
     }
 

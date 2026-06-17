@@ -59,6 +59,8 @@ pub const SENSITIVE_ENV_VARS: &[&str] = &[
 /// Configuration for shell hardening features.
 #[derive(Debug, Clone)]
 pub struct ShellHardeningConfig {
+    /// Preserve failure from any segment of a shell pipeline.
+    pub pipefail: bool,
     /// Disable extended glob patterns (bash extglob / zsh EXTENDED_GLOB).
     pub disable_extglob: bool,
     /// Reset IFS to default (space, tab, newline).
@@ -72,6 +74,7 @@ pub struct ShellHardeningConfig {
 impl Default for ShellHardeningConfig {
     fn default() -> Self {
         Self {
+            pipefail: true,
             disable_extglob: true,
             reset_ifs: true,
             redirect_stdin: true,
@@ -83,13 +86,22 @@ impl Default for ShellHardeningConfig {
 /// Build a hardened command string with security preamble.
 ///
 /// Wraps the user command with:
-/// 1. Extglob disable (prevents malicious filename expansion post-validation)
-/// 2. IFS reset (prevents word-splitting attacks)
-/// 3. Stdin redirect to /dev/null (prevents stdin pipe hijacking)
+/// 1. Pipefail (preserves upstream pipeline failures)
+/// 2. Extglob disable (prevents malicious filename expansion post-validation)
+/// 3. IFS reset (prevents word-splitting attacks)
+/// 4. Stdin redirect to /dev/null (prevents stdin pipe hijacking)
 ///
 /// The preamble is compatible with both bash and zsh.
 pub fn build_hardened_command(config: &ShellHardeningConfig, user_command: &str) -> String {
     let mut parts = Vec::new();
+
+    if config.pipefail {
+        // bash: `set -o pipefail`; zsh: `setopt PIPE_FAIL`. Ignore the
+        // unsupported form so the same preamble works across supported shells.
+        parts.push(
+            "{ set -o pipefail 2>/dev/null || setopt PIPE_FAIL 2>/dev/null; } || true".to_string(),
+        );
+    }
 
     if config.disable_extglob {
         // Compatible with both bash and zsh:
@@ -503,6 +515,10 @@ mod tests {
     fn default_config_adds_all_hardening() {
         let config = ShellHardeningConfig::default();
         let cmd = build_hardened_command(&config, "echo hello");
+        assert!(
+            cmd.contains("pipefail"),
+            "should preserve pipeline failures"
+        );
         assert!(cmd.contains("extglob"), "should disable extglob");
         assert!(cmd.contains("IFS="), "should reset IFS");
         assert!(cmd.contains("< /dev/null"), "should redirect stdin");
@@ -531,6 +547,7 @@ mod tests {
     #[test]
     fn no_hardening_returns_raw_command() {
         let config = ShellHardeningConfig {
+            pipefail: false,
             disable_extglob: false,
             reset_ifs: false,
             redirect_stdin: false,
@@ -826,12 +843,14 @@ mod tests {
     #[test]
     fn hardened_command_only_extglob() {
         let config = ShellHardeningConfig {
+            pipefail: false,
             disable_extglob: true,
             reset_ifs: false,
             redirect_stdin: false,
             scrub_secrets: false,
         };
         let cmd = build_hardened_command(&config, "echo hello");
+        assert!(!cmd.contains("pipefail"));
         assert!(cmd.contains("extglob"));
         assert!(!cmd.contains("IFS="));
         assert!(!cmd.contains("< /dev/null"));
@@ -840,12 +859,14 @@ mod tests {
     #[test]
     fn hardened_command_only_ifs() {
         let config = ShellHardeningConfig {
+            pipefail: false,
             disable_extglob: false,
             reset_ifs: true,
             redirect_stdin: false,
             scrub_secrets: false,
         };
         let cmd = build_hardened_command(&config, "ls");
+        assert!(!cmd.contains("pipefail"));
         assert!(cmd.contains("IFS="));
         assert!(!cmd.contains("extglob"));
     }
@@ -871,6 +892,7 @@ mod tests {
     #[test]
     fn stdin_redirect_wraps_pipe_with_disabled_extras() {
         let config = ShellHardeningConfig {
+            pipefail: false,
             disable_extglob: false,
             reset_ifs: false,
             redirect_stdin: true,
@@ -881,6 +903,21 @@ mod tests {
         assert!(
             cmd.contains("< /dev/null"),
             "pipe commands must have stdin redirect; got: '{cmd}'"
+        );
+    }
+
+    #[test]
+    fn default_config_preserves_pipeline_failures_and_stdin_guard() {
+        let config = ShellHardeningConfig::default();
+        let cmd = build_hardened_command(&config, "cargo test 2>&1 | tail -20");
+
+        assert!(
+            cmd.contains("pipefail") || cmd.contains("PIPE_FAIL"),
+            "pipeline hardening must enable pipefail; got: '{cmd}'"
+        );
+        assert!(
+            cmd.contains("( cargo test 2>&1 | tail -20 ) < /dev/null"),
+            "pipeline hardening must wrap the whole pipeline for stdin guard; got: '{cmd}'"
         );
     }
 

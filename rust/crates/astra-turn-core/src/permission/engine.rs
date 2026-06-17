@@ -2122,6 +2122,31 @@ mod tests {
     }
 
     #[test]
+    fn git_worktree_destructive_bash_requires_approval_in_auto_mode() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let envelope = evaluate_permission(
+            "bash",
+            &serde_json::json!({
+                "command": "git restore --staged --worktree rust/crates/foo/src/lib.rs"
+            }),
+            &ctx,
+        );
+
+        assert!(matches!(
+            envelope.decision,
+            HardDecision::NeedExternal { .. }
+        ));
+        assert!(
+            matches!(envelope.source, DecisionSource::GitSafety { ref violation } if violation.contains("git restore")),
+            "{:?}",
+            envelope.source
+        );
+        assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
+    }
+
+    #[test]
     fn structured_git_force_push_respects_auto_allowlist() {
         let ctx = crate::permission::types::PermissionSyncContext::new(
             crate::permission::types::InheritedPermissions {
