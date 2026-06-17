@@ -841,6 +841,22 @@ fn cleanup_debt_from_row(
     let reason_string: String = row.try_get("reason")?;
     let reason: CleanupReason = serde_json::from_value(serde_json::Value::String(reason_string))?;
     let attempts: i64 = row.try_get("attempts")?;
+    // A negative `attempts` is corruption (schema is INT NOT NULL DEFAULT 0).
+    // Previously masked with u32::MAX, hiding the bug and inflating retry
+    // counters. Surface it so the caller can fail loudly.
+    let attempts = u32::try_from(attempts).map_err(|_| {
+        WorkspaceCleanupDebtStoreError::Database(sqlx::Error::Decode(
+            format!(
+                "cleanup_debt attempts is negative/corrupt: {attempts}"
+            )
+            .into(),
+        ))
+    })?;
+    // `created_at` drives the debt processing order. The previous
+    // `unwrap_or_default()` substituted the empty String silently and
+    // reordered debts ahead of everything else, masking corruption.
+    // Propagate the error instead.
+    let created_at: String = row.try_get("created_at")?;
     Ok(WorkspaceCleanupDebtEntry {
         debt_id: row.try_get("debt_id")?,
         owner_id: row.try_get("owner_id")?,
@@ -849,9 +865,9 @@ fn cleanup_debt_from_row(
         workspace_id: row.try_get("workspace_id")?,
         reason,
         message: row.try_get("message")?,
-        attempts: u32::try_from(attempts).unwrap_or(u32::MAX),
+        attempts,
         record,
-        created_at: row.try_get("created_at").unwrap_or_default(),
+        created_at,
     })
 }
 
