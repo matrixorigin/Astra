@@ -583,8 +583,12 @@ impl WorkspaceCleanupDebtStore for DatabaseWorkspaceRecordStore {
              ON DUPLICATE KEY UPDATE \
               owner_id = VALUES(owner_id), session_id = VALUES(session_id), \
               run_id = VALUES(run_id), workspace_id = VALUES(workspace_id), \
-              reason = VALUES(reason), message = VALUES(message), attempts = VALUES(attempts), \
-              record_json = VALUES(record_json), updated_at = NOW(6), resolved_at = NULL",
+              reason = VALUES(reason), \
+              message = IF(resolved_at IS NULL, VALUES(message), message), \
+              attempts = IF(resolved_at IS NULL, GREATEST(attempts, VALUES(attempts)), attempts), \
+              record_json = IF(resolved_at IS NULL, VALUES(record_json), record_json), \
+              updated_at = NOW(6), \
+              resolved_at = resolved_at",
         )
         .bind(&entry.debt_id)
         .bind(&entry.owner_id)
