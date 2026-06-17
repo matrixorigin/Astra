@@ -2,8 +2,32 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use astra_core::SharedPool;
+
+/// Hash a logical cache_key into a fixed-length (64-char) SHA-256 hex so the
+/// `tool_exactly_once_results.dedup_key` column (part of the PRIMARY KEY)
+/// never truncates. Two distinct cache_keys map to distinct hashes with
+/// overwhelming probability; collisions at this scale are negligible and no
+/// worse than the existing hash-of-args already used by `cache_key`.
+/// The stored value is only a row uniquifier — semantic matching goes through
+/// `key_json`, so hashing the uniquifier loses no information.
+fn dedup_key_hash(cache_key: &str) -> String {
+    let digest = Sha256::digest(cache_key.as_bytes());
+    base16_encode_lower(&digest)
+}
+
+/// Lowercase hex without pulling in another crate.
+fn base16_encode_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
 
 /// Wraps in-memory idempotency with optional DB persistence for crash recovery.
 ///
@@ -268,7 +292,7 @@ pub(crate) async fn record_result(
     if let Some(ref pool) = state.pool {
         let pool = pool.clone();
         let session_id = state.session_id.clone();
-        let dedup_key = cache_key.clone();
+        let dedup_key = dedup_key_hash(&cache_key);
         let cached_for_persist = CachedToolResult {
             tool_name: name.to_string(),
             output: result.output.clone(),
@@ -276,7 +300,12 @@ pub(crate) async fn record_result(
             cached_at,
             context_signature: None,
         };
-
+        tracing::debug!(
+            tool_name = %name,
+            cache_key = %cache_key,
+            dedup_key = %dedup_key,
+            "Exactly-once: persisting result for crash recovery"
+        );
         let persist_fut = persist_result(&pool, &session_id, &dedup_key, &key, &cached_for_persist);
         match tokio::time::timeout(Duration::from_millis(500), persist_fut).await {
             Ok(Ok(())) => {}

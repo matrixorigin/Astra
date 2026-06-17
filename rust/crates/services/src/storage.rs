@@ -3301,13 +3301,20 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
     .await?;
 
     // Migration 19: tool_exactly_once_results for crash-recovery tool dedup.
+    //
+    // `dedup_key` is the SHA-256 hex of the logical cache_key
+    // (see `dedup_key_hash` in tool_exactly_once.rs), so 64 chars is always
+    // sufficient. The earlier VARCHAR(1024) form silently truncated long
+    // cache_keys under non-strict MySQL modes, which could let two distinct
+    // tool calls collide on the PRIMARY KEY and return the wrong cached
+    // result. Keep VARCHAR(128) for defensive headroom.
     run_migration(
         pool,
         19,
         "create tool_exactly_once_results for tool dedup",
         "CREATE TABLE tool_exactly_once_results (
             session_id   VARCHAR(128) NOT NULL,
-            dedup_key    VARCHAR(1024) NOT NULL,
+            dedup_key    VARCHAR(128) NOT NULL,
             key_json     JSON NOT NULL,
             result_json  JSON NOT NULL,
             recorded_at  BIGINT UNSIGNED NOT NULL DEFAULT 0,
