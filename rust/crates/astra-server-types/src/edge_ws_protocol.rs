@@ -97,6 +97,15 @@ pub enum EdgeServerMessage {
     /// Server is closing the connection.
     #[serde(rename = "edge_closing")]
     Closing { reason: String },
+
+    /// Cancel an in-flight tool execution request.
+    ///
+    /// Sent when the caller times out, cancels via `CancellationToken`, or the
+    /// dispatch fails. The edge SHOULD abort the tool process and discard any
+    /// partial result. Failing to acknowledge is acceptable — the server has
+    /// already dropped the pending-result slot.
+    #[serde(rename = "edge_tool_cancel")]
+    ToolCancel { request_id: String },
 }
 
 fn default_tool_timeout_secs() -> u64 {

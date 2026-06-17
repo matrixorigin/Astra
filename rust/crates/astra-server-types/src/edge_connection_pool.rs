@@ -267,10 +267,20 @@ impl EdgeConnectionPool {
             return None;
         }
 
+        // Helper: notify the edge that it should abort the in-flight request
+        // and drop any partial result. Best-effort: if the send fails (edge
+        // already gone), we still proceed with local cleanup.
+        let cancel_edge = || {
+            let _ = sender.try_send(EdgeServerMessage::ToolCancel {
+                request_id: request_id.clone(),
+            });
+        };
+
         let timeout_dur = Duration::from_secs(EDGE_TOOL_TIMEOUT_SECS);
         let result = if let Some(token) = cancel_token {
             tokio::select! {
                 _ = token.cancelled() => {
+                    cancel_edge();
                     pending_results.remove(&request_id);
                     self.remove_pending_request(&request_id);
                     return None;
@@ -286,6 +296,10 @@ impl EdgeConnectionPool {
                 Some(result)
             }
             _ => {
+                // Timed out waiting for the edge. Tell it to abort so the
+                // (possibly still running) tool does not write to a file or
+                // run a destructive command after the caller has given up.
+                cancel_edge();
                 pending_results.remove(&request_id);
                 self.remove_pending_request(&request_id);
                 None
@@ -338,6 +352,17 @@ impl EdgeConnectionPool {
         {
             return tx.send(result).is_ok();
         }
+        // No pending entry: the request was already cancelled, timed out, or the
+        // connection was reset. Log so operators can correlate late edge results
+        // (e.g. a bash command completing after the caller already gave up and
+        // issued a conflicting write) instead of silently dropping them.
+        tracing::warn!(
+            user_id = %user_id,
+            edge_agent_id = %edge_agent_id,
+            request_id = %request_id,
+            is_error = result.is_error,
+            "edge tool result delivered with no pending receiver; dropping"
+        );
         false
     }
 
