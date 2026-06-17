@@ -12,7 +12,8 @@ use astra_turn_core::headless_tool_assembly::{
 use astra_turn_core::headless_tool_body_preview::emit_headless_tool_body_preview;
 use astra_turn_core::headless_tool_journal::{
     journal_record_blocked_tool, journal_record_cross_turn_cache_hit,
-    journal_record_duplicate_within_turn, journal_record_unknown_tool,
+    journal_record_duplicate_within_turn, journal_record_tool_not_admitted,
+    journal_record_unknown_tool,
 };
 use astra_turn_core::headless_tool_stderr_lines::{
     headless_stderr_cache_hit_line, headless_stderr_unknown_tool_detail,
@@ -523,6 +524,13 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 self.ctx.valid_tool_names,
                 self.ctx.deferred_tool_names,
             );
+            let is_deferred_not_admitted = self.ctx.deferred_tool_names.contains(&execution.name);
+            let skip_reason = if is_deferred_not_admitted {
+                "tool_not_admitted"
+            } else {
+                "unknown_tool"
+            };
+            let args_preview = make_args_preview(&execution.name, &execution.args);
             if !self.ctx.quiet {
                 self.ctx.term.emit_line(
                     HeadlessStderrStyle::Red,
@@ -539,21 +547,33 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 self.ctx.step_recorder,
                 &execution.id,
                 &execution.name,
-                "unknown_tool",
+                skip_reason,
                 None,
-                make_args_preview(&execution.name, &execution.args).as_deref(),
+                args_preview.as_deref(),
                 Some(&err_msg),
                 false,
             );
             self.ctx.messages.push(tool_msg);
             self.ctx.tool_results.push(err_tr);
-            self.ctx.tool_call_records.push(journal_record_unknown_tool(
-                execution.name.clone(),
-                execution.early_exit_ms,
-            ));
-            // Unknown local tool names are catalog misses, not runtime failures.
-            // Do not persist them into ToolHealth/deprioritized state; otherwise
-            // removed tools keep resurfacing as "failed repeatedly" context.
+            if is_deferred_not_admitted {
+                self.ctx
+                    .tool_call_records
+                    .push(journal_record_tool_not_admitted(
+                        execution.name.clone(),
+                        args_preview,
+                        &err_msg,
+                        execution.early_exit_ms,
+                    ));
+            } else {
+                self.ctx.tool_call_records.push(journal_record_unknown_tool(
+                    execution.name.clone(),
+                    execution.early_exit_ms,
+                ));
+            }
+            // Catalog misses and not-yet-activated deferred names are caller
+            // protocol issues, not runtime failures. Do not persist them into
+            // ToolHealth/deprioritized state; otherwise removed or deferred
+            // tools keep resurfacing as "failed repeatedly" context.
             return HeadlessPipelineStage::ShortCircuit;
         }
 

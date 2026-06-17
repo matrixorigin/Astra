@@ -6862,6 +6862,56 @@ mod tests {
     }
 
     #[test]
+    fn auto_mode_allows_searching_current_session_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_root = dir.path().join(".astra/sessions");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
+        std::fs::create_dir_all(&sessions_root).unwrap();
+        let journal_path = sessions_root.join("550e8400-e29b-41d4-a716-446655440000.jsonl");
+        std::fs::write(&journal_path, "{}\n").unwrap();
+        let journal_path = journal_path.to_string_lossy().to_string();
+
+        let args = serde_json::json!({
+            "pattern": "str_replace|str replace",
+            "path": journal_path
+        });
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+
+        assert_eq!(
+            super::sensitive_path_match_for_request("grep", &args),
+            None,
+            "current session journals are internal read-only diagnostics"
+        );
+        let decision = pm.check_nonblocking("grep", &args);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "Auto mode should allow read-only session journal search without an opt-in prompt: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn auto_mode_still_denies_writing_current_session_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_root = dir.path().join(".astra/sessions");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
+        std::fs::create_dir_all(&sessions_root).unwrap();
+        let journal_path = sessions_root.join("550e8400-e29b-41d4-a716-446655440000.jsonl");
+        std::fs::write(&journal_path, "{}\n").unwrap();
+
+        let args = serde_json::json!({
+            "path": journal_path.to_string_lossy().to_string(),
+            "content": "tamper"
+        });
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+
+        let decision = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::Deny(_)),
+            "session journals are internal read-only diagnostics, not writable state: {decision:?}"
+        );
+    }
+
+    #[test]
     fn sensitive_path_gate_rejects_internal_artifact_mixed_with_secret_path() {
         let dir = tempfile::tempdir().unwrap();
         let sessions_root = dir.path().join("sessions");

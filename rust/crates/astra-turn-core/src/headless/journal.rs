@@ -123,6 +123,30 @@ pub fn journal_record_unknown_tool(name: String, tool_elapsed_ms: u64) -> ToolCa
 }
 
 #[must_use]
+pub fn journal_record_tool_not_admitted(
+    name: String,
+    args_preview: Option<String>,
+    reason: &str,
+    tool_elapsed_ms: u64,
+) -> ToolCallRecord {
+    let preview: String = format!("Deferred: {reason}").chars().take(500).collect();
+    ToolCallRecord {
+        name,
+        ok: true,
+        ms: tool_elapsed_ms,
+        error: Some("tool_not_admitted".to_string()),
+        input_bytes: None,
+        output_bytes: None,
+        args_preview,
+        result_preview: Some(preview),
+        file_path: None,
+        surgically_removed: None,
+        original_tool_name: None,
+        ..Default::default()
+    }
+}
+
+#[must_use]
 pub fn journal_record_blocked_tool(
     name: String,
     reason: String,
@@ -391,6 +415,26 @@ mod tests {
         assert!(!r.ok);
         assert_eq!(r.ms, 7);
         assert_eq!(r.error.as_deref(), Some("unknown_tool: nope"));
+    }
+
+    #[test]
+    fn tool_not_admitted_record_is_synthetic_success() {
+        let r = journal_record_tool_not_admitted(
+            "agent_fanout".into(),
+            Some("{}".into()),
+            "Tool 'agent_fanout' must be activated first",
+            3,
+        );
+        assert!(r.ok);
+        assert_eq!(r.ms, 3);
+        assert_eq!(r.error.as_deref(), Some("tool_not_admitted"));
+        assert_eq!(r.args_preview.as_deref(), Some("{}"));
+        assert!(
+            r.result_preview
+                .as_deref()
+                .is_some_and(|preview| preview.starts_with("Deferred:"))
+        );
+        assert!(r.is_synthetic_placeholder());
     }
 
     #[test]

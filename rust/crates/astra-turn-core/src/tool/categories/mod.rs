@@ -577,6 +577,32 @@ pub fn registry() -> &'static ToolRegistry {
     INSTANCE.get_or_init(ToolRegistry::new)
 }
 
+/// True when `name` is a dedicated file-mutation tool.
+///
+/// Derived from the [`ToolRegistry`]: a tool is a file-mutation tool when it is
+/// registered as `Mutating` AND carries the `FILE_OP` flag, OR it is
+/// `notebook_edit` (which carries `ORCHESTRATION` instead of `FILE_OP` but
+/// mutates a file-like artifact and must never fall back to shell redirection).
+///
+/// When one of these tools has no edge execution in a turn, the
+/// `no_matching_edge_execution_message` in `astra-turn-core::headless::assembly`
+/// emits a transport-binding-failure message that forbids shell fallback
+/// (bash/heredoc/python redirection) — those bypass file-edit guards.
+///
+/// Deriving from the registry (rather than a parallel hardcoded list) means
+/// new file-mutation tools and their aliases are covered automatically with
+/// no second list to keep in sync.
+#[must_use]
+pub fn is_file_mutation_tool(name: &str) -> bool {
+    let r = registry();
+    // notebook_edit is ORCHESTRATION-flagged but mutates a file-like artifact;
+    // treat it as a file mutation for transport-binding purposes.
+    if name == "notebook_edit" {
+        return true;
+    }
+    r.category(name).is_mutating() && r.flags(name).contains(ToolFlags::FILE_OP)
+}
+
 // ── Args-aware classification ─────────────────────────────────────────
 //
 // Claude Code's killer feature: `bash "git status"` is safe to run in
@@ -1096,6 +1122,40 @@ mod tests {
                 seen.insert(meta.name),
                 "duplicate tool name in TOOL_TABLE: {}",
                 meta.name
+            );
+        }
+    }
+
+    #[test]
+    fn file_mutation_registry_includes_all_known_mutation_tools() {
+        // Contract: any dedicated file-mutation tool that appears in the
+        // registry as `Mutating + FILE_OP` (or notebook_edit, which carries
+        // ORCHESTRATION) MUST be recognized by `is_file_mutation_tool`.
+        // Otherwise its no-edge-execution message falls through to the
+        // generic "use bash" branch, violating the no-shell-fallback guarantee.
+        for meta in TOOL_TABLE {
+            let is_file_mutating = meta.category.is_mutating()
+                && (meta.flags.contains(ToolFlags::FILE_OP) || meta.name == "notebook_edit");
+            if is_file_mutating {
+                assert!(
+                    is_file_mutation_tool(meta.name),
+                    "{:?} is registered as Mutating + FILE_OP but is_file_mutation_tool returns false; \
+                     add it so the no-edge-execution message never suggests shell fallback",
+                    meta.name
+                );
+            }
+        }
+        // Sanity: the canonical mutation tools must always be recognized.
+        for required in [
+            "write_file",
+            "str_replace",
+            "multi_edit",
+            "delete_file",
+            "notebook_edit",
+        ] {
+            assert!(
+                is_file_mutation_tool(required),
+                "{required:?} must be recognized as a file mutation tool"
             );
         }
     }

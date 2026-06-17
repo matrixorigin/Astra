@@ -342,7 +342,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
     /// Execute a batch of read-only tools concurrently.
     /// Returns false if the round should be aborted.
     pub(crate) async fn run_batch_concurrent(&mut self, items: &[HeadlessRoundToolIdx]) -> bool {
-        use super::headless_tool_pipeline::execute::execute_tool_pure;
+        use super::headless_tool_pipeline::execute::{
+            execute_tool_pure, execution_result_is_error,
+        };
 
         // Phase 1: validate + permit serially (fast, needs &mut self).
         let mut permitted_batch: Vec<PermittedExecution> = Vec::with_capacity(items.len());
@@ -385,12 +387,10 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         // Phase 3: post-process + record serially (fast, needs &mut self).
         for (execution, idem_key) in executions {
-            let is_err = matches!(
-                astra_turn_core::tool_result_semantics::classify_tool_error(
-                    &execution.name,
-                    &execution.result_str,
-                ),
-                astra_turn_core::tool_result_semantics::ToolErrorSeverity::HardError
+            let is_err = execution_result_is_error(
+                &execution.name,
+                &execution.result_str,
+                execution.tool_result_fields.as_ref(),
             );
             let executed_ms = if execution.is_edge_tool && execution.edge_duration_ms > 0 {
                 execution.edge_duration_ms
@@ -1224,6 +1224,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_success_output_overrides_stale_failed_edge_status() {
+        let mut harness = PipelineHarness::new();
+        let args = json!({
+            "path": "src/lib.rs",
+            "old_str": "before",
+            "new_str": "after"
+        });
+        harness.edge_tool_round[0].tool = "str_replace".to_string();
+        harness.edge_tool_round[0].args = args;
+        harness.edge_tool_round[0].output =
+            "Replaced successfully\n<<<ASTRA_UNIFIED_DIFF>>>\n-old\n+new\n<<<END_ASTRA_UNIFIED_DIFF>>>"
+                .to_string();
+        harness.edge_tool_round[0].status = "error".to_string();
+        let mut fields = edge_runtime_environment_fields();
+        fields.insert("status".to_string(), Value::String("error".to_string()));
+        harness.edge_tool_round[0].tool_result_fields = Some(fields);
+        harness.valid_tool_names = HashSet::from(["str_replace".to_string()]);
+
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected validated execution"),
+        };
+        let permitted = match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::Continue(permitted) => permitted,
+            _ => panic!("expected permitted execution"),
+        };
+
+        let executed = pipeline.execute_execution(permitted).await;
+        assert!(!executed.is_err, "got: {}", executed.execution.result_str);
+        assert!(
+            !executed.execution.result_str.contains("returned an error"),
+            "successful edit must not receive error feedback: {}",
+            executed.execution.result_str
+        );
+
+        pipeline.record_execution(executed).await;
+        assert_eq!(pipeline.ctx.tool_call_records.len(), 1);
+        let record = &pipeline.ctx.tool_call_records[0];
+        assert!(record.ok);
+        assert!(record.error.is_none());
+        assert!(
+            record
+                .result_preview
+                .as_deref()
+                .is_some_and(|preview| preview.starts_with("Replaced successfully"))
+        );
+    }
+
+    #[tokio::test]
     async fn server_fallback_sets_turn_index_for_current_turn_rollback() {
         let mut harness = PipelineHarness::new();
         let dir = tempfile::TempDir::new().unwrap();
@@ -1550,6 +1600,29 @@ mod tests {
         assert!(
             !body.starts_with("Unknown tool"),
             "deferred denial must not reuse the bare unknown-tool copy; got: {body}"
+        );
+        let record = harness
+            .tool_call_records
+            .last()
+            .expect("deferred denial should record a journal placeholder");
+        assert_eq!(record.name, "agent_fanout");
+        assert!(record.ok);
+        assert_eq!(record.error.as_deref(), Some("tool_not_admitted"));
+        assert!(record.is_synthetic_placeholder());
+        assert!(
+            record
+                .result_preview
+                .as_deref()
+                .is_some_and(|preview| preview.starts_with("Deferred:"))
+        );
+        let tool_events = tool_trace_events(&harness);
+        assert_eq!(
+            tool_events[1]
+                .1
+                .as_ref()
+                .and_then(|payload| payload.get("reason"))
+                .and_then(Value::as_str),
+            Some("tool_not_admitted")
         );
 
         // Hallucinated names still get the Unknown-tool body.

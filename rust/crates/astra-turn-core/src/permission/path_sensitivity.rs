@@ -57,6 +57,11 @@ fn classify_current_session_artifact_path(path: &str) -> Option<InternalPathKind
     let mut components = relative.components();
 
     match (components.next(), components.next(), components.next()) {
+        (Some(Component::Normal(journal_file)), None, None)
+            if is_session_journal_file(journal_file) =>
+        {
+            Some(InternalPathKind::SessionJournal)
+        }
         (
             Some(Component::Normal(session_id)),
             Some(Component::Normal(tool_results)),
@@ -69,6 +74,16 @@ fn classify_current_session_artifact_path(path: &str) -> Option<InternalPathKind
         }
         _ => None,
     }
+}
+
+fn is_session_journal_file(file_name: &std::ffi::OsStr) -> bool {
+    let Some(file_name) = file_name.to_str() else {
+        return false;
+    };
+    let Some(session_id) = file_name.strip_suffix(".jsonl") else {
+        return false;
+    };
+    astra_services::session_journal::validate_session_id(session_id).is_ok()
 }
 
 fn expand_home_path(path: &str) -> PathBuf {
@@ -316,6 +331,20 @@ mod tests {
         (temp, guard, artifact_path)
     }
 
+    fn create_current_session_journal() -> (
+        tempfile::TempDir,
+        astra_services::session_journal::JournalDirGuard,
+        std::path::PathBuf,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_root = temp.path().join("sessions");
+        let guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
+        std::fs::create_dir_all(&sessions_root).unwrap();
+        let journal_path = sessions_root.join("550e8400-e29b-41d4-a716-446655440000.jsonl");
+        std::fs::write(&journal_path, "{}\n").unwrap();
+        (temp, guard, journal_path)
+    }
+
     #[test]
     fn classifies_internal_tool_results_as_read_only_artifacts() {
         let (_temp, _guard, artifact_path) = create_current_session_artifact();
@@ -328,6 +357,26 @@ mod tests {
         assert!(path_requires_sensitive_gate(&artifact_path, PathAccess::DirectRead).is_none());
         assert!(path_requires_sensitive_gate(&artifact_path, PathAccess::ShellReference).is_none());
         assert!(path_requires_sensitive_gate(&artifact_path, PathAccess::DirectWrite).is_some());
+    }
+
+    #[test]
+    fn classifies_current_session_journal_as_read_only_artifact() {
+        let (_temp, _guard, journal_path) = create_current_session_journal();
+        let journal_path = journal_path.to_string_lossy();
+
+        assert_eq!(
+            classify_path_sensitivity(&journal_path),
+            PathSensitivity::InternalArtifactReadOnly(InternalPathKind::SessionJournal)
+        );
+        assert!(path_requires_sensitive_gate(&journal_path, PathAccess::DirectRead).is_none());
+        assert!(path_requires_sensitive_gate(&journal_path, PathAccess::ShellReference).is_none());
+        assert!(path_requires_sensitive_gate(&journal_path, PathAccess::DirectWrite).is_some());
+
+        let grep_args = serde_json::json!({
+            "pattern": "str_replace|str replace",
+            "path": journal_path.to_string()
+        });
+        assert_eq!(sensitive_path_match_for_tool_args("grep", &grep_args), None);
     }
 
     #[test]
@@ -347,6 +396,42 @@ mod tests {
         let hit =
             path_requires_sensitive_gate(&artifact_path, PathAccess::DirectRead).expect("gate");
         assert_eq!(hit.sensitivity, PathSensitivity::Sensitive);
+    }
+
+    #[test]
+    fn arbitrary_astra_session_journals_are_not_permission_internal_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal_path = temp
+            .path()
+            .join(".astra/sessions/550e8400-e29b-41d4-a716-446655440000.jsonl");
+        std::fs::create_dir_all(journal_path.parent().unwrap()).unwrap();
+        std::fs::write(&journal_path, "{}\n").unwrap();
+        let journal_path = journal_path.to_string_lossy();
+
+        assert_eq!(
+            classify_path_sensitivity(&journal_path),
+            PathSensitivity::Sensitive
+        );
+        let hit =
+            path_requires_sensitive_gate(&journal_path, PathAccess::DirectRead).expect("gate");
+        assert_eq!(hit.sensitivity, PathSensitivity::Sensitive);
+    }
+
+    #[test]
+    fn per_session_jsonl_files_are_not_session_journals() {
+        let (_temp, _guard, artifact_path) = create_current_session_artifact();
+        let session_dir = artifact_path
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("session dir");
+        let messages_path = session_dir.join("messages.jsonl");
+        std::fs::write(&messages_path, "{}\n").unwrap();
+        let messages_path = messages_path.to_string_lossy();
+
+        assert!(!matches!(
+            classify_path_sensitivity(&messages_path),
+            PathSensitivity::InternalArtifactReadOnly(InternalPathKind::SessionJournal)
+        ));
     }
 
     #[test]

@@ -321,8 +321,9 @@ pub fn is_dangerous_file_path(path: &str) -> bool {
 /// # Examples
 ///
 /// ```ignore
-/// // Safe internal artifact → allow.
+/// // Safe internal artifacts → allow.
 /// assert!(!is_dangerous_read_path("~/.astra/sessions/s1/tool-results/call_abc.txt"));
+/// assert!(!is_dangerous_read_path("~/.astra/sessions/s1.jsonl"));
 /// // Dangerous but not a safe internal path → block.
 /// assert!(is_dangerous_read_path("~/.astra/config.toml"));
 /// assert!(is_dangerous_read_path(".bashrc"));
@@ -349,10 +350,14 @@ pub fn is_dangerous_read_path(path: &str) -> bool {
 /// # Examples
 ///
 /// ```ignore
-/// // Session tool-results are safe to read back for summarization.
+/// // Session artifacts are safe to read back for summarization/diagnostics.
 /// assert_eq!(
 ///     is_internal_safe_path("~/.astra/sessions/s1/tool-results/call_abc.txt"),
 ///     Some(InternalPathKind::SessionToolResult)
+/// );
+/// assert_eq!(
+///     is_internal_safe_path("~/.astra/sessions/s1.jsonl"),
+///     Some(InternalPathKind::SessionJournal)
 /// );
 /// // But arbitrary .astra/ paths are not safe.
 /// assert_eq!(is_internal_safe_path("~/.astra/config.toml"), None);
@@ -404,6 +409,23 @@ pub fn is_internal_safe_path(path: &str) -> Option<InternalPathKind> {
 fn match_internal_safe_pattern(p: &std::path::Path) -> Option<InternalPathKind> {
     let components: Vec<_> = p.components().collect();
 
+    // Look for pattern: .astra/sessions/<session_id>.jsonl.
+    // This is the top-level session journal file, not arbitrary files under a
+    // per-session directory.
+    for i in 0..components.len().saturating_sub(2) {
+        let c0 = components[i].as_os_str().to_string_lossy();
+        let c1 = components.get(i + 1)?.as_os_str().to_string_lossy();
+        let c2 = components.get(i + 2)?.as_os_str().to_string_lossy();
+
+        if c0 == ".astra"
+            && c1 == "sessions"
+            && components.len() == i + 3
+            && looks_like_session_journal_file(&c2)
+        {
+            return Some(InternalPathKind::SessionJournal);
+        }
+    }
+
     // Look for pattern: .astra/sessions/<session_id>/tool-results/<file>.
     // Must match exactly these 4 components in sequence, with at least one more after.
     for i in 0..components.len().saturating_sub(4) {
@@ -423,9 +445,25 @@ fn match_internal_safe_pattern(p: &std::path::Path) -> Option<InternalPathKind> 
     None
 }
 
+fn looks_like_session_journal_file(name: &str) -> bool {
+    let Some(session_id) = name.strip_suffix(".jsonl") else {
+        return false;
+    };
+    // Delegate to the single source of truth. This previously reimplemented
+    // an alphanumeric/length/`-`/`_`/`.` allowlist that drifted from the
+    // canonical `astra_core::session_id::validate` used by the permission
+    // layer (`path_sensitivity.rs`) and the services layer
+    // (`services::session_journal::validate_session_id`). Any divergence
+    // would let the sandbox accept journal filenames the permission layer
+    // rejects (or vice-versa), so both must consult the same validator.
+    astra_core::session_id::validate(session_id).is_ok()
+}
+
 /// Kind of internal path that the agent is allowed to access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InternalPathKind {
+    /// Top-level session journal (e.g. `.astra/sessions/<session_id>.jsonl`).
+    SessionJournal,
     /// Session tool-result artifact (e.g. `.astra/sessions/*/tool-results/call_*.txt`).
     SessionToolResult,
 }
@@ -500,6 +538,42 @@ mod tests {
         };
         let cmd = build_hardened_command(&config, "echo hello");
         assert_eq!(cmd, "echo hello");
+    }
+
+    #[test]
+    fn journal_filename_validation_matches_session_id_rules() {
+        // Contract: `looks_like_session_journal_file` and the canonical
+        // `astra_core::session_id::validate` must agree. Previously these
+        // reimplemented overlapping-but-divergent allowlists; any drift would
+        // let the sandbox accept journal filenames the permission/services
+        // layer rejects (or vice-versa).
+        let good = [
+            "abc-123.jsonl",
+            "550e8400-e29b-41d4-a716-446655440000.jsonl",
+            "session_2024.jsonl",
+        ];
+        let bad = [
+            ".jsonl",                              // empty id
+            "..jsonl",                             // traversal
+            "a/b.jsonl",                           // separator
+            "café.jsonl",                          // non-ASCII
+            "has\nnewline.jsonl",                  // control char
+            &format!("{}.jsonl", "a".repeat(201)), // too long
+        ];
+        for g in good {
+            assert!(
+                looks_like_session_journal_file(g),
+                "{g:?} should be accepted"
+            );
+        }
+        for b in bad {
+            assert!(
+                !looks_like_session_journal_file(b),
+                "{b:?} should be rejected"
+            );
+        }
+        // Non-.jsonl suffix never matches regardless of id validity.
+        assert!(!looks_like_session_journal_file("abc-123.txt"));
     }
 
     #[test]
@@ -652,6 +726,13 @@ mod tests {
 
         // session tool-results are write-dangerous but NOT read-dangerous
         assert!(!is_dangerous_read_path(&artifact_path.to_string_lossy()));
+        let journal_path = temp.path().join(".astra/sessions/s1.jsonl");
+        std::fs::write(&journal_path, "{}\n").unwrap();
+        assert_eq!(
+            is_internal_safe_path(&journal_path.to_string_lossy()),
+            Some(InternalPathKind::SessionJournal)
+        );
+        assert!(!is_dangerous_read_path(&journal_path.to_string_lossy()));
         // But other .astra/ paths remain read-dangerous
         assert!(is_dangerous_read_path("/Users/test/.astra/config.toml"));
         assert!(is_dangerous_read_path(
@@ -668,6 +749,9 @@ mod tests {
         // write-dangerous: tool-results are still flagged
         assert!(is_dangerous_file_path(
             "/Users/test/.astra/sessions/s1/tool-results/call_abc.txt"
+        ));
+        assert!(is_dangerous_file_path(
+            "/Users/test/.astra/sessions/s1.jsonl"
         ));
         assert!(is_dangerous_file_path("/Users/test/.astra/config.toml"));
     }
@@ -824,7 +908,25 @@ mod tests {
             is_internal_safe_path(&format!("cat {artifact_path}")),
             Some(InternalPathKind::SessionToolResult)
         );
+        let journal = root.join(".astra/sessions/s1.jsonl");
+        std::fs::write(&journal, "journal").expect("write test journal");
+        assert_eq!(
+            is_internal_safe_path(&journal.to_string_lossy()),
+            Some(InternalPathKind::SessionJournal)
+        );
+        assert_eq!(
+            is_internal_safe_path(&format!("grep pattern {}", journal.to_string_lossy())),
+            Some(InternalPathKind::SessionJournal)
+        );
         assert_eq!(is_internal_safe_path(&artifact_dir.to_string_lossy()), None);
+        assert_eq!(
+            is_internal_safe_path(
+                &root
+                    .join(".astra/sessions/s1/messages.jsonl")
+                    .to_string_lossy()
+            ),
+            None
+        );
         assert_eq!(
             is_internal_safe_path(&root.join(".astra/config.toml").to_string_lossy()),
             None

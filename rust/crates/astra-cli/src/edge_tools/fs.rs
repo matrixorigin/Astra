@@ -11,11 +11,29 @@ use astra_tools::fs_ops::{
     check_anchor_vs_replacement_size, read_to_string_lossy, str_replace_fail,
     validate_read_file_args,
 };
+use astra_turn_core::tool_result_semantics::TOOL_SUCCESS_SENTINEL;
 use serde_json::{Value, json};
 
 /// Check if a path is a UNC path (Windows network path that could leak NTLM credentials).
 fn is_unc_path(path: &str) -> bool {
     path.starts_with("\\\\") || path.starts_with("//")
+}
+
+/// Append the stable [`TOOL_SUCCESS_SENTINEL`] to a human-readable success body.
+///
+/// Contract (see `tool::result::semantics`): file-mutation emitters MUST emit
+/// the sentinel on success so the body-wins reconciliation can override a stale
+/// failed edge-metadata status. Callers should pass the human-readable message
+/// they were already returning; this preserves display while making the signal
+/// machine-parseable.
+fn success_body(human: &str) -> String {
+    format!("{human}\n{TOOL_SUCCESS_SENTINEL}")
+}
+
+/// In-place variant for emitters that build up `result` incrementally.
+fn append_success_sentinel(result: &mut String) {
+    result.push('\n');
+    result.push_str(TOOL_SUCCESS_SENTINEL);
 }
 
 fn edit_type_label(edit_type: astra_turn_core::file_edit_journal::EditType) -> &'static str {
@@ -889,6 +907,7 @@ impl ToolExecutor {
                             fuzzy_match.strategy,
                             astra_runtime::observability::FuzzyMatchOutcome::Matched,
                         );
+                        append_success_sentinel(&mut result);
                         return result;
                     }
                     Err(e) => return format!("Error writing file: {e}"),
@@ -1018,6 +1037,7 @@ impl ToolExecutor {
                     "exact",
                     astra_runtime::observability::FuzzyMatchOutcome::Matched,
                 );
+                append_success_sentinel(&mut result);
                 result
             }
             Err(e) => format!("Error writing file: {e}"),
@@ -1071,7 +1091,7 @@ impl ToolExecutor {
                         before_content,
                     ),
                 }
-                format!("Deleted: {}", rel_str)
+                success_body(&format!("Deleted: {}", rel_str))
             }
             Err(e) => format!("Error deleting file: {e}"),
         }
@@ -1925,6 +1945,7 @@ impl ToolExecutor {
                 }
 
                 append_str_replace_cli_unified_diff(&mut result, &content, &working, &path);
+                append_success_sentinel(&mut result);
                 result
             }
             Err(e) => format!("Error writing file: {e}"),

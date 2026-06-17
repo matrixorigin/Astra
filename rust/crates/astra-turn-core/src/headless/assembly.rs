@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 
+use crate::tool::categories::is_file_mutation_tool;
 use crate::tool::result::semantics::tool_dedup_signature;
 
 /// One tool slot to execute in a headless round: either a server `tool_calls[i]` or synthetic edge row `i`.
@@ -367,6 +368,20 @@ fn no_matching_edge_execution_message(name: &str) -> String {
         );
     }
 
+    if is_file_mutation_tool(name) {
+        return format!(
+            "Error: headless edge protocol — tool `{name}` has no matching \
+             edge execution in this turn.\n\n\
+             This is a transport binding failure for a dedicated file mutation \
+             tool. Do NOT retry `{name}` in this round and do NOT replace it \
+             with bash, python, shell redirection, or heredocs; those bypass \
+             file-edit guards and may be blocked by workspace policy. Ask the \
+             user to retry in a mode with file-edit transport, or use another \
+             visible dedicated file-edit tool only if it is actually executable \
+             in this turn."
+        );
+    }
+
     format!(
         "Error: headless edge protocol — tool `{name}` has no matching \
          edge execution in this turn.\n\n\
@@ -680,6 +695,40 @@ mod tests {
         );
         assert_eq!(out.output, "from-map");
         assert_eq!(out.duration_ms, 0);
+    }
+
+    #[test]
+    fn no_edge_execution_for_file_mutation_does_not_suggest_shell_fallback() {
+        let rows: Vec<Row> = vec![];
+        let mut consumed = vec![];
+        let by_sig = HashMap::new();
+        let out = take_edge_output_for_tool_call_with_duration(
+            "write_file",
+            &json!({"path": "index.html", "content": "<main></main>"}),
+            &rows,
+            &mut consumed,
+            &by_sig,
+        );
+
+        let lower = out.output.to_ascii_lowercase();
+        assert!(
+            lower.contains("transport binding failure"),
+            "{}",
+            out.output
+        );
+        assert!(
+            lower.contains("do not retry `write_file`"),
+            "{}",
+            out.output
+        );
+        assert!(lower.contains("do not replace"), "{}", out.output);
+        assert!(lower.contains("bash"), "{}", out.output);
+        assert!(lower.contains("shell redirection"), "{}", out.output);
+        assert!(
+            !out.output.contains("Workaround: use `bash`"),
+            "{}",
+            out.output
+        );
     }
 
     #[test]

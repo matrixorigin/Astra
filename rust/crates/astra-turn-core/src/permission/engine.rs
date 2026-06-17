@@ -1483,6 +1483,20 @@ mod tests {
         (temp, guard, artifact_path)
     }
 
+    fn create_current_session_journal() -> (
+        tempfile::TempDir,
+        astra_services::session_journal::JournalDirGuard,
+        std::path::PathBuf,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_root = temp.path().join("sessions");
+        let guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
+        std::fs::create_dir_all(&sessions_root).unwrap();
+        let journal_path = sessions_root.join("550e8400-e29b-41d4-a716-446655440000.jsonl");
+        std::fs::write(&journal_path, "{}\n").unwrap();
+        (temp, guard, journal_path)
+    }
+
     /// **Pinning test** — Plan v3 §P2 requires a fixed evaluation
     /// order to make rule precedence auditable. Any reorder must
     /// be deliberate and update this test.
@@ -1894,6 +1908,38 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_reading_session_journal_is_allowed_in_auto_mode() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let (_temp, _guard, journal_path) = create_current_session_journal();
+        let journal_path = journal_path.to_string_lossy().to_string();
+
+        let grep = evaluate_permission(
+            "grep",
+            &serde_json::json!({
+                "pattern": "str_replace|str replace",
+                "path": journal_path.clone()
+            }),
+            &ctx,
+        );
+        assert!(
+            matches!(grep.decision, HardDecision::Allow),
+            "session journals are first-party diagnostic artifacts and must be searchable in Auto mode: {grep:?}"
+        );
+
+        let bash_read = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": format!("grep 'str_replace' {journal_path}")}),
+            &ctx,
+        );
+        assert!(
+            matches!(bash_read.decision, HardDecision::Allow),
+            "read-only shell searches of session journals must not require manual approval: {bash_read:?}"
+        );
+    }
+
+    #[test]
     fn evaluate_interpreter_pipeline_over_tool_result_skips_sensitive_path_gate() {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,
@@ -1981,6 +2027,35 @@ mod tests {
         assert!(
             !matches!(bash_rm.decision, HardDecision::Allow),
             "destructive shell operations on tool result artifacts must remain gated"
+        );
+    }
+
+    #[test]
+    fn evaluate_writing_session_journal_still_requires_approval() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let (_temp, _guard, journal_path) = create_current_session_journal();
+        let journal_path = journal_path.to_string_lossy().to_string();
+
+        let write_file = evaluate_permission(
+            "write_file",
+            &serde_json::json!({"path": journal_path.clone(), "content": "tamper"}),
+            &ctx,
+        );
+        assert!(
+            !matches!(write_file.decision, HardDecision::Allow),
+            "session journals are read-only diagnostic state"
+        );
+
+        let bash_rm = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": format!("rm -f {journal_path}")}),
+            &ctx,
+        );
+        assert!(
+            !matches!(bash_rm.decision, HardDecision::Allow),
+            "destructive shell operations on session journals must remain gated"
         );
     }
 

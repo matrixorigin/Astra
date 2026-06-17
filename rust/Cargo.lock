@@ -512,6 +512,7 @@ dependencies = [
 name = "astra-sandbox"
 version = "0.1.0"
 dependencies = [
+ "astra-core",
  "astra-skills",
  "regex",
  "serde",
