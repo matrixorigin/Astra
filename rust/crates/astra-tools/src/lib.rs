@@ -398,6 +398,19 @@ pub trait ToolApprovalGate: Send + Sync {
     fn requires_approval(&self, tool_name: &str) -> bool;
 
     /// Returns `true` if this invocation requires approval before execution.
+    ///
+    /// # Contract for implementers
+    ///
+    /// The default implementation ORs [`Self::requires_approval`] with
+    /// [`tool_requires_approval`] — the latter handles argument-sensitive
+    /// checks (e.g. `git(action=commit)` vs `git(action=diff)`).
+    ///
+    /// If you override this method you **must** either:
+    /// 1. call `tool_requires_approval(tool_name, args)` yourself, or
+    /// 2. replicate its argument-sensitive logic.
+    ///
+    /// Failing to do so will silently bypass approval checks for mutating
+    /// git/github actions.
     fn requires_approval_for(&self, tool_name: &str, args: &Value) -> bool {
         self.requires_approval(tool_name) || tool_requires_approval(tool_name, args)
     }

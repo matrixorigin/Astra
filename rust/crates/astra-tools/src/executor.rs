@@ -63,6 +63,10 @@ pub struct DefaultToolExecutor {
     bash_cache: Arc<Mutex<HashMap<BashCacheKey, BashCacheEntry>>>,
     workspace_generation: Arc<AtomicU64>,
     bash_cache_ttl: std::time::Duration,
+    /// Tracks whether the HTTP client was successfully built.
+    /// When `false`, GitHub tools and other HTTP-dependent tools will report
+    /// a diagnostic error explaining why HTTP is unavailable.
+    http_client_available: bool,
 }
 
 /// Key for the per-session bash dedup cache. Bumping ANY of these
@@ -112,6 +116,12 @@ pub const DEFAULT_BASH_CACHE_TTL: std::time::Duration = std::time::Duration::fro
 /// We keep the recovery (continuing is better than propagating panic across
 /// an await boundary in a tool executor), but emit an `error!` so operators
 /// can correlate the root cause.
+///
+/// Also increments a global counter so monitoring systems can alert on
+/// mutex poisoning events without scraping logs.
+static POISONED_LOCK_RECOVERY_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn recover_poisoned_lock<'a, T>(
     result: std::sync::LockResult<std::sync::MutexGuard<'a, T>>,
     lock_name: &'static str,
@@ -119,13 +129,22 @@ fn recover_poisoned_lock<'a, T>(
     match result {
         Ok(guard) => guard,
         Err(poison) => {
+            let count = POISONED_LOCK_RECOVERY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             tracing::error!(
                 lock = lock_name,
+                recovery_count = count,
                 "mutex poisoned by a panicking thread; recovering to keep tool executor available"
             );
             poison.into_inner()
         }
     }
+}
+
+/// Returns the number of times a poisoned mutex was recovered.
+/// Useful for monitoring and alerting.
+#[allow(dead_code)]
+pub fn poisoned_lock_recovery_count() -> u64 {
+    POISONED_LOCK_RECOVERY_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl DefaultToolExecutor {
@@ -141,6 +160,7 @@ impl DefaultToolExecutor {
             bash_cache: Arc::new(Mutex::new(HashMap::new())),
             workspace_generation: Arc::new(AtomicU64::new(0)),
             bash_cache_ttl: DEFAULT_BASH_CACHE_TTL,
+            http_client_available: true,
         }
     }
 
@@ -175,18 +195,21 @@ impl DefaultToolExecutor {
         user_agent: &str,
         timeout: std::time::Duration,
     ) -> Self {
-        let http_client = reqwest::Client::builder()
+        let (http_client, http_client_available) = match reqwest::Client::builder()
             .timeout(timeout)
             .user_agent(user_agent.to_string())
             .no_proxy()
             .build()
-            .unwrap_or_else(|e| {
+        {
+            Ok(client) => (client, true),
+            Err(e) => {
                 tracing::error!(
                     error = %e,
                     "failed to build HTTP client for tool executor — HTTP-dependent tools will be unavailable"
                 );
-                reqwest::Client::new()
-            });
+                (reqwest::Client::new(), false)
+            }
+        };
 
         let ctx = crate::ToolContext {
             project_root: workspace.to_path_buf(),
@@ -201,6 +224,7 @@ impl DefaultToolExecutor {
         };
 
         let mut executor = Self::new(ctx);
+        executor.http_client_available = http_client_available;
         let tokens = crate::github::resolve_github_tokens();
         if !tokens.is_empty() {
             let github = GitHubClient::from_tokens(http_client, tokens, Vec::new());
@@ -607,14 +631,22 @@ impl DefaultToolExecutor {
         let client = match &self.github_client {
             Some(c) => c,
             None => {
+                if !self.http_client_available {
+                    return ToolResult::error(format!(
+                        "Error: github(action='{action}') failed — HTTP client could not be built.\n\n\
+                         This is a system configuration issue (proxy, TLS, network). \
+                         Check server logs for 'failed to build HTTP client' errors.\n\n\
+                         GitHub integration requires a working HTTP client. \
+                         Once the infrastructure issue is resolved, this tool will function normally."
+                    ));
+                }
                 return ToolResult::error(format!(
                     "Error: github(action='{action}') failed — no GitHub token is configured.\n\n\
                      To fix, do ONE of:\n\
                      1. Run `gh auth login` in a terminal (gh CLI stores the token)\n\
                      2. Set the GITHUB_TOKEN environment variable before starting this session\n\n\
-                     After authenticating, restart the session and retry.\n\
-                     Workaround: use `bash` with `gh issue create ...` or `gh pr create ...` directly \
-                     (the gh CLI may already be authenticated separately)."
+                     If you are running in CI, ensure the token is injected into the runtime.\n\
+                     After authentication, restart the session to enable GitHub integration."
                 ));
             }
         };
@@ -1583,8 +1615,13 @@ mod tests {
             result.output
         );
         assert!(
-            result.output.contains("Workaround"),
-            "error must offer a fallback path: {}",
+            result.output.contains("restart the session"),
+            "error must explain how to enable the feature: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("Workaround"),
+            "error must not suggest bypassing the system architecture: {}",
             result.output
         );
     }
@@ -1637,6 +1674,35 @@ mod tests {
                 result.output
             );
         }
+    }
+
+    #[test]
+    fn recover_poisoned_lock_increments_counter() {
+        use std::sync::Mutex;
+
+        let before = super::poisoned_lock_recovery_count();
+
+        // Create a mutex and poison it by panicking while holding the lock
+        let mutex = Mutex::new(42);
+        let mutex_arc = Arc::new(mutex);
+        let mutex_clone = mutex_arc.clone();
+
+        let handle = std::thread::spawn(move || {
+            let _guard = mutex_clone.lock().unwrap();
+            panic!("poison the lock");
+        });
+        let _ = handle.join();
+
+        // Now try to lock it - it should be poisoned
+        let result = mutex_arc.lock();
+        let _guard = super::recover_poisoned_lock(result, "test_lock");
+
+        let after = super::poisoned_lock_recovery_count();
+        assert_eq!(
+            after,
+            before + 1,
+            "poisoned lock recovery should increment the counter"
+        );
     }
 
     #[tokio::test]

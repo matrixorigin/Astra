@@ -11,13 +11,13 @@ use super::tool_execution_binding::{
     ToolTransportKind, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
 };
 use super::tool_external_transport::{
-    GatewayRelayTransport, SandboxResidentAgentTransport, execute_gateway_relay,
-    execute_sandbox_resident_agent,
+    execute_gateway_relay, execute_sandbox_resident_agent, GatewayRelayTransport,
+    SandboxResidentAgentTransport,
 };
-use super::tool_local_transport::{ServerLocalToolTransport, execute_local_transport};
-use super::tool_route_boundary::{ToolRouteBoundary, route_binding_event_fields};
-use super::tool_route_selection::{ToolExecutionRouteKind, routing_decision};
-use super::tool_runner_rpc::{RunnerRpcTransport, execute_runner_rpc};
+use super::tool_local_transport::{execute_local_transport, ServerLocalToolTransport};
+use super::tool_route_boundary::{route_binding_event_fields, ToolRouteBoundary};
+use super::tool_route_selection::{routing_decision, ToolExecutionRouteKind};
+use super::tool_runner_rpc::{execute_runner_rpc, RunnerRpcTransport};
 use super::tool_transport_errors::{
     capability_denied_result, unsupported_workspace_executor_result,
 };
@@ -330,59 +330,25 @@ impl ToolExecutionService {
 
         match route {
             ToolExecutionRouteKind::ServerLocal | ToolExecutionRouteKind::ServerControlPlane => {
-                let (result_workspace, result_executor, result_transport) =
-                    local_result_binding(route, &request);
-                execute_local_transport(
+                execute_local_route(
                     &request,
                     &binding,
-                    &result_workspace,
-                    &result_executor,
-                    result_transport,
+                    route,
                     local_transport,
                     cancel_token.as_ref(),
                 )
                 .await
             }
-            ToolExecutionRouteKind::ServerRuntime => {
-                let (result_workspace, result_executor, result_transport) =
-                    local_result_binding(route, &request);
-                let mut result = execute_local_transport(
+            ToolExecutionRouteKind::ServerRuntime | ToolExecutionRouteKind::RequestScopedMcp => {
+                let mut result = execute_local_route(
                     &request,
                     &binding,
-                    &result_workspace,
-                    &result_executor,
-                    result_transport,
+                    route,
                     local_transport,
                     cancel_token.as_ref(),
                 )
                 .await;
-                let metadata = result.metadata.get_or_insert_with(Map::new);
-                if let Some(fields) = route_binding_event_fields(route, &request) {
-                    for (key, value) in fields {
-                        metadata.entry(key).or_insert(value);
-                    }
-                }
-                result
-            }
-            ToolExecutionRouteKind::RequestScopedMcp => {
-                let (result_workspace, result_executor, result_transport) =
-                    local_result_binding(route, &request);
-                let mut result = execute_local_transport(
-                    &request,
-                    &binding,
-                    &result_workspace,
-                    &result_executor,
-                    result_transport,
-                    local_transport,
-                    cancel_token.as_ref(),
-                )
-                .await;
-                let metadata = result.metadata.get_or_insert_with(Map::new);
-                if let Some(fields) = route_binding_event_fields(route, &request) {
-                    for (key, value) in fields {
-                        metadata.entry(key).or_insert(value);
-                    }
-                }
+                append_route_binding_metadata(&mut result, route, &request);
                 result
             }
             ToolExecutionRouteKind::EdgeBound => {
@@ -502,6 +468,45 @@ fn local_result_binding(
             request.executor.clone(),
             request.executor.transport,
         ),
+    }
+}
+
+/// Execute a tool via the local transport, resolving binding metadata first.
+async fn execute_local_route<L>(
+    request: &ToolExecutionRequest,
+    binding: &astra_runtime_env::RunBinding,
+    route: ToolExecutionRouteKind,
+    local_transport: &L,
+    cancel_token: Option<&Arc<CancellationToken>>,
+) -> astra_tools::ToolResult
+where
+    L: ServerLocalToolTransport + ?Sized,
+{
+    let (result_workspace, result_executor, result_transport) =
+        local_result_binding(route, request);
+    execute_local_transport(
+        request,
+        binding,
+        &result_workspace,
+        &result_executor,
+        result_transport,
+        local_transport,
+        cancel_token,
+    )
+    .await
+}
+
+/// Append route-specific binding metadata to a tool result.
+fn append_route_binding_metadata(
+    result: &mut astra_tools::ToolResult,
+    route: ToolExecutionRouteKind,
+    request: &ToolExecutionRequest,
+) {
+    if let Some(fields) = route_binding_event_fields(route, request) {
+        let metadata = result.metadata.get_or_insert_with(Map::new);
+        for (key, value) in fields {
+            metadata.entry(key).or_insert(value);
+        }
     }
 }
 
