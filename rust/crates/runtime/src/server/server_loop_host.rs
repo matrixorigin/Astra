@@ -2532,6 +2532,44 @@ impl ServerAgenticLoopHost {
         self.admissible_extras = extras;
     }
 
+    /// Compute the effective restricted-tool set for a turn from a base
+    /// (already-merged) restricted set. Applies runtime allowlist
+    /// restrictions, optional interaction-scoped restrictions, boosts, and
+    /// health-gated rescue of activated deferred tools.
+    ///
+    /// Single source of truth shared by `visible_turn_tools`, `execute_turn`,
+    /// and the summary path so the four-step recipe cannot drift between
+    /// call sites.
+    fn compute_effective_restricted(
+        &self,
+        state: &AgenticLoopState,
+        mut effective: HashSet<String>,
+        include_interaction_scope: bool,
+    ) -> HashSet<String> {
+        effective.extend(self.runtime_allowlist_restrictions(state));
+        if include_interaction_scope {
+            let interaction_mode = self.turn_interaction_mode();
+            effective.extend(interaction_scoped_tool_restrictions(interaction_mode));
+        }
+        // Boosted tools are never hidden, even if they landed in the restricted
+        // set earlier (e.g., via stall-based deprioritization).
+        for boosted in &state.boosted_tools {
+            effective.remove(boosted);
+        }
+        if let Some(executor) = state.server_tool_executor.as_deref() {
+            for name in executor.activated_deferred_tool_names() {
+                // Rescue activated deferred tools so they're visible this turn,
+                // but NOT if the health tracker has hard-deprioritized them —
+                // a broken-but-activated tool must stay restricted so it can be
+                // quarantined rather than silently rescued every turn.
+                if !state.turn_guard.health.is_deprioritized(name.as_str()) {
+                    effective.remove(&name);
+                }
+            }
+        }
+        effective
+    }
+
     /// Compute the tool schemas visible for the current turn after applying
     /// health-based restrictions. This is the server-path equivalent of the
     /// CLI's deny-at-assembly behavior.
@@ -2546,24 +2584,8 @@ impl ServerAgenticLoopHost {
                 &mut state.restricted_tools,
             );
         }
-        let mut effective_restricted = state.restricted_tools.clone();
-        effective_restricted.extend(self.runtime_allowlist_restrictions(state));
-        // Boosted tools are never hidden, even if they landed in the restricted
-        // set earlier (e.g., via stall-based deprioritization).
-        for boosted in &state.boosted_tools {
-            effective_restricted.remove(boosted);
-        }
-        if let Some(executor) = state.server_tool_executor.as_deref() {
-            for name in executor.activated_deferred_tool_names() {
-                // Rescue activated deferred tools so they're visible this turn,
-                // but NOT if the health tracker has hard-deprioritized them —
-                // a broken-but-activated tool must stay restricted so it can be
-                // quarantined rather than silently rescued every turn.
-                if !state.turn_guard.health.is_deprioritized(name.as_str()) {
-                    effective_restricted.remove(&name);
-                }
-            }
-        }
+        let effective_restricted =
+            self.compute_effective_restricted(state, state.restricted_tools.clone(), false);
         let visible = self.filtered_turn_tools(&effective_restricted);
         self.sync_valid_tools_to_visible_for_state(&visible, state);
         visible
@@ -3034,24 +3056,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &mut state.restricted_tools,
             );
         }
-        let mut effective_restricted = state.restricted_tools.clone();
-        effective_restricted.extend(self.runtime_allowlist_restrictions(state));
         let interaction_mode = self.turn_interaction_mode();
-        effective_restricted.extend(interaction_scoped_tool_restrictions(interaction_mode));
-        for boosted in &state.boosted_tools {
-            effective_restricted.remove(boosted);
-        }
-        if let Some(executor) = state.server_tool_executor.as_deref() {
-            for name in executor.activated_deferred_tool_names() {
-                // Rescue activated deferred tools so they're visible this turn,
-                // but NOT if the health tracker has hard-deprioritized them —
-                // a broken-but-activated tool must stay restricted so it can be
-                // quarantined rather than silently rescued every turn.
-                if !state.turn_guard.health.is_deprioritized(name.as_str()) {
-                    effective_restricted.remove(&name);
-                }
-            }
-        }
+        let effective_restricted =
+            self.compute_effective_restricted(state, state.restricted_tools.clone(), true);
         let visible_tools = self.filtered_turn_tools(&effective_restricted);
         self.sync_valid_tools_to_visible_for_state(&visible_tools, state);
 
@@ -3706,27 +3713,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .unwrap_or("")
             .to_string();
 
-        let mut effective_restricted = state.restricted_tools.clone();
+        let mut base = state.restricted_tools.clone();
         if !state.widen_selection_pending {
-            merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut effective_restricted);
+            merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut base);
         }
-        effective_restricted.extend(self.runtime_allowlist_restrictions(state));
-        let interaction_mode = self.turn_interaction_mode();
-        effective_restricted.extend(interaction_scoped_tool_restrictions(interaction_mode));
-        for boosted in &state.boosted_tools {
-            effective_restricted.remove(boosted);
-        }
-        if let Some(executor) = state.server_tool_executor.as_deref() {
-            for name in executor.activated_deferred_tool_names() {
-                // Rescue activated deferred tools so they're visible this turn,
-                // but NOT if the health tracker has hard-deprioritized them —
-                // a broken-but-activated tool must stay restricted so it can be
-                // quarantined rather than silently rescued every turn.
-                if !state.turn_guard.health.is_deprioritized(name.as_str()) {
-                    effective_restricted.remove(&name);
-                }
-            }
-        }
+        let effective_restricted = self.compute_effective_restricted(state, base, true);
         let visible_tools = self.filtered_turn_tools(&effective_restricted);
         // We only need the system messages here — the inline summary call
         // reuses the main turn's system prefix, not its tools.
