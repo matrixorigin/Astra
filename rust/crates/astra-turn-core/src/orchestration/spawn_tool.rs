@@ -131,6 +131,13 @@ pub struct SpawnAgentInput {
     /// must not silently become a fourth requested agent.
     #[serde(default)]
     pub fanout_slot_index: Option<usize>,
+
+    /// Optional stable caller-facing label for the fanout slot. This is
+    /// not the runtime-generated `agent_id`; it exists so callers can
+    /// correlate start/results/status projections without inventing
+    /// extra top-level fields.
+    #[serde(default)]
+    pub fanout_slot_id: Option<String>,
 }
 
 impl SpawnAgentInput {
@@ -142,7 +149,8 @@ impl SpawnAgentInput {
         let any = self.fanout_group_id.is_some()
             || self.fanout_group_title.is_some()
             || self.fanout_target_count.is_some()
-            || self.fanout_slot_index.is_some();
+            || self.fanout_slot_index.is_some()
+            || self.fanout_slot_id.is_some();
         if !any {
             return Ok(None);
         }
@@ -164,7 +172,13 @@ impl SpawnAgentInput {
         let slot_index = self
             .fanout_slot_index
             .ok_or_else(|| format!("fanout group '{group_id}' requires fanout_slot_index"))?;
-        AgentFanoutSlotIdentity::new(group_id, target_count, slot_index).map(Some)
+        AgentFanoutSlotIdentity::new(
+            group_id,
+            target_count,
+            slot_index,
+            self.fanout_slot_id.clone(),
+        )
+        .map(Some)
     }
 }
 
@@ -218,6 +232,7 @@ impl Default for SpawnAgentInput {
             fanout_group_title: None,
             fanout_target_count: None,
             fanout_slot_index: None,
+            fanout_slot_id: None,
         }
     }
 }
@@ -460,7 +475,8 @@ mod tests {
             "fanout_group_id": "review-1",
             "fanout_group_title": "Review fanout",
             "fanout_target_count": 3,
-            "fanout_slot_index": 1
+            "fanout_slot_index": 1,
+            "fanout_slot_id": "storage"
         }"#;
         let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
         input.validate_fanout_metadata().unwrap();
@@ -468,6 +484,16 @@ mod tests {
         assert_eq!(input.fanout_group_title.as_deref(), Some("Review fanout"));
         assert_eq!(input.fanout_target_count, Some(3));
         assert_eq!(input.fanout_slot_index, Some(1));
+        assert_eq!(input.fanout_slot_id.as_deref(), Some("storage"));
+        assert_eq!(
+            input
+                .fanout_slot_identity()
+                .unwrap()
+                .unwrap()
+                .slot_id
+                .as_deref(),
+            Some("storage")
+        );
     }
 
     #[test]
@@ -523,6 +549,20 @@ mod tests {
         .unwrap();
         let err = out_of_range.validate_fanout_metadata().unwrap_err();
         assert!(err.contains("outside target_count"), "{err}");
+
+        let empty_slot_id: SpawnAgentInput = serde_json::from_str(
+            r#"{
+                "description": "Review storage",
+                "prompt": "Review storage layer",
+                "fanout_group_id": "review-1",
+                "fanout_target_count": 3,
+                "fanout_slot_index": 1,
+                "fanout_slot_id": "   "
+            }"#,
+        )
+        .unwrap();
+        let err = empty_slot_id.validate_fanout_metadata().unwrap_err();
+        assert!(err.contains("fanout_slot_id"), "{err}");
     }
 
     #[test]

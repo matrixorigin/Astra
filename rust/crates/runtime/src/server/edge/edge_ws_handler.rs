@@ -66,9 +66,9 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
                         edge_agent_id,
                         hostname,
                         workspace_dir,
-                        capabilities: _,
+                        capabilities,
                     }) => {
-                        return Some((token, edge_agent_id, hostname, workspace_dir));
+                        return Some((token, edge_agent_id, hostname, workspace_dir, capabilities));
                     }
                     _ => {
                         let _ = send_edge_msg(
@@ -87,7 +87,7 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
     })
     .await;
 
-    let (token, edge_agent_id, hostname, workspace_dir) = match auth_result {
+    let (token, edge_agent_id, hostname, workspace_dir, capabilities) = match auth_result {
         Ok(Some(auth)) => auth,
         _ => {
             tracing::warn!(
@@ -140,6 +140,13 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
     )
     .await;
 
+    // ── Phase 1a: Validate & sanitize self-reported capabilities ─────
+    // Edge nodes self-report their capabilities; a malicious edge could
+    // fabricate tool names or claim capabilities it doesn't possess.
+    // We validate against the server-side registry and strip anything
+    // that doesn't check out.
+    let capabilities = validate_edge_capabilities(capabilities, &edge_agent_id, &user_id);
+
     tracing::info!(
         user_id = %user_id,
         edge_agent_id = %edge_agent_id,
@@ -148,12 +155,15 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
     );
 
     // ── Phase 2: Register in pool ────────────────────────────────────
-    let (pool_tx, mut pool_rx) = mpsc::unbounded_channel::<EdgeServerMessage>();
-    state.edge_connection_pool.register(
+    let (pool_tx, mut pool_rx) = mpsc::channel::<EdgeServerMessage>(
+        astra_server_types::edge_connection_pool::EDGE_WS_CHANNEL_CAPACITY,
+    );
+    state.edge_connection_pool.register_with_capabilities(
         &user_id,
         &edge_agent_id,
         hostname.clone(),
         workspace_dir.clone(),
+        capabilities.clone(),
         pool_tx,
     );
 
@@ -167,7 +177,7 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
             &edge_id_for_registry,
             hostname.as_deref(),
             workspace_dir.as_deref(),
-            None,
+            capabilities,
         )
         .await;
 
@@ -371,4 +381,82 @@ async fn send_edge_msg(
         .send(Message::Text(text.into()))
         .await
         .map_err(|_| ())
+}
+
+/// Validate edge self-reported capabilities against the server-side tool
+/// registry. Strips tool names that don't exist in the built-in registry
+/// (a malicious edge could fabricate them) and ensures the executor type
+/// is consistent with an edge connection.
+///
+/// Returns the sanitized capabilities JSON, or `None` if the edge claimed
+/// no valid tools.
+fn validate_edge_capabilities(
+    capabilities: Option<serde_json::Value>,
+    edge_agent_id: &str,
+    _user_id: &str,
+) -> Option<serde_json::Value> {
+    let capabilities = capabilities?;
+
+    let mut advert = match serde_json::from_value::<
+        astra_runtime_env::RuntimeEnvironmentAdvertisement,
+    >(capabilities.clone())
+    {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(
+                target: "astra_runtime::edge_ws",
+                edge_agent_id = %edge_agent_id,
+                error = %e,
+                "edge sent unparseable capabilities; accepting with empty capabilities"
+            );
+            return None;
+        }
+    };
+
+    // Reject schema versions we don't understand.
+    if advert.schema_version != astra_runtime_env::RuntimeEnvironmentAdvertisement::SCHEMA_VERSION {
+        tracing::warn!(
+            target: "astra_runtime::edge_ws",
+            edge_agent_id = %edge_agent_id,
+            claimed = advert.schema_version,
+            expected = astra_runtime_env::RuntimeEnvironmentAdvertisement::SCHEMA_VERSION,
+            "edge sent unknown schema version; accepting with empty capabilities"
+        );
+        return None;
+    }
+
+    // Ensure the executor is actually an edge agent (not a cloud runner
+    // or local CLI masquerading as edge).
+    if !advert.binding.executor.is_edge_agent() {
+        tracing::warn!(
+            target: "astra_runtime::edge_ws",
+            edge_agent_id = %edge_agent_id,
+            executor = ?advert.binding.executor,
+            "edge sent non-edge executor binding; accepting with empty capabilities"
+        );
+        return None;
+    }
+
+    // Cross-reference tool names against the server-side built-in registry.
+    // Strip any tool name that doesn't exist — a malicious edge cannot
+    // fabricate tools it doesn't really have.
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let original_count = advert.binding.tool_surface.tool_names.len();
+    advert
+        .binding
+        .tool_surface
+        .tool_names
+        .retain(|name| registry.get(name).is_some());
+    let stripped = original_count - advert.binding.tool_surface.tool_names.len();
+    if stripped > 0 {
+        tracing::warn!(
+            target: "astra_runtime::edge_ws",
+            edge_agent_id = %edge_agent_id,
+            stripped,
+            remaining = advert.binding.tool_surface.tool_names.len(),
+            "edge advertised non-existent tools — stripped"
+        );
+    }
+
+    serde_json::to_value(&advert).ok()
 }

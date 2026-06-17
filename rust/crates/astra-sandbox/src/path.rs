@@ -1,6 +1,6 @@
 //! Path validation and boundary enforcement.
 
-use super::policy::{SandboxMode, SandboxPolicy};
+use super::policy::{IsolationLevel, SandboxPolicy};
 use std::path::{Path, PathBuf};
 
 /// Error type for path validation failures.
@@ -59,8 +59,8 @@ impl SandboxPathError {
 
 /// Validate and resolve a path against the sandbox policy.
 ///
-/// For Permissive mode, returns the path as-is (backward compatible).
-/// For Standard/Strict modes:
+/// For Permissive isolation, returns the path as-is.
+/// For Standard/Strict isolation:
 /// 1. Resolves the path (relative to project_root or absolute)
 /// 2. Canonicalizes to resolve symlinks and `..` components
 /// 3. Checks the canonical path is within allowed boundaries
@@ -69,8 +69,8 @@ impl SandboxPathError {
 ///
 /// Returns `SandboxPathError` if the path escapes the boundary or can't be resolved.
 pub fn validate_path(policy: &SandboxPolicy, path: &str) -> Result<PathBuf, SandboxPathError> {
-    // Permissive mode: no validation, backward compatible
-    if policy.mode == SandboxMode::Permissive {
+    // Permissive isolation: no validation.
+    if policy.isolation == IsolationLevel::Permissive {
         let p = Path::new(path);
         return Ok(if p.is_absolute() {
             p.to_path_buf()
@@ -87,7 +87,11 @@ pub fn validate_path(policy: &SandboxPolicy, path: &str) -> Result<PathBuf, Sand
         policy.project_root.join(raw)
     };
 
-    // For existing paths: canonicalize to follow symlinks and resolve ..
+    // Resolve symlinks safely: canonicalize what exists, normalize the rest.
+    // This mitigates TOCTOU attacks where a symlink is created between exists() and
+    // canonicalize(), and prevents new-file paths from silently escaping via
+    // symlinked parent directories. Note: a small race window remains between
+    // exists() and canonicalize(); true prevention requires openat2(RESOLVE_BENEATH).
     let canonical = if resolved.exists() {
         resolved
             .canonicalize()
@@ -96,8 +100,9 @@ pub fn validate_path(policy: &SandboxPolicy, path: &str) -> Result<PathBuf, Sand
                 reason: e.to_string(),
             })?
     } else {
-        // For new files: normalize the path components manually
-        normalize_path(&resolved)
+        // For new files: canonicalize the nearest existing ancestor to resolve
+        // symlinks in parent components, then append the remaining path segments.
+        canonicalize_parent_and_append(&resolved)?
     };
 
     // Check boundary
@@ -116,7 +121,7 @@ pub fn validate_path(policy: &SandboxPolicy, path: &str) -> Result<PathBuf, Sand
 ///
 /// Resolves `.` and `..` components lexically. This doesn't follow symlinks
 /// but prevents obvious directory traversal attacks.
-pub(crate) fn normalize_path(path: &Path) -> PathBuf {
+pub fn normalize_path(path: &Path) -> PathBuf {
     let mut components = Vec::new();
 
     for component in path.components() {
@@ -144,6 +149,49 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     components.iter().collect()
 }
 
+/// Canonicalize the nearest existing ancestor directory, then append the remaining
+/// path segments. This safely resolves symlinks in parent components for new-file paths.
+///
+/// Example: if `/home/user/proj/subdir` exists but `newfile.txt` doesn't, canonicalize
+/// `/home/user/proj/subdir` then append `newfile.txt`.
+pub fn canonicalize_parent_and_append(path: &Path) -> Result<PathBuf, SandboxPathError> {
+    let mut current = path.to_path_buf();
+    let mut suffix = Vec::new();
+
+    // Walk up until we find an existing ancestor
+    while !current.exists() {
+        if let Some(name) = current.file_name() {
+            suffix.push(name.to_os_string());
+        } else {
+            break;
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+
+    // Canonicalize the existing ancestor
+    let canonical_base = if current.exists() {
+        current
+            .canonicalize()
+            .map_err(|e| SandboxPathError::ResolutionFailed {
+                requested: path.display().to_string(),
+                reason: e.to_string(),
+            })?
+    } else {
+        // Fallback: couldn't find any existing ancestor, normalize the whole path
+        return Ok(normalize_path(path));
+    };
+
+    // Append the suffix in reverse order (we collected bottom-up)
+    let mut result = canonical_base;
+    for segment in suffix.into_iter().rev() {
+        result.push(segment);
+    }
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,10 +204,10 @@ mod tests {
         SandboxPolicy::strict(root)
     }
 
-    // ── Permissive mode ────────────────────────────────────────────────��
+    // ── Permissive isolation ─────────────────────────────────────────────
 
     #[test]
-    fn permissive_mode_path_validation() {
+    fn permissive_isolation_path_validation() {
         let p = SandboxPolicy::permissive("/home/user/project");
         // Allows absolute paths
         let result = validate_path(&p, "/etc/passwd");
@@ -177,10 +225,10 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ── Standard mode ────────────────────────────────────────────────────
+    // ── Standard isolation ───────────────────────────────────────────────
 
     #[test]
-    fn standard_mode_path_validation() {
+    fn standard_isolation_path_validation() {
         let p = standard_policy("/home/user/proj");
         // Allows relative within project
         assert!(validate_path(&p, "subdir/file.txt").is_ok());
@@ -199,10 +247,10 @@ mod tests {
         assert!(validate_path(&p, "/etc/shadow").is_err());
     }
 
-    // ── Strict mode ──────────────────────────────────────────────────────
+    // ── Strict isolation ─────────────────────────────────────────────────
 
     #[test]
-    fn strict_mode_path_validation() {
+    fn strict_isolation_path_validation() {
         let p = strict_policy("/home/user/project");
         // Blocks /var/tmp
         assert!(validate_path(&p, "/var/tmp/secret").is_err());

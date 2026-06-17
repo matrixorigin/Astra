@@ -531,7 +531,8 @@ async fn run_archive_gc_batch(pool: SharedPool, limit: i64) -> Result<u64, Strin
 pub(crate) fn spawn_session_todo_stale_sweeper(
     pool: SharedPool,
     lease: Arc<crate::server::sweeper_lease::SweeperLease>,
-) {
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(STALE_SWEEP_INTERVAL_SECS));
@@ -539,101 +540,100 @@ pub(crate) fn spawn_session_todo_stale_sweeper(
 
         let mut consecutive_failures: u32 = 0;
         loop {
-            interval.tick().await;
-            let tick_result = AssertUnwindSafe(async {
-                match lease.check_leader().await {
-                    crate::server::sweeper_lease::LeaderStatus::Leader => {}
-                    crate::server::sweeper_lease::LeaderStatus::NotLeader => return,
-                    crate::server::sweeper_lease::LeaderStatus::Unavailable(e) => {
-                        tracing::warn!(
-                            target: "astra_runtime::session_todo_sweeper",
-                            error = %e,
-                            "stale sweep lease check unavailable, skipping"
-                        );
-                        return;
-                    }
-                }
-                match run_stale_in_progress_sweep(pool.clone()).await {
-                    Ok(0) => {
-                        consecutive_failures = 0;
-                    }
-                    Ok(n) => {
-                        consecutive_failures = 0;
-                        tracing::info!(
-                            target: "astra_runtime::session_todo_sweeper",
-                            rows = n,
-                            "auto-paused {n} stale in_progress task(s)"
-                        );
-                    }
-                    Err(e) => {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    let tick_result = AssertUnwindSafe(async {
+                        match lease.check_leader().await {
+                            crate::server::sweeper_lease::LeaderStatus::Leader => {}
+                            crate::server::sweeper_lease::LeaderStatus::NotLeader => return,
+                            crate::server::sweeper_lease::LeaderStatus::Unavailable(e) => {
+                                tracing::warn!(
+                                    target: "astra_runtime::session_todo_sweeper",
+                                    error = %e,
+                                    "stale sweep lease check unavailable, skipping"
+                                );
+                                return;
+                            }
+                        }
+                        match run_stale_in_progress_sweep(pool.clone()).await {
+                            Ok(0) => {
+                                consecutive_failures = 0;
+                            }
+                            Ok(n) => {
+                                consecutive_failures = 0;
+                                tracing::info!(
+                                    target: "astra_runtime::session_todo_sweeper",
+                                    rows = n,
+                                    "auto-paused {n} stale in_progress task(s)"
+                                );
+                            }
+                            Err(e) => {
+                                consecutive_failures = consecutive_failures.saturating_add(1);
+                                if consecutive_failures >= STALE_SWEEP_ALERT_THRESHOLD {
+                                    tracing::error!(
+                                        target: "astra_runtime::session_todo_sweeper",
+                                        consecutive_failures = consecutive_failures,
+                                        error = %e,
+                                        "stale-in_progress sweeper has failed {consecutive_failures} \
+                                         consecutive times — DB or infrastructure may be degraded"
+                                    );
+                                } else {
+                                    tracing::error!(
+                                        target: "astra_runtime::session_todo_sweeper",
+                                        error = %e,
+                                        "stale-in_progress sweep failed"
+                                    );
+                                }
+                            }
+                        }
+                        match run_stale_idempotency_sweep(pool.clone()).await {
+                            Ok(0) => {}
+                            Ok(n) => {
+                                tracing::info!(
+                                    target: "astra_runtime::session_todo_sweeper",
+                                    rows = n,
+                                    "completed {n} stale idempotency row(s) with error message"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    target: "astra_runtime::session_todo_sweeper",
+                                    error = %e,
+                                    "stale-idempotency sweep failed"
+                                );
+                            }
+                        }
+                    })
+                    .catch_unwind()
+                    .await;
+                    if let Err(panic_err) = tick_result {
                         consecutive_failures = consecutive_failures.saturating_add(1);
+                        let msg = panic_err
+                            .downcast_ref::<&str>()
+                            .copied()
+                            .or_else(|| panic_err.downcast_ref::<String>().map(|s| s.as_str()))
+                            .unwrap_or("unknown panic");
                         if consecutive_failures >= STALE_SWEEP_ALERT_THRESHOLD {
                             tracing::error!(
                                 target: "astra_runtime::session_todo_sweeper",
                                 consecutive_failures = consecutive_failures,
-                                error = %e,
-                                "stale-in_progress sweeper has failed {consecutive_failures} \
+                                panic = %msg,
+                                "stale-in_progress sweeper has panicked {consecutive_failures} \
                                  consecutive times — DB or infrastructure may be degraded"
                             );
                         } else {
                             tracing::error!(
                                 target: "astra_runtime::session_todo_sweeper",
-                                error = %e,
-                                "stale-in_progress sweep failed"
+                                panic = %msg,
+                                "stale-in_progress sweeper panicked; will retry on next tick"
                             );
                         }
                     }
                 }
-                match run_stale_idempotency_sweep(pool.clone()).await {
-                    Ok(0) => {}
-                    Ok(n) => {
-                        tracing::info!(
-                            target: "astra_runtime::session_todo_sweeper",
-                            rows = n,
-                            "completed {n} stale idempotency row(s) with error message"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            target: "astra_runtime::session_todo_sweeper",
-                            error = %e,
-                            "stale-idempotency sweep failed"
-                        );
-                    }
-                }
-            })
-            .catch_unwind()
-            .await;
-            if let Err(panic_err) = tick_result {
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                let msg = panic_err
-                    .downcast_ref::<&str>()
-                    .copied()
-                    .or_else(|| panic_err.downcast_ref::<String>().map(|s| s.as_str()))
-                    .unwrap_or("unknown panic");
-                if consecutive_failures >= STALE_SWEEP_ALERT_THRESHOLD {
-                    tracing::error!(
-                        target: "astra_runtime::session_todo_sweeper",
-                        consecutive_failures = consecutive_failures,
-                        panic = %msg,
-                        "stale-in_progress sweeper has panicked {consecutive_failures} \
-                         consecutive times — DB or infrastructure may be degraded"
-                    );
-                } else {
-                    tracing::error!(
-                        target: "astra_runtime::session_todo_sweeper",
-                        panic = %msg,
-                        "stale-in_progress sweeper panicked; will retry on next tick"
-                    );
-                }
             }
-            // No exponential backoff: sleeping after a failure delays
-            // recovery when the DB comes back mid-backoff.  The 5-minute
-            // tick interval provides natural spacing; a deterministic
-            // corrupt-row panic is already logged above and pauses until
-            // human remediation anyway.
         }
-    });
+    })
 }
 
 /// Spawn the weekly archive hygiene sweepers. First pass auto-archives
@@ -643,71 +643,76 @@ pub(crate) fn spawn_session_todo_stale_sweeper(
 pub(crate) fn spawn_session_todo_archive_sweeper(
     pool: SharedPool,
     lease: Arc<crate::server::sweeper_lease::SweeperLease>,
-) {
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(ARCHIVE_SWEEP_INTERVAL_SECS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            interval.tick().await;
-            let tick_result = AssertUnwindSafe(async {
-                match lease.check_leader().await {
-                    crate::server::sweeper_lease::LeaderStatus::Leader => {}
-                    crate::server::sweeper_lease::LeaderStatus::NotLeader => return,
-                    crate::server::sweeper_lease::LeaderStatus::Unavailable(e) => {
-                        tracing::warn!(
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    let tick_result = AssertUnwindSafe(async {
+                        match lease.check_leader().await {
+                            crate::server::sweeper_lease::LeaderStatus::Leader => {}
+                            crate::server::sweeper_lease::LeaderStatus::NotLeader => return,
+                            crate::server::sweeper_lease::LeaderStatus::Unavailable(e) => {
+                                tracing::warn!(
+                                    target: "astra_runtime::session_todo_sweeper",
+                                    error = %e,
+                                    "archive sweep lease check unavailable, skipping"
+                                );
+                                return;
+                            }
+                        }
+                        let auto_archive_days = completed_auto_archive_days();
+                        match run_completed_auto_archive_once(pool.clone()).await {
+                            Ok(0) => {}
+                            Ok(n) => tracing::info!(
+                                target: "astra_runtime::session_todo_sweeper",
+                                rows = n,
+                                older_than_days = auto_archive_days,
+                                "auto-archived {n} completed task(s) older than {auto_archive_days} days"
+                            ),
+                            Err(e) => tracing::warn!(
+                                target: "astra_runtime::session_todo_sweeper",
+                                error = %e,
+                                "completed-auto-archive sweep failed"
+                            ),
+                        }
+                        match run_archive_gc_once(pool.clone()).await {
+                            Ok(0) => {}
+                            Ok(n) => tracing::info!(
+                                target: "astra_runtime::session_todo_sweeper",
+                                rows = n,
+                                "garbage-collected {n} archived task row(s)"
+                            ),
+                            Err(e) => tracing::warn!(
+                                target: "astra_runtime::session_todo_sweeper",
+                                error = %e,
+                                "archive-gc failed"
+                            ),
+                        }
+                    })
+                    .catch_unwind()
+                    .await;
+                    if let Err(panic_err) = tick_result {
+                        let msg = panic_err
+                            .downcast_ref::<&str>()
+                            .copied()
+                            .or_else(|| panic_err.downcast_ref::<String>().map(|s| s.as_str()))
+                            .unwrap_or("unknown panic");
+                        tracing::error!(
                             target: "astra_runtime::session_todo_sweeper",
-                            error = %e,
-                            "archive sweep lease check unavailable, skipping"
+                            panic = %msg,
+                            "archive sweeper panicked; will retry on next tick"
                         );
-                        return;
                     }
                 }
-                let auto_archive_days = completed_auto_archive_days();
-                match run_completed_auto_archive_once(pool.clone()).await {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!(
-                        target: "astra_runtime::session_todo_sweeper",
-                        rows = n,
-                        older_than_days = auto_archive_days,
-                        "auto-archived {n} completed task(s) older than {auto_archive_days} days"
-                    ),
-                    Err(e) => tracing::warn!(
-                        target: "astra_runtime::session_todo_sweeper",
-                        error = %e,
-                        "completed-auto-archive sweep failed"
-                    ),
-                }
-                match run_archive_gc_once(pool.clone()).await {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!(
-                        target: "astra_runtime::session_todo_sweeper",
-                        rows = n,
-                        "garbage-collected {n} archived task row(s)"
-                    ),
-                    Err(e) => tracing::warn!(
-                        target: "astra_runtime::session_todo_sweeper",
-                        error = %e,
-                        "archive-gc failed"
-                    ),
-                }
-            })
-            .catch_unwind()
-            .await;
-            if let Err(panic_err) = tick_result {
-                let msg = panic_err
-                    .downcast_ref::<&str>()
-                    .copied()
-                    .or_else(|| panic_err.downcast_ref::<String>().map(|s| s.as_str()))
-                    .unwrap_or("unknown panic");
-                tracing::error!(
-                    target: "astra_runtime::session_todo_sweeper",
-                    panic = %msg,
-                    "archive sweeper panicked; will retry on next tick"
-                );
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]

@@ -12,31 +12,38 @@ use serde_json::{Value, json};
 
 use crate::tool::args::hints::{command_hint_from_args, path_hint_from_args};
 
+const WORKSPACE_MARKERS: &[(&str, &str)] = &[
+    ("Cargo.toml", "rust"),
+    ("package.json", "node/javascript"),
+    ("go.mod", "go"),
+    ("pyproject.toml", "python"),
+    ("requirements.txt", "python"),
+    ("pom.xml", "java/maven"),
+    ("build.gradle", "java/gradle"),
+    ("Makefile", "make"),
+    ("Dockerfile", "docker"),
+    ("docker-compose.yml", "docker-compose"),
+    ("docker-compose.yaml", "docker-compose"),
+];
+
 /// Build a compact workspace context object for the LLM / server (`edge_profile.workspace`).
 /// Detects project type, key files, and top-level directory structure. Capped implicitly by listing limits.
 pub fn detect_workspace_context(project_root: &Path) -> Value {
     let mut project_type = Vec::new();
     let mut key_files = Vec::new();
+    let mut manifest_roots = Vec::new();
 
-    let markers = [
-        ("Cargo.toml", "rust"),
-        ("package.json", "node/javascript"),
-        ("go.mod", "go"),
-        ("pyproject.toml", "python"),
-        ("requirements.txt", "python"),
-        ("pom.xml", "java/maven"),
-        ("build.gradle", "java/gradle"),
-        ("Makefile", "make"),
-        ("Dockerfile", "docker"),
-        ("docker-compose.yml", "docker-compose"),
-        ("docker-compose.yaml", "docker-compose"),
-    ];
-    for (file, ptype) in markers {
+    for &(file, ptype) in WORKSPACE_MARKERS {
         if project_root.join(file).exists() {
             if !project_type.contains(&ptype) {
                 project_type.push(ptype);
             }
             key_files.push(file.to_string());
+            manifest_roots.push(json!({
+                "path": ".",
+                "manifest": file,
+                "kind": ptype,
+            }));
         }
     }
 
@@ -59,6 +66,21 @@ pub fn detect_workspace_context(project_root: &Path) -> Value {
             }
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 top_dirs.push(format!("{name_str}/"));
+                if manifest_roots.len() < 20 {
+                    for &(file, ptype) in WORKSPACE_MARKERS {
+                        if entry.path().join(file).exists() {
+                            if !project_type.contains(&ptype) {
+                                project_type.push(ptype);
+                            }
+                            key_files.push(format!("{name_str}/{file}"));
+                            manifest_roots.push(json!({
+                                "path": name_str.to_string(),
+                                "manifest": file,
+                                "kind": ptype,
+                            }));
+                        }
+                    }
+                }
             }
             if top_dirs.len() >= 15 {
                 break;
@@ -70,6 +92,7 @@ pub fn detect_workspace_context(project_root: &Path) -> Value {
         "project_types": project_type,
         "key_files": key_files,
         "top_directories": top_dirs,
+        "manifest_roots": manifest_roots,
     })
 }
 
@@ -301,6 +324,35 @@ pub fn build_static_environment_context(project_root: &Path) -> String {
 
     lines.push(format!("- CWD: {}", project_root.display()));
 
+    let workspace_context = detect_workspace_context(project_root);
+    if let Some(manifest_roots) = workspace_context
+        .get("manifest_roots")
+        .and_then(Value::as_array)
+        .filter(|roots| !roots.is_empty())
+    {
+        let entries: Vec<String> = manifest_roots
+            .iter()
+            .take(8)
+            .filter_map(|root| {
+                let path = root.get("path").and_then(Value::as_str)?;
+                let manifest = root.get("manifest").and_then(Value::as_str)?;
+                let kind = root
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("project");
+                let display = if path == "." {
+                    manifest.to_string()
+                } else {
+                    format!("{path}/{manifest}")
+                };
+                Some(format!("{display} ({kind})"))
+            })
+            .collect();
+        if !entries.is_empty() {
+            lines.push(format!("- Workspace manifests: {}", entries.join(", ")));
+        }
+    }
+
     if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
         lines.push(format!("- Home: {home}"));
     }
@@ -399,23 +451,29 @@ pub fn make_args_preview(tool_name: &str, args: &Value) -> Option<String> {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         "shell_exec" | "bash" => command_hint_from_args(args).map(String::from),
-        "git_diff" => {
-            let base = args.get("base").and_then(|v| v.as_str()).unwrap_or("HEAD");
-            let file = args.get("file").and_then(|v| v.as_str());
-            match file {
-                Some(f) => Some(format!("{base} -- {f}")),
-                None => Some(base.to_string()),
+        "git" => {
+            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            match action {
+                "diff" => {
+                    let base = args.get("base").and_then(|v| v.as_str()).unwrap_or("HEAD");
+                    let file = args.get("file").and_then(|v| v.as_str());
+                    match file {
+                        Some(f) => Some(format!("{base} -- {f}")),
+                        None => Some(base.to_string()),
+                    }
+                }
+                "log" | "show" => args
+                    .get("ref")
+                    .or_else(|| args.get("commit"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                "blame" => args
+                    .get("file")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                _ => None,
             }
         }
-        "git_log" | "git_show" => args
-            .get("ref")
-            .or_else(|| args.get("commit"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        "git_blame" => args
-            .get("file")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
         "memory" => {
             let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
             match action {
@@ -618,10 +676,46 @@ mod tests {
                 .any(|v| v.as_str() == Some("Cargo.toml")),
             "should list Cargo.toml, got: {ctx}"
         );
+        assert_eq!(ctx["manifest_roots"][0]["path"], ".");
+        assert_eq!(ctx["manifest_roots"][0]["manifest"], "Cargo.toml");
         let dirs = ctx["top_directories"].as_array().unwrap();
         assert!(
             dirs.iter().any(|v| v.as_str() == Some("src/")),
             "should list src/, got: {ctx}"
+        );
+    }
+
+    #[test]
+    fn workspace_context_detects_nested_manifest_roots() {
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("rust")).unwrap();
+        std::fs::write(tmp.path().join("rust").join("Cargo.toml"), "[workspace]").unwrap();
+
+        let ctx = detect_workspace_context(tmp.path());
+
+        assert!(
+            ctx["project_types"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str() == Some("rust")),
+            "should detect nested rust workspace, got: {ctx}"
+        );
+        assert!(
+            ctx["key_files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str() == Some("rust/Cargo.toml")),
+            "should list nested Cargo.toml, got: {ctx}"
+        );
+        assert_eq!(ctx["manifest_roots"][0]["path"], "rust");
+        assert_eq!(ctx["manifest_roots"][0]["manifest"], "Cargo.toml");
+
+        let env = build_static_environment_context(tmp.path());
+        assert!(
+            env.contains("Workspace manifests: rust/Cargo.toml (rust)"),
+            "{env}"
         );
     }
 

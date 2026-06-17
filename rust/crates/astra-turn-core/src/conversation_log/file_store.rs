@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
-use super::{CslEntry, CslStore, CslStoreError, materialize, validate_session_id};
+use super::{materialize, validate_session_id, CslEntry, CslStore, CslStoreError};
 
 const LOG_FILENAME: &str = "conversation_log.jsonl";
 
@@ -84,6 +84,11 @@ impl FileCslStore {
         let tmp = path.with_extension("jsonl.tmp");
         {
             let mut file = std::fs::File::create(&tmp)?;
+            // Copy permissions from the original BEFORE writing payload so the
+            // healed file never exposes sensitive content with looser permissions.
+            if let Ok(meta) = std::fs::metadata(path) {
+                let _ = std::fs::set_permissions(&tmp, meta.permissions());
+            }
             for entry in entries {
                 let mut line = serde_json::to_string(entry)?;
                 line.push('\n');
@@ -226,7 +231,7 @@ impl CslStore for FileCslStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation_log::{AppendMeta, SessionStateCompact, materialize};
+    use crate::conversation_log::{materialize, AppendMeta, SessionStateCompact};
     use serde_json::json;
     use tempfile::TempDir;
 

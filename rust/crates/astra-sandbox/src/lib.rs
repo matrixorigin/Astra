@@ -15,7 +15,6 @@ mod path;
 mod policy;
 mod process_isolation;
 mod shell_hardening;
-mod tier;
 
 // Re-export TrustTier from astra-skills
 pub use astra_skills::manifest::TrustTier;
@@ -27,8 +26,8 @@ pub use command::{
 pub use git_safety::{
     GitSafetyViolation, is_bare_git_repo, is_soft_violation, validate_git_command,
 };
-pub use path::{SandboxPathError, validate_path};
-pub use policy::{SandboxMode, SandboxPolicy};
+pub use path::{SandboxPathError, canonicalize_parent_and_append, normalize_path, validate_path};
+pub use policy::{IsolationLevel, SandboxPolicy};
 pub use process_isolation::{
     CgroupGuard, IsolatedOutput, IsolationConfig, apply_cgroup, execute_isolated,
 };
@@ -38,4 +37,3 @@ pub use shell_hardening::{
     is_dangerous_read_path, is_internal_safe_path, is_session_tool_result_artifact_reference,
     is_shell_home_path, is_windows_drive_path, scrub_secrets_from_env,
 };
-pub use tier::{ToolTier, classify_tool, effective_tier};

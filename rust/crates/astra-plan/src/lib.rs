@@ -15,5 +15,6 @@ pub use repository::{
 };
 pub use resume::{plan_resume_digest, plan_resume_hint_for_session, plan_resume_prompt_hint};
 pub use state::{
-    ExecutionTimeline, PlanExecutionConfig, PlanModeState, TimelineEvent, TimelineEventKind,
+    ExecutionTimeline, PlanExecutionConfig, PlanModeState, PlanPhase, TimelineEvent,
+    TimelineEventKind,
 };

@@ -96,6 +96,24 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         schema_tokens: 35,
     },
     ToolMeta {
+        name: "publish_artifact",
+        description: "Publish a generated workspace or /tmp file for web preview and download",
+        triggers: &[
+            "publish_artifact",
+            "publish artifact",
+            "download file",
+            "preview file",
+            "发布文件",
+            "下载文件",
+            "预览文件",
+        ],
+        pinned: true,
+        intents: &[IntentType::CodeRead],
+        scope: Scope::Local,
+        requires: &[],
+        schema_tokens: 35,
+    },
+    ToolMeta {
         name: "read_file",
         description: "Read file contents with optional line range",
         triggers: &[
@@ -488,6 +506,74 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         schema_tokens: 60,
     },
     ToolMeta {
+        name: "prioritize_tool",
+        description: "Pin a tool as preferred for this session",
+        triggers: &[
+            "prioritize_tool",
+            "prioritize",
+            "prefer tool",
+            "pin tool",
+            "工具优先",
+            "优先使用",
+        ],
+        pinned: false,
+        intents: &[IntentType::Introspect],
+        scope: Scope::Local,
+        requires: &[],
+        schema_tokens: 25,
+    },
+    ToolMeta {
+        name: "deprioritize_tool",
+        description: "Soft-deprioritize a tool for this session",
+        triggers: &[
+            "deprioritize_tool",
+            "deprioritize",
+            "avoid tool",
+            "lower priority",
+            "不要优先",
+            "降低工具优先级",
+        ],
+        pinned: false,
+        intents: &[IntentType::Introspect],
+        scope: Scope::Local,
+        requires: &[],
+        schema_tokens: 25,
+    },
+    ToolMeta {
+        name: "compress_context",
+        description: "Request manual context compression for this session",
+        triggers: &[
+            "compress_context",
+            "compact context",
+            "compress context",
+            "compact history",
+            "压缩上下文",
+            "压缩历史",
+        ],
+        pinned: false,
+        intents: &[IntentType::Introspect],
+        scope: Scope::Local,
+        requires: &[],
+        schema_tokens: 25,
+    },
+    ToolMeta {
+        name: "rollback_session_state",
+        description: "List or restore session-state mutations",
+        triggers: &[
+            "rollback_session_state",
+            "rollback session",
+            "restore session state",
+            "undo preference",
+            "回滚会话",
+            "恢复会话状态",
+        ],
+        pinned: false,
+        intents: &[IntentType::Introspect],
+        scope: Scope::Local,
+        requires: &[],
+        schema_tokens: 35,
+    },
+    ToolMeta {
         name: "mo",
         description: "MatrixOne database operations: query, snapshot, branch. Execute SQL and manage DB state.",
         triggers: &[
@@ -505,6 +591,40 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         scope: Scope::External,
         requires: &[Capability::Database],
         schema_tokens: 40,
+    },
+    ToolMeta {
+        name: "mo_query",
+        description: "Run MatrixOne SQL with pre-state rollback snapshot support",
+        triggers: &[
+            "mo_query",
+            "matrixone query",
+            "run sql",
+            "sql query",
+            "数据库查询",
+            "执行 SQL",
+        ],
+        pinned: false,
+        intents: &[IntentType::Database],
+        scope: Scope::External,
+        requires: &[Capability::Database],
+        schema_tokens: 35,
+    },
+    ToolMeta {
+        name: "rollback_database_snapshots",
+        description: "List or restore MatrixOne rollback snapshots",
+        triggers: &[
+            "rollback_database_snapshots",
+            "database rollback",
+            "restore database snapshot",
+            "matrixone rollback",
+            "数据库回滚",
+            "恢复数据库快照",
+        ],
+        pinned: false,
+        intents: &[IntentType::Database],
+        scope: Scope::External,
+        requires: &[Capability::Database],
+        schema_tokens: 35,
     },
     ToolMeta {
         name: "agent",
@@ -828,12 +948,33 @@ mod tests {
     }
 
     #[test]
+    fn catalog_includes_top_level_session_state_tools() {
+        for name in [
+            "prioritize_tool",
+            "deprioritize_tool",
+            "compress_context",
+            "rollback_session_state",
+        ] {
+            let tool = TOOL_CATALOG
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} must exist in catalog"));
+            assert!(
+                tool.intents.contains(&IntentType::Introspect),
+                "{name} should be modeled as a session-state/introspection control tool"
+            );
+        }
+    }
+
+    #[test]
     fn capability_gated_tools_declare_requires() {
         let cases = [
             ("agent", Capability::AgentSpawner),
             ("agent_fanout", Capability::AgentSpawner),
             ("memory", Capability::MemoryService),
             ("mo", Capability::Database),
+            ("mo_query", Capability::Database),
+            ("rollback_database_snapshots", Capability::Database),
             ("github", Capability::GitHubAuth),
             ("lsp", Capability::LSPServer),
             ("skill", Capability::SkillsCatalog),

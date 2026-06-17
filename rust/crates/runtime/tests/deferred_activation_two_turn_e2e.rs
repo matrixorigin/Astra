@@ -4,17 +4,21 @@
 //! Turn N : LLM sees `<deferred_tools>` listing `github`. Calls
 //!          `tool_search(query="select:github")`. Runtime returns the
 //!          full `github` schema in the tool_result.
-//! Turn N+1: LLM calls `github(action="list_prs", ...)`. `github` is NOT
-//!          in `tools[]` (it's deferred). Validator must accept.
+//! Turn N+1: Runtime records the selected name as activated. LLM calls
+//!          `github(action="list_prs", ...)`. `github` is NOT in `tools[]`
+//!          (it's deferred), but validator accepts it via the activated set.
 //!
 //! This test simulates both turns at the public-API level. If either
 //! primitive regresses — `tool_search(select:…)` stops returning a usable
 //! schema, or the validator stops admitting deferred names — this test
 //! fails loudly.
 
-use astra_runtime::turn::headless_tool_pipeline::admissible_tool_names_from_visible;
+use astra_runtime::turn::headless_tool_pipeline::{
+    admissible_tool_names_from_visible, admissible_tool_names_from_visible_and_extras,
+};
 use astra_tools::schemas::all_tool_schemas;
 use astra_tools::tool_search::tool_search;
+use astra_turn_core::tool::deferred_activation::activated_tool_names_from_tool_search_output;
 use serde_json::{Value, json};
 
 fn pick_schema(schemas: &[Value], name: &str) -> Option<Value> {
@@ -69,17 +73,21 @@ fn turn_n_tool_search_select_returns_usable_schema_for_deferred_tool() {
 #[test]
 fn turn_n_plus_1_validator_admits_github_even_when_not_in_tools_array() {
     // Turn N+1: model now calls github. `tools[]` this turn contains only
-    // the pinned set — github is deferred. The validator's admitted set
-    // must include github because it's dispatchable via the catalog.
+    // the pinned set — github is deferred. Without activation, it stays
+    // rejected.
     let pinned_visible = vec![
         json!({"type": "function", "function": {"name": "bash"}}),
         json!({"type": "function", "function": {"name": "read_file"}}),
         json!({"type": "function", "function": {"name": "tool_search"}}),
     ];
     let admitted = admissible_tool_names_from_visible(&pinned_visible);
+    assert!(!admitted.contains("github"));
+
+    let admitted =
+        admissible_tool_names_from_visible_and_extras(&pinned_visible, &["github".to_string()]);
     assert!(
         admitted.contains("github"),
-        "validator must admit github post-deferred-activation; got {admitted:?}"
+        "validator must admit github only after deferred activation; got {admitted:?}"
     );
     // And the visible tools remain admitted.
     assert!(admitted.contains("bash"));
@@ -100,6 +108,8 @@ fn two_turn_flow_composes_end_to_end() {
         Some("web_fetch"),
         "turn N: select must return web_fetch schema"
     );
+    let activated = activated_tool_names_from_tool_search_output(&t1);
+    assert_eq!(activated, vec!["web_fetch".to_string()]);
 
     // Turn N+1 — validator check. `tools[]` has pinned only, NOT web_fetch.
     let pinned_visible = vec![
@@ -107,9 +117,12 @@ fn two_turn_flow_composes_end_to_end() {
         pick_schema(&schemas, "read_file").unwrap(),
     ];
     let admitted = admissible_tool_names_from_visible(&pinned_visible);
+    assert!(!admitted.contains("web_fetch"));
+
+    let admitted = admissible_tool_names_from_visible_and_extras(&pinned_visible, &activated);
     assert!(
         admitted.contains("web_fetch"),
-        "turn N+1: web_fetch must be admissible"
+        "turn N+1: web_fetch must be admissible after activation"
     );
 }
 

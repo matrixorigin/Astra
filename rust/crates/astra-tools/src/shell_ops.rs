@@ -163,10 +163,13 @@ impl<'a> Drop for DetachHandleGuard<'a> {
 
 use crate::detach::{
     detach_signal_observed, restore_detach_signal_receiver, sigkill_process_group,
-    terminate_detached_payload,
+    terminate_child_gracefully, terminate_detached_payload,
 };
 
 const GLOB_TIMEOUT: Duration = Duration::from_secs(15);
+/// Grace period for SIGTERM before escalating to SIGKILL. Gives child
+/// processes a chance to flush buffers and release resources.
+const TERM_GRACE_PERIOD: Duration = Duration::from_secs(2);
 /// Fallback `bash` timeout when the caller omits `timeout` AND the classifier
 /// cannot confidently identify the command family. See [`classify_bash_command`]
 /// and [`default_bash_timeout_for`] — most real commands hit a classifier branch
@@ -791,6 +794,7 @@ pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
             | CommandRisk::DestructiveCommand(_)
             | CommandRisk::CredentialAccess(_)
             | CommandRisk::WorkspaceOutWrite(_)
+            | CommandRisk::InlineInterpreter(_)
             | CommandRisk::Eval
             | CommandRisk::CommandSubstitution
             | CommandRisk::ProcessSubstitution => {
@@ -1106,13 +1110,7 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
 }
 
 fn should_enable_pipefail(command: &str) -> bool {
-    if !command_has_pipeline_operator(command) {
-        return false;
-    }
-    matches!(
-        classify_bash_command(command),
-        BashCommandClass::Build | BashCommandClass::Lint | BashCommandClass::Test
-    )
+    command_has_pipeline_operator(command)
 }
 
 fn command_has_pipeline_operator(command: &str) -> bool {
@@ -3086,14 +3084,14 @@ async fn run_readonly_command_with_partial(
             Ok(None) => {
                 if tokio::time::Instant::now() >= deadline {
                     timed_out = true;
-                    sigkill_process_group(&mut child).await;
+                    terminate_child_gracefully(&mut child, TERM_GRACE_PERIOD).await;
                     break;
                 }
                 if let Some(token) = cancel_token {
                     tokio::select! {
                         _ = token.cancelled() => {
                             cancelled = true;
-                            sigkill_process_group(&mut child).await;
+                            terminate_child_gracefully(&mut child, TERM_GRACE_PERIOD).await;
                             break;
                         }
                         _ = tokio::time::sleep(Duration::from_millis(25)) => {}
@@ -3104,7 +3102,7 @@ async fn run_readonly_command_with_partial(
             }
             Err(e) => {
                 let error_msg = format!("Error: {command_kind} failed: {e}");
-                sigkill_process_group(&mut child).await;
+                terminate_child_gracefully(&mut child, TERM_GRACE_PERIOD).await;
                 let _ = stdout_task.await;
                 let _ = stderr_task.await;
                 drain_command_chunks(
@@ -4933,6 +4931,59 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
+    async fn bash_grep_no_match_pipeline_is_not_tool_error_with_pipefail() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("haystack.txt"), "hay\n").unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({
+                "command": "grep needle haystack.txt | head -20"
+            }),
+        )
+        .await;
+
+        assert!(
+            !result.is_error,
+            "grep no-match pipeline is informational, not a tool error: {}",
+            result.output
+        );
+        assert_eq!(
+            result.exit_semantics,
+            Some(crate::exit_semantics::ExitSemantics::InformationalFailure)
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_pipeline_preserves_upstream_execution_failure() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({
+                "command": "sh -c 'echo upstream failed >&2; exit 7' | head -20"
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_error,
+            "pipefail must preserve upstream execution failure: {result:?}"
+        );
+        assert_eq!(
+            result.exit_semantics,
+            Some(crate::exit_semantics::ExitSemantics::ExecutionError)
+        );
+        assert!(
+            result.output.contains("[exit code: 7]"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
     async fn bash_diff_difference_is_not_tool_error() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
@@ -5349,13 +5400,13 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[test]
-    fn pipefail_only_enabled_for_build_lint_test_pipelines() {
+    fn pipefail_enabled_for_all_real_pipelines() {
         assert!(should_enable_pipefail(
             "python -m pytest tests 2>&1 | tail -20"
         ));
         assert!(should_enable_pipefail("cargo test 2>&1 | tail -20"));
         assert!(should_enable_pipefail("cargo clippy 2>&1 | tee clippy.log"));
-        assert!(!should_enable_pipefail("rg TODO src | head -20"));
+        assert!(should_enable_pipefail("rg TODO src | head -20"));
         assert!(!should_enable_pipefail("echo 'a|b'"));
         assert!(!should_enable_pipefail("false || true"));
     }

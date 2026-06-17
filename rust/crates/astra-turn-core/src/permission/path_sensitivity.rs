@@ -160,8 +160,20 @@ pub fn sensitive_path_match_for_tool_args(
         && !command.is_empty()
     {
         for token in shell_like_tokens(command) {
-            if let Some(hit) = path_requires_sensitive_gate(&token, PathAccess::ShellReference) {
-                return Some(hit);
+            let extracted = shell_token_path_candidates(&token);
+            if extracted.is_empty() {
+                if let Some(hit) = path_requires_sensitive_gate(&token, PathAccess::ShellReference)
+                {
+                    return Some(hit);
+                }
+                continue;
+            }
+            for candidate in extracted {
+                if let Some(hit) =
+                    path_requires_sensitive_gate(&candidate, PathAccess::ShellReference)
+                {
+                    return Some(hit);
+                }
             }
         }
     }
@@ -202,6 +214,88 @@ fn push_shell_like_token(tokens: &mut Vec<String>, current: &mut String) {
         tokens.push(token);
     }
     current.clear();
+}
+
+fn shell_token_path_candidates(token: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let mut starts = Vec::new();
+    for (idx, _) in token.char_indices() {
+        if idx > 0
+            && let Some(prev) = token[..idx].chars().next_back()
+            && !is_shell_path_start_boundary(prev)
+        {
+            continue;
+        }
+        let rest = &token[idx..];
+        if rest.starts_with('/')
+            || rest.starts_with("~/")
+            || rest.starts_with("$HOME/")
+            || rest.starts_with("${HOME}/")
+        {
+            starts.push(idx);
+        }
+    }
+
+    for start in starts {
+        let rest = &token[start..];
+        let prefix_len = if rest.starts_with("${HOME}/") {
+            "${HOME}/".len()
+        } else if rest.starts_with("$HOME/") {
+            "$HOME/".len()
+        } else if rest.starts_with("~/") {
+            "~/".len()
+        } else {
+            1
+        };
+        let mut end = token.len();
+        for (rel_idx, ch) in rest.char_indices() {
+            if rel_idx < prefix_len {
+                continue;
+            }
+            if ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '\'' | '"'
+                        | '`'
+                        | ')'
+                        | '('
+                        | ','
+                        | ';'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '<'
+                        | '>'
+                        | '|'
+                        | '&'
+                        | '$'
+                        | '\\'
+                        | '!'
+                        | '#'
+                )
+            {
+                end = start + rel_idx;
+                break;
+            }
+        }
+        let candidate = token[start..end]
+            .trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ':' | '[' | ']'))
+            .to_string();
+        if !candidate.is_empty() && !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+
+    candidates
+}
+
+fn is_shell_path_start_boundary(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '\'' | '"' | '`' | '(' | ',' | ';' | '[' | '{' | '<' | '=' | ':' | '|' | '&'
+        )
 }
 
 #[cfg(test)]
@@ -265,6 +359,36 @@ mod tests {
         });
 
         assert_eq!(sensitive_path_match_for_tool_args("bash", &args), None);
+    }
+
+    #[test]
+    fn interpreter_source_string_over_internal_artifact_does_not_trip_sensitive_gate() {
+        let (_temp, _guard, artifact_path) = create_current_session_artifact();
+        std::fs::write(&artifact_path, "{\"ok\":true}").unwrap();
+        let artifact_path = artifact_path.to_string_lossy();
+        let args = serde_json::json!({
+            "command": format!(
+                "python3 -c \"import json; print(json.load(open('{artifact_path}')))\""
+            )
+        });
+
+        assert_eq!(sensitive_path_match_for_tool_args("bash", &args), None);
+    }
+
+    #[test]
+    fn shell_path_candidates_stop_at_shell_metacharacters() {
+        assert_eq!(
+            shell_token_path_candidates("/etc/secret|wc"),
+            vec!["/etc/secret".to_string()]
+        );
+        assert_eq!(
+            shell_token_path_candidates("$HOME/.ssh/id_rsa#comment"),
+            vec!["$HOME/.ssh/id_rsa".to_string()]
+        );
+        assert_eq!(
+            shell_token_path_candidates("${HOME}/.ssh/id_rsa&&echo"),
+            vec!["${HOME}/.ssh/id_rsa".to_string()]
+        );
     }
 
     #[test]

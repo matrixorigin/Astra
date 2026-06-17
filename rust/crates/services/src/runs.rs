@@ -222,9 +222,39 @@ pub enum RequestedTurnInteractionMode {
 pub enum WorkspaceBindingRequestKind {
     ServerSandbox,
     EdgeWorkspace,
-    UploadedSnapshot,
-    GitCheckout,
+    CloudWorkspace,
     None,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum WorkspaceSourceRequest {
+    EdgePath {
+        path: String,
+    },
+    UploadedSnapshot {
+        artifact_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        root: Option<String>,
+    },
+    GitCheckout {
+        repository: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reference: Option<String>,
+    },
+    Template {
+        template_id: String,
+    },
+    DatasetBundle {
+        dataset_id: String,
+    },
+    ArtifactBundle {
+        artifact_id: String,
+    },
+    Scratch,
+    PersistentVolume {
+        volume_id: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,7 +278,9 @@ pub struct WorkspaceBindingRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
+    pub root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<WorkspaceSourceRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority: Option<WorkspaceAuthorityRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -262,7 +294,9 @@ pub enum ExecutorBindingRequestKind {
     EdgeAgent,
     ThinClient,
     Mcp,
+    PersonalRunner,
     HostedRunner,
+    EnterpriseRunner,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3886,7 +3920,7 @@ mod tests {
                 "call_id": "c1",
                 "tool": "bash",
                 "reason": "workspace_executor_unavailable",
-                "workspace": {"kind": "git_checkout"},
+                "workspace": {"kind": "cloud_workspace"},
                 "executor": {"kind": "hosted_runner", "status": "degraded"},
             }),
         ] {
@@ -3903,7 +3937,7 @@ mod tests {
                 "tool": "bash",
                 "reason": "workspace_executor_unavailable",
                 "message": "Workspace is not routed to an available executor.",
-                "workspace": {"kind": "git_checkout"},
+                "workspace": {"kind": "cloud_workspace"},
                 "executor": {"kind": "hosted_runner", "status": "degraded"},
                 "transport": "runner_rpc",
                 "fallback_policy": "disabled"
@@ -3919,7 +3953,7 @@ mod tests {
                 "tool": "bash",
                 "reason": "workspace_executor_unavailable",
                 "message": "Workspace is not routed to an available executor.",
-                "workspace": {"kind": "git_checkout"},
+                "workspace": {"kind": "cloud_workspace"},
                 "executor": {"kind": "hosted_runner", "status": "degraded"},
                 "transport": "runner_rpc",
                 "fallback_policy": "disabled"

@@ -691,7 +691,6 @@ pub(crate) async fn stream_chat_sse(
             forced_execution_retry: false,
             forced_execution_escalation: false,
             forced_parallel_batching: false,
-            forced_parallel_batching_escalated: false,
             forced_round_budget_phase1: false,
             forced_round_budget_phase2: false,
             introspection_count: 0,

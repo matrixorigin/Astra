@@ -27,8 +27,8 @@ fn default_temp_allowed_paths() -> Vec<PathBuf> {
 
 /// Security enforcement level (ordered from least to most restrictive).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum SandboxMode {
-    /// No restrictions — backward compatible with current behavior.
+pub enum IsolationLevel {
+    /// No restrictions.
     Permissive,
     /// Path boundary enforcement + env filtering. No OS-level isolation.
     Standard,
@@ -48,7 +48,7 @@ pub enum SandboxMode {
 #[derive(Debug, Clone)]
 pub struct SandboxPolicy {
     /// Security enforcement level.
-    pub mode: SandboxMode,
+    pub isolation: IsolationLevel,
 
     /// Primary project directory — all relative paths resolve here.
     pub project_root: PathBuf,
@@ -68,11 +68,11 @@ pub struct SandboxPolicy {
     pub max_output_bytes: usize,
 
     /// Whether to allow network access from bash commands.
-    /// When false, adds `--network=none` to unshare (Strict mode only).
+    /// When false, adds `--network=none` to unshare (Strict isolation only).
     pub network_allowed: bool,
 }
 
-/// Baseline environment variables always allowed in Standard+ modes.
+/// Baseline environment variables always allowed in Standard+ isolation.
 pub(crate) const ENV_BASELINE: &[&str] = &[
     "PATH",
     "HOME",
@@ -111,15 +111,64 @@ pub(crate) const ENV_BASELINE: &[&str] = &[
     "ASTRA_DATABASE_PREFIX",
 ];
 
+/// Environment variable substrings that are NEVER passed to child processes,
+/// even in Permissive isolation. These are credential-bearing names that
+/// no tool, even fully trusted bundled tools, should have access to.
+const ALWAYS_DENIED_ENV_KEY_PATTERNS: &[&str] = &[
+    "SECRET",
+    "TOKEN",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "API_KEY",
+    "ENCRYPTION_KEY",
+    "FERNET_KEY",
+    "MASTER_KEY",
+    "PRIVATE_KEY",
+];
+
+/// Path substrings that identify credential files — NEVER readable,
+/// even in Permissive isolation. These are data-at-rest threats:
+/// secret keys, password databases, credential stores.
+const NEVER_READABLE_PATH_PATTERNS: &[&str] = &[
+    "/etc/shadow",
+    "/etc/gshadow",
+    ".ssh/id_",
+    ".ssh/authorized_keys",
+    ".ssh/identity",
+    ".aws/credentials",
+    ".gnupg/secring.gpg",
+    ".gnupg/private-keys-v1.d",
+    ".docker/config.json",
+    ".netrc",
+    "/var/run/secrets",
+];
+
+/// Check if a path matches any never-readable pattern.
+fn is_never_readable_path(path: &std::path::Path) -> bool {
+    let path_str = path.to_string_lossy();
+    NEVER_READABLE_PATH_PATTERNS
+        .iter()
+        .any(|pattern| path_str.contains(pattern))
+}
+
+/// Check if an env key matches any always-denied pattern.
+fn is_always_denied_env_key(key: &str) -> bool {
+    let upper = key.to_uppercase();
+    ALWAYS_DENIED_ENV_KEY_PATTERNS
+        .iter()
+        .any(|pattern| upper.contains(pattern))
+}
+
 impl SandboxPolicy {
-    /// Create a policy for a project directory with Standard mode defaults.
+    /// Create a policy for a project directory with Standard isolation defaults.
     pub fn for_project(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         let mut allowed_paths = default_temp_allowed_paths();
         push_unique_path(&mut allowed_paths, PathBuf::from("/var/tmp"));
         push_unique_path(&mut allowed_paths, PathBuf::from("/dev/null"));
         Self {
-            mode: SandboxMode::Standard,
+            isolation: IsolationLevel::Standard,
             project_root: root,
             allowed_paths,
             env_allowlist: None,
@@ -129,10 +178,10 @@ impl SandboxPolicy {
         }
     }
 
-    /// Create a permissive policy (backward compatible, no restrictions).
+    /// Create a permissive policy with no restrictions.
     pub fn permissive(root: impl Into<PathBuf>) -> Self {
         Self {
-            mode: SandboxMode::Permissive,
+            isolation: IsolationLevel::Permissive,
             project_root: root.into(),
             allowed_paths: vec![],
             env_allowlist: None,
@@ -148,7 +197,7 @@ impl SandboxPolicy {
         let mut allowed_paths = default_temp_allowed_paths();
         push_unique_path(&mut allowed_paths, PathBuf::from("/dev/null"));
         Self {
-            mode: SandboxMode::Strict,
+            isolation: IsolationLevel::Strict,
             project_root: root,
             allowed_paths,
             env_allowlist: Some(Vec::new()), // Only baseline vars
@@ -160,7 +209,7 @@ impl SandboxPolicy {
 
     /// Create a policy based on the skill's trust tier.
     ///
-    /// Maps trust tiers to sandbox modes:
+    /// Maps trust tiers to isolation levels:
     /// - Bundled → Permissive (platform-tested, full trust)
     /// - Verified → Standard (reviewed publisher, path enforcement)
     /// - Community → Standard + env allowlist (automated scan only)
@@ -185,8 +234,13 @@ impl SandboxPolicy {
     }
 
     /// Check if a path prefix is allowed (project root or allowed_paths).
+    /// Never-readable credential paths are always denied, even in Permissive mode.
     pub fn is_path_allowed(&self, path: &std::path::Path) -> bool {
-        if self.mode == SandboxMode::Permissive {
+        // Never-readable paths are blocked at every isolation level.
+        if is_never_readable_path(path) {
+            return false;
+        }
+        if self.isolation == IsolationLevel::Permissive {
             return true;
         }
         let path_variants = unique_path_variants(path);
@@ -202,17 +256,23 @@ impl SandboxPolicy {
     }
 
     /// Check if an environment variable should be passed to child process.
+    /// Credential-bearing env vars are always denied, even in Permissive mode.
     pub fn is_env_allowed(&self, key: &str) -> bool {
-        if self.mode == SandboxMode::Permissive {
+        // Baseline vars are explicitly permitted at every isolation level.
+        if ENV_BASELINE.contains(&key) {
             return true;
         }
-        if ENV_BASELINE.contains(&key) {
+        // Credential env vars are blocked at every isolation level.
+        if is_always_denied_env_key(key) {
+            return false;
+        }
+        if self.isolation == IsolationLevel::Permissive {
             return true;
         }
         if let Some(ref allowlist) = self.env_allowlist {
             return allowlist.iter().any(|a| a == key);
         }
-        // No explicit allowlist in Standard mode → allow all
+        // No explicit allowlist in Standard isolation: allow all.
         true
     }
 }
@@ -224,7 +284,7 @@ mod tests {
     #[test]
     fn standard_policy_defaults() {
         let p = SandboxPolicy::for_project("/home/user/project");
-        assert_eq!(p.mode, SandboxMode::Standard);
+        assert_eq!(p.isolation, IsolationLevel::Standard);
         assert_eq!(p.max_execution_secs, 30.0);
         assert!(p.network_allowed);
         assert!(p.allowed_paths.contains(&PathBuf::from("/tmp")));
@@ -236,7 +296,7 @@ mod tests {
         assert!(p.is_path_allowed(std::path::Path::new("/tmp/build")));
         assert!(!p.is_path_allowed(std::path::Path::new("/etc/passwd")));
 
-        // Standard policy without project-scoped allowlist allows any env
+        // Standard isolation without project-scoped allowlist allows any env.
         let p = SandboxPolicy::for_project("/");
         assert!(p.is_env_allowed("ANYTHING"));
     }
@@ -267,15 +327,15 @@ mod tests {
     #[test]
     fn trust_tier_policy_mapping() {
         use astra_skills::manifest::TrustTier;
-        let cases: Vec<(TrustTier, SandboxMode, bool, f64)> = vec![
-            (TrustTier::Bundled, SandboxMode::Permissive, true, 30.0),
-            (TrustTier::Verified, SandboxMode::Standard, true, 30.0),
-            (TrustTier::Community, SandboxMode::Standard, true, 30.0),
-            (TrustTier::Unverified, SandboxMode::Strict, false, 15.0),
+        let cases: Vec<(TrustTier, IsolationLevel, bool, f64)> = vec![
+            (TrustTier::Bundled, IsolationLevel::Permissive, true, 30.0),
+            (TrustTier::Verified, IsolationLevel::Standard, true, 30.0),
+            (TrustTier::Community, IsolationLevel::Standard, true, 30.0),
+            (TrustTier::Unverified, IsolationLevel::Strict, false, 15.0),
         ];
-        for (tier, mode, network, max_secs) in cases {
+        for (tier, isolation, network, max_secs) in cases {
             let p = SandboxPolicy::for_trust_tier(&tier, "/proj");
-            assert_eq!(p.mode, mode, "{tier:?}");
+            assert_eq!(p.isolation, isolation, "{tier:?}");
             assert_eq!(p.network_allowed, network, "{tier:?}");
             assert_eq!(p.max_execution_secs, max_secs, "{tier:?}");
             // Permissive allows any path; others block outside
@@ -289,12 +349,12 @@ mod tests {
         }
     }
 
-    // --- mode comparisons ---
+    // --- isolation comparisons ---
 
     #[test]
-    fn mode_ordering_and_constraints() {
-        assert!(SandboxMode::Permissive < SandboxMode::Standard);
-        assert!(SandboxMode::Standard < SandboxMode::Strict);
+    fn isolation_ordering_and_constraints() {
+        assert!(IsolationLevel::Permissive < IsolationLevel::Standard);
+        assert!(IsolationLevel::Standard < IsolationLevel::Strict);
         let standard = SandboxPolicy::for_project("/proj");
         let strict = SandboxPolicy::strict("/proj");
         assert!(strict.max_output_bytes < standard.max_output_bytes);
@@ -339,15 +399,24 @@ mod tests {
     fn permissive_path_and_env_rules() {
         let p = SandboxPolicy::permissive("/proj");
         assert!(p.allowed_paths.is_empty());
+        // Permissive allows most paths except never-readable credential files.
         assert!(p.is_path_allowed(std::path::Path::new("/anywhere")));
         assert!(p.is_path_allowed(std::path::Path::new("/etc/passwd")));
-        assert!(p.is_env_allowed("SECRET_KEY"));
+        // Credential paths are always blocked.
+        assert!(!p.is_path_allowed(std::path::Path::new("/etc/shadow")));
+        assert!(!p.is_path_allowed(std::path::Path::new("/home/user/.ssh/id_rsa")));
+        // Credential env vars are always blocked, even in Permissive mode.
+        assert!(!p.is_env_allowed("SECRET_KEY"));
+        assert!(!p.is_env_allowed("GITHUB_TOKEN"));
+        // Non-credential vars are allowed in Permissive mode.
+        assert!(p.is_env_allowed("HOME"));
+        assert!(p.is_env_allowed("EDITOR"));
     }
 
     // ── Regression: /dev/null blocked by sandbox (session 5f21382b) ──
 
     #[test]
-    fn dev_null_allowed_in_all_modes() {
+    fn dev_null_allowed_in_all_isolation_levels() {
         for p in [
             SandboxPolicy::permissive("/proj"),
             SandboxPolicy::for_project("/proj"),

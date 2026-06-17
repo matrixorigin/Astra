@@ -19,11 +19,22 @@ pub(crate) fn suggest_followup(
         return None;
     }
 
-    astra_turn_core::followup_suggestion::suggest_followup(
-        trimmed,
-        &result.full_text,
-        &result.tools_used,
-    )
+    let markers = if result.tool_call_records.is_empty() {
+        result.tools_used.clone()
+    } else {
+        result
+            .tool_call_records
+            .iter()
+            .map(|record| {
+                astra_turn_core::followup_suggestion::tool_marker(
+                    &record.name,
+                    record.args_full.as_deref(),
+                )
+            })
+            .collect()
+    };
+
+    astra_turn_core::followup_suggestion::suggest_followup(trimmed, &result.full_text, &markers)
 }
 
 #[cfg(test)]
@@ -42,6 +53,21 @@ mod tests {
             full_text: full_text.to_string(),
             tool_calls_count: tools_used.len() as u32,
             tools_used,
+            ..Default::default()
+        }
+    }
+
+    fn result_with_git_action_commit_record(full_text: &str) -> StreamResult {
+        StreamResult {
+            full_text: full_text.to_string(),
+            tool_calls_count: 1,
+            tools_used: vec!["git".to_string()],
+            tool_call_records: vec![astra_services::session_journal::ToolCallRecord {
+                name: "git".to_string(),
+                ok: true,
+                args_full: Some(r#"{"action":"commit","message":"ship"}"#.to_string()),
+                ..Default::default()
+            }],
             ..Default::default()
         }
     }
@@ -90,7 +116,7 @@ mod tests {
         let suggestion = suggest_followup(
             "commit it",
             &base_state(),
-            &base_result(vec!["git_commit"], "Committed the changes."),
+            &result_with_git_action_commit_record("Committed the changes."),
         )
         .expect("suggestion");
         assert_eq!(suggestion.text, "push it");

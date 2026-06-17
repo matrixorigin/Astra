@@ -12,10 +12,25 @@ pub struct FollowupSuggestion {
     pub kind: FollowupSuggestionKind,
 }
 
+pub fn tool_marker(tool_name: &str, args_json: Option<&str>) -> String {
+    let action = args_json
+        .and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok())
+        .and_then(|args| {
+            args.get("action")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+    match (tool_name, action.as_deref()) {
+        ("git", Some(action)) => format!("git:{action}"),
+        ("github", Some(action)) => format!("github:{action}"),
+        _ => tool_name.to_string(),
+    }
+}
+
 pub fn suggest_followup(
     user_message: &str,
     assistant_text: &str,
-    tool_names: &[String],
+    tool_markers: &[String],
 ) -> Option<FollowupSuggestion> {
     let trimmed = user_message.trim();
     if trimmed.is_empty()
@@ -27,9 +42,9 @@ pub fn suggest_followup(
     }
 
     let lexicon = suggestion_lexicon(trimmed, assistant_text);
-    let edited = tool_names.iter().any(|tool| is_edit_tool(tool));
-    let validated = tool_names.iter().any(|tool| is_validation_tool(tool));
-    let committed = tool_names.iter().any(|tool| tool == "git_commit");
+    let edited = tool_markers.iter().any(|tool| is_edit_tool(tool));
+    let validated = tool_markers.iter().any(|tool| is_validation_tool(tool));
+    let committed = tool_markers.iter().any(|tool| is_commit_tool(tool));
 
     if let Some(question_reply) =
         suggest_reply_to_assistant_question(assistant_text, edited, validated, committed, &lexicon)
@@ -98,14 +113,12 @@ fn prefers_chinese(text: &str) -> bool {
 fn is_edit_tool(tool: &str) -> bool {
     matches!(
         tool,
-        "write_file"
-            | "str_replace"
-            | "multi_edit"
-            | "create_file"
-            | "delete_file"
-            | "move_file"
-            | "git_commit"
+        "write_file" | "str_replace" | "multi_edit" | "create_file" | "delete_file" | "move_file"
     )
+}
+
+fn is_commit_tool(tool: &str) -> bool {
+    tool == "git:commit"
 }
 
 fn is_validation_tool(tool: &str) -> bool {
@@ -245,6 +258,43 @@ mod tests {
         )
         .expect("suggestion");
         assert_eq!(suggestion.text, "跑一下测试");
+    }
+
+    #[test]
+    fn marker_extracts_consolidated_git_action() {
+        assert_eq!(
+            tool_marker("git", Some(r#"{"action":"commit","message":"ship"}"#)),
+            "git:commit"
+        );
+        assert_eq!(tool_marker("git", Some(r#"{"action":"diff"}"#)), "git:diff");
+        assert_eq!(
+            tool_marker("read_file", Some(r#"{"path":"a.rs"}"#)),
+            "read_file"
+        );
+    }
+
+    #[test]
+    fn suggests_push_after_consolidated_git_action_commit_marker() {
+        let suggestion = suggest_followup(
+            "commit it",
+            "Committed the changes.",
+            &["git:commit".to_string()],
+        )
+        .expect("suggestion");
+        assert_eq!(suggestion.text, "push it");
+        assert_eq!(suggestion.kind, FollowupSuggestionKind::Push);
+    }
+
+    #[test]
+    fn read_only_git_marker_does_not_suggest_push() {
+        assert_eq!(
+            suggest_followup(
+                "show the diff",
+                "Here is the diff.",
+                &["git:diff".to_string()]
+            ),
+            None
+        );
     }
 
     #[test]

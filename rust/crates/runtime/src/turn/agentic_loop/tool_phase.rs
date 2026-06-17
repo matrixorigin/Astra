@@ -1,11 +1,15 @@
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::server::tool_database_snapshots;
+use crate::server::tool_file_runtime;
+use crate::server::tool_session_state_rollback;
 use crate::server::tool_transport::{
-    TOOL_ERROR_KIND_EXECUTOR_OFFLINE, TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED,
-    TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE,
+    TOOL_ERROR_KIND_EXECUTOR_OFFLINE, TOOL_ERROR_KIND_ROUTE_MISMATCH,
+    TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED,
 };
 use astra_services::EvaluationService;
 use astra_services::evaluation::SessionQualityAssessmentRequest;
@@ -66,10 +70,188 @@ fn execution_boundary_blocked_wait_reason(tool_results: &[Value]) -> Option<Stri
                 TOOL_ERROR_KIND_EXECUTOR_OFFLINE
                 | TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED
                 | TOOL_ERROR_KIND_FALLBACK_DISABLED
-                | TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE,
+                | TOOL_ERROR_KIND_ROUTE_MISMATCH,
             ) => Some(reason.to_string()),
             _ => None,
         }
+    })
+}
+
+fn detached_background_task_wait_reason(
+    edge_tool_round: &[astra_turn_core::sse_stream_host::EdgeToolExecResult],
+    tool_results: &[Value],
+) -> Option<String> {
+    edge_tool_round
+        .iter()
+        .find_map(detached_background_task_reason_from_edge_result)
+        .or_else(|| {
+            tool_results
+                .iter()
+                .find_map(detached_background_task_reason_from_tool_result)
+        })
+}
+
+fn detached_background_task_reason_from_edge_result(
+    result: &astra_turn_core::sse_stream_host::EdgeToolExecResult,
+) -> Option<String> {
+    if result
+        .tool_result_fields
+        .as_ref()
+        .is_some_and(|fields| fields.get("bash_detached").and_then(Value::as_bool) == Some(true))
+        || result.output.contains("<bash_detached>")
+    {
+        return Some(detached_background_task_reason(
+            result
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| background_task_id_from_map(fields))
+                .or_else(|| background_task_id_from_text(&result.output)),
+        ));
+    }
+    None
+}
+
+fn detached_background_task_reason_from_tool_result(result: &Value) -> Option<String> {
+    let result = result.as_object()?;
+    let detached = result.get("bash_detached").and_then(Value::as_bool) == Some(true)
+        || result
+            .get("metadata")
+            .and_then(Value::as_object)
+            .is_some_and(|metadata| {
+                metadata.get("bash_detached").and_then(Value::as_bool) == Some(true)
+            })
+        || ["output", "result", "content"]
+            .iter()
+            .filter_map(|key| result.get(*key).and_then(Value::as_str))
+            .any(|text| text.contains("<bash_detached>"));
+    if !detached {
+        return None;
+    }
+    Some(detached_background_task_reason(
+        background_task_id_from_map(result)
+            .or_else(|| {
+                result
+                    .get("metadata")
+                    .and_then(Value::as_object)
+                    .and_then(background_task_id_from_map)
+            })
+            .or_else(|| {
+                ["output", "result", "content"]
+                    .iter()
+                    .filter_map(|key| result.get(*key).and_then(Value::as_str))
+                    .find_map(background_task_id_from_text)
+            }),
+    ))
+}
+
+fn background_task_id_from_map(map: &serde_json::Map<String, Value>) -> Option<String> {
+    ["background_task_id", "task_id"]
+        .iter()
+        .find_map(|key| map.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn background_task_id_from_text(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .map(|part| {
+            part.trim_matches(|ch: char| {
+                !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == ':')
+            })
+        })
+        .find(|part| part.starts_with("bg-shell-") || part.starts_with("bg-task-"))
+        .map(ToString::to_string)
+}
+
+fn detached_background_task_reason(task_id: Option<String>) -> String {
+    match task_id {
+        Some(task_id) => format!("background_task_detached:{task_id}"),
+        None => "background_task_detached".to_string(),
+    }
+}
+
+fn agent_fanout_wait_reason(
+    edge_tool_round: &[astra_turn_core::sse_stream_host::EdgeToolExecResult],
+    tool_results: &[Value],
+) -> Option<String> {
+    edge_tool_round
+        .iter()
+        .find_map(agent_fanout_reason_from_edge_result)
+        .or_else(|| {
+            tool_results
+                .iter()
+                .find_map(agent_fanout_reason_from_tool_result)
+        })
+}
+
+fn agent_fanout_reason_from_edge_result(
+    result: &astra_turn_core::sse_stream_host::EdgeToolExecResult,
+) -> Option<String> {
+    if result.tool != "agent_fanout" {
+        return None;
+    }
+    agent_fanout_reason_from_text(&result.output)
+}
+
+fn agent_fanout_reason_from_tool_result(result: &Value) -> Option<String> {
+    agent_fanout_reason_from_value(result).or_else(|| {
+        result.as_object().and_then(|object| {
+            ["output", "result", "content"]
+                .iter()
+                .filter_map(|key| object.get(*key).and_then(Value::as_str))
+                .find_map(agent_fanout_reason_from_text)
+        })
+    })
+}
+
+fn agent_fanout_reason_from_text(text: &str) -> Option<String> {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|value| agent_fanout_reason_from_value(&value))
+}
+
+fn agent_fanout_reason_from_value(value: &Value) -> Option<String> {
+    let root = value.as_object()?;
+    let fanout = root.get("fanout")?.as_object()?;
+    let accepted = fanout.get("accepted").and_then(Value::as_u64).unwrap_or(0);
+    let active = fanout.get("active").and_then(Value::as_u64).unwrap_or(0);
+    let terminal = fanout
+        .get("terminal")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            let completed = fanout.get("completed").and_then(Value::as_u64).unwrap_or(0);
+            let failed = fanout.get("failed").and_then(Value::as_u64).unwrap_or(0);
+            let cancelled_by_user = fanout
+                .get("cancelled_by_user")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let cancelled_by_parent_budget = fanout
+                .get("cancelled_by_parent_budget")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let timed_out = fanout.get("timed_out").and_then(Value::as_u64).unwrap_or(0);
+            Some(completed + failed + cancelled_by_user + cancelled_by_parent_budget + timed_out)
+        })
+        .unwrap_or(0);
+    let root_status = root.get("status").and_then(Value::as_str).unwrap_or("");
+    let fanout_status = fanout.get("status").and_then(Value::as_str).unwrap_or("");
+    let running = active > 0
+        || matches!(root_status, "running")
+        || matches!(fanout_status, "planned" | "running")
+        || (accepted > 0 && terminal < accepted);
+    if !running {
+        return None;
+    }
+    let group_id = root
+        .get("group_id")
+        .and_then(Value::as_str)
+        .or_else(|| fanout.get("group_id").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|group_id| !group_id.is_empty());
+    Some(match group_id {
+        Some(group_id) => format!("agent_fanout_running:{group_id}"),
+        None => "agent_fanout_running".to_string(),
     })
 }
 
@@ -263,9 +445,6 @@ pub(crate) fn is_server_mutator_tool_name(name: &str) -> bool {
             | "delete_file"
             // database
             | "mo_query"
-            // git
-            | "git_commit"
-            | "git_revert_commit"
             // session state
             | "adjust_config"
             | "prioritize_tool"
@@ -274,6 +453,29 @@ pub(crate) fn is_server_mutator_tool_name(name: &str) -> bool {
             | "compress_context"
             | "task"
     )
+}
+
+fn git_args_are_rollback_mutator(args: &Value) -> bool {
+    matches!(
+        args.get("action").and_then(Value::as_str),
+        Some("commit" | "revert_commit")
+    )
+}
+
+fn tool_call_is_git_mutator(tool_call: &Value) -> bool {
+    tool_call_name(tool_call) == Some("git")
+        && git_args_are_rollback_mutator(&tool_call_arguments_value(tool_call))
+}
+
+fn tool_record_is_server_mutator(record: &ToolCallRecord) -> bool {
+    if record.name == "git" {
+        return record
+            .args_full
+            .as_deref()
+            .and_then(|args| serde_json::from_str::<Value>(args).ok())
+            .is_some_and(|args| git_args_are_rollback_mutator(&args));
+    }
+    is_server_mutator_tool_name(&record.name)
 }
 
 fn task_tool_call_is_session_state_mutator(tool_call: &Value) -> bool {
@@ -305,12 +507,7 @@ fn server_database_mutator_in_round(tool_calls: &[Value]) -> bool {
 }
 
 fn server_git_mutator_in_round(tool_calls: &[Value]) -> bool {
-    tool_calls.iter().any(|tool_call| {
-        matches!(
-            tool_call_name(tool_call),
-            Some("git_commit" | "git_revert_commit")
-        )
-    })
+    tool_calls.iter().any(tool_call_is_git_mutator)
 }
 
 fn server_session_state_mutator_in_round(tool_calls: &[Value]) -> bool {
@@ -567,8 +764,10 @@ fn server_git_mutation_targets(tool_results: &[Value]) -> Vec<String> {
         .filter_map(|tool_result| {
             let tool_name = tool_result.get("name").and_then(Value::as_str)?;
             match tool_name {
-                "git_commit" => tool_result.get("commit_sha").and_then(Value::as_str),
-                "git_revert_commit" => tool_result.get("revert_commit_sha").and_then(Value::as_str),
+                "git" => tool_result
+                    .get("commit_sha")
+                    .or_else(|| tool_result.get("revert_commit_sha"))
+                    .and_then(Value::as_str),
                 _ => None,
             }
             .map(ToString::to_string)
@@ -589,8 +788,8 @@ async fn rollback_server_git_mutations(
     for commit_sha in targets.iter().rev() {
         let result = executor
             .execute_with_metadata(
-                "git_revert_commit",
-                &serde_json::json!({ "commit_sha": commit_sha }),
+                "git",
+                &serde_json::json!({ "action": "revert_commit", "commit_sha": commit_sha }),
             )
             .await;
         let mut entry = serde_json::Map::from_iter([(
@@ -651,12 +850,15 @@ fn open_server_rollback_boundary(
 
     let active = ServerRollbackBoundary {
         turn_index,
-        file_checkpoint: has_file_mutator.then(|| executor.file_journal_checkpoint()),
-        database_checkpoint: has_database_mutator
-            .then(|| executor.database_snapshot_journal_checkpoint()),
+        file_checkpoint: has_file_mutator
+            .then(|| tool_file_runtime::file_journal_checkpoint(executor.file_journal.as_ref())),
+        database_checkpoint: has_database_mutator.then(|| {
+            tool_database_snapshots::journal_checkpoint(executor.database_snapshot_journal.as_ref())
+        }),
         git_mutations: has_git_mutator,
-        session_state_checkpoint: has_session_state_mutator
-            .then(|| executor.session_state_journal_checkpoint()),
+        session_state_checkpoint: has_session_state_mutator.then(|| {
+            tool_session_state_rollback::journal_checkpoint(executor.session_state_journal.as_ref())
+        }),
     };
     if let Some(session_id) = session_id {
         append_session_journal_event(
@@ -681,18 +883,15 @@ async fn finalize_server_rollback_boundary(
     new_tool_results: &[Value],
 ) {
     let file_entries_added = active.file_checkpoint.map_or(0, |checkpoint| {
-        executor
-            .file_journal_checkpoint()
+        tool_file_runtime::file_journal_checkpoint(executor.file_journal.as_ref())
             .saturating_sub(checkpoint)
     });
     let database_entries_added = active.database_checkpoint.map_or(0, |checkpoint| {
-        executor
-            .database_snapshot_journal_checkpoint()
+        tool_database_snapshots::journal_checkpoint(executor.database_snapshot_journal.as_ref())
             .saturating_sub(checkpoint)
     });
     let session_state_entries_added = active.session_state_checkpoint.map_or(0, |checkpoint| {
-        executor
-            .session_state_journal_checkpoint()
+        tool_session_state_rollback::journal_checkpoint(executor.session_state_journal.as_ref())
             .saturating_sub(checkpoint)
     });
     let git_mutation_targets = if active.git_mutations {
@@ -709,16 +908,21 @@ async fn finalize_server_rollback_boundary(
     // behavior that otherwise makes model action-history diverge from disk.
     let failed_mutator_record = new_records
         .iter()
-        .find(|record| !record.ok && is_server_mutator_tool_name(&record.name));
+        .find(|record| !record.ok && tool_record_is_server_mutator(record));
     if let Some(failed_record) = failed_mutator_record {
         let file_rollback = if let Some(file_checkpoint) = active.file_checkpoint {
             (file_entries_added > 0).then(|| {
                 parse_server_rollback_output(
                     "rollback_file_edits",
-                    executor.rollback_file_edits(&serde_json::json!({
-                        "scope": "current_turn",
-                        "after_sequence": file_checkpoint,
-                    })),
+                    tool_file_runtime::execute_rollback_file_edits(
+                        executor.workspace_root(),
+                        &serde_json::json!({
+                            "scope": "current_turn",
+                            "after_sequence": file_checkpoint,
+                        }),
+                        executor.journal_turn_index.load(Ordering::Relaxed),
+                        executor.file_journal.as_ref(),
+                    ),
                 )
             })
         } else {
@@ -729,10 +933,14 @@ async fn finalize_server_rollback_boundary(
                 (database_entries_added > 0).then(|| {
                     parse_server_rollback_output(
                         "rollback_database_snapshots",
-                        executor.rollback_database_snapshots(&serde_json::json!({
-                            "scope": "current_turn",
-                            "database_after_sequence": database_checkpoint,
-                        })),
+                        tool_database_snapshots::rollback_database_snapshots(
+                            executor.database_snapshot_journal.as_ref(),
+                            &serde_json::json!({
+                                "scope": "current_turn",
+                                "database_after_sequence": database_checkpoint,
+                            }),
+                            executor.journal_turn_index.load(Ordering::Relaxed),
+                        ),
                     )
                 })
             } else {
@@ -740,25 +948,38 @@ async fn finalize_server_rollback_boundary(
             };
         let git_mutation_rollback =
             rollback_server_git_mutations(executor, &git_mutation_targets).await;
-        let session_state_rollback =
-            if let Some(session_state_checkpoint) = active.session_state_checkpoint {
-                if session_state_entries_added > 0 {
-                    let output = executor
-                        .rollback_session_state(&serde_json::json!({
-                            "scope": "current_turn",
-                            "session_state_after_sequence": session_state_checkpoint,
-                        }))
-                        .await;
-                    Some(parse_server_rollback_output(
-                        "rollback_session_state",
-                        output,
-                    ))
-                } else {
-                    None
-                }
+        let session_state_rollback = if let Some(session_state_checkpoint) =
+            active.session_state_checkpoint
+        {
+            if session_state_entries_added > 0 {
+                let output = tool_session_state_rollback::execute_rollback_session_state(
+                    tool_session_state_rollback::RollbackSessionStateContext {
+                        journal: executor.session_state_journal.as_ref(),
+                        current_turn_index: executor.journal_turn_index.load(Ordering::Relaxed),
+                        restore_context: tool_session_state_rollback::SessionStateRestoreContext {
+                            session_id: &executor.session_id,
+                            observability_session: executor.observability_session.as_ref(),
+                            config: &executor.session_config.inner,
+                            task_manager: &executor.task_manager(),
+                        },
+                    },
+                    &serde_json::json!({
+                        "scope": "current_turn",
+                        "session_state_after_sequence": session_state_checkpoint,
+                    }),
+                    || executor.publish_current_workspace("tool_phase:rollback_session_state"),
+                )
+                .await;
+                Some(parse_server_rollback_output(
+                    "rollback_session_state",
+                    output,
+                ))
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
         let rollback = combine_server_rollback_outputs(
             active.turn_index,
             file_rollback,
@@ -976,6 +1197,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     }
 
     let valid_tool_names = host.valid_tool_names().clone();
+    let deferred_tool_names = host.deferred_tool_names();
     let DelegationInterceptionResult {
         effective_tool_calls,
         intercepted_any: delegation_intercepted,
@@ -1056,6 +1278,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             messages: &mut state.messages,
             tool_results: &mut state.tool_results,
             valid_tool_names: &valid_tool_names,
+            deferred_tool_names: &deferred_tool_names,
             restricted_tools: &mut state.restricted_tools,
             turn_guard: &mut state.turn_guard,
             step_recorder: &mut state.step_recorder,
@@ -1230,6 +1453,27 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     }
 
     if let Some(reason) = execution_boundary_blocked_wait_reason(&new_tool_results) {
+        state.step_recorder.end_turn(false);
+        finalize_turn_trace(state).await;
+        refresh_runtime_promotion_signals_from_db(state).await;
+        return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Waiting(
+            reason,
+        )));
+    }
+
+    if let Some(reason) =
+        detached_background_task_wait_reason(&turn_result.edge_tool_round, &new_tool_results)
+    {
+        state.step_recorder.end_turn(false);
+        finalize_turn_trace(state).await;
+        refresh_runtime_promotion_signals_from_db(state).await;
+        return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Waiting(
+            reason,
+        )));
+    }
+
+    if let Some(reason) = agent_fanout_wait_reason(&turn_result.edge_tool_round, &new_tool_results)
+    {
         state.step_recorder.end_turn(false);
         finalize_turn_trace(state).await;
         refresh_runtime_promotion_signals_from_db(state).await;
@@ -1628,11 +1872,11 @@ fn build_introspect_snapshot(
         introspection_count: state.stall.introspection_count,
         forced_execution_escalation: state.stall.forced_execution_escalation,
         forced_parallel_batching: state.stall.forced_parallel_batching,
-        forced_completion_soft_stop: state.stall.forced_completion_soft_stop,
         forced_redundant_reads_corrective: state.stall.forced_redundant_reads_corrective,
         forced_cache_waste_corrective: state.stall.forced_cache_waste_corrective,
         forced_exploration_family_phase2: state.stall.forced_exploration_family_phase2,
         forced_exploration_family_corrective: state.stall.forced_exploration_family_corrective,
+        forced_completion_soft_stop: state.stall.forced_completion_soft_stop,
     };
 
     // Injection-freshness is session-scoped (lives on ObservabilitySession,
@@ -1828,19 +2072,19 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_workspace_executor_waits_the_loop() {
+    fn route_mismatch_waits_the_loop() {
         let results = vec![json!({
             "tool_call_id": "call-workspace-unavailable",
             "name": "bash",
             "result": "workspace executor unavailable",
             "blocked": true,
-            "error_kind": "workspace_executor_unavailable",
-            "reason": "workspace_executor_unavailable"
+            "error_kind": "route_mismatch",
+            "reason": "route_mismatch"
         })];
 
         assert_eq!(
             execution_boundary_blocked_wait_reason(&results).as_deref(),
-            Some("workspace_executor_unavailable")
+            Some("route_mismatch")
         );
     }
 
@@ -1919,6 +2163,13 @@ mod tests {
             surgically_removed: None,
             original_tool_name: None,
             ..Default::default()
+        }
+    }
+
+    fn tool_record_with_args(name: &str, args: Value, ok: bool) -> ToolCallRecord {
+        ToolCallRecord {
+            args_full: Some(args.to_string()),
+            ..tool_record(name, ok)
         }
     }
 
@@ -2356,12 +2607,15 @@ esac
             Some(&session_id),
             &executor,
             8,
-            &[json!({"function": {"name": "git_commit", "arguments": "{}"}})],
+            &[json!({"function": {"name": "git", "arguments": "{\"action\":\"commit\",\"message\":\"turn commit\"}"}})],
         )
-        .expect("boundary should open for git_commit");
+        .expect("boundary should open for git action commit");
 
         let commit_result = executor
-            .execute_with_metadata("git_commit", &json!({"message": "turn commit"}))
+            .execute_with_metadata(
+                "git",
+                &json!({"action": "commit", "message": "turn commit"}),
+            )
             .await;
         assert!(!commit_result.is_error, "got: {}", commit_result.output);
 
@@ -2370,11 +2624,19 @@ esac
             &executor,
             &active,
             &[
-                tool_record("git_commit", true),
+                tool_record_with_args(
+                    "git",
+                    json!({"action": "commit", "message": "turn commit"}),
+                    true,
+                ),
                 // A second mutator in the same round fails → rollback MUST fire.
-                tool_record("git_revert_commit", false),
+                tool_record_with_args(
+                    "git",
+                    json!({"action": "revert_commit", "commit_sha": "HEAD"}),
+                    false,
+                ),
             ],
-            &[tool_result_row("git_commit", commit_result)],
+            &[tool_result_row("git", commit_result)],
         )
         .await;
 
@@ -2393,10 +2655,7 @@ esac
         let boundary = &boundary_events[1].metadata.as_ref().unwrap()["execution_boundary"];
         assert_eq!(boundary["kind"].as_str(), Some("turn_rollback"));
         assert_eq!(boundary["reason"].as_str(), Some("tool_error"));
-        assert_eq!(
-            boundary["trigger_tool_name"].as_str(),
-            Some("git_revert_commit")
-        );
+        assert_eq!(boundary["trigger_tool_name"].as_str(), Some("git"));
         assert_eq!(
             boundary["rollback"]["git_mutations"]["reverted"]
                 .as_array()
@@ -2424,9 +2683,6 @@ esac
         assert!(is_server_mutator_tool_name("delete_file"));
         // Database mutators
         assert!(is_server_mutator_tool_name("mo_query"));
-        // Git mutators
-        assert!(is_server_mutator_tool_name("git_commit"));
-        assert!(is_server_mutator_tool_name("git_revert_commit"));
         // Session-state mutators
         assert!(is_server_mutator_tool_name("adjust_config"));
         assert!(is_server_mutator_tool_name("prioritize_tool"));
@@ -2441,9 +2697,7 @@ esac
             "read_file",
             "glob",
             "ls",
-            "git_show",
-            "git_status",
-            "git_diff",
+            "git",
             "web_fetch",
             "think",
         ] {
@@ -2452,6 +2706,43 @@ esac
                 "{name} should not be a mutator"
             );
         }
+    }
+
+    #[test]
+    fn server_git_mutator_detection_uses_consolidated_git_action() {
+        assert!(server_git_mutator_in_round(&[json!({
+            "function": {
+                "name": "git",
+                "arguments": "{\"action\":\"commit\",\"message\":\"save\"}"
+            }
+        })]));
+        assert!(server_git_mutator_in_round(&[json!({
+            "function": {
+                "name": "git",
+                "arguments": "{\"action\":\"revert_commit\",\"commit_sha\":\"abc123\"}"
+            }
+        })]));
+        assert!(!server_git_mutator_in_round(&[json!({
+            "function": {
+                "name": "git",
+                "arguments": "{\"action\":\"diff\",\"path\":\"tracked.txt\"}"
+            }
+        })]));
+    }
+
+    #[test]
+    fn server_git_failure_record_uses_args_full_for_mutator_scope() {
+        assert!(tool_record_is_server_mutator(&tool_record_with_args(
+            "git",
+            json!({"action": "commit", "message": "save"}),
+            false,
+        )));
+        assert!(!tool_record_is_server_mutator(&tool_record_with_args(
+            "git",
+            json!({"action": "diff", "path": "tracked.txt"}),
+            false,
+        )));
+        assert!(!tool_record_is_server_mutator(&tool_record("git", false)));
     }
 
     #[test]
@@ -2598,7 +2889,7 @@ esac
                 tool_record("write_file", true),
                 tool_record("grep", false),
                 tool_record("read_file", false),
-                tool_record("git_show", false),
+                tool_record_with_args("git", json!({"action": "diff"}), false),
             ],
             &[],
         )

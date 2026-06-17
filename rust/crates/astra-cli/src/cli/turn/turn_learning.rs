@@ -85,12 +85,6 @@ pub(crate) fn turn_quality_feedback_from_eval(
 
     for signal in &eval.signals {
         match signal {
-            EvalSignal::SequentialReadChurn(streak) => {
-                saw_batching_issue = true;
-                findings.push(format!(
-                    "Detected {streak} consecutive single-tool rounds; independent reads/searches should be batched in one round."
-                ));
-            }
             EvalSignal::RepeatToolCall(tool) => {
                 repeated_tools.insert(tool.clone());
             }
@@ -107,6 +101,12 @@ pub(crate) fn turn_quality_feedback_from_eval(
                     "TurnGuard emitted a warning-or-higher verdict; follow that warning instead of continuing the same pattern."
                         .to_string(),
                 );
+            }
+            EvalSignal::ExplorationFamilyChurn { streak, .. } => {
+                saw_batching_issue = true;
+                findings.push(format!(
+                    "{streak} consecutive reads in a single tool family — batch them in one round instead."
+                ));
             }
             _ => {}
         }
@@ -224,7 +224,10 @@ mod tests {
             quality: 0.2,
             confidence: 0.8,
             signals: vec![
-                EvalSignal::SequentialReadChurn(13),
+                EvalSignal::ExplorationFamilyChurn {
+                    family: "read".to_string(),
+                    streak: 13,
+                },
                 EvalSignal::RepeatToolCall("bash".to_string()),
                 EvalSignal::RepeatToolCall("read_file".to_string()),
                 EvalSignal::StallDetected,

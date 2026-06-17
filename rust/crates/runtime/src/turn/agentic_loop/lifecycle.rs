@@ -820,8 +820,6 @@ struct StallDiagnosis {
 }
 
 fn compute_stall_diagnosis(state: &AgenticLoopState) -> StallDiagnosis {
-    let single_tool_streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
-
     // 1. Exploration family streak (read/search/diff dominance)
     if let Some((family, streak)) =
         astra_turn_core::evaluation::exploration_family_round_streak(&state.stall.tool_call_records)
@@ -867,12 +865,14 @@ fn compute_stall_diagnosis(state: &AgenticLoopState) -> StallDiagnosis {
         };
     }
 
-    // 3. Single-tool streak
-    if single_tool_streak >= 3 {
+    let single_tool_streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
+    // Stall signal must fire AFTER nudge (nudge at 6, stall at 8+) to give the model
+    // a chance to self-correct before declaring a stall.
+    if single_tool_streak >= 8 {
         return StallDiagnosis {
             signal: Some(format!("single_tool_streak={single_tool_streak}")),
             summary: Some(format!(
-                "a single-tool streak of {single_tool_streak} consecutive rounds"
+                "{single_tool_streak} consecutive single-tool rounds without batching"
             )),
             restricted_tools: Vec::new(),
         };
@@ -967,9 +967,6 @@ pub(crate) fn build_circuit_breaker_abort_message(state: &AgenticLoopState) -> S
         }
         Some(s) if s.contains("exploration_family=search") => {
             "Next: stop fanning out new greps; pick the single most-promising hit and read it directly."
-        }
-        Some(s) if s.starts_with("single_tool_streak=") => {
-            "Next: batch independent tool calls into one parallel round, or commit a partial answer with what you have."
         }
         _ => {
             "Next: produce a textual answer from existing evidence; only call a tool if it adds genuinely new information."
@@ -2184,12 +2181,24 @@ mod tests {
             json!({"role": "tool", "content": ""}),
             json!({"role": "assistant", "content": ""}),
             json!({"role": "tool", "content": ""}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": ""}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": ""}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": ""}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": ""}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": ""}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": ""}),
         ];
 
         let summary = interruption_state_summary(&state, None);
         assert_eq!(
             summary.stall_signal.as_deref(),
-            Some("single_tool_streak=3")
+            Some("single_tool_streak=9")
         );
         assert_eq!(
             summary.resume_restricted_tools,

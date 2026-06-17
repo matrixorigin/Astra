@@ -99,7 +99,7 @@ fn is_mutating_tool(name: &str) -> bool {
             | "execute_sql"
             | "delete_file"
             | "create_directory"
-            | "git_commit"
+            | "git"
             | "execute"
     )
 }

@@ -2,6 +2,8 @@
 
 use serde_json::Value;
 
+use crate::ToolResult;
+
 /// Construct web search URLs for various engines.
 /// Returns URLs that can be fetched with web_fetch to get actual results.
 pub fn web_search(args: &Value) -> String {
@@ -109,4 +111,54 @@ pub fn web_search(args: &Value) -> String {
         "usage": "Call web_fetch with the search_url. The response is structured JSON with a content field (Markdown) and links array."
     })
     .to_string()
+}
+
+pub fn web_search_result(args: &Value) -> ToolResult {
+    let output = web_search(args);
+    let json_error = serde_json::from_str::<Value>(&output)
+        .ok()
+        .and_then(|value| value.get("error").cloned())
+        .is_some();
+    if output.starts_with("Error") || json_error {
+        ToolResult::error(output)
+    } else {
+        ToolResult::text(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn web_search_result_marks_missing_query_as_error() {
+        let result = web_search_result(&json!({}));
+
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains("Missing or empty 'query' parameter"));
+    }
+
+    #[test]
+    fn web_search_result_marks_unknown_engine_as_error() {
+        let result = web_search_result(&json!({
+            "query": "astra",
+            "engine": "unknown",
+        }));
+
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains("Unknown engine"));
+    }
+
+    #[test]
+    fn web_search_result_preserves_success_payload() {
+        let result = web_search_result(&json!({
+            "query": "astra runtime",
+            "engine": "duckduckgo",
+        }));
+
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.output.contains("search_url"));
+        assert!(result.output.contains("DuckDuckGo"));
+    }
 }

@@ -166,6 +166,7 @@ pub fn server_runtime_tool_schemas(
         capabilities,
         &astra_tools::schemas::all_tool_schemas(),
     );
+    schemas.retain(|schema| !matches!(tool_schema_name(schema), Some("lsp" | "powershell")));
     #[cfg(unix)]
     {
         astra_tools::schemas::narrow_run_script_for_server(&mut schemas);

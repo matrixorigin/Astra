@@ -196,34 +196,41 @@ async fn apply_artifact_retention_policy(
 pub(crate) fn spawn_artifact_retention_sweeper(
     pool: SharedPool,
     lease: Arc<crate::server::sweeper_lease::SweeperLease>,
-) {
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(SWEEP_INTERVAL_SECS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            interval.tick().await;
-            match lease.check_leader().await {
-                crate::server::sweeper_lease::LeaderStatus::Leader => {}
-                crate::server::sweeper_lease::LeaderStatus::NotLeader => continue,
-                crate::server::sweeper_lease::LeaderStatus::Unavailable(e) => {
-                    tracing::warn!(
-                        target: "astra_runtime::artifact_retention_sweeper",
-                        error = %e,
-                        "sweeper lease check unavailable, skipping sweep"
-                    );
-                    continue;
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    'tick: {
+                        match lease.check_leader().await {
+                            crate::server::sweeper_lease::LeaderStatus::Leader => {}
+                            crate::server::sweeper_lease::LeaderStatus::NotLeader => break 'tick,
+                            crate::server::sweeper_lease::LeaderStatus::Unavailable(e) => {
+                                tracing::warn!(
+                                    target: "astra_runtime::artifact_retention_sweeper",
+                                    error = %e,
+                                    "sweeper lease check unavailable, skipping sweep"
+                                );
+                                break 'tick;
+                            }
+                        }
+                        if let Err(error) = run_artifact_retention_gc_once(pool.clone(), 1_000).await {
+                            tracing::warn!(
+                                target: "astra_runtime::artifact_retention_sweeper",
+                                error = %error,
+                                "artifact retention sweeper failed"
+                            );
+                        }
+                    }
                 }
             }
-            if let Err(error) = run_artifact_retention_gc_once(pool.clone(), 1_000).await {
-                tracing::warn!(
-                    target: "astra_runtime::artifact_retention_sweeper",
-                    error = %error,
-                    "artifact retention sweeper failed"
-                );
-            }
         }
-    });
+    })
 }
 
 #[cfg(test)]

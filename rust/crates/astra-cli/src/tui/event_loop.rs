@@ -3696,8 +3696,8 @@ fn handle_app_event(
         | TuiAppEvent::Compaction(_)
         | TuiAppEvent::ExplainReport(_)
         | TuiAppEvent::VerdictReport(_)
-        | TuiAppEvent::TurnWarning(_)
-        | TuiAppEvent::TurnInfo(_)
+        | TuiAppEvent::SystemWarning(_)
+        | TuiAppEvent::SystemInfo(_)
         | TuiAppEvent::PermissionAutoApproved { .. } => {}
         TuiAppEvent::TurnComplete | TuiAppEvent::TurnError(_) => {
             bottom_pane.set_task_status(TaskStatus::Idle);
@@ -3936,7 +3936,7 @@ mod tests {
         );
         agent.fanout_slot = Some(
             astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity::new(
-                "review-1", 3, 0,
+                "review-1", 3, 0, None,
             )
             .unwrap(),
         );
@@ -3975,7 +3975,12 @@ mod tests {
                 3,
             );
         group
-            .set_slot_request(1, "api reviewer", "review API surface")
+            .set_slot_request(
+                1,
+                Some("api-reviewer".to_string()),
+                "api reviewer",
+                "review API surface",
+            )
             .unwrap();
         group
             .record_spawn_rejected(1, "concurrency cap reached")
@@ -4090,7 +4095,7 @@ mod tests {
 
     #[tokio::test]
     async fn restored_local_agent_projects_as_unavailable_stale_task() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
         let restored = vec![restored_local_agent_projection("running")];
@@ -4125,7 +4130,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_task_list_xml_includes_restored_local_agent_without_spawner() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
         let restored = vec![restored_local_agent_projection("running")];
@@ -4146,7 +4151,7 @@ mod tests {
 
     #[tokio::test]
     async fn restored_local_agent_keeps_fanout_group_metadata_for_resume_footer() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
         let restored = vec![restored_fanout_local_agent_projection("running")];
@@ -4179,7 +4184,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_output_command_reads_restored_local_agent_projection() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
         let restored = vec![restored_local_agent_projection("running")];
@@ -4204,7 +4209,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_stop_command_reports_stale_handle_for_restored_local_agent() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
         let restored = vec![restored_local_agent_projection("running")];
@@ -4230,7 +4235,7 @@ mod tests {
         let spawned = spawner.spawn(input, &test_spawn_context()).await.unwrap();
         assert!(matches!(spawned, SpawnAgentOutput::Launched { .. }));
 
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
 
@@ -4264,7 +4269,7 @@ mod tests {
             other => panic!("expected launched background agent, got {other:?}"),
         };
 
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
 
@@ -4298,7 +4303,7 @@ mod tests {
             other => panic!("expected launched background agent, got {other:?}"),
         };
 
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
 
@@ -4338,7 +4343,7 @@ mod tests {
             other => panic!("expected launched background agent, got {other:?}"),
         };
 
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
         let mut chat_widget = chat_widget::ChatWidget::new("");
@@ -4403,7 +4408,7 @@ mod tests {
             other => panic!("expected launched background agent, got {other:?}"),
         };
 
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
         let mut chat_widget = chat_widget::ChatWidget::new("");
@@ -4451,7 +4456,7 @@ mod tests {
         let spawned = spawner.spawn(input, &test_spawn_context()).await.unwrap();
         assert!(matches!(spawned, SpawnAgentOutput::Launched { .. }));
 
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
         let mut bottom_pane = BottomPane::new();
@@ -4538,7 +4543,7 @@ mod tests {
 
     #[tokio::test]
     async fn force_open_background_task_view_opens_panel_on_empty_registry() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("empty"));
         let mut bottom_pane = BottomPane::new();
@@ -4562,7 +4567,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_task_switcher_opens_for_pending_bash_handoff() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("pending"));
         let mut bottom_pane = BottomPane::new();
@@ -4607,7 +4612,7 @@ mod tests {
 
     #[tokio::test]
     async fn force_open_background_task_view_preempts_existing_bottom_pane() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("overlay"));
         let mut bottom_pane = BottomPane::new();
@@ -4644,7 +4649,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_task_rows_include_typed_status_and_combined_tail() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("bg-task-row-projection"),
         );
@@ -4679,7 +4684,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_task_rows_surface_missing_output_artifact() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("bg-task-missing-output"),
         );
@@ -4710,7 +4715,7 @@ mod tests {
 
     #[test]
     fn background_task_rows_project_restored_running_as_unavailable_stale() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let stdout = temp.path().join("restored.stdout");
         let stderr = temp.path().join("restored.stderr");
         std::fs::write(&stdout, "line from previous session\n").unwrap();
@@ -4756,7 +4761,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn background_task_projection_persistence_round_trips_workspace() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "bg-projection-session";
         let mut workspace = astra_services::session_workspace::WorkspaceMetadata::with_context(
@@ -4810,7 +4815,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn background_local_agent_projection_persistence_round_trips_workspace() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "bg-local-agent-projection-session";
         let workspace = astra_services::session_workspace::WorkspaceMetadata::with_context(
@@ -4862,7 +4867,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_task_output_snapshot_drains_completion_before_status() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("bg-task-output-snapshot"),
         );
@@ -4881,7 +4886,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_task_output_snapshot_includes_stderr_only_shell_output() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("bg-task-output-stderr"),
         );
@@ -4901,7 +4906,7 @@ mod tests {
 
     #[test]
     fn background_task_output_snapshot_projects_restored_running_as_unavailable() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let stdout = temp.path().join("restored.stdout");
         let stderr = temp.path().join("restored.stderr");
         std::fs::write(&stdout, "old output\n").unwrap();
@@ -4935,7 +4940,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_task_switcher_opens_for_failed_but_not_completed_only() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut completed_registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("completed-only"),
         );

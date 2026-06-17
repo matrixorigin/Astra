@@ -2040,7 +2040,10 @@ mod tests {
         let executor = ToolExecutor::new(repo.path());
 
         let outcome = executor
-            .execute_with_metadata("git_stash", &json!({"action": "push", "message": "demo"}))
+            .execute_with_metadata(
+                "git",
+                &json!({"action": "stash", "sub_action": "push", "message": "demo"}),
+            )
             .await;
         assert!(
             !outcome.output.starts_with("Error:"),

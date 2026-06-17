@@ -622,13 +622,7 @@ mod tests {
     #[test]
     fn individual_tool_kind_classification() {
         // Write-gated tools
-        for tool in &[
-            "git_stash",
-            "git_commit",
-            "git_revert_commit",
-            "delete_file",
-            "github_create_issue",
-        ] {
+        for tool in &["git", "delete_file", "github"] {
             assert_eq!(
                 cloud_gated_tool_kind(tool),
                 Some(CloudGatedToolKind::Write),
@@ -1054,6 +1048,26 @@ mod tests {
         ));
         assert_eq!(
             cloud_gated_tool_kind_with_args("write_file", Some(&write_args)),
+            Some(CloudGatedToolKind::Write)
+        );
+        let git_status = serde_json::json!({"action": "status"});
+        assert!(!edge_tool_requires_cloud_approval_with_args(
+            "git",
+            Some(&git_status)
+        ));
+        let git_commit = serde_json::json!({"action": "commit", "message": "ship"});
+        assert_eq!(
+            cloud_gated_tool_kind_with_args("git", Some(&git_commit)),
+            Some(CloudGatedToolKind::Write)
+        );
+        let github_list = serde_json::json!({"action": "list_prs"});
+        assert!(!edge_tool_requires_cloud_approval_with_args(
+            "github",
+            Some(&github_list)
+        ));
+        let github_create = serde_json::json!({"action": "create_issue", "title": "bug"});
+        assert_eq!(
+            cloud_gated_tool_kind_with_args("github", Some(&github_create)),
             Some(CloudGatedToolKind::Write)
         );
         // MCP tools always require approval

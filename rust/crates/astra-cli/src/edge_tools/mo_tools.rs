@@ -24,25 +24,53 @@ use uuid::Uuid;
 // ─── MatrixOne connection helper ────────────────────────────────────────────
 
 /// Cached account name — queried once via `SELECT current_account_name()`.
+///
+/// Only successful (non-empty) resolutions are cached. If MatrixOne is
+/// unreachable at first call, the fallback "sys" is NOT cached — each
+/// subsequent call retries the query so snapshot ops recover once MO comes
+/// back, rather than permanently targeting the wrong account.
 fn mo_current_account() -> &'static str {
-    use std::sync::OnceLock;
-    static ACCOUNT: OnceLock<String> = OnceLock::new();
-    ACCOUNT.get_or_init(|| {
-        let out =
-            mo_execute_sql("SELECT current_account_name() AS name", None).unwrap_or_else(|e| e);
-        // Parse the value from mysql --table output.
-        out.lines()
-            .filter(|l| !l.starts_with('+') && !l.contains("name"))
-            .find_map(|l| {
-                let trimmed = l.trim().trim_matches('|').trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
+    use std::sync::Mutex;
+
+    // Leaked on success so we can hand out a &'static str without lifetime
+    // gymnastics; process-lifetime cache, exactly one allocation per process.
+    static ACCOUNT: Mutex<Option<&'static str>> = Mutex::new(None);
+
+    if let Ok(guard) = ACCOUNT.lock() {
+        if let Some(cached) = *guard {
+            return cached;
+        }
+    }
+
+    let out =
+        mo_execute_sql("SELECT current_account_name() AS name", None).unwrap_or_else(|e| e);
+    // Parse the value from mysql --table output.
+    let parsed = out
+        .lines()
+        .filter(|l| !l.starts_with('+') && !l.contains("name"))
+        .find_map(|l| {
+            let trimmed = l.trim().trim_matches('|').trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
+    match parsed {
+        Some(account) if !account.is_empty() && !is_mo_error(&out) => {
+            // Cache only verified successes.
+            let leaked: &'static str = Box::leak(account.into_boxed_str());
+            if let Ok(mut guard) = ACCOUNT.lock() {
+                if guard.is_none() {
+                    *guard = Some(leaked);
                 }
-            })
-            .unwrap_or_else(|| "sys".to_string())
-    })
+            }
+            leaked
+        }
+        // Query failed or empty — do NOT cache the fallback; next call retries.
+        _ => "sys",
+    }
 }
 
 fn mo_database() -> &'static str {
@@ -82,8 +110,18 @@ fn mo_query_requires_pre_state_snapshot(sql: &str, allow_destructive: bool) -> b
         .map(str::to_ascii_uppercase)
         .as_deref()
     {
+        // Mutating statements — always snapshot for rollback safety.
         Some("INSERT" | "UPDATE" | "REPLACE" | "CREATE") => true,
         Some("DROP" | "DELETE" | "TRUNCATE" | "ALTER" | "GRANT" | "REVOKE") => true,
+        // Pure reads — never mutate state; skip the snapshot cost regardless
+        // of allow_destructive (the flag gates *execution* of writes, not
+        // snapshot capture on reads).
+        Some(
+            "SELECT" | "SHOW" | "EXPLAIN" | "DESC" | "DESCRIBE" | "USE" | "HELP" | "SOURCE"
+            | "START_TRANSACTION" | "BEGIN" | "COMMIT" | "ROLLBACK" | "SET" | "LOAD" | "PREPARE",
+        ) => false,
+        // Unknown keyword: snapshot only when destructive ops are permitted,
+        // so unrecognized potentially-mutating statements are still covered.
         _ => allow_destructive,
     }
 }
@@ -866,6 +904,12 @@ mod tests {
             "DELETE FROM metrics",
             true
         ));
+        // Pure reads never snapshot, even with allow_destructive.
+        assert!(!mo_query_requires_pre_state_snapshot("SELECT 1", true));
+        assert!(!mo_query_requires_pre_state_snapshot("EXPLAIN SELECT 1", true));
+        // Unknown keyword covered when destructive ops are permitted.
+        assert!(mo_query_requires_pre_state_snapshot("MERGE INTO t", true));
+        assert!(!mo_query_requires_pre_state_snapshot("MERGE INTO t", false));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::process::Command;
 
-use super::policy::{SandboxMode, SandboxPolicy};
+use super::policy::SandboxPolicy;
 
 /// Error type for sandbox command preparation failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,11 +41,7 @@ pub fn sandbox_command(
     policy: &SandboxPolicy,
     cmd: &mut Command,
 ) -> Result<(), SandboxCommandError> {
-    if policy.mode == SandboxMode::Permissive {
-        return Ok(());
-    }
-
-    // Always set working directory to project root
+    // Always set working directory to project root for defense in depth.
     cmd.current_dir(&policy.project_root);
 
     // Filter environment variables
@@ -61,17 +57,13 @@ pub fn sandbox_command(
 /// Build a restricted bash command string.
 ///
 /// Applies shell hardening (extglob disable, IFS reset, stdin redirect)
-/// for Standard+ modes.
+/// for Standard+ isolation.
 ///
 /// Note: ulimit-based resource limits were removed (relies on timeouts
 /// and concurrent tool limits instead).
 /// ulimit -u is UID-wide and caused false-positive fork failures.
-pub fn wrap_command_with_limits(policy: &SandboxPolicy, user_command: &str) -> String {
-    if policy.mode == SandboxMode::Permissive {
-        return user_command.to_string();
-    }
-
-    // Only apply shell hardening, no ulimit restrictions.
+pub fn wrap_command_with_limits(_policy: &SandboxPolicy, user_command: &str) -> String {
+    // Apply shell hardening at all isolation levels (defense in depth).
     // Resource control is handled at the orchestration layer:
     // - Concurrent tool execution limit (MAX_CONCURRENT_READ_ONLY_TOOLS = 10)
     // - Per-command timeouts (max_execution_secs)
@@ -82,13 +74,9 @@ pub fn wrap_command_with_limits(policy: &SandboxPolicy, user_command: &str) -> S
 /// Filter environment variables according to policy.
 ///
 /// Returns the filtered environment as a key-value map.
-/// In Standard+ modes, also scrubs known secret environment variables.
+/// In Standard+ isolation, also scrubs known secret environment variables.
 pub fn filter_environment(policy: &SandboxPolicy) -> HashMap<String, String> {
     let current_env: HashMap<String, String> = std::env::vars().collect();
-
-    if policy.mode == SandboxMode::Permissive {
-        return current_env;
-    }
 
     let mut filtered = HashMap::new();
 
@@ -150,6 +138,32 @@ pub fn is_rm_catastrophic_rm_path(lower: &str) -> bool {
         if target == *d || target.starts_with(&format!("{d}/")) {
             return true;
         }
+    }
+    false
+}
+
+/// Returns `true` when `cmd_name` appears as a standalone word in the
+/// lowercased command string (preceded by start-of-string or whitespace,
+/// followed by whitespace or end-of-string).
+fn is_standalone_command(lower: &str, cmd_name: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = lower[start..].find(cmd_name) {
+        let idx = start + pos;
+        let before_ok = idx == 0
+            || lower
+                .as_bytes()
+                .get(idx - 1)
+                .is_some_and(|b| b.is_ascii_whitespace());
+        let after_idx = idx + cmd_name.len();
+        let after_ok = after_idx == lower.len()
+            || lower
+                .as_bytes()
+                .get(after_idx)
+                .is_some_and(|b| b.is_ascii_whitespace());
+        if before_ok && after_ok {
+            return true;
+        }
+        start = idx + cmd_name.len();
     }
     false
 }
@@ -251,6 +265,55 @@ pub fn analyze_command_risks(command: &str) -> Vec<CommandRisk> {
                 &mut risks,
                 CommandRisk::ZshDangerous(format!("{builtin} builtin")),
             );
+        }
+    }
+
+    // Inline interpreter execution (-c/-e/-r flags) can bypass AST-based bash
+    // analysis by embedding malicious commands inside string literals:
+    //   python3 -c 'import os; os.system("rm -rf /")'
+    //   perl -e 'system("reboot")'
+    //   ruby -e '`rm -rf /`'
+    //   node -e 'require("child_process").exec("reboot")'
+    //   php -r 'system("rm -rf /")'
+    //   lua -e 'os.execute("reboot")'
+    // Block these at the risk level so validate_execute_bash_command rejects them.
+    // Each tuple: (flag_byte, &[interpreter_names]) where flag_byte is the
+    // first byte of the flag (-c, -e, or -r).
+    let inline_interpreters: &[(u8, &[&str])] = &[
+        (1, &["python", "python2", "python3", "python3.12"]),
+        (b'c', &["perl"]),
+        (b'e', &["ruby", "lua"]),
+        (b'e', &["node", "nodejs"]),
+        (b'r', &["php"]),
+    ];
+    // awk is special: it accepts inline code as the first non-flag argument
+    // (e.g., `awk 'BEGIN { system("reboot") }'`). We detect it as a
+    // standalone word (not a flag-based invocation).
+    if is_standalone_command(&lower, "awk") {
+        push_unique(&mut risks, CommandRisk::InlineInterpreter("awk".into()));
+    }
+    for (_flag_byte, names) in inline_interpreters {
+        for name in *names {
+            // Match word-boundary: the interpreter name must be a standalone
+            // word followed by whitespace and -c/-e/-r.
+            if let Some(pos) = lower.find(name) {
+                let after = &lower[pos + name.len()..];
+                if let Some(rest) = after.strip_prefix(' ') {
+                    let flag = if rest.starts_with("-c ") {
+                        "-c"
+                    } else if rest.starts_with("-e ") {
+                        "-e"
+                    } else if rest.starts_with("-r ") {
+                        "-r"
+                    } else {
+                        continue;
+                    };
+                    push_unique(
+                        &mut risks,
+                        CommandRisk::InlineInterpreter(format!("{name} {flag}")),
+                    );
+                }
+            }
         }
     }
 
@@ -524,6 +587,9 @@ pub enum CommandRisk {
     CredentialAccess(String),
     /// Command writes to a path outside the workspace boundary.
     WorkspaceOutWrite(String),
+    /// Command uses inline interpreter execution (-c/-e flags on python/perl/ruby/node)
+    /// which can bypass AST-based bash analysis by embedding commands in string literals.
+    InlineInterpreter(String),
 }
 
 impl std::fmt::Display for CommandRisk {
@@ -544,6 +610,9 @@ impl std::fmt::Display for CommandRisk {
             Self::DestructiveCommand(cmd) => write!(f, "destructive command ({cmd})"),
             Self::CredentialAccess(path) => write!(f, "credential path access ({path})"),
             Self::WorkspaceOutWrite(path) => write!(f, "workspace-out write ({path})"),
+            Self::InlineInterpreter(cmd) => {
+                write!(f, "inline interpreter execution ({cmd})")
+            }
         }
     }
 }
@@ -598,10 +667,18 @@ mod tests {
     // ── Command wrapping ─────────────────────────────────────────────────
 
     #[test]
-    fn permissive_no_wrapping() {
+    fn permissive_applies_minimal_hardening() {
         let p = SandboxPolicy::permissive("/tmp");
         let wrapped = wrap_command_with_limits(&p, "echo hello");
-        assert_eq!(wrapped, "echo hello");
+        // Permissive now applies shell hardening (stdin redirect, extglob disable).
+        assert!(
+            wrapped.contains("echo hello"),
+            "should contain user command"
+        );
+        assert!(
+            wrapped.contains("< /dev/null"),
+            "should redirect stdin from /dev/null"
+        );
     }
 
     #[test]
@@ -617,7 +694,7 @@ mod tests {
             wrapped.contains("echo hello"),
             "should contain user command"
         );
-        // Shell hardening should be applied in Standard+ modes.
+        // Shell hardening should be applied in Standard+ isolation.
         assert!(wrapped.contains("extglob"), "should disable extglob");
         assert!(wrapped.contains("IFS="), "should reset IFS");
     }
@@ -867,7 +944,7 @@ mod tests {
             let output = cmd.output().unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
 
-            // Standard mode without allowlist allows all vars, but env is cleared
+            // Standard isolation without allowlist allows all vars, but env is cleared.
             // and re-populated, so TEST_SANDBOX_VAR should be present
             assert!(stdout.contains("PATH="), "PATH should be in env");
         });
@@ -999,5 +1076,39 @@ mod tests {
         assert!(!is_rm_catastrophic_rm_path("rm -rf ./build"));
         assert!(!is_rm_catastrophic_rm_path("rm -rf node_modules"));
         assert!(!is_rm_catastrophic_rm_path("rm -rf target/debug"));
+    }
+
+    #[test]
+    fn detects_inline_interpreters() {
+        // Existing coverage (python, perl, ruby, node)
+        assert!(
+            analyze_command_risks("python -c 'import os; os.system(\"rm -rf /\")'")
+                .contains(&CommandRisk::InlineInterpreter("python -c".into()))
+        );
+        assert!(
+            analyze_command_risks("perl -e 'system(\"reboot\")'")
+                .contains(&CommandRisk::InlineInterpreter("perl -e".into()))
+        );
+        assert!(
+            analyze_command_risks("ruby -e '`rm -rf /`'")
+                .contains(&CommandRisk::InlineInterpreter("ruby -e".into()))
+        );
+        assert!(
+            analyze_command_risks("node -e 'require(\"child_process\").exec(\"reboot\")'")
+                .contains(&CommandRisk::InlineInterpreter("node -e".into()))
+        );
+        // New coverage: php, lua, awk
+        assert!(
+            analyze_command_risks("php -r 'system(\"rm -rf /\")'")
+                .contains(&CommandRisk::InlineInterpreter("php -r".into()))
+        );
+        assert!(
+            analyze_command_risks("lua -e 'os.execute(\"reboot\")'")
+                .contains(&CommandRisk::InlineInterpreter("lua -e".into()))
+        );
+        assert!(
+            analyze_command_risks("awk 'BEGIN { system(\"reboot\") }'")
+                .contains(&CommandRisk::InlineInterpreter("awk".into()))
+        );
     }
 }

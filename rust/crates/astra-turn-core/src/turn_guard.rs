@@ -594,9 +594,9 @@ impl TurnGuard {
                              outline=true, grep, or glob instead of rereading the same file."
                                 .to_string(),
                         ),
-                        "git_diff" => injections.push(
-                            "For repeated git_diff cache hits, reuse the earlier diff until the \
-                             worktree changes, or narrow the diff to a specific path or commit."
+                        "git" => injections.push(
+                            "For repeated git cache hits, reuse the earlier output until the \
+                             worktree changes, or narrow with a specific path or commit."
                                 .to_string(),
                         ),
                         _ => {}

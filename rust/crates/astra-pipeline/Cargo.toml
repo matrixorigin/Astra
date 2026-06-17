@@ -19,7 +19,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
-ring = "0.17"
 sqlx = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

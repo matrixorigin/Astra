@@ -618,10 +618,7 @@ fn extract_file_path_from_tool_result(
             .and_then(Value::as_str)
             .and_then(|id| id_to_name.get(id).copied())
     })?;
-    if !matches!(
-        tool_name,
-        "read_file" | "grep" | "glob" | "git_show" | "git_diff"
-    ) {
+    if !matches!(tool_name, "read_file" | "grep" | "glob" | "git") {
         return None;
     }
     // Try to extract path from content (read_file results typically start with path)
@@ -1568,7 +1565,7 @@ mod tests {
         messages.push(assistant_with_tools(&[
             ("c5", "read_file"),
             ("c6", "grep"),
-            ("c7", "git_diff"),
+            ("c7", "glob"),
             ("c8", "read_file"),
         ]));
         messages.extend([

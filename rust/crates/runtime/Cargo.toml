@@ -47,6 +47,7 @@ astra-text-utils.workspace = true
 astra-pipeline.workspace = true
 astra-plan.workspace = true
 astra-prompts.workspace = true
+astra-runtime-env.workspace = true
 astra-sandbox.workspace = true
 astra-server-types = { workspace = true, features = ["server"] }
 astra-mcp.workspace = true

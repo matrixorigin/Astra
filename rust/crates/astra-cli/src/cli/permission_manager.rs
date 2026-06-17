@@ -5456,8 +5456,8 @@ mod tests {
     #[test]
     fn explicit_irreversible_actions_auto_allowed_in_auto_mode() {
         let mut pm = PermissionManager::new(true); // auto mode
-        let args = serde_json::json!({"message": "ship it"});
-        let decision = pm.check_nonblocking("git_commit", &args);
+        let args = serde_json::json!({"action": "commit", "message": "ship it"});
+        let decision = pm.check_nonblocking("git", &args);
         assert!(
             matches!(decision, PermissionDecision::Allow),
             "Auto mode should auto-allow explicit tools, got: {decision:?}"
@@ -5467,8 +5467,8 @@ mod tests {
     #[test]
     fn explicit_irreversible_actions_need_approval_in_prompt_mode() {
         let mut pm = PermissionManager::new(false); // prompt mode
-        let args = serde_json::json!({"message": "ship it"});
-        let decision = pm.check_nonblocking("git_commit", &args);
+        let args = serde_json::json!({"action": "commit", "message": "ship it"});
+        let decision = pm.check_nonblocking("git", &args);
         assert!(
             matches!(decision, PermissionDecision::NeedApproval { .. }),
             "Prompt mode should require approval for explicit tools, got: {decision:?}"
@@ -5512,8 +5512,8 @@ mod tests {
     #[test]
     fn need_approval_does_not_record_rejection() {
         let mut pm = PermissionManager::new(false);
-        let args = serde_json::json!({"message": "ship it"});
-        let decision = pm.check_nonblocking("git_commit", &args);
+        let args = serde_json::json!({"action": "commit", "message": "ship it"});
+        let decision = pm.check_nonblocking("git", &args);
         assert!(matches!(decision, PermissionDecision::NeedApproval { .. }));
         assert!(pm.recent_rejections().is_empty());
     }

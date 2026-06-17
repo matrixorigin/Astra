@@ -15,12 +15,16 @@ use astra_turn_core::headless_tool_postprocess::{
     record_headless_cacheable_success_and_semantic_hint_if_ok,
     try_write_light_headless_step_checkpoint,
 };
-use astra_turn_core::headless_tool_status_display::{tool_call_detail, tool_result_summary};
+use astra_turn_core::headless_tool_status_display::{
+    tool_call_detail, tool_error_summary, tool_result_summary,
+};
 use astra_turn_core::headless_tool_stderr_lines::{
     headless_stderr_error_preview_line, headless_stderr_tool_error_detail_line,
     headless_stderr_tool_error_line, headless_stderr_tool_ok_line,
 };
-use astra_turn_core::tool_result_sanitize::tool_result_content_for_model;
+use astra_turn_core::tool_result_sanitize::{
+    tool_result_content_for_model_unbounded, truncate_tool_result_for_model,
+};
 
 fn emit_tool_display_feedback(
     quiet: bool,
@@ -45,13 +49,12 @@ fn emit_tool_display_feedback(
                 HeadlessStderrStyle::Red,
                 headless_stderr_tool_error_line(name, &duration_str, detail.as_deref()),
             );
-            if let Some(first_line) = result_str.lines().next() {
-                let preview = headless_stderr_error_preview_line(first_line, 100);
-                term.emit_line(
-                    HeadlessStderrStyle::Dim,
-                    headless_stderr_tool_error_detail_line(&preview),
-                );
-            }
+            let summary = tool_error_summary(name, result_str);
+            let preview = headless_stderr_error_preview_line(&summary, 100);
+            term.emit_line(
+                HeadlessStderrStyle::Dim,
+                headless_stderr_tool_error_detail_line(&preview),
+            );
         } else {
             term.emit_line(
                 HeadlessStderrStyle::Green,
@@ -74,7 +77,8 @@ fn maybe_persist_model_tool_result(
     current_session_id: Option<&String>,
     id: &str,
     name: &str,
-    model_result_str: String,
+    full_model_result_str: &str,
+    inline_model_result_str: String,
 ) -> String {
     if let Some(sid) = current_session_id {
         let session_dir = astra_services::local_session_artifact_store()
@@ -84,13 +88,13 @@ fn maybe_persist_model_tool_result(
             &session_dir,
             id,
             name,
-            &model_result_str,
+            full_model_result_str,
         ) {
             Some(replacement) => replacement,
-            None => model_result_str,
+            None => inline_model_result_str,
         }
     } else {
-        model_result_str
+        inline_model_result_str
     }
 }
 
@@ -212,12 +216,15 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             executed_ms,
         );
 
+        let full_model_result_str =
+            tool_result_content_for_model_unbounded(&execution.name, &execution.result_str);
         let model_result_str =
-            tool_result_content_for_model(&execution.name, &execution.result_str);
+            truncate_tool_result_for_model(&execution.name, &full_model_result_str);
         let model_result_str = maybe_persist_model_tool_result(
             self.ctx.current_session_id,
             &execution.id,
             &execution.name,
+            &full_model_result_str,
             model_result_str,
         );
 

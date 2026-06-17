@@ -1825,15 +1825,13 @@ mod tests {
         let ctx = crate::permission::types::PermissionSyncContext::new(
             crate::permission::types::InheritedPermissions {
                 mode: crate::permission::types::PermissionMode::Prompt,
-                allow_rules: vec![crate::permission::types::PermissionRule::parse(
-                    "git_commit",
-                )],
+                allow_rules: vec![crate::permission::types::PermissionRule::parse("git")],
                 ..Default::default()
             },
         );
         let envelope = evaluate_permission(
-            "git_commit",
-            &serde_json::json!({"message": "ship it"}),
+            "git",
+            &serde_json::json!({"action": "commit", "message": "ship it"}),
             &ctx,
         );
         assert!(matches!(

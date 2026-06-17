@@ -14,6 +14,7 @@ pub struct AgentFanoutSlotIdentity {
     pub group_id: String,
     pub target_count: usize,
     pub slot_index: usize,
+    pub slot_id: Option<String>,
 }
 
 impl AgentFanoutSlotIdentity {
@@ -21,6 +22,7 @@ impl AgentFanoutSlotIdentity {
         group_id: impl Into<String>,
         target_count: usize,
         slot_index: usize,
+        slot_id: Option<String>,
     ) -> Result<Self, String> {
         let group_id = group_id.into();
         let group_id = group_id.trim();
@@ -37,10 +39,21 @@ impl AgentFanoutSlotIdentity {
                 "fanout slot_index {slot_index} is outside target_count {target_count}"
             ));
         }
+        let slot_id = match slot_id {
+            Some(slot_id) => {
+                let slot_id = slot_id.trim();
+                if slot_id.is_empty() {
+                    return Err("fanout metadata requires non-empty fanout_slot_id".to_string());
+                }
+                Some(slot_id.to_string())
+            }
+            None => None,
+        };
         Ok(Self {
             group_id: group_id.to_string(),
             target_count,
             slot_index,
+            slot_id,
         })
     }
 }
@@ -63,6 +76,7 @@ pub struct AgentFanoutGroupProjection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentFanoutSlot {
     pub slot_index: usize,
+    pub slot_id: Option<String>,
     pub role: String,
     pub requested_description: String,
     pub agent_id: Option<String>,
@@ -92,6 +106,23 @@ pub enum AgentFanoutSlotStatus {
     TimedOut,
 }
 
+impl AgentFanoutSlotStatus {
+    /// Lowercase snake_case label for JSON/API output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::SpawnAccepted => "spawn_accepted",
+            Self::SpawnRejected => "spawn_rejected",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::CancelledByUser => "cancelled_by_user",
+            Self::CancelledByParentBudget => "cancelled_by_parent_budget",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AgentFanoutSummary {
     pub target_count: usize,
@@ -115,6 +146,7 @@ impl AgentFanoutGroupProjection {
         let slots = (0..target_count)
             .map(|idx| AgentFanoutSlot {
                 slot_index: idx,
+                slot_id: None,
                 role: String::new(),
                 requested_description: String::new(),
                 agent_id: None,
@@ -159,10 +191,12 @@ impl AgentFanoutGroupProjection {
     pub fn set_slot_request(
         &mut self,
         slot_index: usize,
+        slot_id: Option<String>,
         role: impl Into<String>,
         requested_description: impl Into<String>,
     ) -> Result<(), String> {
         let slot = self.slot_mut(slot_index)?;
+        slot.slot_id = slot_id;
         slot.role = role.into();
         slot.requested_description = requested_description.into();
         Ok(())

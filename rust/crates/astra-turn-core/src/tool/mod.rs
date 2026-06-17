@@ -2,6 +2,7 @@
 
 pub mod args;
 pub mod categories;
+pub mod deferred_activation;
 pub mod health;
 pub mod policy;
 pub mod registry;

@@ -241,15 +241,7 @@ fn classify_task_type(
 /// a weak signal.
 fn infer_domain_from_tools(tools: &[String]) -> Option<DomainHint> {
     let github_prefixes = ["github_", "github"];
-    let git_tools = [
-        "git_status",
-        "git_diff",
-        "git_log",
-        "git_blame",
-        "git_file_history",
-        "git_contributors",
-        "git_log_search",
-    ];
+    let git_tools = ["git"];
     let memory_tools = ["memory"];
     let db_tools = ["mo_query", "mo_snapshot", "mo_branch"];
 

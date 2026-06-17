@@ -1390,16 +1390,88 @@ fn is_reversible_auto_completed_parent(task: &SessionTask) -> bool {
             .unwrap_or(false)
 }
 
+fn task_actions_allowing_field(field: &str, current_action: &str) -> Vec<&'static str> {
+    const TASK_ACTION_FIELDS: &[(&str, &[&str])] = &[
+        (
+            "create",
+            &[
+                "action",
+                "title",
+                "description",
+                "subtasks",
+                "active_form",
+                "owner",
+                "metadata",
+                "add_blocks",
+                "add_blocked_by",
+            ],
+        ),
+        ("list", &["action", "status_filter"]),
+        ("get", &["action", "task_id"]),
+        (
+            "update",
+            &[
+                "action",
+                "task_id",
+                "new_status",
+                "status",
+                "title",
+                "description",
+                "subtask_id",
+                "active_form",
+                "owner",
+                "metadata",
+                "add_blocks",
+                "add_blocked_by",
+                "remove_blocks",
+                "remove_blocked_by",
+                "reason",
+                "error_message",
+            ],
+        ),
+        ("stop", &["action", "task_id", "reason"]),
+        (
+            "archive",
+            &["action", "task_id", "older_than_days", "reason"],
+        ),
+    ];
+
+    TASK_ACTION_FIELDS
+        .iter()
+        .filter_map(|(action, fields)| {
+            (*action != current_action && fields.contains(&field)).then_some(*action)
+        })
+        .collect()
+}
+
+fn unknown_task_field_message(action: &str, key: &str, allowed: &[&str]) -> String {
+    let other_actions = task_actions_allowing_field(key, action);
+    let action_hint = if other_actions.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; field is valid for: {}",
+            other_actions
+                .iter()
+                .map(|action| format!("task.{action}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    format!(
+        "unknown field '{key}' for task.{action} (valid: {}{})",
+        allowed.join(", "),
+        action_hint
+    )
+}
+
 fn validate_allowed_fields(args: &Value, action: &str, allowed: &[&str]) -> Result<(), String> {
     let Some(obj) = args.as_object() else {
         return Err(format!("task.{action} arguments must be an object"));
     };
     for key in obj.keys() {
         if !allowed.contains(&key.as_str()) {
-            return Err(format!(
-                "unknown field '{key}' for task.{action} (valid: {})",
-                allowed.join(", ")
-            ));
+            return Err(unknown_task_field_message(action, key, allowed));
         }
     }
     if let Some(action_value) = obj.get("action")
@@ -1959,6 +2031,12 @@ impl TaskManager {
     /// `restore_snapshot` uses the sealed version as its compare-and-restore
     /// guard. This lets rollback undo the caller's own mutation while refusing
     /// to clobber any later concurrent task-board write.
+    ///
+    /// **TOCTOU guard**: verifies that at most one version increment
+    /// (the caller's own mutation) occurred between snapshot capture and
+    /// seal. Returns an error if a concurrent mutation advanced the
+    /// version further, because the snapshot no longer represents the
+    /// pre-state of ONLY this caller's mutation.
     pub async fn seal_snapshot_for_restore(
         &self,
         snapshot: &mut TaskManagerSnapshot,
@@ -1969,6 +2047,16 @@ impl TaskManager {
             .get_session_version(&sid)
             .await
             .map_err(|e| format!("seal_snapshot_for_restore: failed to read version: {e}"))?;
+        // TOCTOU guard: if more than one version increment happened
+        // (i.e. a concurrent mutation intervened between capture and
+        // seal), the snapshot is stale.
+        if version > snapshot.version + 1 {
+            return Err(format!(
+                "seal_snapshot_for_restore: concurrent mutation detected \
+                 (captured version={}, current version={}) — snapshot is stale",
+                snapshot.version, version
+            ));
+        }
         snapshot.restore_version = Some(version);
         Ok(())
     }
@@ -3473,6 +3561,18 @@ mod tests {
                 "{action} should reject unknown fields explicitly: {output}"
             );
         }
+
+        let create_only_field_on_update = m
+            .update(&json!({"task_id": "task-1", "subtasks": []}))
+            .await;
+        assert!(
+            create_only_field_on_update.contains("unknown field 'subtasks' for task.update"),
+            "{create_only_field_on_update}"
+        );
+        assert!(
+            create_only_field_on_update.contains("field is valid for: task.create"),
+            "{create_only_field_on_update}"
+        );
 
         let action_wrong_type = m
             .create(&json!({"action": true, "title": "bad action"}))

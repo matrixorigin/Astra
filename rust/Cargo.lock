@@ -154,6 +154,7 @@ dependencies = [
  "astra-pipeline",
  "astra-prompts",
  "astra-runtime",
+ "astra-runtime-env",
  "astra-sandbox",
  "astra-services",
  "astra-skills",
@@ -283,6 +284,7 @@ name = "astra-edge"
 version = "0.1.0"
 dependencies = [
  "astra-logging",
+ "astra-runtime-env",
  "astra-server-types",
  "astra-tools",
  "clap",
@@ -375,7 +377,6 @@ dependencies = [
  "astra-turn-types",
  "async-trait",
  "chrono",
- "ring",
  "serde",
  "serde_json",
  "sha2",
@@ -419,6 +420,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "astra-runner"
+version = "0.1.0"
+dependencies = [
+ "astra-runtime-env",
+ "astra-tools",
+ "async-trait",
+ "axum 0.8.9",
+ "clap",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower 0.5.3",
+]
+
+[[package]]
 name = "astra-runtime"
 version = "0.1.0"
 dependencies = [
@@ -432,6 +448,7 @@ dependencies = [
  "astra-pipeline",
  "astra-plan",
  "astra-prompts",
+ "astra-runtime-env",
  "astra-sandbox",
  "astra-server-types",
  "astra-services",
@@ -481,6 +498,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "astra-runtime-env"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "astra-sandbox"
 version = "0.1.0"
 dependencies = [
@@ -524,6 +552,7 @@ dependencies = [
  "astra-config",
  "astra-core",
  "astra-logging",
+ "astra-runtime-env",
  "astra-turn-types",
  "async-trait",
  "axum 0.8.9",
@@ -540,7 +569,6 @@ dependencies = [
  "jsonwebtoken",
  "regex",
  "reqwest 0.12.28",
- "ring",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -617,6 +645,7 @@ dependencies = [
 name = "astra-thin-client"
 version = "0.1.0"
 dependencies = [
+ "astra-runtime-env",
  "async-stream",
  "futures-util",
  "hex",
@@ -643,6 +672,7 @@ dependencies = [
  "base64",
  "chrono",
  "dirs 6.0.0",
+ "futures",
  "gix",
  "libc",
  "nix 0.31.2",

@@ -925,12 +925,20 @@ pub async fn run_script(
     // until the child has exited and been waited on — otherwise Drop
     // tries to remove a non-empty cgroup directory. Silent fallback when
     // cgroup v2 is unavailable: the guard is inactive and does nothing.
-    let _cgroup_guard =
-        astra_sandbox::apply_cgroup(&mut cmd, config.memory_limit_bytes, config.cpu_quota);
+    let cgroup_guard = astra_sandbox::apply_cgroup(config.memory_limit_bytes, config.cpu_quota);
 
     let mut child = cmd
         .spawn()
         .map_err(|e| io_context("run_script spawn python", e))?;
+
+    // Post-spawn: join child to cgroup by writing its real PID.
+    if let Some(pid) = child.id()
+        && let Err(e) = cgroup_guard.join_child(pid)
+    {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(io_context("cgroup join_child", e).into());
+    }
 
     let stdout = child.stdout.take().expect("stdout piped");
     let max_stdout = config.max_stdout_bytes;

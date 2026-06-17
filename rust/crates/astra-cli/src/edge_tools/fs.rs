@@ -5,10 +5,11 @@ use super::{
     AGGREGATE_OUTPUT_BUDGET, AGGREGATE_SOFT_LIMIT, ReadDedupKey, SANDBOX_DENIED_PREFIX,
     ToolExecutor, code_intel, fuzzy_replacer, tool_output_limit, truncate_output,
 };
-use astra_runtime::tool_sandbox::{SandboxMode, validate_path};
+use astra_runtime::tool_sandbox::{IsolationLevel, validate_path};
 use astra_sandbox::is_internal_safe_path;
 use astra_tools::fs_ops::{
     check_anchor_vs_replacement_size, read_to_string_lossy, str_replace_fail,
+    validate_read_file_args,
 };
 use serde_json::{Value, json};
 
@@ -111,7 +112,7 @@ impl ToolExecutor {
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(ref policy) = *sp_guard
-                && !matches!(policy.mode, SandboxMode::Permissive)
+                && !matches!(policy.isolation, IsolationLevel::Permissive)
             {
                 return validate_path(policy, path).map_err(|e| {
                     if e.is_boundary_violation() {
@@ -135,9 +136,15 @@ impl ToolExecutor {
     }
 
     pub(crate) fn read_file(&self, args: &Value) -> String {
+        if let Err(error) = validate_read_file_args(args) {
+            return error;
+        }
         let path_str = match args.get("path").and_then(Value::as_str) {
             Some(p) => p,
-            None => return "Error: missing 'path'".to_string(),
+            None => {
+                return "Error: missing required field `path` for read_file. Valid fields: path, start_line, end_line, outline."
+                    .to_string();
+            }
         };
         let path = match self.resolve_checked(path_str) {
             Ok(safe) => safe,
@@ -446,7 +453,7 @@ impl ToolExecutor {
             }
         };
 
-        // Outline mode: return only definition signatures with line numbers
+        // Outline isolation: return only definition signatures with line numbers
         if has_outline {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let total_lines = content.lines().count();
@@ -589,8 +596,6 @@ impl ToolExecutor {
         let lines: Vec<&str> = content.lines().collect();
         let s = start.unwrap_or(1).saturating_sub(1).min(lines.len());
         let e = end.unwrap_or(lines.len()).min(lines.len());
-        // Auto-swap if the LLM accidentally reversed start/end.
-        let (s, e) = if s > e { (e, s) } else { (s, e) };
         if s >= e {
             return format!(
                 "(empty range: start_line {} >= end_line {} or file has only {} lines)",
@@ -3255,6 +3260,53 @@ type Handler interface {
         let executor = test_executor_in(dir.path());
         let result = executor.read_file(&serde_json::json!({"path": "numbered.txt"}));
         assert_eq!(result, "1\thello\n2\tworld\n3\tfoo");
+    }
+
+    #[test]
+    fn read_file_rejects_unknown_fields_before_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
+
+        let result = executor.read_file(&serde_json::json!({
+            "file": "numbered.txt",
+            "offset": 1,
+            "limit": 300
+        }));
+
+        assert!(result.contains("unknown field `file`"), "{result}");
+        assert!(result.contains("Valid fields: path"), "{result}");
+        assert!(
+            !result.contains("missing 'path'"),
+            "unknown-field contract should fire before legacy missing-path text: {result}"
+        );
+    }
+
+    #[test]
+    fn read_file_rejects_invalid_optional_arg_types() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.txt"), "a\nb\nc").unwrap();
+        let executor = test_executor_in(dir.path());
+
+        let result = executor.read_file(&serde_json::json!({
+            "path": "test.txt",
+            "start_line": "1"
+        }));
+        assert!(result.contains("`start_line`"), "{result}");
+        assert!(result.contains("positive integer"), "{result}");
+
+        let result = executor.read_file(&serde_json::json!({
+            "path": "test.txt",
+            "outline": 1
+        }));
+        assert!(result.contains("`outline`"), "{result}");
+        assert!(result.contains("boolean"), "{result}");
+
+        let result = executor.read_file(&serde_json::json!({
+            "path": "test.txt",
+            "start_line": 3,
+            "end_line": 1
+        }));
+        assert!(result.contains("must be <= `end_line`"), "{result}");
     }
 
     #[test]

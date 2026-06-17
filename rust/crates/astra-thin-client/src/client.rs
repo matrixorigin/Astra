@@ -2106,6 +2106,7 @@ mod tests {
             output: Some("out".into()),
             duration_ms: Some(12),
             result_hash: None,
+            tool_result_fields: None,
         };
         let v = client
             .post_tool_result(Some("tok"), Some("edge-abc"), &body)
@@ -2165,10 +2166,18 @@ mod tests {
     #[tokio::test]
     async fn wiremock_agents_edge_register_typed_body() {
         let srv = MockServer::start().await;
+        let capabilities =
+            crate::edge::edge_runtime_environment_capabilities("agent-logical", "/workspace/app");
         Mock::given(method("POST"))
             .and(path("/agents/edge"))
             .and(header("authorization", "Bearer t"))
             .and(header("x-astra-edge-id", "transport-1"))
+            .and(body_json(serde_json::json!({
+                "edge_agent_id": "agent-logical",
+                "hostname": "host-a",
+                "worktree_path": "/workspace/app",
+                "capabilities": capabilities,
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
             .mount(&srv)
             .await;
@@ -2177,8 +2186,11 @@ mod tests {
         let body = EdgeRegisterRequest {
             edge_agent_id: "agent-logical".into(),
             hostname: Some("host-a".into()),
-            worktree_path: None,
-            capabilities: None,
+            worktree_path: Some("/workspace/app".into()),
+            capabilities: Some(crate::edge::edge_runtime_environment_capabilities(
+                "agent-logical",
+                "/workspace/app",
+            )),
         };
         let v = client
             .post_agents_edge_register(Some("t"), Some("transport-1"), &body)

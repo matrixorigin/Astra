@@ -640,36 +640,6 @@ pub async fn persist_remote_workspace(
         .map_err(|error| error.to_string())
 }
 
-/// Write workspace metadata to disk.
-pub fn write_workspace(metadata: &WorkspaceMetadata) -> std::io::Result<()> {
-    let dir = validated_workspace_dir(&metadata.session_id)?;
-    std::fs::create_dir_all(&dir)?;
-    sync_parent_dir(&dir)?;
-    let path = dir.join("workspace.yaml");
-    let yaml = serde_yaml_ng::to_string(metadata)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let tmp = dir.join(".workspace.yaml.tmp");
-    // Write to tmp, set perms, fsync, then atomically rename.
-    {
-        use std::io::Write;
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(yaml.as_bytes())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
-        }
-        file.sync_all()?;
-    }
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    sync_parent_dir(&path)?;
-    Ok(())
-}
-
-/// Read workspace metadata from disk.
 pub fn read_workspace(session_id: &str) -> std::io::Result<WorkspaceMetadata> {
     let path = workspace_file_path(session_id)?;
     let metadata = std::fs::metadata(&path)?;
@@ -687,6 +657,38 @@ pub fn read_workspace(session_id: &str) -> std::io::Result<WorkspaceMetadata> {
     let content = std::fs::read_to_string(&path)?;
     serde_yaml_ng::from_str(&content)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Write workspace metadata to disk.
+pub fn write_workspace(metadata: &WorkspaceMetadata) -> std::io::Result<()> {
+    let dir = validated_workspace_dir(&metadata.session_id)?;
+    std::fs::create_dir_all(&dir)?;
+    sync_parent_dir(&dir)?;
+    let path = dir.join("workspace.yaml");
+    let yaml = serde_yaml_ng::to_string(metadata)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    // Atomic write: tmp → fsync → rename → fsync parent
+    let tmp_path = path.with_extension("yaml.tmp");
+    {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        // Set restrictive permissions (0o600) before writing sensitive session data
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        let mut writer = std::io::BufWriter::new(file);
+        writer.write_all(yaml.as_bytes())?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?; // fsync data to disk
+    }
+    // Atomic rename
+    std::fs::rename(&tmp_path, &path)?;
+    sync_parent_dir(&path)?;
+    Ok(())
 }
 
 /// Read workspace metadata when present, while preserving corruption as an error.

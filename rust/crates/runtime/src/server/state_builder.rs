@@ -38,6 +38,8 @@ pub async fn build_server_state(
             settings.memoria.base_url.clone(),
             settings.memoria.master_key.clone(),
         );
+    let runner_pool = crate::server::runner_pool::ServerRunnerPool::database(&shared_pool).await?;
+    let state = state.with_runner_pool(runner_pool);
     let state = install_skillify_harness_service(state, &settings, &shared_pool, &shared_encryptor);
 
     let wiring = runtime::build_runtime_wiring(
@@ -64,7 +66,6 @@ pub async fn build_server_state(
         &matrix_rt,
     );
 
-    crate::server::sweeper_lease::spawn_runtime_sweepers(shared_pool.clone());
     Ok(state.with_matrix_cloud_runtime(Some(matrix_rt)))
 }
 

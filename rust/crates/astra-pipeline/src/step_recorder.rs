@@ -1885,16 +1885,16 @@ mod tests {
 
         let adopted_path = tmp.path().join("sess-adopted").join("step_events.jsonl");
         let persisted = std::fs::read_to_string(adopted_path).unwrap();
-        // Decrypt each line (hex-encoded encrypted JSONL)
-        let decrypted: Vec<String> = persisted
+        let parsed: Vec<StepEvent> = persisted
             .lines()
-            .filter_map(crate::step_checkpoint::decrypt_checkpoint)
-            .collect();
-        let decrypted_str = decrypted.join(
-            "
-",
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()
+            .expect("step_events.jsonl should be plaintext JSONL");
+        assert!(
+            parsed
+                .iter()
+                .any(|event| event.step_id == "sess-adopted-turn-0-step-0")
         );
-        assert!(decrypted_str.contains("\"step_id\":\"sess-adopted-turn-0-step-0\""));
         assert!(
             !tmp.path()
                 .join("ephemeral")

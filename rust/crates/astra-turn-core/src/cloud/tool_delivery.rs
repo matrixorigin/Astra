@@ -226,7 +226,11 @@ fn structured_tool_result(
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string(),
-        tool_result_fields: body.as_object().cloned(),
+        tool_result_fields: body
+            .get("tool_result_fields")
+            .and_then(Value::as_object)
+            .cloned()
+            .or_else(|| body.as_object().cloned()),
     }
 }
 
@@ -1126,6 +1130,42 @@ mod tests {
         assert_eq!(
             fields.get("output").and_then(Value::as_str),
             Some("permission denied")
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_tool_result_prefers_nested_tool_result_fields() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let uid = "u1_nested";
+        let tc = read_tool("c_nested");
+        ledger.lock().await.insert(
+            tool_callback_key(uid, "c_nested"),
+            json!({
+                "body": {
+                    "request_id": "c_nested",
+                    "status": "ok",
+                    "output": "done",
+                    "duration_ms": 5,
+                    "tool_result_fields": {
+                        "runtime_environment_advertisement": {"schema_version": 1}
+                    }
+                }
+            }),
+        );
+
+        let delivery =
+            wait_tool_result_ledger_for_tool(&ledger, uid, &tc, Duration::from_millis(60)).await;
+        let fields = delivery.tool_results[0]
+            .tool_result_fields
+            .as_ref()
+            .expect("nested structured fields");
+        assert!(fields.get("request_id").is_none());
+        assert_eq!(
+            fields
+                .get("runtime_environment_advertisement")
+                .and_then(|value| value.get("schema_version"))
+                .and_then(Value::as_u64),
+            Some(1)
         );
     }
 

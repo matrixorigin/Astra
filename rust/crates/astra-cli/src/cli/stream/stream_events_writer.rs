@@ -240,7 +240,9 @@ mod tests {
             label: "auth reviewer".into(),
             tool_use_id: "spawn-tu".into(),
             agent_id: None,
-            fanout_slot: Some(AgentFanoutSlotIdentity::new("review-1", 3, 1).unwrap()),
+            fanout_slot: Some(
+                AgentFanoutSlotIdentity::new("review-1", 3, 1, Some("storage".into())).unwrap(),
+            ),
             fanout_title: Some("review fanout".into()),
         });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -249,6 +251,7 @@ mod tests {
         assert_eq!(v["fanout_slot"]["group_id"], "review-1");
         assert_eq!(v["fanout_slot"]["target_count"], 3);
         assert_eq!(v["fanout_slot"]["slot_index"], 1);
+        assert_eq!(v["fanout_slot"]["slot_id"], "storage");
     }
 
     #[test]

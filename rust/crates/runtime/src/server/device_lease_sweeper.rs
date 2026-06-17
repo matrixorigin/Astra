@@ -94,34 +94,41 @@ pub async fn expire_due_device_leases_once(
 pub(crate) fn spawn_device_lease_expiry_sweeper(
     pool: SharedPool,
     lease: Arc<crate::server::sweeper_lease::SweeperLease>,
-) {
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(SWEEP_INTERVAL_SECS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            interval.tick().await;
-            match lease.check_leader().await {
-                crate::server::sweeper_lease::LeaderStatus::Leader => {}
-                crate::server::sweeper_lease::LeaderStatus::NotLeader => continue,
-                crate::server::sweeper_lease::LeaderStatus::Unavailable(e) => {
-                    tracing::warn!(
-                        target: "astra_runtime::device_lease_sweeper",
-                        error = %e,
-                        "sweeper lease check unavailable, skipping sweep"
-                    );
-                    continue;
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    'tick: {
+                        match lease.check_leader().await {
+                            crate::server::sweeper_lease::LeaderStatus::Leader => {}
+                            crate::server::sweeper_lease::LeaderStatus::NotLeader => break 'tick,
+                            crate::server::sweeper_lease::LeaderStatus::Unavailable(e) => {
+                                tracing::warn!(
+                                    target: "astra_runtime::device_lease_sweeper",
+                                    error = %e,
+                                    "sweeper lease check unavailable, skipping sweep"
+                                );
+                                break 'tick;
+                            }
+                        }
+                        if let Err(error) = expire_due_device_leases_once(pool.clone(), 500).await {
+                            tracing::warn!(
+                                target: "astra_runtime::device_lease_sweeper",
+                                error = %error,
+                                "device lease expiry sweeper failed"
+                            );
+                        }
+                    }
                 }
             }
-            if let Err(error) = expire_due_device_leases_once(pool.clone(), 500).await {
-                tracing::warn!(
-                    target: "astra_runtime::device_lease_sweeper",
-                    error = %error,
-                    "device lease expiry sweeper failed"
-                );
-            }
         }
-    });
+    })
 }
 
 #[cfg(test)]

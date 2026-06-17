@@ -65,6 +65,14 @@ fn edit_in_external_editor_with_command(
     initial: &str,
     command_override: Option<&str>,
 ) -> Result<String, String> {
+    edit_in_external_editor_with_command_in(initial, command_override, None)
+}
+
+fn edit_in_external_editor_with_command_in(
+    initial: &str,
+    command_override: Option<&str>,
+    temp_dir: Option<&std::path::Path>,
+) -> Result<String, String> {
     let editor = command_override
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -74,7 +82,11 @@ fn edit_in_external_editor_with_command(
             "no external editor found; set $VISUAL/$EDITOR or install one of: nvim, vim, vi, nano"
                 .to_string()
         })?;
-    let file = tempfile::NamedTempFile::new().map_err(|e| format!("create temp draft: {e}"))?;
+    let file = match temp_dir {
+        Some(dir) => tempfile::NamedTempFile::new_in(dir),
+        None => tempfile::NamedTempFile::new(),
+    }
+    .map_err(|e| format!("create temp draft: {e}"))?;
     std::fs::write(file.path(), initial).map_err(|e| format!("write temp draft: {e}"))?;
     let status = build_editor_process(&editor, file.path())?
         .status()
@@ -180,12 +192,12 @@ fn requires_shell_evaluation(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        edit_in_external_editor_with_command, first_available_editor, requires_shell_evaluation,
+        edit_in_external_editor_with_command_in, first_available_editor, requires_shell_evaluation,
     };
 
     #[test]
     fn external_editor_roundtrips_updated_text() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tests::test_temp_dir();
         let script = dir.path().join("editor.sh");
         std::fs::write(
             &script,
@@ -198,9 +210,10 @@ mod tests {
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        let edited = edit_in_external_editor_with_command(
+        let edited = edit_in_external_editor_with_command_in(
             "before",
             Some(&format!("sh {}", script.display())),
+            Some(dir.path()),
         )
         .unwrap();
         assert_eq!(edited, "edited from editor\n");
@@ -208,11 +221,10 @@ mod tests {
 
     #[test]
     fn external_editor_supports_quoted_paths_and_env_prefixes() {
-        let dir = tempfile::Builder::new()
-            .prefix("external editor ")
-            .tempdir()
-            .unwrap();
-        let script = dir.path().join("editor script.sh");
+        let temp = crate::tests::test_temp_dir();
+        let dir = temp.path().join("external editor path");
+        std::fs::create_dir(&dir).unwrap();
+        let script = dir.join("editor script.sh");
         std::fs::write(
             &script,
             "#!/bin/sh\n[ \"$EDITOR_MODE\" = \"test\" ] || exit 9\nprintf 'edited with args\\n' > \"$1\"\n",
@@ -224,9 +236,10 @@ mod tests {
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        let edited = edit_in_external_editor_with_command(
+        let edited = edit_in_external_editor_with_command_in(
             "before",
             Some(&format!("EDITOR_MODE=test sh '{}'", script.display())),
+            Some(temp.path()),
         )
         .unwrap();
         assert_eq!(edited, "edited with args\n");

@@ -108,27 +108,82 @@ pub async fn restore_detach_signal_receiver(
     }
 }
 
+/// Send SIGTERM to a child's process group (when spawned with
+/// `process_group(0)`). Best-effort on Unix; falls back to sending
+/// SIGTERM to the child directly elsewhere.
+#[cfg(unix)]
+fn sigterm_process_group(child: &tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        if pid <= i32::MAX as u32 {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        } else {
+            tracing::warn!("sigterm_process_group: PID exceeds i32::MAX, skipping killpg");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn sigterm_process_group(_child: &tokio::process::Child) {}
+
 /// SIGKILL a child's process group (when spawned with `process_group(0)`)
 /// and reap. Best-effort on Unix; falls back to `child.kill()` elsewhere.
-/// Centralized here so both bash runners terminate detached payloads
-/// the same way on adoption failure.
+#[cfg(unix)]
 pub async fn sigkill_process_group(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        if pid <= i32::MAX as u32 {
+            let pgid = nix::unistd::Pid::from_raw(pid as i32);
+            let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+        } else {
+            tracing::warn!("sigkill_process_group: PID exceeds i32::MAX, skipping killpg");
+        }
+    }
+    // Robust fallback: callers normally spawn with `process_group(0)`, but a
+    // missing process group must never make shutdown wait on a live child.
+    let _ = child.start_kill();
+    // Always try to reap after signaling.
+    let _ = child.wait().await;
+}
+
+#[cfg(not(unix))]
+pub async fn sigkill_process_group(child: &mut tokio::process::Child) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+/// Gracefully terminate a child process: send SIGTERM to the process
+/// group, wait up to `grace_period`, then escalate to SIGKILL if the
+/// process is still alive.
+pub async fn terminate_child_gracefully(child: &mut tokio::process::Child, grace_period: Duration) {
     #[cfg(unix)]
+    sigterm_process_group(child);
+    #[cfg(not(unix))]
     {
-        if let Some(pid) = child.id() {
-            if let Ok(raw) = i32::try_from(pid) {
-                let pgid = nix::unistd::Pid::from_raw(raw);
-                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
-            } else {
-                tracing::warn!(
-                    pid,
-                    "sigkill_process_group: PID exceeds i32::MAX, skipping killpg"
-                );
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return;
+    }
+
+    // Wait for graceful shutdown, then escalate.
+    let deadline = tokio::time::Instant::now() + grace_period;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return, // Exited gracefully
+            Ok(None) => {
+                if tokio::time::Instant::now() >= deadline {
+                    sigkill_process_group(child).await;
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(_) => {
+                sigkill_process_group(child).await;
+                return;
             }
         }
     }
-    let _ = child.kill().await;
-    let _ = child.wait().await;
 }
 
 /// SIGKILL the live child carried in a [`DetachedShellPayload`]. Used

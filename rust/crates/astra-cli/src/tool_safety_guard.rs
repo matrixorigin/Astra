@@ -74,7 +74,7 @@ impl ToolSafetyGuard {
             })
         {
             return Err(format!(
-                "Error: run_chain rollback_on_failure only supports read-only bash steps. `{command}` is mutating. Use structured mutation tools (write_file, git_*, rollback-aware editors), use run_build_test for build/test loops when available, or keep bash read-only inside the chain."
+                "Error: run_chain rollback_on_failure only supports read-only bash steps. `{command}` is mutating. Use structured mutation tools (write_file, git_*, rollback-aware editors), run project-native build/test commands through visible tools after the transaction, or keep bash read-only inside the chain."
             ));
         }
 

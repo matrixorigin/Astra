@@ -9,7 +9,7 @@ use std::borrow::Cow;
 
 use crate::diff_utils::parse_hunk_header;
 
-pub use astra_text_utils::str_preview::{github_repo_display, shorten_path, truncate_line};
+pub use astra_text_utils::str_preview::{shorten_path, truncate_line};
 
 /// Unified diff for CLI summaries: `str_replace` / `multi_edit` sentinels, or `write_file` JSON field.
 pub fn extract_cli_diff_block(output: &str) -> Option<Cow<'_, str>> {

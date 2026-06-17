@@ -4,7 +4,7 @@
 //! the runtime's [`run_agentic_loop_with_host`]; this module now only exposes
 //! `fetch_chat_turn_sse` for use by [`crate::cli_loop_host::CliAgenticLoopHost`].
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::Arc;
@@ -26,8 +26,9 @@ use astra_runtime::{
     },
     turn::chat_turn_budget_pressure::budget_pressure_for_chat_turn,
     turn::chat_turn_edge_profile::{
-        EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW, EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT,
-        detect_active_system_skills_in_message, read_git_branch_abbrev,
+        EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW,
+        EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT, detect_active_system_skills_in_message,
+        read_git_branch_abbrev,
     },
     turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
     turn::chat_turn_heuristics::extract_repos_from_memory,
@@ -57,6 +58,17 @@ use crate::{
 use crate::cli::chat_stream::edge_executor::edge_executor_instance_id;
 
 const BASH_BACKGROUND_TASK_CONTROL_TOOLS: &[&str] = &["task_output", "task_list", "task_stop"];
+
+/// Session-control tools injected unconditionally to prevent schema thrashing.
+/// Their combined cost is < 200 tokens but toggling them on/off breaks prompt
+/// caching at every plan-mode transition or selector variance.
+const CACHE_STABLE_SESSION_TOOLS: &[&str] = &[
+    "enter_plan_mode",
+    "exit_plan_mode",
+    "prioritize_tool",
+    "deprioritize_tool",
+    "compress_context",
+];
 
 /// Per-phase stderr timings for `/chat/turn`. Disabled — use `RUST_LOG=debug` instead.
 pub(crate) fn chat_turn_timing_stderr_enabled() -> bool {
@@ -256,13 +268,23 @@ pub(crate) fn turn_policy_from_payload_edge_tools(
     payload: &Value,
     interaction_mode: TurnInteractionMode,
 ) -> TurnInteractionPolicy {
+    let schemas = final_visible_tool_schemas_from_payload(payload);
+    TurnInteractionPolicy::from_tool_schemas(interaction_mode, &schemas)
+}
+
+pub(crate) fn final_visible_tool_schemas_from_payload(payload: &Value) -> Vec<Value> {
     payload
         .get("edge_tools")
         .and_then(Value::as_array)
-        .map(|tools| TurnInteractionPolicy::from_tool_schemas(interaction_mode, tools))
-        .unwrap_or_else(|| {
-            TurnInteractionPolicy::from_visible_tool_names(interaction_mode, Vec::new())
-        })
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn tool_schema_name(schema: &Value) -> Option<&str> {
+    schema
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
 }
 
 async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
@@ -499,6 +521,19 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                 ctx.all_schemas,
             );
         }
+        // Keep already-activated deferred tools visible for the remainder of
+        // the turn, preventing schema add→remove→add thrashing that breaks
+        // prompt caching.
+        let activated = ctx.executor.activated_deferred_tool_names();
+        if !activated.is_empty() {
+            let refs: Vec<&str> = activated.iter().map(String::as_str).collect();
+            astra_turn_core::tool_schema_prune::inject_required_tool_names(
+                &mut turn_schemas,
+                &mut selection_report,
+                &refs,
+                ctx.all_schemas,
+            );
+        }
         if selection_report
             .tools_selected
             .iter()
@@ -512,14 +547,16 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             );
         }
     }
-    if ctx.plan_mode_active {
-        astra_turn_core::tool_schema_prune::inject_required_tool_names(
-            &mut turn_schemas,
-            &mut selection_report,
-            astra_turn_core::tool_schema_prune::PLAN_MODE_REQUIRED_TOOLS,
-            ctx.all_schemas,
-        );
-    }
+    // Always inject session-control tools regardless of current mode.
+    // Toggling them on/off causes schema changes that break prompt caching
+    // on every transition. They're tiny (< 200 tokens combined) and harmless
+    // when not actively used.
+    astra_turn_core::tool_schema_prune::inject_required_tool_names(
+        &mut turn_schemas,
+        &mut selection_report,
+        CACHE_STABLE_SESSION_TOOLS,
+        ctx.all_schemas,
+    );
 
     // Plan-mode tool restrictions are owned by the host
     // (`CliAgenticLoopHost::execute_turn`) using the same
@@ -555,8 +592,33 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     );
     ctx.executor.set_budget_pressure(budget_pressure);
 
-    let tool_surface =
-        tool_registry::surface::ToolSurface::from_runtime_config(ctx.registry.all_tool_schemas());
+    let surface_schemas: Vec<Value> = ctx
+        .registry
+        .all_tool_schemas()
+        .iter()
+        .filter(|schema| {
+            tool_schema_name(schema)
+                .map(|name| !ctx.restricted_tools.contains(name))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    let tool_surface = tool_registry::surface::ToolSurface::build(
+        surface_schemas,
+        &astra_config::runtime_config::RuntimeConfig::cached().tool_surface,
+        &[],
+    );
+    let activatable_tool_names_ordered: BTreeSet<String> = tool_surface
+        .deferred()
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
+    let deferred_tool_names_for_wire: Vec<String> =
+        activatable_tool_names_ordered.iter().cloned().collect();
+    let activatable_tool_names: HashSet<String> =
+        activatable_tool_names_ordered.into_iter().collect();
+    ctx.executor
+        .set_current_activatable_tool_names(activatable_tool_names);
     if let Some(deferred_tools_text) = tool_surface.deferred_block_text(requested_model) {
         let deferred_tools_context_window = prompts::budget_for_model(requested_model).model_limit;
         merge_edge_profile_extensions(
@@ -564,14 +626,11 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             &json!({
                 EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT: deferred_tools_text,
                 EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW: deferred_tools_context_window,
+                EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES: deferred_tool_names_for_wire,
             }),
         );
     }
 
-    // Pass the selector-produced `turn_schemas` (which includes any force-injected
-    // plan-mode or skill-allowed tools) rather than `tool_surface.pinned_schemas()`.
-    // Pinned schemas only contain tools invoked in prior turns; using them here would
-    // discard newly-injected required tools that haven't been called yet.
     apply_selector_hints_then_attach_filtered_edge_tools(
         &mut payload,
         turn_schemas,
@@ -580,6 +639,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         selection_confidence,
         None,
     );
+    // Sync the executor guard from the final payload, after selector hints,
+    // capability restrictions, and interaction-mode filtering have all been
+    // applied. The guard must mirror what the model actually saw.
+    let final_visible_schemas = final_visible_tool_schemas_from_payload(&payload);
+    ctx.executor
+        .set_current_visible_tool_schemas(&final_visible_schemas);
     *ctx.turn_policy = turn_policy_from_payload_edge_tools(&payload, ctx.interaction_mode);
     log_chat_turn_timing_phase(timing, "skill_merge_attach_edge_tools", &mut mark);
 
@@ -1445,6 +1510,22 @@ mod tests {
         assert!(!policy.allow_ask_user);
     }
 
+    #[test]
+    fn final_visible_tool_schemas_from_payload_uses_only_payload_edge_tools() {
+        let payload = json!({
+            "edge_tools": [schema("read_file")],
+            "candidate_tools_before_filter": [schema(ASK_USER_TOOL_NAME)]
+        });
+
+        let schemas = super::final_visible_tool_schemas_from_payload(&payload);
+        let names: Vec<&str> = schemas
+            .iter()
+            .filter_map(|schema| schema["function"]["name"].as_str())
+            .collect();
+
+        assert_eq!(names, vec!["read_file"]);
+    }
+
     // ── Regression: skill allowed_tools not force-included (session c3dea07a) ──
     //
     // When a skill declares allowed_tools (e.g. review-changes allows grep, glob),
@@ -1709,14 +1790,15 @@ mod tests {
             .iter()
             .filter_map(|schema| schema["function"]["name"].as_str())
             .collect();
-        // Plan-mode escape hatches must NOT be present when plan_mode_active is false
+        // Session-control tools are always injected for cache stability
+        // (prevents schema thrashing on plan-mode transitions).
         assert!(
-            !edge_tool_names.contains(&"enter_plan_mode"),
-            "enter_plan_mode should not be injected when plan_mode_active=false"
+            edge_tool_names.contains(&"enter_plan_mode"),
+            "enter_plan_mode should always be injected for cache stability"
         );
         assert!(
-            !edge_tool_names.contains(&"exit_plan_mode"),
-            "exit_plan_mode should not be injected when plan_mode_active=false"
+            edge_tool_names.contains(&"exit_plan_mode"),
+            "exit_plan_mode should always be injected for cache stability"
         );
     }
 

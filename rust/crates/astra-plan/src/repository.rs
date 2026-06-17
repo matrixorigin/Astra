@@ -274,18 +274,6 @@ impl CloudPlanRepository {
     }
 }
 
-fn infer_phase_for_persist(state: &PlanModeState) -> &'static str {
-    if state.plan.progress_pct() == 100 {
-        "completed"
-    } else if state.plan.subtasks.is_empty() {
-        "planning"
-    } else if state.plan.items_done() > 0 {
-        "executing"
-    } else {
-        "refining"
-    }
-}
-
 fn map_sqlx(err: sqlx::Error) -> PlanLoadError {
     PlanLoadError::Internal(format!("sql error: {err}"))
 }
@@ -341,7 +329,7 @@ impl PlanRepository for CloudPlanRepository {
         expected_version: Option<u64>,
     ) -> Result<(), PlanLoadError> {
         validate_plan_id(plan_id)?;
-        let phase = infer_phase_for_persist(state);
+        let phase = state.infer_phase().as_str();
         let progress = state.plan.progress_pct() as i32;
         let goal = state.goal.clone();
         let user_id = state
@@ -908,7 +896,7 @@ impl PlanRepository for CloudPlanRepository {
         subtask_ids: &[String],
     ) -> Result<u64, PlanLoadError> {
         validate_plan_id(plan_id)?;
-        let phase = infer_phase_for_persist(state);
+        let phase = state.infer_phase().as_str();
         let progress = state.plan.progress_pct() as i32;
         let goal = state.goal.clone();
         let next_version = expected_version
@@ -1097,7 +1085,7 @@ impl PlanRepository for InMemoryPlanRepository {
                     return None;
                 }
                 if let Some(phase) = filter.phase
-                    && infer_phase_for_persist(state) != phase
+                    && state.infer_phase().as_str() != phase
                 {
                     return None;
                 }

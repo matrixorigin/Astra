@@ -972,10 +972,9 @@ mod tests {
             "str_replace",
             "delete_file",
             "multi_edit",
-            "git_commit",
-            "git_stash",
+            "git",
             "git_checkout_file",
-            "github_create_issue",
+            "github",
             "mo_query",
             "mo_snapshot",
             "mo_branch",
@@ -991,18 +990,7 @@ mod tests {
 
     #[test]
     fn read_only_tools_covers_git_and_github_reads() {
-        for expected in &[
-            "git_status",
-            "git_diff",
-            "git_log",
-            "git_blame",
-            "read_file",
-            "grep",
-            "glob",
-            "list_dir",
-            "github_list_prs",
-            "github_get_pr",
-        ] {
+        for expected in &["read_file", "grep", "glob", "list_dir"] {
             assert!(
                 READ_ONLY_TOOLS.contains(expected),
                 "missing cacheable tool: {expected}"
@@ -1132,14 +1120,6 @@ mod tests {
         assert_eq!(tr["name"], "mo_query");
         assert_eq!(tr["result"], "OK (no results)");
         assert_eq!(tr["pre_state_snapshot_id"], "moq_snap_2");
-    }
-
-    #[test]
-    fn read_only_tools_includes_git_show() {
-        assert!(
-            READ_ONLY_TOOLS.contains(&"git_show"),
-            "git_show should be cacheable (idempotent read of committed content)"
-        );
     }
 
     #[test]
@@ -1339,7 +1319,7 @@ mod tests {
 
     #[test]
     fn non_plan_no_matching_edge_error_keeps_direct_workaround() {
-        let message = no_matching_edge_execution_message("github_create_issue");
+        let message = no_matching_edge_execution_message("github");
 
         assert!(message.contains("Workaround: use `bash`"), "{message}");
     }

@@ -443,19 +443,6 @@ struct StallSummary {
 }
 
 fn summarize_stall_signal_for_user(signal: &str) -> Option<StallSummary> {
-    if signal.starts_with("single_tool_streak=") {
-        let streak = signal.trim_start_matches("single_tool_streak=");
-        return Some(StallSummary {
-            cause: format!(
-                "the run stayed in one-tool-per-round mode for {streak} consecutive rounds"
-            ),
-            correction: format!(
-                "batch independent calls (different files / greps / reads) \
-                 into a single parallel round instead of another {streak}-round \
-                 single-tool streak"
-            ),
-        });
-    }
     if signal.starts_with("exploration_family=") {
         let kv = parse_kv_stall_signal(signal);
         if let (Some(family), Some(streak)) = (kv.get("exploration_family"), kv.get("streak")) {
@@ -499,6 +486,17 @@ fn summarize_stall_signal_for_user(signal: &str) -> Option<StallSummary> {
             ),
             correction:
                 "reuse the file content already in context instead of reopening overlapping ranges"
+                    .to_string(),
+        });
+    }
+    if signal.starts_with("single_tool_streak=") {
+        let streak = signal.trim_start_matches("single_tool_streak=");
+        return Some(StallSummary {
+            cause: format!(
+                "the run made {streak} consecutive rounds with only one tool call each"
+            ),
+            correction:
+                "batch independent tool calls together and stop serializing reads, searches, or status checks when they can run in parallel"
                     .to_string(),
         });
     }

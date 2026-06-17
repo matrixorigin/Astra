@@ -236,6 +236,16 @@ impl AgenticLoopHost for SubRunHost {
         let tool_surface = astra_runtime::tool_registry::surface::ToolSurface::from_runtime_config(
             &self.all_schemas,
         );
+        let activatable_tool_names: std::collections::HashSet<String> = tool_surface
+            .deferred()
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        let activatable_for_wire: Vec<String> = {
+            let mut names: Vec<String> = activatable_tool_names.iter().cloned().collect();
+            names.sort();
+            names
+        };
         if let Some(deferred_tools_text) = tool_surface.deferred_block_text(effective_model) {
             let deferred_tools_context_window =
                 prompts::budget_for_model(effective_model).model_limit;
@@ -245,7 +255,9 @@ impl AgenticLoopHost for SubRunHost {
                     astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT:
                         deferred_tools_text,
                     astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW:
-                        deferred_tools_context_window
+                        deferred_tools_context_window,
+                    astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES:
+                        activatable_for_wire,
                 }),
             );
         }
@@ -253,6 +265,15 @@ impl AgenticLoopHost for SubRunHost {
             self.inherited_prefix.as_ref(),
             tool_surface.pinned_schemas(),
         );
+        self.executor
+            .set_current_visible_tool_schemas(&schemas_to_use);
+        // Mirror the deferred manifest onto the executor so a deferred-tool
+        // call inside the sub-run gets the activation hint instead of the
+        // bare "Unknown tool" denial. Without this, the parent's executor
+        // (cloned via `Arc`) would still hold the parent turn's set, which
+        // can drift from this sub-run's surface.
+        self.executor
+            .set_current_activatable_tool_names(activatable_tool_names);
         astra_runtime::turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools(
             &mut payload,
             schemas_to_use,

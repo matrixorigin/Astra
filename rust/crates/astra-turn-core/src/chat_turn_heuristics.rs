@@ -478,11 +478,9 @@ pub fn looks_like_mutating_task(input: &str) -> bool {
 }
 
 fn recent_tools_imply_live_domain(recent_tools: &[String]) -> bool {
-    recent_tools.iter().any(|tool| {
-        tool.starts_with("github_")
-            || tool.starts_with("memory_")
-            || matches!(tool.as_str(), "git_status" | "git_diff")
-    })
+    recent_tools
+        .iter()
+        .any(|tool| matches!(tool.as_str(), "github" | "memory" | "git"))
 }
 
 pub fn looks_like_live_query_with_context(input: &str, recent_tools: &[String]) -> bool {
@@ -889,7 +887,7 @@ mod tests {
         let none: Vec<String> = vec![];
         let policy = TurnInteractionPolicy::from_visible_tool_names(
             TurnInteractionMode::Deny,
-            vec!["github_ci_status".into()],
+            vec!["github".into()],
         );
         assert!(should_force_factual_tool_retry(
             TaskExecutionProfile::default(),
@@ -960,7 +958,7 @@ mod tests {
 
     #[test]
     fn contextual_live_query_detects_short_followup() {
-        let recent = vec!["github_ci_status".to_string()];
+        let recent = vec!["github".to_string()];
         assert!(looks_like_live_query_with_context("最新的", &recent));
         assert!(looks_like_live_query_with_context("pr呢？", &recent));
         assert!(!looks_like_live_query_with_context("hello", &recent));

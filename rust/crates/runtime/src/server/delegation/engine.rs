@@ -7118,7 +7118,7 @@ mod tests {
     /// P1-B source guard: cancel_run must call cancel_children_of on delegation engine.
     #[test]
     fn cancel_run_cascades_to_delegation_children() {
-        let source = include_str!("../run/lifecycle.rs");
+        let source = include_str!("../run/lifecycle/mod.rs");
         let fn_start = source
             .find("async fn cancel_run(")
             .expect("cancel_run must exist");

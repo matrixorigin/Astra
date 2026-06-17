@@ -139,6 +139,18 @@ async fn build_test_router_keeps_core_routes_reachable_for_oneshot_tests() {
 
     let edge_ws = request_status(app, request("GET", "/edge/ws", &[], Body::empty())).await;
     assert_ne!(edge_ws, StatusCode::NOT_FOUND);
+
+    let runners = request_status(
+        build_test_router(build_guardrail_state()),
+        request(
+            "GET",
+            "/runners",
+            &[("authorization", "Bearer test-token")],
+            Body::empty(),
+        ),
+    )
+    .await;
+    assert_ne!(runners, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

@@ -15,30 +15,25 @@ impl TuiUiAdapter {
 }
 
 impl ReplUiAdapter for TuiUiAdapter {
+    /// Route errors through TurnError so the ChatWidget commits a SystemCell::error into scrollback.
     fn show_error(&mut self, msg: &str) {
-        // Route errors through TurnError so the ChatWidget commits
-        // a SystemCell::error into scrollback. Previously this was a
-        // StatusLine, which the bridge intentionally drops (it's meant
-        // for bottom-pane status only) — that made turn failures like
-        // "Model 'default' not configured" disappear silently, leaving
-        // the user with a 0-token turn_summary and no visible cause.
         let _ = self.tx.send(TuiAppEvent::TurnError(msg.to_string()));
     }
+
+    /// Route warnings through SystemWarning so the ChatWidget commits a SystemCell::warning into scrollback.
     fn show_warning(&mut self, msg: &str) {
-        // Route warnings through TurnWarning so the ChatWidget commits
-        // a SystemCell::warning into scrollback. Previously this was a
-        // StatusLine, which the bridge intentionally drops (it's meant
-        // for bottom-pane status only) — that made warnings like
-        // "Not logged in" disappear silently.
-        let _ = self.tx.send(TuiAppEvent::TurnWarning(msg.to_string()));
+        let _ = self.tx.send(TuiAppEvent::SystemWarning(msg.to_string()));
     }
+
+    /// Route info through SystemInfo so the ChatWidget commits a SystemCell::info into scrollback.
     fn show_info(&mut self, msg: &str) {
-        // Same story: StatusLine is dropped by the bridge, so we route
-        // through TurnInfo for scrollback visibility.
-        let _ = self.tx.send(TuiAppEvent::TurnInfo(msg.to_string()));
+        let _ = self.tx.send(TuiAppEvent::SystemInfo(msg.to_string()));
     }
+
+    /// Bottom-pane status line — handled by surface_status_line_system_cell for deferred input.
     fn show_status(&mut self, msg: &str) {
         let _ = self.tx.send(TuiAppEvent::StatusLine(msg.to_string()));
     }
+
     fn blank_line(&mut self) {}
 }

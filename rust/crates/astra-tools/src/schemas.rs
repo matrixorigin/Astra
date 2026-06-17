@@ -23,6 +23,20 @@ pub fn all_tool_schemas() -> Vec<Value> {
     all_tool_schemas_with_env(|k| std::env::var(k).ok())
 }
 
+/// Check whether a tool name has a corresponding schema in the built-in
+/// registry. Used by [`super::tool_engine::ToolEngine::register_handler`]
+/// to detect schema↔handler mismatches at registration time rather than
+/// at runtime when the LLM calls an unimplemented or mis-specified tool.
+pub fn schema_exists_for_tool(name: &str) -> bool {
+    all_tool_schemas().iter().any(|schema| {
+        schema
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            == Some(name)
+    })
+}
+
 /// Replace the `run_script` schema with the narrowed server-side variant.
 #[cfg(unix)]
 pub fn narrow_run_script_for_server(schemas: &mut [Value]) {
@@ -186,6 +200,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "description": "Create, overwrite, or delete a file. For writes, provide `path` and `content`. Use this for new files, complete rewrites, or large changes (>4KB) — `str_replace` is a diff channel and should not be used for full-section replacements. WARNING: overwrites existing files silently — read first if you need to preserve content. For deletes, set `delete=true` and omit `content`. Retry `write_file` with corrected args; do not switch to bash or python just to write a file.",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
                         "content": {"type": "string", "description": "File content. Required unless deleting."},
@@ -203,18 +218,20 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "str_replace",
-                "description": "Replace text in a file (diff channel — for targeted edits, not full rewrites). Supports single replacement or batched `edits`. Use the smallest old_str that uniquely identifies the target — typically 2-4 adjacent lines (≥3 lines preferred when new_str is large). For full-section rewrites or changes >4KB, use `write_file` with the complete file content instead. WARNING: old_str must match exactly (including whitespace); if it matches multiple locations the edit is rejected — add surrounding context lines to disambiguate, or use replace_all=true.",
+                "description": "Replace text in a file (diff channel — for targeted edits, not full rewrites). Supports single replacement or batched `edits`. Use exact fields only: `path` + `old_str` + `new_str`, or `path` + `edits`; do not use aliases such as old/new/original_text/replacements. Use the smallest old_str that uniquely identifies the target — typically 2-4 adjacent lines (≥3 lines preferred when new_str is large). For full-section rewrites or changes >4KB, use `write_file` with the complete file content instead. WARNING: old_str must match exactly (including whitespace); if it matches multiple locations the edit is rejected — add surrounding context lines to disambiguate, or use replace_all=true.",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
-                        "old_str": {"type": "string", "description": "String to replace (single-edit mode)."},
-                        "new_str": {"type": "string", "description": "Replacement text (single-edit mode)."},
+                        "old_str": {"type": "string", "description": "String to replace. Required with new_str in single-edit mode; omit when using edits."},
+                        "new_str": {"type": "string", "description": "Replacement text. Required with old_str in single-edit mode; omit when using edits."},
                         "edits": {
                             "type": "array",
-                            "description": "Atomic array of {old_str, new_str} pairs. Mutually exclusive with old_str/new_str.",
+                            "description": "Atomic batch mode: array of {old_str, new_str} pairs. Mutually exclusive with top-level old_str/new_str.",
                             "items": {
                                 "type": "object",
+                                "additionalProperties": false,
                                 "properties": {
                                     "old_str": {"type": "string"},
                                     "new_str": {"type": "string"}
@@ -226,7 +243,11 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "replace_all": {"type": "boolean", "description": "Replace all occurrences."},
                         "allow_structural_change": {"type": "boolean", "description": "Bypass structural safety checks for intentional syntax-breaking edits."}
                     },
-                    "required": ["path"]
+                    "required": ["path"],
+                    "x-astra-per-action-required": {
+                        "single": ["path", "old_str", "new_str"],
+                        "batch": ["path", "edits"]
+                    }
                 }
             }
         }),
@@ -656,6 +677,67 @@ fn all_tool_schemas_core() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "prioritize_tool",
+                "description": "Pin a tool as preferred for this session when it is clearly more useful than alternatives. This updates server-side session preferences and can be rolled back with rollback_session_state.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "tool": {"type": "string", "description": "Tool name to prioritize."}
+                    },
+                    "required": ["tool"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "deprioritize_tool",
+                "description": "Soft-deprioritize a tool for this session when it is unreliable, irrelevant, or repeatedly less suitable than another available tool. This updates server-side session preferences and can be rolled back with rollback_session_state.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "tool": {"type": "string", "description": "Tool name to deprioritize."}
+                    },
+                    "required": ["tool"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "compress_context",
+                "description": "Record a manual context-compression request for the current turn. Use when the session is carrying stale or bulky context and future turns should prefer a compacted history.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "reason": {"type": "string", "description": "Short reason for manual compression. Defaults to manual_request."}
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "rollback_session_state",
+                "description": "List or restore server-side session-state mutations such as tool preference changes, config overrides, task-state snapshots, and manual context-compression markers. This is for session state, not file contents; use rollback_file_edits for file rollback.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "scope": {"type": "string", "enum": ["current_turn", "turn", "list"], "description": "Rollback scope. Defaults to current_turn. Use list to inspect available rollback handles."},
+                        "turn_index": {"type": "integer", "description": "Turn index when scope=turn."},
+                        "session_state_after_sequence": {"type": "integer", "description": "Only restore entries recorded after this rollback-journal sequence."},
+                        "after_sequence": {"type": "integer", "description": "Alias for session_state_after_sequence."}
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "mo",
                 "description": "MatrixOne database operations. Actions: query (run SQL), snapshot (create named snapshot), branch (create named branch).",
                 "parameters": {
@@ -677,21 +759,57 @@ fn all_tool_schemas_core() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "mo_query",
+                "description": "Run a MatrixOne SQL query. Destructive statements are blocked unless allow_destructive=true, and mutating queries capture a pre-state snapshot for rollback_database_snapshots.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "sql": {"type": "string", "description": "SQL to execute."},
+                        "database": {"type": "string", "description": "Optional MatrixOne database name."},
+                        "allow_destructive": {"type": "boolean", "description": "Explicitly allow destructive or mutating SQL when needed. Default false."}
+                    },
+                    "required": ["sql"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "rollback_database_snapshots",
+                "description": "List or restore MatrixOne pre-state snapshots captured before mutating SQL. Use this for database rollback, not file or session-state rollback.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "scope": {"type": "string", "enum": ["current_turn", "turn", "snapshot", "list"], "description": "Rollback scope. Defaults to current_turn. Use list to inspect recorded snapshots."},
+                        "turn_index": {"type": "integer", "description": "Turn index when scope=turn."},
+                        "snapshot_id": {"type": "string", "description": "Snapshot identifier when scope=snapshot."},
+                        "database": {"type": "string", "description": "Optional database name when restoring a specific snapshot."},
+                        "database_after_sequence": {"type": "integer", "description": "Only restore database snapshot entries recorded after this journal sequence."},
+                        "after_sequence": {"type": "integer", "description": "Alias for database_after_sequence."}
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "agent",
-                "description": "Multi-agent operations. Actions: spawn, get_result, run_chain, send_message.\n\n\
+                "description": "Actions: spawn needs description+prompt (not task/type/agent_id; foreground; no background arg); get_result needs returned agent_id; run_chain needs steps.\n\n\
+         Multi-agent operations. Actions: spawn, get_result, run_chain, send_message.\n\n\
          ## Required fields per action\n\
-         - `spawn`: REQUIRES `action`, `description`, `prompt`. (Optional: `agent_type`, `run_in_background`, `model`, `max_turns`, `complexity`, `isolated`, `allowed_tools`, `name`.)\n\
+         - `spawn`: REQUIRES `action`, `description`, `prompt`. (Optional: `agent_type`, `model`, `max_turns`, `complexity`, `isolated`, `allowed_tools`, `name`.)\n\
          - `get_result`: REQUIRES `action`, `agent_id`.\n\
          - `run_chain`: REQUIRES `action`, `steps`.\n\
          - `send_message`: REQUIRES `action`, `to`, `message`.\n\n\
-         For `spawn`, pass both non-empty fields: `description` (short UI summary) and `prompt` (full child brief). Do NOT pass a top-level `task` field. Do NOT pass `type`; use `agent_type`. Do NOT pass `inherit_context`. `agent_id` is ONLY for `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. If you need a mailbox label, use `name`, but `name` is not valid for `get_result`.\n\n\
+         For `spawn`, pass both non-empty fields: `description` (short UI summary) and `prompt` (full child brief). Do NOT pass a top-level `task` field. Do NOT pass `type`; use `agent_type`. Do NOT pass `inherit_context`. `agent_id` is ONLY for `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. Later `get_result` calls must reuse the exact returned `agent_id`. If you need a mailbox label, use `name`, but `name` is not valid for `get_result`.\n\n\
          ## Spawn example\n\
          `agent(action='spawn', description='Audit auth flow', prompt='Read src/auth/* and report any token-handling bugs. Focus on session expiry and refresh logic. Return findings as a numbered list.', agent_type='general-purpose')`\n\n\
          ## Execution mode\n\
-         - **Default (synchronous)**: `spawn` blocks until the sub-agent's final result is ready. Use this for work you depend on in the current turn. The sub-agent's tool calls stream back inline — the TUI renders them inside the parent Task card so the user sees progress live.\n\
-         - **Background**: pass `run_in_background: true` to return immediately with `{agent_id}`. Use this for fire-and-forget or long-running work you don't need to await in the current turn; follow up with `get_result` later using the exact returned `agent_id`. Local restarts preserve a visible background-task projection, not a live executor handle.\n\n\
+         `spawn` is foreground by contract: it blocks until the sub-agent's final result is ready, and the sub-agent's tool calls stream back inline. Backgrounding is user-controlled from the UI with Ctrl+B while the live agent is running; do not pass a background flag in tool arguments.\n\n\
          ## Parallel sub-agent fan-out\n\
-         Use `agent_fanout(action='start', target_count=N, slots=[...])` to start a fixed-size parallel group atomically, then `agent_fanout(action='get_results', group_id=...)` to collect every slot. Do not simulate fan-out with an `agents:[...]` payload on `agent`.\n\
+         Use `agent_fanout(action='start', target_count=N, slots=[...])` to run a fixed-size parallel group atomically. It waits for slot results and returns them in the same tool call unless the user backgrounds the live run with Ctrl+B. Slots may include `id` as a caller-facing label; runtime-generated `agent_id` values come back in the result. Do not simulate fan-out with an `agents:[...]` payload on `agent`.\n\
          For plan lifecycle, call `enter_plan_mode` / `exit_plan_mode` directly. Do NOT wrap them inside `agent(action='run_chain', ...)`.\n\
          Do NOT pass an `agents:[...]` payload, do NOT pass a top-level `task` field, and do NOT wrap spawn arguments under a `spawn` field. `agent` launches one child; `agent_fanout` launches a fixed parallel group.
 
@@ -709,7 +827,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "prompt": {"type": "string", "description": "Full child task brief for spawn. Non-empty and required with description."},
                         "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Sub-agent persona (spawn). Default: general-purpose."},
                         "model": {"type": "string", "description": "Model override (spawn). Default: parent's model."},
-                        "run_in_background": {"type": "boolean", "description": "If true, return immediately with a runtime-generated agent_id instead of blocking on the sub-agent's final result. Use that exact returned value with get_result. Default false (sync). Applies to spawn."},
                         "name": {"type": "string", "description": "Addressable mailbox name (spawn). Optional; auto-generated if omitted. Not the runtime agent_id used by get_result."},
                         "max_turns": {"type": "integer", "description": "Max turns (spawn). Explicit value wins over `complexity`."},
                         "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Task-complexity hint scaling the default budget when `max_turns` is absent. `light`≈10 turns, `normal`=agent default, `deep`=2× default. Use `deep` for review/refactor/multi-file tasks that routinely exhaust the default."},
@@ -736,11 +853,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "agent_fanout",
-                "description": "Atomic parallel sub-agent fan-out. Actions: start, get_results, stop_slot.\n\n\
-         - `start`: REQUIRES `action`, `target_count`, `slots`. `slots` length must equal `target_count`; every slot requires `description` and `prompt`. Starts all slots in the background and returns one `group_id` plus per-slot runtime agent ids.\n\
+                "description": "Atomic parallel sub-agent fan-out: start needs target_count and exactly target_count slots; each slot needs description+prompt; optional id; no brief/agents/background.\n\n\
+         Actions: start, get_results, stop_slot.\n\n\
+         - `start`: REQUIRES `action`, `target_count`, `slots`. `slots` length must equal `target_count`; every slot requires `description` and `prompt`. Optional per-slot `id` is a stable caller label returned in start/results/fanout projections. Foreground mode waits for all accepted slots and returns `results`; backgrounding is user-controlled with Ctrl+B, not a tool argument.\n\
          - `get_results`: REQUIRES `action`, `group_id`. Blocks until accepted slots finish, then returns every slot result and the fanout summary.\n\
          - `stop_slot`: REQUIRES `action`, `group_id`, `slot_index`. Cancels one running slot in the group.\n\n\
-         Use this instead of `agent` when the user asks for multiple reviewers, parallel exploration, or N independent sub-agents. Do not pass an `agents:[...]` payload to `agent`.",
+         Canonical start shape for two children: `agent_fanout(action='start', target_count=2, slots=[{id:'api', description:'Review API', prompt:'Full child task prompt for API'}, {id:'ui', description:'Review UI', prompt:'Full child task prompt for UI'}], defaults={agent_type:'code-review'})`.\n\
+         Use this instead of `agent` when the user asks for multiple reviewers, parallel exploration, or N independent sub-agents. Do not pass an `agents:[...]` payload to `agent`. Do not put top-level `brief`, `agents`, or `run_in_background` on `agent_fanout`; put full work instructions in each `slots[i].prompt`. Do not put `agent_id` inside slots; use `id` for the caller-facing slot label.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -755,11 +874,11 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                 "type": "object",
                                 "additionalProperties": false,
                                 "properties": {
+                                    "id": {"type": "string", "description": "Optional stable caller-facing label for this slot. Returned in start/results/fanout projections. Not the runtime agent_id."},
                                     "description": {"type": "string", "description": "Short UI summary for this slot."},
                                     "prompt": {"type": "string", "description": "Full child task brief for this slot."},
                                     "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"]},
                                     "model": {"type": "string"},
-                                    "name": {"type": "string", "description": "Optional mailbox name; not the runtime agent_id."},
                                     "max_turns": {"type": "integer"},
                                     "max_output_tokens": {"type": "integer"},
                                     "complexity": {"type": "string", "enum": ["light","normal","deep"]},
@@ -769,13 +888,20 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                 "required": ["description", "prompt"]
                             }
                         },
-                        "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Default slot agent_type for start."},
-                        "model": {"type": "string", "description": "Default slot model for start. Defaults to parent model."},
-                        "max_turns": {"type": "integer", "description": "Default slot max_turns for start."},
-                        "max_output_tokens": {"type": "integer", "description": "Default slot max_output_tokens for start."},
-                        "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Default slot complexity for start."},
-                        "isolated": {"type": "boolean", "description": "Default slot isolation for start."},
-                        "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Default slot tool allowlist for start."},
+                        "defaults": {
+                            "type": "object",
+                            "description": "Shared runtime configuration inherited by every slot. Slot-level overrides take precedence.",
+                            "additionalProperties": false,
+                            "properties": {
+                                "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"]},
+                                "model": {"type": "string"},
+                                "max_turns": {"type": "integer"},
+                                "max_output_tokens": {"type": "integer"},
+                                "complexity": {"type": "string", "enum": ["light","normal","deep"]},
+                                "isolated": {"type": "boolean"},
+                                "allowed_tools": {"type": "array", "items": {"type": "string"}}
+                            }
+                        },
                         "slot_index": {"type": "integer", "description": "REQUIRED for stop_slot. Zero-based slot index."}
                     },
                     "required": ["action"],
@@ -799,6 +925,24 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "subtopic": {"type": "string", "enum": ["session","cache","recent","volatile","stall","noise","all"], "description": "Diagnostic to run. `noise` reports stale runtime-injected prompt channels."},
                         "detail": {"type": "string", "enum": ["full","summary","minimal"], "description": "Detail level for session output."}
                     }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "get_agent_info",
+                "description": "Return the current Astra agent identity and capability summary. Use dimension='capability' to inspect which tools are actually available under the current workspace, executor, runtime, and policy binding.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "dimension": {
+                            "type": "string",
+                            "enum": ["identity", "capability", "all"],
+                            "description": "Information slice to return. Defaults to all."
+                        }
+                    },
+                    "additionalProperties": false
                 }
             }
         }),
@@ -897,14 +1041,14 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task",
-                "description": "Durable checklist. Use this tool proactively for multi-step work; not for shell commands or agents.\n\
+                "description": "Durable checklist; use proactively for multi-step work, not shell commands or agents.\n\
         ## When to Use\n\
         3+ distinct outcomes/files/phases, approved plans, delegated deliverables, or expanding scope.\n\
         ## When NOT to Use\n\
         Single edit/command/answer, pure info, or trivial work.\n\
-        Create one task per outcome: NOT one umbrella task. Broad work -> 3-7 leaf tasks. Mark first task `in_progress` BEFORE beginning work. Keep exactly ONE task as `in_progress` at a time. Finish immediately: `completed`, `failed` + `error_message`, or use `archive` for old history.\n\
-        Field notes: `title` is the outcome; `active_form` is spinner text; `metadata` null deletes a key; `add_blocks`/`add_blocked_by` work on create or update.\n\
-        <example>User: Build reimbursements. Assistant: create backend, API, UI, verify tasks; mark backend in_progress BEFORE beginning work.</example>",
+        One task per outcome: NOT one umbrella task. Broad work -> 3-7 leaf tasks. Mark first task `in_progress` BEFORE beginning work. Keep exactly ONE task as `in_progress` at a time. Finish immediately: `completed`, `failed` + `error_message`, or use `archive` for old history.\n\
+        Field notes: `title` is outcome; `active_form` is spinner text; `metadata` null deletes a key; `add_blocks`/`add_blocked_by` work on create/update. `subtasks` is create-only; update subtask progress with `subtask_id` + `new_status`.\n\
+        <example>Build reimbursements: create backend, API, UI, verify tasks; mark backend in_progress BEFORE beginning work.</example>",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -927,7 +1071,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "remove_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update only; never with create) Remove symmetric blocked_by edges."},
                         "subtasks": {
                             "type": "array",
-                            "description": "(create) Optional subtasks.",
+                            "description": "(create only) Optional subtasks. Do not send on update; use subtask_id + new_status to update existing subtask progress.",
                             "items": {
                                 "type": "object",
                                 "additionalProperties": false,
@@ -1147,15 +1291,10 @@ mod tests {
     // `execute_code` is NOT in the schema list (so the model doesn't
     // hallucinate it).
 
-    // ── agent tool: sync-default + run_in_background contract ─────────────
+    // ── agent tool: foreground default + Ctrl+B backgrounding contract ─────
 
     #[test]
-    fn agent_schema_exposes_run_in_background_parameter() {
-        // The TUI's `TaskCell` UX relies on the model being able to
-        // opt out of the sync default when the user says "kick this
-        // off in the background". Schema must surface the param
-        // directly — a tool hint in the description is not enough
-        // (cache budget) nor discoverable.
+    fn agent_schema_does_not_expose_model_background_parameter() {
         let schemas = all_tool_schemas_with_env(|_| None);
         let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
         let props = agent
@@ -1164,16 +1303,8 @@ mod tests {
             .and_then(|p| p.get("properties"))
             .expect("agent must expose parameters.properties");
         assert!(
-            props.get("run_in_background").is_some(),
-            "agent must expose `run_in_background` param so background delegation is discoverable"
-        );
-        assert_eq!(
-            props
-                .get("run_in_background")
-                .and_then(|p| p.get("type"))
-                .and_then(Value::as_str),
-            Some("boolean"),
-            "run_in_background must be typed as a boolean flag"
+            props.get("run_in_background").is_none(),
+            "backgrounding must be user-controlled with Ctrl+B, not model-controlled by schema"
         );
     }
 
@@ -1197,8 +1328,8 @@ mod tests {
             "agent description must state that spawn is sync by default"
         );
         assert!(
-            desc.contains("run_in_background"),
-            "agent description must name `run_in_background` so the model learns the opt-out"
+            desc.contains("Ctrl+B"),
+            "agent description must point backgrounding at the user-controlled Ctrl+B path"
         );
     }
 
@@ -1245,6 +1376,10 @@ mod tests {
         let params = &fanout["function"]["parameters"];
 
         assert!(desc.contains("Atomic parallel sub-agent fan-out"));
+        assert!(desc.contains("`id`"));
+        assert!(desc.contains("Ctrl+B"));
+        assert!(desc.contains("Foreground mode") || desc.contains("returns `results`"));
+        assert!(desc.contains("top-level `brief`"));
         assert_eq!(params["additionalProperties"], false);
         assert_eq!(
             params["properties"]["action"]["enum"]
@@ -1262,6 +1397,17 @@ mod tests {
         assert_eq!(
             params["properties"]["slots"]["items"]["required"],
             json!(["description", "prompt"])
+        );
+        assert!(params["properties"].get("run_in_background").is_none());
+        let slot_props = &params["properties"]["slots"]["items"]["properties"];
+        assert!(
+            slot_props.get("id").is_some(),
+            "fanout slots must expose the canonical caller-facing identity field"
+        );
+        assert!(slot_props.get("slot_id").is_none());
+        assert!(
+            slot_props.get("name").is_none(),
+            "fanout slots should not expose spawn mailbox names as slot identity"
         );
     }
 
@@ -1478,6 +1624,11 @@ mod tests {
             "task schema should explicitly teach when to archive finished work: {desc}"
         );
         assert!(
+            desc.contains("`subtasks` is create-only")
+                && desc.contains("`subtask_id` + `new_status`"),
+            "task schema should explain that subtasks are create-only and subtask progress uses update fields: {desc}"
+        );
+        assert!(
             properties["status_filter"]
                 .as_object()
                 .and_then(|_| properties["status_filter"]["enum"].as_array())
@@ -1555,6 +1706,14 @@ mod tests {
             "subtask depends_on should explain execution order constraints: {depends_on_desc}"
         );
         let subtask_item = &properties["subtasks"]["items"];
+        let subtasks_desc = properties["subtasks"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            subtasks_desc.contains("create only")
+                && subtasks_desc.contains("subtask_id + new_status"),
+            "subtasks property should prevent task.update(subtasks) misuse: {subtasks_desc}"
+        );
         assert_eq!(
             properties["subtasks"]["maxItems"].as_u64(),
             Some(crate::task_mgmt::MAX_CREATE_SUBTASKS as u64),
@@ -1687,6 +1846,84 @@ mod tests {
     }
 
     #[test]
+    fn self_mod_session_state_top_level_schemas_exist() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        for name in [
+            "prioritize_tool",
+            "deprioritize_tool",
+            "compress_context",
+            "rollback_session_state",
+        ] {
+            find_schema(&schemas, name)
+                .expect("top-level schema must exist for ToolEngine routing");
+        }
+
+        let prioritize = find_schema(&schemas, "prioritize_tool").expect("prioritize_tool schema");
+        let deprioritize =
+            find_schema(&schemas, "deprioritize_tool").expect("deprioritize_tool schema");
+        for schema in [prioritize, deprioritize] {
+            let required = schema["function"]["parameters"]["required"]
+                .as_array()
+                .expect("tool preference schemas should declare required fields");
+            assert!(
+                required.iter().any(|value| value.as_str() == Some("tool")),
+                "tool preference schemas must require tool: {schema:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn matrixone_top_level_schemas_exist() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        for name in ["mo", "mo_query", "rollback_database_snapshots"] {
+            find_schema(&schemas, name)
+                .expect("top-level schema must exist for ToolEngine routing");
+        }
+
+        let mo_query = find_schema(&schemas, "mo_query").expect("mo_query schema");
+        let required = mo_query["function"]["parameters"]["required"]
+            .as_array()
+            .expect("mo_query should declare required fields");
+        assert!(
+            required.iter().any(|value| value.as_str() == Some("sql")),
+            "mo_query schema must require sql: {mo_query:?}"
+        );
+        let rollback =
+            find_schema(&schemas, "rollback_database_snapshots").expect("rollback schema");
+        let scopes = rollback["function"]["parameters"]["properties"]["scope"]["enum"]
+            .as_array()
+            .expect("rollback scope should have enum values")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(scopes.contains("snapshot"));
+        assert!(scopes.contains("list"));
+    }
+
+    #[test]
+    fn get_agent_info_schema_exposes_capability_dimension() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let get_agent_info =
+            find_schema(&schemas, "get_agent_info").expect("get_agent_info schema must exist");
+        let properties = get_agent_info["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("get_agent_info properties must be an object");
+        let dimension = properties
+            .get("dimension")
+            .expect("get_agent_info should expose dimension");
+        let enum_values = dimension["enum"]
+            .as_array()
+            .expect("dimension should have enum values")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<std::collections::HashSet<_>>();
+
+        assert!(enum_values.contains("identity"));
+        assert!(enum_values.contains("capability"));
+        assert!(enum_values.contains("all"));
+    }
+
+    #[test]
     fn execute_code_no_longer_present_in_schemas() {
         let schemas = all_tool_schemas_with_env(|_| None);
         let names = schema_names(&schemas);
@@ -1798,6 +2035,12 @@ mod tests {
             .get("parameters")
             .expect("write_file schema must include parameters");
 
+        assert_eq!(
+            params.get("additionalProperties").and_then(Value::as_bool),
+            Some(false),
+            "write_file should reject unknown top-level fields"
+        );
+
         // Anthropic/Bedrock reject oneOf/allOf/anyOf at the top level of input_schema.
         // The write vs delete distinction is expressed via description prose and the
         // x-astra-per-action-required extension, not via composition keywords.
@@ -1843,6 +2086,77 @@ mod tests {
         assert!(
             delete_req.iter().any(|v| v == "path"),
             "delete action must require path: {delete_req:?}"
+        );
+    }
+
+    #[test]
+    fn str_replace_schema_uses_provider_compatible_edit_mode_contract() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let str_replace =
+            find_schema(&schemas, "str_replace").expect("str_replace schema must exist");
+        let desc = str_replace
+            .pointer("/function/description")
+            .and_then(Value::as_str)
+            .expect("str_replace schema must include description");
+        let params = str_replace
+            .pointer("/function/parameters")
+            .expect("str_replace schema must include parameters");
+
+        assert!(
+            desc.contains("do not use aliases"),
+            "str_replace description should steer models away from legacy alias fields: {desc}"
+        );
+        assert_eq!(
+            params.get("additionalProperties").and_then(Value::as_bool),
+            Some(false),
+            "str_replace should reject unknown top-level fields"
+        );
+        assert!(
+            params.get("oneOf").is_none()
+                && params.get("allOf").is_none()
+                && params.get("anyOf").is_none(),
+            "str_replace parameters must avoid provider-rejected top-level schema composition"
+        );
+
+        let required = params
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("str_replace parameters must include required fields");
+        assert!(
+            required.iter().any(|v| v == "path"),
+            "str_replace must always require path: {required:?}"
+        );
+
+        let per_action = params.get("x-astra-per-action-required").expect(
+            "str_replace must use x-astra-per-action-required to encode edit-mode requirements",
+        );
+        let single = per_action
+            .get("single")
+            .and_then(Value::as_array)
+            .expect("single mode must be listed");
+        assert!(
+            ["path", "old_str", "new_str"]
+                .iter()
+                .all(|field| single.iter().any(|value| value.as_str() == Some(*field))),
+            "single mode must require path, old_str, and new_str: {single:?}"
+        );
+        let batch = per_action
+            .get("batch")
+            .and_then(Value::as_array)
+            .expect("batch mode must be listed");
+        assert!(
+            ["path", "edits"]
+                .iter()
+                .all(|field| batch.iter().any(|value| value.as_str() == Some(*field))),
+            "batch mode must require path and edits: {batch:?}"
+        );
+
+        assert_eq!(
+            params
+                .pointer("/properties/edits/items/additionalProperties")
+                .and_then(Value::as_bool),
+            Some(false),
+            "batch edit entries should reject unknown fields"
         );
     }
 

@@ -2302,11 +2302,11 @@ mod tests {
     fn build_watch_snapshot_with_fanout_shows_group_summary_and_slots() {
         let mut group = AgentFanoutGroupProjection::new("review-1", "review fanout", 3);
         group
-            .set_slot_request(0, "auth", "review auth flow")
+            .set_slot_request(0, Some("auth".to_string()), "auth", "review auth flow")
             .unwrap();
         group.record_spawn_accepted(0, "auth@run-1").unwrap();
         group
-            .set_slot_request(1, "storage", "review storage")
+            .set_slot_request(1, Some("storage".to_string()), "storage", "review storage")
             .unwrap();
         group.record_spawn_rejected(1, "model denied").unwrap();
 
@@ -2326,7 +2326,7 @@ mod tests {
     fn build_watch_snapshot_with_fanout_names_parent_budget_cancellation() {
         let mut group = AgentFanoutGroupProjection::new("review-1", "review fanout", 2);
         group
-            .set_slot_request(0, "auth", "review auth flow")
+            .set_slot_request(0, Some("auth".to_string()), "auth", "review auth flow")
             .unwrap();
         group.record_spawn_accepted(0, "auth@run-1").unwrap();
         group

@@ -1,5 +1,5 @@
 //! Phase-4 contract tests: `tool_search` as a first-class pinned tool,
-//! and a validator primitive that admits deferred tool calls.
+//! and a validator primitive that admits activated deferred tool calls.
 //!
 //! Pre-phase-4 state:
 //!   - `tool_search` was hidden inside the `session` meta-tool's `action`
@@ -8,9 +8,8 @@
 //!     activation flow an unambiguous entry point.
 //!   - The headless pipeline rejected any tool call whose name wasn't in
 //!     `valid_tool_names`, which is synced from the *visible* `tools[]`.
-//!     That made the deferred activation flow impossible: once the LLM
-//!     ran `tool_search(select:web_fetch)` and learned the schema, it
-//!     still couldn't call `web_fetch` because it wasn't in `tools[]`.
+//!     The fixed contract admits visible tools plus names explicitly
+//!     activated by `tool_search(select:NAME)`.
 //!
 //! `introspect` stays in the catalog — it exposes runtime diagnostics
 //! (token pressure, cache hit rate, tool health, volatile injections,
@@ -105,45 +104,42 @@ fn introspect_still_available_alongside_tool_search() {
     assert!(names.contains(&"tool_search".to_string()));
 }
 
-// ── 3. Validator admits deferred (executor-dispatchable) names ──────────────
+// ── 3. Validator admits activated deferred names ────────────────────────────
 //
 // The validator logic lives in runtime/turn/headless_tool_pipeline/policy.rs
 // and gates on `valid_tool_names`. We assert the helper that computes the
-// "admissible set" includes names that the executor can dispatch even when
-// they're not in the current tools[] slice.
+// "admissible set" includes visible names plus explicitly activated names,
+// not the whole catalog.
 
 #[test]
-fn admissible_tool_names_includes_dispatchable_beyond_visible_tools() {
+fn admissible_tool_names_includes_activated_beyond_visible_tools() {
     use astra_runtime::turn::headless_tool_pipeline::admissible_tool_names;
 
     let visible: std::collections::HashSet<String> =
         ["bash".into(), "read_file".into()].into_iter().collect();
-    let full_catalog: std::collections::HashSet<String> =
-        ["bash".into(), "web_fetch".into()].into_iter().collect();
+    let activated: std::collections::HashSet<String> = ["web_fetch".into()].into_iter().collect();
 
-    let admitted = admissible_tool_names(&visible, &full_catalog);
+    let admitted = admissible_tool_names(&visible, &activated);
 
     // Visible names are admitted unconditionally.
     assert!(admitted.contains("bash"));
     assert!(admitted.contains("read_file"));
-    // A tool in the full catalog but NOT in visible tools[] is still
-    // admitted — this is the deferred-activation flow.
+    // A selected deferred tool is admitted after explicit activation.
     assert!(
         admitted.contains("web_fetch"),
-        "deferred tools (in full catalog but not in tools[]) must be admitted: got {admitted:?}"
+        "activated deferred tools must be admitted: got {admitted:?}"
     );
 }
 
 #[test]
-fn admissible_tool_names_rejects_truly_unknown_names() {
+fn admissible_tool_names_does_not_admit_catalog_by_default() {
     use astra_runtime::turn::headless_tool_pipeline::admissible_tool_names;
 
     let visible: std::collections::HashSet<String> = ["bash".into()].into_iter().collect();
-    let full_catalog: std::collections::HashSet<String> =
-        ["bash".into(), "web_fetch".into()].into_iter().collect();
-    let admitted = admissible_tool_names(&visible, &full_catalog);
+    let activated: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let admitted = admissible_tool_names(&visible, &activated);
 
-    // A name in neither set stays rejected — this is the hallucination guard.
+    assert!(!admitted.contains("web_fetch"));
     assert!(
         !admitted.contains("completely_made_up_tool"),
         "unknown names must still be rejected"

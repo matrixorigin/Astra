@@ -105,7 +105,9 @@ pub fn build_hardened_command(config: &ShellHardeningConfig, user_command: &str)
     if config.reset_ifs {
         // Reset IFS to default (space, tab, newline) to prevent word-splitting attacks.
         // An attacker could set IFS to '/' to break path parsing.
-        parts.push("IFS=$' \\t\\n'".to_string());
+        // Keep this POSIX-sh compatible and free of single quotes: isolated execution
+        // paths may wrap the full command in a single-quoted shell argument.
+        parts.push("IFS=$(printf \" \\011\\012\")".to_string());
     }
 
     if parts.is_empty() {
@@ -467,6 +469,25 @@ mod tests {
         assert!(cmd.contains("IFS="), "should reset IFS");
         assert!(cmd.contains("< /dev/null"), "should redirect stdin");
         assert!(cmd.ends_with("echo hello < /dev/null"));
+    }
+
+    #[test]
+    fn ifs_reset_is_shell_portable_and_quote_safe() {
+        let config = ShellHardeningConfig::default();
+        let cmd = build_hardened_command(&config, "echo hello");
+
+        assert!(
+            cmd.contains("IFS=$(printf \" \\011\\012\")"),
+            "IFS reset must use portable printf form; got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("$'"),
+            "ANSI-C quoting is bash-specific and breaks sh wrappers; got: {cmd}"
+        );
+        assert!(
+            !cmd.contains('\''),
+            "hardening preamble must not introduce single quotes; got: {cmd}"
+        );
     }
 
     #[test]

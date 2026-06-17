@@ -30,6 +30,85 @@ const BINARY_EXTS: &[&str] = &[
     "ttf", "otf", "woff", "woff2", "eot", "sqlite", "db", "mdb", "ico",
 ];
 
+const READ_FILE_ALLOWED_FIELDS: &[&str] = &[
+    "path",
+    "start_line",
+    "end_line",
+    "outline",
+    // System-level transaction/rollback fields injected by the rollback engine.
+    "transaction_id",
+    "rollback_on_failure",
+    "rollback_boundary",
+    "rollback_state",
+    "rollback",
+    // System-level field injected by headless tool pipeline for idempotency
+    // and work-surface deduplication.
+    "_tool_call_id",
+];
+
+pub fn validate_read_file_args(args: &Value) -> Result<(), String> {
+    let Some(object) = args.as_object() else {
+        return Err(
+            "Error: read_file arguments must be a JSON object with required field `path`."
+                .to_string(),
+        );
+    };
+    for key in object.keys() {
+        if !READ_FILE_ALLOWED_FIELDS.contains(&key.as_str()) {
+            return Err(format!(
+                "Error: unknown field `{key}` for read_file. Valid fields: {}. Required: path.",
+                READ_FILE_ALLOWED_FIELDS.join(", ")
+            ));
+        }
+    }
+    match object.get("path") {
+        Some(Value::String(path)) if !path.trim().is_empty() => Ok(()),
+        Some(_) => Err(
+            "Error: field `path` for read_file must be a non-empty string. Valid fields: path, start_line, end_line, outline."
+                .to_string(),
+        ),
+        None => Err(
+            "Error: missing required field `path` for read_file. Valid fields: path, start_line, end_line, outline."
+                .to_string(),
+        ),
+    }?;
+    validate_read_file_line_arg(object, "start_line")?;
+    validate_read_file_line_arg(object, "end_line")?;
+    if let Some(value) = object.get("outline")
+        && !value.is_boolean()
+    {
+        return Err(
+            "Error: field `outline` for read_file must be a boolean. Valid fields: path, start_line, end_line, outline."
+                .to_string(),
+        );
+    }
+    if let (Some(start), Some(end)) = (
+        object.get("start_line").and_then(Value::as_u64),
+        object.get("end_line").and_then(Value::as_u64),
+    ) && start > end
+    {
+        return Err(format!(
+            "Error: field `start_line` for read_file must be <= `end_line` (got {start} > {end})."
+        ));
+    }
+    Ok(())
+}
+
+fn validate_read_file_line_arg(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<(), String> {
+    let Some(value) = object.get(field) else {
+        return Ok(());
+    };
+    match value.as_u64() {
+        Some(value) if value > 0 => Ok(()),
+        _ => Err(format!(
+            "Error: field `{field}` for read_file must be a positive integer. Valid fields: path, start_line, end_line, outline."
+        )),
+    }
+}
+
 /// Build a structured str_replace failure message.
 ///
 /// All six `str_replace` failure paths in this module share this banner so
@@ -182,7 +261,22 @@ pub fn resolve_path_sandboxed(
             .canonicalize()
             .map_err(|e| format!("Cannot resolve path: {e}"))?
     } else {
-        normalized
+        // Canonicalize parent directory to resolve symlinks in the path
+        // prefix even when the leaf doesn't exist yet. Without this, a
+        // symlink in the workspace pointing outside (e.g. → /etc) would
+        // bypass the sandbox check for not-yet-created files.
+        match normalized.parent() {
+            Some(parent) if parent.exists() => {
+                let canonical_parent = parent
+                    .canonicalize()
+                    .map_err(|e| format!("Cannot resolve parent path: {e}"))?;
+                match normalized.file_name() {
+                    Some(name) => canonical_parent.join(name),
+                    None => normalized,
+                }
+            }
+            _ => normalized,
+        }
     };
 
     // Check workspace root first.
@@ -212,9 +306,17 @@ pub fn resolve_path_sandboxed(
 }
 
 pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
+    if let Err(error) = validate_read_file_args(args) {
+        return ToolResult::error(error);
+    }
     let path_str = match args.get("path").and_then(|v| v.as_str()) {
         Some(p) => p,
-        None => return ToolResult::error("Error: Missing 'path' parameter".into()),
+        None => {
+            return ToolResult::error(
+                "Error: missing required field `path` for read_file. Valid fields: path, start_line, end_line, outline."
+                    .into(),
+            );
+        }
     };
     let path = match resolve_path(workspace_root, path_str) {
         Ok(p) => p,
@@ -478,11 +580,6 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
 
     let start_line = start_line.unwrap_or(1);
     let end_line = end_line.unwrap_or(lines.len());
-    let (start_line, end_line) = if start_line > end_line {
-        (end_line, start_line)
-    } else {
-        (start_line, end_line)
-    };
     let start = start_line.saturating_sub(1).min(lines.len());
     let end = end_line.min(lines.len());
 
@@ -717,6 +814,18 @@ pub fn prepare_write_file(
     workspace_root: &Path,
     args: &Value,
 ) -> Result<PreparedWriteFile, ToolResult> {
+    let Some(input) = args.as_object() else {
+        return Err(ToolResult::error(
+            "Error: write_file arguments must be an object".into(),
+        ));
+    };
+    reject_unknown_fields(
+        input,
+        "write_file",
+        &["content", "delete", "path", "_tool_call_id"],
+    )
+    .map_err(ToolResult::error)?;
+
     let path_str = match args.get("path").and_then(|v| v.as_str()) {
         Some(p) => p,
         None => {
@@ -804,13 +913,17 @@ pub fn prepare_str_replace(
     let args = &args;
     let path_str = match args.get("path").and_then(|v| v.as_str()) {
         Some(p) => p,
-        None => return Err(ToolResult::error("Error: Missing 'path' parameter".into())),
+        None => {
+            return Err(ToolResult::error(
+                "Error: Missing 'path' parameter. Retry str_replace with path plus either old_str/new_str or edits.".into(),
+            ));
+        }
     };
     let old_str = match args.get("old_str").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => {
             return Err(ToolResult::error(
-                "Error: Missing 'old_str' parameter".into(),
+                "Error: Missing 'old_str' parameter. Retry str_replace single-edit mode with path, old_str, and new_str; or use edits for batch mode.".into(),
             ));
         }
     };
@@ -818,7 +931,7 @@ pub fn prepare_str_replace(
         Some(s) => s,
         None => {
             return Err(ToolResult::error(
-                "Error: Missing 'new_str' parameter".into(),
+                "Error: Missing 'new_str' parameter. Retry str_replace single-edit mode with path, old_str, and new_str; or use edits for batch mode.".into(),
             ));
         }
     };
@@ -1020,7 +1133,11 @@ pub fn prepare_multi_edit(
     let args = &args;
     let path_str = match args.get("path").and_then(|v| v.as_str()) {
         Some(p) => p,
-        None => return Err(ToolResult::error("Error: Missing 'path' parameter".into())),
+        None => {
+            return Err(ToolResult::error(
+                "Error: Missing 'path' parameter. Retry str_replace batch mode with path and edits.".into(),
+            ));
+        }
     };
     let edits = match args.get("edits").and_then(|v| v.as_array()) {
         Some(e) => e,
@@ -1240,53 +1357,52 @@ pub fn normalize_str_replace_args(args: &Value) -> Result<Value, String> {
     };
     let mut out = input.clone();
 
-    if !out.contains_key("old_str")
-        && let Some(value) = first_string_value(input, &["original_text", "old_text", "original"])
-    {
-        out.insert("old_str".to_string(), Value::String(value.to_string()));
-    }
-    if !out.contains_key("new_str")
-        && let Some(value) =
-            first_string_value(input, &["new_text", "replacement_text", "replacement"])
-    {
-        out.insert("new_str".to_string(), Value::String(value.to_string()));
-    }
+    reject_unknown_fields(
+        input,
+        "str_replace",
+        &[
+            "allow_structural_change",
+            "dry_run",
+            "edits",
+            "new_str",
+            "old_str",
+            "path",
+            "replace_all",
+        ],
+    )?;
 
-    if !out.contains_key("edits")
-        && let Some(replacements) = input.get("replacements")
-    {
-        out.insert("edits".to_string(), normalize_edit_array(replacements)?);
-    }
     if let Some(edits) = out.get("edits").cloned() {
+        if out.contains_key("old_str") || out.contains_key("new_str") {
+            return Err(
+                "Error: str_replace edits mode is mutually exclusive with top-level old_str/new_str"
+                    .to_string(),
+            );
+        }
         out.insert("edits".to_string(), normalize_edit_array(&edits)?);
     }
 
     Ok(Value::Object(out))
 }
 
-fn first_string_value<'a>(
-    input: &'a serde_json::Map<String, Value>,
-    fields: &[&str],
-) -> Option<&'a str> {
-    fields
-        .iter()
-        .find_map(|field| input.get(*field).and_then(Value::as_str))
+fn reject_unknown_fields(
+    input: &serde_json::Map<String, Value>,
+    context: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    for key in input.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(format!(
+                "Error: unknown field '{key}' for {context} (valid: {})",
+                allowed.join(", ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn normalize_edit_array(value: &Value) -> Result<Value, String> {
-    let parsed_value;
-    let value = if let Some(raw) = value.as_str() {
-        parsed_value = serde_json::from_str::<Value>(raw).map_err(|error| {
-            format!(
-                "Error: str_replace 'edits'/'replacements' string must contain a JSON array: {error}"
-            )
-        })?;
-        &parsed_value
-    } else {
-        value
-    };
     let Some(items) = value.as_array() else {
-        return Err("Error: str_replace 'edits'/'replacements' must be an array".to_string());
+        return Err("Error: str_replace 'edits' must be an array".to_string());
     };
     let mut normalized = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
@@ -1295,20 +1411,12 @@ fn normalize_edit_array(value: &Value) -> Result<Value, String> {
                 "Error: str_replace edit[{index}] must be an object"
             ));
         };
-        let mut out = edit.clone();
-        if !out.contains_key("old_str")
-            && let Some(value) =
-                first_string_value(edit, &["original_text", "old_text", "original"])
-        {
-            out.insert("old_str".to_string(), Value::String(value.to_string()));
-        }
-        if !out.contains_key("new_str")
-            && let Some(value) =
-                first_string_value(edit, &["new_text", "replacement_text", "replacement"])
-        {
-            out.insert("new_str".to_string(), Value::String(value.to_string()));
-        }
-        normalized.push(Value::Object(out));
+        reject_unknown_fields(
+            edit,
+            &format!("str_replace.edits[{index}]"),
+            &["new_str", "old_str"],
+        )?;
+        normalized.push(Value::Object(edit.clone()));
     }
     Ok(Value::Array(normalized))
 }
@@ -2002,6 +2110,36 @@ mod tests {
     }
 
     #[test]
+    fn read_file_rejects_unknown_fields_before_missing_path() {
+        let tmp = TempDir::new().unwrap();
+        let result = read_file(
+            tmp.path(),
+            &serde_json::json!({
+                "file": "test.txt",
+                "offset": 1,
+                "limit": 300
+            }),
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("unknown field `file`"),
+            "{:?}",
+            result.output
+        );
+        assert!(
+            result.output.contains("Valid fields: path"),
+            "{:?}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("Missing 'path'"),
+            "unknown-field contract should fire before legacy missing-path text: {}",
+            result.output
+        );
+    }
+
+    #[test]
     fn read_file_with_range() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("test.txt"), "a\nb\nc\nd").unwrap();
@@ -2263,7 +2401,7 @@ mod tests {
     }
 
     #[test]
-    fn read_file_swaps_reversed_ranges() {
+    fn read_file_rejects_reversed_ranges() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("test.txt"), "a\nb\nc\nd").unwrap();
 
@@ -2272,10 +2410,40 @@ mod tests {
             &serde_json::json!({"path": "test.txt", "start_line": 4, "end_line": 2}),
         );
 
-        assert!(!result.is_error);
-        assert!(result.output.contains("2\tb"), "got: {}", result.output);
-        assert!(result.output.contains("3\tc"), "got: {}", result.output);
-        assert!(result.output.contains("4\td"), "got: {}", result.output);
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("must be <= `end_line`"),
+            "got: {}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn read_file_rejects_invalid_optional_arg_types() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("test.txt"), "a\nb\nc\nd").unwrap();
+
+        let result = read_file(
+            tmp.path(),
+            &serde_json::json!({"path": "test.txt", "start_line": "2"}),
+        );
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("`start_line`") && result.output.contains("positive integer"),
+            "got: {}",
+            result.output
+        );
+
+        let result = read_file(
+            tmp.path(),
+            &serde_json::json!({"path": "test.txt", "outline": 1}),
+        );
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("`outline`") && result.output.contains("boolean"),
+            "got: {}",
+            result.output
+        );
     }
 
     #[test]
@@ -2389,6 +2557,28 @@ mod tests {
     }
 
     #[test]
+    fn prepare_write_file_rejects_unknown_fields() {
+        let tmp = TempDir::new().unwrap();
+        let err = prepare_write_file(
+            tmp.path(),
+            &serde_json::json!({
+                "path": "note.txt",
+                "content": "hello",
+                "mode": "append"
+            }),
+        )
+        .expect_err("unknown fields should fail");
+
+        assert!(err.is_error);
+        assert!(err.output.contains("unknown field 'mode'"));
+        assert!(err.output.contains("write_file"));
+        assert!(
+            !tmp.path().join("note.txt").exists(),
+            "unknown fields must fail before writing"
+        );
+    }
+
+    #[test]
     fn str_replace_basic() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("f.txt"), "foo bar baz").unwrap();
@@ -2419,7 +2609,7 @@ mod tests {
     }
 
     #[test]
-    fn str_replace_normalizes_replacements_original_text_aliases() {
+    fn str_replace_rejects_replacements_alias() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("f.txt"), "one two three").unwrap();
         let args = serde_json::json!({
@@ -2432,25 +2622,68 @@ mod tests {
 
         let result = str_replace(tmp.path(), &args);
 
-        assert!(!result.is_error, "got error: {}", result.output);
+        assert!(result.is_error, "alias must be rejected");
+        assert!(result.output.contains("unknown field 'replacements'"));
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
-        assert_eq!(content, "ONE two THREE\n");
+        assert_eq!(content, "one two three");
     }
 
     #[test]
-    fn str_replace_normalizes_json_string_replacements_aliases() {
+    fn str_replace_rejects_string_edits_payload() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("f.txt"), "red green blue").unwrap();
         let args = serde_json::json!({
             "path": "f.txt",
-            "replacements": r#"[{"original_text":"red","new_text":"RED"},{"original_text":"blue","new_text":"BLUE"}]"#
+            "edits": r#"[{"old_str":"red","new_str":"RED"},{"old_str":"blue","new_str":"BLUE"}]"#
         });
 
         let result = str_replace(tmp.path(), &args);
 
-        assert!(!result.is_error, "got error: {}", result.output);
+        assert!(result.is_error, "string edits payload must be rejected");
+        assert!(result.output.contains("'edits' must be an array"));
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
-        assert_eq!(content, "RED green BLUE\n");
+        assert_eq!(content, "red green blue");
+    }
+
+    #[test]
+    fn str_replace_rejects_top_level_single_fields_with_edits() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "red green blue").unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "old_str": "red",
+            "new_str": "RED",
+            "edits": [
+                {"old_str": "blue", "new_str": "BLUE"}
+            ]
+        });
+
+        let result = str_replace(tmp.path(), &args);
+
+        assert!(result.is_error, "mixed edit modes must be rejected");
+        assert!(result.output.contains("mutually exclusive"));
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(content, "red green blue");
+    }
+
+    #[test]
+    fn str_replace_rejects_unknown_edit_fields() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "red green blue").unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "edits": [
+                {"old_str": "red", "new_str": "RED", "comment": "legacy note"}
+            ]
+        });
+
+        let result = str_replace(tmp.path(), &args);
+
+        assert!(result.is_error, "unknown edit fields must be rejected");
+        assert!(result.output.contains("unknown field 'comment'"));
+        assert!(result.output.contains("str_replace.edits[0]"));
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(content, "red green blue");
     }
 
     #[test]

@@ -861,6 +861,10 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         &self.valid_tool_names
     }
 
+    fn deferred_tool_names(&self) -> HashSet<String> {
+        self.executor.current_activatable_tool_names_snapshot()
+    }
+
     fn on_deferred_user_input(&mut self, input: &Value) {
         let Some(tx) = &self.stream_event_tx else {
             return;

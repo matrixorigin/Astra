@@ -26,7 +26,7 @@
 //! - Journal gap (missing events between checkpoint and crash) → `Failed(JournalGap)`
 //! - In-flight tool call at crash time → classified as `RequireUser`
 //! - Side-effect tool partially executed → classified as `RequireUser`
-//! - Crypto hash mismatch (tamper/corruption) → `Failed(HashMismatch)`
+//! - Recovery hash mismatch (tamper/corruption) → `Failed(HashMismatch)`
 //! - Double crash (recovery itself crashes) → `Failed(RecursiveCrash)`
 
 use astra_turn_types::{ToolIdempotency, classify_tool_idempotency};
@@ -228,7 +228,7 @@ pub enum RecoveryError {
     JournalGap { expected_after: u64, found_at: u64 },
     /// Journal could not be read for recovery replay.
     JournalRead(String),
-    /// Crypto hash mismatch — data was tampered with or corrupted.
+    /// Recovery hash mismatch — data was tampered with or corrupted.
     HashMismatch { expected: String, actual: String },
     /// Recovery was attempted on an already-recovering session.
     RecursiveCrash,
@@ -1543,8 +1543,8 @@ mod tests {
         );
         // str_replace depends on file state — NOT safe to replay blindly
         assert_eq!(classify_tool("str_replace"), ToolSafetyClass::SideEffect);
-        // git_commit has permanent side effects — NOT safe to replay
-        assert_eq!(classify_tool("git_commit"), ToolSafetyClass::SideEffect);
+        // git mutating actions have permanent side effects — NOT safe to replay
+        assert_eq!(classify_tool("git"), ToolSafetyClass::SideEffect);
     }
 
     #[test]

@@ -86,6 +86,10 @@ pub mod stall;
 pub mod state;
 pub mod stop_hooks;
 pub mod streaming_tool_exec;
+pub mod sync_utils;
+pub use sync_utils::{
+    rwlock_check_contains_or_default, rwlock_read_clone_or_default, rwlock_write_reset_on_poison,
+};
 pub mod tail_persist;
 pub mod task;
 pub mod task_context;

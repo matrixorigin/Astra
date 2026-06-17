@@ -3300,6 +3300,22 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
     )
     .await?;
 
+    // Migration 19: tool_exactly_once_results for crash-recovery tool dedup.
+    run_migration(
+        pool,
+        19,
+        "create tool_exactly_once_results for tool dedup",
+        "CREATE TABLE tool_exactly_once_results (
+            session_id   VARCHAR(128) NOT NULL,
+            dedup_key    VARCHAR(1024) NOT NULL,
+            key_json     JSON NOT NULL,
+            result_json  JSON NOT NULL,
+            recorded_at  BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            PRIMARY KEY (session_id, dedup_key)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+    )
+    .await?;
+
     Ok(())
 }
 

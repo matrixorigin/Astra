@@ -583,7 +583,7 @@ mod tests {
     async fn explicit_actions_follow_auto_mode_without_parent() {
         let inherited = InheritedPermissions {
             mode: PermissionMode::Auto,
-            allow_rules: vec![PermissionRule::parse("git_commit")],
+            allow_rules: vec![PermissionRule::parse("git")],
             deny_rules: vec![],
             ask_rules: vec![],
             allowed_tools: None,
@@ -593,8 +593,8 @@ mod tests {
         let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
 
         let result = check_tool_permission(
-            "git_commit",
-            Some(r#"{"message":"ship it"}"#),
+            "git",
+            Some(r#"{"action":"commit","message":"ship it"}"#),
             Some(&ctx),
             None,
             Duration::from_secs(1),
@@ -637,7 +637,7 @@ mod tests {
 
         let inherited = InheritedPermissions {
             mode: PermissionMode::Prompt,
-            allow_rules: vec![PermissionRule::parse("git_commit")],
+            allow_rules: vec![PermissionRule::parse("git")],
             deny_rules: vec![],
             ask_rules: vec![],
             allowed_tools: None,
@@ -670,8 +670,8 @@ mod tests {
         });
 
         let result = check_tool_permission(
-            "git_commit",
-            Some(r#"{"message":"ship it"}"#),
+            "git",
+            Some(r#"{"action":"commit","message":"ship it"}"#),
             Some(&ctx),
             Some(&mut child_mailbox),
             Duration::from_secs(1),

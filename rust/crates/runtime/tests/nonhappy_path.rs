@@ -646,7 +646,7 @@ mod error_recovery_integration {
         assert!(delay.is_some());
 
         // After retry fails, build recovery message
-        let msg = build_recovery_message("github_list_prs", error, category, &[]);
+        let msg = build_recovery_message("read_file", error, category, &[]);
         assert!(msg.contains("Alternatives"));
 
         // Escalation after multiple issues (new thresholds: 3 nudges → Warning,

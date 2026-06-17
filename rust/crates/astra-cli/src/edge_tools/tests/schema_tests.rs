@@ -46,8 +46,7 @@ fn tool_schemas_include_core_tools() {
                 .map(String::from)
         })
         .collect();
-    // Consolidated tools: git, github, memory, session, mo, agent cover
-    // the legacy individual tools (git_status, github_ci_status, etc.)
+    // Consolidated action tools: git, github, memory, session, mo, agent.
     for expected in &[
         "bash",
         "read_file",
@@ -594,6 +593,28 @@ fn local_cli_catalog_includes_plan_mode_wrappers() {
         names.iter().any(|n| n == "exit_plan_mode"),
         "local CLI catalog should expose exit_plan_mode via the client-backed wrapper"
     );
+}
+
+#[test]
+fn local_cli_catalog_uses_runtime_env_surface_for_local_runtime() {
+    let names: Vec<String> = crate::edge_tools::local_tool_schemas()
+        .iter()
+        .filter_map(|s| s["function"]["name"].as_str().map(ToString::to_string))
+        .collect();
+
+    for name in [
+        "tool_search",
+        "memory",
+        "web_search",
+        "bash",
+        "read_file",
+        "git",
+    ] {
+        assert!(
+            names.iter().any(|visible| visible == name),
+            "local CLI runtime catalog should expose `{name}`: {names:?}"
+        );
+    }
 }
 
 #[test]

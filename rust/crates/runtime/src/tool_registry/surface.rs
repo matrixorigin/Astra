@@ -11,7 +11,7 @@
 //!   `tool_search(query="select:NAME")` which returns the full schema via a
 //!   tool_result — the tool is never added to `tools[]`.
 //!
-//! The default T1 set is the 12-member coding core (see `DEFAULT_PINNED`).
+//! The default T1 set is the 14-member coding core (see `DEFAULT_PINNED`).
 //! Users override via `runtime.tool_surface.pinned_tools` in TOML. A name
 //! prefixed with `-` removes a default (e.g. `"-grep"`).
 //!
@@ -23,7 +23,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 /// Default T1 pinned tools — the coding golden path + astra intrinsics +
-/// activation primitives. ~12 entries.
+/// activation primitives.
 ///
 /// Rationale for each inclusion:
 /// - `bash`, `read_file`, `write_file`, `str_replace` — the coding four.
@@ -32,6 +32,10 @@ use serde_json::Value;
 ///   comment at tool_registry_meta:408 — "memory is pinned, intrinsic
 ///   store/retrieve capability"). Deferring it would force a
 ///   round-trip for every memory op.
+/// - `git` — read-mostly VCS observability (`status`, `diff`, `log`) is part
+///   of the normal coding loop and is referenced directly by the system
+///   prompt. Deferring it makes "show diff" pay an activation round and
+///   contradicts that contract.
 /// - `skill`, `tool_search` — the two activation primitives. Needed to
 ///   reach anything in the deferred list.
 /// - `introspect` — runtime diagnostics. Cheap schema, high value when
@@ -41,12 +45,17 @@ use serde_json::Value;
 ///   T2 means the model rarely activates it via `tool_search`, and the
 ///   board never shows up — defeating its purpose. Pin it so multi-step
 ///   work is visible by default.
+/// - `ask_user` — the structured clarification primitive. It is pinned as
+///   core interaction vocabulary, then removed by interaction-mode filtering
+///   in Auto/NonInteractive/Headless turns where no user prompt sink exists.
 ///
-/// Explicitly deferred: `github`, `git`, `mo`, `agent`, `web_fetch`,
-/// `lsp`, `notify`, `ask_user`, `session`, `symbols`,
-/// `powershell`, `run_script`. Users pin via config as needed.
+/// Explicitly deferred: `github`, `mo`, `agent`, `web_fetch`,
+/// `lsp`, `notify`, `session`, `symbols`, `powershell`, `run_script`.
+/// Users pin via config as needed.
 pub const DEFAULT_PINNED: &[&str] = &[
+    "ask_user",
     "bash",
+    "git",
     "glob",
     "grep",
     "introspect",
@@ -187,18 +196,19 @@ fn schema_name(schema: &Value) -> Option<String> {
         .map(String::from)
 }
 
-/// Truncate the schema description to ≤120 chars at a UTF-8 char boundary.
+/// Truncate the schema description to a compact UTF-8 char-boundary summary.
 ///
-/// 120 chars is enough for one-line relevance cues — the full description
-/// comes back later via `tool_search(select:…)` when the model actually
-/// pulls the schema.
+/// The summary is discovery metadata, not a full schema. The cap is long
+/// enough for one complete load-bearing sentence so deferred listings do not
+/// cut off required shape constraints like per-action fields or count
+/// invariants.
 fn short_description(schema: &Value) -> String {
     let raw = schema
         .get("function")
         .and_then(|f| f.get("description"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    const MAX: usize = 120;
+    const MAX: usize = 180;
     if raw.chars().count() <= MAX {
         return raw.to_string();
     }

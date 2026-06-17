@@ -8,35 +8,13 @@
 
 use astra_config::runtime_config::RuntimeConfig;
 use astra_runtime::tool_registry::surface::ToolSurface;
-use astra_turn_core::tool_registry_meta::TOOL_CATALOG;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::io::Write;
 
 fn catalog_schemas() -> Vec<Value> {
-    let mut out: Vec<Value> = TOOL_CATALOG
-        .iter()
-        .map(|t| {
-            json!({
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": {"type": "object", "properties": {}}
-                }
-            })
-        })
-        .collect();
-    for name in ["skill", "tool_search"] {
-        out.push(json!({
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": "",
-                "parameters": {"type": "object", "properties": {}}
-            }
-        }));
-    }
-    out
+    let mut schemas = astra_tools::schemas::all_tool_schemas();
+    schemas.push(astra_runtime::turn::skill_tool::skill_tool_schema_v2());
+    schemas
 }
 
 fn names(schemas: &[Value]) -> Vec<String> {
@@ -139,8 +117,10 @@ fn missing_toml_defaults_are_in_wire() {
         let pinned = names(&surface.pinned_schemas());
         // Spot check: all defaults present, no extras.
         for must in [
+            "ask_user",
             "bash",
             "read_file",
+            "git",
             "grep",
             "memory",
             "skill",

@@ -1316,10 +1316,10 @@ fn merge_activations(prev: Option<SkillActivation>, new: SkillActivation) -> Ski
         merged.allowed_tools.extend(additions);
     }
 
-    // Sandbox: stricter policy wins (higher SandboxMode ordinal = more restrictive).
+    // Sandbox: stricter policy wins (higher IsolationLevel ordinal = more restrictive).
     match (&merged.sandbox_policy, &new.sandbox_policy) {
         (None, p @ Some(_)) => merged.sandbox_policy = p.clone(),
-        (Some(prev_p), Some(new_p)) if new_p.mode > prev_p.mode => {
+        (Some(prev_p), Some(new_p)) if new_p.isolation > prev_p.isolation => {
             merged.sandbox_policy = Some(new_p.clone());
         }
         _ => {} // prev has policy, new doesn't → keep prev; both None → nothing.

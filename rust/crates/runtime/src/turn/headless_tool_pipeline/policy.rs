@@ -6,8 +6,8 @@ use super::*;
 use astra_turn_core::edge_prompt_context::make_args_preview;
 use astra_turn_core::headless_tool_assembly::{
     READ_ONLY_TOOLS, headless_idempotency_hit_openai_pair,
-    headless_openai_duplicate_within_turn_pair, headless_unknown_local_tool_openai_pair,
-    openai_tool_roundtrip_values, unknown_local_tool_error_message,
+    headless_openai_duplicate_within_turn_pair, openai_tool_roundtrip_values,
+    unknown_local_tool_error_message,
 };
 use astra_turn_core::headless_tool_body_preview::emit_headless_tool_body_preview;
 use astra_turn_core::headless_tool_journal::{
@@ -18,6 +18,7 @@ use astra_turn_core::headless_tool_stderr_lines::{
     headless_stderr_cache_hit_line, headless_stderr_unknown_tool_detail,
     headless_stderr_unknown_tool_header,
 };
+use astra_turn_core::tool::deferred_activation::tool_not_admitted_message;
 use astra_turn_core::tool_result_semantics::tool_dedup_signature;
 
 const OUTCOME_MEMORY_FAILURE_BLOCK_WINDOW: usize = 2;
@@ -58,6 +59,34 @@ fn emit_blocked_tool_result(
         make_args_preview(blocked.name, blocked.args),
         blocked.early_exit_ms,
     ));
+}
+
+/// Decide which denial body to emit for a name the validator rejected.
+///
+/// First-principle: the model can only act on what we have already told it
+/// about. If `name` appears in this turn's `<deferred_tools>` manifest, it
+/// has been advertised — denying with the bare "Unknown tool" copy contradicts
+/// the prompt. Surface the activation hint instead. Otherwise the name is
+/// truly hallucinated; preserve the legacy "Unknown tool. Available: …" body
+/// so the model can self-correct.
+fn validator_denial_body(
+    name: &str,
+    valid_tool_names: &std::collections::HashSet<String>,
+    deferred_tool_names: &std::collections::HashSet<String>,
+) -> String {
+    if deferred_tool_names.contains(name) {
+        tool_not_admitted_message(name, true)
+    } else if deferred_tool_names.is_empty() && valid_tool_names.contains("tool_search") {
+        format!(
+            "Error: Tool '{name}' is not visible in this turn's `tools[]`. \
+             If you expect it to be deferred, first call `tool_search` with \
+             `query=\"select:{name}\"` to fetch the full schema. If \
+             `tool_search` reports it missing, use one of the currently \
+             visible tools instead."
+        )
+    } else {
+        unknown_local_tool_error_message(name, valid_tool_names)
+    }
 }
 
 fn trace_short_circuit_tool_skip(
@@ -120,7 +149,11 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             slot.id,
             raw_tc.as_deref().unwrap_or("(synthetic edge)")
         );
-        let err_msg = unknown_local_tool_error_message(&slot.name, self.ctx.valid_tool_names);
+        let err_msg = validator_denial_body(
+            &slot.name,
+            self.ctx.valid_tool_names,
+            self.ctx.deferred_tool_names,
+        );
         if !self.ctx.quiet {
             self.ctx.term.emit_line(
                 HeadlessStderrStyle::Red,
@@ -131,11 +164,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 headless_stderr_unknown_tool_detail(&err_msg),
             );
         }
-        let (tool_msg, err_tr) = headless_unknown_local_tool_openai_pair(
-            &slot.id,
-            &slot.name,
-            self.ctx.valid_tool_names,
-        );
+        let (tool_msg, err_tr) =
+            openai_tool_roundtrip_values(&slot.id, &slot.name, err_msg.as_str());
         trace_short_circuit_tool_skip(
             self.ctx.step_recorder,
             &slot.id,
@@ -488,8 +518,11 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         );
 
         if !self.ctx.valid_tool_names.contains(&execution.name) {
-            let err_msg =
-                unknown_local_tool_error_message(&execution.name, self.ctx.valid_tool_names);
+            let err_msg = validator_denial_body(
+                &execution.name,
+                self.ctx.valid_tool_names,
+                self.ctx.deferred_tool_names,
+            );
             if !self.ctx.quiet {
                 self.ctx.term.emit_line(
                     HeadlessStderrStyle::Red,
@@ -500,11 +533,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     headless_stderr_unknown_tool_detail(&err_msg),
                 );
             }
-            let (tool_msg, err_tr) = headless_unknown_local_tool_openai_pair(
-                &execution.id,
-                &execution.name,
-                self.ctx.valid_tool_names,
-            );
+            let (tool_msg, err_tr) =
+                openai_tool_roundtrip_values(&execution.id, &execution.name, err_msg.as_str());
             trace_short_circuit_tool_skip(
                 self.ctx.step_recorder,
                 &execution.id,
@@ -541,6 +571,31 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             mut execution,
             idem_key,
         } = validated;
+        if let Some(err_msg) = edge_result_runtime_environment_denial(&execution) {
+            emit_blocked_tool_result(
+                HeadlessBlockedTool {
+                    id: &execution.id,
+                    name: &execution.name,
+                    args: &execution.args,
+                    reason_code: "edge_runtime_capability_denied",
+                    journal_reason: err_msg.clone(),
+                    err_msg,
+                    early_exit_ms: execution.early_exit_ms,
+                    status_line: Some(format!(
+                        "  ⚠ Edge runtime capability denied: {}",
+                        execution.name
+                    )),
+                },
+                self.ctx.step_recorder,
+                self.ctx.quiet,
+                self.ctx.term,
+                self.ctx.messages,
+                self.ctx.tool_results,
+                self.ctx.tool_call_records,
+            );
+            return HeadlessPipelineStage::ShortCircuit;
+        }
+
         if self.ctx.restricted_tools.contains(&execution.name) {
             // The fallback recommendation has to know which tools
             // the model could actually call this turn — without

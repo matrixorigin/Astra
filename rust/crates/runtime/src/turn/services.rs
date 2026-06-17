@@ -242,9 +242,27 @@ impl TraceEventWriter for DatabaseTraceEventWriter {
             .begin()
             .await
             .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
+        DatabaseTraceEventWriter::write_many_in_tx(&mut tx, events).await?;
+        tx.commit()
+            .await
+            .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
+        Ok(())
+    }
+}
+
+impl DatabaseTraceEventWriter {
+    /// Variant of [`write_many`] that uses an existing transaction instead of
+    /// creating its own. The caller owns commit/rollback.
+    pub(crate) async fn write_many_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        events: Vec<TraceEvent>,
+    ) -> Result<(), TraceWriteError> {
+        if events.is_empty() {
+            return Ok(());
+        }
         let mut touched_sessions = std::collections::BTreeMap::<String, (String, String)>::new();
         for event in &events {
-            insert_trace_event(&mut tx, event)
+            insert_trace_event(tx, event)
                 .await
                 .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
             touched_sessions.insert(
@@ -253,10 +271,10 @@ impl TraceEventWriter for DatabaseTraceEventWriter {
             );
         }
         for (session_id, (user_id, last_event_id)) in touched_sessions {
-            let event_count = load_agent_event_count(&mut *tx, &session_id)
+            let event_count = load_agent_event_count(&mut **tx, &session_id)
                 .await
                 .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
-            upsert_agent_session_event_count(&mut *tx, &session_id, &user_id, event_count)
+            upsert_agent_session_event_count(&mut **tx, &session_id, &user_id, event_count)
                 .await
                 .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
             query(
@@ -267,13 +285,10 @@ impl TraceEventWriter for DatabaseTraceEventWriter {
             )
             .bind(last_event_id)
             .bind(session_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
         }
-        tx.commit()
-            .await
-            .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
         Ok(())
     }
 }

@@ -28,10 +28,13 @@ use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
 use astra_text_utils::semantic_dedup::SemanticDedup;
+
+use crate::server::tool_execution_service::ToolExecutionService;
 use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
 use astra_turn_core::turn_guard::TurnGuard;
 
 use super::server_loop_host::ServerAgenticLoopHostBuilder;
+use super::tool_transport::{ExecutionBindingSnapshot, RunnerRpcTransport};
 
 /// Maximum turns for a skill sub-run (matches CLI's SUBRUN_MAX_TURNS).
 pub const SUBRUN_MAX_TURNS: usize = 30;
@@ -55,6 +58,8 @@ pub struct ServerSkillSubRunExecutor {
     edge_tools: Vec<Value>,
     /// Edge profile (cwd, git_branch, etc.) inherited from parent.
     edge_profile: Map<String, Value>,
+    /// Workspace/executor/runtime binding inherited from the parent run.
+    execution_binding_snapshot: Option<ExecutionBindingSnapshot>,
     /// Skill resolver inherited from parent — enables nested inline skills.
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
     /// Parent cancellation token — propagated so stop/cancel interrupts sub-runs.
@@ -68,6 +73,8 @@ pub struct ServerSkillSubRunExecutor {
     session_id: String,
     /// Edge connection pool for routing tool calls to connected edges.
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
+    /// Runner RPC transport for hosted/personal runtime executors.
+    runner_rpc_transport: Option<Arc<dyn RunnerRpcTransport>>,
     /// Shared tool_call dedup state from the parent host. When set, the sub-run
     /// host will observe the same emitted_tool_call_ids HashSet as the parent,
     /// preventing duplicate `tool_call` events across host instances within the
@@ -99,12 +106,14 @@ impl ServerSkillSubRunExecutor {
             llm_token_service: None,
             edge_tools: Vec::new(),
             edge_profile: Map::new(),
+            execution_binding_snapshot: None,
             skill_resolver: None,
             cancel_token: None,
             forward_headers: HashMap::new(),
             request_constraints: Default::default(),
             session_id,
             edge_connection_pool: None,
+            runner_rpc_transport: None,
             #[cfg(feature = "bridge-e2e-hooks")]
             dedup_state: None,
             #[cfg(feature = "harness")]
@@ -158,6 +167,11 @@ impl ServerSkillSubRunExecutor {
         self
     }
 
+    pub fn with_execution_binding_snapshot(mut self, snapshot: ExecutionBindingSnapshot) -> Self {
+        self.execution_binding_snapshot = Some(snapshot);
+        self
+    }
+
     pub fn with_skill_resolver(
         mut self,
         resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
@@ -189,6 +203,11 @@ impl ServerSkillSubRunExecutor {
         pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
     ) -> Self {
         self.edge_connection_pool = Some(pool);
+        self
+    }
+
+    pub fn with_runner_rpc_transport(mut self, transport: Arc<dyn RunnerRpcTransport>) -> Self {
+        self.runner_rpc_transport = Some(transport);
         self
     }
 
@@ -287,6 +306,10 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         ))
         .with_edge_profile(self.edge_profile.clone())
         .with_edge_callback_ledger(Arc::new(TokioMutex::new(HashMap::new())));
+
+        if let Some(snapshot) = &self.execution_binding_snapshot {
+            builder = builder.with_execution_binding_snapshot(snapshot.clone());
+        }
 
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
@@ -504,6 +527,15 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         {
             let workspace = self.provision_skill_workspace(skill_name, &subrun_session_id);
             let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
+
+            let mut builder = ToolExecutionService::builder();
+            if let Some(pool) = &self.edge_connection_pool {
+                builder = builder.edge_connection_pool(pool.clone());
+            }
+            if let Some(transport) = &self.runner_rpc_transport {
+                builder = builder.runner_rpc_transport(Arc::clone(transport));
+            }
+
             let mut executor = super::server_tool_executor::ServerToolExecutor::new(
                 workspace,
                 String::new(), // skill sub-runs don't track user_id
@@ -514,10 +546,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
                 self.shared_pool.is_some(),
             ))
-            .with_cancel_token(self.cancel_token.clone());
-            if let Some(pool) = &self.edge_connection_pool {
-                executor.set_edge_connection_pool(pool.clone());
-            }
+            .with_cancel_token(self.cancel_token.clone())
+            .with_tool_execution_service(builder.build());
             if let Some(pool) = &self.shared_pool {
                 executor.set_context_manifest_pool(pool.clone());
             }
@@ -548,6 +578,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::tool_transport::{
+        ExecutorBinding, ExecutorStatus, ToolTransportKind, WorkspaceAuthority, WorkspaceBinding,
+    };
 
     fn mock_matrixone() -> MatrixOneSettings {
         MatrixOneSettings::mock()
@@ -555,6 +588,23 @@ mod tests {
 
     fn mock_encryptor() -> Arc<FernetTokenEncryptor> {
         Arc::new(FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=").unwrap())
+    }
+
+    fn edge_runtime_snapshot() -> ExecutionBindingSnapshot {
+        ExecutionBindingSnapshot::new(
+            WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-1",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+            astra_runtime_env::RuntimeBinding::host_process("edge-host"),
+        )
     }
 
     #[test]
@@ -590,6 +640,22 @@ mod tests {
         assert!(executor.llm_token_service.is_some());
         assert_eq!(executor.edge_tools.len(), 1);
         assert!(executor.cancel_token.is_some());
+    }
+
+    #[test]
+    fn server_skill_subrun_executor_keeps_execution_binding_snapshot() {
+        let snapshot = edge_runtime_snapshot();
+        let executor = ServerSkillSubRunExecutor::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "test-session".to_string(),
+        )
+        .with_execution_binding_snapshot(snapshot.clone());
+
+        assert_eq!(
+            executor.execution_binding_snapshot.as_ref(),
+            Some(&snapshot)
+        );
     }
 
     /// Server-side symmetric to `cli_skill_subrun_rejects_when_recursion_depth_limit_reached`:

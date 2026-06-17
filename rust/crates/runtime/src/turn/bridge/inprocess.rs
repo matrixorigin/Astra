@@ -598,7 +598,7 @@ fn build_bridge_tool_call_records(
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("ok");
-        let ok = matches!(
+        let status_ok = matches!(
             super::super::agentic_loop::tool_support::edge_tool_status_exit_code(status),
             Some(0)
         );
@@ -656,6 +656,10 @@ fn build_bridge_tool_call_records(
                 stringified
             }
         });
+        let output_semantic_error = output
+            .as_deref()
+            .is_some_and(astra_turn_core::tool_result_semantics::is_tool_error);
+        let ok = status_ok && !output_semantic_error;
         let error = tool_result
             .get("error")
             .and_then(Value::as_str)
@@ -1064,6 +1068,20 @@ fn tool_names_from_tool_calls(tool_calls: &[Value]) -> Vec<String> {
         .collect()
 }
 
+fn tool_markers_from_tool_calls(tool_calls: &[Value]) -> Vec<String> {
+    tool_calls
+        .iter()
+        .filter_map(|tool_call| tool_call.get("function").and_then(Value::as_object))
+        .filter_map(|function| {
+            let name = function.get("name").and_then(Value::as_str)?;
+            let args = function.get("arguments").and_then(Value::as_str);
+            Some(astra_turn_core::followup_suggestion::tool_marker(
+                name, args,
+            ))
+        })
+        .collect()
+}
+
 fn filter_round_edge_tools(edge_tools: &[Value], restricted_tools: &HashSet<String>) -> Vec<Value> {
     if restricted_tools.is_empty() {
         return edge_tools.to_vec();
@@ -1112,7 +1130,7 @@ fn turn_complete_event(messages: &[Value], assistant_text: &str, tool_calls: &[V
         && let Some(suggestion) = astra_turn_core::followup_suggestion::suggest_followup(
             user_message,
             assistant_text,
-            &tool_names_from_tool_calls(tool_calls),
+            &tool_markers_from_tool_calls(tool_calls),
         )
     {
         event.insert(
@@ -6358,6 +6376,22 @@ mod tests {
         assert_eq!(event["followup_suggestion"], "继续");
     }
 
+    #[test]
+    fn turn_complete_event_uses_git_action_marker_for_followup() {
+        let messages = vec![json!({"role": "user", "content": "commit it"})];
+        let tool_calls = vec![json!({
+            "id": "call-1",
+            "function": {
+                "name": "git",
+                "arguments": r#"{"action":"commit","message":"ship"}"#
+            }
+        })];
+
+        let event = turn_complete_event(&messages, "Committed the changes.", &tool_calls);
+
+        assert_eq!(event["followup_suggestion"], "push it");
+    }
+
     // ── P1: L0 anchor appears in system prompt ──────────────────────────
 
     // ── P2: Continuation prompt after compaction ────────────────────────
@@ -7811,6 +7845,35 @@ mod tests {
             records[0].result_preview.as_deref(),
             Some("hello\n"),
             "string output must pass through verbatim"
+        );
+    }
+
+    #[test]
+    fn build_bridge_records_json_error_output_overrides_success_status() {
+        let tool_calls = vec![json!({
+            "id": "call-1",
+            "function": {"name": "agent_fanout", "arguments": "{\"action\":\"start\"}"}
+        })];
+        let tool_results = vec![json!({
+            "request_id": "call-1",
+            "name": "agent_fanout",
+            "status": "success",
+            "output": "{\"status\":\"failed\",\"error\":\"Invalid input: unknown field `slot_id`\"}",
+            "duration_ms": 50
+        })];
+        let records = build_bridge_tool_call_records(
+            &tool_calls,
+            &tool_results,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].ok, "{records:?}");
+        assert!(
+            records[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("unknown field `slot_id`")),
+            "{records:?}"
         );
     }
 

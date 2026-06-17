@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::cli::chat_stream::edge_executor_instance_id;
 use crate::cli::session::session_runtime::{attempt_token_refresh, current_access_token};
-use astra_thin_client::edge::edge_register_with_capabilities;
+use astra_thin_client::edge::edge_runtime_environment_capabilities;
 use astra_thin_client::{EdgeHeartbeatRequest, EdgeRegisterRequest, ThinClient, ThinClientError};
 use tokio_util::sync::CancellationToken;
 
@@ -278,13 +278,25 @@ fn enrich_register_body(body: &mut EdgeRegisterRequest) {
     }
 }
 
+fn attach_runtime_environment_capabilities(body: &mut EdgeRegisterRequest) {
+    let Some(worktree_path) = body.worktree_path.clone() else {
+        body.capabilities = None;
+        return;
+    };
+    body.capabilities = Some(edge_runtime_environment_capabilities(
+        &body.edge_agent_id,
+        worktree_path,
+    ));
+}
+
 pub async fn register_edge_once(api: &ThinClient, token: &str) -> Result<(), ThinClientError> {
     if !edge_cloud_registry_enabled() {
         return Ok(());
     }
     let transport_id = edge_executor_instance_id();
-    let mut body = edge_register_with_capabilities(transport_id);
+    let mut body = EdgeRegisterRequest::new(transport_id);
     enrich_register_body(&mut body);
+    attach_runtime_environment_capabilities(&mut body);
     api.post_agents_edge_register(Some(token), Some(transport_id), &body)
         .await?;
     Ok(())
@@ -582,8 +594,8 @@ fn print_skip_notice(_e: &ThinClientError) {
 #[cfg(test)]
 mod tests {
     use super::{
-        PendingToolRequestGuard, ReplayInFlightGuard, backoff_delay,
-        completed_request_ids_snapshot, edge_cloud_registry_enabled, edge_lifecycle,
+        PendingToolRequestGuard, ReplayInFlightGuard, attach_runtime_environment_capabilities,
+        backoff_delay, completed_request_ids_snapshot, edge_cloud_registry_enabled, edge_lifecycle,
         enrich_register_body, heartbeat_period, jitter, record_completed_request,
         register_edge_once, send_heartbeat,
     };
@@ -871,6 +883,33 @@ mod tests {
         assert_eq!(
             ctx.registered_worktree_path(),
             Some(temp.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn attach_runtime_environment_capabilities_uses_registered_worktree() {
+        let mut body = EdgeRegisterRequest::new("edge-test");
+        body.worktree_path = Some("/workspace/project".to_string());
+
+        attach_runtime_environment_capabilities(&mut body);
+
+        let capabilities = body.capabilities.expect("runtime capabilities");
+        assert_eq!(capabilities["schema_version"], 1);
+        assert_eq!(
+            capabilities["binding"]["workspace"]["kind"],
+            "edge_workspace"
+        );
+        assert_eq!(
+            capabilities["binding"]["workspace"]["cwd"],
+            "/workspace/project"
+        );
+        assert_eq!(
+            capabilities["binding"]["executor"]["executor_id"],
+            "edge-test"
+        );
+        assert_eq!(
+            capabilities["binding"]["capabilities"]["runtime"]["runtime_has_shell"],
+            true
         );
     }
 }

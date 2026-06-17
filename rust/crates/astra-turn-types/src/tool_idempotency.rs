@@ -59,6 +59,15 @@ pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolI
             _ => ToolIdempotency::NonIdempotent,
         },
 
+        // Consolidated `github` tool: read-only API calls are safe to retry;
+        // mutating/unknown actions are conservative.
+        "github" => match args.and_then(|a| a.get("action")).and_then(Value::as_str) {
+            Some(
+                "list_prs" | "get_pr" | "ci_status" | "repo_stats" | "list_issues" | "get_issue",
+            ) => ToolIdempotency::PureRead,
+            _ => ToolIdempotency::NonIdempotent,
+        },
+
         // Consolidated `task` tool: reads are safe; mutations write
         // session state and must not be blindly retried.
         "task" => match args.and_then(|a| a.get("action")).and_then(Value::as_str) {
@@ -312,7 +321,6 @@ mod tests {
         for name in [
             "bash",
             "str_replace",
-            "github_create_issue",
             "delete_file",
             "multi_edit",
             "edit_file",
@@ -325,6 +333,10 @@ mod tests {
                 "Expected NonIdempotent for {name}"
             );
         }
+        assert_eq!(
+            classify_tool_idempotency("github", Some(&json!({"action": "create_issue"}))),
+            ToolIdempotency::NonIdempotent
+        );
     }
 
     #[test]

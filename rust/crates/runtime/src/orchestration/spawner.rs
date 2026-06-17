@@ -953,7 +953,12 @@ impl DynamicAgentSpawner {
                 )));
             }
             group
-                .set_slot_request(identity.slot_index, agent_type, description)
+                .set_slot_request(
+                    identity.slot_index,
+                    identity.slot_id.clone(),
+                    agent_type,
+                    description,
+                )
                 .map_err(SpawnError::InvalidInput)?;
             group
                 .record_spawn_accepted(identity.slot_index, agent_id)
@@ -1002,7 +1007,12 @@ impl DynamicAgentSpawner {
                 )));
             }
             group
-                .set_slot_request(identity.slot_index, agent_type, description)
+                .set_slot_request(
+                    identity.slot_index,
+                    identity.slot_id.clone(),
+                    agent_type,
+                    description,
+                )
                 .map_err(SpawnError::InvalidInput)?;
             group
                 .record_spawn_rejected(identity.slot_index, reason)
@@ -1175,6 +1185,7 @@ impl DynamicAgentSpawner {
                 "group_id": &slot.group_id,
                 "target_count": slot.target_count,
                 "slot_index": slot.slot_index,
+                "slot_id": &slot.slot_id,
             })),
         });
         Self::merge_execution_metadata(&mut metadata, state.execution_metadata.as_ref());
@@ -3872,6 +3883,7 @@ mod tests {
         input.fanout_group_title = Some("review fanout".to_string());
         input.fanout_target_count = Some(3);
         input.fanout_slot_index = Some(1);
+        input.fanout_slot_id = Some("storage".to_string());
 
         let output = spawner
             .spawn(input, &make_bg_context())
@@ -3893,6 +3905,7 @@ mod tests {
         assert_eq!(slot.group_id, "review-1");
         assert_eq!(slot.target_count, 3);
         assert_eq!(slot.slot_index, 1);
+        assert_eq!(slot.slot_id.as_deref(), Some("storage"));
 
         let listed = spawner.list_agents("root").await;
         let projected = listed
@@ -3936,6 +3949,7 @@ mod tests {
         input.fanout_group_title = Some("review fanout".to_string());
         input.fanout_target_count = Some(3);
         input.fanout_slot_index = Some(1);
+        input.fanout_slot_id = Some("storage".to_string());
 
         let first = spawner
             .spawn(input.clone(), &make_bg_context())
@@ -3956,6 +3970,7 @@ mod tests {
         assert_eq!(summary.target_count, 3);
         assert_eq!(summary.accepted, 1);
         assert_eq!(summary.active, 1);
+        assert_eq!(groups[0].slots[1].slot_id.as_deref(), Some("storage"));
         assert_eq!(groups[0].slots[1].requested_description, "bg test");
 
         factory.unblock();

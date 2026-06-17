@@ -280,6 +280,21 @@ pub trait AgenticLoopHost: Send {
     /// Valid tool names from the host's tool schemas.
     fn valid_tool_names(&self) -> &HashSet<String>;
 
+    /// Names listed in the current turn's `<deferred_tools>` manifest.
+    ///
+    /// The validator uses this to differentiate "unknown tool" denials
+    /// (truly hallucinated names) from "not yet activated" denials
+    /// (deferred but reachable via `tool_search(query="select:NAME")`).
+    /// Default: empty — hosts that don't render a deferred manifest get
+    /// the legacy "Unknown tool" copy on every miss.
+    ///
+    /// Returned by value because some hosts compute the set lazily from
+    /// shared state (`Arc<ToolExecutor>`) and don't keep a borrowable
+    /// `HashSet`. The validator clones once per round, so this isn't hot.
+    fn deferred_tool_names(&self) -> HashSet<String> {
+        HashSet::new()
+    }
+
     /// Active capability set for this host. Prompt rendering should read this
     /// rather than inferring capabilities from the resolved tool list.
     fn capabilities(&self) -> astra_turn_core::capability::CapabilitySet {
@@ -580,14 +595,6 @@ pub struct StallTrackingState {
     /// when the model has produced a long streak of consecutive single-tool
     /// rounds despite the soft prompt-layer nudge. One-shot per turn.
     pub forced_parallel_batching: bool,
-    /// Escalation of `forced_parallel_batching`: fires a second, harder
-    /// corrective when the model has continued streaking despite the
-    /// first force injection. Session 8d9e5903 T11 showed 18 consecutive
-    /// single-tool rounds without any mid-loop correction because the
-    /// first-tier was silenced by a scaffolding-detection bug (fixed
-    /// separately); even with that bug fixed, one-shot correction is
-    /// insufficient when the streak keeps growing. One-shot per turn.
-    pub forced_parallel_batching_escalated: bool,
     /// Whether the round-budget convergence guard injected its phase-1
     /// corrective this loop. Phase-1 fires when `state.llm_rounds_completed`
     /// crosses the effective round-budget hard limit; it tells the model
@@ -2408,6 +2415,17 @@ pub(crate) mod tests {
     use astra_services::session_journal::SURGICAL_REMOVAL_TOOL_NAME;
     use serde_json::json;
 
+    fn edge_runtime_environment_fields() -> serde_json::Map<String, Value> {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+            astra_runtime_env::RunBinding::edge_developer("/workspace/project", &registry),
+        );
+        serde_json::Map::from_iter([(
+            "runtime_environment_advertisement".to_string(),
+            serde_json::to_value(advertisement).expect("serialize advertisement"),
+        )])
+    }
+
     /// Unwind-safe cleanup guard for tests that write under
     /// `session_journal::local_sessions_dir()`. Removes the provided directory
     /// on drop — including during panic unwinds from failed assertions — so
@@ -2645,13 +2663,16 @@ pub(crate) mod tests {
             tool: name.to_string(),
             args: json!({}),
             output: output.to_string(),
-            tool_result_fields: None,
+            tool_result_fields: Some(edge_runtime_environment_fields()),
             status: "ok".to_string(),
             duration_ms: 10,
         }
     }
 
     fn make_detached_bash_edge_tool(task_id: &str) -> EdgeToolExecResult {
+        let mut fields = edge_runtime_environment_fields();
+        fields.insert("bash_detached".to_string(), json!(true));
+        fields.insert("background_task_id".to_string(), json!(task_id));
         EdgeToolExecResult {
             request_id: "req-bash".to_string(),
             tool: "bash".to_string(),
@@ -2659,10 +2680,40 @@ pub(crate) mod tests {
             output: format!(
                 "<bash_detached>The bash command was promoted to background task {task_id}.</bash_detached>"
             ),
-            tool_result_fields: Some(serde_json::Map::from_iter([
-                ("bash_detached".to_string(), json!(true)),
-                ("background_task_id".to_string(), json!(task_id)),
-            ])),
+            tool_result_fields: Some(fields),
+            status: "ok".to_string(),
+            duration_ms: 10,
+        }
+    }
+
+    fn make_running_agent_fanout_edge_tool(group_id: &str) -> EdgeToolExecResult {
+        EdgeToolExecResult {
+            request_id: "req-agent-fanout".to_string(),
+            tool: "agent_fanout".to_string(),
+            args: json!({
+                "action": "start",
+                "target_count": 3,
+                "slots": []
+            }),
+            output: json!({
+                "status": "started",
+                "group_id": group_id,
+                "target_count": 3,
+                "fanout": {
+                    "accepted": 3,
+                    "active": 3,
+                    "completed": 0,
+                    "failed": 0,
+                    "cancelled_by_user": 0,
+                    "cancelled_by_parent_budget": 0,
+                    "timed_out": 0,
+                    "terminal": 0,
+                    "group_id": group_id,
+                    "status": "running"
+                }
+            })
+            .to_string(),
+            tool_result_fields: Some(edge_runtime_environment_fields()),
             status: "ok".to_string(),
             duration_ms: 10,
         }
@@ -2674,7 +2725,7 @@ pub(crate) mod tests {
             tool: name.to_string(),
             args,
             output: output.to_string(),
-            tool_result_fields: None,
+            tool_result_fields: Some(edge_runtime_environment_fields()),
             status: "ok".to_string(),
             duration_ms: 10,
         }
@@ -3886,21 +3937,74 @@ pub(crate) mod tests {
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
 
-        assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
+        assert!(
+            matches!(
+                outcome,
+                Ok(AgenticLoopOutcome::Waiting(ref reason))
+                    if reason == "background_task_detached:bg-shell-1"
+            ),
+            "{outcome:?}"
+        );
         assert_eq!(
             host.turn_count(),
-            3,
-            "detached bash on turn 1, task_output on turn 2, text completes on turn 3"
+            1,
+            "detached bash must stop the current turn without a follow-up poll round"
         );
-        assert_eq!(state.total_tool_calls, 2);
+        assert_eq!(state.total_tool_calls, 1);
         assert!(state.telemetry.all_tools_used.contains("bash"));
-        assert!(state.telemetry.all_tools_used.contains("task_output"));
+        assert!(!state.telemetry.all_tools_used.contains("task_output"));
         assert!(
             state
                 .messages
                 .iter()
                 .any(|message| message.to_string().contains("bg-shell-1")),
             "background task id must remain visible in the tool result messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn running_agent_fanout_stops_without_followup_poll_round() {
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_running_agent_fanout_edge_tool("review-group")],
+                10,
+                5,
+                None,
+            ),
+            edge_tool_result(
+                vec![make_edge_tool("agent_fanout", "should not poll")],
+                10,
+                5,
+                None,
+            ),
+            text_result("done", 10, 5, None),
+        ])
+        .with_valid_tools(&["agent_fanout"]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(
+            matches!(
+                outcome,
+                Ok(AgenticLoopOutcome::Waiting(ref reason))
+                    if reason == "agent_fanout_running:review-group"
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            host.turn_count(),
+            1,
+            "running fanout must stop the current turn instead of polling get_results"
+        );
+        assert_eq!(state.total_tool_calls, 1);
+        assert!(state.telemetry.all_tools_used.contains("agent_fanout"));
+        assert!(
+            state
+                .messages
+                .iter()
+                .any(|message| message.to_string().contains("review-group")),
+            "fanout group id must remain visible in the tool result messages"
         );
     }
 
@@ -9230,12 +9334,12 @@ print(json.dumps({'context': 'user said: ' + msg}))
         for (i, name) in [
             "read_file",
             "grep",
-            "git_diff",
+            "list_dir",
             "read_file",
             "grep",
-            "git_show",
-            "read_file",
             "glob",
+            "read_file",
+            "web_search",
         ]
         .into_iter()
         .enumerate()

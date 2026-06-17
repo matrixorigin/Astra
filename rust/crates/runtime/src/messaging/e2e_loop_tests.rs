@@ -12,7 +12,7 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use serde_json::{Value, json};
+    use serde_json::{Map, Value, json};
 
     use crate::orchestration::permission_sync::{
         InheritedPermissions, PermissionMode, PermissionRequest, PermissionRequestMessaging,
@@ -36,6 +36,17 @@ mod tests {
     use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
     use astra_turn_core::sse_stream_host::EdgeToolExecResult;
     use astra_turn_core::turn_guard::TurnGuard;
+
+    fn edge_runtime_environment_fields() -> Map<String, Value> {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+            astra_runtime_env::RunBinding::edge_developer("/workspace/project", &registry),
+        );
+        Map::from_iter([(
+            "runtime_environment_advertisement".to_string(),
+            serde_json::to_value(advertisement).expect("serialize advertisement"),
+        )])
+    }
 
     // ── Mock Host ───────────────────────────────────────────────────────────
 
@@ -468,7 +479,7 @@ mod tests {
             tool: "bash".into(),
             args: json!({"command": "echo hello"}),
             output: "hello".into(),
-            tool_result_fields: None,
+            tool_result_fields: Some(edge_runtime_environment_fields()),
             status: "ok".into(),
             duration_ms: 5,
         }];
@@ -525,7 +536,7 @@ mod tests {
             tool: "read_file".into(),
             args: json!({"path": "/tmp/x.txt"}),
             output: "content".into(),
-            tool_result_fields: None,
+            tool_result_fields: Some(edge_runtime_environment_fields()),
             status: "ok".into(),
             duration_ms: 5,
         }];
@@ -672,6 +683,7 @@ mod tests {
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
+            deferred_tool_names: &std::collections::HashSet::new(),
             restricted_tools: &mut restricted_tools,
             turn_guard: &mut turn_guard,
             step_recorder: &mut step_recorder,
@@ -748,6 +760,7 @@ mod tests {
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
+            deferred_tool_names: &std::collections::HashSet::new(),
             restricted_tools: &mut restricted_tools,
             turn_guard: &mut turn_guard,
             step_recorder: &mut step_recorder,
@@ -838,6 +851,7 @@ mod tests {
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
+            deferred_tool_names: &std::collections::HashSet::new(),
             restricted_tools: &mut restricted_tools,
             turn_guard: &mut turn_guard,
             step_recorder: &mut step_recorder,
@@ -942,6 +956,7 @@ mod tests {
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
+            deferred_tool_names: &std::collections::HashSet::new(),
             restricted_tools: &mut restricted_tools,
             turn_guard: &mut turn_guard,
             step_recorder: &mut step_recorder,
@@ -1066,6 +1081,7 @@ mod tests {
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
+            deferred_tool_names: &std::collections::HashSet::new(),
             restricted_tools: &mut restricted_tools,
             turn_guard: &mut turn_guard,
             step_recorder: &mut step_recorder,
@@ -1143,7 +1159,7 @@ mod tests {
             tool: "grep".to_string(),
             args: json!({"pattern": "TODO"}),
             output: "src/main.rs:10: // TODO fix".to_string(),
-            tool_result_fields: None,
+            tool_result_fields: Some(edge_runtime_environment_fields()),
             status: "ok".to_string(),
             duration_ms: 50,
         }];
@@ -1179,6 +1195,7 @@ mod tests {
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
+            deferred_tool_names: &std::collections::HashSet::new(),
             restricted_tools: &mut restricted_tools,
             turn_guard: &mut turn_guard,
             step_recorder: &mut step_recorder,
@@ -1277,6 +1294,7 @@ mod tests {
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
+            deferred_tool_names: &std::collections::HashSet::new(),
             restricted_tools: &mut restricted_tools,
             turn_guard: &mut turn_guard,
             step_recorder: &mut step_recorder,
@@ -1403,6 +1421,7 @@ mod tests {
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
+            deferred_tool_names: &std::collections::HashSet::new(),
             restricted_tools: &mut restricted_tools,
             turn_guard: &mut turn_guard,
             step_recorder: &mut step_recorder,
@@ -1533,6 +1552,7 @@ mod tests {
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
+            deferred_tool_names: &std::collections::HashSet::new(),
             restricted_tools: &mut restricted_tools,
             turn_guard: &mut turn_guard,
             step_recorder: &mut step_recorder,
@@ -1616,6 +1636,7 @@ mod tests {
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
+            deferred_tool_names: &std::collections::HashSet::new(),
             restricted_tools: &mut restricted_tools,
             turn_guard: &mut turn_guard,
             step_recorder: &mut step_recorder,

@@ -548,30 +548,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 ),
             );
         }
-    } else if !suppress_nudges && should_escalate_parallel_batching(state) {
-        // Second-tier: the first force didn't stop the streak. Fire a
-        // harder corrective before the circuit breaker aborts the turn
-        // (session 8d9e5903 T11 reached streak 18 with no mid-loop
-        // escalation). One-shot per turn.
-        let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
-        state.stall.forced_parallel_batching_escalated = true;
-        let msg = parallel_batching_escalation_message(streak);
-        state.push_volatile(super::host::VolatileKind::ParallelBatchingForce, msg);
-        tracing::warn!(
-            target: "astra::loop_guard",
-            tier = "parallel_batching_escalation",
-            streak,
-            round = state.llm_rounds_completed,
-            "loop guard escalated"
-        );
-        if !prep.quiet {
-            host.emit_headless_line(
-                HeadlessStderrStyle::Yellow,
-                format!(
-                    "↻↻ streak still growing ({streak}); escalating parallel-batching corrective…"
-                ),
-            );
-        }
     }
 
     // ── Circuit breaker observation ──────────────────────────────────────
@@ -1949,41 +1925,25 @@ pub(crate) fn is_execution_corrective_message(m: &serde_json::Value) -> bool {
 
 /// Third-tier guard for the parallel-batching layer. The prompt-side soft
 /// nudge fires when the trailing single-tool round streak hits
-/// `PARALLEL_BATCHING_NUDGE_THRESHOLD` (=4). If the model ignores the nudge
+/// `PARALLEL_BATCHING_NUDGE_THRESHOLD` (=6). If the model ignores the nudge
 /// and produces yet another single-tool round, the streak crosses the
-/// resolved `parallel_batching_force_streak` threshold (default 5, per-model
+/// resolved `parallel_batching_force_streak` threshold (default 8, per-model
 /// overrides via `ModelPolicyProfile`) and we inject a hard corrective
-/// `user` message — the same pattern as `EXECUTION_ESCALATION`, scoped to a
-/// different failure mode (sequential read churn rather than read-only spin
-/// on a mutating task).
+/// `user` message.
 ///
-/// Invariant: the resolved force threshold must stay strictly greater than
-/// `PARALLEL_BATCHING_NUDGE_THRESHOLD` so the soft→hard cascade is preserved
-/// (otherwise the runtime hard-corrects before the prompt-layer nudge ever
-/// gets a chance to fire). Pinned by
-/// `parallel_batching_force_default_above_nudge_threshold`.
+/// The circuit breaker handles persistent stalls that ignore the hard force —
+/// no escalation layer needed.
 pub(crate) const PARALLEL_BATCHING_FORCE_MARKER: &str = "## ⤴ Parallel Batching Force";
 
 /// Trailing single-tool-round streak length at which the soft prompt nudge
-/// (=4) escalates into a forced corrective injection. One above the nudge
-/// threshold so the model gets exactly ONE chance to self-correct before we
-/// intervene with a higher-priority `user` message.
-/// Default for the early-streak threshold; the actual value used at runtime
-/// flows through `ToolSelectionConfig::effective_parallel_batching_force_streak`
-/// (and per-model overrides via `ModelPolicyProfile`).
+/// (=6) escalates into a forced corrective injection.
+/// Default for the threshold; the actual value used at runtime flows through
+/// `ToolSelectionConfig::effective_parallel_batching_force_streak` (and
+/// per-model overrides via `ModelPolicyProfile`).
 /// Must match `effective_parallel_batching_force_streak`'s zero-default.
 #[cfg(test)]
-pub(crate) const PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD: usize = 5;
-
-/// Tightened streak threshold once the turn has entered the round-budget
-/// warning zone (`round_index >= ROUND_BUDGET_THRESHOLD`). At that point any
-/// additional sequential single-tool round is materially closer to running
-/// out of budget without a final answer, so we intervene more aggressively.
-/// Empirical real-session data: turns near the round-budget warning that
-/// added a 3rd consecutive single-tool round virtually never converged
-/// without external correction.
-#[cfg(test)]
-pub(crate) const PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD_LATE: usize = 3;
+pub(crate) const PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD: usize =
+    astra_config::runtime_config::DEFAULT_PARALLEL_BATCHING_FORCE_STREAK as usize;
 
 pub(crate) fn is_parallel_batching_force(m: &serde_json::Value) -> bool {
     if m.get("role").and_then(|r| r.as_str()) != Some("user") {
@@ -1994,10 +1954,7 @@ pub(crate) fn is_parallel_batching_force(m: &serde_json::Value) -> bool {
         .is_some_and(|s| s.starts_with(PARALLEL_BATCHING_FORCE_MARKER))
 }
 
-pub(crate) fn should_force_parallel_batching(
-    state: &AgenticLoopState,
-    early_threshold: usize,
-) -> bool {
+pub(crate) fn should_force_parallel_batching(state: &AgenticLoopState, threshold: usize) -> bool {
     if state.stall.forced_parallel_batching {
         return false;
     }
@@ -2016,54 +1973,7 @@ pub(crate) fn should_force_parallel_batching(
         return false;
     }
     let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
-    // Late-budget threshold stays derived (compile-time floor of 2): once the
-    // model is close to the round-budget warning, even a short streak should
-    // trigger correction. Derived as `max(2, early - 2)` so the original
-    // (early=5 → late=3) gap is preserved at the default while remaining
-    // proportional under per-model overrides (e.g. early=8 → late=6).
-    let late_threshold = early_threshold.saturating_sub(2).max(2);
-    let threshold = if state.llm_rounds_completed >= crate::prompts::ROUND_BUDGET_THRESHOLD {
-        late_threshold
-    } else {
-        early_threshold
-    };
     streak >= threshold
-}
-
-/// Escalation threshold: once the first parallel-batching force has
-/// fired, if the model is still producing single-tool rounds and the
-/// streak from *the round after the force* has grown by this many
-/// rounds, fire a second, harder corrective. Chosen to avoid immediate
-/// re-fire (the model needs at least 1 round to react) while catching
-/// cases where the streak grows without bound (session 8d9e5903 T11
-/// reached 18).
-pub(crate) const PARALLEL_BATCHING_ESCALATION_STREAK: usize = 10;
-
-pub(crate) fn should_escalate_parallel_batching(state: &AgenticLoopState) -> bool {
-    // Requires that the first-tier force already fired.
-    if !state.stall.forced_parallel_batching {
-        return false;
-    }
-    // One-shot: never re-fire the escalation in the same turn.
-    if state.stall.forced_parallel_batching_escalated {
-        return false;
-    }
-    let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
-    streak >= PARALLEL_BATCHING_ESCALATION_STREAK
-}
-
-pub(crate) fn parallel_batching_escalation_message(streak: usize) -> String {
-    format!(
-        "{PARALLEL_BATCHING_FORCE_MARKER}\n\
-         Runtime ESCALATION: the prior parallel-batching correction did not \
-         change your behavior — you are still on a streak of {streak} consecutive \
-         single-tool rounds. This is a hard loop; the turn will be aborted \
-         by the circuit breaker if it continues. \
-         Your NEXT response MUST be one of:\n\
-         - A final answer (no tool calls), OR\n\
-         - ≥2 independent tool calls in a single parallel batch.\n\
-         Do not produce another single-tool round — there is no third warning."
-    )
 }
 
 pub(crate) fn parallel_batching_force_message(streak: usize, original_query: &str) -> String {
@@ -2119,6 +2029,25 @@ pub(crate) fn is_completion_soft_stop(m: &serde_json::Value) -> bool {
         .is_some_and(|s| s.starts_with(COMPLETION_SOFT_STOP_MARKER))
 }
 
+fn tool_record_is_git_commit_action(
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> bool {
+    if !record.ok || record.name != "git" {
+        return false;
+    }
+    record
+        .args_full
+        .as_deref()
+        .and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok())
+        .and_then(|args| {
+            args.get("action")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .as_deref()
+        == Some("commit")
+}
+
 /// Build a `RoundSignal` from the current loop state for the circuit breaker.
 /// Uses the latest `turn_sigs` entry and checks `tool_call_records` for mutations.
 fn build_circuit_breaker_signal(
@@ -2166,7 +2095,7 @@ fn build_circuit_breaker_signal(
     let task_completed = !state.hooks.task_board_snapshot.has_unfinished_tasks()
         && latest_round_records
             .iter()
-            .any(|record| record.ok && record.name == "git_commit");
+            .any(|record| tool_record_is_git_commit_action(record));
 
     RoundSignal {
         tool_signatures,
@@ -3603,18 +3532,19 @@ mod tests {
     }
 
     #[test]
-    fn circuit_breaker_signal_marks_successful_git_commit_as_task_completed() {
+    fn circuit_breaker_signal_marks_successful_git_commit_action_as_task_completed() {
         let mut state = make_state();
         state.llm_rounds_completed = 4;
         state.stall.turn_sigs.push(
-            ["git_commit:{\"message\":\"finish\"}".to_string()]
+            ["git:{\"action\":\"commit\",\"message\":\"finish\"}".to_string()]
                 .into_iter()
                 .collect(),
         );
         state.stall.tool_call_records.push(ToolCallRecord {
-            name: "git_commit".into(),
+            name: "git".into(),
             ok: true,
             round: Some(3),
+            args_full: Some(r#"{"action":"commit","message":"finish"}"#.into()),
             ..Default::default()
         });
 
@@ -3623,7 +3553,7 @@ mod tests {
         assert!(signal.task_completed);
         assert!(
             signal.produced_mutation,
-            "git_commit still counts as mutation evidence"
+            "git(action=commit) still counts as mutation evidence"
         );
     }
 
@@ -3650,14 +3580,15 @@ mod tests {
                 },
             ]);
         state.stall.turn_sigs.push(
-            ["git_commit:{\"message\":\"finish\"}".to_string()]
+            ["git:{\"action\":\"commit\",\"message\":\"finish\"}".to_string()]
                 .into_iter()
                 .collect(),
         );
         state.stall.tool_call_records.push(ToolCallRecord {
-            name: "git_commit".into(),
+            name: "git".into(),
             ok: true,
             round: Some(3),
+            args_full: Some(r#"{"action":"commit","message":"finish"}"#.into()),
             ..Default::default()
         });
 
@@ -3831,7 +3762,7 @@ mod tests {
     }
 
     #[test]
-    fn circuit_breaker_signal_does_not_reuse_stale_git_commit_completion() {
+    fn circuit_breaker_signal_does_not_reuse_stale_git_commit_action_completion() {
         let mut state = make_state();
         state.llm_rounds_completed = 5;
         state.stall.turn_sigs.push(
@@ -3840,9 +3771,10 @@ mod tests {
                 .collect(),
         );
         state.stall.tool_call_records.push(ToolCallRecord {
-            name: "git_commit".into(),
+            name: "git".into(),
             ok: true,
             round: Some(3),
+            args_full: Some(r#"{"action":"commit","message":"finish"}"#.into()),
             ..Default::default()
         });
         state.stall.tool_call_records.push(ToolCallRecord {
@@ -4429,78 +4361,6 @@ mod tests {
     // from firing *before* the first-tier has fired.
 
     #[test]
-    fn parallel_batching_escalation_silent_before_first_tier_fires() {
-        let mut state = make_state();
-        state.message = "explore".into();
-        for _ in 0..PARALLEL_BATCHING_ESCALATION_STREAK {
-            push_single_tool_round(&mut state);
-        }
-        // Even at high streak, escalation requires the first-tier to
-        // have fired already — otherwise the first-tier should fire
-        // instead (and does; asserted in its own tests).
-        assert!(!should_escalate_parallel_batching(&state));
-    }
-
-    #[test]
-    fn parallel_batching_escalation_fires_when_streak_persists_after_first_tier() {
-        let mut state = make_state();
-        state.message = "explore".into();
-        // Simulate: first-tier already fired some rounds back; model
-        // ignored the correction and kept streaking.
-        state.stall.forced_parallel_batching = true;
-        for _ in 0..PARALLEL_BATCHING_ESCALATION_STREAK {
-            push_single_tool_round(&mut state);
-        }
-        assert!(
-            should_escalate_parallel_batching(&state),
-            "with forced_parallel_batching=true and streak>=10, escalation must fire \
-             — session 8d9e5903 T11 reached streak 18 with no escalation because \
-             this path did not exist"
-        );
-    }
-
-    #[test]
-    fn parallel_batching_escalation_silent_below_escalation_threshold() {
-        let mut state = make_state();
-        state.message = "explore".into();
-        state.stall.forced_parallel_batching = true;
-        for _ in 0..(PARALLEL_BATCHING_ESCALATION_STREAK - 1) {
-            push_single_tool_round(&mut state);
-        }
-        assert!(!should_escalate_parallel_batching(&state));
-    }
-
-    #[test]
-    fn parallel_batching_escalation_is_one_shot_per_turn() {
-        let mut state = make_state();
-        state.message = "explore".into();
-        state.stall.forced_parallel_batching = true;
-        for _ in 0..PARALLEL_BATCHING_ESCALATION_STREAK {
-            push_single_tool_round(&mut state);
-        }
-        assert!(should_escalate_parallel_batching(&state));
-        // Once escalation has fired, a second round of single-tool does
-        // NOT re-escalate.
-        state.stall.forced_parallel_batching_escalated = true;
-        push_single_tool_round(&mut state);
-        assert!(!should_escalate_parallel_batching(&state));
-    }
-
-    #[test]
-    fn parallel_batching_escalation_message_contains_streak_and_no_third_warning() {
-        let msg = parallel_batching_escalation_message(18);
-        assert!(msg.contains("18 consecutive"));
-        assert!(
-            msg.contains("no third warning"),
-            "escalation message must make clear this is the last chance: {msg}"
-        );
-        assert!(
-            msg.contains("ESCALATION"),
-            "message must distinguish itself from the first-tier force: {msg}"
-        );
-    }
-
-    #[test]
     fn parallel_batching_force_marker_recognized_by_corrective_filter() {
         let msg = serde_json::json!({
             "role": "user",
@@ -4517,41 +4377,38 @@ mod tests {
     }
 
     #[test]
-    fn parallel_batching_force_uses_tighter_threshold_in_round_budget_warning_zone() {
-        // Streak of 3 — below the early-zone threshold of 5...
+    fn parallel_batching_force_keeps_resolved_threshold_in_round_budget_warning_zone() {
+        let below_force_threshold = PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD - 1;
         let mut state = make_state();
         state.message = "explore the codebase".into();
-        for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD_LATE {
+        for _ in 0..below_force_threshold {
             push_single_tool_round(&mut state);
         }
-        // ...so before the warning zone, this must NOT fire.
+        // Before the warning zone, this must NOT fire.
         state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD - 1;
         assert!(!should_force_parallel_batching(
             &state,
             PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
         ));
 
-        // Once round_index crosses ROUND_BUDGET_THRESHOLD, the same streak of
-        // 3 must fire — this is the coupling we want.
+        // The warning zone must not make the hard corrective more aggressive;
+        // it already has soft budget guidance for pacing.
         state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD;
-        assert!(should_force_parallel_batching(
+        assert!(!should_force_parallel_batching(
             &state,
             PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
         ));
     }
 
     #[test]
-    fn parallel_batching_force_late_threshold_silent_at_streak_two() {
+    fn parallel_batching_force_warning_zone_still_fires_at_resolved_threshold() {
         let mut state = make_state();
         state.message = "explore the codebase".into();
-        for _ in 0..(PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD_LATE - 1) {
+        for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD {
             push_single_tool_round(&mut state);
         }
         state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD + 2;
-        // Even deep into the warning zone, a streak below the late threshold
-        // (=3) must not fire — we don't punish a single isolated single-tool
-        // round just because the turn is long.
-        assert!(!should_force_parallel_batching(
+        assert!(should_force_parallel_batching(
             &state,
             PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
         ));
@@ -4625,10 +4482,9 @@ mod tests {
     /// (model-blind) would silently break this.
     #[test]
     fn parallel_batching_force_uses_resolved_per_model_threshold() {
-        // Configure a user profile that more than doubles the global default.
-        // 11 is well above the global default 5 and well above the nudge
-        // threshold, so a streak of 5 should NOT fire under this profile but
-        // WOULD fire under the global default.
+        // Configure a user profile well above the global default and nudge
+        // threshold, so a default-length streak should NOT fire under this
+        // profile but WOULD fire under the global default.
         let mut cfg = astra_config::runtime_config::ToolSelectionConfig::default();
         cfg.model_profiles
             .push(astra_config::runtime_config::ModelPolicyProfile {
@@ -4639,20 +4495,23 @@ mod tests {
         let policy = cfg.resolve_for_model(Some("us.anthropic.claude-haiku-4-5-20251001-v1:0"));
         assert_eq!(policy.parallel_batching_force_streak, 11);
 
-        // Build a state with a streak equal to the global default (5).
+        let global_default = cfg.effective_parallel_batching_force_streak() as usize;
+        assert!(global_default < policy.parallel_batching_force_streak as usize);
+
+        // Build a state with a streak equal to the global default.
         let mut state = make_state();
         state.message = "explore the codebase".into();
-        for _ in 0..5 {
+        for _ in 0..global_default {
             push_single_tool_round(&mut state);
         }
 
         // Resolved per-model threshold (=11) must suppress the corrective…
         assert!(
             !should_force_parallel_batching(&state, policy.parallel_batching_force_streak as usize),
-            "streak=5 must NOT fire under per-model force=11"
+            "streak={global_default} must NOT fire under per-model force=11"
         );
 
-        // …whereas the model-blind global path (=5) would fire. This is the
+        // …whereas the model-blind global path would fire. This is the
         // actual regression target: if someone re-routes the guard back to
         // `effective_parallel_batching_force_streak`, the second assertion
         // would still pass but the first would change behavior — pinning
@@ -4662,7 +4521,7 @@ mod tests {
                 &state,
                 cfg.effective_parallel_batching_force_streak() as usize
             ),
-            "streak=5 SHOULD fire at the global default — sanity check that \
+            "streak={global_default} SHOULD fire at the global default — sanity check that \
              the test exercises the right axis"
         );
     }
@@ -4695,30 +4554,25 @@ mod tests {
         }
     }
 
-    /// Late-zone derivation `early - 2` must remain proportional under
-    /// per-model overrides — protects the comment-stated invariant that
-    /// "early=8 → late=6" preserves the original (5,3) gap shape.
+    /// Round-budget warning state must not override the resolved per-model
+    /// threshold. Pacing hints can be soft; hard correction should stay tied
+    /// to the explicit tool-selection policy.
     #[test]
-    fn parallel_batching_force_late_threshold_proportional_to_early() {
+    fn parallel_batching_force_warning_zone_respects_resolved_per_model_threshold() {
         let mut state = make_state();
         state.message = "explore the codebase".into();
-        // Six trailing single-tool rounds, deep in the round-budget warning
-        // zone. Under early=8 the late threshold derives to 6, so this must
-        // fire. Under early=9 the late threshold derives to 7, so it must
-        // NOT fire on the same streak — proves the late path is a function
-        // of the resolved early threshold, not a hardcoded 3.
-        for _ in 0..6 {
+        for _ in 0..8 {
             push_single_tool_round(&mut state);
         }
         state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD + 1;
 
         assert!(
             should_force_parallel_batching(&state, 8),
-            "streak=6 in warning zone must fire under early=8 (late=6)"
+            "streak=8 in warning zone must fire under resolved threshold 8"
         );
         assert!(
             !should_force_parallel_batching(&state, 9),
-            "streak=6 in warning zone must NOT fire under early=9 (late=7)"
+            "streak=8 in warning zone must NOT fire under resolved threshold 9"
         );
     }
 

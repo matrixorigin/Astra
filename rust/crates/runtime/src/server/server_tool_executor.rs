@@ -15,997 +15,111 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
-use sqlx::Row;
-use uuid::Uuid;
 
 use astra_core::SharedPool;
-use astra_services::{SessionArtifactJsonRecord, SessionArtifactJsonStore};
+use astra_runtime_env::WorkspaceRecord;
 use astra_tools::executor::DefaultToolExecutor;
-use astra_tools::exit_semantics::{classify_command_result, classify_exit};
 use astra_tools::task_mgmt::{
     InMemoryTaskStore, MAX_CREATE_SUBTASKS, SessionTask, TaskManager, TaskManagerSnapshot,
     TaskStore,
 };
-use astra_tools::{
-    AskUserAnswers, AskUserDecision, AskUserGate, AskUserPrompt, AskUserQuestionAnswer,
-    ToolExecutor, build_ask_user_prompt_telemetry, build_ask_user_tool_call_audit,
-    normalize_ask_user_answers, parse_ask_user_prompt,
-};
+use astra_tools::tool_engine::ToolEngine;
+use astra_tools::{AskUserGate, ToolExecutor};
+use astra_turn_core::sync_utils::{rwlock_read_clone_or_default, rwlock_write_reset_on_poison};
 use async_trait::async_trait;
 
 use crate::orchestration::AgentToolContext;
+use crate::server::server_bash_execution::execute_server_bash;
+use crate::server::tool_ask_user::{AskUserExecutionContext, execute_ask_user};
+use crate::server::tool_database_snapshots::{self, DatabaseSnapshotRollbackJournal};
+use crate::server::tool_exactly_once;
+use crate::server::tool_execution_result::{result_metadata_str, tool_result_from_output};
+use crate::server::tool_local_execution::{
+    LocalToolExecutionLifecycle, LocalToolPreflight, LocalToolPreflightContext,
+    record_preview_template_missing, run_local_tool_preflight, spawn_resource_tool_call_recording,
+    unknown_local_tool_result,
+};
+use crate::server::tool_plan_gate::{
+    PlanModeSnapshot, is_plan_mode_blocked_tool, plan_mode_authoring_active,
+};
+use crate::server::tool_route_runtime::{ToolRouteRuntimeContext, execute_tool_route_with_events};
+use crate::server::tool_session_config::{
+    ToolPreferenceAction, execute_adjust_config, execute_compress_context,
+    execute_tool_preference_update,
+};
+use crate::server::tool_session_state_rollback::{
+    self, RollbackSessionStateContext, SessionStateRestoreContext, SessionStateRollbackAction,
+    SessionStateRollbackJournal,
+};
+
 use crate::server::tool_transport::{
-    ExecutorBinding, ExecutorStatus, RUN_BLOCKED_REASON_EXECUTOR_OFFLINE,
-    RUN_BLOCKED_REASON_FALLBACK_DISABLED, RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED,
-    RUN_BLOCKED_REASON_WORKSPACE_EXECUTOR_UNAVAILABLE, ServerLocalToolTransport,
+    ExecutionBindingState, ExecutorBinding, ServerLocalToolTransport,
     TOOL_ERROR_KIND_AGENT_WAITING, TOOL_ERROR_KIND_APPROVAL_TIMEOUT, TOOL_ERROR_KIND_CANCELLED,
-    TOOL_ERROR_KIND_EXECUTOR_OFFLINE, TOOL_ERROR_KIND_FALLBACK_DISABLED,
+    TOOL_ERROR_KIND_CAPABILITY_DENIED, TOOL_ERROR_KIND_EXECUTOR_OFFLINE,
     TOOL_ERROR_KIND_TOOL_TIMEOUT, TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED,
-    TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE, TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH,
-    ToolExecutionRequest, ToolExecutionRouteKind, ToolExecutionService, ToolPolicySnapshot,
-    ToolTransportKind, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
-    binding_event_fields, cancelled_tool_result, route_binding_event_fields,
+    TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH, ToolExecutionRequest, ToolExecutionService,
+    WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind, binding_event_fields,
+    capability_filtered_server_tool_schemas, tool_schema_name,
 };
-use crate::tool_sandbox::{
-    IsolatedOutput, IsolationConfig, SandboxMode, SandboxPolicy, ToolTier, effective_tier,
-    execute_isolated, extract_local_workspace_path_mentions, filter_environment,
-    is_shell_home_path, is_windows_drive_path, wrap_command_with_limits,
+use crate::server::tool_work_surface_events::{
+    WorkSurfaceEventEmitter, binding_snapshot_events, task_board_snapshot_event,
 };
-use astra_turn_core::file_edit_journal::{EditType, FileEditJournal};
+use crate::tool_sandbox::{IsolationLevel, SandboxPolicy};
+use astra_turn_core::file_edit_journal::FileEditJournal;
 
 use astra_tools::plan_task_mirror;
 
-fn normalize_path(path: &Path) -> PathBuf {
-    path.components()
-        .fold(PathBuf::new(), |mut acc, component| {
-            match component {
-                std::path::Component::ParentDir => {
-                    acc.pop();
-                }
-                std::path::Component::CurDir => {}
-                other => acc.push(other),
-            }
-            acc
-        })
-}
-
-fn unique_path_variants(path: &Path) -> Vec<PathBuf> {
-    let mut variants = vec![normalize_path(path)];
-    if let Ok(canonical) = path.canonicalize()
-        && !variants.iter().any(|existing| existing == &canonical)
-    {
-        variants.push(canonical);
-    }
-    variants
-}
-
-fn workspace_owns_absolute_path(workspace_root: &Path, raw_path: &str) -> bool {
-    let candidate = Path::new(raw_path);
-    if !candidate.is_absolute() {
-        return false;
-    }
-    let candidate_variants = unique_path_variants(candidate);
-    let workspace_variants = unique_path_variants(workspace_root);
-    candidate_variants.iter().any(|candidate| {
-        workspace_variants
-            .iter()
-            .any(|workspace| candidate == workspace || candidate.starts_with(workspace))
-    })
-}
-
-fn server_sandbox_local_path_mismatch(
-    command: &str,
-    workspace_root: &Path,
-    workspace_binding: &WorkspaceBinding,
-) -> Option<String> {
-    server_sandbox_local_path_mismatch_in_text(
-        "command",
-        command,
-        workspace_root,
-        workspace_binding,
-    )
-}
-
-fn server_sandbox_local_path_mismatch_in_text(
-    subject: &str,
-    text: &str,
-    workspace_root: &Path,
-    workspace_binding: &WorkspaceBinding,
-) -> Option<String> {
-    if workspace_binding.kind != WorkspaceBindingKind::ServerSandbox {
-        return None;
-    }
-
-    extract_local_workspace_path_mentions(text)
-        .into_iter()
-        .find(|path| {
-            is_shell_home_path(path)
-                || is_windows_drive_path(path)
-                || !workspace_owns_absolute_path(workspace_root, path)
-        })
-        .map(|path| {
-            let cwd = workspace_binding
-                .cwd
-                .as_deref()
-                .unwrap_or_else(|| workspace_root.to_str().unwrap_or("server sandbox"));
-            format!(
-                "Error: {subject} references local path '{path}', but this run is bound to Server sandbox at {cwd}. Select a connected edge workspace that owns that path, then retry."
-            )
-        })
-}
-
-fn server_sandbox_path_argument_mismatch(
-    subject: &str,
-    raw_path: &str,
-    workspace_root: &Path,
-    workspace_binding: &WorkspaceBinding,
-) -> Option<String> {
-    if workspace_binding.kind != WorkspaceBindingKind::ServerSandbox {
-        return None;
-    }
-
-    let path = raw_path.trim();
-    if path.is_empty() {
-        return None;
-    }
-    let candidate = Path::new(path);
-    let mismatched = is_shell_home_path(path)
-        || is_windows_drive_path(path)
-        || (candidate.is_absolute() && !workspace_owns_absolute_path(workspace_root, path));
-    if !mismatched {
-        return None;
-    }
-
-    let cwd = workspace_binding
-        .cwd
-        .as_deref()
-        .unwrap_or_else(|| workspace_root.to_str().unwrap_or("server sandbox"));
-    Some(format!(
-        "Error: {subject} references local path '{path}', but this run is bound to Server sandbox at {cwd}. Select a connected edge workspace that owns that path, then retry."
-    ))
-}
-
-fn path_arg<'a>(args: &'a Value, field: &str) -> Option<&'a str> {
-    args.get(field)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
-fn server_sandbox_tool_path_mismatch(
-    tool_name: &str,
-    args: &Value,
-    workspace_root: &Path,
-    workspace_binding: &WorkspaceBinding,
-) -> Option<String> {
-    if tool_name == "bash" {
-        return path_arg(args, "command").and_then(|command| {
-            server_sandbox_local_path_mismatch(command, workspace_root, workspace_binding)
-        });
-    }
-
-    let fields: &[&str] = match tool_name {
-        "publish_artifact" | "read_file" | "write_file" | "str_replace" | "list_dir"
-        | "symbols" => &["path"],
-        "grep" => &["path"],
-        "glob" => &["path", "pattern"],
-        "git" => &["path", "file"],
-        "git_diff" | "git_contributors" => &["path"],
-        "git_blame" | "git_file_history" => &["file"],
-        _ => &[],
-    };
-
-    fields.iter().find_map(|field| {
-        let value = path_arg(args, field)?;
-        let subject = format!("tool '{tool_name}' argument '{field}'");
-        server_sandbox_path_argument_mismatch(&subject, value, workspace_root, workspace_binding)
-    })
-}
-
-const MAX_PUBLISH_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
-
-fn string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
-fn validate_short_token(value: &str, field: &str, max_len: usize) -> Result<(), String> {
-    if value.len() > max_len {
-        return Err(format!("Error: {field} must be at most {max_len} bytes"));
-    }
-    if value.chars().any(|ch| ch.is_control()) {
-        return Err(format!(
-            "Error: {field} must not contain control characters"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_artifact_kind(value: &str) -> Result<String, String> {
-    validate_short_token(value, "artifact_kind", 64)?;
-    if !value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
-    {
-        return Err(
-            "Error: artifact_kind may only contain ASCII letters, digits, '_', '-', or '.'"
-                .to_string(),
-        );
-    }
-    Ok(value.to_ascii_lowercase())
-}
-
-fn validate_content_type(value: &str) -> Result<String, String> {
-    validate_short_token(value, "content_type", 128)?;
-    if !value.contains('/') || value.contains(';') {
-        return Err("Error: content_type must be a simple MIME type such as image/png".to_string());
-    }
-    Ok(value.to_ascii_lowercase())
-}
-
-fn infer_content_type(path: &Path) -> &'static str {
-    match path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("svg") => "image/svg+xml",
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("avif") => "image/avif",
-        Some("pdf") => "application/pdf",
-        Some("html") | Some("htm") => "text/html",
-        Some("md") | Some("markdown") => "text/markdown",
-        Some("txt") | Some("log") => "text/plain",
-        Some("json") => "application/json",
-        Some("jsonl") => "application/x-ndjson",
-        Some("csv") => "text/csv",
-        Some("tsv") => "text/tab-separated-values",
-        Some("yaml") | Some("yml") => "application/yaml",
-        Some("toml") => "application/toml",
-        Some("xml") => "application/xml",
-        Some("zip") => "application/zip",
-        Some("tar") => "application/x-tar",
-        Some("gz") | Some("tgz") => "application/gzip",
-        Some("parquet") => "application/vnd.apache.parquet",
-        _ => "application/octet-stream",
-    }
-}
-
-fn infer_artifact_kind(path: &Path, content_type: &str) -> &'static str {
-    if content_type.starts_with("image/") {
-        return "image";
-    }
-    match content_type {
-        "application/pdf" => "pdf",
-        "text/html" => "html",
-        "text/markdown" => "markdown",
-        "application/json"
-        | "application/x-ndjson"
-        | "text/csv"
-        | "text/tab-separated-values"
-        | "application/yaml"
-        | "application/toml" => "data",
-        "text/plain" => "text",
-        "application/zip" | "application/x-tar" | "application/gzip" => "archive",
-        _ => match path.extension().and_then(|ext| ext.to_str()) {
-            Some("rs" | "go" | "py" | "ts" | "tsx" | "js" | "jsx" | "sql" | "sh") => "code",
-            _ => "file",
-        },
-    }
-}
-
-fn should_store_artifact_as_text(content_type: &str, path: &Path) -> bool {
-    content_type.starts_with("text/")
-        || matches!(
-            content_type,
-            "image/svg+xml"
-                | "application/json"
-                | "application/x-ndjson"
-                | "application/yaml"
-                | "application/toml"
-                | "application/xml"
-        )
-        || matches!(
-            path.extension().and_then(|ext| ext.to_str()),
-            Some("rs" | "go" | "py" | "ts" | "tsx" | "js" | "jsx" | "sql" | "sh")
-        )
-}
-
-fn undo_file_with_candidates(
-    journal: &FileEditJournal,
-    candidates: &[PathBuf],
-) -> std::io::Result<Option<(PathBuf, EditType)>> {
-    for candidate in candidates {
-        match journal.undo_file(candidate)? {
-            Some(edit_type) => return Ok(Some((candidate.clone(), edit_type))),
-            None => continue,
-        }
-    }
-    Ok(None)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DatabaseSnapshotRollbackEntry {
-    sequence: u64,
-    snapshot_id: String,
-    database: Option<String>,
-    turn_index: u32,
-}
-
-#[derive(Debug, Default)]
-struct DatabaseSnapshotRollbackJournal {
-    entries: Vec<DatabaseSnapshotRollbackEntry>,
-    next_sequence: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SessionHistoryRow {
-    item_seq: i64,
-    source: String,
-    role: String,
-    content: String,
-    run_id: Option<String>,
-    created_at: Option<String>,
-}
-
-impl DatabaseSnapshotRollbackJournal {
-    fn record(
-        &mut self,
-        snapshot_id: impl Into<String>,
-        database: Option<String>,
-        turn_index: u32,
-    ) {
-        self.entries.push(DatabaseSnapshotRollbackEntry {
-            sequence: self.next_sequence,
-            snapshot_id: snapshot_id.into(),
-            database,
-            turn_index,
-        });
-        self.next_sequence = self.next_sequence.saturating_add(1);
-    }
-
-    fn list(&self) -> Vec<DatabaseSnapshotRollbackEntry> {
-        self.entries.iter().rev().cloned().collect()
-    }
-
-    fn entry_for_snapshot(&self, snapshot_id: &str) -> Option<DatabaseSnapshotRollbackEntry> {
-        self.entries
-            .iter()
-            .rev()
-            .find(|entry| entry.snapshot_id == snapshot_id)
-            .cloned()
-    }
-
-    fn restore_plan_for_turn(&self, turn_index: u32) -> Vec<DatabaseSnapshotRollbackEntry> {
-        self.restore_plan_for_turn_since(turn_index, 0)
-    }
-
-    fn restore_plan_for_turn_since(
-        &self,
-        turn_index: u32,
-        checkpoint: u64,
-    ) -> Vec<DatabaseSnapshotRollbackEntry> {
-        let mut seen_databases = std::collections::HashSet::new();
-        let mut plan = Vec::new();
-        for entry in self
-            .entries
-            .iter()
-            .filter(|entry| entry.turn_index == turn_index && entry.sequence >= checkpoint)
-        {
-            if seen_databases.insert(entry.database.clone()) {
-                plan.push(entry.clone());
-            }
-        }
-        plan
-    }
-
-    fn checkpoint(&self) -> u64 {
-        self.next_sequence
-    }
-
-    fn remove_snapshot(&mut self, snapshot_id: &str) -> bool {
-        if let Some(index) = self
-            .entries
-            .iter()
-            .rposition(|entry| entry.snapshot_id == snapshot_id)
-        {
-            self.entries.remove(index);
-            true
-        } else {
-            false
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-enum SessionStateRollbackAction {
-    ToolPreferences {
-        previous_pinned_tools: Vec<String>,
-        previous_deprioritized_tools: Vec<String>,
-    },
-    ConfigOverride {
-        path: String,
-        old_value: Value,
-        snapshot: crate::observability::ObservabilitySessionRollbackSnapshot,
-    },
-    Compression {
-        turn: u32,
-        snapshot: crate::observability::ObservabilitySessionRollbackSnapshot,
-    },
-    TaskState {
-        snapshot: TaskManagerSnapshot,
-    },
-}
-
-#[derive(Debug, Clone)]
-struct SessionStateRollbackEntry {
-    sequence: u64,
-    turn_index: u32,
-    timestamp: SystemTime,
-    label: String,
-    action: SessionStateRollbackAction,
-}
-
-#[derive(Debug, Default)]
-struct SessionStateRollbackJournal {
-    entries: Vec<SessionStateRollbackEntry>,
-    next_sequence: u64,
-}
-
-impl SessionStateRollbackJournal {
-    fn record(&mut self, turn_index: u32, label: String, action: SessionStateRollbackAction) {
-        self.entries.push(SessionStateRollbackEntry {
-            sequence: self.next_sequence,
-            turn_index,
-            timestamp: SystemTime::now(),
-            label,
-            action,
-        });
-        self.next_sequence = self.next_sequence.saturating_add(1);
-    }
-
-    fn list(&self) -> Vec<SessionStateRollbackEntry> {
-        self.entries.iter().rev().cloned().collect()
-    }
-
-    fn restore_plan_for_turn(&self, turn_index: u32) -> Vec<SessionStateRollbackEntry> {
-        self.restore_plan_for_turn_since(turn_index, 0)
-    }
-
-    fn restore_plan_for_turn_since(
-        &self,
-        turn_index: u32,
-        checkpoint: u64,
-    ) -> Vec<SessionStateRollbackEntry> {
-        self.entries
-            .iter()
-            .rev()
-            .filter(|entry| entry.turn_index == turn_index && entry.sequence >= checkpoint)
-            .cloned()
-            .collect()
-    }
-
-    fn checkpoint(&self) -> u64 {
-        self.next_sequence
-    }
-
-    fn remove_sequence(&mut self, sequence: u64) -> bool {
-        if let Some(index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.sequence == sequence)
-        {
-            self.entries.remove(index);
-            true
-        } else {
-            false
-        }
-    }
-}
-
-fn action_kind(action: &SessionStateRollbackAction) -> &'static str {
-    match action {
-        SessionStateRollbackAction::ToolPreferences { .. } => "tool_preferences",
-        SessionStateRollbackAction::ConfigOverride { .. } => "config_override",
-        SessionStateRollbackAction::Compression { .. } => "compression",
-        SessionStateRollbackAction::TaskState { .. } => "task_state",
-    }
-}
-
-fn normalized_drift(old: f64, new: f64) -> Option<f64> {
-    if !old.is_finite() || !new.is_finite() {
-        return None;
-    }
-    let denom = old.abs().max(new.abs());
-    if denom < f64::EPSILON {
-        return Some(0.0);
-    }
-
-    Some((new - old).abs() / denom)
-}
-
-fn extract_tool_name(args: &Value) -> Option<String> {
-    args.get("tool")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|tool| !tool.is_empty())
-        .map(ToString::to_string)
-}
-
-fn effective_runtime_config(
-    workspace: Option<&astra_services::session_workspace::WorkspaceMetadata>,
-) -> Result<astra_config::runtime_config::RuntimeConfig, String> {
-    match workspace.and_then(|workspace| workspace.tuned_config_json.as_deref()) {
-        Some(json) => serde_json::from_str(json).map_err(|error| error.to_string()),
-        None => Ok(astra_config::runtime_config::RuntimeConfig::load()),
-    }
-}
-
-fn replace_json_path(root: &mut Value, path: &str, new_value: Value) -> Result<Value, String> {
-    let segments: Vec<&str> = path
-        .split('.')
-        .filter(|segment| !segment.is_empty())
-        .collect();
-    if segments.is_empty() {
-        return Err("mutation path cannot be empty".to_string());
-    }
-
-    let mut current = root;
-    for segment in &segments[..segments.len() - 1] {
-        current = current
-            .get_mut(*segment)
-            .ok_or_else(|| format!("unknown config path segment '{segment}'"))?;
-    }
-
-    let Some(last) = segments.last() else {
-        return Err("mutation path cannot be empty".to_string());
-    };
-    let object = current
-        .as_object_mut()
-        .ok_or_else(|| format!("config path '{path}' does not point to an object parent"))?;
-    let slot = object
-        .get_mut(*last)
-        .ok_or_else(|| format!("unknown config leaf '{last}'"))?;
-    let old_value = slot.clone();
-    *slot = new_value;
-    Ok(old_value)
-}
-
-fn append_config_change_event(
-    session_id: &str,
-    turn: u32,
-    key: &str,
-    new_value: &Value,
-    old_value: Option<Value>,
-    source: &str,
-) -> Result<(), String> {
-    let writer = astra_services::session_journal::JournalWriter::new(session_id)
-        .map_err(|e| e.to_string())?;
-    let mut event = astra_services::session_journal::JournalEvent::config_change(
-        Some(session_id),
-        key,
-        &new_value.to_string(),
-    );
-    event.turn = Some(turn);
-    let mut metadata =
-        serde_json::Map::from_iter([("source".to_string(), Value::String(source.to_string()))]);
-    if let Some(old_value) = old_value {
-        metadata.insert("old_value".to_string(), old_value);
-    }
-    event.metadata = Some(Value::Object(metadata));
-    writer.append(&event).map_err(|e| e.to_string())
-}
-
-fn persist_config_override(
-    session_id: &str,
-    path: &str,
-    new_value: Value,
-    source: &str,
-) -> Result<(), String> {
-    let mut workspace =
-        astra_services::session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
-    let base_config = effective_runtime_config(Some(&workspace))?;
-    let mut value = serde_json::to_value(&base_config).map_err(|e| e.to_string())?;
-    let old_value = replace_json_path(&mut value, path, new_value.clone())?;
-    let candidate_config: astra_config::runtime_config::RuntimeConfig =
-        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
-    let baseline_json = serde_json::to_value(astra_config::runtime_config::RuntimeConfig::load())
-        .map_err(|e| e.to_string())?;
-    workspace.tuned_config_json = if value == baseline_json {
-        None
-    } else {
-        Some(serde_json::to_string(&candidate_config).map_err(|e| e.to_string())?)
-    };
-    workspace.updated_at = chrono::Utc::now().to_rfc3339();
-    astra_services::session_workspace::write_workspace(&workspace).map_err(|e| e.to_string())?;
-    append_config_change_event(
-        session_id,
-        workspace.turn_count,
-        path,
-        &new_value,
-        Some(old_value),
-        source,
-    )
-}
-
-fn persist_tool_preferences(
-    session_id: &str,
-    pinned_tools: &[String],
-    deprioritized_tools: &[String],
-    source: &str,
-) -> Result<(), String> {
-    let mut workspace =
-        astra_services::session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
-    let mut pinned = pinned_tools.to_vec();
-    pinned.sort();
-    pinned.dedup();
-    let mut deprioritized = deprioritized_tools.to_vec();
-    deprioritized.sort();
-    deprioritized.dedup();
-
-    let old_pinned = workspace.pinned_tools.clone();
-    let old_deprioritized = workspace.deprioritized_tools.clone();
-    workspace.pinned_tools = pinned.clone();
-    workspace.deprioritized_tools = deprioritized.clone();
-    workspace.updated_at = chrono::Utc::now().to_rfc3339();
-    astra_services::session_workspace::write_workspace(&workspace).map_err(|e| e.to_string())?;
-
-    if old_pinned != pinned {
-        append_config_change_event(
-            session_id,
-            workspace.turn_count,
-            "pinned_tools",
-            &json!(pinned),
-            Some(json!(old_pinned)),
-            source,
-        )?;
-    }
-    if old_deprioritized != deprioritized {
-        append_config_change_event(
-            session_id,
-            workspace.turn_count,
-            "deprioritized_tools",
-            &json!(deprioritized),
-            Some(json!(old_deprioritized)),
-            source,
-        )?;
-    }
-    Ok(())
-}
-
-fn persist_manual_compression(
-    session_id: &str,
-    turn: u32,
-    reason: &str,
-    source: &str,
-) -> Result<(), String> {
-    let writer = astra_services::session_journal::JournalWriter::new(session_id)
-        .map_err(|e| e.to_string())?;
-    let mut event = astra_services::session_journal::JournalEvent::compact_with_summary(
-        Some(session_id),
-        turn,
-        1,
-        0,
-        Some(reason),
-    );
-    event.metadata = Some(json!({
-        "source": source,
-        "reason": reason,
-        "manual": true,
-    }));
-    writer.append(&event).map_err(|e| e.to_string())
-}
+mod tool_handlers;
 
 fn resolved_server_tool_names(
     capabilities: &astra_turn_core::capability::CapabilitySet,
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    runtime: Option<&astra_runtime_env::RuntimeBinding>,
 ) -> HashSet<String> {
-    crate::capabilities::server_runtime_tool_schemas(capabilities)
+    capability_filtered_server_tool_schemas(capabilities, workspace, executor, runtime)
         .iter()
-        .filter_map(|schema| {
-            schema
-                .get("function")
-                .and_then(|function| function.get("name"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
+        .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
         .collect()
 }
 
-fn json_str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
-    args.get(key).and_then(Value::as_str)
+/// Per-turn mutation accounting and self-modification preferences.
+/// Held inside a single [`Mutex`] so tool-preference updates and
+/// adjust_config mutation counting share the same lock — avoiding
+/// the lock-ordering hazard of three independent locks.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SessionConfigInner {
+    /// Per-turn mutation accounting for adjust_config governor.
+    pub(crate) mutation_counter: (u32, u32),
+    /// Self-modification pinned tool preferences.
+    pub(crate) pinned_tools: Vec<String>,
+    /// Self-modification deprioritized tool preferences.
+    pub(crate) deprioritized_tools: Vec<String>,
 }
 
-fn json_i64_arg(args: &Value, key: &str) -> Option<i64> {
-    args.get(key).and_then(Value::as_i64)
-}
-
-fn json_usize_arg(args: &Value, key: &str, default: usize, min: usize, max: usize) -> usize {
-    let value = args
-        .get(key)
-        .and_then(Value::as_u64)
-        .and_then(|value| {
-            usize::try_from(value)
-                .inspect_err(|e| {
-                    tracing::warn!(
-                        key,
-                        value,
-                        error = %e,
-                        "json_usize_arg: type overflow, falling back to default={default}"
-                    );
-                })
-                .ok()
-        })
-        .unwrap_or(default);
-    value.clamp(min, max)
-}
-
-fn normalized_history_role(args: &Value) -> Option<String> {
-    match json_str_arg(args, "role").unwrap_or("all") {
-        "user" => Some("user".to_string()),
-        "assistant" => Some("assistant".to_string()),
-        "system" => Some("system".to_string()),
-        _ => None,
-    }
-}
-
-fn compact_history_content(content: &str, max_chars: usize) -> String {
-    let compact = content.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut out = String::new();
-    for ch in compact.chars().take(max_chars) {
-        out.push(ch);
-    }
-    if compact.chars().count() > max_chars {
-        out.push_str("...");
-    }
-    out
-}
-
-fn session_history_match_score(query: &str, content: &str) -> i32 {
-    let query = query.trim().to_lowercase();
-    if query.is_empty() {
-        return 0;
-    }
-
-    let content = content.to_lowercase();
-    let mut score = 0;
-    if content.contains(&query) {
-        score += 100 + i32::try_from(query.chars().count().min(50)).unwrap_or(0);
-    }
-
-    for token in query
-        .split(|ch: char| ch.is_whitespace() || ",.;:!?()[]{}\"'`/\\|".contains(ch))
-        .filter(|token| token.chars().count() >= 2)
-    {
-        if content.contains(token) {
-            score += 10 + i32::try_from(token.chars().count().min(30)).unwrap_or(0);
-        }
-    }
-
-    if score == 0 && !query.is_ascii() {
-        let mut seen = std::collections::HashSet::new();
-        let mut char_hits = 0;
-        for ch in query.chars().filter(|ch| !ch.is_whitespace()) {
-            if seen.insert(ch) && content.contains(ch) {
-                char_hits += 1;
-            }
-        }
-        if char_hits >= 3 {
-            score += char_hits;
-        }
-    }
-
-    score
-}
-
-fn render_session_history_rows(
-    label: &str,
-    rows: &[SessionHistoryRow],
-    note: Option<String>,
-) -> String {
-    let mut out = String::new();
-    out.push_str(label);
-    out.push_str(&format!(
-        " session_id={} rows={}\n",
-        "<current>",
-        rows.len()
-    ));
-    if let Some(note) = note {
-        out.push_str(&note);
-        out.push('\n');
-    }
-    if rows.is_empty() {
-        out.push_str("No transcript rows matched. Try a broader query, a larger scan_limit, or page by before_seq.\n");
-        return out;
-    }
-
-    let min_seq = rows.iter().map(|row| row.item_seq).min().unwrap_or(0);
-    let max_seq = rows.iter().map(|row| row.item_seq).max().unwrap_or(0);
-    out.push_str(&format!(
-        "cursor_hints: older before_seq={}, newer after_seq={}\n",
-        min_seq, max_seq
-    ));
-    for row in rows {
-        let created = row.created_at.as_deref().unwrap_or("unknown_time");
-        let run = row.run_id.as_deref().unwrap_or("-");
-        out.push_str(&format!(
-            "[{}] {} source={} role={} ref={}: {}\n",
-            row.item_seq,
-            created,
-            row.source,
-            row.role,
-            run,
-            compact_history_content(&row.content, 700)
-        ));
-        if out.chars().count() > 12_000 {
-            out.push_str("... truncated by session history tool output budget\n");
-            break;
-        }
-    }
-    out
-}
-
-/// Tools that mutate the world outside the session. Blocked while plan mode
-/// is active (`PlanPhase` = Planning|Refining) to mirror Claude
-/// Code's `prepareContextForPlanMode` behaviour: the model must call
-/// ExitPlanMode before writing anything.
+/// Self-modification session configuration state.
 ///
-/// Read-only tools (grep, glob, read_file, git_status/diff/log, web_search)
-/// and session-scoped authoring tools (`task`, memory_retrieve, …) stay
-/// available so the agent can continue exploring while authoring a plan.
-fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
-    // Legacy standalone tools are always blocked
-    if tool == "task_stop" {
-        return true;
-    }
-
-    // Consolidated `task` tool: block only destructive actions (stop)
-    if tool == "task" {
-        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
-        return action == "stop";
-    }
-
-    matches!(
-        tool,
-        "bash"
-            | "write_file"
-            | "str_replace"
-            | "mo"
-            | "rollback_database_snapshots"
-            | "git_commit"
-            | "git_stash"
-            | "git_revert_commit"
-            | "github_create_issue"
-    )
+/// Groups pinned/deprioritized tool preferences and mutation counter
+/// that were previously scattered across individual fields on
+/// [`ServerToolExecutor`].
+pub(crate) struct SessionConfigState {
+    pub(crate) inner: Mutex<SessionConfigInner>,
 }
 
-fn mo_current_account() -> &'static str {
-    use std::sync::OnceLock;
-
-    static ACCOUNT: OnceLock<String> = OnceLock::new();
-    ACCOUNT.get_or_init(|| {
-        let out = mo_execute_sql("SELECT current_account_name() AS name", None);
-        out.lines()
-            .filter(|line| !line.starts_with('+') && !line.contains("name"))
-            .find_map(|line| {
-                let trimmed = line.trim().trim_matches('|').trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            })
-            .unwrap_or_else(|| "sys".to_string())
-    })
-}
-
-fn mo_database() -> &'static str {
-    use std::sync::OnceLock;
-
-    static DB: OnceLock<String> = OnceLock::new();
-    DB.get_or_init(|| astra_core::resolve_database_name(&|k| std::env::var(k).ok()))
-}
-
-fn resolved_mo_database(database: Option<&str>) -> String {
-    database
-        .map(str::trim)
-        .filter(|database| !database.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| mo_database().to_string())
-}
-
-fn mo_create_snapshot_sql(name: &str, database: Option<&str>) -> String {
-    format!(
-        "CREATE SNAPSHOT `{name}` FOR DATABASE `{}`",
-        resolved_mo_database(database)
-    )
-}
-
-fn mo_restore_snapshot_sql(name: &str, database: Option<&str>) -> String {
-    let account = mo_current_account();
-    format!(
-        "RESTORE ACCOUNT `{account}` DATABASE `{}` FROM SNAPSHOT `{name}`",
-        resolved_mo_database(database)
-    )
-}
-
-fn mo_drop_snapshot_sql(name: &str) -> String {
-    format!("DROP SNAPSHOT IF EXISTS `{name}`")
-}
-
-fn mo_query_requires_pre_state_snapshot(sql: &str, allow_destructive: bool) -> bool {
-    match sql
-        .split_whitespace()
-        .next()
-        .map(|keyword| keyword.trim_matches(|c: char| c == '(' || c == ';'))
-        .map(str::to_ascii_uppercase)
-        .as_deref()
-    {
-        Some("INSERT" | "UPDATE" | "REPLACE" | "CREATE") => true,
-        Some("DROP" | "DELETE" | "TRUNCATE" | "ALTER" | "GRANT" | "REVOKE") => true,
-        _ => allow_destructive,
-    }
-}
-
-fn mo_pre_state_snapshot_name() -> String {
-    format!("moq_{}", uuid::Uuid::now_v7().simple())
-}
-
-fn is_valid_snapshot_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-}
-
-fn is_mo_error(output: &str) -> bool {
-    output.trim_start().starts_with("Error:")
-}
-
-fn mo_mysql_cmd(database: Option<&str>) -> Result<Command, String> {
-    let settings = astra_core::MatrixOneSettings::from_env();
-    Ok(settings.mysql_cmd(database))
-}
-
-fn mo_execute_sql(sql: &str, database: Option<&str>) -> String {
-    let mut cmd = match mo_mysql_cmd(database) {
-        Ok(c) => c,
-        Err(e) => return e,
-    };
-    cmd.arg("-e").arg(sql);
-
-    match cmd.output() {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if !out.status.success() {
-                let err = if stderr.is_empty() {
-                    stdout.to_string()
-                } else {
-                    stderr.to_string()
-                };
-                format!("Error: {}", err.trim())
-            } else if stdout.is_empty() {
-                "OK (no results)".to_string()
-            } else {
-                stdout.to_string()
-            }
+impl SessionConfigState {
+    fn new(pinned_tools: Vec<String>, deprioritized_tools: Vec<String>) -> Self {
+        Self {
+            inner: Mutex::new(SessionConfigInner {
+                mutation_counter: (0, 0),
+                pinned_tools,
+                deprioritized_tools,
+            }),
         }
-        Err(error) => format!("Error: failed to execute mysql client: {error}"),
     }
 }
 
@@ -1014,69 +128,82 @@ fn mo_execute_sql(sql: &str, database: Option<&str>) -> String {
 /// Wraps tool calls in a sandboxed environment without requiring a CLI process.
 /// Created per-session by `AgenticRunLifecycleService::create_run()`.
 pub struct ServerToolExecutor {
+    // ── Identity ──────────────────────────────────────────────────────────────
     /// Workspace root for this session.
-    workspace_root: PathBuf,
+    pub(super) workspace_root: PathBuf,
     /// User ID owning this session (used for Memoria isolation).
-    user_id: String,
+    pub(super) user_id: String,
     /// Session ID for isolation.
-    session_id: String,
-    /// Sandbox policy for tool execution.
-    sandbox_policy: SandboxPolicy,
-    /// File edit journal for undo support.
-    file_journal: Arc<Mutex<FileEditJournal>>,
-    /// Database snapshot journal for MatrixOne rollback support.
-    database_snapshot_journal: Arc<Mutex<DatabaseSnapshotRollbackJournal>>,
-    /// Session-state rollback journal for bounded self-mod and task undo.
-    session_state_journal: Arc<Mutex<SessionStateRollbackJournal>>,
+    pub(crate) session_id: String,
     /// Task manager for session-local task tools. Backed by whichever
     /// [`TaskStore`] the host wired in (in-memory for tests and offline CLI,
     /// MatrixOne for production so the same `session_id` is visible across
     /// edge and cloud).
     task_manager: Arc<TaskManager>,
-    /// Current turn index for journal entries.
-    journal_turn_index: AtomicU32,
-    /// Aggregate output bytes this turn.
-    aggregate_output_bytes: AtomicUsize,
     /// Memoria client for memory operations.
     memoria_client: astra_tools::memoria::MemoriaClient,
-    /// Optional approval gate for dangerous tool execution.
-    approval_gate: Option<Arc<dyn astra_tools::ToolApprovalGate>>,
-    /// Optional ask_user gate for interactive client prompts.
-    ask_user_gate: Option<Arc<dyn AskUserGate>>,
-    /// Optional progress callback for streaming tool output.
-    progress_callback: Option<Arc<dyn astra_tools::ToolProgressCallback>>,
-    /// Optional auxiliary event writer for ask_user-specific audit events.
-    auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
-    /// Optional resource governor for usage tracking (Phase 5).
-    resource_governor:
-        Option<std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>>,
-    /// Transport-agnostic tool execution router for server-local, edge, and relay paths.
-    tool_execution_service: ToolExecutionService,
-    /// Optional observability session for self-mod and rollback-backed session state.
-    observability_session:
-        Option<Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>>,
-    /// Self-modification pinned tool preferences.
-    self_mod_pinned_tools: Mutex<Vec<String>>,
-    /// Self-modification deprioritized tool preferences.
-    self_mod_deprioritized_tools: Mutex<Vec<String>>,
-    /// Per-turn mutation accounting for adjust_config governor.
-    self_mod_mutation_counter: Mutex<(u32, u32)>,
+    /// Optional shared pool for context-manifest side events.
+    pub(super) context_manifest_pool: Option<SharedPool>,
     /// Budget-adaptive introspection snapshot, updated each turn by the
     /// execution phase. The `introspect` tool reads this to return runtime
     /// state without coupling to AgenticLoopState.
     introspect_snapshot:
         Arc<std::sync::RwLock<Option<astra_turn_core::introspect::IntrospectSnapshot>>>,
+
+    // ── Execution routing and handler registry ────────────────────────────────
+    /// Transport-agnostic tool execution router for server-local, edge, and relay paths.
+    tool_execution_service: ToolExecutionService,
     /// Shared default executor for delegating common tool logic.
-    default_executor: DefaultToolExecutor,
+    pub(super) default_executor: DefaultToolExecutor,
+    /// Canonical handler registry for server-local tools.
+    tool_engine: ToolEngine<ServerToolExecutor>,
     /// Cooperative cancellation for server-owned runtime/control-plane tool awaits.
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
+    /// Explicit workspace, executor, runtime, and provisioned workspace record
+    /// used for routing, tool visibility, and runtime preparation.
+    execution_binding: ExecutionBindingState,
+    capabilities: astra_turn_core::capability::CapabilitySet,
+
+    // ── Locking (journals and dedup) ──────────────────────────────────────────
+    /// File edit journal for undo support.
+    pub(crate) file_journal: Arc<Mutex<FileEditJournal>>,
+    /// Database snapshot journal for MatrixOne rollback support.
+    pub(crate) database_snapshot_journal: Arc<Mutex<DatabaseSnapshotRollbackJournal>>,
+    /// Session-state rollback journal for bounded self-mod and task undo.
+    pub(crate) session_state_journal: Arc<Mutex<SessionStateRollbackJournal>>,
+    /// Exactly-once executor for crash recovery deduplication.
+    /// When active (Some), checks idempotency cache before executing tools.
+    exactly_once_executor: Option<tool_exactly_once::ExactlyOnceState>,
+
+    // ── Governor ────────────────────────────────────────────────��─────────────
+    /// Sandbox policy for tool execution.
+    sandbox_policy: SandboxPolicy,
+    /// Current turn index for journal entries.
+    pub(crate) journal_turn_index: AtomicU32,
+    /// Aggregate output bytes this turn.
+    aggregate_output_bytes: AtomicUsize,
+    /// Optional resource governor for usage tracking (Phase 5).
+    resource_governor:
+        Option<std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>>,
+
+    // ── Persistence ───────────────────────────────────────────────────────────
     /// Optional remote workspace artifact store for publishing workspace metadata.
     workspace_artifact_store: Option<astra_services::DatabaseSessionArtifactStore>,
-    /// Optional shared pool for context-manifest side events.
-    context_manifest_pool: Option<SharedPool>,
+
+    // ── Publish (work surface events) ─────────────────────────────────────────
+    /// Optional live event channel used by the web-agent work surface.
+    pub(super) work_surface_events: WorkSurfaceEventEmitter,
+
+    // ── Session state (self-mod, rollback, observability) ─────────────────────
+    /// Optional observability session for self-mod and rollback-backed session state.
+    pub(crate) observability_session:
+        Option<Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>>,
+    /// Self-modification session config state (preferences + mutation counter).
+    pub(crate) session_config: SessionConfigState,
+
+    // ── Plan mode ─────────────────────────────────────────────────────────────
     /// Plan repository for plan-mode gating and Enter/ExitPlanMode tools.
-    /// `None` leaves plan-mode unconditionally off (back-compat for tests /
-    /// constructor call sites that haven't been updated).
+    /// `None` means plan-mode tools fail closed and the write guard is inactive.
     plan_repo: Option<Arc<dyn astra_plan::PlanRepository>>,
     /// Cache for `plan_mode_authoring_active()` so a typical session with
     /// 20-50 tool calls doesn't incur 40-100 DB round-trips. Invalidated
@@ -1088,6 +215,8 @@ pub struct ServerToolExecutor {
     /// plan-mode state write through this so the next turn's system prompt
     /// reflects current state instead of the loop-start snapshot.
     plan_resume_hint_handle: Option<Arc<std::sync::RwLock<Option<String>>>>,
+
+    // ── MCP and external tool integration ─────────────────────────────────────
     /// MCP client manager for forwarding `mcp__*` tool calls to connected
     /// MCP servers. Set by `stream_chat()` after MCP discovery.
     mcp_manager: Option<Arc<tokio::sync::RwLock<astra_mcp::McpClientManager>>>,
@@ -1096,32 +225,29 @@ pub struct ServerToolExecutor {
     /// deferred activation reaches plugin tools. Populated by the server
     /// loop host once MCP servers have been refreshed.
     plugin_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
+    /// Deferred tool names whose full schema has been fetched via
+    /// `tool_search(query="select:NAME")` in this session.
+    activated_deferred_tools: Arc<std::sync::RwLock<HashSet<String>>>,
+    /// Tool names searchable/admissible in the current server-host turn.
+    /// `None` keeps direct unit-test executor calls permissive.
+    current_searchable_tool_names: Arc<std::sync::RwLock<Option<HashSet<String>>>>,
+    /// Tool names listed in the current turn's `<deferred_tools>` manifest.
+    /// Mirrors the CLI executor's `current_activatable_tool_names`. Populated
+    /// from `ToolSurface::deferred()` per turn so the validator can emit the
+    /// activation hint and `tool_search` can resolve `select:NAME` for these.
+    current_activatable_tool_names: Arc<std::sync::RwLock<Option<HashSet<String>>>>,
     /// Shared dynamic-agent tool context for `agent(action='spawn'|'get_result')`.
     agent_tool_context: Option<AgentToolContext>,
-    /// Optional live event channel used by the web-agent work surface.
-    work_surface_event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
-    /// Explicit workspace authority for this executor. Tool events include
-    /// this snapshot so Web never has to infer where a command ran.
-    workspace_binding: WorkspaceBinding,
-    /// Explicit executor/transport binding for this executor.
-    executor_binding: ExecutorBinding,
-    capabilities: astra_turn_core::capability::CapabilitySet,
-    server_tool_names: HashSet<String>,
-    /// Exactly-once executor for crash recovery deduplication.
-    /// When active (Some), checks idempotency cache before executing tools.
-    exactly_once_executor: Option<Mutex<astra_pipeline::exactly_once::ExactlyOnceExecutor>>,
-}
 
-/// Snapshot used by the plan-mode write guard and the system-prompt
-/// injector. Populated on first access per plan-mode state change; cleared
-/// by the enter/exit tools so the next call sees fresh DB state.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct PlanModeSnapshot {
-    /// Whether the session currently has an active plan still in authoring.
-    pub authoring_active: Option<bool>,
-    /// Rendered system-prompt section to inject on the next turn (`None`
-    /// when there's no active plan or it's already executing).
-    pub resume_hint: Option<String>,
+    // ── Gates and callbacks ───────────────────────────────────────────────────
+    /// Optional approval gate for dangerous tool execution.
+    approval_gate: Option<Arc<dyn astra_tools::ToolApprovalGate>>,
+    /// Optional ask_user gate for interactive client prompts.
+    ask_user_gate: Option<Arc<dyn AskUserGate>>,
+    /// Optional progress callback for streaming tool output.
+    progress_callback: Option<Arc<dyn astra_tools::ToolProgressCallback>>,
+    /// Optional auxiliary event writer for ask_user-specific audit events.
+    auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
 }
 
 impl ServerToolExecutor {
@@ -1134,7 +260,7 @@ impl ServerToolExecutor {
         cloud_token: Option<String>,
     ) -> Self {
         let sandbox_policy = SandboxPolicy {
-            mode: SandboxMode::Strict,
+            isolation: IsolationLevel::Strict,
             project_root: workspace_root.clone(),
             allowed_paths: vec![PathBuf::from("/tmp")],
             env_allowlist: None,
@@ -1162,14 +288,15 @@ impl ServerToolExecutor {
         let task_manager = Arc::new(TaskManager::new(session_id.clone(), task_store));
 
         let capabilities = crate::capabilities::full_server_capabilities_for_tests();
-        let server_tool_names = resolved_server_tool_names(&capabilities);
+        let tool_engine = tool_handlers::server_tool_engine();
 
         Self {
             workspace_root: workspace_root.clone(),
             user_id,
-            session_id,
+            session_id: session_id.clone(),
             sandbox_policy,
             default_executor,
+            tool_engine,
             file_journal: Arc::new(Mutex::new(FileEditJournal::new(500))),
             database_snapshot_journal: Arc::new(Mutex::new(
                 DatabaseSnapshotRollbackJournal::default(),
@@ -1184,12 +311,10 @@ impl ServerToolExecutor {
             progress_callback: None,
             auxiliary_event_writer: None,
             resource_governor: None,
-            tool_execution_service: ToolExecutionService::new(),
+            tool_execution_service: ToolExecutionService::builder().build(),
             observability_session: None,
             introspect_snapshot: Arc::new(std::sync::RwLock::new(None)),
-            self_mod_pinned_tools: Mutex::new(pinned_tools),
-            self_mod_deprioritized_tools: Mutex::new(deprioritized_tools),
-            self_mod_mutation_counter: Mutex::new((0, 0)),
+            session_config: SessionConfigState::new(pinned_tools, deprioritized_tools),
             cancel_token: None,
             workspace_artifact_store: None,
             context_manifest_pool: None,
@@ -1197,13 +322,14 @@ impl ServerToolExecutor {
             plan_mode_cache: Arc::new(tokio::sync::RwLock::new(PlanModeSnapshot::default())),
             plan_resume_hint_handle: None,
             plugin_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
+            activated_deferred_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            current_searchable_tool_names: Arc::new(std::sync::RwLock::new(None)),
+            current_activatable_tool_names: Arc::new(std::sync::RwLock::new(None)),
             mcp_manager: None,
             agent_tool_context: None,
-            work_surface_event_tx: None,
-            workspace_binding: WorkspaceBinding::server_sandbox(&workspace_root),
-            executor_binding: ExecutorBinding::server_local(),
+            work_surface_events: WorkSurfaceEventEmitter::new(session_id.clone()),
+            execution_binding: ExecutionBindingState::server_sandbox(&workspace_root),
             capabilities,
-            server_tool_names,
             exactly_once_executor: None,
         }
     }
@@ -1212,149 +338,32 @@ impl ServerToolExecutor {
         Arc::clone(&self.task_manager)
     }
 
+    /// Public accessor for transport-aware tool execution routing.
+    /// Callers wire edge, runner RPC, gateway relay, and sandbox-resident
+    /// agent transports through this handle instead of through
+    /// `ServerToolExecutor` thin-setters.
+    pub fn tool_execution_service(&mut self) -> &mut ToolExecutionService {
+        &mut self.tool_execution_service
+    }
+
+    /// Replace the internal ToolExecutionService with a shared instance,
+    /// so that multiple executors share the same disabled_tools set.
+    pub fn with_tool_execution_service(mut self, service: ToolExecutionService) -> Self {
+        self.tool_execution_service = service;
+        self
+    }
+
     /// Enable exactly-once execution for crash recovery deduplication.
     /// When enabled, tools are checked against an idempotency cache before execution.
-    /// The cache is warmed from the event store on creation to survive restarts.
-    pub fn enable_exactly_once(&mut self) {
-        let mut executor = astra_pipeline::exactly_once::ExactlyOnceExecutor::new();
-
-        // Warm the cache from persisted step events so that after a crash,
-        // already-executed tools (especially side-effect tools like bash)
-        // are found in cache and not re-executed.
-        let (warmed_cache, _completed) =
-            astra_pipeline::step_restore::warm_cache_from_events(&self.session_id);
-        // Merge warmed entries into the new executor's cache.
-        // Since ExactlyOnceExecutor wraps InMemoryIdempotencyCache internally,
-        // we replace the fresh cache with the warmed one.
-        let warmed_len = warmed_cache.len();
-        if warmed_len > 0 {
-            *executor.cache_mut() = warmed_cache;
-            tracing::info!(
-                session_id = %self.session_id,
-                entries = warmed_len,
-                "Exactly-once cache warmed from event store"
-            );
-        }
-
-        self.exactly_once_executor = Some(Mutex::new(executor));
-    }
-
-    /// Check exactly-once cache and return cached result if available.
-    /// Returns None if cache miss or exactly-once is disabled.
-    fn check_exactly_once_cache(
-        &self,
-        name: &str,
-        args: &Value,
-    ) -> Option<astra_tools::ToolResult> {
-        use astra_turn_types::classify_tool_idempotency;
-
-        let executor_mutex = self.exactly_once_executor.as_ref()?;
-        let public_args = Self::public_tool_arguments(args);
-        let key = Self::exactly_once_key(name, args);
-        let cache_key = key.cache_key();
-
-        let executor = match executor_mutex.lock() {
-            Ok(executor) => executor,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "exactly-once cache lock poisoned; skipping cache lookup"
-                );
-                return None;
-            }
-        };
-        let cached = executor.cache().check(&key)?;
-        let idempotency = classify_tool_idempotency(name, Some(&public_args));
-
-        match idempotency {
-            astra_turn_types::ToolIdempotency::NonIdempotent
-            | astra_turn_types::ToolIdempotency::IdempotentWrite => {
-                tracing::debug!(
-                    tool_name = %name,
-                    cache_key = %cache_key,
-                    "Exactly-once: cache hit, returning cached result"
-                );
-                Some(astra_tools::ToolResult {
-                    output: cached.output.clone(),
-                    is_error: cached.is_error,
-                    metadata: None,
-                    exit_semantics: None,
-                })
-            }
-            astra_turn_types::ToolIdempotency::PureRead => {
-                tracing::debug!(
-                    tool_name = %name,
-                    cache_key = %cache_key,
-                    "Exactly-once: cache hit for PureRead (AlwaysCache policy)"
-                );
-                Some(astra_tools::ToolResult {
-                    output: cached.output.clone(),
-                    is_error: cached.is_error,
-                    metadata: None,
-                    exit_semantics: None,
-                })
-            }
-        }
-    }
-
-    /// Record tool result in exactly-once cache after execution.
-    fn record_exactly_once_result(
-        &self,
-        name: &str,
-        args: &Value,
-        result: &astra_tools::ToolResult,
-    ) {
-        use astra_pipeline::step_protocol::CachedToolResult;
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        if result.is_error {
-            tracing::debug!(
-                tool_name = %name,
-                "Exactly-once: skipping failed tool result because failures are retryable"
-            );
-            return;
-        }
-
-        let Some(executor_mutex) = self.exactly_once_executor.as_ref() else {
-            return;
-        };
-
-        let key = Self::exactly_once_key(name, args);
-        let cache_key = key.cache_key();
-
-        let mut executor = match executor_mutex.lock() {
-            Ok(executor) => executor,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "exactly-once cache lock poisoned; skipping result record"
-                );
-                return;
-            }
-        };
-        let cached_at = match SystemTime::now().duration_since(UNIX_EPOCH) {
-            Ok(duration) => duration.as_secs(),
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "system clock predates UNIX_EPOCH; using zero exactly-once cache timestamp"
-                );
-                0
-            }
-        };
-        let cached_result = CachedToolResult {
-            tool_name: name.to_string(),
-            output: result.output.clone(),
-            is_error: false,
-            cached_at,
-            context_signature: None,
-        };
-        executor.cache_mut().record(&key, cached_result);
-
-        tracing::debug!(
-            tool_name = %name,
-            cache_key = %cache_key,
-            "Exactly-once: recorded successful tool result in cache"
+    /// The cache is warmed from the event store and (when available) the DB on creation
+    /// to survive restarts.
+    pub async fn enable_exactly_once(&mut self) {
+        self.exactly_once_executor = Some(
+            tool_exactly_once::enable_exactly_once(
+                &self.session_id,
+                self.context_manifest_pool.clone(),
+            )
+            .await,
         );
     }
 
@@ -1367,11 +376,95 @@ impl ServerToolExecutor {
             .await
     }
 
+    // ── Session tool wrappers (delegate to extracted module functions) ──────
+
+    pub(super) fn adjust_config(&self, args: &Value) -> String {
+        let outcome = crate::server::tool_session_config::execute_adjust_config(
+            &self.session_id,
+            self.observability_session.as_ref(),
+            &self.session_config.inner,
+            args,
+            || self.publish_current_workspace("adjust_config"),
+            &self.session_state_journal,
+            self.journal_turn_index.load(Ordering::Relaxed),
+        );
+        outcome.output
+    }
+
+    pub(super) fn prioritize_tool(&self, args: &Value) -> String {
+        let outcome = crate::server::tool_session_config::execute_tool_preference_update(
+            &self.session_id,
+            &self.session_config.inner,
+            args,
+            crate::server::tool_session_config::ToolPreferenceAction::Prioritize,
+            |tool| self.supports_server_tool_name(tool),
+            || self.publish_current_workspace("prioritize_tool"),
+            &self.session_state_journal,
+            self.journal_turn_index.load(Ordering::Relaxed),
+        );
+        outcome.output
+    }
+
+    pub(super) fn deprioritize_tool(&self, args: &Value) -> String {
+        let outcome = crate::server::tool_session_config::execute_tool_preference_update(
+            &self.session_id,
+            &self.session_config.inner,
+            args,
+            crate::server::tool_session_config::ToolPreferenceAction::Deprioritize,
+            |tool| self.supports_server_tool_name(tool),
+            || self.publish_current_workspace("deprioritize_tool"),
+            &self.session_state_journal,
+            self.journal_turn_index.load(Ordering::Relaxed),
+        );
+        outcome.output
+    }
+
+    pub(super) fn compress_context(&self, args: &Value) -> String {
+        let outcome = crate::server::tool_session_config::execute_compress_context(
+            &self.session_id,
+            self.observability_session.as_ref(),
+            args,
+            &self.session_state_journal,
+            self.journal_turn_index.load(Ordering::Relaxed),
+        );
+        outcome.output
+    }
+
+    // ── Task work-surface event emission ─────────────────────────────────
+
+    pub(super) async fn emit_task_board_snapshot(&self, reason: &str, args: &Value) {
+        if !self.work_surface_events.is_configured() {
+            return;
+        }
+        let tasks = match self.task_manager.store().load(&self.session_id).await {
+            Ok(tasks) => tasks,
+            Err(_) => return,
+        };
+        let event = crate::server::tool_work_surface_events::task_board_snapshot_event(
+            &self.session_id,
+            reason,
+            args,
+            tasks,
+        );
+        self.emit_work_surface_event(event, "work-surface task board event channel unavailable")
+            .await;
+    }
+
+    // ── Introspect snapshot update ──────────────────────────────────────────
+
+    pub(crate) fn update_introspect_snapshot(
+        &self,
+        snapshot: astra_turn_core::introspect::IntrospectSnapshot,
+    ) {
+        if let Ok(mut guard) = self.introspect_snapshot.write() {
+            *guard = Some(snapshot);
+        }
+    }
+
     pub fn with_capabilities(
         mut self,
         capabilities: astra_turn_core::capability::CapabilitySet,
     ) -> Self {
-        self.server_tool_names = resolved_server_tool_names(&capabilities);
         self.capabilities = capabilities;
         self
     }
@@ -1388,18 +481,109 @@ impl ServerToolExecutor {
     /// `tool_search(select:NAME)` can resolve them for deferred activation.
     /// Called by the server loop host after MCP manager refresh.
     ///
-    /// Poison handling: recovers via `into_inner()` so a prior panic
-    /// doesn't permanently disable plugin lookup server-side. Logs a
-    /// warning so operators can trace the underlying panic.
+    /// Poison handling: plugin schemas are a rebuildable cache. Reset cached
+    /// state on poison instead of reusing possibly half-written inner data.
     pub fn set_plugin_schemas(&self, schemas: Vec<Value>) {
-        let mut guard = self.plugin_schemas.write().unwrap_or_else(|poisoned| {
-            tracing::warn!(
-                "server plugin_schemas RwLock was poisoned; recovering inner. \
-                 A prior panic held the write lock — investigate that panic first."
-            );
-            poisoned.into_inner()
-        });
+        let mut guard = rwlock_write_reset_on_poison(&self.plugin_schemas, "plugin_schemas");
         *guard = schemas;
+    }
+
+    pub fn set_current_searchable_tool_schemas(&self, schemas: &[Value]) {
+        let names = astra_turn_core::tool::deferred_activation::tool_names_from_schemas(schemas);
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.current_searchable_tool_names,
+            "current_searchable_tool_names",
+        );
+        *guard = Some(names);
+    }
+
+    pub fn set_current_activatable_tool_names(&self, names: HashSet<String>) {
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.current_activatable_tool_names,
+            "current_activatable_tool_names",
+        );
+        *guard = Some(names);
+    }
+
+    pub fn current_activatable_tool_names_snapshot(&self) -> HashSet<String> {
+        rwlock_read_clone_or_default(
+            &self.current_activatable_tool_names,
+            "current_activatable_tool_names_snapshot",
+        )
+        .unwrap_or_default()
+    }
+
+    pub(crate) fn current_searchable_tool_names(&self) -> Option<HashSet<String>> {
+        rwlock_read_clone_or_default(
+            &self.current_searchable_tool_names,
+            "current_searchable_tool_names",
+        )
+    }
+
+    pub fn activated_deferred_tool_names(&self) -> Vec<String> {
+        let allowed = self.current_searchable_tool_names();
+
+        // Use zero-clone filter path to avoid cloning the entire HashSet
+        let mut result = Vec::new();
+        match self.activated_deferred_tools.read() {
+            Ok(guard) => {
+                for name in guard.iter() {
+                    if allowed
+                        .as_ref()
+                        .map_or(true, |allowed| allowed.contains(name))
+                    {
+                        result.push(name.clone());
+                    }
+                }
+            }
+            Err(poisoned) => {
+                tracing::error!(
+                    cache = "activated_deferred_tools",
+                    "RwLock poisoned on read; resetting cached state to default"
+                );
+                drop(poisoned);
+                // Clear poison BEFORE acquiring write lock — if write() panics
+                // (e.g. during reset), the flag would otherwise remain stuck.
+                self.activated_deferred_tools.clear_poison();
+                let mut guard = match self.activated_deferred_tools.write() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                *guard = HashSet::new();
+            }
+        }
+        result
+    }
+
+    fn record_tool_search_activation_output(&self, output: &str) {
+        let names =
+            astra_turn_core::tool::deferred_activation::activated_tool_names_from_tool_search_output(
+                output,
+            );
+        if names.is_empty() {
+            return;
+        }
+        let allowed = self.current_searchable_tool_names();
+        let names: Vec<String> = names
+            .into_iter()
+            .filter(|name| {
+                allowed
+                    .as_ref()
+                    .map_or(true, |allowed| allowed.contains(name))
+            })
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.activated_deferred_tools,
+            "activated_deferred_tools",
+        );
+        guard.extend(names);
+    }
+
+    pub(crate) fn plugin_schemas_snapshot(&self, label: &str) -> Vec<Value> {
+        rwlock_read_clone_or_default(&self.plugin_schemas, label)
     }
 
     async fn execute_mcp_tool(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
@@ -1422,7 +606,22 @@ impl ServerToolExecutor {
     }
 
     fn supports_server_tool_name(&self, tool: &str) -> bool {
-        self.server_tool_names.contains(tool)
+        resolved_server_tool_names(
+            &self.capabilities,
+            self.execution_binding.workspace(),
+            self.execution_binding.executor(),
+            self.execution_binding.runtime(),
+        )
+        .contains(tool)
+    }
+
+    fn capability_filtered_server_tool_schemas(&self) -> Vec<Value> {
+        capability_filtered_server_tool_schemas(
+            &self.capabilities,
+            self.execution_binding.workspace(),
+            self.execution_binding.executor(),
+            self.execution_binding.runtime(),
+        )
     }
 
     /// Inject the plan repository so plan-mode tools and the write-tool guard
@@ -1487,7 +686,7 @@ impl ServerToolExecutor {
 
     /// Attach the live web-agent work-surface event channel.
     pub fn set_work_surface_event_tx(&mut self, tx: tokio::sync::mpsc::Sender<Value>) {
-        self.work_surface_event_tx = Some(tx);
+        self.work_surface_events.set_tx(tx);
     }
 
     pub fn set_execution_bindings(
@@ -1495,9 +694,21 @@ impl ServerToolExecutor {
         workspace: WorkspaceBinding,
         executor: ExecutorBinding,
     ) {
-        self.workspace_binding = workspace;
-        self.executor_binding = executor;
+        self.execution_binding.set_bindings(workspace, executor);
         self.emit_binding_snapshot();
+    }
+
+    pub fn set_execution_binding_snapshot(
+        &mut self,
+        snapshot: crate::server::tool_transport::ExecutionBindingSnapshot,
+    ) {
+        self.execution_binding.set_snapshot(snapshot);
+        self.emit_binding_snapshot();
+    }
+
+    pub fn set_workspace_record(&mut self, workspace_record: Option<WorkspaceRecord>) {
+        self.execution_binding
+            .set_workspace_record(workspace_record);
     }
 
     pub fn set_edge_workspace_binding(
@@ -1507,119 +718,46 @@ impl ServerToolExecutor {
         cwd: impl Into<String>,
         authority: WorkspaceAuthority,
     ) {
-        let executor_id = executor_id.into();
-        let display_name = display_name.into();
-        self.workspace_binding =
-            WorkspaceBinding::edge_workspace(display_name.clone(), cwd, authority);
-        self.executor_binding = ExecutorBinding::edge_agent(
+        self.execution_binding.set_edge_workspace_binding(
             executor_id,
             display_name,
-            ToolTransportKind::EdgeWs,
-            ExecutorStatus::Unknown,
+            cwd,
+            authority,
         );
         self.emit_binding_snapshot();
     }
 
-    fn binding_event_fields(&self) -> Map<String, Value> {
-        binding_event_fields(&self.workspace_binding, &self.executor_binding)
+    pub(super) fn binding_event_fields(&self) -> Map<String, Value> {
+        binding_event_fields(
+            self.execution_binding.workspace(),
+            self.execution_binding.executor(),
+        )
     }
 
     pub fn binding_metadata(&self) -> Value {
         Value::Object(self.binding_event_fields())
     }
 
-    fn tool_call_id(args: &Value) -> Option<&str> {
-        args.get("_tool_call_id").and_then(Value::as_str)
+    fn try_emit_work_surface_event(&self, event: Map<String, Value>, unavailable_label: &str) {
+        self.work_surface_events
+            .try_emit(event, &self.binding_event_fields(), unavailable_label);
     }
 
-    fn run_id(args: &Value) -> Option<&str> {
-        string_arg(args, "_run_id")
-    }
-
-    fn insert_run_id(event: &mut Map<String, Value>, args: &Value) {
-        if let Some(run_id) = Self::run_id(args) {
-            event.insert("run_id".to_string(), Value::String(run_id.to_string()));
-        }
-    }
-
-    fn public_tool_arguments(args: &Value) -> Value {
-        let Some(map) = args.as_object() else {
-            return args.clone();
-        };
-        Value::Object(
-            map.iter()
-                .filter(|(key, _)| !key.starts_with('_'))
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-        )
-    }
-
-    fn exactly_once_key(name: &str, args: &Value) -> astra_pipeline::step_protocol::IdempotencyKey {
-        let public_args = Self::public_tool_arguments(args);
-        astra_pipeline::step_protocol::IdempotencyKey::semantic(name, &public_args)
-    }
-
-    fn try_emit_work_surface_event(&self, mut event: Map<String, Value>, unavailable_label: &str) {
-        let Some(tx) = &self.work_surface_event_tx else {
-            return;
-        };
-        for (key, value) in self.binding_event_fields() {
-            event.entry(key).or_insert(value);
-        }
-        if let Err(error) = tx.try_send(Value::Object(event)) {
-            tracing::debug!(
-                target: "astra_runtime::work_surface",
-                session_id = %self.session_id,
-                error = %error,
-                "{unavailable_label}"
-            );
-        }
-    }
-
-    async fn emit_work_surface_event(
+    pub(super) async fn emit_work_surface_event(
         &self,
-        mut event: Map<String, Value>,
+        event: Map<String, Value>,
         unavailable_label: &str,
     ) {
-        let Some(tx) = &self.work_surface_event_tx else {
-            return;
-        };
-        for (key, value) in self.binding_event_fields() {
-            event.entry(key).or_insert(value);
-        }
-        if let Err(error) = tx.send(Value::Object(event)).await {
-            tracing::debug!(
-                target: "astra_runtime::work_surface",
-                session_id = %self.session_id,
-                error = %error,
-                "{unavailable_label}"
-            );
-        }
+        self.work_surface_events
+            .emit(event, &self.binding_event_fields(), unavailable_label)
+            .await;
     }
 
     pub fn emit_binding_snapshot(&self) {
-        let mut workspace_event = Map::new();
-        workspace_event.insert(
-            "type".to_string(),
-            Value::String("workspace_bound".to_string()),
-        );
-        workspace_event.insert(
-            "session_id".to_string(),
-            Value::String(self.session_id.clone()),
-        );
+        let [workspace_event, executor_event] = binding_snapshot_events(&self.session_id);
         self.try_emit_work_surface_event(
             workspace_event,
             "work-surface workspace binding event channel unavailable",
-        );
-
-        let mut executor_event = Map::new();
-        executor_event.insert(
-            "type".to_string(),
-            Value::String("executor_bound".to_string()),
-        );
-        executor_event.insert(
-            "session_id".to_string(),
-            Value::String(self.session_id.clone()),
         );
         self.try_emit_work_surface_event(
             executor_event,
@@ -1627,753 +765,9 @@ impl ServerToolExecutor {
         );
     }
 
-    fn insert_event_binding_fields(event: &mut Map<String, Value>, fields: &Map<String, Value>) {
-        for (key, value) in fields {
-            event.insert(key.clone(), value.clone());
-        }
-    }
-
-    async fn emit_tool_routing_decision(
-        &self,
-        name: &str,
-        args: &Value,
-        route: ToolExecutionRouteKind,
-        route_fields: Option<&Map<String, Value>>,
-    ) {
-        let Some(call_id) = Self::tool_call_id(args) else {
-            return;
-        };
-        let mut event = Map::new();
-        event.insert(
-            "type".to_string(),
-            Value::String("tool_routing_decision".to_string()),
-        );
-        event.insert("call_id".to_string(), Value::String(call_id.to_string()));
-        Self::insert_run_id(&mut event, args);
-        event.insert("tool".to_string(), Value::String(name.to_string()));
-        event.insert(
-            "route".to_string(),
-            Value::String(route.as_str().to_string()),
-        );
-        if let Some(route_fields) = route_fields {
-            Self::insert_event_binding_fields(&mut event, route_fields);
-        }
-        self.emit_work_surface_event(event, "work-surface tool routing event channel unavailable")
-            .await;
-    }
-
-    async fn emit_tool_transport_started(
-        &self,
-        name: &str,
-        args: &Value,
-        route_fields: Option<&Map<String, Value>>,
-    ) {
-        let Some(call_id) = Self::tool_call_id(args) else {
-            return;
-        };
-        let mut event = Map::new();
-        event.insert(
-            "type".to_string(),
-            Value::String("tool_transport_started".to_string()),
-        );
-        event.insert("call_id".to_string(), Value::String(call_id.to_string()));
-        Self::insert_run_id(&mut event, args);
-        event.insert("tool".to_string(), Value::String(name.to_string()));
-        event.insert("arguments".to_string(), Self::public_tool_arguments(args));
-        if let Some(route_fields) = route_fields {
-            Self::insert_event_binding_fields(&mut event, route_fields);
-        }
-        self.emit_work_surface_event(event, "work-surface tool start event channel unavailable")
-            .await;
-    }
-
-    async fn emit_tool_transport_finished(
-        &self,
-        name: &str,
-        args: &Value,
-        result: &astra_tools::ToolResult,
-        duration_ms: u64,
-    ) {
-        let Some(call_id) = Self::tool_call_id(args) else {
-            return;
-        };
-        let mut event = Map::new();
-        event.insert(
-            "type".to_string(),
-            Value::String(
-                if result.is_error {
-                    "tool_transport_failed"
-                } else {
-                    "tool_transport_completed"
-                }
-                .to_string(),
-            ),
-        );
-        event.insert("call_id".to_string(), Value::String(call_id.to_string()));
-        Self::insert_run_id(&mut event, args);
-        event.insert("tool".to_string(), Value::String(name.to_string()));
-        event.insert("success".to_string(), Value::Bool(!result.is_error));
-        event.insert(
-            "duration_ms".to_string(),
-            Value::Number(serde_json::Number::from(duration_ms)),
-        );
-        if result.is_error {
-            event.insert("error".to_string(), Value::String(result.output.clone()));
-        }
-        copy_result_routing_metadata(&mut event, result);
-        self.emit_work_surface_event(
-            event,
-            "work-surface tool transport completion event channel unavailable",
-        )
-        .await;
-        self.emit_executor_blocked_if_needed(name, args, result)
-            .await;
-        self.emit_agent_waiting_if_needed(name, args, result).await;
-    }
-
-    async fn emit_agent_waiting_if_needed(
-        &self,
-        name: &str,
-        args: &Value,
-        result: &astra_tools::ToolResult,
-    ) {
-        if name != "agent" {
-            return;
-        }
-        let parsed = serde_json::from_str::<Value>(&result.output).ok();
-        let is_waiting = result_metadata_str(result, "agent_status") == Some("waiting")
-            || parsed
-                .as_ref()
-                .and_then(|value| value.get("status"))
-                .and_then(Value::as_str)
-                == Some("waiting");
-        if !is_waiting {
-            return;
-        }
-        let Some(agent_id) = result_metadata_str(result, "agent_id").or_else(|| {
-            parsed
-                .as_ref()
-                .and_then(|value| value.get("agent_id"))
-                .and_then(Value::as_str)
-        }) else {
-            return;
-        };
-        let reason = result_metadata_str(result, "reason")
-            .or_else(|| {
-                parsed
-                    .as_ref()
-                    .and_then(|value| value.get("reason"))
-                    .and_then(Value::as_str)
-            })
-            .unwrap_or("waiting");
-        let mut event = Map::new();
-        event.insert(
-            "type".to_string(),
-            Value::String("agent_waiting".to_string()),
-        );
-        event.insert("agent_id".to_string(), Value::String(agent_id.to_string()));
-        event.insert("status".to_string(), Value::String("waiting".to_string()));
-        event.insert("reason".to_string(), Value::String(reason.to_string()));
-        if let Some(call_id) = Self::tool_call_id(args) {
-            event.insert("call_id".to_string(), Value::String(call_id.to_string()));
-        }
-        copy_result_routing_metadata(&mut event, result);
-        self.emit_work_surface_event(
-            event,
-            "work-surface agent waiting event channel unavailable",
-        )
-        .await;
-    }
-
-    async fn emit_executor_blocked_if_needed(
-        &self,
-        name: &str,
-        args: &Value,
-        result: &astra_tools::ToolResult,
-    ) {
-        let Some(error_kind) = result_metadata_str(result, "error_kind") else {
-            return;
-        };
-        let (executor_status, blocked_reason) = match error_kind {
-            TOOL_ERROR_KIND_EXECUTOR_OFFLINE => ("offline", RUN_BLOCKED_REASON_EXECUTOR_OFFLINE),
-            TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED => {
-                ("degraded", RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED)
-            }
-            TOOL_ERROR_KIND_FALLBACK_DISABLED => ("degraded", RUN_BLOCKED_REASON_FALLBACK_DISABLED),
-            TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE => (
-                "degraded",
-                RUN_BLOCKED_REASON_WORKSPACE_EXECUTOR_UNAVAILABLE,
-            ),
-            _ => return,
-        };
-        let Some(call_id) = Self::tool_call_id(args) else {
-            return;
-        };
-        let run_id = Self::run_id(args);
-
-        let reason = result_metadata_str(result, "reason").unwrap_or(error_kind);
-        let mut executor_event = Map::new();
-        executor_event.insert(
-            "type".to_string(),
-            Value::String("executor_status_changed".to_string()),
-        );
-        executor_event.insert(
-            "session_id".to_string(),
-            Value::String(self.session_id.clone()),
-        );
-        executor_event.insert(
-            "status".to_string(),
-            Value::String(executor_status.to_string()),
-        );
-        executor_event.insert("reason".to_string(), Value::String(reason.to_string()));
-        executor_event.insert("call_id".to_string(), Value::String(call_id.to_string()));
-        if let Some(run_id) = run_id {
-            executor_event.insert("run_id".to_string(), Value::String(run_id.to_string()));
-        }
-        executor_event.insert("tool".to_string(), Value::String(name.to_string()));
-        executor_event.insert("message".to_string(), Value::String(result.output.clone()));
-        copy_result_routing_metadata(&mut executor_event, result);
-        self.emit_work_surface_event(
-            executor_event,
-            "work-surface executor status event channel unavailable",
-        )
-        .await;
-
-        let mut blocked_event = Map::new();
-        blocked_event.insert("type".to_string(), Value::String("run_blocked".to_string()));
-        blocked_event.insert(
-            "reason".to_string(),
-            Value::String(blocked_reason.to_string()),
-        );
-        blocked_event.insert(
-            "session_id".to_string(),
-            Value::String(self.session_id.clone()),
-        );
-        blocked_event.insert("call_id".to_string(), Value::String(call_id.to_string()));
-        if let Some(run_id) = run_id {
-            blocked_event.insert("run_id".to_string(), Value::String(run_id.to_string()));
-        }
-        blocked_event.insert("tool".to_string(), Value::String(name.to_string()));
-        blocked_event.insert("message".to_string(), Value::String(result.output.clone()));
-        copy_result_routing_metadata(&mut blocked_event, result);
-        self.emit_work_surface_event(
-            blocked_event,
-            "work-surface run blocked event channel unavailable",
-        )
-        .await;
-    }
-
-    fn attach_binding_metadata(&self, result: &mut astra_tools::ToolResult) {
-        let metadata = result.metadata.get_or_insert_with(Map::new);
-        for (key, value) in self.binding_event_fields() {
-            metadata.entry(key).or_insert(value);
-        }
-    }
-
     fn tool_execution_request(&self, name: &str, args: &Value) -> ToolExecutionRequest {
-        ToolExecutionRequest {
-            user_id: self.user_id.clone(),
-            run_id: string_arg(args, "_run_id").unwrap_or_default().to_string(),
-            session_id: self.session_id.clone(),
-            tool_call_id: Self::tool_call_id(args).unwrap_or_default().to_string(),
-            tool_name: name.to_string(),
-            args: args.clone(),
-            workspace: self.workspace_binding.clone(),
-            executor: self.executor_binding.clone(),
-            policy: ToolPolicySnapshot::default(),
-        }
-    }
-
-    fn record_resource_tool_call(&self) {
-        let Some(ref gov) = self.resource_governor else {
-            return;
-        };
-        let gov = gov.clone();
-        let uid = self.user_id.clone();
-        tokio::spawn(async move {
-            gov.record_tool_calls(&uid, 1).await;
-        });
-    }
-
-    async fn server_run_script(&self, args: &Value) -> astra_tools::ToolResult {
-        #[cfg(unix)]
-        {
-            use std::collections::HashSet;
-
-            let mut config = astra_tools::run_script::RunScriptConfig::default();
-            config.mode = astra_tools::run_script::ExecutionMode::Project;
-            config.session_cwd = Some(self.workspace_root.clone());
-            config.allowed_tools = astra_tools::schemas::SERVER_RUN_SCRIPT_RPC_TOOL_NAMES
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect::<HashSet<_>>();
-            astra_tools::run_script::handle_run_script(args, self, config).await
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = args;
-            astra_tools::ToolResult::error(
-                "run_script is not available on this platform (requires Unix domain sockets)"
-                    .to_string(),
-            )
-        }
-    }
-
-    async fn publish_artifact(&self, args: &Value) -> astra_tools::ToolResult {
-        let Some(store) = self.workspace_artifact_store.as_ref() else {
-            return astra_tools::ToolResult::error(
-                "Error: publish_artifact requires a configured MatrixOne artifact store for this session"
-                    .to_string(),
-            );
-        };
-
-        let Some(raw_path) = string_arg(args, "path") else {
-            return astra_tools::ToolResult::error(
-                "Error: publish_artifact requires a non-empty path".to_string(),
-            );
-        };
-        let (path, bytes) = match self.resolve_publish_artifact_path(raw_path) {
-            Ok(v) => v,
-            Err(e) => return astra_tools::ToolResult::error(e),
-        };
-        if bytes.len() as u64 > MAX_PUBLISH_ARTIFACT_BYTES {
-            return astra_tools::ToolResult::error(format!(
-                "Error: publish_artifact currently supports files up to {} MiB; {} is {} bytes",
-                MAX_PUBLISH_ARTIFACT_BYTES / 1024 / 1024,
-                path.display(),
-                bytes.len()
-            ));
-        }
-
-        let content_type = match string_arg(args, "content_type") {
-            Some(value) => match validate_content_type(value) {
-                Ok(value) => value,
-                Err(error) => return astra_tools::ToolResult::error(error),
-            },
-            None => infer_content_type(&path).to_string(),
-        };
-        let artifact_kind = match string_arg(args, "artifact_kind") {
-            Some(value) => match validate_artifact_kind(value) {
-                Ok(value) => value,
-                Err(error) => return astra_tools::ToolResult::error(error),
-            },
-            None => infer_artifact_kind(&path, &content_type).to_string(),
-        };
-        let filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("artifact")
-            .to_string();
-        let title = string_arg(args, "title")
-            .map(ToString::to_string)
-            .unwrap_or_else(|| filename.clone());
-        if let Err(error) = validate_short_token(&title, "title", 160) {
-            return astra_tools::ToolResult::error(error);
-        }
-        let description = string_arg(args, "description").map(ToString::to_string);
-        if let Some(description) = &description
-            && let Err(error) = validate_short_token(description, "description", 1000)
-        {
-            return astra_tools::ToolResult::error(error);
-        }
-
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        let sha256 = format!("{:x}", hasher.finalize());
-        let (encoding, data) = if should_store_artifact_as_text(&content_type, &path) {
-            match std::str::from_utf8(&bytes) {
-                Ok(text) => ("utf-8", text.to_string()),
-                Err(_) => ("base64", BASE64_STANDARD.encode(&bytes)),
-            }
-        } else {
-            ("base64", BASE64_STANDARD.encode(&bytes))
-        };
-
-        let source_path = self
-            .relative_to_workspace_root(&path)
-            .map(|relative| relative.display().to_string())
-            .unwrap_or_else(|| path.display().to_string());
-        let artifact_id = Uuid::new_v4().to_string();
-        let record = SessionArtifactJsonRecord {
-            artifact_id: artifact_id.clone(),
-            session_id: self.session_id.clone(),
-            user_id: self.user_id.clone(),
-            artifact_kind: artifact_kind.clone(),
-            source: Some("publish_artifact".to_string()),
-            turn: Some(self.journal_turn_index.load(Ordering::Relaxed)),
-            round: None,
-            content: json!({
-                "kind": artifact_kind.clone(),
-                "title": title.clone(),
-                "filename": filename.clone(),
-                "content_type": content_type.clone(),
-                "encoding": encoding,
-                "data": data,
-                "description": description.clone(),
-                "byte_size": bytes.len(),
-                "sha256": sha256.clone(),
-            }),
-            metadata: Some(json!({
-                "download_filename": filename.clone(),
-                "content_type": content_type.clone(),
-                "byte_size": bytes.len(),
-                "sha256": sha256.clone(),
-                "source_path": source_path,
-                "normalize_version": "artifact_file_v1",
-            })),
-        };
-
-        let artifact = match store.persist_json_artifact(record).await {
-            Ok(artifact) => artifact,
-            Err(error) => {
-                return astra_tools::ToolResult::error(format!(
-                    "Error: failed to persist published artifact: {error}"
-                ));
-            }
-        };
-        let artifact_ref = format!(
-            "artifact://session/{}/{}",
-            self.session_id, artifact.artifact_id
-        );
-        let output = format!(
-            "Published artifact '{title}'.\n\
-             artifact_ref: {artifact_ref}\n\
-             artifact_id: {artifact_id}\n\
-             artifact_kind: {artifact_kind}\n\
-             content_type: {content_type}\n\
-             download_filename: {filename}\n\
-             byte_size: {byte_size}\n\
-             The web UI can preview supported file types and download the stored artifact.",
-            title = title,
-            artifact_id = artifact.artifact_id,
-            artifact_kind = artifact.artifact_kind,
-            content_type = content_type,
-            filename = filename,
-            byte_size = bytes.len(),
-        );
-        let mut result_metadata = serde_json::Map::new();
-        result_metadata.insert("artifact_id".to_string(), json!(artifact.artifact_id));
-        result_metadata.insert("artifact_kind".to_string(), json!(artifact.artifact_kind));
-        result_metadata.insert("artifact_ref".to_string(), json!(artifact_ref));
-        result_metadata.insert("download_filename".to_string(), json!(filename));
-        result_metadata.insert("content_type".to_string(), json!(content_type));
-        result_metadata.insert("byte_size".to_string(), json!(bytes.len()));
-        astra_tools::ToolResult {
-            output,
-            metadata: Some(result_metadata),
-            is_error: false,
-            exit_semantics: None,
-        }
-    }
-
-    async fn query_session_history_rows(
-        &self,
-        before_seq: Option<i64>,
-        after_seq: Option<i64>,
-        limit: usize,
-        order: &str,
-        role_filter: Option<&str>,
-    ) -> Result<Vec<SessionHistoryRow>, sqlx::Error> {
-        let Some(pool) = &self.context_manifest_pool else {
-            return Ok(Vec::new());
-        };
-
-        let mut sql = String::from(
-            "SELECT item_seq, user_id, role, content, run_id, \
-                    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-             FROM session_transcript_items \
-             WHERE session_id = ?",
-        );
-        if before_seq.is_some() {
-            sql.push_str(" AND item_seq < ?");
-        }
-        if after_seq.is_some() {
-            sql.push_str(" AND item_seq > ?");
-        }
-        sql.push_str(" ORDER BY item_seq ");
-        sql.push_str(if order == "asc" { "ASC" } else { "DESC" });
-        sql.push_str(&format!(" LIMIT {}", limit.max(1)));
-
-        let mut query = sqlx::query(&sql).bind(&self.session_id);
-        if let Some(before_seq) = before_seq {
-            query = query.bind(before_seq);
-        }
-        if let Some(after_seq) = after_seq {
-            query = query.bind(after_seq);
-        }
-
-        let rows = query.fetch_all(pool.get()).await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let row_user_id: String = row.try_get("user_id")?;
-            if row_user_id != self.user_id {
-                continue;
-            }
-            let role: String = row.try_get("role")?;
-            if !matches!(role.as_str(), "user" | "assistant" | "system") {
-                continue;
-            }
-            if let Some(filter) = role_filter
-                && filter != "all"
-                && role != filter
-            {
-                continue;
-            }
-            let content: String = row.try_get("content")?;
-            if content.trim().is_empty() {
-                continue;
-            }
-            out.push(SessionHistoryRow {
-                item_seq: row.try_get("item_seq")?,
-                source: "transcript".to_string(),
-                role,
-                content,
-                run_id: row.try_get::<Option<String>, _>("run_id")
-                    .inspect_err(|e| tracing::warn!(column="run_id", session_id=%self.session_id, error=%e, "session_history: column type mismatch"))
-                    .ok()
-                    .flatten(),
-                created_at: row
-                    .try_get::<Option<String>, _>("created_at")
-                    .inspect_err(|e| tracing::warn!(column="created_at", session_id=%self.session_id, error=%e, "session_history: column type mismatch"))
-                    .ok()
-                    .flatten(),
-            });
-        }
-        Ok(out)
-    }
-
-    async fn query_session_history_chunk_rows(
-        &self,
-        query_text: &str,
-        limit: usize,
-    ) -> Result<Vec<SessionHistoryRow>, sqlx::Error> {
-        let Some(pool) = &self.context_manifest_pool else {
-            return Ok(Vec::new());
-        };
-
-        let mut patterns = vec![format!("%{}%", query_text.trim())];
-        for token in query_text
-            .split(|ch: char| ch.is_whitespace() || ",.;:!?()[]{}\"'`/\\|".contains(ch))
-            .filter(|token| token.chars().count() >= 2)
-            .take(4)
-        {
-            patterns.push(format!("%{token}%"));
-        }
-        patterns.sort();
-        patterns.dedup();
-
-        let mut sql = String::from(
-            "SELECT user_id, chunk_type, source_id, content_text, \
-                    COALESCE(item_seq_start, seq_start) AS item_seq, \
-                    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-             FROM session_history_chunks \
-             WHERE session_id = ? AND (",
-        );
-        for idx in 0..patterns.len() {
-            if idx > 0 {
-                sql.push_str(" OR ");
-            }
-            sql.push_str("content_text LIKE ?");
-        }
-        sql.push_str(&format!(
-            ") ORDER BY created_at DESC LIMIT {}",
-            limit.max(1)
-        ));
-
-        let mut query = sqlx::query(&sql).bind(&self.session_id);
-        for pattern in patterns {
-            query = query.bind(pattern);
-        }
-
-        let rows = query.fetch_all(pool.get()).await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let row_user_id: String = row.try_get("user_id")?;
-            if row_user_id != self.user_id {
-                continue;
-            }
-            let content: String = row.try_get("content_text")?;
-            if content.trim().is_empty() {
-                continue;
-            }
-            let chunk_type: String = row.try_get("chunk_type")?;
-            out.push(SessionHistoryRow {
-                item_seq: row.try_get("item_seq")?,
-                source: "history_chunk".to_string(),
-                role: chunk_type,
-                content,
-                run_id: row.try_get::<Option<String>, _>("source_id")
-                    .inspect_err(|e| tracing::warn!(column="source_id", session_id=%self.session_id, error=%e, "session_history: column type mismatch"))
-                    .ok()
-                    .flatten(),
-                created_at: row
-                    .try_get::<Option<String>, _>("created_at")
-                    .inspect_err(|e| tracing::warn!(column="created_at", session_id=%self.session_id, error=%e, "session_history: column type mismatch"))
-                    .ok()
-                    .flatten(),
-            });
-        }
-        Ok(out)
-    }
-
-    async fn tool_session_history_page(&self, args: &Value) -> astra_tools::ToolResult {
-        if self.context_manifest_pool.is_none() {
-            return astra_tools::ToolResult::error(
-                "Error: session_history_page failed operation=preflight reason=database_pool_not_configured".to_string(),
-            );
-        }
-        let before_seq = json_i64_arg(args, "before_seq");
-        let after_seq = json_i64_arg(args, "after_seq");
-        let limit = json_usize_arg(args, "limit", 20, 1, 50);
-        let order = json_str_arg(args, "order").unwrap_or("desc");
-        let order = if order == "asc" { "asc" } else { "desc" };
-        let role = normalized_history_role(args);
-
-        match self
-            .query_session_history_rows(before_seq, after_seq, limit, order, role.as_deref())
-            .await
-        {
-            Ok(rows) => astra_tools::ToolResult::text(render_session_history_rows(
-                "session_history_page",
-                &rows,
-                Some(format!(
-                    "cursor before_seq={:?} after_seq={:?} order={}",
-                    before_seq, after_seq, order
-                )),
-            )),
-            Err(error) => astra_tools::ToolResult::error(format!(
-                "Error: session_history_page failed for session_id={} operation=query_transcript_page: {}",
-                self.session_id, error
-            )),
-        }
-    }
-
-    async fn tool_session_history_search(&self, args: &Value) -> astra_tools::ToolResult {
-        if self.context_manifest_pool.is_none() {
-            return astra_tools::ToolResult::error(
-                "Error: session_history_search failed operation=preflight reason=database_pool_not_configured".to_string(),
-            );
-        }
-        let pattern = json_str_arg(args, "pattern").unwrap_or("").trim();
-        if pattern.is_empty() {
-            return astra_tools::ToolResult::error(
-                "Error: session_history_search requires a non-empty pattern".to_string(),
-            );
-        }
-
-        let before_seq = json_i64_arg(args, "before_seq");
-        let after_seq = json_i64_arg(args, "after_seq");
-        let limit = json_usize_arg(args, "limit", 8, 1, 20);
-        let scan_limit = json_usize_arg(args, "scan_limit", 400, 50, 1000);
-        let role = normalized_history_role(args);
-
-        let mut rows = match self
-            .query_session_history_rows(before_seq, after_seq, scan_limit, "desc", role.as_deref())
-            .await
-        {
-            Ok(rows) => rows,
-            Err(error) => {
-                return astra_tools::ToolResult::error(format!(
-                    "Error: session_history_search failed for session_id={} operation=query_transcript_scan: {}",
-                    self.session_id, error
-                ));
-            }
-        };
-
-        let scanned = rows.len();
-        let chunk_rows = if role.is_none() {
-            match self
-                .query_session_history_chunk_rows(pattern, limit.saturating_mul(4).max(20))
-                .await
-            {
-                Ok(chunk_rows) => chunk_rows,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "astra_runtime::session_history",
-                        session_id = %self.session_id,
-                        error = %error,
-                        "failed to query session_history_chunks during history search"
-                    );
-                    Vec::new()
-                }
-            }
-        } else {
-            Vec::new()
-        };
-        let chunk_candidates = chunk_rows.len();
-        rows.extend(chunk_rows);
-        rows.retain(|row| session_history_match_score(pattern, &row.content) > 0);
-        rows.sort_by(|left, right| {
-            let right_score = session_history_match_score(pattern, &right.content);
-            let left_score = session_history_match_score(pattern, &left.content);
-            right_score
-                .cmp(&left_score)
-                .then_with(|| right.item_seq.cmp(&left.item_seq))
-        });
-        rows.truncate(limit);
-
-        astra_tools::ToolResult::text(render_session_history_rows(
-            "session_history_search",
-            &rows,
-            Some(format!(
-                "pattern={pattern:?} scanned_transcript_rows={scanned} chunk_candidates={chunk_candidates}; call session_history_around(item_seq=<seq>) to inspect exact surrounding turns"
-            )),
-        ))
-    }
-
-    async fn tool_session_history_around(&self, args: &Value) -> astra_tools::ToolResult {
-        if self.context_manifest_pool.is_none() {
-            return astra_tools::ToolResult::error(
-                "Error: session_history_around failed operation=preflight reason=database_pool_not_configured".to_string(),
-            );
-        }
-        let Some(item_seq) = json_i64_arg(args, "item_seq") else {
-            return astra_tools::ToolResult::error(
-                "Error: session_history_around requires item_seq".to_string(),
-            );
-        };
-        let radius = json_usize_arg(args, "radius", 3, 0, 10) as i64;
-        let role = normalized_history_role(args);
-
-        match self
-            .query_session_history_rows(
-                Some(item_seq.saturating_add(radius).saturating_add(1)),
-                Some(item_seq.saturating_sub(radius).saturating_sub(1)),
-                (radius as usize).saturating_mul(2).saturating_add(1),
-                "asc",
-                role.as_deref(),
-            )
-            .await
-        {
-            Ok(rows) => astra_tools::ToolResult::text(render_session_history_rows(
-                "session_history_around",
-                &rows,
-                Some(format!("anchor_item_seq={item_seq} radius={radius}")),
-            )),
-            Err(error) => astra_tools::ToolResult::error(format!(
-                "Error: session_history_around failed for session_id={} operation=query_transcript_window: {}",
-                self.session_id, error
-            )),
-        }
-    }
-
-    async fn record_preview_template_missing(&self, tool_name: &str) {
-        let Some(pool) = &self.context_manifest_pool else {
-            return;
-        };
-        let store = astra_services::DatabaseContextManifestStore::new(pool.clone());
-        if let Err(error) = store
-            .preview_template_budget_or_fallback(&self.user_id, &self.session_id, None, tool_name)
-            .await
-        {
-            tracing::warn!(
-                target: "astra_runtime::tool_preview",
-                session_id = %self.session_id,
-                tool_name,
-                error = %error,
-                "failed to persist preview_template_missing event"
-            );
-        }
+        self.execution_binding
+            .tool_execution_request(&self.user_id, &self.session_id, name, args)
     }
 
     /// Swap the in-memory task store for a shared one (MatrixOne in
@@ -2393,21 +787,9 @@ impl ServerToolExecutor {
         // Drop any TaskState rollback entries that referenced the old store.
         // Other action kinds (ToolPreferences, ConfigOverride, Compression)
         // are store-independent and survive the swap.
-        let dropped = match self.session_state_journal.lock() {
-            Ok(mut j) => {
-                let before = j.entries.len();
-                j.entries
-                    .retain(|e| !matches!(e.action, SessionStateRollbackAction::TaskState { .. }));
-                before - j.entries.len()
-            }
-            Err(poisoned) => {
-                let mut j = poisoned.into_inner();
-                let before = j.entries.len();
-                j.entries
-                    .retain(|e| !matches!(e.action, SessionStateRollbackAction::TaskState { .. }));
-                before - j.entries.len()
-            }
-        };
+        let dropped = tool_session_state_rollback::drop_task_state_entries(
+            self.session_state_journal.as_ref(),
+        );
         if dropped > 0 {
             tracing::warn!(
                 session_id = %self.session_id,
@@ -2419,51 +801,35 @@ impl ServerToolExecutor {
         self
     }
 
-    fn publish_current_workspace(&self, source: &str) -> Result<(), String> {
+    pub(crate) fn publish_current_workspace(&self, source: &str) -> Result<(), String> {
         let Some(store) = self.workspace_artifact_store.clone() else {
             return Ok(());
         };
         let workspace = astra_services::session_workspace::read_workspace(&self.session_id)
             .map_err(|error| format!("{source}: {error}"))?;
         let user_id = self.user_id.clone();
-        let future = async move {
-            astra_services::session_workspace::persist_remote_workspace(
-                &workspace, &user_id, &store,
-            )
-            .await
-            .map(|_| ())
-        };
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
+            Ok(handle) => handle.block_on(async {
+                astra_services::session_workspace::persist_remote_workspace(
+                    &workspace, &user_id, &store,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("{source}: {error}"))
+            }),
             Err(_) => tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|error| error.to_string())?
-                .block_on(future),
+                .block_on(async {
+                    astra_services::session_workspace::persist_remote_workspace(
+                        &workspace, &user_id, &store,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| format!("{source}: {error}"))
+                }),
         }
-        .map_err(|error| format!("{source}: {error}"))
-    }
-
-    /// Set the edge connection pool for remote tool routing.
-    pub fn set_edge_connection_pool(
-        &mut self,
-        pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
-    ) {
-        self.tool_execution_service.set_edge_connection_pool(pool);
-    }
-
-    pub fn set_edge_dispatch_service(
-        &mut self,
-        svc: Arc<dyn astra_services::multi_agent::EdgeDispatchService>,
-    ) {
-        self.tool_execution_service.set_edge_dispatch_service(svc);
-    }
-
-    pub fn set_edge_registry_service(
-        &mut self,
-        svc: Arc<dyn astra_services::multi_agent::EdgeRegistryService>,
-    ) {
-        self.tool_execution_service.set_edge_registry_service(svc);
     }
 
     pub fn set_observability_session(
@@ -2485,37 +851,29 @@ impl ServerToolExecutor {
 
     /// Execute a tool call and preserve structured metadata for server-side fallback paths.
     pub async fn execute_with_metadata(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
-        let started_at = std::time::Instant::now();
+        let request = self.tool_execution_request(name, args);
 
-        // Early cancel check before any routing/transport work
+        // Early cancel check before route-boundary event emission.
         if let Some(token) = self.cancel_token.as_ref() {
             if token.is_cancelled() {
-                return cancelled_tool_result(name);
+                return self
+                    .tool_execution_service
+                    .cancelled_before_route_result(&request);
             }
         }
 
-        let request = self.tool_execution_request(name, args);
-        let route = self.tool_execution_service.routing_decision(&request);
-        let route_fields = route_binding_event_fields(route, &request);
-        self.emit_tool_routing_decision(name, args, route, route_fields.as_ref())
-            .await;
-        self.emit_tool_transport_started(name, args, route_fields.as_ref())
-            .await;
-
-        let mut result = self
-            .tool_execution_service
-            .execute_with_cancel(request, self, self.cancel_token.clone())
-            .await;
-        annotate_default_executor_cancel_if_needed(name, &mut result);
-
-        self.attach_binding_metadata(&mut result);
-        let duration_ms = started_at.elapsed().as_millis() as u64;
-        self.emit_tool_transport_finished(name, args, &result, duration_ms)
-            .await;
-        self.emit_tool_call_end(name, args, &result, duration_ms)
-            .await;
-
-        result
+        execute_tool_route_with_events(
+            ToolRouteRuntimeContext {
+                execution_service: &self.tool_execution_service,
+                local_transport: self,
+                work_surface_events: &self.work_surface_events,
+                session_id: &self.session_id,
+                binding_fields: self.binding_event_fields(),
+                cancel_token: self.cancel_token.clone(),
+            },
+            request,
+        )
+        .await
     }
 
     /// Execute a tool locally on the server (no edge routing).
@@ -2524,641 +882,94 @@ impl ServerToolExecutor {
         name: &str,
         args: &Value,
     ) -> astra_tools::ToolResult {
-        // ── Plan-mode write guard ────────────────────────────────────
-        // If the session has an active plan still in authoring phase,
-        // short-circuit world-mutating tools with a structured error that
-        // names ExitPlanMode as the escape hatch. Read-only tools (explore,
-        // status, tasks, memory) still pass through so the agent can keep
-        // investigating while authoring.
-        if is_plan_mode_blocked_tool(name, args) && self.plan_mode_authoring_active().await {
-            return astra_tools::ToolResult::error(format!(
-                "Tool '{name}' is blocked while plan mode is active. \
-                 The agent must call `exit_plan_mode` with an approved plan \
-                 before any write operation. This mirrors Claude Code's plan \
-                 mode: the plan is authored with read-only tools, approved by \
-                 the user, then execution proceeds with writes unlocked."
-            ));
+        if let LocalToolPreflight::ShortCircuit(result) =
+            self.run_local_tool_preflight(name, args).await
+        {
+            return result;
         }
 
-        if let Some(reason) = server_sandbox_tool_path_mismatch(
-            name,
-            args,
-            &self.workspace_root,
-            &self.workspace_binding,
-        ) {
-            return workspace_path_mismatch_tool_result(reason);
-        }
+        let lifecycle = LocalToolExecutionLifecycle {
+            session_id: &self.session_id,
+            aggregate_output_bytes: &self.aggregate_output_bytes,
+            memoria_client: &self.memoria_client,
+            progress_callback: self.progress_callback.as_deref(),
+            exactly_once_executor: self.exactly_once_executor.as_ref(),
+        };
+        let call_id = lifecycle.start(name, args).await;
 
-        // ── Approval gate check ──────────────────────────────────────
-        if let Some(gate) = &self.approval_gate {
-            if gate.requires_approval(name) {
-                let request_id = format!("srv-{}-{}", self.session_id, Uuid::new_v4());
-                let decision = gate.request_approval(&request_id, name, args).await;
-                match decision {
-                    astra_tools::ApprovalDecision::Approved => { /* proceed */ }
-                    astra_tools::ApprovalDecision::Denied { reason } => {
-                        let msg = reason.unwrap_or_else(|| "User denied execution".into());
-                        return astra_tools::ToolResult::error(format!(
-                            "Tool execution denied: {msg}"
-                        ));
-                    }
-                    astra_tools::ApprovalDecision::Timeout => {
-                        return approval_timeout_tool_result();
-                    }
-                }
-            }
-        }
-
-        // ── Exactly-once: check cache before execution ──────────────
-        if let Some(cached) = self.check_exactly_once_cache(name, args) {
-            return cached;
-        }
-
-        // ── Progress: tool started ───────────────────────────────────
-        let call_id = format!("{name}-{}", Uuid::new_v4());
-        if let Some(cb) = &self.progress_callback {
-            cb.tool_started(&call_id, name, args).await;
-        }
-
-        let mut result = match name {
-            // ── Memory tools (HTTP proxy) ──────────────────────────────
-            "memory" => {
-                let op = match args.get("action").and_then(|v| v.as_str()) {
-                    Some(a) => a,
-                    None => return tool_result_from_output(
-                        "Error: missing required parameter `action`. \
-                         Use one of: remember, recall, expand, forget, update, focus, reflect, profile, feedback".to_string()),
-                };
-                let isolated_args = self.memory_args_with_context(args);
-                let output = self.memoria_client.call(op, &isolated_args).await;
-                if output.starts_with("Error") {
-                    astra_tools::ToolResult::error(output)
+        let result = match name {
+            _ if self.tool_engine.contains(name) => {
+                if let Some(result) = self.tool_engine.execute(name, self, args).await {
+                    result
                 } else {
-                    astra_tools::ToolResult::text(output)
+                    astra_tools::ToolResult::error(format!(
+                        "Error: ToolEngine handler for '{name}' disappeared before execution"
+                    ))
                 }
             }
-            // ── Tool search (first-class activation primitive) ─────────
-            //
-            // Lets the LLM look up schemas by name via
-            // `tool_search(query="select:NAME")`.
-            // Schema pool = capability-resolved server tools + plugin schemas
-            // installed via `set_plugin_schemas`. Without the union,
-            // MCP/skill-backed tools would never resolve.
-            "tool_search" => {
-                let mut pool = crate::capabilities::server_runtime_tool_schemas(&self.capabilities);
-                // Poison recovery: recover inner so deferred activation
-                // survives a prior panic. See set_plugin_schemas doc.
-                let guard = self.plugin_schemas.read().unwrap_or_else(|poisoned| {
-                    tracing::warn!("server plugin_schemas RwLock poisoned on read; recovering.");
-                    poisoned.into_inner()
-                });
-                pool.extend(guard.iter().cloned());
-                tool_result_from_output(astra_tools::tool_search::tool_search(&pool, args))
-            }
-            // ── Web search (standalone function) ───────────────────────
-            "web_search" => {
-                let output = astra_tools::web_search::web_search(args);
-                if output.starts_with("Error") {
-                    astra_tools::ToolResult::error(output)
-                } else {
-                    astra_tools::ToolResult::text(output)
-                }
-            }
-            "publish_artifact" => self.publish_artifact(args).await,
-            "ask_user" => self.server_ask_user(args).await,
-            // ── File operations ─────────────────────────────────────────
-            // Write operations use server-specific journal recording.
-            // Read-only operations delegate to DefaultToolExecutor.
-            "web_fetch" => self.default_executor.execute("web_fetch", args).await,
-            "run_script" => self.server_run_script(args).await,
-            "read_file" => self.default_executor.execute("read_file", args).await,
-            "write_file" => {
-                // delete=true routes to delete_file handler
-                if args
-                    .get("delete")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
-                    tool_result_from_output(self.server_delete_file(args))
-                } else {
-                    tool_result_from_output(self.server_write_file(args))
-                }
-            }
-            "str_replace" => {
-                let args = match astra_tools::fs_ops::normalize_str_replace_args(args) {
-                    Ok(args) => args,
-                    Err(error) => return tool_result_from_output(error),
-                };
-                // edits array routes to multi_edit handler
-                if args.get("edits").and_then(|v| v.as_array()).is_some() {
-                    tool_result_from_output(self.server_multi_edit(&args))
-                } else {
-                    tool_result_from_output(self.server_str_replace(&args))
-                }
-            }
-            "list_dir" => self.default_executor.execute("list_dir", args).await,
-            // ── Top-level plan-mode tools ───────────────────────────────
-            "enter_plan_mode" => {
-                astra_tools::ToolResult::text(self.tool_enter_plan_mode(args).await)
-            }
-            "exit_plan_mode" => astra_tools::ToolResult::text(self.tool_exit_plan_mode(args).await),
-            // ── Consolidated session tool ──────────────────────────────
-            "session" => {
-                let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                match action {
-                    "config" => tool_result_from_output(self.adjust_config(args)),
-                    "prioritize" => tool_result_from_output(self.prioritize_tool(args)),
-                    "deprioritize" => tool_result_from_output(self.deprioritize_tool(args)),
-                    "compact" => tool_result_from_output(self.compress_context(args)),
-                    "rollback_edits" => tool_result_from_output(self.rollback_file_edits(args)),
-                    "ask_user" => self.server_ask_user(args).await,
-                    "sleep" => self.default_executor.execute("sleep", args).await,
-                    "history_page" => self.tool_session_history_page(args).await,
-                    "history_search" => self.tool_session_history_search(args).await,
-                    "history_around" => self.tool_session_history_around(args).await,
-                    "" => tool_result_from_output("Missing required parameter: action. Use: config, prioritize, deprioritize, set_goal, compact, rollback_edits, ask_user, sleep, history_page, history_search, history_around. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools.".to_string()),
-                    other => tool_result_from_output(format!("Unknown session action: '{other}'. For plan mode use `enter_plan_mode` / `exit_plan_mode`.")),
-                }
-            }
-            "prioritize_tool" => tool_result_from_output(self.prioritize_tool(args)),
-            "deprioritize_tool" => tool_result_from_output(self.deprioritize_tool(args)),
-            "introspect" => tool_result_from_output(self.handle_introspect(args)),
-            "compress_context" => tool_result_from_output(self.compress_context(args)),
-            "rollback_session_state" => {
-                tool_result_from_output(self.rollback_session_state(args).await)
-            }
-            "task" => {
-                let action_value = args.get("action");
-                let action = match action_value {
-                    Some(Value::String(action)) => action.as_str(),
-                    Some(_) => {
-                        return tool_result_from_output(
-                            "Error: field 'action' must be a string".to_string(),
-                        );
-                    }
-                    None => {
-                        return tool_result_from_output(
-                            "Error: missing required parameter `action` for `task`. Use one of: create, update, list, get, stop, list_user, adopt, archive.".to_string(),
-                        );
-                    }
-                };
-                match action {
-                    "create" => match Self::validate_task_tool_args_for_action("create", args) {
-                        Ok(()) => tool_result_from_output(self.task_action_create(args).await),
-                        Err(error) => tool_result_from_output(format!("Error: {error}")),
-                    },
-                    "list" => match Self::validate_task_tool_args_for_action("list", args) {
-                        Ok(()) => tool_result_from_output(self.task_list(args).await),
-                        Err(error) => tool_result_from_output(format!("Error: {error}")),
-                    },
-                    "get" => match Self::validate_task_tool_args_for_action("get", args) {
-                        Ok(()) => tool_result_from_output(self.task_get(args).await),
-                        Err(error) => tool_result_from_output(format!("Error: {error}")),
-                    },
-                    "update" => match Self::validate_task_tool_args_for_action("update", args) {
-                        Ok(()) => tool_result_from_output(self.task_action_update(args).await),
-                        Err(error) => tool_result_from_output(format!("Error: {error}")),
-                    },
-                    "stop" => match Self::validate_task_tool_args_for_action("stop", args) {
-                        Ok(()) => tool_result_from_output(self.task_action_stop(args).await),
-                        Err(error) => tool_result_from_output(format!("Error: {error}")),
-                    },
-                    "list_user" => {
-                        match Self::validate_task_tool_args_for_action("list_user", args) {
-                            Ok(()) => tool_result_from_output(self.task_list_user(args).await),
-                            Err(error) => tool_result_from_output(format!("Error: {error}")),
-                        }
-                    }
-                    "adopt" => match Self::validate_task_tool_args_for_action("adopt", args) {
-                        Ok(()) => tool_result_from_output(self.task_adopt(args).await),
-                        Err(error) => tool_result_from_output(format!("Error: {error}")),
-                    },
-                    "archive" => match Self::validate_task_tool_args_for_action("archive", args) {
-                        Ok(()) => tool_result_from_output(self.task_archive(args).await),
-                        Err(error) => tool_result_from_output(format!("Error: {error}")),
-                    },
-                    other => tool_result_from_output(format!(
-                        "Error: unknown `task` action '{other}'. Valid: create, update, list, get, stop, list_user, adopt, archive."
-                    )),
-                }
-            }
-            // ── Consolidated mo tool ───────────────────────────────────
-            "mo" => {
-                let action = args
-                    .get("action")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("query");
-                match action {
-                    "query" => self.server_mo_query(args),
-                    "snapshot" | "branch" => {
-                        self.default_executor
-                            .execute(&format!("mo_{action}"), args)
-                            .await
-                    }
-                    other => tool_result_from_output(format!(
-                        "Unknown mo action: '{other}'. Use: query, snapshot, branch"
-                    )),
-                }
-            }
-            // Legacy alias
-            "mo_query" => self.server_mo_query(args),
-            "rollback_database_snapshots" => {
-                tool_result_from_output(self.rollback_database_snapshots(args))
-            }
-            // ── Shell operations ───────────────────────────────────────
-            // bash uses tiered process isolation (server-specific).
-            // grep + glob delegate to DefaultToolExecutor.
-            "bash" => self.server_bash(args).await,
-            "grep" => self.default_executor.execute("grep", args).await,
-            "glob" => self.default_executor.execute("glob", args).await,
-            "symbols" => self.default_executor.execute("symbols", args).await,
-            // ── Git operations ─────────────────────────────────────────
-            // All git ops remap to the unified `git` tool with an `action`
-            // parameter, since DefaultToolExecutor only handles `"git"`.
-            "git" => self.default_executor.execute("git", args).await,
-            "git_status" | "git_diff" | "git_log" | "git_show" | "git_blame"
-            | "git_file_history" | "git_log_search" | "git_contributors" | "git_commit"
-            | "git_revert_commit" | "git_push" => {
-                let action = name.strip_prefix("git_").unwrap_or(name);
-                let mut map = args.as_object().cloned().unwrap_or_default();
-                map.insert("action".to_string(), json!(action));
-                self.default_executor
-                    .execute("git", &Value::Object(map))
-                    .await
-            }
-            "git_stash" => {
-                // Remap: the `git_stash` tool uses `action` for the stash
-                // sub-action, but `git_dispatch` reads `stash_action`.
-                let mut map = args.as_object().cloned().unwrap_or_default();
-                if let Some(action_val) = map.remove("action") {
-                    map.insert("stash_action".to_string(), action_val);
-                }
-                map.insert("action".to_string(), json!("stash"));
-                self.default_executor
-                    .execute("git", &Value::Object(map))
-                    .await
-            }
-            // ── GitHub operations ────────────────────────────────────────
-            // GitHub tools delegate to DefaultToolExecutor.
-            "github_list_prs" => self.default_executor.execute("github_list_prs", args).await,
-            "github_get_pr" => self.default_executor.execute("github_get_pr", args).await,
-            "github_ci_status" => {
-                self.default_executor
-                    .execute("github_ci_status", args)
-                    .await
-            }
-            "github_list_issues" => {
-                self.default_executor
-                    .execute("github_list_issues", args)
-                    .await
-            }
-            "github_get_issue" => {
-                self.default_executor
-                    .execute("github_get_issue", args)
-                    .await
-            }
-            "github_repo_stats" => {
-                self.default_executor
-                    .execute("github_repo_stats", args)
-                    .await
-            }
-            "github_create_issue" => {
-                self.default_executor
-                    .execute("github_create_issue", args)
-                    .await
-            }
-            "github" => self.default_executor.execute("github", args).await,
-            // ── Agent introspection ────────────────────────────────────
-            "get_agent_info" => tool_result_from_output(self.server_get_agent_info(args)),
-            // ── Consolidated agent tool ────────────────────────────────
-            "agent" => {
-                // Mirrors the CLI executor: `agent(action='delegate')` was
-                // never intercepted by `agentic::delegate_interception` (which
-                // matches on tool NAME == "delegate", not action="delegate").
-                // It silently returned a fake-success acknowledgement.
-                // Removed in favor of the consolidated agent spawn action. The standalone `delegate`
-                // tool name (below) still works — it IS intercepted upstream
-                // and routed through the real DelegationEngine.
-                let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                match action {
-                    "delegate" => astra_tools::ToolResult::error(
-                        "Error: agent.delegate has been removed because action-shaped \
-                         delegation was not intercepted by the delegation engine. Use \
-                         agent(action='spawn', description='...', prompt='...', run_in_background: true) \
-                         instead, or call the standalone `delegate` tool directly to engage \
-                         the engine.".to_string(),
-                    ),
-                    "run_chain" => self.default_executor.execute("run_chain", args).await,
-                    "spawn" | "get_result" | "send_message" => agent_tool_result_from_output(
-                        crate::orchestration::handle_agent_tool(
-                            args,
-                            self.agent_tool_context.as_ref(),
-                        )
-                        .await,
-                    ),
-                    other if other.is_empty() && args.get("spawn").is_some() => {
-                        agent_tool_result_from_output(
-                            crate::orchestration::handle_agent_tool(
-                                args,
-                                self.agent_tool_context.as_ref(),
-                            )
-                            .await,
-                        )
-                    }
-                    other if other.is_empty() && args.get("agents").is_some() => {
-                        agent_tool_result_from_output(
-                            crate::orchestration::handle_agent_tool(
-                                args,
-                                self.agent_tool_context.as_ref(),
-                            )
-                            .await,
-                        )
-                    }
-                    other => tool_result_from_output(format!(
-                        "Unknown agent action: '{other}'. Use: spawn, get_result, run_chain."
-                    )),
-                }
-            }
-            "agent_fanout" => tool_result_from_output(
-                crate::orchestration::handle_agent_fanout_tool(
-                    args,
-                    self.agent_tool_context.as_ref(),
-                )
-                .await,
-            ),
-            // Legacy alias
-            "delegate" => astra_tools::ToolResult::text(
-                "Delegation request acknowledged. The delegation engine will execute \
-                 this request and provide results in the next round."
-                    .to_string(),
-            ),
-            "notify" => {
-                let message = string_arg(args, "message").unwrap_or("");
-                if message.is_empty() {
-                    astra_tools::ToolResult::error(
-                        "Error: notify requires a non-empty message".to_string(),
-                    )
-                } else {
-                    astra_tools::ToolResult::text(format!("Notification: {message}"))
-                }
-            }
-            // ── MCP tool forwarding ──────────────────────────────────
-            _ if name.starts_with("mcp__") => self.execute_mcp_tool(name, args).await,
             // ── Unknown tool fallback ──────────────────────────────────
             _ => {
-                self.record_preview_template_missing(name).await;
-                astra_tools::ToolResult::error(format!(
-                    "Error: Tool '{name}' is not available in server-side execution mode. \
-                     Available: bash, read_file, write_file, str_replace, delete_file, rollback_file_edits, \
-                     multi_edit, list_dir, adjust_config, prioritize_tool, deprioritize_tool, compress_context, \
-                     rollback_session_state, task, sleep, tool_search, mo_query, rollback_database_snapshots, \
-                     grep, glob, git_status, git_diff, git_log, git_file_history, git_contributors, git_log_search, \
-                     git_show, git_blame, symbols, git_commit, git_stash, git_revert_commit, github_list_prs, github_get_pr, \
-                     github_ci_status, github_list_issues, github_get_issue, github_repo_stats, github_create_issue, memory_*, web_fetch, \
-                     web_search, publish_artifact, run_script, notify, ask_user, get_agent_info"
-                ))
+                record_preview_template_missing(
+                    &self.user_id,
+                    &self.session_id,
+                    self.context_manifest_pool.as_ref(),
+                    name,
+                )
+                .await;
+                unknown_local_tool_result(name)
             }
         };
 
-        result.output = astra_tools::normalize_empty_output(result.output, name);
-        let limit = astra_tools::per_tool_output_limit(name);
-        result.output = astra_tools::truncate_output(result.output, limit);
-        let agg = self
-            .aggregate_output_bytes
-            .fetch_add(result.output.len(), Ordering::Relaxed);
-        result.output = astra_tools::maybe_persist_large_output(result.output, agg, name);
-
-        if name != "memory" && !result.is_error {
-            let session_id = self.session_id.clone();
-            let ctx = format!("server-tool:{name}");
-            let client = astra_tools::memoria::MemoriaClient::new(
-                self.memoria_client.cloud_base.clone(),
-                self.memoria_client.cloud_token.clone(),
-            );
-            tokio::spawn(async move {
-                let report = client
-                    .feedback_pending_recalls(&session_id, "useful", &ctx)
-                    .await;
-                if report.attempted > 0 {
-                    tracing::debug!(
-                        session_id = %session_id,
-                        context = %ctx,
-                        attempted = report.attempted,
-                        succeeded = report.succeeded,
-                        failed = report.failed,
-                        "closed recall feedback after successful tool"
-                    );
-                }
-            });
+        let result = lifecycle.finish(name, args, &call_id, result).await;
+        if name == "tool_search" && !result.is_error {
+            self.record_tool_search_activation_output(&result.output);
         }
-
-        // ── Progress: tool completed ─────────────────────────────────
-        if let Some(cb) = &self.progress_callback {
-            cb.tool_completed(&call_id, &result.output, !result.is_error)
-                .await;
-        }
-        // ── Exactly-once: record result in cache ────────────────────
-        self.record_exactly_once_result(name, args, &result);
-
         result
     }
 
-    async fn server_ask_user(&self, args: &Value) -> astra_tools::ToolResult {
-        let prompt = match parse_ask_user_prompt(args) {
-            Ok(prompt) => prompt,
-            Err(error) => return astra_tools::ToolResult::error(error),
+    async fn run_local_tool_preflight(&self, name: &str, args: &Value) -> LocalToolPreflight {
+        let plan_mode_authoring_active = if is_plan_mode_blocked_tool(name, args) {
+            plan_mode_authoring_active(
+                self.plan_repo.as_ref(),
+                &self.session_id,
+                self.plan_mode_cache.as_ref(),
+            )
+            .await
+        } else {
+            false
         };
-
-        let Some(gate) = &self.ask_user_gate else {
-            return astra_tools::ToolResult::error(
-                "Error: ask_user requires an interactive client connection".into(),
-            );
-        };
-
-        let request_id = format!("ask-{}-{}", self.session_id, Uuid::new_v4());
-        let content = ask_user_content_preview(&prompt);
-        self.persist_ask_user_auxiliary_event(
-            "ask_user_prompted",
-            content.clone(),
-            request_id.clone(),
-            serde_json::json!({
-                "tool_name": "ask_user",
-                "request_id": request_id.clone(),
-                "ask_user": {
-                    "prompt": build_ask_user_prompt_telemetry(&prompt),
-                },
-            }),
+        run_local_tool_preflight(
+            LocalToolPreflightContext {
+                session_id: &self.session_id,
+                workspace_root: &self.workspace_root,
+                workspace_binding: self.execution_binding.workspace(),
+                approval_gate: self.approval_gate.as_deref(),
+                exactly_once_executor: self.exactly_once_executor.as_ref(),
+                plan_mode_authoring_active,
+            },
+            name,
+            args,
         )
-        .await;
-
-        match gate.request_questionnaire(&request_id, &prompt).await {
-            AskUserDecision::Submitted(submitted) => {
-                let answers = match normalize_ask_user_answers(&prompt, &submitted) {
-                    Ok(answers) => answers,
-                    Err(error) => {
-                        if let Some(cb) = &self.progress_callback {
-                            cb.ask_user_resolved(&request_id, "error", &[], None, Some(&error))
-                                .await;
-                        }
-                        self.persist_ask_user_auxiliary_event(
-                            "ask_user_error",
-                            content,
-                            request_id.clone(),
-                            serde_json::json!({
-                                "tool_name": "ask_user",
-                                "request_id": request_id.clone(),
-                                "ask_user": build_ask_user_tool_call_audit(&prompt, "error", None, Some(&error)),
-                            }),
-                        )
-                        .await;
-                        return astra_tools::ToolResult::error(error);
-                    }
-                };
-                let flattened_answers = flatten_ask_user_answers(&answers);
-                let was_custom = Some(ask_user_answers_use_freeform(&prompt, &answers));
-                if let Some(cb) = &self.progress_callback {
-                    cb.ask_user_resolved(
-                        &request_id,
-                        "submitted",
-                        &flattened_answers,
-                        was_custom,
-                        None,
-                    )
-                    .await;
-                }
-                self.persist_ask_user_auxiliary_event(
-                    "ask_user_submitted",
-                    content,
-                    request_id.clone(),
-                    serde_json::json!({
-                        "tool_name": "ask_user",
-                        "request_id": request_id.clone(),
-                        "ask_user": build_ask_user_tool_call_audit(
-                            &prompt,
-                            "submitted",
-                            Some(&answers),
-                            None,
-                        ),
-                    }),
-                )
-                .await;
-                astra_tools::ToolResult::text(answers.to_tool_result_value().to_string())
-            }
-            AskUserDecision::Cancelled => {
-                let error = "Error: ask_user was cancelled by the user";
-                if let Some(cb) = &self.progress_callback {
-                    cb.ask_user_resolved(&request_id, "cancelled", &[], None, Some(error))
-                        .await;
-                }
-                self.persist_ask_user_auxiliary_event(
-                    "ask_user_cancelled",
-                    content,
-                    request_id.clone(),
-                    serde_json::json!({
-                        "tool_name": "ask_user",
-                        "request_id": request_id.clone(),
-                        "ask_user": build_ask_user_tool_call_audit(&prompt, "cancelled", None, Some(error)),
-                    }),
-                )
-                .await;
-                astra_tools::ToolResult::error(error.into())
-            }
-            AskUserDecision::Timeout => {
-                let error = "Error: ask_user timed out waiting for user response";
-                if let Some(cb) = &self.progress_callback {
-                    cb.ask_user_resolved(&request_id, "timeout", &[], None, Some(error))
-                        .await;
-                }
-                self.persist_ask_user_auxiliary_event(
-                    "ask_user_timeout",
-                    content,
-                    request_id.clone(),
-                    serde_json::json!({
-                        "tool_name": "ask_user",
-                        "request_id": request_id.clone(),
-                        "ask_user": build_ask_user_tool_call_audit(&prompt, "timeout", None, Some(error)),
-                    }),
-                )
-                .await;
-                astra_tools::ToolResult::error(error.into())
-            }
-            AskUserDecision::Error(message) => {
-                let error = format!("Error: ask_user failed: {message}");
-                if let Some(cb) = &self.progress_callback {
-                    cb.ask_user_resolved(&request_id, "error", &[], None, Some(&error))
-                        .await;
-                }
-                self.persist_ask_user_auxiliary_event(
-                    "ask_user_error",
-                    content,
-                    request_id.clone(),
-                    serde_json::json!({
-                        "tool_name": "ask_user",
-                        "request_id": request_id.clone(),
-                        "ask_user": build_ask_user_tool_call_audit(&prompt, "error", None, Some(&error)),
-                    }),
-                )
-                .await;
-                astra_tools::ToolResult::error(format!("ask_user failed: {message}"))
-            }
-        }
+        .await
     }
 
-    async fn persist_ask_user_auxiliary_event(
-        &self,
-        event_type: &str,
-        content: String,
-        request_id: String,
-        metadata: Value,
-    ) {
-        let Some(writer) = &self.auxiliary_event_writer else {
-            return;
-        };
-        let record = crate::TurnAuxiliaryEventRecord {
-            event_id: Uuid::now_v7().to_string(),
-            user_id: self.user_id.clone(),
-            session_id: self.session_id.clone(),
-            agent_id: None,
-            event_type: event_type.to_string(),
-            content,
-            parent_event_id: None,
-            parent_event_ids: Vec::new(),
-            causal_chain_id: request_id,
-            metadata: Some(metadata),
-            reasoning_content: None,
-        };
-        if let Err(error) = writer.persist_events(vec![record]).await {
-            tracing::warn!(
-                session_id = %self.session_id,
-                event_type,
-                error = %error,
-                "failed to persist ask_user auxiliary event"
-            );
-        }
+    pub(super) async fn server_ask_user(&self, args: &Value) -> astra_tools::ToolResult {
+        execute_ask_user(
+            AskUserExecutionContext {
+                user_id: &self.user_id,
+                session_id: &self.session_id,
+                gate: self.ask_user_gate.as_deref(),
+                progress_callback: self.progress_callback.as_deref(),
+                auxiliary_event_writer: self.auxiliary_event_writer.as_deref(),
+            },
+            args,
+        )
+        .await
     }
 
     /// Set the current turn index for journal entries.
     pub fn set_turn_index(&self, idx: u32) {
         self.journal_turn_index.store(idx, Ordering::Release);
-    }
-
-    fn memory_args_with_context(&self, args: &Value) -> Value {
-        let mut isolated_args = args.clone();
-        if let Some(obj) = isolated_args.as_object_mut() {
-            obj.remove("action"); // the verb is routed via `op`, not sent to Memoria
-            obj.insert(
-                "session_id".to_string(),
-                Value::String(self.session_id.clone()),
-            );
-            obj.insert("user_id".to_string(), Value::String(self.user_id.clone()));
-            obj.insert(
-                "turn".to_string(),
-                Value::Number(serde_json::Number::from(
-                    self.journal_turn_index.load(Ordering::Relaxed),
-                )),
-            );
-        }
-        isolated_args
     }
 
     /// Reset aggregate output counter at the start of a new turn.
@@ -3171,1795 +982,6 @@ impl ServerToolExecutor {
         &self.workspace_root
     }
 
-    fn with_file_journal_mut<T>(
-        &self,
-        operation: &'static str,
-        f: impl FnOnce(&mut FileEditJournal) -> T,
-    ) -> T {
-        match self.file_journal.lock() {
-            Ok(mut journal) => f(&mut journal),
-            Err(poisoned) => {
-                tracing::warn!(
-                    operation,
-                    "file_journal mutex poisoned; recovering inner journal"
-                );
-                let mut journal = poisoned.into_inner();
-                f(&mut journal)
-            }
-        }
-    }
-
-    fn with_file_journal<T>(
-        &self,
-        operation: &'static str,
-        f: impl FnOnce(&FileEditJournal) -> T,
-    ) -> T {
-        match self.file_journal.lock() {
-            Ok(journal) => f(&journal),
-            Err(poisoned) => {
-                tracing::warn!(
-                    operation,
-                    "file_journal mutex poisoned; recovering inner journal"
-                );
-                let journal = poisoned.into_inner();
-                f(&journal)
-            }
-        }
-    }
-
-    pub(crate) fn file_journal_checkpoint(&self) -> u64 {
-        self.with_file_journal("file_journal_checkpoint", |journal| journal.checkpoint())
-    }
-
-    pub(crate) fn database_snapshot_journal_checkpoint(&self) -> u64 {
-        self.with_database_snapshot_journal("database_snapshot_journal_checkpoint", |journal| {
-            journal.checkpoint()
-        })
-    }
-
-    fn with_database_snapshot_journal_mut<T>(
-        &self,
-        operation: &'static str,
-        f: impl FnOnce(&mut DatabaseSnapshotRollbackJournal) -> T,
-    ) -> T {
-        match self.database_snapshot_journal.lock() {
-            Ok(mut journal) => f(&mut journal),
-            Err(poisoned) => {
-                tracing::warn!(
-                    operation,
-                    "database_snapshot_journal mutex poisoned; recovering inner journal"
-                );
-                let mut journal = poisoned.into_inner();
-                f(&mut journal)
-            }
-        }
-    }
-
-    fn with_database_snapshot_journal<T>(
-        &self,
-        operation: &'static str,
-        f: impl FnOnce(&DatabaseSnapshotRollbackJournal) -> T,
-    ) -> T {
-        match self.database_snapshot_journal.lock() {
-            Ok(journal) => f(&journal),
-            Err(poisoned) => {
-                tracing::warn!(
-                    operation,
-                    "database_snapshot_journal mutex poisoned; recovering inner journal"
-                );
-                let journal = poisoned.into_inner();
-                f(&journal)
-            }
-        }
-    }
-
-    fn record_database_snapshot_rollback(
-        &self,
-        snapshot_id: impl Into<String>,
-        database: Option<String>,
-    ) {
-        let turn_index = self.journal_turn_index.load(Ordering::Relaxed);
-        self.with_database_snapshot_journal_mut("record_database_snapshot_rollback", |journal| {
-            journal.record(snapshot_id, database, turn_index)
-        });
-    }
-
-    fn database_snapshot_entries(&self) -> Vec<DatabaseSnapshotRollbackEntry> {
-        self.with_database_snapshot_journal("database_snapshot_entries", |journal| journal.list())
-    }
-
-    fn database_snapshot_entry_for_snapshot(
-        &self,
-        snapshot_id: &str,
-    ) -> Option<DatabaseSnapshotRollbackEntry> {
-        self.with_database_snapshot_journal("database_snapshot_entry_for_snapshot", |journal| {
-            journal.entry_for_snapshot(snapshot_id)
-        })
-    }
-
-    fn database_snapshot_restore_plan_for_turn_since(
-        &self,
-        turn_index: u32,
-        checkpoint: u64,
-    ) -> Vec<DatabaseSnapshotRollbackEntry> {
-        self.with_database_snapshot_journal(
-            "database_snapshot_restore_plan_for_turn_since",
-            |journal| journal.restore_plan_for_turn_since(turn_index, checkpoint),
-        )
-    }
-
-    fn remove_database_snapshot_rollback(&self, snapshot_id: &str) {
-        self.with_database_snapshot_journal_mut("remove_database_snapshot_rollback", |journal| {
-            journal.remove_snapshot(snapshot_id)
-        });
-    }
-
-    fn rollback_database_snapshot_entry_json(entry: &DatabaseSnapshotRollbackEntry) -> Value {
-        let mut value = serde_json::Map::from_iter([
-            (
-                "snapshot_id".to_string(),
-                Value::String(entry.snapshot_id.clone()),
-            ),
-            (
-                "turn_index".to_string(),
-                Value::Number(serde_json::Number::from(entry.turn_index)),
-            ),
-        ]);
-        if let Some(database) = entry.database.as_ref() {
-            value.insert("database".to_string(), Value::String(database.clone()));
-        }
-        Value::Object(value)
-    }
-
-    fn restore_database_snapshot_entry(
-        &self,
-        entry: &DatabaseSnapshotRollbackEntry,
-    ) -> Result<(), String> {
-        let restore_output = mo_execute_sql(
-            &mo_restore_snapshot_sql(&entry.snapshot_id, entry.database.as_deref()),
-            None,
-        );
-        if is_mo_error(&restore_output) {
-            return Err(restore_output);
-        }
-
-        let drop_output = mo_execute_sql(&mo_drop_snapshot_sql(&entry.snapshot_id), None);
-        if is_mo_error(&drop_output) {
-            Err(format!(
-                "restored MatrixOne snapshot `{}` but failed to drop it afterwards.\n{}",
-                entry.snapshot_id, drop_output
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn server_mo_query(&self, args: &Value) -> astra_tools::ToolResult {
-        let sql = match args.get("sql").and_then(Value::as_str) {
-            Some(sql) if !sql.trim().is_empty() => sql.trim(),
-            _ => return astra_tools::ToolResult::error("Error: Missing 'sql' parameter".into()),
-        };
-
-        let allow_destructive = args
-            .get("allow_destructive")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if !allow_destructive
-            && let Some(kind) = astra_turn_core::safety_middleware::check_sql_safety(sql)
-        {
-            return astra_tools::ToolResult::error(format!(
-                "Error: {kind} statements are blocked by default. Pass \"allow_destructive\": true to confirm execution."
-            ));
-        }
-
-        let database = args.get("database").and_then(Value::as_str);
-        let resolved_database = resolved_mo_database(database);
-        let mut metadata = None;
-        if mo_query_requires_pre_state_snapshot(sql, allow_destructive) {
-            let snapshot_id = mo_pre_state_snapshot_name();
-            let snapshot_output =
-                mo_execute_sql(&mo_create_snapshot_sql(&snapshot_id, database), None);
-            if is_mo_error(&snapshot_output) {
-                return astra_tools::ToolResult::error(format!(
-                    "Error: failed to capture pre-state snapshot `{snapshot_id}` before executing query.\n{snapshot_output}"
-                ));
-            }
-            self.record_database_snapshot_rollback(
-                snapshot_id.clone(),
-                Some(resolved_database.clone()),
-            );
-            metadata = Some(serde_json::Map::from_iter([
-                (
-                    "pre_state_snapshot_id".to_string(),
-                    Value::String(snapshot_id),
-                ),
-                (
-                    "pre_state_snapshot_database".to_string(),
-                    Value::String(resolved_database),
-                ),
-            ]));
-        }
-
-        let output = mo_execute_sql(sql, database);
-        astra_tools::ToolResult {
-            is_error: is_mo_error(&output),
-            output,
-            metadata,
-            exit_semantics: None,
-        }
-    }
-
-    pub(crate) fn rollback_database_snapshots(&self, args: &Value) -> String {
-        let scope = args
-            .get("scope")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                if args.get("snapshot_id").is_some() {
-                    Some("snapshot")
-                } else {
-                    None
-                }
-            })
-            .unwrap_or("current_turn");
-
-        match scope {
-            "list" => {
-                let entries = self
-                    .database_snapshot_entries()
-                    .into_iter()
-                    .map(|entry| Self::rollback_database_snapshot_entry_json(&entry))
-                    .collect::<Vec<_>>();
-                json!({
-                    "success": true,
-                    "scope": "list",
-                    "total_entries": entries.len(),
-                    "entries": entries,
-                })
-                .to_string()
-            }
-            "snapshot" => {
-                let snapshot_id = match args.get("snapshot_id").and_then(Value::as_str) {
-                    Some(snapshot_id) if is_valid_snapshot_name(snapshot_id) => snapshot_id,
-                    Some(snapshot_id) => {
-                        return json!({
-                            "success": false,
-                            "scope": "snapshot",
-                            "error": format!("invalid snapshot_id `{snapshot_id}`"),
-                        })
-                        .to_string();
-                    }
-                    None => {
-                        return json!({
-                            "success": false,
-                            "scope": "snapshot",
-                            "error": "missing 'snapshot_id' for scope=snapshot",
-                        })
-                        .to_string();
-                    }
-                };
-                let journal_entry = self.database_snapshot_entry_for_snapshot(snapshot_id);
-                let database = args
-                    .get("database")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|database| !database.is_empty())
-                    .map(ToString::to_string)
-                    .or_else(|| {
-                        journal_entry
-                            .as_ref()
-                            .and_then(|entry| entry.database.clone())
-                    });
-                let entry = DatabaseSnapshotRollbackEntry {
-                    sequence: journal_entry.as_ref().map_or(0, |entry| entry.sequence),
-                    snapshot_id: snapshot_id.to_string(),
-                    database,
-                    turn_index: journal_entry.as_ref().map_or_else(
-                        || self.journal_turn_index.load(Ordering::Relaxed),
-                        |entry| entry.turn_index,
-                    ),
-                };
-                match self.restore_database_snapshot_entry(&entry) {
-                    Ok(()) => {
-                        self.remove_database_snapshot_rollback(snapshot_id);
-                        let database = entry.database.clone();
-                        json!({
-                            "success": true,
-                            "scope": "snapshot",
-                            "snapshot_id": snapshot_id,
-                            "database": database,
-                            "summary": format!(
-                                "Restored MatrixOne snapshot `{}`{}",
-                                snapshot_id,
-                                database
-                                    .as_deref()
-                                    .map(|database| format!(" for database `{database}`"))
-                                    .unwrap_or_default()
-                            ),
-                        })
-                        .to_string()
-                    }
-                    Err(error) => json!({
-                        "success": false,
-                        "scope": "snapshot",
-                        "snapshot_id": snapshot_id,
-                        "database": entry.database.clone(),
-                        "error": error,
-                    })
-                    .to_string(),
-                }
-            }
-            "turn" | "current_turn" => {
-                let turn_index = if scope == "turn" {
-                    match args.get("turn_index").and_then(Value::as_u64) {
-                        Some(turn_index) => turn_index as u32,
-                        None => {
-                            return json!({
-                                "success": false,
-                                "scope": "turn",
-                                "error": "missing 'turn_index' for scope=turn",
-                            })
-                            .to_string();
-                        }
-                    }
-                } else {
-                    self.journal_turn_index.load(Ordering::Relaxed)
-                };
-                let checkpoint = args
-                    .get("database_after_sequence")
-                    .or_else(|| args.get("after_sequence"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let plan = if checkpoint > 0 {
-                    self.database_snapshot_restore_plan_for_turn_since(turn_index, checkpoint)
-                } else {
-                    self.with_database_snapshot_journal(
-                        "database_snapshot_restore_plan_for_turn",
-                        |journal| journal.restore_plan_for_turn(turn_index),
-                    )
-                };
-                let mut restored = Vec::new();
-                let mut failed = Vec::new();
-                for entry in &plan {
-                    match self.restore_database_snapshot_entry(entry) {
-                        Ok(()) => {
-                            self.remove_database_snapshot_rollback(&entry.snapshot_id);
-                            restored.push(Self::rollback_database_snapshot_entry_json(entry));
-                        }
-                        Err(error) => {
-                            let mut failed_entry =
-                                Self::rollback_database_snapshot_entry_json(entry)
-                                    .as_object()
-                                    .cloned()
-                                    .unwrap_or_default();
-                            failed_entry.insert("error".to_string(), Value::String(error));
-                            failed.push(Value::Object(failed_entry));
-                        }
-                    }
-                }
-                let success = !restored.is_empty() && failed.is_empty();
-                let summary = if plan.is_empty() {
-                    format!("No recorded MatrixOne snapshots found for turn {turn_index}")
-                } else if failed.is_empty() {
-                    format!(
-                        "Restored {} MatrixOne snapshot{} for turn {turn_index}",
-                        restored.len(),
-                        if restored.len() == 1 { "" } else { "s" }
-                    )
-                } else {
-                    format!(
-                        "Restored {} MatrixOne snapshot{} for turn {turn_index} with {} failure{}",
-                        restored.len(),
-                        if restored.len() == 1 { "" } else { "s" },
-                        failed.len(),
-                        if failed.len() == 1 { "" } else { "s" }
-                    )
-                };
-                json!({
-                    "success": success,
-                    "scope": scope,
-                    "turn_index": turn_index,
-                    "restored": restored,
-                    "failed": failed,
-                    "summary": summary,
-                })
-                .to_string()
-            }
-            other => json!({
-                "success": false,
-                "error": format!(
-                    "unknown scope `{other}`. Supported: current_turn, turn, snapshot, list"
-                ),
-            })
-            .to_string(),
-        }
-    }
-
-    pub(crate) fn session_state_journal_checkpoint(&self) -> u64 {
-        self.with_session_state_journal("session_state_journal_checkpoint", |journal| {
-            journal.checkpoint()
-        })
-    }
-
-    fn with_session_state_journal_mut<T>(
-        &self,
-        operation: &'static str,
-        f: impl FnOnce(&mut SessionStateRollbackJournal) -> T,
-    ) -> T {
-        match self.session_state_journal.lock() {
-            Ok(mut journal) => f(&mut journal),
-            Err(poisoned) => {
-                tracing::warn!(
-                    operation,
-                    "session_state_journal mutex poisoned; recovering inner journal"
-                );
-                let mut journal = poisoned.into_inner();
-                f(&mut journal)
-            }
-        }
-    }
-
-    fn with_session_state_journal<T>(
-        &self,
-        operation: &'static str,
-        f: impl FnOnce(&SessionStateRollbackJournal) -> T,
-    ) -> T {
-        match self.session_state_journal.lock() {
-            Ok(journal) => f(&journal),
-            Err(poisoned) => {
-                tracing::warn!(
-                    operation,
-                    "session_state_journal mutex poisoned; recovering inner journal"
-                );
-                let journal = poisoned.into_inner();
-                f(&journal)
-            }
-        }
-    }
-
-    fn record_session_state_rollback(&self, label: String, action: SessionStateRollbackAction) {
-        let turn_index = self.journal_turn_index.load(Ordering::Relaxed);
-        self.with_session_state_journal_mut("record_session_state_rollback", |journal| {
-            journal.record(turn_index, label, action)
-        });
-    }
-
-    fn record_tool_preferences_rollback(
-        &self,
-        previous_pinned_tools: Vec<String>,
-        previous_deprioritized_tools: Vec<String>,
-        label: impl Into<String>,
-    ) {
-        self.record_session_state_rollback(
-            label.into(),
-            SessionStateRollbackAction::ToolPreferences {
-                previous_pinned_tools,
-                previous_deprioritized_tools,
-            },
-        );
-    }
-
-    fn record_adjust_config_rollback(
-        &self,
-        path: impl Into<String>,
-        old_value: Value,
-        snapshot: crate::observability::ObservabilitySessionRollbackSnapshot,
-    ) {
-        let path = path.into();
-        self.record_session_state_rollback(
-            format!("adjust_config:{path}"),
-            SessionStateRollbackAction::ConfigOverride {
-                path,
-                old_value,
-                snapshot,
-            },
-        );
-    }
-
-    fn record_compression_rollback(
-        &self,
-        turn: u32,
-        snapshot: crate::observability::ObservabilitySessionRollbackSnapshot,
-    ) {
-        self.record_session_state_rollback(
-            format!("compress_context:turn-{turn}"),
-            SessionStateRollbackAction::Compression { turn, snapshot },
-        );
-    }
-
-    fn record_task_state_rollback(&self, snapshot: TaskManagerSnapshot, label: impl Into<String>) {
-        self.record_session_state_rollback(
-            label.into(),
-            SessionStateRollbackAction::TaskState { snapshot },
-        );
-    }
-
-    fn session_state_entries(&self) -> Vec<SessionStateRollbackEntry> {
-        self.with_session_state_journal("session_state_entries", |journal| journal.list())
-    }
-
-    fn session_state_restore_plan_for_turn(
-        &self,
-        turn_index: u32,
-    ) -> Vec<SessionStateRollbackEntry> {
-        self.with_session_state_journal("session_state_restore_plan_for_turn", |journal| {
-            journal.restore_plan_for_turn(turn_index)
-        })
-    }
-
-    fn session_state_restore_plan_for_turn_since(
-        &self,
-        turn_index: u32,
-        checkpoint: u64,
-    ) -> Vec<SessionStateRollbackEntry> {
-        self.with_session_state_journal("session_state_restore_plan_for_turn_since", |journal| {
-            journal.restore_plan_for_turn_since(turn_index, checkpoint)
-        })
-    }
-
-    fn remove_session_state_rollback(&self, sequence: u64) {
-        self.with_session_state_journal_mut("remove_session_state_rollback", |journal| {
-            journal.remove_sequence(sequence)
-        });
-    }
-
-    fn restore_observability_snapshot(
-        &self,
-        snapshot: &crate::observability::ObservabilitySessionRollbackSnapshot,
-    ) -> Result<(), String> {
-        let Some(observability_session) = self.observability_session.as_ref() else {
-            return Err("No observability session available".to_string());
-        };
-        let mut session = observability_session
-            .write()
-            .map_err(|_| "Failed to acquire observability session".to_string())?;
-        session.restore_rollback_snapshot(snapshot);
-        Ok(())
-    }
-
-    fn rollback_session_state_entry_json(entry: &SessionStateRollbackEntry) -> Value {
-        let timestamp_ms = entry
-            .timestamp
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .inspect_err(|e| {
-                tracing::warn!(
-                    error = %e,
-                    "rollback timestamp predates UNIX_EPOCH, using 0"
-                );
-            })
-            .ok()
-            .map(|duration| duration.as_millis())
-            .and_then(|millis| {
-                u64::try_from(millis)
-                    .inspect_err(|e| {
-                        tracing::warn!(
-                            millis,
-                            error = %e,
-                            "rollback timestamp u64 overflow, using 0"
-                        );
-                    })
-                    .ok()
-            });
-        let mut value = serde_json::Map::from_iter([
-            ("label".to_string(), Value::String(entry.label.clone())),
-            (
-                "kind".to_string(),
-                Value::String(action_kind(&entry.action).to_string()),
-            ),
-            (
-                "turn_index".to_string(),
-                Value::Number(serde_json::Number::from(entry.turn_index)),
-            ),
-        ]);
-        if let Some(timestamp_ms) = timestamp_ms {
-            value.insert(
-                "timestamp_ms".to_string(),
-                Value::Number(serde_json::Number::from(timestamp_ms)),
-            );
-        }
-        match &entry.action {
-            SessionStateRollbackAction::ConfigOverride { path, .. } => {
-                value.insert("path".to_string(), Value::String(path.clone()));
-            }
-            SessionStateRollbackAction::Compression { turn, .. } => {
-                value.insert(
-                    "turn".to_string(),
-                    Value::Number(serde_json::Number::from(*turn)),
-                );
-            }
-            SessionStateRollbackAction::ToolPreferences { .. }
-            | SessionStateRollbackAction::TaskState { .. } => {}
-        }
-        Value::Object(value)
-    }
-
-    async fn rollback_session_state_entry(
-        &self,
-        entry: &SessionStateRollbackEntry,
-    ) -> Result<(), String> {
-        // C-SRV-2: bound any async restore step so a wedged store can't
-        // hang rollback indefinitely or be silently cancelled by an
-        // outer dropping future.
-        const ROLLBACK_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-        match &entry.action {
-            SessionStateRollbackAction::ToolPreferences {
-                previous_pinned_tools,
-                previous_deprioritized_tools,
-            } => {
-                let mut pinned = self
-                    .self_mod_pinned_tools
-                    .lock()
-                    .map_err(|_| "Failed to access pinned tools".to_string())?;
-                let mut deprioritized = self
-                    .self_mod_deprioritized_tools
-                    .lock()
-                    .map_err(|_| "Failed to access deprioritized tools".to_string())?;
-                let current_pinned = pinned.clone();
-                let current_deprioritized = deprioritized.clone();
-                *pinned = previous_pinned_tools.clone();
-                *deprioritized = previous_deprioritized_tools.clone();
-                if let Err(error) = persist_tool_preferences(
-                    &self.session_id,
-                    &pinned,
-                    &deprioritized,
-                    "server_tool_executor:rollback_session_state",
-                ) {
-                    *pinned = current_pinned;
-                    *deprioritized = current_deprioritized;
-                    return Err(format!(
-                        "failed to persist restored tool preferences: {error}"
-                    ));
-                }
-                Ok(())
-            }
-            SessionStateRollbackAction::ConfigOverride {
-                path,
-                old_value,
-                snapshot,
-            } => {
-                self.restore_observability_snapshot(snapshot)?;
-                persist_config_override(
-                    &self.session_id,
-                    path,
-                    old_value.clone(),
-                    "server_tool_executor:rollback_session_state",
-                )
-                .map_err(|error| {
-                    format!("failed to persist restored config override for {path}: {error}")
-                })
-            }
-            SessionStateRollbackAction::Compression { snapshot, .. } => {
-                self.restore_observability_snapshot(snapshot)
-            }
-            SessionStateRollbackAction::TaskState { snapshot } => {
-                // Bound the async restore: a stuck store must surface as
-                // an error, not silently drop on cancellation.
-                match tokio::time::timeout(
-                    ROLLBACK_STEP_TIMEOUT,
-                    self.task_manager.restore_snapshot(snapshot),
-                )
-                .await
-                {
-                    Ok(res) => res,
-                    Err(_) => Err(format!(
-                        "task_manager.restore_snapshot timed out after {}s",
-                        ROLLBACK_STEP_TIMEOUT.as_secs()
-                    )),
-                }
-            }
-        }
-    }
-
-    /// Decide whether a `task(action=...)` tool output represents a successful
-    /// mutation worth snapshotting for rollback.
-    ///
-    /// Conservative policy (C-SRV-1 fix): the **default is "yes"**, with
-    /// only two explicit reject paths:
-    ///   1. The output starts with `Error:` (legacy error convention).
-    ///   2. The output contains a JSON body with `"success": false`.
-    ///
-    /// Pre-fix this returned `false` when the body had no `{`, which
-    /// silently dropped the rollback snapshot for every successful
-    /// `task(action=create|update|stop)` response that was a plain
-    /// human-readable summary (e.g. just `"Created task #5: foo"`).
-    /// That made `rollback_session_state` a no-op on the most common path.
-    fn find_json_body_start(output: &str) -> Option<usize> {
-        // task_mgmt prefixes responses with a one-line summary followed by a JSON body.
-        // The JSON body starts on its own line, so look for `{` at the start of a line.
-        if output.starts_with('{') {
-            return Some(0);
-        }
-        output.find("\n{").map(|pos| pos + 1)
-    }
-
-    fn task_output_success(output: &str) -> bool {
-        if output.starts_with("Error:") {
-            return false;
-        }
-        // task_mgmt prefixes successful responses with a one-line summary
-        // followed by a JSON body (see `prefix_summary` in task_mgmt.rs).
-        // If we *can* find a JSON body, honor its explicit `success: false`;
-        // otherwise treat as a success (conservative — better to snapshot
-        // a no-op than to lose a real snapshot).
-        if let Some(pos) = Self::find_json_body_start(output) {
-            if let Ok(value) = serde_json::from_str::<Value>(&output[pos..]) {
-                if let Some(false) = value.get("success").and_then(Value::as_bool) {
-                    return false;
-                }
-            }
-            // Unparseable JSON body: don't punish the caller; treat as success.
-        }
-        true
-    }
-
-    fn validate_task_tool_args_for_action(action: &str, args: &Value) -> Result<(), String> {
-        let allowed: &[&str] = match action {
-            "create" => &[
-                "action",
-                "title",
-                "description",
-                "subtasks",
-                "active_form",
-                "owner",
-                "metadata",
-                "add_blocks",
-                "add_blocked_by",
-            ],
-            "list" => &["action", "status_filter"],
-            "get" => &["action", "task_id"],
-            "update" => &[
-                "action",
-                "task_id",
-                "new_status",
-                "title",
-                "description",
-                "subtask_id",
-                "active_form",
-                "owner",
-                "metadata",
-                "add_blocks",
-                "add_blocked_by",
-                "remove_blocks",
-                "remove_blocked_by",
-                "error_message",
-            ],
-            "stop" => &["action", "task_id", "reason"],
-            "list_user" => &["action", "user_status"],
-            "adopt" => &["action", "source_session_id", "task_id"],
-            "archive" => &["action", "task_id", "older_than_days"],
-            _ => return Ok(()),
-        };
-        let Some(obj) = args.as_object() else {
-            return Err(format!("task.{action} arguments must be an object"));
-        };
-        for key in obj.keys() {
-            if key.starts_with('_') {
-                continue;
-            }
-            if !allowed.contains(&key.as_str()) {
-                return Err(format!(
-                    "unknown field '{key}' for task.{action} (valid: {})",
-                    allowed.join(", ")
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn normalize_task_user_status(args: &Value) -> Result<&str, String> {
-        let Some(raw) = args.get("user_status") else {
-            return Ok("active");
-        };
-        let Some(status) = raw.as_str() else {
-            return Err("Error: field 'user_status' must be a string".to_string());
-        };
-        if astra_tools::task_mgmt::VALID_LIST_STATUS_FILTERS.contains(&status) {
-            Ok(status)
-        } else {
-            Err(format!(
-                "Error: invalid user_status '{}' (valid: {})",
-                status,
-                astra_tools::task_mgmt::VALID_LIST_STATUS_FILTERS.join("|")
-            ))
-        }
-    }
-
-    fn task_user_status_matches(
-        status_filter: &str,
-        status: astra_tools::task_mgmt::SessionTaskStatusKind,
-    ) -> bool {
-        match status_filter {
-            // Cross-session active means open work the user may need to
-            // resume or adopt. Keep this aligned with single-session
-            // task.list(status_filter="active"): pending + in_progress +
-            // paused.
-            "active" => status.blocks_duplicate_create(),
-            "all" => true,
-            status_filter => {
-                status == astra_tools::task_mgmt::SessionTaskStatusKind::from(status_filter)
-            }
-        }
-    }
-
-    async fn task_action_create(&self, args: &Value) -> String {
-        let mut snapshot = match self.task_manager.try_snapshot_state().await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                return format!("Error: failed to capture task rollback snapshot: {error}");
-            }
-        };
-        let task_args = Self::public_tool_arguments(args);
-        let output = self.task_manager.create(&task_args).await;
-        if Self::task_output_success(&output) {
-            if let Err(error) = self
-                .task_manager
-                .seal_snapshot_for_restore(&mut snapshot)
-                .await
-            {
-                return format!("Error: failed to seal task rollback snapshot: {error}");
-            }
-            self.record_task_state_rollback(
-                snapshot,
-                format!(
-                    "task:create:{}",
-                    task_args
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .unwrap_or("task")
-                ),
-            );
-            self.emit_task_board_snapshot("task_create", args).await;
-        }
-        output
-    }
-
-    async fn task_list(&self, args: &Value) -> String {
-        let task_args = Self::public_tool_arguments(args);
-        self.task_manager.list(&task_args).await
-    }
-
-    async fn task_get(&self, args: &Value) -> String {
-        let task_args = Self::public_tool_arguments(args);
-        self.task_manager.get(&task_args).await
-    }
-
-    async fn task_action_update(&self, args: &Value) -> String {
-        let mut snapshot = match self.task_manager.try_snapshot_state().await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                return format!("Error: failed to capture task rollback snapshot: {error}");
-            }
-        };
-        let task_args = Self::public_tool_arguments(args);
-        let output = self.task_manager.update(&task_args).await;
-        if Self::task_output_success(&output) {
-            if let Err(error) = self
-                .task_manager
-                .seal_snapshot_for_restore(&mut snapshot)
-                .await
-            {
-                return format!("Error: failed to seal task rollback snapshot: {error}");
-            }
-            self.record_task_state_rollback(
-                snapshot,
-                format!(
-                    "task:update:{}",
-                    task_args
-                        .get("task_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("task")
-                ),
-            );
-            self.emit_task_board_snapshot("task_update", args).await;
-        }
-        output
-    }
-
-    async fn task_action_stop(&self, args: &Value) -> String {
-        let mut snapshot = match self.task_manager.try_snapshot_state().await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                return format!("Error: failed to capture task rollback snapshot: {error}");
-            }
-        };
-        let task_args = Self::public_tool_arguments(args);
-        let output = self.task_manager.stop(&task_args).await;
-        if Self::task_output_success(&output) {
-            if let Err(error) = self
-                .task_manager
-                .seal_snapshot_for_restore(&mut snapshot)
-                .await
-            {
-                return format!("Error: failed to seal task rollback snapshot: {error}");
-            }
-            self.record_task_state_rollback(
-                snapshot,
-                format!(
-                    "task:stop:{}",
-                    task_args
-                        .get("task_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("task")
-                ),
-            );
-            self.emit_task_board_snapshot("task_stop", args).await;
-        }
-        output
-    }
-
-    async fn task_list_user(&self, args: &Value) -> String {
-        let status_filter = match Self::normalize_task_user_status(args) {
-            Ok(status) => status,
-            Err(err) => return err,
-        };
-        let sessions = match self.task_manager.store().load_all_sessions().await {
-            Ok(sessions) => sessions,
-            Err(e) => return format!("Error: {e}"),
-        };
-
-        let mut rows = Vec::new();
-        for (session_id, tasks) in sessions {
-            for task in tasks {
-                let include = Self::task_user_status_matches(status_filter, task.status);
-                if include {
-                    rows.push(json!({
-                        "session_id": session_id,
-                        "todo_id": task.id,
-                        "title": task.title,
-                        "status": task.status.to_string(),
-                        "updated_at": task.updated_at,
-                    }));
-                }
-            }
-        }
-        rows.sort_by(|a, b| {
-            let a_updated = a.get("updated_at").and_then(Value::as_str).unwrap_or("");
-            let b_updated = b.get("updated_at").and_then(Value::as_str).unwrap_or("");
-            b_updated.cmp(a_updated)
-        });
-        rows.truncate(200);
-        let total = rows.len();
-        format!(
-            "Cross-session todos: {total} item(s)\n{}",
-            json!({
-                "tasks": rows,
-                "total": total,
-            })
-        )
-    }
-
-    async fn task_adopt(&self, _args: &Value) -> String {
-        "Error: task(action='adopt') requires the HTTP /sessions/{session_id}/todos:execute endpoint so the source migrate and target clone use the transactional MatrixOne CAS path"
-            .to_string()
-    }
-
-    async fn task_archive(&self, args: &Value) -> String {
-        let mut snapshot = match self.task_manager.try_snapshot_state().await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                return format!("Error: failed to capture task rollback snapshot: {error}");
-            }
-        };
-        let task_args = Self::public_tool_arguments(args);
-        let output = self.task_manager.archive(&task_args).await;
-        if Self::task_output_success(&output) {
-            if let Err(error) = self
-                .task_manager
-                .seal_snapshot_for_restore(&mut snapshot)
-                .await
-            {
-                return format!("Error: failed to seal task rollback snapshot: {error}");
-            }
-            self.record_task_state_rollback(
-                snapshot,
-                format!(
-                    "task:archive:{}",
-                    task_args
-                        .get("task_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("bulk")
-                ),
-            );
-            self.emit_task_board_snapshot("task_archive", args).await;
-        }
-        output
-    }
-
-    async fn emit_task_board_snapshot(&self, reason: &str, args: &Value) {
-        if self.work_surface_event_tx.is_none() {
-            return;
-        }
-        let tasks = match self.task_manager.store().load(&self.session_id).await {
-            Ok(tasks) => tasks,
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra_runtime::work_surface",
-                    session_id = %self.session_id,
-                    error = %error,
-                    "failed to load task board snapshot after task mutation"
-                );
-                return;
-            }
-        };
-        let mut event = Map::new();
-        event.insert(
-            "type".to_string(),
-            Value::String("task_board_snapshot".to_string()),
-        );
-        event.insert(
-            "session_id".to_string(),
-            Value::String(self.session_id.clone()),
-        );
-        Self::insert_run_id(&mut event, args);
-        event.insert("reason".to_string(), Value::String(reason.to_string()));
-        event.insert("tasks".to_string(), json!(tasks));
-        self.emit_work_surface_event(event, "work-surface task board event channel unavailable")
-            .await;
-    }
-
-    async fn emit_tool_call_end(
-        &self,
-        name: &str,
-        args: &Value,
-        result: &astra_tools::ToolResult,
-        duration_ms: u64,
-    ) {
-        let Some(call_id) = Self::tool_call_id(args) else {
-            return;
-        };
-        let mut event = Map::new();
-        event.insert(
-            "type".to_string(),
-            Value::String("tool_call_end".to_string()),
-        );
-        event.insert("call_id".to_string(), Value::String(call_id.to_string()));
-        Self::insert_run_id(&mut event, args);
-        event.insert("tool".to_string(), Value::String(name.to_string()));
-        event.insert("result".to_string(), Value::String(result.output.clone()));
-        event.insert("success".to_string(), Value::Bool(!result.is_error));
-        event.insert(
-            "duration_ms".to_string(),
-            Value::Number(serde_json::Number::from(duration_ms)),
-        );
-        copy_result_routing_metadata(&mut event, result);
-        self.emit_work_surface_event(
-            event,
-            "work-surface tool completion event channel unavailable",
-        )
-        .await;
-    }
-
-    #[allow(dead_code)]
-    fn plan_task_board_fingerprint(plan: &astra_services::task_orchestrator::TaskPlan) -> String {
-        plan_task_mirror::plan_task_board_fingerprint(plan)
-    }
-
-    #[allow(dead_code)]
-    fn approved_plan_task_matches(
-        task: &SessionTask,
-        plan_id: &str,
-        plan_fingerprint: &str,
-    ) -> bool {
-        plan_task_mirror::approved_plan_task_matches(task, plan_id, plan_fingerprint)
-    }
-
-    #[allow(dead_code)]
-    fn approved_plan_step_task_matches(
-        task: &SessionTask,
-        plan_id: &str,
-        plan_fingerprint: &str,
-        plan_subtask_id: &str,
-    ) -> bool {
-        plan_task_mirror::approved_plan_step_task_matches(
-            task,
-            plan_id,
-            plan_fingerprint,
-            plan_subtask_id,
-        )
-    }
-
-    fn server_get_agent_info(&self, args: &Value) -> String {
-        let dimension = args
-            .get("dimension")
-            .and_then(Value::as_str)
-            .unwrap_or("all");
-        let identity = || {
-            serde_json::json!({
-                "name": "astra",
-                "version": env!("CARGO_PKG_VERSION"),
-                "runtime": "cloud-server",
-                "user_id": self.user_id,
-                "session_id": self.session_id,
-                "workspace": self.workspace_root.display().to_string(),
-            })
-        };
-        let capability = || {
-            let schemas = crate::capabilities::server_runtime_tool_schemas(&self.capabilities);
-            let tool_names: Vec<&str> = schemas
-                .iter()
-                .filter_map(|t| {
-                    t.get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(Value::as_str)
-                })
-                .collect();
-            serde_json::json!({
-                "tool_count": tool_names.len(),
-                "tools": tool_names,
-            })
-        };
-        match dimension {
-            "identity" => identity().to_string(),
-            "capability" => capability().to_string(),
-            _ => {
-                let mut info = identity();
-                if let Value::Object(ref mut m) = info {
-                    let cap = capability();
-                    if let Value::Object(cap_m) = cap {
-                        m.extend(cap_m);
-                    }
-                }
-                info.to_string()
-            }
-        }
-    }
-
-    fn adjust_config(&self, args: &Value) -> String {
-        let path = match args.get("path").and_then(Value::as_str) {
-            Some(path) if !path.trim().is_empty() => path.trim(),
-            _ => return json!({"error": "Missing required parameter: path"}).to_string(),
-        };
-        let value = match args.get("value") {
-            Some(value) => value,
-            None => return json!({"error": "Missing required parameter: value"}).to_string(),
-        };
-        let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
-
-        let Some(observability_session) = self.observability_session.as_ref() else {
-            return json!({"error": "No observability session available"}).to_string();
-        };
-        // LOCK ORDER: observability_session → self_mod_mutation_counter.
-        // The session guard is held across the counter lock because the
-        // mutation paths below require atomic read-modify-write of session
-        // config based on the counter check. All call sites that need both
-        // locks MUST take them in this order to avoid deadlock.
-        let mut session = match observability_session.write() {
-            Ok(guard) => guard,
-            Err(_) => {
-                return json!({"error": "Failed to acquire observability session"}).to_string();
-            }
-        };
-
-        let turn = session.turn_number;
-        let constraints = crate::self_model::ConstraintSet::default();
-        let mut counter = match self.self_mod_mutation_counter.lock() {
-            Ok(counter) => counter,
-            Err(_) => return json!({"error": "Failed to access mutation counter"}).to_string(),
-        };
-        if counter.0 != turn {
-            *counter = (turn, 0);
-        }
-        if !force && counter.1 >= constraints.max_mutations_per_turn {
-            return json!({
-                "error": "mutation_limit_exceeded",
-                "turn": turn,
-                "max_mutations_per_turn": constraints.max_mutations_per_turn,
-                "hint": "Set force=true to override governor once.",
-            })
-            .to_string();
-        }
-
-        let parse_u32 = |value: &Value| {
-            value.as_u64().and_then(|number| {
-                u32::try_from(number)
-                    .inspect_err(|e| {
-                        tracing::warn!("config_drift: u64→u32 overflow converting {number}: {e}");
-                    })
-                    .ok()
-            })
-        };
-        let parse_f64 = |value: &Value| value.as_f64();
-        let ceiling = constraints.config_drift_ceiling;
-        let session_snapshot = session.rollback_snapshot();
-        let (old_value, new_value, drift) = match path {
-            "compression.compression_threshold" => {
-                let Some(new) = parse_f64(value) else {
-                    return json!({"error": "value must be a number"}).to_string();
-                };
-                if !(0.5..=0.98).contains(&new) {
-                    return json!({"error": "compression.compression_threshold must be within [0.5, 0.98]"}).to_string();
-                }
-                let old = session.config.compression.compression_threshold;
-                let drift = normalized_drift(old, new);
-                if let Some(drift_value) = drift
-                    && !force
-                    && drift_value > ceiling
-                {
-                    return json!({
-                        "error": "config_drift_ceiling_exceeded",
-                        "path": path,
-                        "old": old,
-                        "new": new,
-                        "drift": drift_value,
-                        "ceiling": ceiling,
-                    })
-                    .to_string();
-                }
-                session.config.compression.compression_threshold = new;
-                (json!(old), json!(new), drift)
-            }
-            "memory.retrieval_top_k" => {
-                let Some(new) = parse_u32(value) else {
-                    return json!({"error": "value must be an integer"}).to_string();
-                };
-                if !(1..=20).contains(&new) {
-                    return json!({"error": "memory.retrieval_top_k must be within [1, 20]"})
-                        .to_string();
-                }
-                let old = session.config.memory.retrieval_top_k;
-                let drift = normalized_drift(old as f64, new as f64);
-                if let Some(drift_value) = drift
-                    && !force
-                    && drift_value > ceiling
-                {
-                    return json!({
-                        "error": "config_drift_ceiling_exceeded",
-                        "path": path,
-                        "old": old,
-                        "new": new,
-                        "drift": drift_value,
-                        "ceiling": ceiling,
-                    })
-                    .to_string();
-                }
-                session.config.memory.retrieval_top_k = new;
-                (json!(old), json!(new), drift)
-            }
-            "tool_selection.max_tools" => {
-                let Some(new) = parse_u32(value) else {
-                    return json!({"error": "value must be an integer"}).to_string();
-                };
-                if !(5..=80).contains(&new) {
-                    return json!({"error": "tool_selection.max_tools must be within [5, 80]"})
-                        .to_string();
-                }
-                let old = session.config.tool_selection.max_tools;
-                let drift = normalized_drift(old as f64, new as f64);
-                if let Some(drift_value) = drift
-                    && !force
-                    && drift_value > ceiling
-                {
-                    return json!({
-                        "error": "config_drift_ceiling_exceeded",
-                        "path": path,
-                        "old": old,
-                        "new": new,
-                        "drift": drift_value,
-                        "ceiling": ceiling,
-                    })
-                    .to_string();
-                }
-                session.config.tool_selection.max_tools = new;
-                (json!(old), json!(new), drift)
-            }
-            "tool_selection.tool_budget_tokens" => {
-                let Some(new) = parse_u32(value) else {
-                    return json!({"error": "value must be an integer"}).to_string();
-                };
-                if new > 40_000 {
-                    return json!({"error": "tool_selection.tool_budget_tokens must be within [0, 40000]"}).to_string();
-                }
-                let old = session.config.tool_selection.tool_budget_tokens;
-                let drift = normalized_drift(old as f64, new as f64);
-                if let Some(drift_value) = drift
-                    && !force
-                    && drift_value > ceiling
-                {
-                    return json!({
-                        "error": "config_drift_ceiling_exceeded",
-                        "path": path,
-                        "old": old,
-                        "new": new,
-                        "drift": drift_value,
-                        "ceiling": ceiling,
-                    })
-                    .to_string();
-                }
-                session.config.tool_selection.tool_budget_tokens = new;
-                (json!(old), json!(new), drift)
-            }
-            "token_budget.max_turn_input_tokens" => {
-                let Some(new) = parse_u32(value) else {
-                    return json!({"error": "value must be an integer"}).to_string();
-                };
-                if !(8_000..=200_000).contains(&new) {
-                    return json!({"error": "token_budget.max_turn_input_tokens must be within [8000, 200000]"}).to_string();
-                }
-                let old = session.config.token_budget.max_turn_input_tokens;
-                let drift = normalized_drift(old as f64, new as f64);
-                if let Some(drift_value) = drift
-                    && !force
-                    && drift_value > ceiling
-                {
-                    return json!({
-                        "error": "config_drift_ceiling_exceeded",
-                        "path": path,
-                        "old": old,
-                        "new": new,
-                        "drift": drift_value,
-                        "ceiling": ceiling,
-                    })
-                    .to_string();
-                }
-                session.config.token_budget.max_turn_input_tokens = new;
-                (json!(old), json!(new), drift)
-            }
-            "token_budget.tools_reserve" => {
-                let Some(new) = parse_u32(value) else {
-                    return json!({"error": "value must be an integer"}).to_string();
-                };
-                if !(1_000..=40_000).contains(&new) {
-                    return json!({"error": "token_budget.tools_reserve must be within [1000, 40000]"}).to_string();
-                }
-                let old = session.config.token_budget.tools_reserve;
-                let drift = normalized_drift(old as f64, new as f64);
-                if let Some(drift_value) = drift
-                    && !force
-                    && drift_value > ceiling
-                {
-                    return json!({
-                        "error": "config_drift_ceiling_exceeded",
-                        "path": path,
-                        "old": old,
-                        "new": new,
-                        "drift": drift_value,
-                        "ceiling": ceiling,
-                    })
-                    .to_string();
-                }
-                session.config.token_budget.tools_reserve = new;
-                (json!(old), json!(new), drift)
-            }
-            "verification.strictness" => {
-                let Some(new) = parse_f64(value) else {
-                    return json!({"error": "value must be a number"}).to_string();
-                };
-                if !(0.2..=0.95).contains(&new) {
-                    return json!({"error": "verification.strictness must be within [0.2, 0.95]"})
-                        .to_string();
-                }
-                let old = session.config.verification.strictness;
-                let drift = normalized_drift(old, new);
-                if let Some(drift_value) = drift
-                    && !force
-                    && drift_value > ceiling
-                {
-                    return json!({
-                        "error": "config_drift_ceiling_exceeded",
-                        "path": path,
-                        "old": old,
-                        "new": new,
-                        "drift": drift_value,
-                        "ceiling": ceiling,
-                    })
-                    .to_string();
-                }
-                session.config.verification.strictness = new;
-                (json!(old), json!(new), drift)
-            }
-            _ => {
-                return json!({
-                    "error": "Unsupported config path",
-                    "path": path,
-                    "supported_paths": [
-                        "compression.compression_threshold",
-                        "memory.retrieval_top_k",
-                        "tool_selection.max_tools",
-                        "tool_selection.tool_budget_tokens",
-                        "token_budget.max_turn_input_tokens",
-                        "token_budget.tools_reserve",
-                        "verification.strictness",
-                    ],
-                })
-                .to_string();
-            }
-        };
-
-        if let Err(error) = persist_config_override(
-            &self.session_id,
-            path,
-            new_value.clone(),
-            "server_tool_executor:adjust_config",
-        ) {
-            session.restore_rollback_snapshot(&session_snapshot);
-            return json!({
-                "error": "failed_to_persist_config_override",
-                "path": path,
-                "detail": error,
-            })
-            .to_string();
-        }
-        if let Err(error) = self.publish_current_workspace("server_tool_executor:adjust_config") {
-            session.restore_rollback_snapshot(&session_snapshot);
-            return json!({
-                "error": "failed_to_publish_workspace_artifact",
-                "path": path,
-                "detail": error,
-            })
-            .to_string();
-        }
-
-        counter.1 += 1;
-        self.record_adjust_config_rollback(path.to_string(), old_value.clone(), session_snapshot);
-        json!({
-            "status": "ok",
-            "path": path,
-            "old": old_value,
-            "new": new_value,
-            "turn": turn,
-            "mutations_this_turn": counter.1,
-            "max_mutations_per_turn": constraints.max_mutations_per_turn,
-            "drift": drift,
-            "drift_ceiling": ceiling,
-        })
-        .to_string()
-    }
-
-    fn prioritize_tool(&self, args: &Value) -> String {
-        let Some(tool) = extract_tool_name(args) else {
-            return json!({"error": "Missing required parameter: tool"}).to_string();
-        };
-        if !self.supports_server_tool_name(&tool) {
-            return json!({"error": format!("Unknown tool: {tool}")}).to_string();
-        }
-
-        let mut pinned = match self.self_mod_pinned_tools.lock() {
-            Ok(pinned) => pinned,
-            Err(_) => return json!({"error": "Failed to access pinned tools"}).to_string(),
-        };
-        let mut deprioritized = match self.self_mod_deprioritized_tools.lock() {
-            Ok(deprioritized) => deprioritized,
-            Err(_) => return json!({"error": "Failed to access deprioritized tools"}).to_string(),
-        };
-        let original_pinned = pinned.clone();
-        let original_deprioritized = deprioritized.clone();
-
-        if !pinned.contains(&tool) {
-            pinned.push(tool.clone());
-        }
-        pinned.sort();
-        deprioritized.retain(|entry| entry != &tool);
-
-        if let Err(error) = persist_tool_preferences(
-            &self.session_id,
-            &pinned,
-            &deprioritized,
-            "server_tool_executor:prioritize_tool",
-        ) {
-            *pinned = original_pinned;
-            *deprioritized = original_deprioritized;
-            return json!({
-                "error": "failed_to_persist_tool_preferences",
-                "detail": error,
-                "tool": tool,
-            })
-            .to_string();
-        }
-        if let Err(error) = self.publish_current_workspace("server_tool_executor:prioritize_tool") {
-            *pinned = original_pinned;
-            *deprioritized = original_deprioritized;
-            return json!({
-                "error": "failed_to_publish_workspace_artifact",
-                "detail": error,
-                "tool": tool,
-            })
-            .to_string();
-        }
-
-        let changed = original_pinned != *pinned || original_deprioritized != *deprioritized;
-        if changed {
-            self.record_tool_preferences_rollback(
-                original_pinned.clone(),
-                original_deprioritized.clone(),
-                format!("prioritize_tool:{tool}"),
-            );
-        }
-        json!({
-            "status": "ok",
-            "prioritized_tool": tool,
-            "previous_pinned_tools": original_pinned,
-            "previous_deprioritized_tools": original_deprioritized,
-            "pinned_tools": pinned.clone(),
-            "deprioritized_tools": deprioritized.clone(),
-        })
-        .to_string()
-    }
-
-    fn deprioritize_tool(&self, args: &Value) -> String {
-        let Some(tool) = extract_tool_name(args) else {
-            return json!({"error": "Missing required parameter: tool"}).to_string();
-        };
-        if !self.supports_server_tool_name(&tool) {
-            return json!({"error": format!("Unknown tool: {tool}")}).to_string();
-        }
-
-        let mut pinned = match self.self_mod_pinned_tools.lock() {
-            Ok(pinned) => pinned,
-            Err(_) => return json!({"error": "Failed to access pinned tools"}).to_string(),
-        };
-        let mut deprioritized = match self.self_mod_deprioritized_tools.lock() {
-            Ok(deprioritized) => deprioritized,
-            Err(_) => return json!({"error": "Failed to access deprioritized tools"}).to_string(),
-        };
-        let original_pinned = pinned.clone();
-        let original_deprioritized = deprioritized.clone();
-
-        if !deprioritized.contains(&tool) {
-            deprioritized.push(tool.clone());
-        }
-        deprioritized.sort();
-        pinned.retain(|entry| entry != &tool);
-
-        if let Err(error) = persist_tool_preferences(
-            &self.session_id,
-            &pinned,
-            &deprioritized,
-            "server_tool_executor:deprioritize_tool",
-        ) {
-            *pinned = original_pinned;
-            *deprioritized = original_deprioritized;
-            return json!({
-                "error": "failed_to_persist_tool_preferences",
-                "detail": error,
-                "tool": tool,
-            })
-            .to_string();
-        }
-        if let Err(error) = self.publish_current_workspace("server_tool_executor:deprioritize_tool")
-        {
-            *pinned = original_pinned;
-            *deprioritized = original_deprioritized;
-            return json!({
-                "error": "failed_to_publish_workspace_artifact",
-                "detail": error,
-                "tool": tool,
-            })
-            .to_string();
-        }
-
-        let changed = original_pinned != *pinned || original_deprioritized != *deprioritized;
-        if changed {
-            self.record_tool_preferences_rollback(
-                original_pinned.clone(),
-                original_deprioritized.clone(),
-                format!("deprioritize_tool:{tool}"),
-            );
-        }
-        json!({
-            "status": "ok",
-            "deprioritized_tool": tool,
-            "previous_pinned_tools": original_pinned,
-            "previous_deprioritized_tools": original_deprioritized,
-            "pinned_tools": pinned.clone(),
-            "deprioritized_tools": deprioritized.clone(),
-        })
-        .to_string()
-    }
-
-    /// Update the introspect snapshot from the agentic loop state each turn.
-    pub fn update_introspect_snapshot(
-        &self,
-        snapshot: astra_turn_core::introspect::IntrospectSnapshot,
-    ) {
-        if let Ok(mut guard) = self.introspect_snapshot.write() {
-            *guard = Some(snapshot);
-        }
-    }
-
-    fn handle_introspect(&self, args: &Value) -> String {
-        let detail_arg = args
-            .get("detail")
-            .and_then(Value::as_str)
-            .unwrap_or("summary");
-        let detail = astra_turn_core::introspect::IntrospectDetail::from_arg(detail_arg);
-
-        let snapshot = self.introspect_snapshot.read().unwrap_or_else(|poison| {
-            tracing::warn!(
-                session_id = %self.session_id,
-                "introspect_snapshot lock poisoned (writer panicked), recovering with inner data"
-            );
-            poison.into_inner()
-        }).clone();
-
-        match snapshot {
-            Some(snap) => astra_turn_core::introspect::render_introspect(&snap, detail),
-            None => "No introspection data available yet (first turn).".to_string(),
-        }
-    }
-
-    fn compress_context(&self, args: &Value) -> String {
-        let reason = args
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or("manual_request");
-        let Some(observability_session) = self.observability_session.as_ref() else {
-            return json!({"error": "No observability session available"}).to_string();
-        };
-        let mut session = match observability_session.write() {
-            Ok(guard) => guard,
-            Err(_) => {
-                return json!({"error": "Failed to acquire observability session"}).to_string();
-            }
-        };
-        let session_snapshot = session.rollback_snapshot();
-
-        let turn = if session.turn_number == 0 {
-            1
-        } else {
-            session.turn_number
-        };
-        let previous_compression_count = session.compressed_turns.len();
-        let already_compressed_this_turn = session.compressed_turns.contains(&turn);
-
-        if let Err(error) = persist_manual_compression(
-            &self.session_id,
-            turn,
-            reason,
-            "server_tool_executor:compress_context",
-        ) {
-            return json!({
-                "error": "failed_to_persist_manual_compression",
-                "detail": error,
-                "turn": turn,
-                "reason": reason,
-            })
-            .to_string();
-        }
-
-        session.record_compression(turn);
-        self.record_compression_rollback(turn, session_snapshot);
-
-        json!({
-            "status": "ok",
-            "turn": turn,
-            "reason": reason,
-            "previous_compression_count": previous_compression_count,
-            "already_compressed_this_turn": already_compressed_this_turn,
-            "compression_count": session.compressed_turns.len(),
-        })
-        .to_string()
-    }
-
-    pub(crate) async fn rollback_session_state(&self, args: &Value) -> String {
-        let scope = args
-            .get("scope")
-            .and_then(Value::as_str)
-            .unwrap_or("current_turn");
-        let explicit_turn_index = if scope == "turn" {
-            match args.get("turn_index").and_then(Value::as_u64) {
-                Some(turn_index) => Some(turn_index),
-                None => {
-                    return json!({
-                        "success": false,
-                        "error": "missing 'turn_index' for scope=turn",
-                    })
-                    .to_string();
-                }
-            }
-        } else {
-            None
-        };
-        let checkpoint = args
-            .get("session_state_after_sequence")
-            .or_else(|| args.get("after_sequence"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-
-        match scope {
-            "list" => {
-                let entries = self
-                    .session_state_entries()
-                    .into_iter()
-                    .map(|entry| Self::rollback_session_state_entry_json(&entry))
-                    .collect::<Vec<_>>();
-                json!({
-                    "success": true,
-                    "scope": "list",
-                    "total_entries": entries.len(),
-                    "entries": entries,
-                    "summary": format!(
-                        "Listed {} recorded session-state rollback entr{}",
-                        entries.len(),
-                        if entries.len() == 1 { "y" } else { "ies" },
-                    ),
-                })
-                .to_string()
-            }
-            "turn" | "current_turn" => {
-                let turn_index = explicit_turn_index
-                    .unwrap_or_else(|| self.journal_turn_index.load(Ordering::Relaxed) as u64)
-                    as u32;
-                let plan = if checkpoint > 0 {
-                    self.session_state_restore_plan_for_turn_since(turn_index, checkpoint)
-                } else {
-                    self.session_state_restore_plan_for_turn(turn_index)
-                };
-                let mut restored = Vec::new();
-                let mut failed = Vec::new();
-                for entry in &plan {
-                    match self.rollback_session_state_entry(entry).await {
-                        Ok(()) => {
-                            self.remove_session_state_rollback(entry.sequence);
-                            restored.push(Self::rollback_session_state_entry_json(entry));
-                        }
-                        Err(error) => {
-                            let mut failed_entry = Self::rollback_session_state_entry_json(entry)
-                                .as_object()
-                                .cloned()
-                                .unwrap_or_default();
-                            failed_entry.insert("error".to_string(), Value::String(error));
-                            failed.push(Value::Object(failed_entry));
-                        }
-                    }
-                }
-                let success = !restored.is_empty() && failed.is_empty();
-                if !restored.is_empty()
-                    && failed.is_empty()
-                    && let Err(error) = self
-                        .publish_current_workspace("server_tool_executor:rollback_session_state")
-                {
-                    return json!({
-                        "success": false,
-                        "scope": scope,
-                        "turn_index": turn_index,
-                        "restored": restored,
-                        "failed": [{
-                            "error": error,
-                            "kind": "workspace_artifact_publish"
-                        }],
-                        "summary": "Restored session state locally but failed to publish workspace artifact",
-                    })
-                    .to_string();
-                }
-                let summary = if plan.is_empty() {
-                    format!(
-                        "No recorded session-state rollback handles found for turn {turn_index}"
-                    )
-                } else if failed.is_empty() {
-                    format!(
-                        "Restored {} recorded session-state mutation{} for turn {turn_index}",
-                        restored.len(),
-                        if restored.len() == 1 { "" } else { "s" },
-                    )
-                } else {
-                    format!(
-                        "Restored {} recorded session-state mutation{} for turn {turn_index} with {} failure{}",
-                        restored.len(),
-                        if restored.len() == 1 { "" } else { "s" },
-                        failed.len(),
-                        if failed.len() == 1 { "" } else { "s" },
-                    )
-                };
-                json!({
-                    "success": success,
-                    "scope": scope,
-                    "turn_index": turn_index,
-                    "restored": restored,
-                    "failed": failed,
-                    "summary": summary,
-                })
-                .to_string()
-            }
-            other => json!({
-                "success": false,
-                "error": format!(
-                    "unknown scope `{other}`. Supported: current_turn, turn, list"
-                ),
-            })
-            .to_string(),
-        }
-    }
-
     // ────────────────────────────────────────────────────────────────────────
     // Plan-mode gating and tools
     // ────────────────────────────────────────────────────────────────────────
@@ -4969,1003 +991,20 @@ impl ServerToolExecutor {
     /// there is no plan, the plan is executing/completed/failed, or when no
     /// plan repository has been wired.
     ///
-    /// Cached per-executor: the first call hits the repo (1 SELECT on
-    /// `agent_sessions.active_plan_id` + 1 SELECT on `plans.plan_json`); every
-    /// subsequent call within the same plan-mode state returns instantly.
-    /// The cache is invalidated by `enter_plan_mode` / `exit_plan_mode`, which
-    /// are the only two events that change the result.
-    async fn plan_mode_authoring_active(&self) -> bool {
-        if let Some(cached) = self.plan_mode_cache.read().await.authoring_active {
-            return cached;
-        }
-        let (authoring, hint) = self.recompute_plan_mode_snapshot().await;
-        let mut w = self.plan_mode_cache.write().await;
-        w.authoring_active = Some(authoring);
-        w.resume_hint = hint;
-        authoring
-    }
-
-    /// Fresh DB query for the authoring gate + resume hint. Callers should
-    /// normally go through the cache; this is exposed so the cache-warming
-    /// path is obvious and testable.
-    async fn recompute_plan_mode_snapshot(&self) -> (bool, Option<String>) {
-        let Some(repo) = &self.plan_repo else {
-            return (false, None);
-        };
-        let Ok(Some(plan_id)) = repo.active_plan_for_session(&self.session_id).await else {
-            return (false, None);
-        };
-        match repo.load(&plan_id).await {
-            Ok(state) => {
-                // Phase is inferred from plan contents; we mirror the same
-                // logic plan_handlers uses so the gate stays consistent.
-                let has_subtasks = !state.plan.subtasks.is_empty();
-                let any_in_progress =
-                    state.plan.subtasks.iter().any(|s| {
-                        s.status == astra_services::task_orchestrator::TaskStatus::InProgress
-                    });
-                let items_done = state.plan.items_done() > 0;
-                let progress_complete = state.plan.progress_pct() == 100;
-                // Authoring = no execution activity yet. Once anything is
-                // in-progress or completed, writes are unlocked. A plan row
-                // with no subtasks yet (brand-new, pre-decomposition) also
-                // counts as authoring.
-                let authoring =
-                    !has_subtasks || (!any_in_progress && !items_done && !progress_complete);
-                let hint = astra_plan::plan_resume_prompt_hint(&state);
-                (authoring, hint)
-            }
-            Err(_) => (false, None),
-        }
-    }
-
-    /// Clear the plan-mode cache so the next authoring check re-reads from
-    /// the repo, AND push a fresh hint to the host's plan_resume_hint slot
-    /// so the next system-prompt build reflects the new state. Called by
-    /// the enter/exit tools whenever they change `active_plan_id`.
-    async fn invalidate_plan_mode_cache(&self) {
-        {
-            let mut w = self.plan_mode_cache.write().await;
-            *w = PlanModeSnapshot::default();
-        }
-        // Recompute the hint and push it to the host handle so the very next
-        // turn sees the updated prompt — without this, the host keeps the
-        // stale "A plan is currently in-flight" text even after exit_plan_mode.
-        if let Some(handle) = &self.plan_resume_hint_handle {
-            let (_, hint) = self.recompute_plan_mode_snapshot().await;
-            if let Ok(mut slot) = handle.write() {
-                *slot = hint.clone();
-            }
-            // Also warm the cache with the freshly-computed values so the
-            // next authoring check in the same turn doesn't re-query.
-            let (authoring, _) = self.recompute_plan_mode_snapshot().await;
-            let mut w = self.plan_mode_cache.write().await;
-            w.authoring_active = Some(authoring);
-            w.resume_hint = hint;
-        }
-    }
-
-    /// `enter_plan_mode` tool — mark the current session as authoring a plan
-    /// so subsequent write tools are gated. Creates a new plan row owned by
-    /// the session's user if `plan_id` isn't supplied.
-    async fn tool_enter_plan_mode(&self, args: &Value) -> String {
-        let Some(repo) = self.plan_repo.clone() else {
-            return "Error: plan repository not configured on this executor".to_string();
-        };
-        let goal = args
-            .get("goal")
-            .and_then(Value::as_str)
-            .unwrap_or("(pending)")
-            .trim()
-            .to_string();
-        let goal = if goal.is_empty() {
-            "(pending)".to_string()
-        } else {
-            goal
-        };
-
-        let plan_id = args
-            .get("plan_id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| astra_plan::PlanModeState::generate_plan_id(&goal));
-
-        // Create-or-link with CAS retry: if a concurrent editor bumped the
-        // version between our load and save, reload and retry (up to 3
-        // attempts) instead of silently dropping work.
-        const MAX_CAS_RETRIES: u32 = 3;
-        let mut last_conflict: Option<String> = None;
-        for _attempt in 0..MAX_CAS_RETRIES {
-            let (mut state, expected_version) = match repo.load(&plan_id).await {
-                Ok(mut s) => {
-                    let v = s.version;
-                    s.session_hint = Some(self.session_id.clone());
-                    (s, Some(v))
-                }
-                Err(astra_plan::PlanLoadError::NotFound(_)) => {
-                    let mut s = astra_plan::PlanModeState::new_with_owner(
-                        goal.clone(),
-                        self.user_id.clone(),
-                    );
-                    s.session_hint = Some(self.session_id.clone());
-                    (s, None)
-                }
-                Err(e) => return format!("Error: load plan: {e}"),
-            };
-
-            match repo.save(&plan_id, &mut state, expected_version).await {
-                Ok(()) => {
-                    last_conflict = None;
-                    break;
-                }
-                Err(astra_plan::PlanLoadError::Conflict { expected, actual }) => {
-                    last_conflict = Some(format!(
-                        "version conflict (expected {expected}, stored {actual})"
-                    ));
-                    continue;
-                }
-                Err(e) => return format!("Error: save plan: {e}"),
-            }
-        }
-        if let Some(conflict) = last_conflict {
-            return format!("Error: save plan after {MAX_CAS_RETRIES} retries: {conflict}");
-        }
-
-        if let Err(e) = repo.set_active_plan(&self.session_id, Some(&plan_id)).await {
-            return format!("Error: link plan to session: {e}");
-        }
-
-        // Invalidate so the next write tool and the next system-prompt build
-        // both observe the freshly-linked plan instead of reading a stale
-        // "no active plan" cache entry populated before the tool fired.
-        self.invalidate_plan_mode_cache().await;
-
-        // Journal the entry so session audit surfaces show it.
-        if let Ok(writer) = astra_services::session_journal::JournalWriter::new(&self.session_id) {
-            let _ = writer.append(
-                &astra_services::session_journal::JournalEvent::plan_lifecycle(
-                    Some(&self.session_id),
-                    "plan_mode_entered",
-                    Some(serde_json::json!({
-                        "plan_id": plan_id,
-                        "goal": goal,
-                    })),
-                ),
-            );
-        }
-
-        format!(
-            "Entered plan mode. plan_id={} goal=\"{}\". Write tools are now blocked — \
-             author the plan, then call `exit_plan_mode` with `approved=true` when ready.",
-            plan_id, goal
-        )
-    }
-
-    /// `exit_plan_mode` tool — submit the authored plan for trusted user
-    /// approval. Model-supplied tool arguments must not unlock writes.
-    async fn tool_exit_plan_mode(&self, args: &Value) -> String {
-        let Some(repo) = self.plan_repo.clone() else {
-            return "Error: plan repository not configured on this executor".to_string();
-        };
-
-        let active = match repo.active_plan_for_session(&self.session_id).await {
-            Ok(Some(id)) => id,
-            Ok(None) => {
-                return "Note: session has no active plan; nothing to exit.".to_string();
-            }
-            Err(e) => return format!("Error: lookup active plan: {e}"),
-        };
-
-        if let Some(plan_md) = args
-            .get("plan")
-            .and_then(Value::as_str)
-            .or_else(|| args.get("plan_md").and_then(Value::as_str))
-        {
-            // CAS retry: reload + re-save on version conflict so concurrent
-            // plan edits don't silently drop submitted markdown.
-            const MAX_CAS_RETRIES: u32 = 3;
-            let mut last_conflict: Option<String> = None;
-            for _attempt in 0..MAX_CAS_RETRIES {
-                let mut state = match repo.load(&active).await {
-                    Ok(state) => state,
-                    Err(e) => return format!("Error: load active plan: {e}"),
-                };
-                state.plan_md = Some(plan_md.to_string());
-                let expected = Some(state.version);
-                match repo.save(&active, &mut state, expected).await {
-                    Ok(()) => {
-                        last_conflict = None;
-                        break;
-                    }
-                    Err(astra_plan::PlanLoadError::Conflict { expected, actual }) => {
-                        last_conflict = Some(format!(
-                            "version conflict (expected {expected}, stored {actual})"
-                        ));
-                        continue;
-                    }
-                    Err(e) => return format!("Error: save submitted plan markdown: {e}"),
-                }
-            }
-            if let Some(conflict) = last_conflict {
-                return format!(
-                    "Error: save submitted plan markdown after {MAX_CAS_RETRIES} retries: {conflict}"
-                );
-            }
-        }
-
-        self.invalidate_plan_mode_cache().await;
-
-        if let Ok(writer) = astra_services::session_journal::JournalWriter::new(&self.session_id) {
-            let _ = writer.append(
-                &astra_services::session_journal::JournalEvent::plan_lifecycle(
-                    Some(&self.session_id),
-                    "plan_submitted_for_approval",
-                    Some(serde_json::json!({ "plan_id": active })),
-                ),
-            );
-        }
-
-        format!(
-            "Plan {active} submitted for trusted user approval. Write tools remain blocked until the UI/control plane records the user's approval."
-        )
-    }
-
-    // File operations (sandboxed to workspace_root)
-    // ────────────────────────────────────────────────────────────────────────
-
-    fn resolve_path(&self, relative: &str) -> Result<PathBuf, String> {
-        astra_tools::fs_ops::resolve_path(&self.workspace_root, relative)
-    }
-
-    fn resolve_publish_artifact_path(&self, raw_path: &str) -> Result<(PathBuf, Vec<u8>), String> {
-        let candidate = self.workspace_root.join(raw_path);
-        let canonical = candidate.canonicalize().map_err(|error| {
-            format!(
-                "Error: publish_artifact path does not resolve to an existing file: {} ({error})",
-                candidate.display()
-            )
-        })?;
-
-        // `publish_artifact` is intentionally narrower than arbitrary file
-        // access: only files under the session workspace or /tmp are allowed.
-        let mut allowed = false;
-        for root in [&self.workspace_root] {
-            if let Ok(canonical_root) = root.canonicalize() {
-                if canonical.starts_with(&canonical_root) {
-                    allowed = true;
-                    break;
-                }
-            }
-        }
-        if !allowed {
-            if let Ok(temp_root) = std::env::temp_dir().canonicalize() {
-                if canonical.starts_with(&temp_root) {
-                    allowed = true;
-                }
-            }
-        }
-        if !allowed {
-            return Err(format!(
-                "Error: publish_artifact can only publish files under the session workspace or /tmp: {}",
-                canonical.display()
-            ));
-        }
-
-        // **TOCTOU defense**: open and read the canonical file immediately
-        // while we still hold the resolved path.  Without this, a symlink
-        // swap between canonicalize and tokio::fs::read could redirect the
-        // read to an arbitrary file.
-        let bytes = std::fs::read(&canonical).map_err(|error| {
-            format!(
-                "Error: publish_artifact failed to read resolved file: {} ({error})",
-                canonical.display()
-            )
-        })?;
-
-        Ok((canonical, bytes))
-    }
-
-    fn server_write_file(&self, args: &Value) -> String {
-        let prepared = match astra_tools::fs_ops::prepare_write_file(&self.workspace_root, args) {
-            Ok(prepared) => prepared,
-            Err(error) => return error.output,
-        };
-
-        // Record journal entry before writing
-        let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
-        self.with_file_journal_mut("server_write_file:record_before", |journal| {
-            journal.record_before(prepared.path(), "server-write", turn_idx);
-        });
-
-        let result = prepared.apply();
-        if !result.is_error {
-            self.with_file_journal_mut("server_write_file:record_after", |journal| {
-                journal.record_after(prepared.path(), "server-write", prepared.content_bytes());
-            });
-        }
-        result.output
-    }
-
-    fn server_str_replace(&self, args: &Value) -> String {
-        let prepared = match astra_tools::fs_ops::prepare_str_replace(&self.workspace_root, args) {
-            Ok(prepared) => prepared,
-            Err(error) => return error.output,
-        };
-        let dry_run = prepared.is_dry_run();
-
-        if dry_run {
-            return prepared.apply().output;
-        }
-
-        let path = prepared.path().to_owned();
-        let new_content_bytes = prepared.new_content_bytes().to_vec();
-
-        // Record journal entry
-        let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
-        self.with_file_journal_mut("server_str_replace:record_before", |journal| {
-            journal.record_before_patch(&path, "server-str-replace", turn_idx);
-        });
-
-        let result = prepared.apply();
-        if !result.is_error {
-            self.with_file_journal_mut("server_str_replace:record_after", |journal| {
-                journal.record_after(&path, "server-str-replace", &new_content_bytes);
-            });
-        }
-        result.output
-    }
-
-    fn server_multi_edit(&self, args: &Value) -> String {
-        let prepared = match astra_tools::fs_ops::prepare_multi_edit(&self.workspace_root, args) {
-            Ok(prepared) => prepared,
-            Err(error) => return error.output,
-        };
-
-        if !args
-            .get("dry_run")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
-            self.with_file_journal_mut("server_multi_edit:record_before", |journal| {
-                journal.record_before_patch(prepared.path(), "server-multi-edit", turn_idx);
-            });
-        }
-
-        let result = prepared.apply();
-        if !result.is_error
-            && !args
-                .get("dry_run")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        {
-            self.with_file_journal_mut("server_multi_edit:record_after", |journal| {
-                journal.record_after(
-                    prepared.path(),
-                    "server-multi-edit",
-                    prepared.new_content_bytes(),
-                );
-            });
-        }
-        result.output
-    }
-
-    fn server_delete_file(&self, args: &Value) -> String {
-        let prepared = match astra_tools::fs_ops::prepare_delete_file(&self.workspace_root, args) {
-            Ok(prepared) => prepared,
-            Err(error) => return error.output,
-        };
-        let path = prepared.path().to_path_buf();
-        let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
-
-        let result = prepared.apply();
-        if !result.is_error {
-            self.with_file_journal_mut("server_delete_file:record_delete", |journal| {
-                journal.record_delete(
-                    &path,
-                    "server-delete",
-                    turn_idx,
-                    prepared.into_before_content(),
-                );
-            });
-        }
-        result.output
-    }
-
-    fn rollback_display_path(&self, path: &Path) -> String {
-        self.relative_to_workspace_root(path)
-            .unwrap_or_else(|| path.to_path_buf())
-            .display()
-            .to_string()
-    }
-
-    fn relative_to_workspace_root(&self, path: &Path) -> Option<PathBuf> {
-        let path_variants = unique_path_variants(path);
-        let root_variants = unique_path_variants(&self.workspace_root);
-
-        path_variants.iter().find_map(|candidate| {
-            root_variants.iter().find_map(|root| {
-                candidate
-                    .strip_prefix(root)
-                    .ok()
-                    .map(std::path::Path::to_path_buf)
-            })
-        })
-    }
-
-    fn rollback_path_candidates(&self, raw_path: &str, resolved: &Path) -> Vec<PathBuf> {
-        let mut candidates = Vec::new();
-        let mut push_unique = |candidate: PathBuf| {
-            if !candidates.iter().any(|existing| existing == &candidate) {
-                candidates.push(candidate);
-            }
-        };
-
-        for variant in unique_path_variants(resolved) {
-            push_unique(variant);
-        }
-
-        let relative = if Path::new(raw_path).is_absolute() {
-            self.relative_to_workspace_root(Path::new(raw_path))
-        } else {
-            Some(normalize_path(Path::new(raw_path)))
-        };
-
-        if let Some(relative) = relative {
-            push_unique(self.workspace_root.join(&relative));
-            if let Ok(canonical_root) = self.workspace_root.canonicalize() {
-                push_unique(canonical_root.join(relative));
-            }
-        }
-
-        candidates
-    }
-
-    pub(crate) fn rollback_file_edits(&self, args: &Value) -> String {
-        let scope = args
-            .get("scope")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                if args.get("path").is_some() {
-                    Some("file")
-                } else {
-                    None
-                }
-            })
-            .unwrap_or("current_turn");
-
-        match scope {
-            "list" => {
-                let summary =
-                    self.with_file_journal("rollback_file_edits:list", |journal| journal.summary());
-                let entries: Vec<Value> = summary
-                    .into_iter()
-                    .map(|(path, turn_index, edit_type)| {
-                        json!({
-                            "path": self.rollback_display_path(&path),
-                            "turn_index": turn_index,
-                            "edit_type": edit_type_label(edit_type),
-                        })
-                    })
-                    .collect();
-                json!({
-                    "success": true,
-                    "scope": "list",
-                    "total_entries": entries.len(),
-                    "entries": entries,
-                })
-                .to_string()
-            }
-            "file" => {
-                let raw_path = match args.get("path").and_then(Value::as_str) {
-                    Some(path) => path,
-                    None => {
-                        return json!({
-                            "success": false,
-                            "error": "missing 'path' for scope=file",
-                        })
-                        .to_string();
-                    }
-                };
-                let path = match self.resolve_path(raw_path) {
-                    Ok(path) => path,
-                    Err(error) => return error,
-                };
-                let rollback_candidates = self.rollback_path_candidates(raw_path, &path);
-                let undo_result = self.with_file_journal("rollback_file_edits:file", |journal| {
-                    undo_file_with_candidates(journal, &rollback_candidates)
-                });
-                match undo_result {
-                    Ok(Some((rolled_back_path, edit_type))) => json!({
-                        "success": true,
-                        "scope": "file",
-                        "path": self.rollback_display_path(&rolled_back_path),
-                        "edit_type": edit_type_label(edit_type),
-                        "summary": format!(
-                            "Rolled back the latest recorded edit for {}",
-                            self.rollback_display_path(&rolled_back_path)
-                        ),
-                    })
-                    .to_string(),
-                    Ok(None) => json!({
-                        "success": false,
-                        "scope": "file",
-                        "path": self.rollback_display_path(&path),
-                        "error": "no recorded file edit found for that path",
-                    })
-                    .to_string(),
-                    Err(error) => json!({
-                        "success": false,
-                        "scope": "file",
-                        "path": self.rollback_display_path(&path),
-                        "error": error.to_string(),
-                    })
-                    .to_string(),
-                }
-            }
-            "turn" | "current_turn" => {
-                let turn_index = if scope == "turn" {
-                    match args.get("turn_index").and_then(Value::as_u64) {
-                        Some(turn_index) => turn_index as u32,
-                        None => {
-                            return json!({
-                                "success": false,
-                                "error": "missing 'turn_index' for scope=turn",
-                            })
-                            .to_string();
-                        }
-                    }
-                } else {
-                    self.journal_turn_index.load(Ordering::Relaxed)
-                };
-                let checkpoint = args
-                    .get("file_after_sequence")
-                    .or_else(|| args.get("after_sequence"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let result = match self.file_journal.lock() {
-                    Ok(journal) => journal.undo_turn_since(turn_index, checkpoint),
-                    Err(poisoned) => poisoned
-                        .into_inner()
-                        .undo_turn_since(turn_index, checkpoint),
-                };
-                let reverted: Vec<String> = result
-                    .reverted
-                    .iter()
-                    .map(|path| self.rollback_display_path(path))
-                    .collect();
-                let failed: Vec<Value> = result
-                    .failed
-                    .iter()
-                    .map(|(path, error)| {
-                        json!({
-                            "path": self.rollback_display_path(path),
-                            "error": error,
-                        })
-                    })
-                    .collect();
-                let success = !reverted.is_empty() && failed.is_empty();
-                let summary = if reverted.is_empty() {
-                    format!("No recorded file edits found for turn {turn_index}")
-                } else if failed.is_empty() {
-                    format!(
-                        "Rolled back {} file edit{} from turn {turn_index}",
-                        reverted.len(),
-                        if reverted.len() == 1 { "" } else { "s" }
-                    )
-                } else {
-                    format!(
-                        "Rolled back {} file edit{} from turn {turn_index} with {} failure{}",
-                        reverted.len(),
-                        if reverted.len() == 1 { "" } else { "s" },
-                        failed.len(),
-                        if failed.len() == 1 { "" } else { "s" }
-                    )
-                };
-                json!({
-                    "success": success,
-                    "scope": scope,
-                    "turn_index": turn_index,
-                    "reverted": reverted,
-                    "failed": failed,
-                    "summary": summary,
-                })
-                .to_string()
-            }
-            other => json!({
-                "success": false,
-                "error": format!(
-                    "invalid 'scope': {other} (expected one of current_turn, turn, file, list)"
-                ),
-            })
-            .to_string(),
-        }
-    }
-
     // ────────────────────────────────────────────────────────────────────────
     // Shell operations (sandboxed)
     // ────────────────────────────────────────────────────────────────────────
 
     async fn server_bash(&self, args: &Value) -> astra_tools::ToolResult {
-        let command = match args.get("command").and_then(|v| v.as_str()) {
-            Some(c) => c,
-            None => {
-                return astra_tools::ToolResult::error(
-                    "Error: Missing 'command' parameter".to_string(),
-                );
-            }
-        };
-        if let Err(reason) = astra_tools::shell_ops::validate_execute_bash_command(command) {
-            return astra_tools::ToolResult::error(reason);
-        }
-        if let Some(reason) = server_sandbox_local_path_mismatch(
-            command,
+        execute_server_bash(
+            &self.default_executor,
+            &self.sandbox_policy,
             &self.workspace_root,
-            &self.workspace_binding,
-        ) {
-            return workspace_path_mismatch_tool_result(reason);
-        }
-        let timeout_secs = args
-            .get("timeout")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(30.0)
-            .min(self.sandbox_policy.max_execution_secs);
-
-        let tier = effective_tier("bash", self.sandbox_policy.mode);
-        let wrapped_command = wrap_command_with_limits(&self.sandbox_policy, command);
-        match tier {
-            ToolTier::Isolated => {
-                let mut config = IsolationConfig::strict(self.workspace_root.clone());
-                config.timeout = Duration::from_secs_f64(timeout_secs);
-                config.net_namespace = !self.sandbox_policy.network_allowed;
-                let env = filter_environment(&self.sandbox_policy);
-                let out = execute_isolated(&wrapped_command, &env, &config).await;
-                tool_result_from_server_bash_output(command, out, timeout_secs)
-            }
-            ToolTier::Sandboxed => {
-                let mut config = IsolationConfig::sandboxed(self.workspace_root.clone());
-                config.timeout = Duration::from_secs_f64(timeout_secs);
-                let env = filter_environment(&self.sandbox_policy);
-                let out = execute_isolated(&wrapped_command, &env, &config).await;
-                tool_result_from_server_bash_output(command, out, timeout_secs)
-            }
-            ToolTier::InProcess => self.default_executor.execute("bash", args).await,
-        }
-    }
-}
-
-fn tool_result_from_server_bash_output(
-    command: &str,
-    output: IsolatedOutput,
-    timeout_secs: f64,
-) -> astra_tools::ToolResult {
-    let body = format_server_bash_output(&output, timeout_secs);
-    if output.timed_out {
-        return tool_timeout_tool_result(format!("Error: {body}"));
-    }
-    let semantics = output.exit_code.map(|code| classify_exit(command, code));
-    let result_class =
-        classify_command_result(command, &output.stdout, &output.stderr, output.exit_code);
-    let mut result = if output.exit_code.is_some_and(|code| code != 0)
-        && semantics.is_some_and(|semantics| semantics.is_tool_error())
-        || result_class.is_tool_error()
-        || output.exit_code.is_none() && output.stdout.is_empty() && !output.stderr.is_empty()
-    {
-        astra_tools::ToolResult::error(format!("Error: {body}"))
-    } else {
-        astra_tools::ToolResult::text(body)
-    };
-    if let Some(semantics) = semantics {
-        result = result.with_exit_semantics(semantics);
-    }
-    result = result.with_result_class(result_class);
-    result
-}
-
-fn format_server_bash_output(output: &IsolatedOutput, timeout_secs: f64) -> String {
-    let mut body = String::new();
-    if !output.stdout.is_empty() {
-        body.push_str(&output.stdout);
-    }
-    if !output.stderr.is_empty() {
-        if !body.is_empty() {
-            body.push('\n');
-        }
-        body.push_str("stderr:\n");
-        body.push_str(&output.stderr);
-    }
-    if let Some(code) = output.exit_code {
-        if code != 0 {
-            if !body.is_empty() && !body.ends_with('\n') {
-                body.push('\n');
-            }
-            body.push_str(&format!("(exit code: {code})"));
-        }
-    }
-    if output.stdout_capped || output.stderr_capped {
-        if !body.is_empty() && !body.ends_with('\n') {
-            body.push('\n');
-        }
-        body.push_str(&format!(
-            "[output capped: {} limit reached]",
-            capped_streams_label(output.stdout_capped, output.stderr_capped)
-        ));
-    }
-
-    if output.timed_out {
-        if !body.is_empty() && !body.ends_with('\n') {
-            body.push('\n');
-        }
-        body.push_str(&format!(
-            "[bash timed out after {}; partial output shown]",
-            format_timeout_seconds(timeout_secs)
-        ));
-    }
-
-    body
-}
-
-fn capped_streams_label(stdout_capped: bool, stderr_capped: bool) -> &'static str {
-    match (stdout_capped, stderr_capped) {
-        (true, true) => "stdout, stderr",
-        (true, false) => "stdout",
-        (false, true) => "stderr",
-        (false, false) => "output",
-    }
-}
-
-fn format_timeout_seconds(timeout_secs: f64) -> String {
-    let mut text = format!("{timeout_secs:.3}");
-    while text.contains('.') && text.ends_with('0') {
-        text.pop();
-    }
-    if text.ends_with('.') {
-        text.pop();
-    }
-    format!("{text}s")
-}
-
-fn edit_type_label(edit_type: EditType) -> &'static str {
-    match edit_type {
-        EditType::Create => "create",
-        EditType::Overwrite => "overwrite",
-        EditType::Patch => "patch",
-        EditType::Delete => "delete",
-    }
-}
-
-fn ask_user_content_preview(prompt: &AskUserPrompt) -> String {
-    prompt
-        .questions
-        .first()
-        .map(|question| question.question.clone())
-        .unwrap_or_else(|| "ask_user".to_string())
-}
-
-fn flatten_ask_user_answers(answers: &AskUserAnswers) -> Vec<String> {
-    answers
-        .answers
-        .iter()
-        .flat_map(|answer| answer.answers.iter().cloned())
-        .collect()
-}
-
-fn ask_user_answers_use_freeform(prompt: &AskUserPrompt, answers: &AskUserAnswers) -> bool {
-    answers.answers.iter().any(|answer| {
-        prompt
-            .questions
-            .iter()
-            .find(|question| question.question == answer.question)
-            .map(|question| {
-                let option_labels = question
-                    .options
-                    .iter()
-                    .map(|option| option.label.as_str())
-                    .collect::<std::collections::HashSet<_>>();
-                answer
-                    .answers
-                    .iter()
-                    .any(|item| !option_labels.contains(item.as_str()))
-            })
-            .unwrap_or(false)
-    })
-}
-
-fn tool_result_from_output(output: String) -> astra_tools::ToolResult {
-    let parsed = serde_json::from_str::<Value>(&output).ok();
-    let json_error = parsed
-        .as_ref()
-        .and_then(|value| value.get("success").and_then(Value::as_bool))
-        .is_some_and(|success| !success)
-        || parsed
-            .as_ref()
-            .and_then(|value| value.get("error"))
-            .is_some();
-    if output.starts_with("Error:") || output.starts_with("SANDBOX_DENIED:") || json_error {
-        astra_tools::ToolResult::error(output)
-    } else {
-        astra_tools::ToolResult::text(output)
-    }
-}
-
-fn normalized_wait_reason(reason: &str) -> String {
-    reason
-        .trim()
-        .strip_prefix("waiting:")
-        .unwrap_or_else(|| reason.trim())
-        .trim()
-        .to_ascii_lowercase()
-}
-
-fn execution_boundary_wait_error_kind(reason: &str) -> Option<&'static str> {
-    let normalized = normalized_wait_reason(reason);
-    if normalized == TOOL_ERROR_KIND_EXECUTOR_OFFLINE
-        || normalized.starts_with(&format!("{TOOL_ERROR_KIND_EXECUTOR_OFFLINE}:"))
-    {
-        Some(TOOL_ERROR_KIND_EXECUTOR_OFFLINE)
-    } else if normalized == TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED
-        || normalized.starts_with(&format!("{TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED}:"))
-    {
-        Some(TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED)
-    } else if normalized == TOOL_ERROR_KIND_FALLBACK_DISABLED
-        || normalized.starts_with(&format!("{TOOL_ERROR_KIND_FALLBACK_DISABLED}:"))
-    {
-        Some(TOOL_ERROR_KIND_FALLBACK_DISABLED)
-    } else {
-        None
-    }
-}
-
-fn agent_tool_result_from_output(output: String) -> astra_tools::ToolResult {
-    let parsed = serde_json::from_str::<Value>(&output).ok();
-    let waiting_reason = parsed.as_ref().and_then(|value| {
-        let status = value.get("status").and_then(Value::as_str)?;
-        if status != "waiting" {
-            return None;
-        }
-        Some(
-            value
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("waiting"),
+            self.execution_binding.workspace(),
+            args,
         )
-    });
-
-    let Some(reason) = waiting_reason else {
-        return tool_result_from_output(output);
-    };
-
-    let normalized_reason = normalized_wait_reason(reason);
-    let error_kind =
-        execution_boundary_wait_error_kind(reason).unwrap_or(TOOL_ERROR_KIND_AGENT_WAITING);
-    let mut result = astra_tools::ToolResult::error(output);
-    let mut metadata = Map::new();
-    metadata.insert(
-        "error_kind".to_string(),
-        Value::String(error_kind.to_string()),
-    );
-    metadata.insert("reason".to_string(), Value::String(normalized_reason));
-    metadata.insert("blocked".to_string(), Value::Bool(true));
-    metadata.insert(
-        "agent_status".to_string(),
-        Value::String("waiting".to_string()),
-    );
-    if let Some(agent_id) = parsed
-        .as_ref()
-        .and_then(|value| value.get("agent_id"))
-        .and_then(Value::as_str)
-    {
-        metadata.insert("agent_id".to_string(), Value::String(agent_id.to_string()));
+        .await
     }
-    result.metadata = Some(metadata);
-    result
-}
-
-fn approval_timeout_tool_result() -> astra_tools::ToolResult {
-    let mut result =
-        astra_tools::ToolResult::error("Tool execution denied: approval request timed out".into());
-    result.metadata = Some(Map::from_iter([
-        (
-            "error_kind".to_string(),
-            Value::String(TOOL_ERROR_KIND_APPROVAL_TIMEOUT.to_string()),
-        ),
-        (
-            "reason".to_string(),
-            Value::String(TOOL_ERROR_KIND_APPROVAL_TIMEOUT.to_string()),
-        ),
-        ("blocked".to_string(), Value::Bool(true)),
-    ]));
-    result
-}
-
-fn tool_timeout_tool_result(message: String) -> astra_tools::ToolResult {
-    let mut result = astra_tools::ToolResult::error(message);
-    result.metadata = Some(Map::from_iter([
-        (
-            "error_kind".to_string(),
-            Value::String(TOOL_ERROR_KIND_TOOL_TIMEOUT.to_string()),
-        ),
-        (
-            "reason".to_string(),
-            Value::String(TOOL_ERROR_KIND_TOOL_TIMEOUT.to_string()),
-        ),
-    ]));
-    result
-}
-
-fn annotate_default_executor_cancel_if_needed(
-    tool_name: &str,
-    result: &mut astra_tools::ToolResult,
-) {
-    if !result.is_error || result_metadata_str(result, "error_kind").is_some() {
-        return;
-    }
-    let cancelled_before = format!("Tool '{tool_name}' cancelled before completion");
-    let not_executed = format!("Tool '{tool_name}' not executed: run was cancelled");
-    if result.output != cancelled_before && result.output != not_executed {
-        return;
-    }
-    result.metadata = Some(Map::from_iter([
-        (
-            "error_kind".to_string(),
-            Value::String(TOOL_ERROR_KIND_CANCELLED.to_string()),
-        ),
-        (
-            "reason".to_string(),
-            Value::String(TOOL_ERROR_KIND_CANCELLED.to_string()),
-        ),
-        ("cancelled".to_string(), Value::Bool(true)),
-    ]));
-}
-
-fn workspace_path_mismatch_tool_result(message: String) -> astra_tools::ToolResult {
-    let mut result = astra_tools::ToolResult::error(message);
-    result.metadata = Some(Map::from_iter([
-        (
-            "error_kind".to_string(),
-            Value::String(TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH.to_string()),
-        ),
-        (
-            "reason".to_string(),
-            Value::String(TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH.to_string()),
-        ),
-        ("blocked".to_string(), Value::Bool(true)),
-    ]));
-    result
-}
-
-const RESULT_ROUTING_METADATA_FIELDS: &[&str] = &[
-    "workspace",
-    "executor",
-    "transport",
-    "fallback_policy",
-    "error_kind",
-    "reason",
-    "blocked",
-    "cancelled",
-    "agent_id",
-    "agent_status",
-];
-
-fn copy_result_routing_metadata(event: &mut Map<String, Value>, result: &astra_tools::ToolResult) {
-    let Some(metadata) = result.metadata.as_ref() else {
-        return;
-    };
-    for key in RESULT_ROUTING_METADATA_FIELDS {
-        if let Some(value) = metadata.get(*key) {
-            event
-                .entry((*key).to_string())
-                .or_insert_with(|| value.clone());
-        }
-    }
-}
-
-fn result_metadata_str<'a>(result: &'a astra_tools::ToolResult, key: &str) -> Option<&'a str> {
-    result
-        .metadata
-        .as_ref()
-        .and_then(|metadata| metadata.get(key))
-        .and_then(Value::as_str)
 }
 
 // ─── ToolExecutor trait implementation ────────────────────────────────────────
@@ -5981,12 +1020,7 @@ impl ServerLocalToolTransport for ServerToolExecutor {
         &self,
         request: &ToolExecutionRequest,
     ) -> astra_tools::ToolResult {
-        if request.tool_name.starts_with("mcp__") {
-            return self
-                .execute_mcp_tool(&request.tool_name, &request.args)
-                .await;
-        }
-        self.record_resource_tool_call();
+        spawn_resource_tool_call_recording(&self.user_id, self.resource_governor.as_ref());
         self.execute_local_with_metadata(&request.tool_name, &request.args)
             .await
     }
@@ -6000,7 +1034,7 @@ impl ToolExecutor for ServerToolExecutor {
     }
 
     fn tool_schemas(&self) -> Vec<Value> {
-        crate::capabilities::server_runtime_tool_schemas(&self.capabilities)
+        self.capability_filtered_server_tool_schemas()
     }
 
     fn project_root(&self) -> &Path {
@@ -6021,32 +1055,691 @@ mod tests {
     use std::sync::{Mutex as StdMutex, MutexGuard, OnceLock};
 
     use super::*;
+    use crate::server::tool_execution_result::agent_tool_result_from_output;
+    use crate::server::tool_session_history::session_history_match_score;
+    use crate::server::tool_transport::{ExecutorStatus, ToolTransportKind};
+    use crate::tool_sandbox::extract_local_workspace_path_mentions;
     use astra_plan::PlanRepository;
-    use astra_tools::{AskUserAnnotation, AskUserDecision, AskUserGate};
+    use astra_tools::{
+        AskUserAnnotation, AskUserAnswers, AskUserDecision, AskUserGate, AskUserPrompt,
+        AskUserQuestionAnswer,
+    };
     use async_trait::async_trait;
     use serde_json::json;
     use tempfile::TempDir;
 
+    use crate::server::tool_workspace_path_guard::{
+        server_sandbox_local_path_mismatch, server_sandbox_tool_path_mismatch,
+    };
+
+    fn schema_name_set(schemas: Vec<Value>) -> std::collections::HashSet<String> {
+        schemas
+            .into_iter()
+            .filter_map(|schema| tool_schema_name(&schema).map(str::to_string))
+            .collect()
+    }
+
     #[test]
-    fn production_server_tool_executor_has_no_direct_panic_unwraps() {
-        let source = include_str!("server_tool_executor.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+    fn tool_schemas_hide_project_tools_without_workspace_runtime() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_execution_bindings(
+            WorkspaceBinding {
+                kind: WorkspaceBindingKind::None,
+                display_name: "No workspace".to_string(),
+                cwd: None,
+                authority: WorkspaceAuthority::None,
+                fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
+            },
+            ExecutorBinding::server_local(),
+        );
+
+        let names = schema_name_set(exec.tool_schemas());
+
+        assert!(names.contains("ask_user"));
+        assert!(names.contains("tool_search"));
+        assert!(names.contains("web_search"));
+        for hidden in [
+            "bash",
+            "read_file",
+            "write_file",
+            "git",
+            "symbols",
+            "run_script",
+        ] {
+            assert!(
+                !names.contains(hidden),
+                "{hidden} must not be advertised without a workspace runtime"
+            );
+        }
+    }
+
+    #[test]
+    fn supported_server_tool_names_follow_current_runtime_binding() {
+        let (mut exec, _dir) = test_executor();
         assert!(
-            !production.contains(".expect("),
-            "server tool executor production path must return structured errors instead of panicking"
+            exec.supports_server_tool_name("bash"),
+            "server sandbox binding should support project shell tools"
+        );
+
+        exec.set_execution_bindings(
+            WorkspaceBinding {
+                kind: WorkspaceBindingKind::None,
+                display_name: "No workspace".to_string(),
+                cwd: None,
+                authority: WorkspaceAuthority::None,
+                fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
+            },
+            ExecutorBinding::server_local(),
+        );
+
+        assert!(
+            exec.supports_server_tool_name("tool_search"),
+            "control-plane tools should remain supported without a workspace runtime"
         );
         assert!(
-            !production.contains(".unwrap("),
-            "server tool executor production path must handle unhappy paths instead of panicking"
+            !exec.supports_server_tool_name("bash"),
+            "project tools must not remain supported after binding changes to no-runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_executes_from_tool_engine_registry() {
+        let (exec, _dir) = test_executor();
+        assert!(
+            exec.tool_engine.contains("notify"),
+            "notify should be registered in ToolEngine for server-local execution"
+        );
+
+        let result = exec
+            .execute_with_metadata("notify", &json!({"message": " shipped "}))
+            .await;
+
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(result.output, "Notification: shipped");
+        let metadata = result
+            .metadata
+            .expect("binding metadata should be attached");
+        assert!(
+            metadata.contains_key("runtime_environment"),
+            "execute_with_metadata should still wrap ToolEngine results with runtime metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_rejects_empty_message_from_tool_engine_registry() {
+        let (exec, _dir) = test_executor();
+
+        let result = exec
+            .execute_with_metadata("notify", &json!({"message": "   "}))
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(result.output, "Error: notify requires a non-empty message");
+    }
+
+    #[tokio::test]
+    async fn web_search_executes_from_tool_engine_registry() {
+        let (exec, _dir) = test_executor();
+        assert!(
+            exec.tool_engine.contains("web_search"),
+            "web_search should be registered in ToolEngine for server-local execution"
+        );
+
+        let result = exec
+            .execute_with_metadata(
+                "web_search",
+                &json!({"query": "astra runtime", "engine": "wikipedia"}),
+            )
+            .await;
+
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.output.contains("search_url"), "{result:?}");
+        let metadata = result
+            .metadata
+            .expect("binding metadata should be attached");
+        assert!(
+            metadata.contains_key("runtime_environment"),
+            "execute_with_metadata should still wrap ToolEngine results with runtime metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_search_missing_query_is_error_from_tool_engine_registry() {
+        let (exec, _dir) = test_executor();
+
+        let result = exec
+            .execute_with_metadata("web_search", &json!({"engine": "github"}))
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains("Missing or empty 'query' parameter"));
+    }
+
+    #[tokio::test]
+    async fn read_only_delegate_tools_execute_from_tool_engine_registry() {
+        let (exec, dir) = test_executor();
+        for name in [
+            "web_fetch",
+            "read_file",
+            "list_dir",
+            "grep",
+            "glob",
+            "symbols",
+        ] {
+            assert!(
+                exec.tool_engine.contains(name),
+                "{name} should be registered in ToolEngine for server-local execution"
+            );
+        }
+
+        std::fs::write(dir.path().join("notes.txt"), "alpha beta\n").unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub fn sample_symbol() -> usize { 1 }\n",
+        )
+        .unwrap();
+
+        let read = exec
+            .execute_with_metadata("read_file", &json!({"path": "notes.txt"}))
+            .await;
+        assert!(!read.is_error, "{read:?}");
+        assert!(read.output.contains("alpha beta"), "{read:?}");
+
+        let list = exec
+            .execute_with_metadata("list_dir", &json!({"path": "."}))
+            .await;
+        assert!(!list.is_error, "{list:?}");
+        assert!(list.output.contains("notes.txt"), "{list:?}");
+
+        let grep = exec
+            .execute_with_metadata("grep", &json!({"pattern": "alpha", "path": "."}))
+            .await;
+        assert!(!grep.is_error, "{grep:?}");
+        assert!(grep.output.contains("notes.txt"), "{grep:?}");
+
+        let glob = exec
+            .execute_with_metadata("glob", &json!({"pattern": "*.txt"}))
+            .await;
+        assert!(!glob.is_error, "{glob:?}");
+        assert!(glob.output.contains("notes.txt"), "{glob:?}");
+
+        let symbols = exec
+            .execute_with_metadata("symbols", &json!({"path": "lib.rs"}))
+            .await;
+        assert!(!symbols.is_error, "{symbols:?}");
+        assert!(symbols.output.contains("sample_symbol"), "{symbols:?}");
+
+        let web_fetch = exec.execute_with_metadata("web_fetch", &json!({})).await;
+        assert!(web_fetch.is_error, "{web_fetch:?}");
+        assert!(web_fetch.output.contains("Missing 'url'"), "{web_fetch:?}");
+        assert!(
+            web_fetch
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
+            "ToolEngine delegate errors should still receive execution metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_tools_execute_from_tool_engine_registry() {
+        let (exec, dir) = test_executor();
+        for name in ["write_file", "str_replace"] {
+            assert!(
+                exec.tool_engine.contains(name),
+                "{name} should be registered in ToolEngine for server-local execution"
+            );
+        }
+
+        let write = exec
+            .execute_with_metadata(
+                "write_file",
+                &json!({"path": "note.txt", "content": "alpha beta gamma\n"}),
+            )
+            .await;
+        assert!(!write.is_error, "{write:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("note.txt")).unwrap(),
+            "alpha beta gamma\n"
+        );
+
+        let replace = exec
+            .execute_with_metadata(
+                "str_replace",
+                &json!({"path": "note.txt", "old_str": "beta", "new_str": "BETA"}),
+            )
+            .await;
+        assert!(!replace.is_error, "{replace:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("note.txt")).unwrap(),
+            "alpha BETA gamma\n"
+        );
+
+        let multi = exec
+            .execute_with_metadata(
+                "str_replace",
+                &json!({
+                    "path": "note.txt",
+                    "edits": [
+                        {"old_str": "alpha", "new_str": "ALPHA"},
+                        {"old_str": "gamma", "new_str": "GAMMA"}
+                    ]
+                }),
+            )
+            .await;
+        assert!(!multi.is_error, "{multi:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("note.txt")).unwrap(),
+            "ALPHA BETA GAMMA\n"
+        );
+
+        let delete = exec
+            .execute_with_metadata("write_file", &json!({"path": "note.txt", "delete": true}))
+            .await;
+        assert!(!delete.is_error, "{delete:?}");
+        assert!(!dir.path().join("note.txt").exists());
+
+        let missing_path = exec
+            .execute_with_metadata("write_file", &json!({"content": "missing path"}))
+            .await;
+        assert!(missing_path.is_error, "{missing_path:?}");
+        assert!(
+            missing_path.output.contains("Missing 'path' parameter"),
+            "{missing_path:?}"
+        );
+        assert!(
+            missing_path
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
+            "ToolEngine write errors should still receive execution metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_executes_from_tool_engine_registry() {
+        let (exec, _dir) = test_executor();
+        assert!(
+            exec.tool_engine.contains("github"),
+            "consolidated github should be registered in ToolEngine for server-local execution"
+        );
+
+        let result = exec.execute_with_metadata("github", &json!({})).await;
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result.output.contains("Missing required parameter: action"),
+            "{result:?}"
+        );
+        assert!(
+            result
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
+            "ToolEngine github errors should still receive execution metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_agent_info_executes_from_context_aware_tool_engine_handler() {
+        let (exec, _dir) = test_executor();
+        assert!(
+            exec.tool_engine.contains("get_agent_info"),
+            "get_agent_info should be registered in ToolEngine as a context-aware handler"
+        );
+
+        let result = exec
+            .execute_with_metadata("get_agent_info", &json!({"dimension": "identity"}))
+            .await;
+
+        assert!(!result.is_error, "{result:?}");
+        let value: Value = serde_json::from_str(&result.output).expect("agent info JSON");
+        assert_eq!(value["name"], "astra");
+        assert_eq!(value["user_id"], exec.user_id);
+        assert_eq!(value["session_id"], exec.session_id);
+        let metadata = result
+            .metadata
+            .expect("binding metadata should be attached");
+        assert!(
+            metadata.contains_key("runtime_environment"),
+            "execute_with_metadata should still wrap context-aware ToolEngine results"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_agent_info_capability_uses_current_runtime_binding_from_tool_engine() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_execution_bindings(
+            WorkspaceBinding {
+                kind: WorkspaceBindingKind::None,
+                display_name: "No workspace".to_string(),
+                cwd: None,
+                authority: WorkspaceAuthority::None,
+                fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
+            },
+            ExecutorBinding::server_local(),
+        );
+
+        let result = exec
+            .execute_with_metadata("get_agent_info", &json!({"dimension": "capability"}))
+            .await;
+
+        assert!(!result.is_error, "{result:?}");
+        let value: Value = serde_json::from_str(&result.output).expect("agent info JSON");
+        let tools = value["tools"]
+            .as_array()
+            .expect("tools should be an array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(tools.contains("tool_search"));
+        assert!(tools.contains("get_agent_info"));
+        assert!(
+            !tools.contains("bash"),
+            "project tools must stay hidden when the binding has no workspace runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn introspect_executes_from_tool_engine_without_snapshot() {
+        let (exec, _dir) = test_executor();
+        assert!(
+            exec.tool_engine.contains("introspect"),
+            "introspect should be registered in ToolEngine as a context-aware diagnostics handler"
+        );
+
+        let result = exec
+            .execute_with_metadata("introspect", &json!({"detail": "summary"}))
+            .await;
+
+        assert!(!result.is_error, "{result:?}");
+        assert!(
+            result
+                .output
+                .contains("No introspection data available yet"),
+            "{result:?}"
+        );
+        assert!(
+            result
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
+            "ToolEngine introspect results should still receive execution metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_state_tools_execute_from_tool_engine_registry() {
+        let (exec, _dir) = test_executor();
+        for name in [
+            "prioritize_tool",
+            "deprioritize_tool",
+            "compress_context",
+            "rollback_session_state",
+        ] {
+            assert!(
+                exec.tool_engine.contains(name),
+                "{name} should be registered in ToolEngine for server-local execution"
+            );
+        }
+
+        let prioritize = exec
+            .execute_with_metadata("prioritize_tool", &json!({}))
+            .await;
+        assert!(prioritize.is_error, "{prioritize:?}");
+        assert!(
+            prioritize
+                .output
+                .contains("Missing required parameter: tool"),
+            "{prioritize:?}"
+        );
+
+        let deprioritize = exec
+            .execute_with_metadata("deprioritize_tool", &json!({}))
+            .await;
+        assert!(deprioritize.is_error, "{deprioritize:?}");
+        assert!(
+            deprioritize
+                .output
+                .contains("Missing required parameter: tool"),
+            "{deprioritize:?}"
+        );
+
+        let compress = exec
+            .execute_with_metadata("compress_context", &json!({}))
+            .await;
+        assert!(compress.is_error, "{compress:?}");
+        assert!(
+            compress
+                .output
+                .contains("No observability session available"),
+            "{compress:?}"
+        );
+        assert!(
+            compress
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
+            "ToolEngine session-state errors should still receive execution metadata"
+        );
+
+        let rollback = exec
+            .execute_with_metadata("rollback_session_state", &json!({"scope": "list"}))
+            .await;
+        assert!(!rollback.is_error, "{rollback:?}");
+        let value: Value = serde_json::from_str(&rollback.output).expect("rollback list JSON");
+        assert_eq!(value["success"], true);
+        assert_eq!(value["scope"], "list");
+        assert_eq!(value["total_entries"], 0);
+        assert!(
+            rollback
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
+            "ToolEngine rollback_session_state results should still receive execution metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrixone_tools_execute_from_tool_engine_registry() {
+        let (exec, _dir) = test_executor();
+        for name in ["mo", "mo_query", "rollback_database_snapshots"] {
+            assert!(
+                exec.tool_engine.contains(name),
+                "{name} should be registered in ToolEngine for server-local execution"
+            );
+        }
+
+        let mo_missing_sql = exec.execute_with_metadata("mo", &json!({})).await;
+        assert!(mo_missing_sql.is_error, "{mo_missing_sql:?}");
+        assert!(
+            mo_missing_sql.output.contains("Missing 'sql' parameter"),
+            "{mo_missing_sql:?}"
+        );
+
+        let mo_unknown_action = exec
+            .execute_with_metadata("mo", &json!({"action": "vacuum"}))
+            .await;
+        assert!(mo_unknown_action.is_error, "{mo_unknown_action:?}");
+        assert!(
+            mo_unknown_action.output.contains("Unknown mo action"),
+            "{mo_unknown_action:?}"
+        );
+
+        let mo_query_missing_sql = exec.execute_with_metadata("mo_query", &json!({})).await;
+        assert!(mo_query_missing_sql.is_error, "{mo_query_missing_sql:?}");
+        assert!(
+            mo_query_missing_sql
+                .output
+                .contains("Missing 'sql' parameter"),
+            "{mo_query_missing_sql:?}"
+        );
+        assert!(
+            mo_query_missing_sql
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
+            "ToolEngine MatrixOne errors should still receive execution metadata"
+        );
+
+        let rollback_missing_snapshot = exec
+            .execute_with_metadata("rollback_database_snapshots", &json!({"scope": "snapshot"}))
+            .await;
+        assert!(
+            rollback_missing_snapshot.is_error,
+            "{rollback_missing_snapshot:?}"
+        );
+        let value: Value =
+            serde_json::from_str(&rollback_missing_snapshot.output).expect("rollback JSON");
+        assert_eq!(value["success"], false);
+        assert_eq!(value["scope"], "snapshot");
+        assert!(
+            value["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("missing 'snapshot_id'")
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_artifact_executes_from_tool_engine_registry() {
+        let (exec, _dir) = test_executor();
+        assert!(
+            exec.tool_engine.contains("publish_artifact"),
+            "publish_artifact should be registered in ToolEngine for server-local execution"
+        );
+
+        let result = exec
+            .execute_with_metadata("publish_artifact", &json!({"path": "report.md"}))
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result
+                .output
+                .contains("requires a configured MatrixOne artifact store"),
+            "{result:?}"
+        );
+        assert!(
+            result
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
+            "ToolEngine publish_artifact errors should still receive execution metadata"
         );
     }
 
     #[test]
-    fn normalized_drift_is_symmetric_and_handles_zero_baseline() {
-        assert_eq!(normalized_drift(0.0, 0.0), Some(0.0));
-        assert_eq!(normalized_drift(0.0, 10.0), Some(1.0));
-        assert_eq!(normalized_drift(10.0, 0.0), Some(1.0));
-        assert_eq!(normalized_drift(f64::NAN, 1.0), None);
+    fn tool_engine_handlers_are_schema_and_runtime_registry_backed() {
+        let (exec, _dir) = test_executor();
+        let schema_names = schema_name_set(exec.tool_schemas());
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+
+        for handler_name in exec.tool_engine.handler_names() {
+            if !(handler_name == "run_script" && cfg!(not(unix))) {
+                assert!(
+                    schema_names.contains(handler_name),
+                    "ToolEngine handler `{handler_name}` must have a model-visible schema"
+                );
+            }
+            assert!(
+                registry.get(handler_name).is_some(),
+                "ToolEngine handler `{handler_name}` must have a runtime capability spec"
+            );
+        }
+    }
+
+    #[test]
+    fn visible_server_tools_have_local_execution_handlers() {
+        let (exec, _dir) = test_executor();
+        let missing = schema_name_set(exec.tool_schemas())
+            .into_iter()
+            .filter(|schema_name| !exec.tool_engine.contains(schema_name))
+            .collect::<Vec<_>>();
+
+        assert!(
+            missing.is_empty(),
+            "model-visible server tools without local ToolEngine handlers: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn hosted_tool_execution_request_carries_workspace_record() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_workspace_record(Some(WorkspaceRecord {
+            workspace_id: "workspace-run-1".to_string(),
+            owner_scope: astra_runtime_env::WorkspaceOwnerScope::Tenant,
+            kind: astra_runtime_env::WorkspaceBindingKind::CloudWorkspace,
+            authority: astra_runtime_env::WorkspaceAuthority::ReadWrite,
+            root_or_volume_ref: "/hosted/checkouts/workspace-run-1".to_string(),
+            source: astra_runtime_env::WorkspaceSource::GitCheckout {
+                repository: "https://example.com/org/repo.git".to_string(),
+                reference: None,
+            },
+            persistence: astra_runtime_env::WorkspacePersistence::Session,
+            revision: "rev-1".to_string(),
+            display_name: "Hosted checkout".to_string(),
+        }));
+
+        let request = exec.tool_execution_request(
+            "bash",
+            &json!({
+                "_run_id": "run-1",
+                "_tool_call_id": "call-1",
+                "command": "pwd",
+            }),
+        );
+
+        let record = request.workspace_record.expect("workspace record");
+        assert_eq!(record.workspace_id, "workspace-run-1");
+        assert_eq!(
+            record.root_or_volume_ref,
+            "/hosted/checkouts/workspace-run-1"
+        );
+        assert_eq!(
+            record.kind,
+            astra_runtime_env::WorkspaceBindingKind::CloudWorkspace
+        );
+    }
+
+    #[test]
+    fn tool_schemas_keep_server_tools_when_edge_executor_is_offline() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_execution_bindings(
+            WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-1",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Offline,
+            ),
+        );
+
+        let names = schema_name_set(exec.tool_schemas());
+
+        for visible in ["agent", "tool_search", "web_search", "memory"] {
+            assert!(
+                names.contains(visible),
+                "{visible} should remain visible because it runs on the server"
+            );
+        }
+        for hidden in [
+            "bash",
+            "read_file",
+            "write_file",
+            "git",
+            "symbols",
+            "run_script",
+        ] {
+            assert!(
+                !names.contains(hidden),
+                "{hidden} must be hidden while the edge runtime is offline"
+            );
+        }
     }
 
     #[test]
@@ -6085,43 +1778,6 @@ mod tests {
         assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_AGENT_WAITING);
         assert_eq!(metadata["reason"], "tool_approval");
         assert_eq!(metadata["blocked"], true);
-    }
-
-    #[tokio::test]
-    async fn agent_waiting_tool_result_emits_agent_waiting_work_surface_event() {
-        let (mut exec, _dir) = test_executor();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        exec.set_work_surface_event_tx(tx);
-        let mut result = agent_tool_result_from_output(
-            json!({
-                "status": "waiting",
-                "agent_id": "reviewer-1",
-                "reason": "executor_offline"
-            })
-            .to_string(),
-        );
-        exec.attach_binding_metadata(&mut result);
-
-        exec.emit_tool_transport_finished(
-            "agent",
-            &json!({"_tool_call_id": "call-agent"}),
-            &result,
-            12,
-        )
-        .await;
-
-        let mut events = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            events.push(event);
-        }
-        assert!(
-            events.iter().any(|event| {
-                event["type"] == "agent_waiting"
-                    && event["agent_id"] == "reviewer-1"
-                    && event["reason"] == "executor_offline"
-            }),
-            "expected agent_waiting event, got {events:?}"
-        );
     }
 
     fn env_guard() -> MutexGuard<'static, ()> {
@@ -6175,9 +1831,9 @@ mod tests {
             names.contains("session"),
             "session must be advertised to the web-agent LLM"
         );
+        let (exec, _dir) = test_executor();
         assert!(
-            resolved_server_tool_names(&crate::capabilities::full_server_capabilities_for_tests())
-                .contains("session"),
+            exec.supports_server_tool_name("session"),
             "session must be accepted by ServerToolExecutor"
         );
 
@@ -6197,6 +1853,30 @@ mod tests {
                 "session action {action} must be advertised for web-agent history recall"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn session_executes_from_tool_engine_registry() {
+        let (exec, _dir) = test_executor();
+        assert!(
+            exec.tool_engine.contains("session"),
+            "session should be registered in ToolEngine for server-local execution"
+        );
+
+        let result = exec.execute_with_metadata("session", &json!({})).await;
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result.output.contains("missing required parameter")
+                && result.output.contains("action"),
+            "{result:?}"
+        );
+        assert!(
+            result
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
+            "ToolEngine session errors should still receive execution metadata"
+        );
     }
 
     #[test]
@@ -6269,7 +1949,7 @@ esac
         use astra_pipeline::step_protocol::{CachedToolResult, IdempotencyKey};
 
         let (mut exec, _dir) = test_executor();
-        exec.enable_exactly_once();
+        exec.enable_exactly_once().await;
 
         let public_first_args = json!({"action": "create", "title": "cached first"});
         let replay_first_args = json!({
@@ -6289,6 +1969,7 @@ esac
                 .exactly_once_executor
                 .as_ref()
                 .expect("exactly-once executor")
+                .in_memory
                 .lock()
                 .expect("exactly-once lock");
             assert!(
@@ -6301,6 +1982,7 @@ esac
                 .exactly_once_executor
                 .as_ref()
                 .expect("exactly-once executor")
+                .in_memory
                 .lock()
                 .expect("exactly-once lock");
             executor.cache_mut().record(
@@ -6332,6 +2014,7 @@ esac
             .exactly_once_executor
             .as_ref()
             .expect("exactly-once executor")
+            .in_memory
             .lock()
             .expect("exactly-once lock");
         assert!(
@@ -6340,12 +2023,12 @@ esac
         );
     }
 
-    #[test]
-    fn exactly_once_record_skips_failed_tool_results() {
+    #[tokio::test]
+    async fn exactly_once_record_skips_failed_tool_results() {
         use astra_pipeline::step_protocol::IdempotencyKey;
 
         let (mut exec, _dir) = test_executor();
-        exec.enable_exactly_once();
+        exec.enable_exactly_once().await;
 
         let args = json!({"command": "curl https://example.invalid"});
         let result = astra_tools::ToolResult {
@@ -6354,13 +2037,20 @@ esac
             metadata: None,
             exit_semantics: None,
         };
-        exec.record_exactly_once_result("bash", &args, &result);
+        tool_exactly_once::record_result(
+            exec.exactly_once_executor.as_ref(),
+            "bash",
+            &args,
+            &result,
+        )
+        .await;
 
         let key = IdempotencyKey::semantic("bash", &args);
         let executor = exec
             .exactly_once_executor
             .as_ref()
             .expect("exactly-once executor")
+            .in_memory
             .lock()
             .expect("exactly-once lock");
         assert!(
@@ -6429,15 +2119,39 @@ esac
     }
 
     #[tokio::test]
-    async fn legacy_task_tool_names_are_not_executable_on_server_executor() {
+    async fn task_executes_from_tool_engine_registry() {
+        let (exec, _dir) = test_executor();
+        assert!(
+            exec.tool_engine.contains("task"),
+            "consolidated task should be registered in ToolEngine for server-local execution"
+        );
+
+        let result = exec.execute_with_metadata("task", &json!({})).await;
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result.output.contains("missing required parameter")
+                && result.output.contains("action"),
+            "{result:?}"
+        );
+        assert!(
+            result
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
+            "ToolEngine task errors should still receive execution metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn retired_task_tool_names_are_not_executable_on_server_executor() {
         let (exec, _dir) = test_executor();
 
-        let legacy = exec
+        let retired = exec
             .execute("task_create", &json!({"title": "old surface"}))
             .await;
         assert!(
-            legacy.contains("not available") || legacy.contains("Unknown tool"),
-            "legacy task_create must not remain an executable task surface: {legacy}"
+            retired.contains("not available") || retired.contains("Unknown tool"),
+            "retired task_create must not remain an executable task surface: {retired}"
         );
 
         let unified = exec
@@ -6964,6 +2678,7 @@ esac
                 edge_id: format!("edge-id-{}", self.edge_agent_id),
                 hostname: Some("MacBook Pro".to_string()),
                 worktree_path: Some("/Users/test/project".to_string()),
+                capabilities: Some(edge_runtime_environment_advertisement(&self.edge_agent_id)),
                 registered_at: "2026-06-11T00:00:00Z".to_string(),
                 last_heartbeat_at: "2026-06-11T00:00:00Z".to_string(),
             }])
@@ -6974,11 +2689,37 @@ esac
         }
     }
 
+    fn edge_runtime_environment_advertisement(edge_agent_id: &str) -> serde_json::Value {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let binding = astra_runtime_env::RunBinding::resolve(
+            astra_runtime_env::WorkspaceBinding::edge_workspace(
+                "/Users/test/project",
+                astra_runtime_env::WorkspaceAuthority::ReadWrite,
+            ),
+            astra_runtime_env::ExecutorBinding::edge_agent(edge_agent_id.to_string()),
+            astra_runtime_env::RuntimeBinding::host_process(format!("edge-host:{edge_agent_id}")),
+            astra_runtime_env::PolicyIntent::local_developer(),
+            &registry,
+        );
+        serde_json::to_value(astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+            binding,
+        ))
+        .expect("serialize edge runtime environment advertisement")
+    }
+
     #[tokio::test]
     async fn mcp_tools_bypass_edge_dispatch() {
         let (mut exec, _dir) = test_executor();
-        exec.set_edge_dispatch_service(Arc::new(PanicEdgeDispatch));
-        exec.set_edge_registry_service(Arc::new(PanicEdgeRegistry));
+        exec = exec.with_tool_execution_service(
+            ToolExecutionService::builder()
+                .edge_dispatch_service(Arc::new(PanicEdgeDispatch))
+                .edge_registry_service(Arc::new(PanicEdgeRegistry))
+                .build(),
+        );
+        assert!(
+            exec.tool_engine.contains("mcp__demo__search"),
+            "mcp__* calls should be owned by the ToolEngine prefix handler"
+        );
 
         let result = exec
             .execute_with_metadata("mcp__demo__search", &json!({ "query": "hello" }))
@@ -6997,8 +2738,12 @@ esac
         let (mut exec, _dir) = test_executor();
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         exec.set_work_surface_event_tx(tx);
-        exec.set_edge_dispatch_service(Arc::new(PanicEdgeDispatch));
-        exec.set_edge_registry_service(Arc::new(PanicEdgeRegistry));
+        exec = exec.with_tool_execution_service(
+            ToolExecutionService::builder()
+                .edge_dispatch_service(Arc::new(PanicEdgeDispatch))
+                .edge_registry_service(Arc::new(PanicEdgeRegistry))
+                .build(),
+        );
         exec.set_edge_workspace_binding(
             "edge-macbook-1",
             "MacBook Pro",
@@ -7071,7 +2816,7 @@ esac
 
     #[tokio::test]
     async fn server_sandbox_binding_executes_server_local_tools() {
-        let (exec, dir) = test_executor();
+        let (exec, _dir) = test_executor();
 
         let result = exec
             .execute_with_metadata("bash", &json!({"command": "pwd"}))
@@ -7079,14 +2824,22 @@ esac
 
         assert!(!result.is_error, "{result:?}");
         assert!(
-            result.output.contains(&dir.path().display().to_string()),
-            "{}",
+            result.output.contains("/tmp/_astra_ws"),
+            "expected pwd to be inside mount namespace workspace, got: {}",
             result.output
         );
         let metadata = result.metadata.expect("binding metadata");
         assert_eq!(metadata["workspace"]["kind"], "server_sandbox");
         assert_eq!(metadata["executor"]["kind"], "server_local");
         assert_eq!(metadata["transport"], "server_local");
+        assert_eq!(metadata["runtime"]["session_manager"], "host_process");
+        assert_eq!(metadata["runtime"]["isolation_backend"], "host_process");
+        assert_eq!(metadata["runtime"]["launch_driver"], "in_process");
+        assert_eq!(metadata["policy"]["revision"], 1);
+        assert_eq!(
+            metadata["runtime_environment"]["runtime"]["runtime_id"],
+            "runtime:server-local"
+        );
     }
 
     #[tokio::test]
@@ -7096,8 +2849,8 @@ esac
         exec.set_work_surface_event_tx(tx);
         exec.set_execution_bindings(
             WorkspaceBinding {
-                kind: WorkspaceBindingKind::GitCheckout,
-                display_name: "Hosted checkout".to_string(),
+                kind: WorkspaceBindingKind::CloudWorkspace,
+                display_name: "Hosted workspace".to_string(),
                 cwd: Some("/checkout/repo".to_string()),
                 authority: WorkspaceAuthority::ReadOnly,
                 fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
@@ -7124,18 +2877,21 @@ esac
 
         assert!(result.is_error, "{result:?}");
         assert!(
-            result.output.contains("No server fallback was attempted"),
+            result.output.contains("writable_workspace_required")
+                && result.output.contains("no fallback was attempted"),
             "{}",
             result.output
         );
         let metadata = result.metadata.as_ref().expect("blocked metadata");
-        assert_eq!(
-            metadata["error_kind"],
-            TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE
-        );
+        assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_CAPABILITY_DENIED);
         assert_eq!(metadata["blocked"], true);
-        assert_eq!(metadata["workspace"]["kind"], "git_checkout");
-        assert_eq!(metadata["executor"]["status"], "degraded");
+        assert_eq!(metadata["runtime_error"]["kind"], "capability_denied");
+        assert_eq!(
+            metadata["next_action"],
+            "change_workspace_executor_runtime_or_policy"
+        );
+        assert_eq!(metadata["workspace"]["kind"], "cloud_workspace");
+        assert_eq!(metadata["executor"]["status"], "online");
 
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -7146,7 +2902,7 @@ esac
             .iter()
             .find(|event| event["type"] == "tool_routing_decision")
             .expect("tool_routing_decision");
-        assert_eq!(routing["route"], "unsupported");
+        assert_eq!(routing["route"], "runner_rpc");
         assert_eq!(routing["call_id"], "call-unsupported-workspace");
 
         let failed = events
@@ -7154,30 +2910,24 @@ esac
             .find(|event| event["type"] == "tool_transport_failed")
             .expect("tool_transport_failed");
         assert_eq!(failed["call_id"], "call-unsupported-workspace");
-        assert_eq!(
-            failed["error_kind"],
-            TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE
-        );
-        assert_eq!(failed["workspace"]["kind"], "git_checkout");
-        assert_eq!(failed["executor"]["status"], "degraded");
+        assert_eq!(failed["error_kind"], TOOL_ERROR_KIND_CAPABILITY_DENIED);
+        assert_eq!(failed["workspace"]["kind"], "cloud_workspace");
+        assert_eq!(failed["executor"]["status"], "online");
 
         let blocked = events
             .iter()
             .find(|event| {
                 event["type"] == "run_blocked"
-                    && event["reason"] == "workspace_executor_unavailable"
+                    && event["reason"] == TOOL_ERROR_KIND_CAPABILITY_DENIED
             })
-            .expect("run_blocked workspace_executor_unavailable");
+            .expect("run_blocked capability_denied");
         assert_eq!(blocked["run_id"], "run-unsupported-workspace");
         assert_eq!(blocked["call_id"], "call-unsupported-workspace");
-        assert_eq!(
-            blocked["reason"],
-            TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE
-        );
+        assert_eq!(blocked["reason"], TOOL_ERROR_KIND_CAPABILITY_DENIED);
         assert!(
             blocked["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("No server fallback was attempted")),
+                .is_some_and(|message| message.contains("no fallback was attempted")),
             "{blocked:?}"
         );
     }
@@ -7391,10 +3141,14 @@ esac
         let (mut exec, _dir) = test_executor();
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         exec.set_work_surface_event_tx(tx);
-        exec.set_edge_dispatch_service(Arc::new(NoResultEdgeDispatch));
-        exec.set_edge_registry_service(Arc::new(OneEdgeRegistry {
-            edge_agent_id: "edge-macbook-1".to_string(),
-        }));
+        exec = exec.with_tool_execution_service(
+            ToolExecutionService::builder()
+                .edge_dispatch_service(Arc::new(NoResultEdgeDispatch))
+                .edge_registry_service(Arc::new(OneEdgeRegistry {
+                    edge_agent_id: "edge-macbook-1".to_string(),
+                }))
+                .build(),
+        );
         exec.set_edge_workspace_binding(
             "edge-macbook-1",
             "MacBook Pro",
@@ -7467,13 +3221,17 @@ esac
         let failed_reasons = Arc::new(StdMutex::new(Vec::new()));
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
         exec.set_work_surface_event_tx(event_tx);
-        exec.set_edge_dispatch_service(Arc::new(PendingEdgeDispatch {
-            wait_started: StdMutex::new(Some(wait_started_tx)),
-            failed_reasons: failed_reasons.clone(),
-        }));
-        exec.set_edge_registry_service(Arc::new(OneEdgeRegistry {
-            edge_agent_id: "edge-macbook-1".to_string(),
-        }));
+        exec = exec.with_tool_execution_service(
+            ToolExecutionService::builder()
+                .edge_dispatch_service(Arc::new(PendingEdgeDispatch {
+                    wait_started: StdMutex::new(Some(wait_started_tx)),
+                    failed_reasons: failed_reasons.clone(),
+                }))
+                .edge_registry_service(Arc::new(OneEdgeRegistry {
+                    edge_agent_id: "edge-macbook-1".to_string(),
+                }))
+                .build(),
+        );
         exec.set_edge_workspace_binding(
             "edge-macbook-1",
             "MacBook Pro",
@@ -7542,6 +3300,34 @@ esac
         assert_eq!(ended["run_id"], "run-cancelled");
         assert_eq!(ended["error_kind"], TOOL_ERROR_KIND_CANCELLED);
         assert_eq!(ended["cancelled"], true);
+    }
+
+    #[tokio::test]
+    async fn already_cancelled_tool_skips_route_boundary_events() {
+        let (mut exec, _dir) = test_executor();
+        let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+        cancel_token.cancel();
+        exec = exec.with_cancel_token(Some(cancel_token));
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        exec.set_work_surface_event_tx(event_tx);
+
+        let result = exec
+            .execute_with_metadata(
+                "bash",
+                &json!({
+                    "command": "printf no-route",
+                    "_tool_call_id": "call-already-cancelled",
+                    "_run_id": "run-already-cancelled",
+                }),
+            )
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains("cancelled"), "{result:?}");
+        assert!(
+            event_rx.try_recv().is_err(),
+            "early cancellation must not enter route boundary event emission"
+        );
     }
 
     #[tokio::test]
@@ -7699,20 +3485,20 @@ esac
     fn session_state_tools_publish_workspace_artifacts() {
         let source = include_str!("server_tool_executor.rs");
         assert!(
-            source.contains("publish_current_workspace(\"server_tool_executor:adjust_config\")"),
+            source.contains("publish_current_workspace(\"adjust_config\")"),
             "adjust_config should publish remote workspace artifacts"
         );
         assert!(
-            source.contains("publish_current_workspace(\"server_tool_executor:prioritize_tool\")"),
+            source.contains("publish_current_workspace(\"prioritize_tool\")"),
             "prioritize_tool should publish remote workspace artifacts"
         );
         assert!(
-            source
-                .contains("publish_current_workspace(\"server_tool_executor:deprioritize_tool\")"),
+            source.contains("publish_current_workspace(\"deprioritize_tool\")"),
             "deprioritize_tool should publish remote workspace artifacts"
         );
+        let handlers = include_str!("server_tool_executor/tool_handlers.rs");
         assert!(
-            source.contains(
+            handlers.contains(
                 "publish_current_workspace(\"server_tool_executor:rollback_session_state\")"
             ),
             "rollback_session_state should publish remote workspace artifacts after local restore"
@@ -7771,6 +3557,47 @@ esac
                 .contains("top-level `action='spawn'`"),
             "{}",
             result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_tools_execute_from_tool_engine_registry() {
+        let (exec, _dir) = test_executor();
+        for name in ["agent", "agent_fanout"] {
+            assert!(
+                exec.tool_engine.contains(name),
+                "{name} should be registered in ToolEngine for server-local execution"
+            );
+        }
+
+        let delegate = exec
+            .execute_with_metadata("agent", &json!({"action": "delegate"}))
+            .await;
+        assert!(delegate.is_error, "{delegate:?}");
+        assert!(
+            delegate.output.contains("agent.delegate has been removed"),
+            "{delegate:?}"
+        );
+        assert!(
+            delegate
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
+            "ToolEngine agent errors should still receive execution metadata"
+        );
+
+        let fanout = exec.execute_with_metadata("agent_fanout", &json!({})).await;
+        assert!(fanout.is_error, "{fanout:?}");
+        assert!(
+            fanout.output.contains("Missing required field: action"),
+            "{fanout:?}"
+        );
+        assert!(
+            fanout
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
+            "ToolEngine agent_fanout errors should still receive execution metadata"
         );
     }
 
@@ -7876,6 +3703,10 @@ esac
     #[tokio::test]
     async fn server_tool_search_finds_catalog_tool() {
         let (exec, _dir) = test_executor();
+        assert!(
+            exec.tool_engine.contains("tool_search"),
+            "tool_search should be registered in ToolEngine as a context-aware handler"
+        );
         let result = exec
             .execute_with_metadata("tool_search", &json!({"query": "select:github"}))
             .await;
@@ -7887,6 +3718,66 @@ esac
         assert!(
             parsed["missing"].as_array().unwrap().is_empty(),
             "select:github must resolve on server path; got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn server_tool_search_does_not_resolve_hidden_ask_user() {
+        let (exec, _dir) = test_executor();
+        exec.set_current_searchable_tool_schemas(&[
+            json!({"type": "function", "function": {"name": "bash"}}),
+            json!({"type": "function", "function": {"name": "tool_search"}}),
+        ]);
+
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:ask_user"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "hidden ask_user must not resolve on server path; got: {}",
+            result.output
+        );
+        assert!(
+            parsed["missing"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("ask_user")),
+            "hidden ask_user must be reported missing from current search pool; got: {}",
+            result.output
+        );
+    }
+
+    /// Deferred tools must still be discoverable via `tool_search(select:NAME)`
+    /// even though they are *not* in the per-turn visible slice. Without this
+    /// the activation flow deadlocks: prompt instructs the model to select a
+    /// deferred tool, but the search pool excludes it. visible ∪ activatable
+    /// is the right pool.
+    #[tokio::test]
+    async fn server_tool_search_resolves_deferred_via_activatable_set() {
+        let (exec, _dir) = test_executor();
+        exec.set_current_searchable_tool_schemas(&[
+            json!({"type": "function", "function": {"name": "bash"}}),
+            json!({"type": "function", "function": {"name": "tool_search"}}),
+        ]);
+        // The deferred manifest advertises agent_fanout for this turn.
+        exec.set_current_activatable_tool_names(HashSet::from(["agent_fanout".to_string()]));
+
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:agent_fanout"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        let matched_names: Vec<String> = parsed["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["name"].as_str().map(String::from))
+            .collect();
+        assert!(
+            matched_names.iter().any(|n| n == "agent_fanout"),
+            "deferred name from the activatable set must resolve through tool_search; got: {}",
             result.output
         );
     }
@@ -7926,6 +3817,10 @@ esac
     #[tokio::test]
     async fn ask_user_returns_structured_response_from_gate() {
         let (mut exec, _dir) = test_executor();
+        assert!(
+            exec.tool_engine.contains("ask_user"),
+            "ask_user should be registered in ToolEngine as a context-aware interactive handler"
+        );
         exec.set_ask_user_gate(Arc::new(StaticAskUserGate {
             expected_prompt: json!({
                 "context": "Need both product choices",
@@ -8125,58 +4020,6 @@ esac
         );
     }
 
-    #[tokio::test]
-    async fn resolve_path_allows_relative_inside_workspace() {
-        let (exec, _dir) = test_executor();
-        let result = exec.resolve_path("src/main.rs");
-        assert!(result.is_ok());
-        assert!(result.unwrap().starts_with(exec.workspace_root()));
-    }
-
-    #[tokio::test]
-    async fn resolve_path_blocks_parent_traversal() {
-        let (exec, _dir) = test_executor();
-        let result = exec.resolve_path("../../etc/passwd");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("SANDBOX_DENIED"));
-    }
-
-    #[tokio::test]
-    async fn resolve_path_blocks_absolute_outside_workspace() {
-        let (exec, _dir) = test_executor();
-        let result = exec.resolve_path("/etc/passwd");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("SANDBOX_DENIED"));
-    }
-
-    #[tokio::test]
-    async fn resolve_path_allows_absolute_inside_workspace() {
-        let (exec, dir) = test_executor();
-        let inner = dir.path().join("foo.txt");
-        let result = exec.resolve_path(inner.to_str().unwrap());
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn resolve_path_normalizes_dot_dot_in_middle() {
-        let (exec, _dir) = test_executor();
-        // src/../../../etc/passwd should be blocked
-        let result = exec.resolve_path("src/../../../etc/passwd");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("SANDBOX_DENIED"));
-    }
-
-    #[tokio::test]
-    async fn resolve_path_allows_dot_dot_within_workspace() {
-        let (exec, dir) = test_executor();
-        // Create nested dir so the path stays inside workspace
-        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
-        let result = exec.resolve_path("a/b/../c.txt");
-        assert!(result.is_ok());
-        let resolved = result.unwrap();
-        assert!(resolved.starts_with(exec.workspace_root()));
-    }
-
     // ── File operations ────────────────────────────────────────────────
 
     #[tokio::test]
@@ -8253,7 +4096,7 @@ esac
     async fn read_file_missing_path_param_returns_error() {
         let (exec, _dir) = test_executor();
         let result = exec.execute("read_file", &json!({})).await;
-        assert!(result.contains("Missing 'path'"));
+        assert!(result.contains("missing required field `path`"));
     }
 
     #[tokio::test]
@@ -8558,6 +4401,49 @@ esac
         }
     }
 
+    struct AlwaysDeniedGate;
+
+    #[async_trait]
+    impl astra_tools::ToolApprovalGate for AlwaysDeniedGate {
+        async fn request_approval(
+            &self,
+            _request_id: &str,
+            _tool_name: &str,
+            _args: &Value,
+        ) -> astra_tools::ApprovalDecision {
+            astra_tools::ApprovalDecision::Denied {
+                reason: Some("policy says no".to_string()),
+            }
+        }
+
+        fn requires_approval(&self, tool_name: &str) -> bool {
+            tool_name == "bash"
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ToolLifecycleProgressCallback {
+        started: std::sync::atomic::AtomicUsize,
+        completed: std::sync::atomic::AtomicUsize,
+        completed_success: std::sync::Mutex<Vec<bool>>,
+    }
+
+    #[async_trait]
+    impl astra_tools::ToolProgressCallback for ToolLifecycleProgressCallback {
+        async fn tool_started(&self, _call_id: &str, _tool_name: &str, _args: &Value) {
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        async fn tool_output_delta(&self, _call_id: &str, _delta: &str) {}
+
+        async fn tool_completed(&self, _call_id: &str, _result: &str, success: bool) {
+            self.completed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.completed_success.lock().unwrap().push(success);
+        }
+    }
+
     #[tokio::test]
     async fn approval_timeout_returns_denied_error_string() {
         let (mut exec, _dir) = test_executor();
@@ -8578,6 +4464,83 @@ esac
         assert_eq!(metadata["workspace"]["kind"], "server_sandbox");
         assert_eq!(metadata["executor"]["kind"], "server_local");
         assert_eq!(metadata["transport"], "server_local");
+    }
+
+    #[tokio::test]
+    async fn approval_denied_preflight_does_not_start_tool_execution() {
+        let (mut exec, dir) = test_executor();
+        let marker = dir.path().join("approval-denied-marker");
+        let progress = Arc::new(ToolLifecycleProgressCallback::default());
+        exec.set_progress_callback(progress.clone());
+        exec.set_approval_gate(std::sync::Arc::new(AlwaysDeniedGate));
+
+        let result = exec
+            .execute_with_metadata(
+                "bash",
+                &json!({"command": format!("touch {}", marker.display())}),
+            )
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result
+                .output
+                .contains("Tool execution denied: policy says no"),
+            "{}",
+            result.output
+        );
+        assert!(
+            !marker.exists(),
+            "approval-denied preflight must not execute the command"
+        );
+        assert_eq!(
+            progress.started.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "preflight rejection must not emit tool_started"
+        );
+        assert_eq!(
+            progress
+                .completed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "preflight rejection must not emit tool_completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_engine_failure_runs_post_execution_lifecycle() {
+        let (mut exec, _dir) = test_executor();
+        let progress = Arc::new(ToolLifecycleProgressCallback::default());
+        exec.set_progress_callback(progress.clone());
+
+        let result = exec
+            .execute_with_metadata("notify", &json!({"message": "   "}))
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result
+                .output
+                .contains("notify requires a non-empty message"),
+            "{result:?}"
+        );
+        assert_eq!(
+            progress.started.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "registered tool should emit tool_started after preflight passes"
+        );
+        assert_eq!(
+            progress
+                .completed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "registered tool failure should still emit tool_completed through post-execution middleware"
+        );
+        assert_eq!(
+            *progress.completed_success.lock().unwrap(),
+            vec![false],
+            "failed handler completion must be reported as unsuccessful"
+        );
     }
 
     #[tokio::test]
@@ -8626,6 +4589,10 @@ esac
     #[tokio::test]
     async fn bash_echo_returns_output() {
         let (exec, _dir) = test_executor();
+        assert!(
+            exec.tool_engine.contains("bash"),
+            "bash should be registered in ToolEngine for server-local execution"
+        );
         let result = exec
             .execute("bash", &json!({"command": "echo hello"}))
             .await;
@@ -8635,8 +4602,16 @@ esac
     #[tokio::test]
     async fn bash_missing_command_returns_error() {
         let (exec, _dir) = test_executor();
-        let result = exec.execute("bash", &json!({})).await;
-        assert!(result.contains("Missing 'command'"));
+        let result = exec.execute_with_metadata("bash", &json!({})).await;
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains("Missing 'command'"));
+        assert!(
+            result
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
+            "ToolEngine bash errors should still receive execution metadata"
+        );
     }
 
     #[tokio::test]
@@ -8673,10 +4648,12 @@ esac
     #[tokio::test]
     async fn bash_runs_in_workspace_dir() {
         let (exec, dir) = test_executor();
-        std::fs::write(dir.path().join("marker.txt"), "found").unwrap();
+        // create marker inside the sandbox so the file is visible
+        // regardless of mount-namespace isolation
         let result = exec
-            .server_bash(&json!({"command": "cat marker.txt"}))
+            .server_bash(&json!({"command": "echo found > marker.txt && cat marker.txt"}))
             .await;
+        let _ = dir; // keep tempdir alive
         assert!(!result.is_error, "{result:?}");
         assert_eq!(result.output.trim(), "found");
     }
@@ -8836,8 +4813,8 @@ esac
         );
         assert!(
             server_sandbox_tool_path_mismatch(
-                "git_file_history",
-                &json!({"file": "/Users/xupeng/github/astra/src/lib.rs"}),
+                "git",
+                &json!({"action": "file_history", "file": "/Users/xupeng/github/astra/src/lib.rs"}),
                 workspace_root,
                 &workspace,
             )
@@ -8962,6 +4939,7 @@ esac
         assert_eq!(metadata["workspace"]["kind"], "server_sandbox");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_script_executes_in_server_workspace() {
         if std::process::Command::new("python3")
@@ -8972,6 +4950,10 @@ esac
             return;
         }
         let (exec, dir) = test_executor();
+        assert!(
+            exec.tool_engine.contains("run_script"),
+            "run_script should be registered in ToolEngine for server-local Unix execution"
+        );
         std::fs::write(dir.path().join("marker.txt"), "server-script").unwrap();
         let result = exec
             .execute(
@@ -8989,46 +4971,6 @@ esac
             !result.contains("not available in server-side execution mode"),
             "server run_script is advertised and must be actually executable, got: {result}"
         );
-    }
-
-    #[tokio::test]
-    async fn bash_timeout_returns_partial_output() {
-        let output = IsolatedOutput {
-            stdout: "start\n".into(),
-            stderr: String::new(),
-            exit_code: None,
-            timed_out: true,
-            stdout_capped: false,
-            stderr_capped: false,
-            namespace_active: false,
-            cgroup_active: false,
-        };
-        let result = format_server_bash_output(&output, 0.2);
-        assert!(result.contains("start"), "got: {result}");
-        assert!(result.contains("timed out after 0.2s"), "got: {result}");
-        assert!(!result.contains("done"), "got: {result}");
-    }
-
-    #[tokio::test]
-    async fn bash_timeout_sets_error_metadata() {
-        let output = IsolatedOutput {
-            stdout: "start\n".into(),
-            stderr: String::new(),
-            exit_code: None,
-            timed_out: true,
-            stdout_capped: false,
-            stderr_capped: false,
-            namespace_active: false,
-            cgroup_active: false,
-        };
-        let result = tool_result_from_server_bash_output("sleep 10", output, 0.2);
-        assert!(result.is_error, "got: {}", result.output);
-        assert!(result.output.contains("start"), "got: {}", result.output);
-        assert!(result.output.contains("timed out after 0.2s"));
-        let metadata = result.metadata.expect("tool timeout metadata");
-        assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
-        assert_eq!(metadata["reason"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
-        assert!(metadata.get("blocked").is_none(), "{metadata:?}");
     }
 
     #[tokio::test]
@@ -9075,27 +5017,6 @@ esac
         assert_eq!(ended["call_id"], "call-tool-timeout");
         assert_eq!(ended["error_kind"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
         assert_eq!(ended["reason"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
-    }
-
-    #[tokio::test]
-    async fn bash_domain_negative_exit_keeps_non_error_semantics() {
-        let output = IsolatedOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: Some(1),
-            timed_out: false,
-            stdout_capped: false,
-            stderr_capped: false,
-            namespace_active: false,
-            cgroup_active: false,
-        };
-        let result = tool_result_from_server_bash_output("test -f missing", output, 0.2);
-        assert!(!result.is_error, "{result:?}");
-        assert_eq!(
-            result.exit_semantics,
-            Some(astra_tools::exit_semantics::ExitSemantics::DomainNegative)
-        );
-        assert!(result.output.contains("(exit code: 1)"), "{result:?}");
     }
 
     // ── Grep ───────────────────────────────────────────────────────────
@@ -9182,13 +5103,13 @@ esac
     }
 
     #[tokio::test]
-    async fn session_enter_plan_legacy_action_is_unknown() {
+    async fn session_enter_plan_retired_action_is_unknown() {
         let (exec, _dir) = test_executor();
         let result = exec
             .execute("session", &json!({"action": "enter_plan"}))
             .await;
         assert!(
-            result.contains("Unknown session action: 'enter_plan'"),
+            result.contains("Error: unknown `session` action 'enter_plan'"),
             "{result}"
         );
     }
@@ -9211,8 +5132,33 @@ esac
     #[tokio::test]
     async fn git_status_in_non_git_dir_returns_error() {
         let (exec, _dir) = test_executor();
-        let result = exec.execute("git_status", &json!({})).await;
+        let result = exec.execute("git", &json!({"action": "status"})).await;
         assert!(result.contains("Error:") || result.contains("fatal"));
+    }
+
+    #[tokio::test]
+    async fn git_executes_from_tool_engine_registry() {
+        let (exec, _dir) = test_executor();
+        assert!(
+            exec.tool_engine.contains("git"),
+            "consolidated git should be registered in ToolEngine for server-local execution"
+        );
+
+        let result = exec
+            .execute_with_metadata("git", &json!({"action": "status"}))
+            .await;
+
+        assert!(
+            result.output.contains("Error:") || result.output.contains("fatal"),
+            "{result:?}"
+        );
+        assert!(
+            result
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
+            "ToolEngine git errors should still receive execution metadata"
+        );
     }
 
     #[tokio::test]
@@ -9246,62 +5192,68 @@ esac
             .output()
             .unwrap();
         // Request 999 — should be capped at 100
-        let result = exec.execute("git_log", &json!({"n": 999})).await;
+        let result = exec
+            .execute("git", &json!({"action": "log", "n": 999}))
+            .await;
         assert!(result.contains("initial"));
     }
 
     #[tokio::test]
-    async fn git_helper_tools_are_available_in_server_mode() {
-        let (exec, dir) = test_executor();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "-m", "initial helper commit"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
+    async fn git_helper_aliases_are_not_executable_on_server_executor() {
+        let (exec, _dir) = test_executor();
+        for name in [
+            "git_status",
+            "git_diff",
+            "git_log",
+            "git_show",
+            "git_blame",
+            "git_file_history",
+            "git_log_search",
+            "git_contributors",
+        ] {
+            let result = exec.execute_with_metadata(name, &json!({})).await;
+            assert!(result.is_error, "{name}: {result:?}");
+            let metadata = result.metadata.as_ref().expect("metadata should exist");
+            assert_eq!(
+                metadata.get("capability_denial").and_then(Value::as_str),
+                Some("UnknownTool"),
+                "{name}: {result:?}"
+            );
+            assert!(
+                metadata
+                    .get("execution_started")
+                    .and_then(Value::as_bool)
+                    .is_some_and(|started| !started),
+                "{name}: {result:?}"
+            );
+        }
+    }
 
-        let file_history = exec
-            .execute("git_file_history", &json!({"file": "f.txt"}))
+    #[tokio::test]
+    async fn standalone_delegate_is_not_executable_on_server_executor() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute_with_metadata("delegate", &json!({"task": "review this"}))
             .await;
-        assert!(file_history.contains("File: f.txt"), "{file_history}");
 
-        let log_search = exec
-            .execute("git_log_search", &json!({"query": "helper"}))
-            .await;
-        assert!(
-            log_search.contains("Search:") || log_search.contains("initial helper commit"),
-            "{log_search}"
+        assert!(result.is_error, "{result:?}");
+        let metadata = result.metadata.as_ref().expect("metadata should exist");
+        assert_eq!(
+            metadata.get("capability_denial").and_then(Value::as_str),
+            Some("UnknownTool"),
+            "{result:?}"
         );
-
-        let contributors = exec.execute("git_contributors", &json!({})).await;
         assert!(
-            contributors.contains("## Top Contributors"),
-            "{contributors}"
+            metadata
+                .get("execution_started")
+                .and_then(Value::as_bool)
+                .is_some_and(|started| !started),
+            "{result:?}"
         );
     }
 
     #[tokio::test]
-    async fn git_stash_is_available_in_server_mode() {
+    async fn consolidated_git_stash_is_available_in_server_mode() {
         let (exec, dir) = test_executor();
         std::process::Command::new("git")
             .args(["init"])
@@ -9319,7 +5271,9 @@ esac
             .output()
             .unwrap();
 
-        let stash_list = exec.execute("git_stash", &json!({"action": "list"})).await;
+        let stash_list = exec
+            .execute("git", &json!({"action": "stash", "stash_action": "list"}))
+            .await;
         assert!(
             stash_list.contains("No stashes found")
                 || stash_list.contains("stash@")
@@ -9332,8 +5286,12 @@ esac
     async fn rollback_database_snapshots_snapshot_scope_requires_snapshot_id() {
         let (exec, _dir) = test_executor();
         let value: Value =
-            serde_json::from_str(&exec.rollback_database_snapshots(&json!({"scope": "snapshot"})))
-                .expect("rollback_database_snapshots json");
+            serde_json::from_str(&tool_database_snapshots::rollback_database_snapshots(
+                exec.database_snapshot_journal.as_ref(),
+                &json!({"scope": "snapshot"}),
+                exec.journal_turn_index.load(Ordering::Relaxed),
+            ))
+            .expect("rollback_database_snapshots json");
         assert_eq!(value["success"].as_bool(), Some(false));
         assert_eq!(value["scope"].as_str(), Some("snapshot"));
         assert!(
@@ -9397,6 +5355,10 @@ esac
     #[tokio::test]
     async fn memory_tool_injects_user_id() {
         let (exec, _dir) = test_executor();
+        assert!(
+            exec.tool_engine.contains("memory"),
+            "memory should be registered in ToolEngine as a context-aware service handler"
+        );
         // We can't actually call Memoria, but we can verify the execute path
         // doesn't panic and returns a reasonable error (no MEMORIA_BASE_URL set).
         let result = exec
@@ -9406,41 +5368,54 @@ esac
         assert!(!result.is_empty());
     }
 
-    #[test]
-    fn memory_tool_args_include_session_user_and_turn() {
+    #[tokio::test]
+    async fn memory_tool_missing_action_returns_structured_error_from_tool_engine() {
         let (exec, _dir) = test_executor();
-        exec.set_turn_index(12);
 
-        let args = exec.memory_args_with_context(&json!({
-            "action": "recall",
-            "query": "closed loop",
-        }));
+        let result = exec.execute_with_metadata("memory", &json!({})).await;
 
-        assert!(args.get("action").is_none());
-        assert_eq!(args["session_id"].as_str(), Some(exec.session_id.as_str()));
-        assert_eq!(args["user_id"].as_str(), Some(exec.user_id.as_str()));
-        assert_eq!(args["turn"].as_u64(), Some(12));
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result
+                .output
+                .contains("missing required parameter `action`")
+        );
+        assert!(
+            result
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
+            "ToolEngine memory errors should still receive execution metadata"
+        );
     }
 
     #[tokio::test]
-    async fn github_tools_delegate_to_default_executor() {
+    async fn github_helper_aliases_are_not_executable_on_server_executor() {
         let (exec, _dir) = test_executor();
-        // Invariant under test: github_* tools are routed to the default
-        // executor, not rejected as "server-mode-only". We OMIT `repo`
-        // entirely so `github_list_prs` short-circuits via the
-        // `GITHUB_MISSING_REPO_ERROR` path before any network call —
-        // `Some("")` still triggers `github_resolve_repo` which hits the
-        // real API and adds ~500ms of flake-inducing latency.
-        let result = exec
-            .execute_with_metadata("github_list_prs", &json!({}))
-            .await;
-        assert!(
-            !result
-                .output
-                .contains("not available in server-side execution mode"),
-            "github tool should delegate to default executor, not be rejected: {}",
-            result.output
-        );
+        for name in [
+            "github_list_prs",
+            "github_get_pr",
+            "github_ci_status",
+            "github_list_issues",
+            "github_get_issue",
+            "github_repo_stats",
+        ] {
+            let result = exec.execute_with_metadata(name, &json!({})).await;
+            assert!(result.is_error, "{name}: {result:?}");
+            let metadata = result.metadata.as_ref().expect("metadata should exist");
+            assert_eq!(
+                metadata.get("capability_denial").and_then(Value::as_str),
+                Some("UnknownTool"),
+                "{name}: {result:?}"
+            );
+            assert!(
+                metadata
+                    .get("execution_started")
+                    .and_then(Value::as_bool)
+                    .is_some_and(|started| !started),
+                "{name}: {result:?}"
+            );
+        }
     }
 
     // ── Output management ──────────────────────────────────────────────
@@ -9605,7 +5580,14 @@ esac
         exec.set_plan_repository(wrapper);
 
         // No plan → authoring=false, cached.
-        assert!(!exec.plan_mode_authoring_active().await);
+        assert!(
+            !plan_mode_authoring_active(
+                exec.plan_repo.as_ref(),
+                &exec.session_id,
+                exec.plan_mode_cache.as_ref(),
+            )
+            .await
+        );
         let active_after_first = active.load(Ordering::Relaxed);
         let load_after_first = load.load(Ordering::Relaxed);
         assert_eq!(
@@ -9614,7 +5596,14 @@ esac
         );
 
         for _ in 0..20 {
-            assert!(!exec.plan_mode_authoring_active().await);
+            assert!(
+                !plan_mode_authoring_active(
+                    exec.plan_repo.as_ref(),
+                    &exec.session_id,
+                    exec.plan_mode_cache.as_ref(),
+                )
+                .await
+            );
         }
         assert_eq!(
             active.load(Ordering::Relaxed),
@@ -9658,39 +5647,89 @@ esac
             "task",
             &json!({"action": "update", "task_id": "bg-shell-1", "new_status": "in_progress"})
         ));
+
+        assert!(is_plan_mode_blocked_tool(
+            "git",
+            &json!({"action": "commit"})
+        ));
+        assert!(is_plan_mode_blocked_tool(
+            "git",
+            &json!({"action": "revert_commit"})
+        ));
+        assert!(is_plan_mode_blocked_tool("git", &json!({"action": "push"})));
+        assert!(is_plan_mode_blocked_tool(
+            "git",
+            &json!({"action": "stash", "stash_action": "push"})
+        ));
+        assert!(!is_plan_mode_blocked_tool(
+            "git",
+            &json!({"action": "stash", "stash_action": "list"})
+        ));
+        assert!(!is_plan_mode_blocked_tool(
+            "git",
+            &json!({"action": "status"})
+        ));
+
+        assert!(is_plan_mode_blocked_tool(
+            "github",
+            &json!({"action": "create_issue"})
+        ));
+        assert!(!is_plan_mode_blocked_tool(
+            "github",
+            &json!({"action": "list_prs"})
+        ));
     }
 
     #[tokio::test]
-    async fn exit_plan_mode_tool_clears_shared_plan_resume_hint() {
+    async fn exit_plan_mode_tool_refreshes_shared_plan_resume_hint_until_approval() {
         // Regression for the mid-run staleness: the host's plan_resume_hint
         // slot was populated at loop-start and never refreshed, so a tool
-        // call that exited plan mode left "A plan is currently in-flight"
-        // in the system prompt for the rest of the run. The executor now
-        // shares the slot and pushes updates through on enter/exit.
+        // call that changed plan state left old plan text in the system
+        // prompt for the rest of the run. The executor now shares the slot
+        // and pushes updates through real enter/exit tool paths. Model-driven
+        // exit submits for trusted user approval, so the active hint must
+        // remain present until the control plane records approval.
         let inner: Arc<dyn astra_plan::PlanRepository> =
             Arc::new(astra_plan::InMemoryPlanRepository::new());
         let (mut exec, _dir) = test_executor();
         exec.set_plan_repository(inner);
 
-        let hint_slot: Arc<std::sync::RwLock<Option<String>>> = Arc::new(std::sync::RwLock::new(
-            Some("## Active Plan\n[plan-resume] goal=\"x\" · open=1 · done=0/1".into()),
-        ));
+        let stale_hint = "## Active Plan\n[plan-resume] goal=\"stale\" · open=1 · done=0/1";
+        let hint_slot: Arc<std::sync::RwLock<Option<String>>> =
+            Arc::new(std::sync::RwLock::new(Some(stale_hint.into())));
         exec.set_plan_resume_hint_handle(Arc::clone(&hint_slot));
 
-        // Before invalidation: hint is whatever the host was built with
-        // (simulating loop-start snapshot).
-        assert!(hint_slot.read().unwrap().is_some());
+        let enter_result = exec
+            .execute("enter_plan_mode", &json!({"goal": "fresh approval flow"}))
+            .await;
+        assert!(
+            enter_result.contains("Entered plan mode"),
+            "enter_plan_mode must run through the real tool path: {enter_result}"
+        );
 
-        // Simulate exit_plan_mode's follow-up: invalidate_plan_mode_cache is
-        // what the tool calls after clearing active_plan_id. The slot must
-        // now reflect fresh DB state (no active plan → None).
-        exec.invalidate_plan_mode_cache().await;
+        let entered_hint = hint_slot.read().unwrap().clone();
+        assert!(
+            entered_hint
+                .as_deref()
+                .is_some_and(|hint| hint != stale_hint),
+            "enter_plan_mode must refresh the shared resume hint, got: {entered_hint:?}"
+        );
 
-        assert_eq!(
-            hint_slot.read().unwrap().clone(),
-            None,
-            "after exit_plan_mode invalidation, the shared slot must be None — \
-             otherwise the next turn's system prompt still claims a plan is in flight"
+        let exit_result = exec
+            .execute(
+                "exit_plan_mode",
+                &json!({"approved": true, "plan": "1. Ask the user to approve"}),
+            )
+            .await;
+        assert!(
+            exit_result.contains("submitted for trusted user approval"),
+            "model exit should submit for trusted approval, got: {exit_result}"
+        );
+
+        let submitted_hint = hint_slot.read().unwrap().clone();
+        assert!(
+            submitted_hint.is_some(),
+            "exit_plan_mode must keep the active hint while trusted approval is pending"
         );
     }
 
@@ -9713,19 +5752,70 @@ esac
         exec.set_plan_repository(wrapper);
 
         // Prime the cache: no plan yet → authoring=false.
-        assert!(!exec.plan_mode_authoring_active().await);
+        assert!(
+            !plan_mode_authoring_active(
+                exec.plan_repo.as_ref(),
+                &exec.session_id,
+                exec.plan_mode_cache.as_ref(),
+            )
+            .await
+        );
         let before = active.load(Ordering::Relaxed);
 
-        // Simulate an enter_plan_mode: cache must be invalidated.
-        exec.invalidate_plan_mode_cache().await;
+        let enter_result = exec
+            .execute("enter_plan_mode", &json!({"goal": "cache invalidation"}))
+            .await;
+        assert!(
+            enter_result.contains("Entered plan mode"),
+            "enter_plan_mode must run through the real tool path: {enter_result}"
+        );
 
-        // Next authoring check re-queries (LocalCache still returns no plan,
-        // but the call must have happened).
-        assert!(!exec.plan_mode_authoring_active().await);
+        // Next authoring check re-queries and sees the active plan created by
+        // the tool call.
+        assert!(
+            plan_mode_authoring_active(
+                exec.plan_repo.as_ref(),
+                &exec.session_id,
+                exec.plan_mode_cache.as_ref(),
+            )
+            .await
+        );
         assert!(
             active.load(Ordering::Relaxed) > before,
-            "invalidation must force a fresh active_plan_for_session lookup \
+            "enter_plan_mode invalidation must force a fresh active_plan_for_session lookup \
              — active count before={before}, after={}",
+            active.load(Ordering::Relaxed)
+        );
+
+        let before_exit = active.load(Ordering::Relaxed);
+        let exit_result = exec
+            .execute(
+                "exit_plan_mode",
+                &json!({"approved": true, "plan": "1. Wait for approval"}),
+            )
+            .await;
+        assert!(
+            exit_result.contains("submitted for trusted user approval"),
+            "exit_plan_mode must run through the real tool path: {exit_result}"
+        );
+        let after_exit_tool = active.load(Ordering::Relaxed);
+        assert!(
+            after_exit_tool > before_exit,
+            "exit_plan_mode should read the active plan before submission"
+        );
+
+        assert!(
+            plan_mode_authoring_active(
+                exec.plan_repo.as_ref(),
+                &exec.session_id,
+                exec.plan_mode_cache.as_ref(),
+            )
+            .await
+        );
+        assert!(
+            active.load(Ordering::Relaxed) > after_exit_tool,
+            "exit_plan_mode invalidation must force a fresh active_plan_for_session lookup \
+             — active count after tool={after_exit_tool}, after check={}",
             active.load(Ordering::Relaxed)
         );
     }
@@ -10257,7 +6347,7 @@ esac
     }
 
     #[tokio::test]
-    async fn exit_plan_mode_approved_does_not_reuse_legacy_cli_style_plan_tree() {
+    async fn exit_plan_mode_approved_does_not_reuse_retired_cli_style_plan_tree() {
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
             "ship user-visible plan".into(),
@@ -10284,7 +6374,7 @@ esac
         exec.session_id = "reuse-session".to_string();
         exec.user_id = "alice".to_string();
 
-        let fingerprint = ServerToolExecutor::plan_task_board_fingerprint(&state.plan);
+        let fingerprint = plan_task_mirror::plan_task_board_fingerprint(&state.plan);
         let cli_style = exec
             .task_manager
             .create(&json!({
@@ -10331,7 +6421,7 @@ esac
             approved_plan_tasks
                 .iter()
                 .all(|task| task.subtasks.len() == 1),
-            "legacy tree-shaped history should remain untouched while approval is pending: {approved_plan_tasks:?}"
+            "retired tree-shaped history should remain untouched while approval is pending: {approved_plan_tasks:?}"
         );
     }
 
@@ -10370,7 +6460,7 @@ esac
                     "plan_id": "plan-repeat-server",
                     "plan_goal": "repeat server plan",
                     "plan_subtask_id": "step-1",
-                    "plan_fingerprint": ServerToolExecutor::plan_task_board_fingerprint(&state.plan)
+                    "plan_fingerprint": plan_task_mirror::plan_task_board_fingerprint(&state.plan)
                 }
             }))
             .await;
@@ -10458,7 +6548,7 @@ esac
         exec.session_id = "different-goal-session".to_string();
         exec.user_id = "alice".to_string();
 
-        let fingerprint = ServerToolExecutor::plan_task_board_fingerprint(&state.plan);
+        let fingerprint = plan_task_mirror::plan_task_board_fingerprint(&state.plan);
         let old_cli_style = exec
             .task_manager
             .create(&json!({
@@ -10534,13 +6624,13 @@ esac
                 status: astra_services::task_orchestrator::TaskStatus::Pending,
                 ..Default::default()
             });
-        let stale_fingerprint = ServerToolExecutor::plan_task_board_fingerprint(&state.plan);
+        let stale_fingerprint = plan_task_mirror::plan_task_board_fingerprint(&state.plan);
         repo.save("plan-same-id-new-steps", &mut state, None)
             .await
             .unwrap();
 
         state.plan.subtasks[0].title = "new task board sync".into();
-        let _fresh_fingerprint = ServerToolExecutor::plan_task_board_fingerprint(&state.plan);
+        let _fresh_fingerprint = plan_task_mirror::plan_task_board_fingerprint(&state.plan);
         repo.save("plan-same-id-new-steps", &mut state, None)
             .await
             .unwrap();
@@ -10639,13 +6729,13 @@ esac
                 status: astra_services::task_orchestrator::TaskStatus::Pending,
                 ..Default::default()
             });
-        let stale_fingerprint = ServerToolExecutor::plan_task_board_fingerprint(&state.plan);
+        let stale_fingerprint = plan_task_mirror::plan_task_board_fingerprint(&state.plan);
         repo.save("plan-same-id-new-deps", &mut state, None)
             .await
             .unwrap();
 
         state.plan.subtasks[1].depends_on.clear();
-        let fresh_fingerprint = ServerToolExecutor::plan_task_board_fingerprint(&state.plan);
+        let fresh_fingerprint = plan_task_mirror::plan_task_board_fingerprint(&state.plan);
         assert_ne!(
             stale_fingerprint, fresh_fingerprint,
             "dependency changes must affect task-board fingerprint"
@@ -10715,7 +6805,7 @@ esac
                     .and_then(serde_json::Value::as_str)
                     == Some(stale_fingerprint.as_str())
             })
-            .expect("stale legacy task remains");
+            .expect("stale retired task remains");
         assert!(
             verify
                 .subtasks
@@ -10796,6 +6886,10 @@ esac
     async fn enter_plan_mode_without_goal_uses_default_label_on_server() {
         let repo = Arc::new(astra_plan::InMemoryPlanRepository::new());
         let (mut exec, _dir) = test_executor();
+        assert!(
+            exec.tool_engine.contains("enter_plan_mode"),
+            "enter_plan_mode should be registered in ToolEngine as a plan-mode handler"
+        );
         exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
         exec.session_id = "server-empty-goal-session".to_string();
         exec.user_id = "alice".to_string();
@@ -10833,6 +6927,10 @@ esac
     #[tokio::test]
     async fn exit_plan_mode_without_plan_repo_fails_fast() {
         let (mut exec, _dir) = test_executor();
+        assert!(
+            exec.tool_engine.contains("exit_plan_mode"),
+            "exit_plan_mode should be registered in ToolEngine as a plan-mode handler"
+        );
         exec.session_id = "planless-session".to_string();
 
         let result = exec
@@ -10903,48 +7001,6 @@ esac
         );
     }
 
-    // ── C-SRV-1 regression: task_output_success policy ────────────────
-    //
-    // Pre-fix returned `false` when the output had no `{`, silently
-    // dropping rollback snapshots for human-readable success summaries.
-    // The fix flips the default to `true`, only rejecting on `Error:`
-    // prefix or explicit `success: false` JSON.
-
-    #[test]
-    fn task_output_success_treats_plain_summary_as_success() {
-        // No JSON body at all — used to be rejected, now accepted.
-        assert!(ServerToolExecutor::task_output_success(
-            "Created task #5: build PR"
-        ));
-    }
-
-    #[test]
-    fn task_output_success_accepts_summary_plus_json_body() {
-        let out = "Created task #5\n{\"success\": true, \"id\": 5}";
-        assert!(ServerToolExecutor::task_output_success(out));
-    }
-
-    #[test]
-    fn task_output_success_rejects_error_prefix() {
-        assert!(!ServerToolExecutor::task_output_success(
-            "Error: title is required"
-        ));
-    }
-
-    #[test]
-    fn task_output_success_rejects_explicit_success_false() {
-        let out = "Failed to create\n{\"success\": false, \"reason\": \"dup\"}";
-        assert!(!ServerToolExecutor::task_output_success(out));
-    }
-
-    #[test]
-    fn task_output_success_accepts_unparseable_json_body() {
-        // Don't punish callers with malformed JSON — we'd rather snapshot
-        // a no-op than lose a real one (bias toward safety).
-        let out = "Created task #5\n{not actually json";
-        assert!(ServerToolExecutor::task_output_success(out));
-    }
-
     // ── M-SRV-1 regression: with_task_store undo-stack hygiene ────────
     //
     // Pre-fix: with_task_store() swapped the TaskManager but left any
@@ -10959,17 +7015,21 @@ esac
         let (exec, _dir) = test_executor();
 
         // Seed a TaskState entry against the original (in-memory) store.
-        exec.record_task_state_rollback(
-            TaskManagerSnapshot {
-                tasks: vec![],
-                next_task_id: 1,
-                version: 0,
-                restore_version: None,
+        tool_session_state_rollback::record(
+            exec.session_state_journal.as_ref(),
+            exec.journal_turn_index.load(Ordering::Relaxed),
+            "seed".to_string(),
+            SessionStateRollbackAction::TaskState {
+                snapshot: TaskManagerSnapshot {
+                    tasks: vec![],
+                    next_task_id: 1,
+                    version: 0,
+                    restore_version: None,
+                },
             },
-            "seed",
         );
         assert_eq!(
-            exec.session_state_entries().len(),
+            tool_session_state_rollback::entries(exec.session_state_journal.as_ref()).len(),
             1,
             "precondition: one TaskState entry recorded"
         );
@@ -10979,7 +7039,7 @@ esac
         let exec = exec.with_task_store(new_store);
 
         assert_eq!(
-            exec.session_state_entries().len(),
+            tool_session_state_rollback::entries(exec.session_state_journal.as_ref()).len(),
             0,
             "with_task_store must purge TaskState entries that referenced the prior store"
         );
@@ -10994,28 +7054,37 @@ esac
         // simpler ToolPreferences variant.)
         let (exec, _dir) = test_executor();
 
-        exec.record_task_state_rollback(
-            TaskManagerSnapshot {
-                tasks: vec![],
-                next_task_id: 1,
-                version: 0,
-                restore_version: None,
+        tool_session_state_rollback::record(
+            exec.session_state_journal.as_ref(),
+            exec.journal_turn_index.load(Ordering::Relaxed),
+            "task-seed".to_string(),
+            SessionStateRollbackAction::TaskState {
+                snapshot: TaskManagerSnapshot {
+                    tasks: vec![],
+                    next_task_id: 1,
+                    version: 0,
+                    restore_version: None,
+                },
             },
-            "task-seed",
         );
-        exec.record_session_state_rollback(
+        tool_session_state_rollback::record(
+            exec.session_state_journal.as_ref(),
+            exec.journal_turn_index.load(Ordering::Relaxed),
             "prefs-seed".to_string(),
             SessionStateRollbackAction::ToolPreferences {
                 previous_pinned_tools: vec!["bash".into()],
                 previous_deprioritized_tools: vec![],
             },
         );
-        assert_eq!(exec.session_state_entries().len(), 2);
+        assert_eq!(
+            tool_session_state_rollback::entries(exec.session_state_journal.as_ref()).len(),
+            2
+        );
 
         let new_store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
         let exec = exec.with_task_store(new_store);
 
-        let surviving = exec.session_state_entries();
+        let surviving = tool_session_state_rollback::entries(exec.session_state_journal.as_ref());
         assert_eq!(
             surviving.len(),
             1,
@@ -11025,5 +7094,44 @@ esac
             surviving[0].action,
             SessionStateRollbackAction::ToolPreferences { .. }
         ));
+    }
+
+    /// Fix verification: using `Handle::block_on()` inside `block_in_place`
+    /// correctly re-enters the parent runtime without creating a nested one.
+    /// The old pattern (nested current_thread runtime inside block_in_place)
+    /// deadlocks when the future calls `tokio::spawn` on a current_thread
+    /// parent runtime — the only worker thread is stuck inside the nested
+    /// runtime's block_on, so the spawned task can never run.
+    #[test]
+    fn handle_block_on_inside_block_in_place_completes() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let done = Arc::new(AtomicBool::new(false));
+        let done2 = done.clone();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            tokio::task::block_in_place(|| {
+                let handle = tokio::runtime::Handle::current();
+                handle.block_on(async {
+                    tokio::spawn(async move {
+                        done2.store(true, Ordering::SeqCst);
+                    })
+                    .await
+                    .unwrap();
+                });
+            });
+        });
+
+        assert!(
+            done.load(Ordering::SeqCst),
+            "Handle::block_on inside block_in_place should allow spawned tasks to complete"
+        );
     }
 }

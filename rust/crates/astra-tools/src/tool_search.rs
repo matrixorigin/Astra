@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 
 use crate::relevance_score::Scoreable;
 
+const KEYWORD_DESCRIPTION_MAX_CHARS: usize = 180;
+
 struct ToolSchemaAdapter<'a>(&'a Value);
 
 impl Scoreable for ToolSchemaAdapter<'_> {
@@ -124,10 +126,11 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
                 .get("description")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let short_desc: String = desc.chars().take(100).collect();
+            let short_desc: String = desc.chars().take(KEYWORD_DESCRIPTION_MAX_CHARS).collect();
+            let was_truncated = desc.chars().count() > KEYWORD_DESCRIPTION_MAX_CHARS;
             json!({
                 "name": name,
-                "description": if desc.len() > 100 { format!("{}...", short_desc) } else { desc.to_string() },
+                "description": if was_truncated { format!("{}...", short_desc) } else { desc.to_string() },
                 "score": score
             })
         })
@@ -297,5 +300,44 @@ mod tests {
         let parsed: Value = serde_json::from_str(&result).unwrap();
         let desc = parsed["matches"][0]["description"].as_str().unwrap();
         assert!(desc.len() <= 200);
+    }
+
+    #[test]
+    fn keyword_search_preserves_deferred_agent_constraints() {
+        let schemas = crate::schemas::all_tool_schemas();
+
+        let result = tool_search(
+            &schemas,
+            &json!({"query": "agent_fanout", "max_results": 20}),
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let matches = parsed["matches"].as_array().unwrap();
+        let fanout = matches
+            .iter()
+            .find(|m| m["name"].as_str() == Some("agent_fanout"))
+            .expect("agent_fanout should be discoverable by keyword");
+        let desc = fanout["description"].as_str().unwrap_or_default();
+        assert!(
+            desc.contains("exactly target_count slots")
+                && desc.contains("description+prompt")
+                && desc.contains("no brief/agents/background"),
+            "keyword summary must keep fanout shape constraints: {desc}"
+        );
+
+        let result = tool_search(&schemas, &json!({"query": "agent", "max_results": 20}));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let matches = parsed["matches"].as_array().unwrap();
+        let agent = matches
+            .iter()
+            .find(|m| m["name"].as_str() == Some("agent"))
+            .expect("agent should be discoverable by keyword");
+        let desc = agent["description"].as_str().unwrap_or_default();
+        assert!(
+            desc.contains("description+prompt")
+                && desc.contains("agent_id")
+                && desc.contains("foreground")
+                && desc.contains("run_chain"),
+            "keyword summary must keep agent action constraints: {desc}"
+        );
     }
 }

@@ -111,24 +111,18 @@ pub struct BreakerConfig {
 }
 
 impl BreakerConfig {
-    /// Tune the generic breaker thresholds for the active objective.
+    /// Keep breaker sensitivity independent from the inferred task profile.
     ///
-    /// The breaker itself only sees round-level progress signals; this method
-    /// injects the missing goal semantics at configuration time. For mutating
-    /// work, read-only novelty is useful only briefly, so prolonged read-only
-    /// work should settle earlier. Read-only analysis/review keeps the wider
-    /// defaults because novel evidence is the work product.
+    /// The `detect_prolonged_read_only_stall` detector is already progress-aware:
+    /// it only trips when consecutive rounds are *both* read-only *and* stop
+    /// introducing novel tool signatures.  Task profiles may affect diagnosis
+    /// and guidance elsewhere, but they should not silently tighten hard
+    /// circuit-breaker thresholds.
     #[must_use]
     pub fn for_task_profile(
-        mut self,
-        profile: crate::chat_turn_heuristics::TaskExecutionProfile,
+        self,
+        _profile: crate::chat_turn_heuristics::TaskExecutionProfile,
     ) -> Self {
-        if profile.mutates_workspace {
-            self.read_only_stall_threshold = self
-                .read_only_stall_threshold
-                .min(self.stall_threshold.max(4));
-            self.max_introspect_emissions = self.max_introspect_emissions.min(1);
-        }
         self
     }
 }
@@ -570,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn mutating_objective_tightens_read_only_stall_threshold() {
+    fn mutating_objective_keeps_read_only_stall_threshold_relaxed() {
         let profile = infer_task_execution_profile("fix the runtime bug");
         assert!(profile.mutates_workspace);
 
@@ -582,8 +576,8 @@ mod tests {
         }
         .for_task_profile(profile);
 
-        assert_eq!(cfg.read_only_stall_threshold, 6);
-        assert_eq!(cfg.max_introspect_emissions, 1);
+        assert_eq!(cfg.read_only_stall_threshold, 12);
+        assert_eq!(cfg.max_introspect_emissions, 3);
     }
 
     #[test]

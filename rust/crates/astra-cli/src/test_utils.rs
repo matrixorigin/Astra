@@ -75,7 +75,7 @@ impl HomeGuard {
     }
 
     pub(crate) fn temp() -> Self {
-        let dir = tempfile::tempdir().expect("create temp home dir");
+        let dir = test_temp_dir();
         Self::set_impl(dir.path().to_path_buf(), Some(dir))
     }
 
@@ -120,7 +120,7 @@ impl Drop for CredentialsGuard {
 }
 
 pub(crate) fn isolate_credentials() -> CredentialsGuard {
-    let dir = tempfile::tempdir().expect("create temp credentials dir");
+    let dir = test_temp_dir();
     let prev = std::env::var_os("ASTRA_CLI_CREDENTIALS_DIR");
     // SAFETY: Tests using CredentialsGuard are #[serial_test::serial].
     unsafe {
@@ -131,37 +131,77 @@ pub(crate) fn isolate_credentials() -> CredentialsGuard {
 
 // ── Session Journal Isolation ──────────────────────────────────────────
 
-/// Create a temp dir on a real-disk filesystem (not tmpfs), avoiding
-/// ENOSPC due to small /tmp on memory-backed mounts.  Respects
-/// `TMPDIR`; otherwise uses `target/test-tmp` under the workspace.
+/// Create a temp dir on the workspace target filesystem, avoiding
+/// ENOSPC from small `/tmp` tmpfs mounts during highly-parallel test
+/// runs. `ASTRA_TEST_TMPDIR` is the explicit override; otherwise use
+/// Cargo's test temp root or `target/test-tmp` under the workspace.
 pub(crate) fn test_temp_dir() -> tempfile::TempDir {
     use std::sync::OnceLock;
 
-    static BASE: OnceLock<PathBuf> = OnceLock::new();
-    let base = BASE.get_or_init(|| {
+    static BASES: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    let bases = BASES.get_or_init(|| {
+        let pid = std::process::id();
+        let process_base = |root: PathBuf| root.join(format!("astra-cli-{pid}"));
+        let mut bases = Vec::new();
         // 1. explicit override
-        if let Ok(d) = std::env::var("TMPDIR") {
+        if let Ok(d) = std::env::var("ASTRA_TEST_TMPDIR") {
             let p = PathBuf::from(d);
-            if p.is_dir() {
-                return p;
+            if p.exists() || std::fs::create_dir_all(&p).is_ok() {
+                bases.push(process_base(p));
             }
         }
-        // 2. LOCATE workspace root from crate directory
+        // 2. Cargo-provided target temp root when available.
+        if let Ok(d) = std::env::var("CARGO_TARGET_TMPDIR") {
+            let p = PathBuf::from(d);
+            if p.exists() || std::fs::create_dir_all(&p).is_ok() {
+                bases.push(process_base(p));
+            }
+        }
+        // 3. Locate workspace root from crate directory.
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         for ancestor in manifest.ancestors().skip(1) {
             if ancestor.join("Cargo.lock").exists() || ancestor.join("Cargo.toml").exists() {
-                return ancestor.join("target").join("test-tmp");
+                bases.push(process_base(ancestor.join("target").join("test-tmp")));
+                break;
             }
         }
-        // 3. last resort
-        std::env::temp_dir()
+        // 4. Last resort.
+        bases.push(process_base(std::env::temp_dir().join("astra-test-tmp")));
+        bases
     });
 
-    std::fs::create_dir_all(base).expect("create test-tmp base dir");
-    tempfile::Builder::new()
-        .prefix("astra-test-")
-        .tempdir_in(base)
-        .expect("create test temp dir")
+    let mut errors = Vec::new();
+    for base in bases {
+        if let Err(error) = std::fs::create_dir_all(base) {
+            errors.push(format!("{}: create base failed: {error}", base.display()));
+            continue;
+        }
+        for attempt in 0..5 {
+            match tempfile::Builder::new()
+                .prefix("astra-test-")
+                .tempdir_in(base)
+            {
+                Ok(dir) => return dir,
+                Err(error) => {
+                    let retryable = error.kind() == std::io::ErrorKind::StorageFull;
+                    errors.push(format!(
+                        "{}: create temp dir attempt {} failed: {error}",
+                        base.display(),
+                        attempt + 1
+                    ));
+                    if retryable {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    panic!(
+        "create test temp dir failed in all candidate roots:\n{}",
+        errors.join("\n")
+    );
 }
 
 pub(crate) fn isolated_sessions_dir() -> (
@@ -280,7 +320,7 @@ impl crate::cli::ui_adapter::ReplUiAdapter for TestUi {
 
 #[cfg(test)]
 mod tests {
-    use super::{HomeGuard, isolate_credentials};
+    use super::{HomeGuard, isolate_credentials, test_temp_dir};
 
     // ── HomeGuard ──────────────────────────────────────────────────
 
@@ -301,7 +341,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn home_guard_set_redirects_home() {
-        let tmp = tempfile::tempdir().expect("create tmp dir");
+        let tmp = test_temp_dir();
         let guard = HomeGuard::set(tmp.path());
         assert_eq!(guard.path(), tmp.path(), "guard path must match set path");
         assert_eq!(
@@ -367,7 +407,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn home_guard_path_returns_current() {
-        let tmp = tempfile::tempdir().expect("create tmp dir");
+        let tmp = test_temp_dir();
         let guard = HomeGuard::set(tmp.path());
         assert_eq!(guard.path(), tmp.path());
         drop(guard);

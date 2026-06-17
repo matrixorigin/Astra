@@ -6,7 +6,7 @@ use super::{
     SANDBOX_DENIED_PREFIX, ToolExecutor, apply_env_overlay, build_test, code_intel,
     sandbox_command, validate_path, wrap_command_with_limits,
 };
-use astra_runtime::tool_sandbox::{SandboxMode, SandboxPolicy, filter_environment};
+use astra_runtime::tool_sandbox::{IsolationLevel, SandboxPolicy, filter_environment};
 use astra_tools::detach::{
     AdoptionAckOutcome, await_adoption_ack, detach_signal_observed, render_bash_detached_marker,
     restore_detach_signal_receiver, sigkill_process_group, terminate_detached_payload,
@@ -2958,11 +2958,7 @@ enum DetachableShellOutput {
 fn effective_shell_command(config: &ShellRunConfig) -> String {
     if config.harden_command {
         if let Some(ref policy) = config.sandbox_policy {
-            if !matches!(policy.mode, SandboxMode::Permissive) {
-                wrap_command_with_limits(policy, &config.command)
-            } else {
-                config.command.clone()
-            }
+            wrap_command_with_limits(policy, &config.command)
         } else {
             config.command.clone()
         }
@@ -2993,9 +2989,8 @@ fn run_shell_output_with_config(config: ShellRunConfig) -> Result<std::process::
         child_cmd.process_group(0); // child becomes its own process group leader
     }
 
-    // Apply sandbox environment filtering.
+    // Apply sandbox environment filtering (all isolation levels).
     if let Some(ref policy) = config.sandbox_policy
-        && !matches!(policy.mode, SandboxMode::Permissive)
         && let Err(e) = sandbox_command(policy, &mut child_cmd)
     {
         eprintln!("[sandbox] failed to apply policy: {e}");
@@ -3107,9 +3102,7 @@ fn configure_detachable_tokio_command(config: &ShellRunConfig) -> TokioCommand {
     #[cfg(unix)]
     child_cmd.process_group(0);
 
-    if let Some(ref policy) = config.sandbox_policy
-        && !matches!(policy.mode, SandboxMode::Permissive)
-    {
+    if let Some(ref policy) = config.sandbox_policy {
         child_cmd.current_dir(&policy.project_root);
         child_cmd.env_clear();
         for (key, value) in filter_environment(policy) {
@@ -4157,7 +4150,7 @@ impl ToolExecutor {
                 .unwrap_or_else(|e| e.into_inner());
             let is_restrictive = sp_guard
                 .as_ref()
-                .is_some_and(|p| !matches!(p.mode, SandboxMode::Permissive));
+                .is_some_and(|p| !matches!(p.isolation, IsolationLevel::Permissive));
             drop(sp_guard);
             if is_restrictive {
                 return Err(warning);
@@ -4205,7 +4198,7 @@ impl ToolExecutor {
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(ref policy) = *sp_guard
-                && !matches!(policy.mode, SandboxMode::Permissive)
+                && !matches!(policy.isolation, IsolationLevel::Permissive)
             {
                 if let Some(msg) = check_bash_path_boundary(policy, &command) {
                     return Err(msg);
@@ -4485,7 +4478,7 @@ impl ToolExecutor {
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(ref policy) = *sp_guard
-                && !matches!(policy.mode, SandboxMode::Permissive)
+                && !matches!(policy.isolation, IsolationLevel::Permissive)
             {
                 if let Some(msg) = check_powershell_path_boundary(policy, command) {
                     return msg;

@@ -28,10 +28,12 @@ const HIGH_CHURN_DIFF_RESULT_CHARS: usize = 14_000;
 const HIGH_CHURN_SHELL_RESULT_CHARS: usize = 18_000;
 
 /// Remove `_cli_*` keys from JSON tool results and diff sentinels from `str_replace` text.
-/// Also truncates oversized results to `MAX_TOOL_RESULT_CHARS`, keeping head + tail with
-/// a truncation notice in the middle.
+///
+/// This keeps the full sanitized content. Use this for durable artifacts that a
+/// later tool may parse or read back. Budget truncation belongs only at the
+/// model-message boundary.
 #[must_use]
-pub fn tool_result_content_for_model(tool_name: &str, content: &str) -> String {
+pub fn tool_result_content_for_model_unbounded(tool_name: &str, content: &str) -> String {
     let content = match tool_name {
         "write_file" => strip_cli_json_keys(content),
         "str_replace" | "multi_edit" => str_replace_diff_block_re()
@@ -56,10 +58,25 @@ pub fn tool_result_content_for_model(tool_name: &str, content: &str) -> String {
             tool_name
         );
     }
+    sanitized.content
+}
+
+/// Remove `_cli_*` keys from JSON tool results and diff sentinels from
+/// `str_replace` text. Also truncates oversized results to
+/// `MAX_TOOL_RESULT_CHARS`, keeping head + tail with a truncation notice in the
+/// middle.
+#[must_use]
+pub fn tool_result_content_for_model(tool_name: &str, content: &str) -> String {
+    let sanitized = tool_result_content_for_model_unbounded(tool_name, content);
+    truncate_tool_result_for_model(tool_name, &sanitized)
+}
+
+#[must_use]
+pub fn truncate_tool_result_for_model(tool_name: &str, sanitized_content: &str) -> String {
     truncate_tool_result(
         tool_name,
-        &sanitized.content,
-        model_result_char_budget(tool_name, &sanitized.content),
+        sanitized_content,
+        model_result_char_budget(tool_name, sanitized_content),
     )
 }
 
@@ -305,6 +322,27 @@ mod tests {
         assert!(
             out.contains("truncated") || out.contains("elided"),
             "folded output should explain truncation"
+        );
+    }
+
+    #[test]
+    fn unbounded_model_content_preserves_long_json_shape() {
+        let raw = json!({
+            "status": "completed",
+            "result": "x".repeat(MAX_TOOL_RESULT_CHARS + 10_000)
+        })
+        .to_string();
+
+        let unbounded = tool_result_content_for_model_unbounded("agent_fanout", &raw);
+        serde_json::from_str::<Value>(&unbounded)
+            .expect("durable model artifact content must remain parseable JSON");
+
+        let inline = tool_result_content_for_model("agent_fanout", &raw);
+        assert!(
+            inline.contains("truncated")
+                || inline.contains("elided")
+                || inline.len() <= MAX_TOOL_RESULT_CHARS,
+            "inline model content should remain budgeted"
         );
     }
 

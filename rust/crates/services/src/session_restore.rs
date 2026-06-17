@@ -731,7 +731,7 @@ impl HybridRestoreService {
 /// Reads `composite_snapshots.json` from the session step-checkpoint directory.
 ///
 /// Must stay aligned with `astra_pipeline::step_checkpoint::read_composite_snapshot_index`
-/// (same path and at-rest encryption).
+/// (same path and plaintext JSON format).
 fn read_composite_snapshot_index_local(
     session_id: &str,
 ) -> Result<astra_core::composite_snapshot::CompositeSnapshotIndex, String> {
@@ -741,16 +741,8 @@ fn read_composite_snapshot_index_local(
     }
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("read composite_snapshots.json: {e}"))?;
-    let Some(decrypted) = crate::checkpoint_crypto::decrypt_text(&content)
-        .map_err(|e| format!("decrypt composite_snapshots.json: {e}"))?
-    else {
-        return Err(format!(
-            "composite snapshot index decryption failed for {}",
-            path.display()
-        ));
-    };
     let mut index: astra_core::composite_snapshot::CompositeSnapshotIndex =
-        serde_json::from_str(&decrypted)
+        serde_json::from_str(&content)
             .map_err(|e| format!("parse composite_snapshots.json: {e}"))?;
     index.normalize_versions();
     Ok(index)
@@ -2531,45 +2523,41 @@ mod tests {
     }
 
     #[test]
-    fn local_composite_snapshot_index_reads_encrypted_file() {
+    fn local_composite_snapshot_index_reads_plaintext_file() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
         let sid = uuid::Uuid::new_v4().to_string();
         let mut snapshot = astra_core::composite_snapshot::CompositeSnapshotBuilder::new(&sid, 3)
             .session_state("000003-heavy.json")
             .build();
-        snapshot.snapshot_id = "snap-encrypted".into();
+        snapshot.snapshot_id = "snap-plaintext".into();
         let index = astra_core::composite_snapshot::CompositeSnapshotIndex {
             snapshots: vec![snapshot],
         };
         let path = composite_snapshots_json_path(&sid).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let json = serde_json::to_string(&index).unwrap();
-        std::fs::write(
-            &path,
-            crate::checkpoint_crypto::encrypt_text(&json).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(&path, json).unwrap();
 
         let restored = read_composite_snapshot_index_local(&sid).unwrap();
 
         assert_eq!(restored.snapshots.len(), 1);
-        assert_eq!(restored.snapshots[0].snapshot_id, "snap-encrypted");
+        assert_eq!(restored.snapshots[0].snapshot_id, "snap-plaintext");
     }
 
     #[test]
-    fn local_composite_snapshot_index_rejects_undecryptable_file() {
+    fn local_composite_snapshot_index_rejects_invalid_json() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
         let sid = uuid::Uuid::new_v4().to_string();
         let path = composite_snapshots_json_path(&sid).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "not-encrypted-json").unwrap();
+        std::fs::write(&path, "not-json").unwrap();
 
         let error = read_composite_snapshot_index_local(&sid).unwrap_err();
 
         assert!(
-            error.contains("decryption failed"),
+            error.contains("parse composite_snapshots.json"),
             "corrupt local index must surface as restore error: {error}"
         );
     }

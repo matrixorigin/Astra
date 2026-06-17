@@ -48,7 +48,7 @@ pub enum EdgeClientMessage {
         #[serde(default)]
         workspace_dir: Option<String>,
         #[serde(default)]
-        capabilities: Option<Vec<String>>,
+        capabilities: Option<Value>,
     },
 
     /// Tool execution result from the edge.
@@ -203,12 +203,18 @@ mod tests {
             edge_agent_id: "e1".into(),
             hostname: Some("h".into()),
             workspace_dir: None,
-            capabilities: None,
+            capabilities: Some(json!({
+                "schema_version": 1,
+                "binding": {
+                    "executor": {"kind": "edge_agent"}
+                }
+            })),
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "edge_auth");
         assert_eq!(v["token"], "Bearer tok");
         assert_eq!(v["edge_agent_id"], "e1");
+        assert_eq!(v["capabilities"]["schema_version"], 1);
     }
 
     #[test]

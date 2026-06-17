@@ -19,8 +19,22 @@ pub fn is_tool_error(result_str: &str) -> bool {
         if v.get("error_code").is_some() {
             return true;
         }
-        if v.get("status").and_then(|s| s.as_str()) == Some("error") {
-            return true;
+        if let Some(status) = v.get("status").and_then(|s| s.as_str()) {
+            let normalized = status.trim().to_ascii_lowercase();
+            if matches!(
+                normalized.as_str(),
+                "error"
+                    | "failed"
+                    | "failure"
+                    | "partial_failure"
+                    | "denied"
+                    | "cancelled"
+                    | "canceled"
+                    | "timeout"
+                    | "timed_out"
+            ) {
+                return true;
+            }
         }
     }
     result_str.to_lowercase().starts_with("error")
@@ -32,7 +46,8 @@ pub fn is_tool_error(result_str: &str) -> bool {
 /// everything else is reported as `"success"` (the body may still describe failure in JSON).
 #[must_use]
 pub fn cloud_tool_result_status_label(output: &str) -> &'static str {
-    if output.starts_with("Error:")
+    if is_tool_error(output)
+        || output.starts_with("Error:")
         || output.starts_with("Unknown tool:")
         || output.starts_with("Sandbox:")
     {
@@ -411,6 +426,10 @@ mod tests {
         assert_eq!(cloud_tool_result_status_label("Error: x"), "error");
         assert_eq!(cloud_tool_result_status_label("Unknown tool: y"), "error");
         assert_eq!(cloud_tool_result_status_label("Sandbox: z"), "error");
+        assert_eq!(
+            cloud_tool_result_status_label(r#"{"status":"failed","error":"bad args"}"#),
+            "error"
+        );
     }
 
     #[test]
@@ -518,6 +537,11 @@ mod tests {
     #[test]
     fn is_tool_error_json_status_error() {
         assert!(is_tool_error(r#"{"status": "error", "detail": "oops"}"#));
+    }
+
+    #[test]
+    fn is_tool_error_json_status_failed() {
+        assert!(is_tool_error(r#"{"status": "failed", "detail": "oops"}"#));
     }
 
     #[test]
@@ -754,15 +778,9 @@ if let Err(e) = writeln!(file, "{line}") {
             ToolErrorSeverity::HardError
         );
 
-        // git_commit timeout
+        // git action timeout
         assert_eq!(
-            classify_tool_error("git_commit", output),
-            ToolErrorSeverity::HardError
-        );
-
-        // git_revert_commit timeout
-        assert_eq!(
-            classify_tool_error("git_revert_commit", output),
+            classify_tool_error("git", output),
             ToolErrorSeverity::HardError
         );
 
@@ -772,15 +790,9 @@ if let Err(e) = writeln!(file, "{line}") {
             ToolErrorSeverity::HardError
         );
 
-        // git_stash timeout
+        // github mutating action timeout
         assert_eq!(
-            classify_tool_error("git_stash", output),
-            ToolErrorSeverity::HardError
-        );
-
-        // github_create_issue timeout
-        assert_eq!(
-            classify_tool_error("github_create_issue", output),
+            classify_tool_error("github", output),
             ToolErrorSeverity::HardError
         );
     }

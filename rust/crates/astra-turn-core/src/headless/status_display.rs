@@ -38,8 +38,8 @@ fn fmt_github_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
         .or_else(|| obj.get("issue_number"))
         .and_then(|v| v.as_u64());
 
-    match name {
-        "github_create_issue" => {
+    match (name, obj.get("action").and_then(Value::as_str)) {
+        ("github", Some("create_issue")) => {
             let title = obj.get("title").and_then(|v| v.as_str());
             match (repo_display, title) {
                 (Some(repo), Some(title)) => {
@@ -50,7 +50,7 @@ fn fmt_github_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
                 (None, None) => None,
             }
         }
-        "github_get_pr" | "github_get_issue" => match (repo_display, number) {
+        ("github", Some("get_pr" | "get_issue")) => match (repo_display, number) {
             (Some(repo), Some(number)) => Some(format!("{repo}#{number}")),
             (Some(repo), None) => Some(repo),
             (None, Some(_)) => None,
@@ -59,7 +59,7 @@ fn fmt_github_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
                 .and_then(|v| v.as_str())
                 .map(|q| truncate_str(q, 60)),
         },
-        "github_list_prs" | "github_list_issues" | "github_repo_stats" | "github_ci_status" => {
+        ("github", Some("list_prs" | "list_issues" | "repo_stats" | "ci_status")) => {
             match repo_display {
                 Some(repo) => Some(repo),
                 None => obj
@@ -68,13 +68,14 @@ fn fmt_github_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
                     .map(|q| truncate_str(q, 60)),
             }
         }
-        _ => match repo_display {
+        ("github", _) => match repo_display {
             Some(repo) => Some(repo),
             None => obj
                 .get("query")
                 .and_then(|v| v.as_str())
                 .map(|q| truncate_str(q, 60)),
         },
+        _ => None,
     }
 }
 
@@ -162,121 +163,137 @@ fn fmt_search_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
 
 fn fmt_git_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
     match name {
-        "git_diff" => {
-            let path = obj.get("path").and_then(|v| v.as_str());
-            let staged = obj.get("staged").and_then(|v| v.as_bool()).unwrap_or(false);
-            let base_ref = obj.get("base_ref").and_then(|v| v.as_str());
-            let git_ref = obj.get("ref").and_then(|v| v.as_str());
-            if let Some(base) = base_ref {
-                let tip = git_ref.unwrap_or("HEAD");
-                let range = format!("{base}..{tip}");
-                return match path {
-                    Some(p) => Some(format!("{range} -- {p}")),
-                    None => Some(range),
-                };
-            }
-            let suffix = if staged { " (staged)" } else { "" };
-            match path {
-                Some(p) => Some(format!("{p}{suffix}")),
-                None => Some(format!("working tree{suffix}")),
-            }
-        }
-        "git_log" => {
-            let n = obj.get("max_count").and_then(|v| v.as_u64());
-            let path = obj.get("path").and_then(|v| v.as_str());
-            match (path, n) {
-                (Some(p), Some(n)) => Some(format!("{p} (last {n})")),
-                (Some(p), None) => Some(p.to_string()),
-                (None, Some(n)) => Some(format!("last {n} commits")),
-                _ => None,
-            }
-        }
-        "git_show" => obj
-            .get("revision")
-            .and_then(|v| v.as_str())
-            .map(|r| truncate_str(r, 40)),
-        "git_blame" => {
-            let path = obj.get("path").and_then(|v| v.as_str())?;
-            let start = obj.get("start_line").and_then(|v| v.as_u64());
-            let end = obj.get("end_line").and_then(|v| v.as_u64());
-            match (start, end) {
-                (Some(s), Some(e)) => Some(format!("{path}:{s}-{e}")),
-                _ => Some(path.to_string()),
-            }
-        }
-        "git_log_search" => obj
-            .get("query")
-            .and_then(|v| v.as_str())
-            .map(|q| format!("\"{}\"", truncate_str(q, 50))),
-        "git_file_history" => obj
-            .get("file")
-            .and_then(|v| v.as_str())
-            .map(|path| shorten_path(path, 60)),
-        "git_contributors" => {
-            let path = obj.get("path").and_then(|v| v.as_str());
-            let since = obj.get("since").and_then(|v| v.as_str());
-            match (path, since) {
-                (Some(path), Some(since)) => Some(format!(
-                    "{} since {}",
-                    shorten_path(path, 36),
-                    truncate_str(since, 20)
-                )),
-                (Some(path), None) => Some(shorten_path(path, 60)),
-                (None, Some(since)) => Some(format!("since {}", truncate_str(since, 24))),
-                (None, None) => None,
-            }
-        }
-        "git_commit" => obj
-            .get("message")
-            .and_then(|v| v.as_str())
-            .map(|message| truncate_str(message, 60)),
-        "git_revert_commit" => obj
-            .get("commit_sha")
-            .and_then(|v| v.as_str())
-            .map(|sha| truncate_str(sha, 16)),
-        "git_stash" => {
-            let action = obj.get("action").and_then(|v| v.as_str());
-            let stash_ref = obj.get("stash_ref").and_then(|v| v.as_str());
-            let index = obj.get("index").and_then(|v| v.as_i64());
-            match (action, stash_ref, index) {
-                (Some(action), Some(stash_ref), _) => {
-                    Some(format!("{action} {}", truncate_str(stash_ref, 32)))
+        "git" => match obj.get("action").and_then(Value::as_str) {
+            Some("diff") => {
+                let path = obj.get("path").and_then(|v| v.as_str());
+                let staged = obj.get("staged").and_then(|v| v.as_bool()).unwrap_or(false);
+                let base_ref = obj.get("base_ref").and_then(|v| v.as_str());
+                let git_ref = obj.get("ref").and_then(|v| v.as_str());
+                if let Some(base) = base_ref {
+                    let tip = git_ref.unwrap_or("HEAD");
+                    let range = format!("{base}..{tip}");
+                    return match path {
+                        Some(p) => Some(format!("{range} -- {p}")),
+                        None => Some(range),
+                    };
                 }
-                (Some(action), None, Some(index)) => Some(format!("{action} stash@{{{index}}}")),
-                (Some(action), None, None) => Some(action.to_string()),
-                _ => None,
-            }
-        }
-        "git_checkout_file" => {
-            let path = obj.get("path").and_then(|v| v.as_str());
-            let git_ref = obj.get("ref").and_then(|v| v.as_str());
-            match (path, git_ref) {
-                (Some(path), Some(git_ref)) => {
-                    Some(format!("{git_ref} -- {}", shorten_path(path, 40)))
+                let suffix = if staged { " (staged)" } else { "" };
+                match path {
+                    Some(p) => Some(format!("{p}{suffix}")),
+                    None => Some(format!("working tree{suffix}")),
                 }
-                (Some(path), None) => Some(shorten_path(path, 60)),
-                _ => None,
             }
-        }
-        "git_worktree" => {
-            let action = obj.get("action").and_then(|v| v.as_str());
-            let branch = obj.get("branch").and_then(|v| v.as_str());
-            let path = obj.get("path").and_then(|v| v.as_str());
-            match (action, branch, path) {
-                (Some(action), Some(branch), _) => Some(format!(
-                    "{} {}",
-                    truncate_str(action, 16),
-                    truncate_str(branch, 30)
-                )),
-                (Some(action), None, Some(path)) => Some(format!(
-                    "{} {}",
-                    truncate_str(action, 16),
-                    truncate_str(path, 30)
-                )),
-                (Some(action), None, None) => Some(action.to_string()),
-                _ => None,
+            Some("log") => {
+                let n = obj
+                    .get("n")
+                    .or_else(|| obj.get("max_count"))
+                    .and_then(|v| v.as_u64());
+                let path = obj.get("path").and_then(|v| v.as_str());
+                match (path, n) {
+                    (Some(p), Some(n)) => Some(format!("{p} (last {n})")),
+                    (Some(p), None) => Some(p.to_string()),
+                    (None, Some(n)) => Some(format!("last {n} commits")),
+                    _ => None,
+                }
             }
-        }
+            Some("show") => obj
+                .get("revision")
+                .or_else(|| obj.get("ref"))
+                .and_then(|v| v.as_str())
+                .map(|r| truncate_str(r, 40)),
+            Some("blame") => {
+                let path = obj.get("path").and_then(|v| v.as_str())?;
+                let start = obj.get("start_line").and_then(|v| v.as_u64());
+                let end = obj.get("end_line").and_then(|v| v.as_u64());
+                match (start, end) {
+                    (Some(s), Some(e)) => Some(format!("{path}:{s}-{e}")),
+                    _ => Some(path.to_string()),
+                }
+            }
+            Some("log_search") => obj
+                .get("query")
+                .and_then(|v| v.as_str())
+                .map(|q| format!("\"{}\"", truncate_str(q, 50))),
+            Some("file_history") => obj
+                .get("file")
+                .and_then(|v| v.as_str())
+                .map(|path| shorten_path(path, 60)),
+            Some("contributors") => {
+                let path = obj.get("path").and_then(|v| v.as_str());
+                let since = obj.get("since").and_then(|v| v.as_str());
+                match (path, since) {
+                    (Some(path), Some(since)) => Some(format!(
+                        "{} since {}",
+                        shorten_path(path, 36),
+                        truncate_str(since, 20)
+                    )),
+                    (Some(path), None) => Some(shorten_path(path, 60)),
+                    (None, Some(since)) => Some(format!("since {}", truncate_str(since, 24))),
+                    (None, None) => None,
+                }
+            }
+            Some("commit") => obj
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(|message| truncate_str(message, 60)),
+            Some("revert_commit") => obj
+                .get("commit_sha")
+                .and_then(|v| v.as_str())
+                .map(|sha| truncate_str(sha, 16)),
+            Some("stash") => {
+                let sub_action = obj
+                    .get("sub_action")
+                    .or_else(|| obj.get("stash_action"))
+                    .and_then(|v| v.as_str());
+                let stash_ref = obj.get("stash_ref").and_then(|v| v.as_str());
+                let index = obj.get("index").and_then(|v| v.as_i64());
+                match (sub_action, stash_ref, index) {
+                    (Some(action), Some(stash_ref), _) => {
+                        Some(format!("{action} {}", truncate_str(stash_ref, 32)))
+                    }
+                    (Some(action), None, Some(index)) => {
+                        Some(format!("{action} stash@{{{index}}}"))
+                    }
+                    (Some(action), None, None) => Some(action.to_string()),
+                    _ => None,
+                }
+            }
+            Some("checkout_file") => {
+                let path = obj.get("path").and_then(|v| v.as_str());
+                let git_ref = obj.get("ref").and_then(|v| v.as_str());
+                match (path, git_ref) {
+                    (Some(path), Some(git_ref)) => {
+                        Some(format!("{git_ref} -- {}", shorten_path(path, 40)))
+                    }
+                    (Some(path), None) => Some(shorten_path(path, 60)),
+                    _ => None,
+                }
+            }
+            Some("worktree") => {
+                let sub_action = obj
+                    .get("sub_action")
+                    .or_else(|| obj.get("worktree_action"))
+                    .and_then(|v| v.as_str());
+                let branch = obj.get("branch").and_then(|v| v.as_str());
+                let path = obj.get("path").and_then(|v| v.as_str());
+                match (sub_action, branch, path) {
+                    (Some(action), Some(branch), _) => Some(format!(
+                        "{} {}",
+                        truncate_str(action, 16),
+                        truncate_str(branch, 30)
+                    )),
+                    (Some(action), None, Some(path)) => Some(format!(
+                        "{} {}",
+                        truncate_str(action, 16),
+                        truncate_str(path, 30)
+                    )),
+                    (Some(action), None, None) => Some(action.to_string()),
+                    _ => None,
+                }
+            }
+            Some("status") => None,
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -805,6 +822,122 @@ pub fn tool_call_detail(name: &str, args: &Value) -> Option<String> {
     }
 }
 
+const TOOL_ERROR_SUMMARY_MAX_CHARS: usize = 100;
+
+fn structured_field<'a>(result: &'a str, field: &str) -> Option<&'a str> {
+    result
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix(field).map(str::trim))
+        .filter(|value| !value.is_empty())
+}
+
+fn json_error_summary(result: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(result).ok()?;
+    let obj = value.as_object()?;
+    let explicitly_failed = obj.get("success").and_then(Value::as_bool) == Some(false)
+        || obj.get("status").and_then(Value::as_str) == Some("failed")
+        || obj.get("status").and_then(Value::as_str) == Some("error");
+    if !explicitly_failed && !obj.contains_key("error") {
+        return None;
+    }
+    for key in ["error", "message", "detail"] {
+        if let Some(text) = obj.get(key).and_then(Value::as_str)
+            && !text.trim().is_empty()
+        {
+            return Some(text.trim().to_string());
+        }
+    }
+    None
+}
+
+fn informative_error_line(result: &str) -> Option<&str> {
+    const NEEDLES: &[&str] = &[
+        "error:",
+        "failed",
+        "not found",
+        "permission denied",
+        "no such file",
+        "missing",
+        "invalid",
+        "denied",
+    ];
+    result.lines().find(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let lower = trimmed.to_lowercase();
+        NEEDLES.iter().any(|needle| lower.contains(needle))
+    })
+}
+
+/// Extract a compact, actionable error summary from arbitrary tool output.
+///
+/// Preference order is protocol-shaped rather than tool-shaped: structured JSON
+/// error, `WHAT:` failure records, informative error lines, then the first
+/// non-empty line. This keeps UI surfaces from collapsing rich failures like
+/// `WHAT/WHY/NEXT` into a generic banner.
+#[must_use]
+pub fn tool_error_summary(tool_name: &str, result: &str) -> String {
+    let trimmed = result.trim();
+    if trimmed.is_empty() {
+        return format!("{tool_name} failed before returning output");
+    }
+
+    if let Some(summary) = json_error_summary(trimmed) {
+        return truncate_str(&summary, TOOL_ERROR_SUMMARY_MAX_CHARS);
+    }
+
+    if let Some(what) = structured_field(result, "WHAT:") {
+        return truncate_str(what, TOOL_ERROR_SUMMARY_MAX_CHARS);
+    }
+
+    if let Some(line) = informative_error_line(result) {
+        return truncate_str(line.trim(), TOOL_ERROR_SUMMARY_MAX_CHARS);
+    }
+
+    let first = result
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(trimmed)
+        .trim();
+    truncate_str(first, TOOL_ERROR_SUMMARY_MAX_CHARS)
+}
+
+fn summarize_git_result(result: &str) -> Option<String> {
+    if result.trim().is_empty() {
+        return Some("clean/no changes".to_string());
+    }
+
+    if result.contains("--- ") && (result.contains("+++ ") || result.contains("diff --git ")) {
+        let adds = result
+            .lines()
+            .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+            .count();
+        let dels = result
+            .lines()
+            .filter(|line| line.starts_with('-') && !line.starts_with("---"))
+            .count();
+        if adds > 0 || dels > 0 {
+            return Some(format!("+{adds} -{dels}"));
+        }
+    }
+
+    let commits = result
+        .lines()
+        .filter(|line| line.starts_with("commit ") || line.starts_with("* "))
+        .count();
+    if commits > 0 {
+        return Some(format!("{commits} commits"));
+    }
+
+    let lines = result
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    (lines > 0).then(|| format!("{lines} lines"))
+}
+
 /// Build a brief summary of a tool result for the status line (after execution).
 #[must_use]
 pub fn tool_result_summary(name: &str, result: &str) -> Option<String> {
@@ -893,39 +1026,7 @@ pub fn tool_result_summary(name: &str, result: &str) -> Option<String> {
             let count = result.lines().count();
             Some(format!("{count} entries"))
         }
-        "git_diff" => {
-            if result.trim().is_empty() {
-                Some("no changes".to_string())
-            } else {
-                let adds = result.lines().filter(|l| l.starts_with('+')).count();
-                let dels = result.lines().filter(|l| l.starts_with('-')).count();
-                if adds > 0 || dels > 0 {
-                    Some(format!("+{adds} -{dels}"))
-                } else {
-                    let lines = result.lines().count();
-                    Some(format!("{lines} lines"))
-                }
-            }
-        }
-        "git_log" => {
-            let commits = result
-                .lines()
-                .filter(|l| l.starts_with("commit ") || l.starts_with("* "))
-                .count();
-            if commits > 0 {
-                Some(format!("{commits} commits"))
-            } else {
-                None
-            }
-        }
-        "git_status" => {
-            let changed = result.lines().filter(|l| !l.trim().is_empty()).count();
-            if changed == 0 {
-                Some("clean".to_string())
-            } else {
-                Some(format!("{changed} files"))
-            }
-        }
+        "git" => summarize_git_result(result),
         "agent" => serde_json::from_str::<Value>(result)
             .ok()
             .as_ref()
@@ -942,8 +1043,8 @@ mod tests {
     #[test]
     fn tool_call_detail_github_shows_owner_repo() {
         let detail = tool_call_detail(
-            "github_ci_status",
-            &json!({"owner": "matrixorigin", "repo": "matrixone"}),
+            "github",
+            &json!({"action": "ci_status", "owner": "matrixorigin", "repo": "matrixone"}),
         );
         assert_eq!(detail.as_deref(), Some("matrixorigin/matrixone"));
     }
@@ -951,17 +1052,21 @@ mod tests {
     #[test]
     fn tool_call_detail_github_repo_arg_shows_repo_and_number() {
         let detail = tool_call_detail(
-            "github_get_issue",
-            &json!({"repo": "matrixorigin/astra", "issue_number": 147}),
+            "github",
+            &json!({"action": "get_issue", "repo": "matrixorigin/astra", "issue_number": 147}),
         );
         assert_eq!(detail.as_deref(), Some("matrixorigin/astra#147"));
     }
 
     #[test]
-    fn tool_call_detail_github_create_issue_shows_repo_and_title() {
+    fn tool_call_detail_github_action_create_issue_shows_repo_and_title() {
         let detail = tool_call_detail(
-            "github_create_issue",
-            &json!({"repo": "matrixorigin/astra", "title": "Fix renderer drift"}),
+            "github",
+            &json!({
+                "action": "create_issue",
+                "repo": "matrixorigin/astra",
+                "title": "Fix renderer drift"
+            }),
         );
         assert_eq!(
             detail.as_deref(),
@@ -1009,28 +1114,35 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_detail_git_commit_shows_message() {
-        let detail = tool_call_detail("git_commit", &json!({"message": "ship the fix"}));
+    fn tool_call_detail_git_action_commit_shows_message() {
+        let detail = tool_call_detail(
+            "git",
+            &json!({"action": "commit", "message": "ship the fix"}),
+        );
         assert_eq!(detail.as_deref(), Some("ship the fix"));
     }
 
     #[test]
-    fn tool_call_detail_git_stash_shows_action() {
-        let detail = tool_call_detail("git_stash", &json!({"action": "push"}));
+    fn tool_call_detail_git_action_stash_shows_action() {
+        let detail = tool_call_detail("git", &json!({"action": "stash", "sub_action": "push"}));
         assert_eq!(detail.as_deref(), Some("push"));
     }
 
     #[test]
-    fn tool_call_detail_git_file_history_shows_file() {
-        let detail = tool_call_detail("git_file_history", &json!({"file": "src/main.rs"}));
+    fn tool_call_detail_git_action_file_history_shows_file() {
+        let detail = tool_call_detail(
+            "git",
+            &json!({"action": "file_history", "file": "src/main.rs"}),
+        );
         assert_eq!(detail.as_deref(), Some("src/main.rs"));
     }
 
     #[test]
-    fn tool_call_detail_git_checkout_file_shortens_long_path() {
+    fn tool_call_detail_git_action_checkout_file_shortens_long_path() {
         let detail = tool_call_detail(
-            "git_checkout_file",
+            "git",
             &json!({
+                "action": "checkout_file",
                 "path": "/very/long/path/to/deeply/nested/module/with/more/components/src/lib.rs",
                 "ref": "HEAD~1"
             }),
@@ -1041,10 +1153,10 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_detail_git_contributors_shows_filters() {
+    fn tool_call_detail_git_action_contributors_shows_filters() {
         let detail = tool_call_detail(
-            "git_contributors",
-            &json!({"path": "src/", "since": "30 days ago"}),
+            "git",
+            &json!({"action": "contributors", "path": "src/", "since": "30 days ago"}),
         );
         assert_eq!(detail.as_deref(), Some("src/ since 30 days ago"));
     }
@@ -1316,19 +1428,19 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_detail_git_checkout_file_shows_ref_and_path() {
+    fn tool_call_detail_git_action_checkout_file_shows_ref_and_path() {
         let detail = tool_call_detail(
-            "git_checkout_file",
-            &json!({"path": "src/lib.rs", "ref": "HEAD~1"}),
+            "git",
+            &json!({"action": "checkout_file", "path": "src/lib.rs", "ref": "HEAD~1"}),
         );
         assert_eq!(detail.as_deref(), Some("HEAD~1 -- src/lib.rs"));
     }
 
     #[test]
-    fn tool_call_detail_git_worktree_shows_action_and_branch() {
+    fn tool_call_detail_git_action_worktree_shows_sub_action_and_branch() {
         let detail = tool_call_detail(
-            "git_worktree",
-            &json!({"action": "add", "branch": "feature/ui"}),
+            "git",
+            &json!({"action": "worktree", "sub_action": "add", "branch": "feature/ui"}),
         );
         assert_eq!(detail.as_deref(), Some("add feature/ui"));
     }
@@ -1409,29 +1521,32 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_detail_git_diff_staged() {
-        let detail = tool_call_detail("git_diff", &json!({"staged": true}));
+    fn tool_call_detail_git_action_diff_staged() {
+        let detail = tool_call_detail("git", &json!({"action": "diff", "staged": true}));
         assert_eq!(detail.as_deref(), Some("working tree (staged)"));
     }
 
     #[test]
-    fn tool_call_detail_git_diff_range() {
-        let detail = tool_call_detail("git_diff", &json!({"base_ref": "HEAD~5", "ref": "HEAD"}));
+    fn tool_call_detail_git_action_diff_range() {
+        let detail = tool_call_detail(
+            "git",
+            &json!({"action": "diff", "base_ref": "HEAD~5", "ref": "HEAD"}),
+        );
         assert_eq!(detail.as_deref(), Some("HEAD~5..HEAD"));
     }
 
     #[test]
-    fn tool_call_detail_git_diff_range_with_path() {
+    fn tool_call_detail_git_action_diff_range_with_path() {
         let detail = tool_call_detail(
-            "git_diff",
-            &json!({"base_ref": "HEAD~3", "ref": "HEAD", "path": "src/main.rs"}),
+            "git",
+            &json!({"action": "diff", "base_ref": "HEAD~3", "ref": "HEAD", "path": "src/main.rs"}),
         );
         assert_eq!(detail.as_deref(), Some("HEAD~3..HEAD -- src/main.rs"));
     }
 
     #[test]
-    fn tool_call_detail_git_log_with_count() {
-        let detail = tool_call_detail("git_log", &json!({"max_count": 5}));
+    fn tool_call_detail_git_action_log_with_count() {
+        let detail = tool_call_detail("git", &json!({"action": "log", "max_count": 5}));
         assert_eq!(detail.as_deref(), Some("last 5 commits"));
     }
 
@@ -1470,6 +1585,27 @@ mod tests {
     }
 
     #[test]
+    fn tool_error_summary_prefers_structured_what() {
+        let output = "❌ STR_REPLACE FAILED — FILE NOT MODIFIED\n\nWHAT: old_str not found in file.\nWHY:  The exact byte sequence does not appear.\nNEXT: Re-read the target region.";
+        let summary = tool_error_summary("str_replace", output);
+        assert_eq!(summary, "old_str not found in file.");
+    }
+
+    #[test]
+    fn tool_error_summary_uses_json_error() {
+        let output = r#"{"success":false,"error":"missing 'path' for scope=file"}"#;
+        let summary = tool_error_summary("rollback_file_edits", output);
+        assert_eq!(summary, "missing 'path' for scope=file");
+    }
+
+    #[test]
+    fn tool_error_summary_skips_banner_for_informative_line() {
+        let output = "banner\n\nError: Missing 'path' parameter";
+        let summary = tool_error_summary("str_replace", output);
+        assert_eq!(summary, "Error: Missing 'path' parameter");
+    }
+
+    #[test]
     fn result_summary_grep_matches() {
         let result = "src/a.rs:10:match1\nsrc/b.rs:20:match2\nsrc/c.rs:30:match3";
         let summary = tool_result_summary("grep", result);
@@ -1490,15 +1626,15 @@ mod tests {
     }
 
     #[test]
-    fn result_summary_git_diff_empty() {
-        let summary = tool_result_summary("git_diff", "");
-        assert_eq!(summary.as_deref(), Some("no changes"));
+    fn result_summary_git_empty() {
+        let summary = tool_result_summary("git", "");
+        assert_eq!(summary.as_deref(), Some("clean/no changes"));
     }
 
     #[test]
-    fn result_summary_git_status_clean() {
-        let summary = tool_result_summary("git_status", "");
-        assert_eq!(summary.as_deref(), Some("clean"));
+    fn result_summary_git_counts_diff_changes() {
+        let summary = tool_result_summary("git", "--- a/src/lib.rs\n+++ b/src/lib.rs\n-old\n+new");
+        assert_eq!(summary.as_deref(), Some("+1 -1"));
     }
 
     #[test]

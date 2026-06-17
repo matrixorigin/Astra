@@ -1,3 +1,4 @@
+use super::server::tool_transport::ToolExecutionService;
 use super::*;
 use crate::turn::services::{
     NoopTurnAuxiliaryEventWriter, NoopTurnCoreEventWriter, NoopTurnHookDbWriter,
@@ -197,6 +198,12 @@ pub struct AppState {
     pub resource_governor: std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>,
     /// Live edge agent WebSocket connections for remote tool execution (Phase 6).
     pub edge_connection_pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
+    /// Shared ToolExecutionService for admin-controllable disabled_tools.
+    /// All executors share a clone of this service so admin API changes
+    /// take effect immediately on in-flight sessions.
+    pub tool_execution_service: ToolExecutionService,
+    /// Authenticated runner registrations eligible for runtime-env scheduling.
+    pub(crate) runner_pool: crate::server::runner_pool::ServerRunnerPool,
     /// Shared HTTP client for upstream LLM proxy requests (completions handler).
     /// Reuses connection pool and TLS state across requests.
     pub(crate) http_client: reqwest::Client,
@@ -292,6 +299,8 @@ impl AppState {
             ),
             edge_connection_pool: astra_server_types::edge_connection_pool::EdgeConnectionPool::new(
             ),
+            tool_execution_service: ToolExecutionService::builder().build(),
+            runner_pool: crate::server::runner_pool::ServerRunnerPool::default(),
             http_client: reqwest::Client::builder()
                 .no_proxy()
                 .connect_timeout(std::time::Duration::from_secs(30))
@@ -684,6 +693,14 @@ impl AppState {
 
     pub fn with_shared_pool(mut self, pool: SharedPool) -> Self {
         self.shared_pool = Some(pool);
+        self
+    }
+
+    pub(crate) fn with_runner_pool(
+        mut self,
+        runner_pool: crate::server::runner_pool::ServerRunnerPool,
+    ) -> Self {
+        self.runner_pool = runner_pool;
         self
     }
 
