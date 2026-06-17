@@ -379,8 +379,7 @@ impl ToolRegistry {
     }
 
     pub fn is_never_restrict(&self, name: &str) -> bool {
-        self.category(name).is_never_restrict()
-            || self.flags(name).contains(ToolFlags::TASK_MGMT)
+        self.category(name).is_never_restrict() || self.flags(name).contains(ToolFlags::TASK_MGMT)
     }
 
     pub fn is_parallelizable(&self, name: &str) -> bool {

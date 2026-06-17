@@ -2555,7 +2555,13 @@ impl ServerAgenticLoopHost {
         }
         if let Some(executor) = state.server_tool_executor.as_deref() {
             for name in executor.activated_deferred_tool_names() {
-                effective_restricted.remove(&name);
+                // Rescue activated deferred tools so they're visible this turn,
+                // but NOT if the health tracker has hard-deprioritized them —
+                // a broken-but-activated tool must stay restricted so it can be
+                // quarantined rather than silently rescued every turn.
+                if !state.turn_guard.health.is_deprioritized(name.as_str()) {
+                    effective_restricted.remove(&name);
+                }
             }
         }
         let visible = self.filtered_turn_tools(&effective_restricted);
@@ -3037,7 +3043,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
         if let Some(executor) = state.server_tool_executor.as_deref() {
             for name in executor.activated_deferred_tool_names() {
-                effective_restricted.remove(&name);
+                // Rescue activated deferred tools so they're visible this turn,
+                // but NOT if the health tracker has hard-deprioritized them —
+                // a broken-but-activated tool must stay restricted so it can be
+                // quarantined rather than silently rescued every turn.
+                if !state.turn_guard.health.is_deprioritized(name.as_str()) {
+                    effective_restricted.remove(&name);
+                }
             }
         }
         let visible_tools = self.filtered_turn_tools(&effective_restricted);
@@ -3706,7 +3718,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
         if let Some(executor) = state.server_tool_executor.as_deref() {
             for name in executor.activated_deferred_tool_names() {
-                effective_restricted.remove(&name);
+                // Rescue activated deferred tools so they're visible this turn,
+                // but NOT if the health tracker has hard-deprioritized them —
+                // a broken-but-activated tool must stay restricted so it can be
+                // quarantined rather than silently rescued every turn.
+                if !state.turn_guard.health.is_deprioritized(name.as_str()) {
+                    effective_restricted.remove(&name);
+                }
             }
         }
         let visible_tools = self.filtered_turn_tools(&effective_restricted);
