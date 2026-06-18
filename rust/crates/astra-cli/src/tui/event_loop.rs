@@ -1699,6 +1699,11 @@ pub(crate) async fn run_tui_session(
                                         let agent_spawner_for_cancel = state.agent_spawner.clone();
                                         let active_turn_local_run_control =
                                             state.active_turn_local_run_control.clone();
+                                        let preinstalled_run_control =
+                                            crate::cli::turn::local_run_control::LocalDeferredInputRunControl::shared();
+                                        *astra_core::sync_poison::recover_mutex_lock(
+                                            &active_turn_local_run_control,
+                                        ) = Some(preinstalled_run_control);
                                         let bash_detach_slot_for_ctrl_b =
                                             state.bash_detach_slot.clone();
                                         let background_registry_turn_session_id =
@@ -2610,6 +2615,9 @@ pub(crate) async fn run_tui_session(
                                         r
                                     };
 
+                                    *astra_core::sync_poison::recover_mutex_lock(
+                                        &state.active_turn_local_run_control,
+                                    ) = None;
                                     state.tui_stream_event_tx = None;
                                     state.tui_agent_live_event_sink = None;
 
@@ -5056,6 +5064,22 @@ mod tests {
         assert!(
             arm.contains("active_turn_local_run_control"),
             "active-turn Enter should use the live local run-control slot for the current turn"
+        );
+    }
+
+    #[test]
+    fn active_turn_preinstalls_local_run_control_before_stream_future_starts() {
+        let source = include_str!("event_loop.rs");
+        let install_pos = source
+            .find("LocalDeferredInputRunControl::shared()")
+            .expect("TUI turn loop must preinstall local run control");
+        let future_pos = source
+            .find("handle_chat_input_with_ui(submit_text")
+            .expect("TUI turn loop must start chat input future");
+
+        assert!(
+            install_pos < future_pos,
+            "deferred input provider must exist before the active-turn future starts"
         );
     }
 

@@ -80,12 +80,17 @@ async fn prepare_turn_stream_state(state: &SessionState) -> PreparedTurnStreamSt
         }
     };
 
+    let run_control =
+        astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control)
+            .clone()
+            .unwrap_or_else(LocalDeferredInputRunControl::shared);
+
     PreparedTurnStreamState {
         cancel_token: Arc::new(tokio_util::sync::CancellationToken::new()),
         incremental_state: Arc::new(
             astra_turn_core::turn_event_sink::IncrementalTurnState::default(),
         ),
-        run_control: LocalDeferredInputRunControl::shared(),
+        run_control,
         tui_cancel_token: state.tui_cancel_token.clone(),
         observability_hub: state.observability_hub.clone(),
         observability_session: state.observability_session.clone(),
@@ -382,6 +387,21 @@ mod tests {
                 && prompt.contains("simulated task-board outage")
                 && prompt.contains("Do not assume there are no open tasks"),
             "task-board load failure should be explicit in the turn-start prompt: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_turn_stream_state_reuses_preinstalled_tui_run_control() {
+        let state = SessionState::default();
+        let preinstalled = LocalDeferredInputRunControl::shared();
+        *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control) =
+            Some(preinstalled.clone());
+
+        let prepared = prepare_turn_stream_state(&state).await;
+
+        assert!(
+            Arc::ptr_eq(&prepared.run_control, &preinstalled),
+            "pre-turn queued TUI input must flow into the same provider used by the stream"
         );
     }
 
