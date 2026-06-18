@@ -203,7 +203,9 @@ impl ToolCell {
         {
             return;
         }
-        self.output_summary = Some(failure_detail_fallback(&self.name, &self.description));
+        let fallback = failure_detail_fallback(&self.name, &self.description);
+        self.output_summary = Some(fallback.clone());
+        self.output = Some(fallback);
     }
 
     fn bullet(&self) -> Span<'static> {
@@ -1097,6 +1099,7 @@ mod tests {
                 "Bash failed before returning output: slow op.\nOrigin: agent_tool_reporting_error; no error body returned."
             )
         );
+        assert_eq!(t.output.as_deref(), t.output_summary.as_deref());
         assert!(!t.is_live());
     }
 
@@ -1196,6 +1199,7 @@ mod tests {
             "{summary}"
         );
         assert!(summary.contains("agent_tool_reporting_error"), "{summary}");
+        assert_eq!(t.output.as_deref(), t.output_summary.as_deref());
         let out = render(&t, 100, 4);
         assert!(out.contains("Bash failed before returning output"), "{out}");
         assert!(out.contains("agent_tool_reporting_error"), "{out}");
@@ -1322,6 +1326,7 @@ mod tests {
             "{summary}"
         );
         assert!(summary.contains("agent_tool_reporting_error"), "{summary}");
+        assert_eq!(t.output.as_deref(), t.output_summary.as_deref());
     }
 
     #[test]

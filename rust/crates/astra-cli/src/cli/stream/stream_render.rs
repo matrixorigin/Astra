@@ -3153,6 +3153,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         }
         let start = std::time::Instant::now();
         let mut tool_result_fields = None;
+        let mut tool_execution_marked_error = false;
         let mut output = if allowed {
             if tool == astra_runtime::turn::skill_tool::SKILL_TOOL_NAME {
                 // Edge-path skill dedup: if the same skill was already invoked
@@ -3399,15 +3400,19 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             )
                             .await;
                             tool_result_fields = outcome.tool_result_fields;
+                            tool_execution_marked_error = outcome.is_error;
                             outcome.output
                         } else {
+                            tool_execution_marked_error = true;
                             format!("Error: {sandbox_msg}")
                         }
                     } else {
+                        tool_execution_marked_error = outcome.is_error;
                         outcome.output
                     }
                 } else {
                     tool_result_fields = outcome.tool_result_fields;
+                    tool_execution_marked_error = outcome.is_error;
                     outcome.output
                 }
             }
@@ -3415,6 +3420,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             denied_output.unwrap_or_else(|| "Permission denied".to_string())
         };
         let status = if !allowed {
+            "error"
+        } else if tool_execution_marked_error {
             "error"
         } else {
             cloud_tool_result_status_label(&output)
@@ -4192,8 +4199,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let mut terminal_post_failure = false;
         for (pos, (outcome, duration_ms)) in outputs.into_iter().enumerate() {
             let (orig_idx, req) = conc_reqs[pos];
+            let status = edge_tool_outcome_status(&outcome);
             let output = outcome.output;
-            let status = cloud_tool_result_status_label(&output);
 
             // Forward tool-completed event.
             if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
@@ -5708,6 +5715,14 @@ fn panic_payload_summary(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+fn edge_tool_outcome_status(outcome: &crate::edge_tools::ToolExecutionOutcome) -> &'static str {
+    if outcome.is_error {
+        "error"
+    } else {
+        cloud_tool_result_status_label(&outcome.output)
+    }
+}
+
 async fn catch_tool_execution_panic<F>(future: F) -> (crate::edge_tools::ToolExecutionOutcome, u64)
 where
     F: Future<Output = crate::edge_tools::ToolExecutionOutcome>,
@@ -6261,9 +6276,9 @@ mod tests {
         apply_edge_auth_failure_result, approval_batch_group_key, approval_default_always_scope,
         approval_memory_action, approval_memory_preview, approval_scope_context_for_tool,
         approval_stale_revalidation_error, catch_tool_execution_panic, dispatch_turn_event_block,
-        edge_tool_is_cacheable_read, execute_with_metadata_responsive, extract_cli_diff_block,
-        format_tool_display_from_preview, is_edge_auth_failure, merge_edge_tool_rounds,
-        path_mtime_ms, reusable_speculative_output, style_tool_description,
+        edge_tool_is_cacheable_read, edge_tool_outcome_status, execute_with_metadata_responsive,
+        extract_cli_diff_block, format_tool_display_from_preview, is_edge_auth_failure,
+        merge_edge_tool_rounds, path_mtime_ms, reusable_speculative_output, style_tool_description,
         sync_incremental_accum_state, sync_incremental_tool_result_state, task_preview_from_args,
         theme, tool_completion_icon, tool_dedup_signature,
     };
@@ -7867,6 +7882,16 @@ mod tests {
         assert!(duration_ms >= 10);
         assert!(outcome.output.contains("Tool execution panicked: boom"));
         assert!(outcome.tool_result_fields.is_none());
+    }
+
+    #[test]
+    fn edge_tool_outcome_status_prefers_structured_error_flag() {
+        let outcome = crate::edge_tools::ToolExecutionOutcome {
+            output: "plain body from failing transport".to_string(),
+            tool_result_fields: None,
+            is_error: true,
+        };
+        assert_eq!(edge_tool_outcome_status(&outcome), "error");
     }
     // ── Skill/MCP output summary tests ──
 

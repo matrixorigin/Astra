@@ -357,6 +357,10 @@ fn normalize_empty_output(output: String, tool_name: &str) -> String {
     }
 }
 
+fn cli_tool_output_is_error(output: &str) -> bool {
+    astra_turn_core::tool_result_semantics::cloud_tool_result_status_label(output) == "error"
+}
+
 pub(crate) use astra_tools::git_gix::ToolExecutionOutcome;
 
 /// Parse a grep output line to extract the file path and line number.
@@ -4042,7 +4046,7 @@ impl ToolExecutor {
         if name == "bash" {
             let output = self.finalize_tool_output(self.bash_with_cancel(args, cancel_token), name);
             self.record_output_size(output.len());
-            return Some(if output.starts_with("Error") {
+            return Some(if cli_tool_output_is_error(&output) {
                 ToolExecutionOutcome::error(output)
             } else {
                 ToolExecutionOutcome::ok(output)
@@ -4053,7 +4057,7 @@ impl ToolExecutor {
             let output =
                 self.finalize_tool_output(self.powershell_with_cancel(args, cancel_token), name);
             self.record_output_size(output.len());
-            return Some(if output.starts_with("Error") {
+            return Some(if cli_tool_output_is_error(&output) {
                 ToolExecutionOutcome::error(output)
             } else {
                 ToolExecutionOutcome::ok(output)
@@ -4116,7 +4120,12 @@ impl ToolExecutor {
                 _ => {} // Other git actions handled in execute() below
             }
         }
-        ToolExecutionOutcome::text(self.execute(name, args).await)
+        let output = self.execute(name, args).await;
+        if cli_tool_output_is_error(&output) {
+            ToolExecutionOutcome::error(output)
+        } else {
+            ToolExecutionOutcome::ok(output)
+        }
     }
 
     pub async fn execute(&self, name: &str, args: &Value) -> String {
@@ -4572,7 +4581,7 @@ impl ToolExecutor {
         // Normalize empty output, then apply global safety net
         let output = self.finalize_tool_output(output, name);
         if name != "memory"
-            && !output.starts_with("Error")
+            && !cli_tool_output_is_error(&output)
             && let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty())
         {
             let client = astra_tools::memoria::MemoriaClient::new(
@@ -4624,7 +4633,7 @@ impl ToolExecutor {
             return output;
         }
         // Never persist error outputs (they're small and actionable)
-        if output.starts_with("Error:") {
+        if cli_tool_output_is_error(&output) {
             return output;
         }
 
@@ -4736,10 +4745,7 @@ impl ToolExecutor {
 
                 let resolved = resolve_args(&step.args, &ctx);
                 let output = self.execute(&step.tool, &resolved).await;
-                let is_err = output.starts_with("Error")
-                    || output.starts_with("error")
-                    || output.starts_with("Sandbox:")
-                    || output.contains("\"error\":");
+                let is_err = cli_tool_output_is_error(&output);
 
                 ctx.record_step(
                     idx,

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use super::super::tool_transport_plan::{edge_executor_id, EdgeBoundExecutionPlan};
+use super::super::tool_transport_plan::{EdgeBoundExecutionPlan, edge_executor_id};
 
 struct CountingLocalTransport {
     calls: AtomicUsize,
@@ -1221,10 +1221,12 @@ async fn orchestrator_managed_without_transport_returns_transport_unavailable() 
     assert_eq!(metadata["blocked"], true);
     assert_eq!(metadata["execution_started"], false);
     assert_eq!(metadata["runtime_error"]["kind"], "transport_unavailable");
-    assert!(metadata["runtime_error"]["message"]
-        .as_str()
-        .unwrap()
-        .starts_with("sandbox resident agent transport adapter unavailable"));
+    assert!(
+        metadata["runtime_error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("sandbox resident agent transport adapter unavailable")
+    );
 }
 
 #[test]
@@ -1625,9 +1627,11 @@ async fn sandbox_resident_agent_transport_fails_closed_until_adapter_is_configur
 
     assert!(result.is_error, "{result:?}");
     assert_eq!(local.calls(), 0);
-    assert!(result
-        .output
-        .contains("sandbox resident agent transport adapter"));
+    assert!(
+        result
+            .output
+            .contains("sandbox resident agent transport adapter")
+    );
     let metadata = result.metadata.expect("transport metadata");
     assert_eq!(metadata["error_kind"], "transport_unavailable");
     assert_eq!(metadata["runtime_error"]["kind"], "transport_unavailable");
@@ -3027,14 +3031,18 @@ async fn external_transport_health_check_failure_returns_transport_unavailable()
     assert_eq!(local.calls(), 0, "must not fall back locally");
     let metadata = result.metadata.expect("transport metadata");
     assert_eq!(metadata["error_kind"], "transport_unavailable");
-    assert!(metadata["runtime_error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("transport is unhealthy"));
-    assert!(metadata["runtime_error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("connection refused"));
+    assert!(
+        metadata["runtime_error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("transport is unhealthy")
+    );
+    assert!(
+        metadata["runtime_error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("connection refused")
+    );
 }
 
 #[tokio::test]
@@ -3076,10 +3084,12 @@ async fn external_transport_reconnect_failure_returns_transport_unavailable() {
     assert_eq!(local.calls(), 0, "must not fall back locally");
     let metadata = result.metadata.expect("transport metadata");
     assert_eq!(metadata["error_kind"], "transport_unavailable");
-    assert!(metadata["runtime_error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("transport is unhealthy"));
+    assert!(
+        metadata["runtime_error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("transport is unhealthy")
+    );
 }
 
 // ─── ExternalTransport exit_semantics boundary tests ────────────────────────

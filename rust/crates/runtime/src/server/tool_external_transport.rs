@@ -190,8 +190,8 @@ async fn execute_external_transport<F, Fut>(
 where
     F: Fn(ToolExecutionRequest, astra_runtime_env::RunBinding) -> Fut,
     Fut: std::future::Future<
-        Output = Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError>,
-    >,
+            Output = Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError>,
+        >,
 {
     if cancel_token
         .as_ref()

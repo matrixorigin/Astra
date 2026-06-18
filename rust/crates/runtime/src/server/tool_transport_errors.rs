@@ -2,9 +2,9 @@ use serde_json::Value;
 
 use super::tool_execution_binding::{ExecutorStatus, ToolExecutionRequest, WorkspaceBindingKind};
 use super::tool_transport_metadata::{
-    attach_runtime_error_metadata, attach_runtime_policy_metadata, binding_event_fields,
     RUN_BLOCKED_REASON_EXECUTOR_OFFLINE, RUN_BLOCKED_REASON_ROUTE_MISMATCH,
-    TOOL_ERROR_KIND_CAPABILITY_DENIED,
+    TOOL_ERROR_KIND_CAPABILITY_DENIED, attach_runtime_error_metadata,
+    attach_runtime_policy_metadata, binding_event_fields,
 };
 
 pub(crate) fn edge_unavailable_message(request: &ToolExecutionRequest) -> String {

@@ -942,6 +942,13 @@ pub fn prepare_str_replace(
             ));
         }
     };
+    if old_str == new_str {
+        return Err(ToolResult::error(str_replace_fail(
+            "old_str and new_str are identical — no change needed.",
+            "The replacement is a no-op; the file would be unchanged.",
+            "Provide a new_str that actually differs from old_str, or skip the edit.",
+        )));
+    }
     let replace_all = args
         .get("replace_all")
         .and_then(|v| v.as_bool())
@@ -1204,10 +1211,8 @@ pub fn prepare_multi_edit(
         }
         let count = working.matches(old_str).count();
         if count == 0 {
-            return Err(ToolResult::error(str_replace_fail(
-                &format!("edit[{i}] old_str not found in {path_str}."),
-                "The exact byte sequence does not appear in the current file content (whitespace, indentation, or quote style may differ; or the file changed since you last read it).",
-                "Re-read the target region with read_file, copy the exact bytes (including leading whitespace) into old_str, then retry.",
+            return Err(ToolResult::error(str_replace_not_found_hint_for_edit(
+                path_str, &working, old_str, i,
             )));
         }
         if count > 1 {
@@ -1792,10 +1797,31 @@ fn tree_sitter_has_error(source: &str, lang: crate::code_intel::Language) -> Opt
 /// (the echoed window depends on per-call old_str), and encourages the model
 /// to retry by re-emitting the full new_str instead of fixing the anchor.
 fn str_replace_not_found_hint(path_str: &str, content: &str, old_str: &str) -> String {
+    str_replace_not_found_hint_with_what(
+        format!("old_str not found in {path_str}."),
+        content,
+        old_str,
+    )
+}
+
+fn str_replace_not_found_hint_for_edit(
+    path_str: &str,
+    content: &str,
+    old_str: &str,
+    edit_index: usize,
+) -> String {
+    str_replace_not_found_hint_with_what(
+        format!("edit[{edit_index}] old_str not found in {path_str}."),
+        content,
+        old_str,
+    )
+}
+
+fn str_replace_not_found_hint_with_what(what: String, content: &str, old_str: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let old_lines: Vec<&str> = old_str.lines().collect();
     let mut msg = str_replace_fail(
-        &format!("old_str not found in {path_str}."),
+        &what,
         "The exact byte sequence does not appear in the current file content (whitespace, indentation, or quote style may differ; or the file changed since you last read it).",
         "Refer to the prior read_file tool_result for the current file content; copy the exact bytes into old_str and retry. If the file has changed, re-read it first.",
     );
@@ -2910,6 +2936,31 @@ mod tests {
     }
 
     #[test]
+    fn str_replace_rejects_identical_single_edit() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "same\n").unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "old_str": "same",
+            "new_str": "same"
+        });
+        let result = str_replace(tmp.path(), &args);
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("STR_REPLACE FAILED"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("no change needed"),
+            "got: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(content, "same\n");
+    }
+
+    #[test]
     fn str_replace_replace_all_fuzzy_ambiguous_does_not_partially_apply() {
         let tmp = TempDir::new().unwrap();
         let original = "  fn hi() {\n    a();\n  }\n\n\tfn hi() {\n\t  a();\n\t}\n";
@@ -3430,9 +3481,59 @@ mod tests {
         });
         let result = multi_edit(tmp.path(), &args);
         assert!(result.is_error);
+        assert!(
+            result.output.contains("STR_REPLACE FAILED"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("edit[1] old_str not found"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("no_partial_match: true"),
+            "got: {}",
+            result.output
+        );
         // Original file should be unchanged (atomic)
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
         assert_eq!(content, "aaa bbb");
+    }
+
+    #[test]
+    fn multi_edit_missing_anchor_reports_structured_near_match_hint() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("f.txt"),
+            "  fn hello() {\n    println!(\"hi\");\n  }\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "edits": [{
+                "old_str": "fn hello() {\n  println!(\"hi\");\n}",
+                "new_str": "fn hello() {}"
+            }]
+        });
+
+        let result = multi_edit(tmp.path(), &args);
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("edit[0] old_str not found"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("whitespace_normalized_match: true"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("first_line_at: L1"),
+            "got: {}",
+            result.output
+        );
     }
 
     #[test]

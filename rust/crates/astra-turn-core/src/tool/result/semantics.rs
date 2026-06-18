@@ -4,11 +4,7 @@
 
 use serde_json::Value;
 
-/// Determine whether a tool result string indicates an error.
-///
-/// For structured JSON results (our tools), checks `"ok": false` or a non-null
-/// `"error"` field. For plain-text results, falls back to `starts_with("error")`.
-pub fn is_tool_error(result_str: &str) -> bool {
+fn json_tool_result_is_error(result_str: &str) -> bool {
     if let Ok(v) = serde_json::from_str::<Value>(result_str) {
         if let Some(ok_val) = v.get("ok").and_then(|o| o.as_bool()) {
             return !ok_val;
@@ -37,13 +33,65 @@ pub fn is_tool_error(result_str: &str) -> bool {
             }
         }
     }
+    false
+}
+
+fn first_non_empty_line(output: &str) -> Option<&str> {
+    output.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+fn first_line_is_tool_failure_banner(output: &str) -> bool {
+    let Some(line) = first_non_empty_line(output) else {
+        return false;
+    };
+    let Some(rest) = line.strip_prefix("❌ ") else {
+        return false;
+    };
+    let head = rest.split('—').next().unwrap_or(rest).trim();
+    let mut parts = head.split_whitespace();
+    let Some(tool_name) = parts.next() else {
+        return false;
+    };
+    let Some(status) = parts.next() else {
+        return false;
+    };
+    status == "FAILED"
+        && tool_name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// True when the visible tool body carries an explicit failure marker.
+///
+/// This intentionally accepts only machine-owned contracts:
+/// structured JSON error fields/statuses and the tool failure banner
+/// `❌ <TOOL_NAME> FAILED ...` on the first non-empty line. It does not scan
+/// arbitrary prose for words like "failed", which would misclassify normal
+/// file contents, logs, or quoted code.
+#[must_use]
+pub fn tool_output_has_explicit_failure_signal(output: &str) -> bool {
+    json_tool_result_is_error(output)
+        || first_line_is_tool_failure_banner(output)
+        || output.trim_start().starts_with("SANDBOX_DENIED:")
+}
+
+/// Determine whether a tool result string indicates an error.
+///
+/// For structured JSON results (our tools), checks `"ok": false` or a non-null
+/// `"error"` field. For plain-text results, accepts only stable tool failure
+/// contracts plus the legacy `Error:` prefix.
+pub fn is_tool_error(result_str: &str) -> bool {
+    if tool_output_has_explicit_failure_signal(result_str) {
+        return true;
+    }
     result_str.to_lowercase().starts_with("error")
 }
 
-/// `status` string for cloud `POST /tools/result` from edge executor output prefixes.
+/// `status` string for cloud `POST /tools/result` from edge executor output.
 ///
-/// Matches the CLI convention: `Error:`, `Unknown tool:`, and `Sandbox:` imply `"error"`;
-/// everything else is reported as `"success"` (the body may still describe failure in JSON).
+/// Structured JSON failures, stable tool failure banners, sandbox denials, and
+/// legacy error prefixes imply `"error"`. Everything else is reported as
+/// `"success"`.
 #[must_use]
 pub fn cloud_tool_result_status_label(output: &str) -> &'static str {
     if is_tool_error(output)
@@ -505,6 +553,31 @@ mod tests {
             cloud_tool_result_status_label(r#"{"status":"failed","error":"bad args"}"#),
             "error"
         );
+    }
+
+    #[test]
+    fn explicit_failure_signal_detects_structured_tool_banners_only_at_top_level() {
+        let output = "❌ STR_REPLACE FAILED — FILE NOT MODIFIED\n\nWHAT: old_str not found.";
+        assert!(is_tool_error(output));
+        assert_eq!(cloud_tool_result_status_label(output), "error");
+        assert_eq!(
+            classify_tool_error("str_replace", output),
+            ToolErrorSeverity::SoftError
+        );
+
+        let quoted_file_content = "log line from a file\n❌ STR_REPLACE FAILED — FILE NOT MODIFIED";
+        assert!(!is_tool_error(quoted_file_content));
+        assert_eq!(
+            cloud_tool_result_status_label(quoted_file_content),
+            "success"
+        );
+    }
+
+    #[test]
+    fn explicit_failure_signal_detects_sandbox_denied_prefix() {
+        let output = "SANDBOX_DENIED: Path '/tmp/x' is outside workspace";
+        assert!(is_tool_error(output));
+        assert_eq!(cloud_tool_result_status_label(output), "error");
     }
 
     #[test]

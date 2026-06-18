@@ -118,6 +118,40 @@ async fn execute_delegate_tool_returns_deferred_acknowledgment_for_interception_
     );
 }
 
+#[tokio::test]
+async fn execute_with_metadata_marks_structured_str_replace_failure_as_error() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("f.txt"), "let current = 1;\n").unwrap();
+    let executor = ToolExecutor::new(temp.path().to_path_buf());
+
+    let read = executor
+        .execute("read_file", &json!({"path": "f.txt"}))
+        .await;
+    assert!(read.contains("let current = 1;"), "{read}");
+
+    let outcome = executor
+        .execute_with_metadata(
+            "str_replace",
+            &json!({
+                "path": "f.txt",
+                "old_str": "let stale = 1;",
+                "new_str": "let stale = 2;"
+            }),
+        )
+        .await;
+
+    assert!(outcome.is_error, "{outcome:?}");
+    assert!(
+        outcome.output.contains("STR_REPLACE FAILED"),
+        "{}",
+        outcome.output
+    );
+    assert_eq!(
+        astra_turn_core::tool_result_semantics::cloud_tool_result_status_label(&outcome.output),
+        "error"
+    );
+}
+
 /// REGRESSION: the consolidated `agent` tool MUST NOT accept
 /// `action='delegate'`. The CLI never wires a delegation engine, and
 /// `agentic_delegate_interception` only intercepts calls whose tool
