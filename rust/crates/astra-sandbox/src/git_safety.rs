@@ -29,6 +29,12 @@ pub enum GitSafetyViolation {
     WorktreeDestructive { operation: &'static str },
     /// Current directory looks like a bare git repo (potential hook execution trap).
     BareRepoDetected,
+    /// git rebase with --exec (arbitrary command execution).
+    RebaseExec,
+    /// git clone with --recurse-submodules (submodule hooks execute arbitrary code).
+    CloneRecurseSubmodules,
+    /// git submodule update --init (submodule hooks execute arbitrary code).
+    SubmoduleUpdateInit,
 }
 
 impl std::fmt::Display for GitSafetyViolation {
@@ -77,6 +83,21 @@ impl std::fmt::Display for GitSafetyViolation {
             Self::BareRepoDetected => {
                 write!(f, "current directory appears to be a bare git repo")
             }
+            Self::RebaseExec => {
+                write!(f, "git rebase --exec executes arbitrary commands")
+            }
+            Self::CloneRecurseSubmodules => {
+                write!(
+                    f,
+                    "git clone --recurse-submodules may execute untrusted hooks"
+                )
+            }
+            Self::SubmoduleUpdateInit => {
+                write!(
+                    f,
+                    "git submodule update --init may execute untrusted hooks"
+                )
+            }
         }
     }
 }
@@ -114,6 +135,9 @@ pub fn validate_git_command(command: &str) -> Vec<GitSafetyViolation> {
     check_force_push(&lower, &mut violations);
     check_cd_git_compound(&lower, &mut violations);
     check_git_config_flags(command, &mut violations);
+    check_rebase_exec(command, &lower, &mut violations);
+    check_clone_recurse_submodules(&lower, &mut violations);
+    check_submodule_update_init(&lower, &mut violations);
     check_commit_amend(&lower, &mut violations);
     check_worktree_destructive(&lower, &mut violations);
 
@@ -260,6 +284,73 @@ fn check_git_config_flags(command: &str, violations: &mut Vec<GitSafetyViolation
                 }
             }
         }
+    }
+}
+
+fn check_rebase_exec(
+    command: &str,
+    lower: &str,
+    violations: &mut Vec<GitSafetyViolation>,
+) {
+    if !lower.contains("rebase") {
+        return;
+    }
+    // Check for --exec flag with a non-empty argument anywhere after "rebase".
+    // git rebase --exec 'rm -rf /' branch   → "exec" can be abbreviated to 3+ chars.
+    // git rebase -x 'rm -rf /' branch       → short form.
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let mut in_rebase = false;
+    for (i, &word) in words.iter().enumerate() {
+        if word == "git" || word.ends_with("/git") {
+            in_rebase = true;
+            continue;
+        }
+        if in_rebase && word == "rebase" {
+            // Scan subsequent words for --exec or -x
+            for &next in words.iter().skip(i + 1) {
+                if next == "--exec"
+                    || next.starts_with("--exec=")
+                    || (next == "-x" || next.starts_with("-x"))
+                {
+                    violations.push(GitSafetyViolation::RebaseExec);
+                    return;
+                }
+                // Stop scanning at subcommand boundaries
+                if next.starts_with('-') && !next.starts_with("--exec") && next != "-x" {
+                    continue;
+                }
+            }
+            return;
+        }
+    }
+}
+
+fn check_clone_recurse_submodules(
+    lower: &str,
+    violations: &mut Vec<GitSafetyViolation>,
+) {
+    if !lower.contains("clone") {
+        return;
+    }
+    if lower.contains("--recurse-submodules")
+        || lower.contains("--recursive")
+    {
+        violations.push(GitSafetyViolation::CloneRecurseSubmodules);
+    }
+}
+
+fn check_submodule_update_init(
+    lower: &str,
+    violations: &mut Vec<GitSafetyViolation>,
+) {
+    if !lower.contains("submodule") {
+        return;
+    }
+    // git submodule update --init [--recursive] executes submodule hooks
+    let has_update = lower.contains("update");
+    let has_init = lower.contains("--init") || lower.contains("--recursive");
+    if has_update && has_init {
+        violations.push(GitSafetyViolation::SubmoduleUpdateInit);
     }
 }
 
@@ -622,6 +713,80 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rebase_exec_blocked() {
+        for cmd in [
+            "git rebase --exec 'rm -rf /' main",
+            "git rebase -x 'rm -rf /' main",
+            "git rebase --exec='rm -rf /' main",
+        ] {
+            let v = validate_git_command(cmd);
+            assert!(
+                v.iter()
+                    .any(|violation| matches!(violation, GitSafetyViolation::RebaseExec)),
+                "should block rebase --exec: {cmd}"
+            );
+        }
+        // Plain rebase without --exec is allowed
+        let v = validate_git_command("git rebase main");
+        assert!(
+            !v.iter()
+                .any(|violation| matches!(violation, GitSafetyViolation::RebaseExec)),
+            "should allow plain rebase"
+        );
+    }
+
+    #[test]
+    fn clone_recurse_submodules_blocked() {
+        for cmd in [
+            "git clone --recurse-submodules https://evil/repo",
+            "git clone --recursive https://evil/repo",
+        ] {
+            let v = validate_git_command(cmd);
+            assert!(
+                v.iter().any(|violation| matches!(
+                    violation,
+                    GitSafetyViolation::CloneRecurseSubmodules
+                )),
+                "should block: {cmd}"
+            );
+        }
+        // Plain clone is allowed
+        let v = validate_git_command("git clone https://safe/repo");
+        assert!(
+            !v.iter().any(|violation| matches!(
+                violation,
+                GitSafetyViolation::CloneRecurseSubmodules
+            ))
+        );
+    }
+
+    #[test]
+    fn submodule_update_init_blocked() {
+        for cmd in [
+            "git submodule update --init",
+            "git submodule update --init --recursive",
+            "git submodule update --recursive",
+        ] {
+            let v = validate_git_command(cmd);
+            assert!(
+                v.iter().any(|violation| matches!(
+                    violation,
+                    GitSafetyViolation::SubmoduleUpdateInit
+                )),
+                "should block: {cmd}"
+            );
+        }
+        // Plain submodule status is allowed
+        let v = validate_git_command("git submodule status");
+        assert!(
+            !v.iter().any(|violation| matches!(
+                violation,
+                GitSafetyViolation::SubmoduleUpdateInit
+            ))
+        );
+    }
+
     // --- validate_git_command edge cases ---
 
     #[test]
@@ -684,6 +849,9 @@ mod tests {
                 operation: "git reset --hard",
             },
             GitSafetyViolation::BareRepoDetected,
+            GitSafetyViolation::RebaseExec,
+            GitSafetyViolation::CloneRecurseSubmodules,
+            GitSafetyViolation::SubmoduleUpdateInit,
         ];
         for v in &violations {
             let msg = format!("{v}");
