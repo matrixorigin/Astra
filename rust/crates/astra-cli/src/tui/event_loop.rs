@@ -1725,6 +1725,7 @@ pub(crate) async fn run_tui_session(
                                             let itick = tokio::time::sleep(Duration::from_millis(80));
                                             tokio::pin!(itick);
                                             tokio::select! {
+                                                biased;
                                                 result = &mut fut, if turn_result_ready.is_none() => {
                                                     if bash_detach_request_pending {
                                                         turn_result_ready = Some(result);
@@ -1732,7 +1733,7 @@ pub(crate) async fn run_tui_session(
                                                     }
                                                     break result;
                                                 }
-                                                Some(tev) = event_stream.next() => {
+                                                Some(tev) = event_stream.next(), if turn_result_ready.is_none() => {
                                                     match tev {
                                                         TuiEvent::Key(k) => {
                                                             // Shift+Tab cycles permission mode mid-turn.
@@ -5080,6 +5081,27 @@ mod tests {
         assert!(
             install_pos < future_pos,
             "deferred input provider must exist before the active-turn future starts"
+        );
+    }
+
+    #[test]
+    fn active_turn_select_prioritizes_completed_turn_before_keyboard_input() {
+        let source = include_str!("event_loop.rs");
+        let select_pos = source
+            .find("tokio::select! {\n                                                biased;")
+            .expect("active-turn select must be biased");
+        let result_pos = source[select_pos..]
+            .find("result = &mut fut, if turn_result_ready.is_none()")
+            .map(|p| select_pos + p)
+            .expect("active-turn select must poll the turn future");
+        let event_pos = source[select_pos..]
+            .find("Some(tev) = event_stream.next(), if turn_result_ready.is_none()")
+            .map(|p| select_pos + p)
+            .expect("active-turn select must gate keyboard events after turn completion");
+
+        assert!(
+            result_pos < event_pos,
+            "completed turn futures must win over queued keyboard input so Enter at turn end is not misrouted as deferred input"
         );
     }
 
