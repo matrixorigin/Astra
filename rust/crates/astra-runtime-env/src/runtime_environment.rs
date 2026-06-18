@@ -690,13 +690,55 @@ pub fn validate_runtime_session_spec(
     spec: &RuntimeSessionSpec,
 ) -> Result<(), RuntimeError> {
     spec.policy.require_runtime(&spec.binding.runtime)?;
-    let resolver = CapabilityResolver;
     for tool_name in &spec.requested_tools {
-        resolver
-            .check_tool(registry, tool_name, &spec.binding.capabilities)
-            .map_err(|reason| RuntimeError::tool_unavailable(tool_name, reason))?;
+        validate_runtime_tool_name(registry, &spec.binding, tool_name)?;
     }
     Ok(())
+}
+
+pub fn validate_runtime_tool_invocation(
+    registry: &ToolRegistry,
+    invocation: &RuntimeToolInvocation,
+) -> Result<(), RuntimeError> {
+    validate_runtime_tool_call(
+        registry,
+        &invocation.binding,
+        &invocation.tool_name,
+        &invocation.arguments,
+    )
+}
+
+fn validate_runtime_tool_name(
+    registry: &ToolRegistry,
+    binding: &RunBinding,
+    tool_name: &str,
+) -> Result<(), RuntimeError> {
+    if !binding.policy.allows_tool(tool_name) {
+        return Err(RuntimeError::tool_unavailable(
+            tool_name,
+            ToolUnavailableReason::PolicyDenied(PolicyIntent::disallowed_tool_reason(tool_name)),
+        ));
+    }
+    CapabilityResolver
+        .check_tool(registry, tool_name, &binding.capabilities)
+        .map_err(|reason| RuntimeError::tool_unavailable(tool_name, reason))
+}
+
+fn validate_runtime_tool_call(
+    registry: &ToolRegistry,
+    binding: &RunBinding,
+    tool_name: &str,
+    args: &Value,
+) -> Result<(), RuntimeError> {
+    if !binding.policy.allows_tool(tool_name) {
+        return Err(RuntimeError::tool_unavailable(
+            tool_name,
+            ToolUnavailableReason::PolicyDenied(PolicyIntent::disallowed_tool_reason(tool_name)),
+        ));
+    }
+    CapabilityResolver
+        .check_tool_call(registry, tool_name, args, &binding.capabilities)
+        .map_err(|reason| RuntimeError::tool_unavailable(tool_name, reason))
 }
 
 #[async_trait]
@@ -828,14 +870,7 @@ mod tests {
                     "tool invocation policy revision does not match runtime session",
                 ));
             }
-            CapabilityResolver
-                .check_tool_call(
-                    &self.registry,
-                    &invocation.tool_name,
-                    &invocation.arguments,
-                    &invocation.binding.capabilities,
-                )
-                .map_err(|reason| RuntimeError::tool_unavailable(&invocation.tool_name, reason))?;
+            validate_runtime_tool_invocation(&self.registry, &invocation)?;
             Ok(RuntimeToolOutcome::completed(&invocation, "ok", session))
         }
 
@@ -1010,6 +1045,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_session_rejects_requested_tool_outside_policy_allowlist() {
+        let registry = ToolRegistry::builtins();
+        let binding = RunBinding::resolve(
+            WorkspaceBinding::edge_workspace("/workspace/project", WorkspaceAuthority::ReadWrite),
+            ExecutorBinding::local_cli(),
+            RuntimeBinding::gvisor("gvisor-1"),
+            PolicyIntent::local_developer().with_allowed_tools(["read_file"]),
+            &registry,
+        );
+        let runtime = FakeRuntime::new(RuntimeBinding::gvisor("gvisor-1"));
+        let spec =
+            RuntimeSessionSpec::new("session-1", "run-1", binding).with_requested_tools(["bash"]);
+
+        let err = runtime
+            .prepare_session(spec)
+            .await
+            .expect_err("policy-disallowed requested tool must fail before session start");
+
+        assert_eq!(err.kind, RuntimeErrorKind::ToolUnavailable);
+        assert!(!err.execution_started);
+        assert!(!err.side_effects_maybe);
+        assert_eq!(
+            err.tool_reason,
+            Some(ToolUnavailableReason::PolicyDenied(
+                PolicyIntent::disallowed_tool_reason("bash")
+            ))
+        );
+    }
+
+    #[tokio::test]
     async fn execute_tool_rejects_unavailable_tool_before_execution() {
         let registry = ToolRegistry::builtins();
         let binding = RunBinding::cloud_control_plane(&registry);
@@ -1040,6 +1105,47 @@ mod tests {
                 | Some(ToolUnavailableReason::WorkspaceUnavailable(_))
                 | Some(ToolUnavailableReason::RuntimeCapabilityMissing(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn execute_tool_rejects_policy_disallowed_tool_before_execution() {
+        let registry = ToolRegistry::builtins();
+        let binding = RunBinding::resolve(
+            WorkspaceBinding::edge_workspace("/workspace/project", WorkspaceAuthority::ReadWrite),
+            ExecutorBinding::local_cli(),
+            RuntimeBinding::gvisor("gvisor-1"),
+            PolicyIntent::local_developer().with_allowed_tools(["read_file"]),
+            &registry,
+        );
+        let runtime = FakeRuntime::new(RuntimeBinding::gvisor("gvisor-1"));
+        let spec = RuntimeSessionSpec::new("session-1", "run-1", binding.clone())
+            .with_requested_tools(["read_file"]);
+        let session = runtime
+            .prepare_session(spec)
+            .await
+            .expect("prepare session");
+        let invocation = RuntimeToolInvocation::new(
+            "call-1",
+            "bash",
+            json!({"cmd": "pwd"}),
+            binding,
+            session.policy.revision,
+        );
+
+        let err = runtime
+            .execute_tool(&session, invocation)
+            .await
+            .expect_err("policy-disallowed invocation must fail before execution");
+
+        assert_eq!(err.kind, RuntimeErrorKind::ToolUnavailable);
+        assert!(!err.execution_started);
+        assert!(!err.side_effects_maybe);
+        assert_eq!(
+            err.tool_reason,
+            Some(ToolUnavailableReason::PolicyDenied(
+                PolicyIntent::disallowed_tool_reason("bash")
+            ))
+        );
     }
 
     #[tokio::test]
