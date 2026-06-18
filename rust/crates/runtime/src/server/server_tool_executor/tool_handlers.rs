@@ -2,6 +2,7 @@ use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use astra_tools::ToolExecutor;
 use astra_tools::tool_engine::{
@@ -113,7 +114,12 @@ struct GetAgentInfoToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for GetAgentInfoToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
         let schemas = context.capability_filtered_server_tool_schemas();
         let tool_names: Vec<&str> = schemas.iter().filter_map(tool_schema_name).collect();
         tool_result_from_output(render_agent_info(
@@ -136,7 +142,12 @@ struct ToolSearchToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for ToolSearchToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
         let mut pool = context.capability_filtered_server_tool_schemas();
         pool.extend(context.plugin_schemas_snapshot("plugin_schemas_tool_search"));
         // The search pool is `visible ∪ activatable`. The activatable set is
@@ -165,7 +176,12 @@ struct MemoryToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for MemoryToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
         let Some(op) = args.get("action").and_then(Value::as_str) else {
             return astra_tools::ToolResult::error(
                 "Error: missing required parameter `action`. Use one of: remember, recall, expand, forget, update, focus, reflect, profile, feedback".to_string(),
@@ -191,7 +207,12 @@ struct SessionToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for SessionToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
         crate::server::tool_session_runtime::execute_with_executor(context, args).await
     }
 }
@@ -201,7 +222,12 @@ struct TaskToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for TaskToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
         crate::server::tool_task_runtime::execute_with_executor(context, args).await
     }
 }
@@ -211,7 +237,18 @@ struct AgentToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for AgentToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        // P2-C: Cooperative cancellation check at heavy handler entry
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::ToolResult::error(
+                "Agent tool not executed: run was cancelled".to_string(),
+            );
+        }
         execute_agent_tool(
             &context.default_executor,
             context.agent_tool_context.as_ref(),
@@ -226,7 +263,18 @@ struct AgentFanoutToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for AgentFanoutToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        // P2-C: Cooperative cancellation check at heavy handler entry
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::ToolResult::error(
+                "Agent fanout not executed: run was cancelled".to_string(),
+            );
+        }
         execute_agent_fanout_tool(context.agent_tool_context.as_ref(), args).await
     }
 }
@@ -236,7 +284,12 @@ struct AskUserToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for AskUserToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
         context.server_ask_user(args).await
     }
 }
@@ -246,7 +299,12 @@ struct EnterPlanModeToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for EnterPlanModeToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
         astra_tools::ToolResult::text(
             execute_enter_plan_mode(
                 context.plan_repo.as_ref(),
@@ -266,7 +324,12 @@ struct ExitPlanModeToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for ExitPlanModeToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
         astra_tools::ToolResult::text(
             execute_exit_plan_mode(
                 context.plan_repo.as_ref(),
@@ -285,7 +348,12 @@ struct IntrospectToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for IntrospectToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
         tool_result_from_output(handle_introspect(
             args,
             &context.session_id,
@@ -301,7 +369,19 @@ struct DefaultExecutorToolHandler {
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for DefaultExecutorToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        // P2-C: Cooperative cancellation check at heavy handler entry
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::ToolResult::error(format!(
+                "Tool '{}' not executed: run was cancelled",
+                self.name
+            ));
+        }
         context.default_executor.execute(self.name, args).await
     }
 }
@@ -311,7 +391,12 @@ struct WriteFileToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for WriteFileToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
         let turn_index = context.journal_turn_index.load(Ordering::Relaxed);
         if args
             .get("delete")
@@ -340,7 +425,12 @@ struct StrReplaceToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for StrReplaceToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
         let args = match astra_tools::fs_ops::normalize_str_replace_args(args) {
             Ok(args) => args,
             Err(error) => return tool_result_from_output(error),
@@ -373,7 +463,18 @@ struct BashToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for BashToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        // P2-C: Cooperative cancellation check at heavy handler entry
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::ToolResult::error(
+                "Bash tool not executed: run was cancelled".to_string(),
+            );
+        }
         context.server_bash(args).await
     }
 }
@@ -383,7 +484,12 @@ struct PrioritizeToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for PrioritizeToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
         tool_result_from_output(context.prioritize_tool(args))
     }
 }
@@ -393,7 +499,12 @@ struct DeprioritizeToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for DeprioritizeToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
         tool_result_from_output(context.deprioritize_tool(args))
     }
 }
@@ -403,7 +514,12 @@ struct CompressContextToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for CompressContextToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
         tool_result_from_output(context.compress_context(args))
     }
 }
@@ -413,7 +529,12 @@ struct RollbackSessionStateToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for RollbackSessionStateToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
         tool_result_from_output(
             tool_session_state_rollback::execute_rollback_session_state(
                 RollbackSessionStateContext {
@@ -439,7 +560,18 @@ struct MoToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for MoToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        // P2-C: Cooperative cancellation check at heavy handler entry
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::ToolResult::error(
+                "MatrixOne tool not executed: run was cancelled".to_string(),
+            );
+        }
         let action = args
             .get("action")
             .and_then(|value| value.as_str())
@@ -468,7 +600,18 @@ struct MoQueryToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for MoQueryToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        // P2-C: Cooperative cancellation check at heavy handler entry
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::ToolResult::error(
+                "Mo query not executed: run was cancelled".to_string(),
+            );
+        }
         execute_mo_query(
             context.database_snapshot_journal.as_ref(),
             args,
@@ -482,7 +625,12 @@ struct RollbackDatabaseSnapshotsToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for RollbackDatabaseSnapshotsToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
         tool_result_from_output(rollback_database_snapshots(
             context.database_snapshot_journal.as_ref(),
             args,
@@ -496,7 +644,12 @@ struct PublishArtifactToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for PublishArtifactToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
         execute_publish_artifact(
             args,
             context.workspace_artifact_store.as_ref(),
@@ -514,7 +667,18 @@ struct RunScriptToolHandler;
 
 #[async_trait]
 impl ToolHandler<ServerToolExecutor> for RunScriptToolHandler {
-    async fn execute(&self, context: &ServerToolExecutor, args: &Value) -> astra_tools::ToolResult {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        // P2-C: Cooperative cancellation check at heavy handler entry
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::ToolResult::error(
+                "Run script not executed: run was cancelled".to_string(),
+            );
+        }
         execute_server_run_script(args, context, &context.workspace_root).await
     }
 }
@@ -529,6 +693,7 @@ impl DynamicToolHandler<ServerToolExecutor> for McpToolHandler {
         name: &str,
         context: &ServerToolExecutor,
         args: &Value,
+        _cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
         context.execute_mcp_tool(name, args).await
     }

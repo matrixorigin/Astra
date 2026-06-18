@@ -28,6 +28,7 @@ impl ServerLocalToolTransport for CountingLocalTransport {
     async fn execute_server_local_tool(
         &self,
         request: &ToolExecutionRequest,
+        _cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
         self.calls.fetch_add(1, Ordering::SeqCst);
         astra_tools::ToolResult::text(format!("local:{}", request.tool_name))
@@ -57,6 +58,7 @@ impl ServerLocalToolTransport for PendingLocalTransport {
     async fn execute_server_local_tool(
         &self,
         _request: &ToolExecutionRequest,
+        _cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let sender = self

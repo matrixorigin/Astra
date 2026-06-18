@@ -21,6 +21,8 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
+use tokio_util::sync::CancellationToken;
+
 use astra_core::SharedPool;
 use astra_runtime_env::WorkspaceRecord;
 use astra_tools::executor::DefaultToolExecutor;
@@ -886,6 +888,7 @@ impl ServerToolExecutor {
         &self,
         name: &str,
         args: &Value,
+        cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
         if let LocalToolPreflight::ShortCircuit(result) =
             self.run_local_tool_preflight(name, args).await
@@ -904,7 +907,11 @@ impl ServerToolExecutor {
 
         let result = match name {
             _ if self.tool_engine.contains(name) => {
-                if let Some(result) = self.tool_engine.execute(name, self, args).await {
+                if let Some(result) = self
+                    .tool_engine
+                    .execute(name, self, args, cancel_token)
+                    .await
+                {
                     result
                 } else {
                     astra_tools::ToolResult::error(format!(
@@ -1024,9 +1031,10 @@ impl ServerLocalToolTransport for ServerToolExecutor {
     async fn execute_server_local_tool(
         &self,
         request: &ToolExecutionRequest,
+        cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
         spawn_resource_tool_call_recording(&self.user_id, self.resource_governor.as_ref());
-        self.execute_local_with_metadata(&request.tool_name, &request.args)
+        self.execute_local_with_metadata(&request.tool_name, &request.args, cancel_token)
             .await
     }
 }
@@ -1669,6 +1677,64 @@ mod tests {
     }
 
     #[test]
+    fn handler_registry_covers_all_server_control_plane_and_runtime_tools() {
+        use crate::server::tool_binding_projection::{
+            is_server_control_plane_tool, is_server_runtime_tool,
+        };
+
+        let (exec, _dir) = test_executor();
+        let schema_names = schema_name_set(exec.tool_schemas());
+
+        // 1. Every control_plane tool must have a handler.
+        let missing_control_plane: Vec<_> = schema_names
+            .iter()
+            .filter(|n| is_server_control_plane_tool(n) && !exec.tool_engine.contains(n))
+            .cloned()
+            .collect();
+        assert!(
+            missing_control_plane.is_empty(),
+            "control_plane tools without handlers: {missing_control_plane:?}"
+        );
+
+        // 2. Every runtime tool must have a handler.
+        let missing_runtime: Vec<_> = schema_names
+            .iter()
+            .filter(|n| is_server_runtime_tool(n) && !exec.tool_engine.contains(n))
+            .cloned()
+            .collect();
+        assert!(
+            missing_runtime.is_empty(),
+            "runtime tools without handlers: {missing_runtime:?}"
+        );
+
+        // 3. Every handler must have a corresponding schema (excluding dynamic prefix handlers).
+        let handler_names: Vec<_> = exec.tool_engine.handler_names().map(String::from).collect();
+        let unclassified: Vec<_> = handler_names
+            .iter()
+            .filter(|n| {
+                !schema_names.contains(*n) && !n.starts_with("mcp__") // dynamic prefix handler
+            })
+            .cloned()
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "handlers without corresponding schema: {unclassified:?}"
+        );
+
+        // 4. No handler exists without a matching ToolEngine registration
+        //    at the local-transport level (double-check via `contains`).
+        let all_handled: Vec<_> = schema_names
+            .iter()
+            .filter(|n| !exec.tool_engine.contains(*n))
+            .cloned()
+            .collect();
+        assert!(
+            all_handled.is_empty(),
+            "schema↔handler mismatch: {all_handled:?}"
+        );
+    }
+
+    #[test]
     fn cloud_tool_execution_request_carries_workspace_record() {
         let (mut exec, _dir) = test_executor();
         exec.set_workspace_record(Some(WorkspaceRecord {
@@ -2003,11 +2069,13 @@ esac
         }
 
         let first = exec
-            .execute_local_with_metadata("task", &replay_first_args)
+            .execute_local_with_metadata("task", &replay_first_args, None)
             .await;
         assert_eq!(first.output, "cached-first");
 
-        let second = exec.execute_local_with_metadata("task", &second_args).await;
+        let second = exec
+            .execute_local_with_metadata("task", &second_args, None)
+            .await;
         assert!(
             second.output.contains("\"success\":true"),
             "second tool should execute normally: {second:?}"

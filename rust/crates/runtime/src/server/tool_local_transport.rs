@@ -13,6 +13,7 @@ pub trait ServerLocalToolTransport: Send + Sync {
     async fn execute_server_local_tool(
         &self,
         request: &ToolExecutionRequest,
+        cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult;
 }
 
@@ -38,7 +39,8 @@ where
             false,
         );
     }
-    let execution = local_transport.execute_server_local_tool(request);
+    let execution =
+        local_transport.execute_server_local_tool(request, cancel_token.map(|a| a.as_ref()));
     if let Some(token) = cancel_token {
         tokio::select! {
             _ = token.cancelled() => cancelled_runtime_tool_result_for_binding(

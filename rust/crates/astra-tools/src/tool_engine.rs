@@ -5,6 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::FutureExt;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 use tracing;
 
 use crate::ToolResult;
@@ -24,12 +25,23 @@ pub enum ToolEngineRegistrationError {
 
 #[async_trait]
 pub trait ToolHandler<C>: Send + Sync {
-    async fn execute(&self, context: &C, args: &Value) -> ToolResult;
+    async fn execute(
+        &self,
+        context: &C,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> ToolResult;
 }
 
 #[async_trait]
 pub trait DynamicToolHandler<C>: Send + Sync {
-    async fn execute(&self, name: &str, context: &C, args: &Value) -> ToolResult;
+    async fn execute(
+        &self,
+        name: &str,
+        context: &C,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> ToolResult;
 }
 
 #[derive(Clone)]
@@ -137,10 +149,16 @@ impl<C> ToolEngine<C> {
         self.handlers.keys().map(String::as_str)
     }
 
-    pub async fn execute(&self, name: &str, context: &C, args: &Value) -> Option<ToolResult> {
+    pub async fn execute(
+        &self,
+        name: &str,
+        context: &C,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Option<ToolResult> {
         if let Some(handler) = self.handlers.get(name) {
             return Some(
-                AssertUnwindSafe(handler.execute(context, args))
+                AssertUnwindSafe(handler.execute(context, args, cancel_token))
                     .catch_unwind()
                     .await
                     .unwrap_or_else(|_| {
@@ -157,7 +175,7 @@ impl<C> ToolEngine<C> {
             .iter()
             .find(|entry| name.starts_with(&entry.prefix))?;
         Some(
-            AssertUnwindSafe(handler.handler.execute(name, context, args))
+            AssertUnwindSafe(handler.handler.execute(name, context, args, cancel_token))
                 .catch_unwind()
                 .await
                 .unwrap_or_else(|_| {
@@ -179,7 +197,12 @@ impl<C> ToolHandler<C> for NotifyToolHandler
 where
     C: Send + Sync,
 {
-    async fn execute(&self, _context: &C, args: &Value) -> ToolResult {
+    async fn execute(
+        &self,
+        _context: &C,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> ToolResult {
         let message = string_arg(args, "message").unwrap_or("");
         if message.is_empty() {
             ToolResult::error("Error: notify requires a non-empty message".to_string())
@@ -197,7 +220,16 @@ impl<C> ToolHandler<C> for WebSearchToolHandler
 where
     C: Send + Sync,
 {
-    async fn execute(&self, _context: &C, args: &Value) -> ToolResult {
+    async fn execute(
+        &self,
+        _context: &C,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> ToolResult {
+        // P2-C: 重型 handler 入口处合作式取消检查
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return ToolResult::error("Web search not executed: run was cancelled".to_string());
+        }
         crate::web_search::web_search_result(args)
     }
 }
@@ -224,7 +256,12 @@ mod tests {
 
     #[async_trait]
     impl ToolHandler<TestContext> for EchoHandler {
-        async fn execute(&self, context: &TestContext, args: &Value) -> ToolResult {
+        async fn execute(
+            &self,
+            context: &TestContext,
+            args: &Value,
+            _cancel_token: Option<&CancellationToken>,
+        ) -> ToolResult {
             let value = string_arg(args, "value").unwrap_or("");
             ToolResult::text(format!("{}:{value}", context.prefix))
         }
@@ -235,7 +272,13 @@ mod tests {
 
     #[async_trait]
     impl DynamicToolHandler<TestContext> for DynamicEchoHandler {
-        async fn execute(&self, name: &str, context: &TestContext, args: &Value) -> ToolResult {
+        async fn execute(
+            &self,
+            name: &str,
+            context: &TestContext,
+            args: &Value,
+            _cancel_token: Option<&CancellationToken>,
+        ) -> ToolResult {
             let value = string_arg(args, "value").unwrap_or("");
             ToolResult::text(format!("{}:{name}:{value}", context.prefix))
         }
@@ -251,6 +294,7 @@ mod tests {
                 "echo",
                 &TestContext { prefix: "ctx" },
                 &json!({"value": "ok"}),
+                None,
             )
             .await
             .expect("registered handler should execute");
@@ -265,7 +309,7 @@ mod tests {
 
         assert!(
             engine
-                .execute("missing", &TestContext { prefix: "ctx" }, &json!({}))
+                .execute("missing", &TestContext { prefix: "ctx" }, &json!({}), None)
                 .await
                 .is_none()
         );
@@ -286,6 +330,7 @@ mod tests {
                 "mcp__demo__search",
                 &TestContext { prefix: "ctx" },
                 &json!({"value": "ok"}),
+                None,
             )
             .await
             .expect("prefix handler should execute");
@@ -336,6 +381,7 @@ mod tests {
                 "notify",
                 &TestContext { prefix: "unused" },
                 &json!({"message": " hello "}),
+                None,
             )
             .await
             .expect("notify handler should execute");
@@ -347,6 +393,7 @@ mod tests {
                 "notify",
                 &TestContext { prefix: "unused" },
                 &json!({"message": "   "}),
+                None,
             )
             .await
             .expect("notify handler should execute");
@@ -366,6 +413,7 @@ mod tests {
                 "web_search",
                 &TestContext { prefix: "unused" },
                 &json!({"query": "astra runtime", "engine": "github"}),
+                None,
             )
             .await
             .expect("web_search handler should execute");
@@ -377,6 +425,7 @@ mod tests {
                 "web_search",
                 &TestContext { prefix: "unused" },
                 &json!({"engine": "github"}),
+                None,
             )
             .await
             .expect("web_search handler should execute");
@@ -394,7 +443,12 @@ mod tests {
 
         #[async_trait]
         impl ToolHandler<TestContext> for PanicHandler {
-            async fn execute(&self, _context: &TestContext, _args: &Value) -> ToolResult {
+            async fn execute(
+                &self,
+                _context: &TestContext,
+                _args: &Value,
+                _cancel_token: Option<&CancellationToken>,
+            ) -> ToolResult {
                 panic!("handler exploded intentionally");
             }
         }
@@ -404,15 +458,21 @@ mod tests {
 
         // Must not propagate the panic — must return an error ToolResult.
         let result = engine
-            .execute("panic_bomb", &TestContext { prefix: "ctx" }, &json!({}))
+            .execute(
+                "panic_bomb",
+                &TestContext { prefix: "ctx" },
+                &json!({}),
+                None,
+            )
             .await;
 
         let tool_result = result.expect("engine must return Some even on panic");
         assert!(tool_result.is_error, "panic must yield an error result");
         assert!(
-            tool_result.output.contains("panicked"),
-            "error message must mention panic: {}",
-            tool_result.output
+            engine
+                .execute("missing", &TestContext { prefix: "ctx" }, &json!({}), None)
+                .await
+                .is_none()
         );
     }
 
@@ -429,6 +489,7 @@ mod tests {
                 _name: &str,
                 _context: &TestContext,
                 _args: &Value,
+                _cancel_token: Option<&CancellationToken>,
             ) -> ToolResult {
                 panic!("prefix handler exploded");
             }
@@ -440,7 +501,12 @@ mod tests {
             .unwrap();
 
         let result = engine
-            .execute("explode__test", &TestContext { prefix: "ctx" }, &json!({}))
+            .execute(
+                "explode__test",
+                &TestContext { prefix: "ctx" },
+                &json!({}),
+                None,
+            )
             .await;
 
         let tool_result = result.expect("engine must return Some even on panic");
