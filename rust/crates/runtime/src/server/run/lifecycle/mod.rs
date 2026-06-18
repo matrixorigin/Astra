@@ -9119,7 +9119,26 @@ mod tests {
         };
         use async_trait::async_trait;
 
-        struct MockSkillService;
+        #[derive(Default)]
+        struct MockSkillService {
+            unsupported_calls: std::sync::atomic::AtomicUsize,
+        }
+
+        impl MockSkillService {
+            fn unsupported<T>(
+                &self,
+                operation: &str,
+            ) -> Result<T, (StatusCode, Json<ErrorResponse>)> {
+                self.unsupported_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err((
+                    StatusCode::NOT_IMPLEMENTED,
+                    Json(ErrorResponse::new(format!(
+                        "MockSkillService::{operation} is not implemented in this test"
+                    ))),
+                ))
+            }
+        }
 
         #[async_trait]
         impl SkillService for MockSkillService {
@@ -9128,7 +9147,7 @@ mod tests {
                 _: String,
                 _: SkillRegisterRequestData,
             ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
-                unimplemented!()
+                self.unsupported("register_skill")
             }
 
             async fn list_skills(
@@ -9195,7 +9214,7 @@ mod tests {
                 _: String,
                 _: String,
             ) -> Result<SkillInfoRecord, (StatusCode, Json<ErrorResponse>)> {
-                unimplemented!()
+                self.unsupported("get_skill_info")
             }
 
             async fn list_skill_versions(
@@ -9203,7 +9222,7 @@ mod tests {
                 _: String,
                 _: String,
             ) -> Result<Vec<SkillVersionRecord>, (StatusCode, Json<ErrorResponse>)> {
-                unimplemented!()
+                self.unsupported("list_skill_versions")
             }
 
             async fn get_skill_status(
@@ -9211,7 +9230,7 @@ mod tests {
                 _: String,
                 _: u32,
             ) -> Result<SkillStatusRecord, (StatusCode, Json<ErrorResponse>)> {
-                unimplemented!()
+                self.unsupported("get_skill_status")
             }
 
             async fn publish_skill(
@@ -9219,7 +9238,7 @@ mod tests {
                 _: String,
                 _: SkillPublishRequestData,
             ) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
-                unimplemented!()
+                self.unsupported("publish_skill")
             }
 
             async fn unpublish_skill(
@@ -9227,11 +9246,12 @@ mod tests {
                 _: String,
                 _: String,
             ) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
-                unimplemented!()
+                self.unsupported("unpublish_skill")
             }
         }
 
-        let svc = test_service().with_skill_service(Arc::new(MockSkillService));
+        let skill_service = Arc::new(MockSkillService::default());
+        let svc = test_service().with_skill_service(skill_service.clone());
 
         let default_request = test_request("hello");
         let default_state = svc.build_initial_state(
@@ -9333,6 +9353,13 @@ mod tests {
         filtered_resolver
             .resolve("remote-db")
             .expect("allowed remote-db skill should resolve");
+        assert_eq!(
+            skill_service
+                .unsupported_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "build_initial_state should only use list_skills/get_skill on this mock"
+        );
     }
 
     #[tokio::test]
