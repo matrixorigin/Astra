@@ -180,7 +180,7 @@ pub(crate) use task_mgmt::TaskManager;
 #[path = "edge_tools/web_search.rs"]
 mod web_search;
 use file_state::FileState;
-pub(crate) use file_state::ReadDedupKey;
+pub(crate) use file_state::{ReadCoverage, ReadDedupKey};
 
 /// Shared file-state cache handle for cross-turn read-before-write tracking.
 pub(crate) type SharedFileState = std::sync::Arc<std::sync::Mutex<HashMap<PathBuf, FileState>>>;

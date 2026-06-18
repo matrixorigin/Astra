@@ -23,7 +23,12 @@ fn str_replace_diff_block_re() -> &'static Regex {
 /// ~50K chars ≈ 12.5K tokens — generous for individual tool results while
 /// preventing unbounded context growth from large file reads or verbose bash output.
 pub const MAX_TOOL_RESULT_CHARS: usize = 50_000;
-const HIGH_CHURN_READ_RESULT_CHARS: usize = 12_000;
+/// Maximum `read_file`/`view` payload size that is delivered to the model.
+///
+/// File read state must use this as an upper bound for "content seen by the
+/// model"; larger internal caches are not evidence that the model saw the
+/// omitted lines.
+pub const READ_FILE_MODEL_RESULT_CHARS: usize = 12_000;
 const HIGH_CHURN_DIFF_RESULT_CHARS: usize = 14_000;
 const HIGH_CHURN_SHELL_RESULT_CHARS: usize = 18_000;
 
@@ -82,7 +87,7 @@ pub fn truncate_tool_result_for_model(tool_name: &str, sanitized_content: &str) 
 
 fn model_result_char_budget(tool_name: &str, content: &str) -> usize {
     match tool_name {
-        "read_file" | "view" => HIGH_CHURN_READ_RESULT_CHARS,
+        "read_file" | "view" => READ_FILE_MODEL_RESULT_CHARS,
         "git_diff" | "git_show" | "str_replace" | "multi_edit" => HIGH_CHURN_DIFF_RESULT_CHARS,
         // Shell output is too varied to cap as aggressively as structured read
         // tools, but huge diffs/build logs should not dominate the next round.
@@ -315,7 +320,7 @@ mod tests {
         let big = "fn example() {}\n".repeat(6_000);
         let out = tool_result_content_for_model("read_file", &big);
         assert!(
-            out.chars().count() <= HIGH_CHURN_READ_RESULT_CHARS,
+            out.chars().count() <= READ_FILE_MODEL_RESULT_CHARS,
             "read_file output should be bounded for context churn: {} chars",
             out.chars().count()
         );

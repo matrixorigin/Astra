@@ -36,6 +36,34 @@ pub(crate) enum ReadDedupKey {
     },
 }
 
+/// Line coverage actually delivered to the model.
+///
+/// This is deliberately separate from the bytes read from disk or stored in
+/// `cached_content`: a full internal cache does not mean the model saw every
+/// line after tool-result budgeting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReadCoverage {
+    None,
+    Full,
+    Range { start_line: u64, end_line: u64 },
+}
+
+impl ReadCoverage {
+    fn from_complete_request(key: &ReadDedupKey) -> Self {
+        match key {
+            ReadDedupKey::Full => ReadCoverage::Full,
+            ReadDedupKey::Outline => ReadCoverage::None,
+            ReadDedupKey::Range {
+                start_line,
+                end_line,
+            } => ReadCoverage::Range {
+                start_line: start_line.unwrap_or(1),
+                end_line: end_line.unwrap_or(u64::MAX),
+            },
+        }
+    }
+}
+
 /// Tracks the last-read state of a file for staleness detection and dedup.
 pub(crate) struct FileState {
     /// mtime (milliseconds) at the time of last read/write.
@@ -53,11 +81,15 @@ pub(crate) struct FileState {
     pub(super) ranged_read_count: u32,
     /// Last read_file request shape (updated on every successful read).
     pub(super) last_dedup_key: ReadDedupKey,
+    /// Whether repeating `last_dedup_key` can safely be stubbed. False when
+    /// the requested payload was truncated before it reached the model.
+    pub(super) last_read_dedup_eligible: bool,
     /// Cached full file content. Stored on reads/writes when the full content
     /// is available and fits within `MAX_CACHED_FILE_BYTES`. Serves subsequent
     /// reads without disk I/O when mtime is unchanged.
     pub(super) cached_content: Option<String>,
-    /// Merged line ranges already read (sorted, non-overlapping).
+    /// Merged line ranges actually delivered to the model (sorted,
+    /// non-overlapping).
     /// Used to detect when a new ranged read is fully covered by prior reads.
     /// Reset on write or mtime change. Persists across turn boundaries:
     /// compaction (which evicts prior tool_results from the prompt) calls
@@ -163,7 +195,8 @@ impl ToolExecutor {
 
     /// Record file state after a read.
     pub(super) fn record_read(&self, path: &Path, is_partial: bool, last_dedup_key: ReadDedupKey) {
-        self.record_read_impl(path, is_partial, last_dedup_key, None);
+        let coverage = ReadCoverage::from_complete_request(&last_dedup_key);
+        self.record_read_impl(path, is_partial, last_dedup_key, true, coverage, None);
     }
 
     /// Record file state after a read, caching the full file content for
@@ -176,7 +209,34 @@ impl ToolExecutor {
         last_dedup_key: ReadDedupKey,
         content: String,
     ) {
-        self.record_read_impl(path, is_partial, last_dedup_key, Some(content));
+        let coverage = ReadCoverage::from_complete_request(&last_dedup_key);
+        self.record_read_impl(
+            path,
+            is_partial,
+            last_dedup_key,
+            true,
+            coverage,
+            Some(content),
+        );
+    }
+
+    pub(super) fn record_read_cached_with_coverage(
+        &self,
+        path: &Path,
+        is_partial: bool,
+        last_dedup_key: ReadDedupKey,
+        last_read_dedup_eligible: bool,
+        delivered_coverage: ReadCoverage,
+        content: String,
+    ) {
+        self.record_read_impl(
+            path,
+            is_partial,
+            last_dedup_key,
+            last_read_dedup_eligible,
+            delivered_coverage,
+            Some(content),
+        );
     }
 
     fn record_read_impl(
@@ -184,6 +244,8 @@ impl ToolExecutor {
         path: &Path,
         is_partial: bool,
         last_dedup_key: ReadDedupKey,
+        last_read_dedup_eligible: bool,
+        delivered_coverage: ReadCoverage,
         content: Option<String>,
     ) {
         let ts = Self::file_mtime_ms(path);
@@ -201,18 +263,19 @@ impl ToolExecutor {
                 .filter(|fs| fs.from_read && fs.timestamp_ms == ts)
                 .map(|fs| fs.read_ranges.clone())
                 .unwrap_or_default();
-            // Merge the new range into the list.
-            if let ReadDedupKey::Range {
-                start_line,
-                end_line,
-            } = &last_dedup_key
-            {
-                let s = start_line.unwrap_or(1);
-                let e = end_line.unwrap_or(u64::MAX);
-                merge_range(&mut ranges, s, e);
-            } else if matches!(last_dedup_key, ReadDedupKey::Full) {
-                // Full read covers everything.
-                ranges = vec![(1, u64::MAX)];
+            match delivered_coverage {
+                ReadCoverage::Range {
+                    start_line,
+                    end_line,
+                } => {
+                    if start_line <= end_line {
+                        merge_range(&mut ranges, start_line, end_line);
+                    }
+                }
+                ReadCoverage::Full => {
+                    ranges = vec![(1, u64::MAX)];
+                }
+                ReadCoverage::None => {}
             }
             let new_count = if is_partial {
                 prev_count
@@ -233,6 +296,7 @@ impl ToolExecutor {
                     read_count: new_count,
                     ranged_read_count: new_ranged,
                     last_dedup_key,
+                    last_read_dedup_eligible,
                     cached_content,
                     read_ranges: ranges,
                 },
@@ -270,6 +334,7 @@ impl ToolExecutor {
                     read_count: 0,
                     ranged_read_count: 0,
                     last_dedup_key: ReadDedupKey::Full,
+                    last_read_dedup_eligible: false,
                     cached_content,
                     read_ranges: vec![],
                 },
@@ -369,6 +434,7 @@ impl ToolExecutor {
                 s.get(&key).and_then(|fs| {
                     (fs.from_read
                         && fs.timestamp_ms == current_ts
+                        && fs.last_read_dedup_eligible
                         && fs.last_dedup_key == *requested)
                         .then_some(())
                 })

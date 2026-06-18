@@ -59,6 +59,9 @@ pub fn compress_result_for_context(tool_name: &str, content: &str, budget_chars:
     if content.len() <= budget_chars {
         return content.to_string();
     }
+    if prefers_listing_compression(tool_name) && is_line_listing(content) {
+        return compress_listing(content);
+    }
     if let Some(compressed) = try_compress_json(content, budget_chars) {
         return compressed;
     }
@@ -74,6 +77,10 @@ pub fn compress_result_for_context(tool_name: &str, content: &str, budget_chars:
 /// Convenience wrapper using the default budget.
 pub fn compress_with_default_budget(tool_name: &str, content: &str) -> String {
     compress_result_for_context(tool_name, content, DEFAULT_COMPRESSION_BUDGET_CHARS)
+}
+
+fn prefers_listing_compression(tool_name: &str) -> bool {
+    matches!(tool_name, "read_file" | "view")
 }
 
 // ── JSON compression ──────────────────────────────────────────────────────
@@ -312,6 +319,23 @@ mod tests {
         assert!(out.contains("Error: something failed"));
         assert!(out.contains("RuntimeError: boom"));
         assert!(out.contains("middle frames elided"));
+    }
+
+    #[test]
+    fn read_file_listing_with_error_text_stays_line_listing() {
+        let mut lines = vec!["1\tError: this is source text".to_string()];
+        for i in 2..=100 {
+            lines.push(format!("{i}\tlet value_{i} = {i};"));
+        }
+        let content = lines.join("\n");
+
+        let out = compress_result_for_context("read_file", &content, 200);
+
+        assert!(out.contains("middle lines elided"), "got: {out}");
+        assert!(
+            !out.contains("middle frames elided"),
+            "read_file should not be treated as an error stack: {out}"
+        );
     }
 
     #[test]
