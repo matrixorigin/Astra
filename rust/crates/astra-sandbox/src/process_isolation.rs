@@ -157,6 +157,55 @@ struct StreamChunk {
     bytes: Vec<u8>,
 }
 
+struct StreamOutputCapture {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    max_output_bytes: usize,
+    stdout_capped: bool,
+    stderr_capped: bool,
+}
+
+impl StreamOutputCapture {
+    fn new(max_output_bytes: usize) -> Self {
+        Self {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            max_output_bytes,
+            stdout_capped: false,
+            stderr_capped: false,
+        }
+    }
+
+    fn append(&mut self, chunk: StreamChunk) {
+        let retained_bytes = self.stdout.len().saturating_add(self.stderr.len());
+        let remaining = self.max_output_bytes.saturating_sub(retained_bytes);
+        match chunk.stream {
+            StreamKind::Stdout => append_capped(
+                &mut self.stdout,
+                &chunk.bytes,
+                remaining,
+                &mut self.stdout_capped,
+            ),
+            StreamKind::Stderr => append_capped(
+                &mut self.stderr,
+                &chunk.bytes,
+                remaining,
+                &mut self.stderr_capped,
+            ),
+        }
+    }
+
+    fn drain_ready(&mut self, rx: &mut tokio::sync::mpsc::UnboundedReceiver<StreamChunk>) {
+        while let Ok(chunk) = rx.try_recv() {
+            self.append(chunk);
+        }
+    }
+
+    fn is_capped(&self) -> bool {
+        self.stdout_capped || self.stderr_capped
+    }
+}
+
 /// Check if `unshare` with user namespace mapping actually works.
 ///
 /// The binary may exist but the kernel may block unprivileged user namespaces
@@ -412,20 +461,9 @@ fn append_capped(buffer: &mut Vec<u8>, chunk: &[u8], max_bytes: usize, capped: &
 
 fn drain_stream_chunks(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<StreamChunk>,
-    stdout: &mut Vec<u8>,
-    stderr: &mut Vec<u8>,
-    max_output_bytes: usize,
-    stdout_capped: &mut bool,
-    stderr_capped: &mut bool,
+    capture: &mut StreamOutputCapture,
 ) {
-    while let Ok(chunk) = rx.try_recv() {
-        let retained_bytes = stdout.len().saturating_add(stderr.len());
-        let remaining = max_output_bytes.saturating_sub(retained_bytes);
-        match chunk.stream {
-            StreamKind::Stdout => append_capped(stdout, &chunk.bytes, remaining, stdout_capped),
-            StreamKind::Stderr => append_capped(stderr, &chunk.bytes, remaining, stderr_capped),
-        }
-    }
+    capture.drain_ready(rx);
 }
 
 fn trim_incomplete_trailing_line(output: &mut String) {
@@ -471,11 +509,7 @@ async fn drain_stream_pumps_after_exit(
     mut stdout_task: tokio::task::JoinHandle<()>,
     mut stderr_task: tokio::task::JoinHandle<()>,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<StreamChunk>,
-    stdout: &mut Vec<u8>,
-    stderr: &mut Vec<u8>,
-    max_output_bytes: usize,
-    stdout_capped: &mut bool,
-    stderr_capped: &mut bool,
+    capture: &mut StreamOutputCapture,
 ) {
     let mut stdout_done = false;
     let mut stderr_done = false;
@@ -489,17 +523,12 @@ async fn drain_stream_pumps_after_exit(
 
         tokio::select! {
             Some(chunk) = rx.recv() => {
-                let retained_bytes = stdout.len().saturating_add(stderr.len());
-                let remaining = max_output_bytes.saturating_sub(retained_bytes);
-                match chunk.stream {
-                    StreamKind::Stdout => append_capped(stdout, &chunk.bytes, remaining, stdout_capped),
-                    StreamKind::Stderr => append_capped(stderr, &chunk.bytes, remaining, stderr_capped),
-                }
+                capture.append(chunk);
                 idle_timer
                     .as_mut()
                     .reset(tokio::time::Instant::now() + OUTPUT_DRAIN_TIMEOUT);
 
-                if *stdout_capped || *stderr_capped {
+                if capture.is_capped() {
                     if !stdout_done {
                         stdout_task.abort();
                     }
@@ -534,14 +563,7 @@ async fn drain_stream_pumps_after_exit(
         let _ = stderr_task.await;
     }
 
-    drain_stream_chunks(
-        rx,
-        stdout,
-        stderr,
-        max_output_bytes,
-        stdout_capped,
-        stderr_capped,
-    );
+    drain_stream_chunks(rx, capture);
 }
 
 /// Build a shell script that sets up filesystem isolation inside a new mount
@@ -821,24 +843,14 @@ pub async fn execute_isolated(
     let stdout_task = tokio::spawn(pump_stream(stdout, StreamKind::Stdout, tx.clone()));
     let stderr_task = tokio::spawn(pump_stream(stderr, StreamKind::Stderr, tx));
 
-    let mut stdout_bytes = Vec::new();
-    let mut stderr_bytes = Vec::new();
-    let mut stdout_capped = false;
-    let mut stderr_capped = false;
+    let mut capture = StreamOutputCapture::new(config.max_output_bytes);
     let mut exit_code = None;
     let mut timed_out = false;
     let mut abort_stream_pumps = false;
     let deadline = tokio::time::Instant::now() + config.timeout;
 
     loop {
-        drain_stream_chunks(
-            &mut rx,
-            &mut stdout_bytes,
-            &mut stderr_bytes,
-            config.max_output_bytes,
-            &mut stdout_capped,
-            &mut stderr_capped,
-        );
+        drain_stream_chunks(&mut rx, &mut capture);
 
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -889,25 +901,22 @@ pub async fn execute_isolated(
         stdout_task.abort();
         stderr_task.abort();
     }
-    drain_stream_pumps_after_exit(
-        stdout_task,
-        stderr_task,
-        &mut rx,
-        &mut stdout_bytes,
-        &mut stderr_bytes,
-        config.max_output_bytes,
-        &mut stdout_capped,
-        &mut stderr_capped,
-    )
-    .await;
+    drain_stream_pumps_after_exit(stdout_task, stderr_task, &mut rx, &mut capture).await;
 
     // ── Cleanup cgroup ───────────────────────────────────────────────
     if let Some(ref cg) = cg_path {
         cleanup_cgroup(cg);
     }
 
-    let mut stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
-    let mut stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+    let StreamOutputCapture {
+        stdout,
+        stderr,
+        stdout_capped,
+        stderr_capped,
+        ..
+    } = capture;
+    let mut stdout = String::from_utf8_lossy(&stdout).into_owned();
+    let mut stderr = String::from_utf8_lossy(&stderr).into_owned();
     if timed_out || stdout_capped {
         trim_incomplete_trailing_line(&mut stdout);
     }
