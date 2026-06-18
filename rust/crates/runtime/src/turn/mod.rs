@@ -23,6 +23,7 @@ pub(crate) mod llm;
 pub mod loop_dispatcher;
 pub mod memory_prefetch;
 pub mod permission_gate;
+pub(crate) mod plan_mode_guard;
 pub mod prompt_cache;
 pub mod run_control;
 pub mod session_current_date;

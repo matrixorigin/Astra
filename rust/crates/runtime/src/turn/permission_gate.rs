@@ -171,54 +171,6 @@ pub fn permission_denied_error_result(tool_name: &str, reason: &str) -> String {
     )
 }
 
-/// Tools that are unconditionally read-only — safe to call in plan mode.
-///
-/// This list mirrors the tools that claudecode's plan-mode workflow
-/// instructions explicitly allow ("Thoroughly explore the codebase
-/// using Glob, Grep, and Read tools"). The `enter_plan_mode` /
-/// `exit_plan_mode` tools themselves must also pass — otherwise plan
-/// mode is a trap (model enters but can't exit).
-///
-/// Tools NOT on this list are treated as potentially-mutating in plan
-/// mode and denied. The list is conservative: it's safer to deny a
-/// surprising read-only tool than to allow a surprising write tool.
-fn is_read_only_in_plan_mode(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "read_file"
-            | "grep"
-            | "glob"
-            | "list_dir"
-            | "git_status"
-            | "git_diff"
-            | "git_log"
-            | "git_file_history"
-            | "git_contributors"
-            | "git_log_search"
-            | "git_show"
-            | "git_blame"
-            | "symbols"
-            | "introspect"
-            | "lsp"
-            | "web_fetch"
-            | "web_search"
-            | "memory"
-            | "session"
-            | "task"
-            | "tool_search"
-            | "ask_user"
-            | "notify"
-            | "view_image"
-            | "exit_plan_mode" // Read-only sub-actions of `git` tool. The full git tool also
-                               // has stash/commit/revert which mutate, but the model picks
-                               // those by `action` — we'd need argument-aware filtering to
-                               // be safe, so deny the whole git tool in plan mode for now
-                               // and let the model use individual git read tools through
-                               // bash if it really must (which is itself denied — the
-                               // intent is "read the code, don't mutate state").
-    )
-}
-
 /// Plan-mode-aware wrapper around [`check_tool_permission`]. When
 /// `plan_mode_active` is true, mutating tools are denied at the gate
 /// with a redirect to `exit_plan_mode`; read-only tools fall through
@@ -236,7 +188,14 @@ pub async fn check_tool_permission_in_plan_mode(
     timeout: Duration,
     plan_mode_active: bool,
 ) -> PermissionCheckResult {
-    if plan_mode_active && !is_read_only_in_plan_mode(tool_name) {
+    let normalized_args = args
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .map(|parsed| normalize_llm_function_arguments(&parsed))
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    if plan_mode_active
+        && crate::turn::plan_mode_guard::is_plan_mode_blocked_tool(tool_name, &normalized_args)
+    {
         return PermissionCheckResult::Denied {
             reason: format!(
                 "tool '{tool_name}' is blocked while plan mode is active. \
@@ -247,7 +206,15 @@ pub async fn check_tool_permission_in_plan_mode(
             ),
         };
     }
-    check_tool_permission(tool_name, args, permission_context, mailbox, timeout).await
+    let normalized_args_str = serde_json::to_string(&normalized_args).ok();
+    check_tool_permission(
+        tool_name,
+        normalized_args_str.as_deref(),
+        permission_context,
+        mailbox,
+        timeout,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -817,7 +784,7 @@ mod tests {
         // Pretend the session is mid-plan with active plan id present.
         let result = check_tool_permission_in_plan_mode(
             "bash",
-            Some(r#"{"command":"echo hi"}"#),
+            Some(r#"{"command":"touch plan.txt"}"#),
             Some(&ctx),
             None,
             Duration::from_secs(1),
@@ -841,17 +808,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_mode_blocks_str_replace_and_write_file() {
+    async fn plan_mode_blocks_mutating_and_execute_tools_by_args() {
         let inherited = InheritedPermissions {
             mode: PermissionMode::Auto,
             ..Default::default()
         };
         let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
 
-        for tool in &["str_replace", "write_file", "multi_edit"] {
+        for (tool, args) in [
+            ("str_replace", None),
+            ("write_file", None),
+            ("multi_edit", None),
+            ("delete_file", Some(r#"{"path":"stale.txt"}"#)),
+            ("run_script", Some(r#"{"script":"touch plan.txt"}"#)),
+            ("rollback_file_edits", Some(r#"{"scope":"current_turn"}"#)),
+            ("rollback_session_state", Some(r#"{"scope":"last_turn"}"#)),
+            ("adjust_config", Some(r#"{"key":"model","value":"fast"}"#)),
+            ("prioritize_tool", Some(r#"{"tool":"bash"}"#)),
+            ("deprioritize_tool", Some(r#"{"tool":"grep"}"#)),
+            ("compress_context", Some(r#"{"target_tokens":1000}"#)),
+            ("task", Some(r#"{"action":"stop","task_id":"bg-shell-1"}"#)),
+        ] {
             let result = check_tool_permission_in_plan_mode(
                 tool,
-                None,
+                args,
                 Some(&ctx),
                 None,
                 Duration::from_secs(1),
@@ -861,6 +841,32 @@ mod tests {
             assert!(
                 matches!(result, PermissionCheckResult::Denied { .. }),
                 "`{tool}` is a write tool — plan mode must deny it. Got: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_mode_allows_read_only_bash_by_args() {
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Auto,
+            ..Default::default()
+        };
+        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+
+        for command in ["git status --short", "ls src", "grep -R needle src"] {
+            let args = serde_json::json!({ "command": command }).to_string();
+            let result = check_tool_permission_in_plan_mode(
+                "bash",
+                Some(&args),
+                Some(&ctx),
+                None,
+                Duration::from_secs(1),
+                true,
+            )
+            .await;
+            assert!(
+                is_allowed(&result),
+                "read-only bash command `{command}` must stay available during plan authoring. Got: {result:?}"
             );
         }
     }
@@ -918,7 +924,7 @@ mod tests {
 
         let result = check_tool_permission_in_plan_mode(
             "bash",
-            Some(r#"{"command":"echo hi"}"#),
+            Some(r#"{"command":"touch plan.txt"}"#),
             Some(&ctx),
             None,
             Duration::from_secs(1),

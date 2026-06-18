@@ -24,43 +24,7 @@ pub(crate) struct PlanModeSnapshot {
 /// ...) stay available so the agent can continue exploring while authoring a
 /// plan.
 pub(crate) fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
-    if tool == "task_stop" {
-        return true;
-    }
-
-    if tool == "task" {
-        let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-        return action == "stop";
-    }
-
-    if tool == "git" {
-        let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-        return match action {
-            "commit" | "revert_commit" | "push" => true,
-            "stash" => args
-                .get("stash_action")
-                .and_then(Value::as_str)
-                .is_some_and(|stash_action| {
-                    matches!(
-                        stash_action,
-                        "push" | "save" | "apply" | "pop" | "drop" | "branch"
-                    )
-                }),
-            _ => false,
-        };
-    }
-
-    if tool == "github" {
-        return args
-            .get("action")
-            .and_then(Value::as_str)
-            .is_some_and(|action| action == "create_issue");
-    }
-
-    matches!(
-        tool,
-        "bash" | "write_file" | "str_replace" | "mo" | "rollback_database_snapshots"
-    )
+    crate::turn::plan_mode_guard::is_plan_mode_blocked_tool(tool, args)
 }
 
 pub(crate) fn plan_mode_blocked_tool_result(tool: &str) -> astra_tools::ToolResult {
@@ -296,4 +260,95 @@ pub(crate) async fn execute_exit_plan_mode(
     format!(
         "Plan {active} submitted for trusted user approval. Write tools remain blocked until the UI/control plane records the user's approval."
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn plan_mode_blocks_all_write_and_execute_class_tools() {
+        for (tool, args) in [
+            ("bash", json!({"command": "touch plan.txt"})),
+            ("write_file", json!({"path": "plan.txt", "content": "x"})),
+            (
+                "str_replace",
+                json!({"path": "plan.txt", "old": "a", "new": "b"}),
+            ),
+            ("multi_edit", json!({"path": "plan.txt", "edits": []})),
+            ("delete_file", json!({"path": "plan.txt"})),
+            ("rollback_file_edits", json!({"scope": "current_turn"})),
+            ("rollback_session_state", json!({"scope": "last_turn"})),
+            ("adjust_config", json!({"key": "model", "value": "fast"})),
+            ("prioritize_tool", json!({"tool": "bash"})),
+            ("deprioritize_tool", json!({"tool": "grep"})),
+            ("compress_context", json!({"target_tokens": 1000})),
+            ("publish_artifact", json!({"path": "report.md"})),
+            ("run_script", json!({"script": "touch plan.txt"})),
+            ("rollback_database_snapshots", json!({})),
+        ] {
+            assert!(
+                is_plan_mode_blocked_tool(tool, &args),
+                "{tool} must be blocked during plan authoring"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_mode_allows_read_only_exploration_by_args() {
+        for (tool, args) in [
+            ("bash", json!({"command": "git status --short"})),
+            ("bash", json!({"command": "ls src"})),
+            ("read_file", json!({"path": "src/lib.rs"})),
+            ("grep", json!({"pattern": "needle", "path": "src"})),
+            ("glob", json!({"pattern": "**/*.rs"})),
+            ("list_dir", json!({"path": "src"})),
+            ("git", json!({"action": "status"})),
+            ("git", json!({"action": "diff"})),
+            ("github", json!({"action": "list_prs"})),
+            ("task", json!({"action": "list"})),
+            (
+                "task",
+                json!({"action": "create", "title": "draft plan item"}),
+            ),
+            (
+                "memory",
+                json!({"action": "remember", "content": "plan context"}),
+            ),
+        ] {
+            assert!(
+                !is_plan_mode_blocked_tool(tool, &args),
+                "{tool} with args {args} should remain available during plan authoring"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_mode_blocks_action_scoped_tools_only_when_mutating() {
+        assert!(is_plan_mode_blocked_tool(
+            "task_stop",
+            &json!({"task_id": "bg-shell-1"})
+        ));
+        assert!(is_plan_mode_blocked_tool(
+            "task",
+            &json!({"action": "stop", "task_id": "bg-shell-1"})
+        ));
+        assert!(is_plan_mode_blocked_tool(
+            "git",
+            &json!({"action": "commit", "message": "ship"})
+        ));
+        assert!(is_plan_mode_blocked_tool(
+            "git",
+            &json!({"action": "stash", "stash_action": "pop"})
+        ));
+        assert!(!is_plan_mode_blocked_tool(
+            "git",
+            &json!({"action": "stash", "stash_action": "list"})
+        ));
+        assert!(is_plan_mode_blocked_tool(
+            "github",
+            &json!({"action": "create_issue", "title": "bug"})
+        ));
+    }
 }
