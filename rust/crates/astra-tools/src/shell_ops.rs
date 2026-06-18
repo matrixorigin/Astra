@@ -858,8 +858,15 @@ pub(crate) fn parse_bash_timeout_secs(args: &Value) -> f64 {
 pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     let workspace_root = ctx.workspace_root.as_path();
     let command = match args.get("command").and_then(|v| v.as_str()) {
-        Some(c) => c,
-        None => return ToolResult::error("Error: Missing 'command' parameter".into()),
+        Some(c) if !c.trim().is_empty() => c,
+        _ => {
+            return ToolResult::error(
+                "Error: missing required field `command` for bash. \
+                 Origin: model_argument_error; no command was run. \
+                 Next: retry with a JSON object like {\"command\":\"pwd\"}."
+                    .into(),
+            );
+        }
     };
     let timeout_secs = parse_bash_timeout_secs_for(args, command);
 
@@ -4853,6 +4860,46 @@ printf 'probe.txt:1:needle\n'
     fn validate_execute_bash_allows_typical_build_commands() {
         assert!(validate_execute_bash_command("cargo test -p foo --quiet").is_ok());
         assert!(validate_execute_bash_command("echo hello && ls").is_ok());
+    }
+
+    #[tokio::test]
+    async fn bash_missing_command_reports_model_argument_error() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = execute_bash(&ctx, &serde_json::json!({})).await;
+
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("Origin: model_argument_error"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("no command was run"),
+            "got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_blank_command_reports_model_argument_error() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = execute_bash(&ctx, &serde_json::json!({"command": " \n\t "})).await;
+
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("Origin: model_argument_error"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("no command was run"),
+            "got: {}",
+            result.output
+        );
     }
 
     #[tokio::test]

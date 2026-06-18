@@ -322,28 +322,28 @@ describe("WorkSurfacePanel", () => {
           hydrated: true,
           tools: [
             {
-              callId: "call-hosted",
+              callId: "call-cloud",
               tool: "bash",
               result:
-                "Error: workspace 'Hosted checkout' is not routed to an available executor transport.",
+                "Error: workspace 'Cloud checkout' is not routed to an available executor transport.",
               status: "error",
               errorKind: "workspace_executor_unavailable",
               blocked: true,
               workspace: {
                 kind: "git_checkout",
-                display_name: "Hosted checkout",
+                display_name: "Cloud checkout",
                 cwd: "/checkout/repo",
                 authority: "read_only",
                 fallback_policy: "disabled",
               },
               executor: {
-                kind: "hosted_runner",
-                executor_id: "runner-1",
-                display_name: "Hosted runner",
-                transport: "runner_rpc",
+                kind: "orchestrator_managed",
+                executor_id: "orchestrator-managed",
+                display_name: "Orchestrator-managed executor",
+                transport: "sandbox_resident_agent",
                 status: "degraded",
               },
-              transport: "runner_rpc",
+              transport: "sandbox_resident_agent",
               fallbackPolicy: "disabled",
               startedAt: 1_000,
               finishedAt: 2_000,
@@ -364,7 +364,7 @@ describe("WorkSurfacePanel", () => {
         "Workspace executor unavailable. Choose Server sandbox or a connected edge workspace.",
       ),
     ).toBeInTheDocument();
-    expect(screen.getByText("Hosted runner")).toBeInTheDocument();
+    expect(screen.getByText("Orchestrator-managed executor")).toBeInTheDocument();
     expect(screen.getByText("/checkout/repo")).toBeInTheDocument();
   });
 

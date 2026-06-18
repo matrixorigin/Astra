@@ -1766,7 +1766,7 @@ mod proptest_tests {
                 let content = tail_msg["content"].as_str();
                 if let Some(c) = content {
                     assert!(
-                        surviving_contents.iter().any(|s| *s == Some(c)),
+                        surviving_contents.contains(&Some(c)),
                         "tail message with content '{c}' must survive compaction"
                     );
                 }

@@ -4927,7 +4927,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_server_side_tools_follow_hosted_runner_read_only_binding() {
+    fn builder_server_side_tools_follow_orchestrator_read_only_binding() {
         let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -4943,10 +4943,10 @@ mod tests {
                 fallback_policy: FallbackPolicy::Disabled,
             },
             ExecutorBinding {
-                kind: ExecutorBindingKind::HostedRunner,
-                executor_id: "snapshot-runner".to_string(),
-                display_name: "Snapshot runner".to_string(),
-                transport: crate::server::tool_transport::ToolTransportKind::RunnerRpc,
+                kind: ExecutorBindingKind::OrchestratorManaged,
+                executor_id: "orchestrator:snapshot".to_string(),
+                display_name: "Orchestrator-managed executor".to_string(),
+                transport: crate::server::tool_transport::ToolTransportKind::SandboxResidentAgent,
                 status: crate::server::tool_transport::ExecutorStatus::Online,
             },
             astra_runtime_env::RuntimeBinding::oci_container("snapshot-runtime"),
@@ -4957,17 +4957,17 @@ mod tests {
         for visible in ["read_file", "grep", "glob", "git"] {
             assert!(
                 names.contains(visible),
-                "{visible} should be advertised for an online read-only hosted runner"
+                "{visible} should be advertised for an online read-only orchestrator-managed executor"
             );
             assert!(
                 host.valid_tool_names().contains(visible),
-                "{visible} should be admitted for an online read-only hosted runner"
+                "{visible} should be admitted for an online read-only orchestrator-managed executor"
             );
         }
         for hidden in ["write_file", "str_replace", "run_script"] {
             assert!(
                 !names.contains(hidden),
-                "{hidden} must be hidden for a read-only hosted runner"
+                "{hidden} must be hidden for a read-only orchestrator-managed executor"
             );
         }
     }

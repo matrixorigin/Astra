@@ -596,7 +596,7 @@ mod tests {
         let reg = CapabilityRegistry::new();
 
         let container_provider = Arc::new(StubProvider {
-            kind: ProviderKind::SandboxRunner,
+            kind: ProviderKind::SandboxRuntime,
             capabilities: vec![ToolCapability::Named("bash".into())],
             priority: 10,
             isolation: IsolationIntent::Container,

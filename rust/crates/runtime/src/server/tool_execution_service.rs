@@ -11,13 +11,12 @@ use super::tool_execution_binding::{
     ToolTransportKind, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
 };
 use super::tool_external_transport::{
-    execute_gateway_relay, execute_sandbox_resident_agent, GatewayRelayTransport,
-    SandboxResidentAgentTransport,
+    GatewayRelayTransport, SandboxResidentAgentTransport, execute_gateway_relay,
+    execute_sandbox_resident_agent,
 };
-use super::tool_local_transport::{execute_local_transport, ServerLocalToolTransport};
-use super::tool_route_boundary::{route_binding_event_fields, ToolRouteBoundary};
-use super::tool_route_selection::{routing_decision, ToolExecutionRouteKind};
-use super::tool_runner_rpc::{execute_runner_rpc, RunnerRpcTransport};
+use super::tool_local_transport::{ServerLocalToolTransport, execute_local_transport};
+use super::tool_route_boundary::{ToolRouteBoundary, route_binding_event_fields};
+use super::tool_route_selection::{ToolExecutionRouteKind, routing_decision};
 use super::tool_transport_errors::{
     capability_denied_result, unsupported_workspace_executor_result,
 };
@@ -34,7 +33,6 @@ pub struct ToolExecutionServiceBuilder {
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
-    runner_rpc_transport: Option<Arc<dyn RunnerRpcTransport>>,
     gateway_relay_transport: Option<Arc<dyn GatewayRelayTransport>>,
     sandbox_resident_agent_transport: Option<Arc<dyn SandboxResidentAgentTransport>>,
     tool_registry: astra_runtime_env::ToolRegistry,
@@ -75,11 +73,6 @@ impl ToolExecutionServiceBuilder {
         self
     }
 
-    pub fn runner_rpc_transport(mut self, transport: Arc<dyn RunnerRpcTransport>) -> Self {
-        self.runner_rpc_transport = Some(transport);
-        self
-    }
-
     pub fn gateway_relay_transport(mut self, transport: Arc<dyn GatewayRelayTransport>) -> Self {
         self.gateway_relay_transport = Some(transport);
         self
@@ -108,7 +101,6 @@ impl ToolExecutionServiceBuilder {
             edge_connection_pool: self.edge_connection_pool,
             edge_dispatch_service: self.edge_dispatch_service,
             edge_registry_service: self.edge_registry_service,
-            runner_rpc_transport: self.runner_rpc_transport,
             gateway_relay_transport: self.gateway_relay_transport,
             sandbox_resident_agent_transport: self.sandbox_resident_agent_transport,
             tool_registry: self.tool_registry,
@@ -122,7 +114,6 @@ pub struct ToolExecutionService {
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
-    runner_rpc_transport: Option<Arc<dyn RunnerRpcTransport>>,
     gateway_relay_transport: Option<Arc<dyn GatewayRelayTransport>>,
     sandbox_resident_agent_transport: Option<Arc<dyn SandboxResidentAgentTransport>>,
     tool_registry: astra_runtime_env::ToolRegistry,
@@ -219,12 +210,6 @@ impl ToolExecutionService {
                     false,
                 )
             }
-            ToolExecutionRouteKind::RunnerRpc => cancelled_runtime_tool_result(
-                request,
-                &binding,
-                ToolTransportKind::RunnerRpc,
-                false,
-            ),
             ToolExecutionRouteKind::GatewayRelay => cancelled_runtime_tool_result(
                 request,
                 &binding,
@@ -359,15 +344,6 @@ impl ToolExecutionService {
                     self.edge_dispatch_service.clone(),
                     self.edge_registry_service.clone(),
                     &self.tool_registry,
-                    cancel_token,
-                )
-                .await
-            }
-            ToolExecutionRouteKind::RunnerRpc => {
-                execute_runner_rpc(
-                    request,
-                    &binding,
-                    self.runner_rpc_transport.clone(),
                     cancel_token,
                 )
                 .await

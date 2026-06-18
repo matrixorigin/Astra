@@ -441,8 +441,6 @@ pub enum RuntimeErrorKind {
     ExecutorOffline,
     #[error("transport_unavailable")]
     TransportUnavailable,
-    #[error("runner_lease_expired")]
-    RunnerLeaseExpired,
     #[error("workspace_unavailable")]
     WorkspaceUnavailable,
     #[error("workspace_authority_denied")]
@@ -475,8 +473,6 @@ pub enum RuntimeErrorKind {
     RouteMismatch,
     #[error("audit_sink_unavailable")]
     AuditSinkUnavailable,
-    #[error("runner_protocol_error")]
-    RunnerProtocolError,
     #[error("transport_disconnected")]
     TransportDisconnected,
     #[error("timed_out")]
@@ -494,8 +490,7 @@ pub enum RuntimeRecoveryAction {
     None,
     SelectSupportedTool,
     ChangeWorkspaceExecutorRuntimeOrPolicy,
-    WaitForCapacityOrSwitchRunner,
-    ReconnectRunner,
+    WaitForCapacity,
     RefreshCredential,
     RequestApproval,
     RecreateRuntimeSession,
@@ -546,7 +541,7 @@ impl RuntimeError {
             retryable: true,
             ..Self::new(RuntimeErrorKind::RuntimeCapacityExhausted, message)
         }
-        .with_next_action(RuntimeRecoveryAction::WaitForCapacityOrSwitchRunner)
+        .with_next_action(RuntimeRecoveryAction::WaitForCapacity)
     }
 
     pub fn sandbox_recreate_required(message: impl Into<String>) -> Self {
@@ -554,20 +549,12 @@ impl RuntimeError {
             .with_next_action(RuntimeRecoveryAction::RecreateRuntimeSession)
     }
 
-    pub fn runner_protocol(message: impl Into<String>) -> Self {
-        Self {
-            retryable: true,
-            ..Self::new(RuntimeErrorKind::RunnerProtocolError, message)
-        }
-        .with_next_action(RuntimeRecoveryAction::ReconnectRunner)
-    }
-
     pub fn transport_unavailable(message: impl Into<String>) -> Self {
         Self {
             retryable: true,
             ..Self::new(RuntimeErrorKind::TransportUnavailable, message)
         }
-        .with_next_action(RuntimeRecoveryAction::ReconnectRunner)
+        .with_next_action(RuntimeRecoveryAction::ChangeWorkspaceExecutorRuntimeOrPolicy)
     }
 
     pub fn transport_disconnected(message: impl Into<String>) -> Self {
@@ -585,15 +572,7 @@ impl RuntimeError {
             retryable: true,
             ..Self::new(RuntimeErrorKind::ExecutorOffline, message)
         }
-        .with_next_action(RuntimeRecoveryAction::ReconnectRunner)
-    }
-
-    pub fn runner_lease_expired(message: impl Into<String>) -> Self {
-        Self {
-            retryable: true,
-            ..Self::new(RuntimeErrorKind::RunnerLeaseExpired, message)
-        }
-        .with_next_action(RuntimeRecoveryAction::ReconnectRunner)
+        .with_next_action(RuntimeRecoveryAction::ChangeWorkspaceExecutorRuntimeOrPolicy)
     }
 
     pub fn route_mismatch(message: impl Into<String>) -> Self {
@@ -747,8 +726,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        ExecutorBinding, ExecutorBindingKind, ExecutorStatus, PolicyIntent, RuntimeBinding,
-        ToolTransportKind, WorkspaceAuthority, WorkspaceBinding,
+        ExecutorBinding, PolicyIntent, RuntimeBinding, WorkspaceAuthority, WorkspaceBinding,
     };
 
     struct FakeRuntime {
@@ -871,15 +849,9 @@ mod tests {
         let registry = ToolRegistry::builtins();
         RunBinding::resolve(
             WorkspaceBinding::edge_workspace("/workspace/project", WorkspaceAuthority::ReadWrite),
-            ExecutorBinding {
-                kind: ExecutorBindingKind::HostedRunner,
-                executor_id: "runner-1".to_string(),
-                display_name: "Hosted runner".to_string(),
-                transport: ToolTransportKind::RunnerRpc,
-                status: ExecutorStatus::Online,
-            },
+            ExecutorBinding::local_cli(),
             RuntimeBinding::gvisor("gvisor-1"),
-            PolicyIntent::strict_runner(),
+            PolicyIntent::local_developer(),
             &registry,
         )
     }
@@ -895,7 +867,6 @@ mod tests {
             RuntimeErrorKind::ExecutorOffline,
             RuntimeErrorKind::TransportUnavailable,
             RuntimeErrorKind::TransportDisconnected,
-            RuntimeErrorKind::RunnerLeaseExpired,
             RuntimeErrorKind::WorkspaceUnavailable,
             RuntimeErrorKind::WorkspaceAuthorityDenied,
             RuntimeErrorKind::WorkspacePathDenied,
@@ -909,7 +880,6 @@ mod tests {
             RuntimeErrorKind::OutputLimitExceeded,
             RuntimeErrorKind::ResourceLimitExceeded,
             RuntimeErrorKind::DeviceUnavailable,
-            RuntimeErrorKind::RunnerProtocolError,
             RuntimeErrorKind::RouteMismatch,
             RuntimeErrorKind::SandboxRecreateRequired,
             RuntimeErrorKind::AuditSinkUnavailable,
@@ -930,7 +900,6 @@ mod tests {
             "executor_offline",
             "transport_unavailable",
             "transport_disconnected",
-            "runner_lease_expired",
             "workspace_unavailable",
             "workspace_authority_denied",
             "workspace_path_denied",
@@ -944,7 +913,6 @@ mod tests {
             "output_limit_exceeded",
             "resource_limit_exceeded",
             "device_unavailable",
-            "runner_protocol_error",
             "route_mismatch",
             "sandbox_recreate_required",
             "audit_sink_unavailable",
@@ -959,16 +927,19 @@ mod tests {
 
     #[test]
     fn runtime_error_serialization_includes_recovery_contract() {
-        let error = RuntimeError::transport_unavailable("runner has no RPC endpoint");
+        let error = RuntimeError::transport_unavailable("executor transport is not configured");
 
         let value = serde_json::to_value(&error).expect("serialize runtime error");
 
         assert_eq!(value["kind"], "transport_unavailable");
-        assert_eq!(value["message"], "runner has no RPC endpoint");
+        assert_eq!(value["message"], "executor transport is not configured");
         assert_eq!(value["retryable"], true);
         assert_eq!(value["execution_started"], false);
         assert_eq!(value["side_effects_maybe"], false);
-        assert_eq!(value["next_action"], "reconnect_runner");
+        assert_eq!(
+            value["next_action"],
+            "change_workspace_executor_runtime_or_policy"
+        );
     }
 
     #[tokio::test]
@@ -1008,7 +979,7 @@ mod tests {
     async fn execute_tool_rejects_unavailable_tool_before_execution() {
         let registry = ToolRegistry::builtins();
         let binding = RunBinding::cloud_control_plane(&registry);
-        let runtime = FakeRuntime::new(RuntimeBinding::oci_container("runner-runtime"));
+        let runtime = FakeRuntime::new(RuntimeBinding::oci_container("orchestrator-runtime"));
         let spec = RuntimeSessionSpec::new("session-1", "run-1", binding.clone());
         let session = runtime
             .prepare_session(spec)

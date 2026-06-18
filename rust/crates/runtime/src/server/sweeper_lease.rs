@@ -133,11 +133,6 @@ pub(crate) fn spawn_runtime_sweepers(
             std::sync::Arc::clone(&lease),
             cancel.clone(),
         ),
-        crate::server::runner_pool::spawn_runner_pool_reaper(
-            shared_pool.clone(),
-            std::sync::Arc::clone(&lease),
-            cancel.clone(),
-        ),
         crate::server::artifact_retention_sweeper::spawn_artifact_retention_sweeper(
             shared_pool.clone(),
             std::sync::Arc::clone(&lease),

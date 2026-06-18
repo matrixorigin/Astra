@@ -266,7 +266,7 @@ Sprint A-D 历经 4 轮 "patch → 回归"，19 gap review + 10 端到端推演 
 
 ## Phase 6: Artifact + Retention + Preview Templates
 
-**目标**: `session_tool_outputs` + `session_artifacts` retention/ACL + preview_template_registry + tool_runner_registry。
+**目标**: `session_tool_outputs` + `session_artifacts` retention/ACL + preview_template_registry + tool_executor_registry。
 
 **涉及 Gap**: G8/G9/G17/G27 (artifact + preview + retention + normalization)
 
@@ -276,7 +276,7 @@ Sprint A-D 历经 4 轮 "patch → 回归"，19 gap review + 10 端到端推演 
 | --- | --- |
 | L1-25 | `session_artifacts` 含 retention_policy / retention_until / referenced_by_*_count |
 | L1-26 | `preview_template_registry` + 18+ baseline 模板 |
-| L1-27 | `tool_runner_registry` + `raw_ref_scheme_registry` |
+| L1-27 | `tool_executor_registry` + `raw_ref_scheme_registry` |
 
 ### L2 Contract（8 条）
 

@@ -70,8 +70,8 @@ pub enum ProviderKind {
     ServerBuiltin,
     /// Edge-executed tools in the CLI process (local file access).
     EdgeConnection,
-    /// Tools running in a sandbox environment (Firecracker, Docker, etc.).
-    SandboxRunner,
+    /// Tools running in a sandboxed runtime (Firecracker, Docker, etc.).
+    SandboxRuntime,
     /// Tools served by an external MCP server.
     McpServer,
 }

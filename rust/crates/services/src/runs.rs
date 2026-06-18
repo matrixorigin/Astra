@@ -292,11 +292,9 @@ pub struct WorkspaceBindingRequest {
 pub enum ExecutorBindingRequestKind {
     ServerLocal,
     EdgeAgent,
+    OrchestratorManaged,
     ThinClient,
     Mcp,
-    PersonalRunner,
-    HostedRunner,
-    EnterpriseRunner,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,8 +303,9 @@ pub enum ToolTransportKindRequest {
     ServerLocal,
     EdgeWs,
     EdgeLedger,
+    GatewayRelay,
+    SandboxResidentAgent,
     McpHttp,
-    RunnerRpc,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3921,7 +3920,7 @@ mod tests {
                 "tool": "bash",
                 "reason": "workspace_executor_unavailable",
                 "workspace": {"kind": "cloud_workspace"},
-                "executor": {"kind": "hosted_runner", "status": "degraded"},
+                "executor": {"kind": "orchestrator_managed", "status": "degraded"},
             }),
         ] {
             assert_eq!(transform_run_event_for_client(event.clone()), event);
@@ -3938,8 +3937,8 @@ mod tests {
                 "reason": "workspace_executor_unavailable",
                 "message": "Workspace is not routed to an available executor.",
                 "workspace": {"kind": "cloud_workspace"},
-                "executor": {"kind": "hosted_runner", "status": "degraded"},
-                "transport": "runner_rpc",
+                "executor": {"kind": "orchestrator_managed", "status": "degraded"},
+                "transport": "sandbox_resident_agent",
                 "fallback_policy": "disabled"
             },
             "index": 4
@@ -3954,8 +3953,8 @@ mod tests {
                 "reason": "workspace_executor_unavailable",
                 "message": "Workspace is not routed to an available executor.",
                 "workspace": {"kind": "cloud_workspace"},
-                "executor": {"kind": "hosted_runner", "status": "degraded"},
-                "transport": "runner_rpc",
+                "executor": {"kind": "orchestrator_managed", "status": "degraded"},
+                "transport": "sandbox_resident_agent",
                 "fallback_policy": "disabled"
             })
         );

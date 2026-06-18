@@ -420,21 +420,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "astra-runner"
-version = "0.1.0"
-dependencies = [
- "astra-runtime-env",
- "astra-tools",
- "async-trait",
- "axum 0.8.9",
- "clap",
- "serde_json",
- "tempfile",
- "tokio",
- "tower 0.5.3",
-]
-
-[[package]]
 name = "astra-runtime"
 version = "0.1.0"
 dependencies = [

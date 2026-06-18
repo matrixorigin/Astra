@@ -351,7 +351,7 @@ impl PolicyIntent {
         }
     }
 
-    pub fn strict_runner() -> Self {
+    pub fn strict_orchestrator() -> Self {
         Self {
             isolation: IsolationIntent::GVisor,
             filesystem: FilesystemPolicy::ReadWriteWorkspace,

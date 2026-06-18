@@ -9,7 +9,6 @@ members = [
     "crates/astra-admin",
     "crates/astra-thin-client",
     "crates/astra-edge",
-    "crates/astra-runner",
     "crates/astra-pipeline",
     "crates/astra-plan",
     "crates/astra-prompts",
@@ -47,7 +46,6 @@ astra-pipeline = { path = "crates/astra-pipeline" }
 astra-plan = { path = "crates/astra-plan" }
 astra-prompts = { path = "crates/astra-prompts" }
 astra-runtime-env = { path = "crates/astra-runtime-env" }
-astra-runner = { path = "crates/astra-runner" }
 astra-sandbox = { path = "crates/astra-sandbox" }
 astra-server-types = { path = "crates/astra-server-types", default-features = false }
 astra-turn-core = { path = "crates/astra-turn-core" }

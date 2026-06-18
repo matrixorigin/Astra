@@ -13,7 +13,7 @@ pub enum WorkspaceOwnerScope {
     Organization,
     Tenant,
     ServerSession,
-    Runner,
+    Executor,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -24,7 +24,7 @@ pub enum WorkspaceSource {
         path: String,
     },
     EdgePath {
-        runner_id: String,
+        executor_id: String,
         path: String,
     },
     ServerSandbox {

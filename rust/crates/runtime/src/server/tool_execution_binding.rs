@@ -63,11 +63,9 @@ impl WorkspaceBinding {
 pub enum ExecutorBindingKind {
     ServerLocal,
     EdgeAgent,
+    OrchestratorManaged,
     ThinClient,
     Mcp,
-    PersonalRunner,
-    HostedRunner,
-    EnterpriseRunner,
     Unknown,
 }
 
@@ -78,7 +76,6 @@ pub enum ToolTransportKind {
     EdgeWs,
     EdgeLedger,
     McpHttp,
-    RunnerRpc,
     GatewayRelay,
     SandboxResidentAgent,
     Unknown,
@@ -125,6 +122,20 @@ impl ExecutorBinding {
             executor_id: executor_id.into(),
             display_name: display_name.into(),
             transport,
+            status,
+        }
+    }
+
+    pub fn orchestrator_managed(
+        executor_id: impl Into<String>,
+        display_name: impl Into<String>,
+        status: ExecutorStatus,
+    ) -> Self {
+        Self {
+            kind: ExecutorBindingKind::OrchestratorManaged,
+            executor_id: executor_id.into(),
+            display_name: display_name.into(),
+            transport: ToolTransportKind::SandboxResidentAgent,
             status,
         }
     }
@@ -353,17 +364,17 @@ mod tests {
                 fallback_policy: FallbackPolicy::Disabled,
             },
             ExecutorBinding {
-                kind: ExecutorBindingKind::HostedRunner,
-                executor_id: "runner-1".to_string(),
-                display_name: "Hosted runner".to_string(),
-                transport: ToolTransportKind::RunnerRpc,
+                kind: ExecutorBindingKind::EdgeAgent,
+                executor_id: "edge-1".to_string(),
+                display_name: "Edge agent".to_string(),
+                transport: ToolTransportKind::EdgeWs,
                 status: ExecutorStatus::Online,
             },
             astra_runtime_env::RuntimeBinding::gvisor("runtime-1"),
         ));
 
         assert_eq!(state.workspace().kind, WorkspaceBindingKind::CloudWorkspace);
-        assert_eq!(state.executor().kind, ExecutorBindingKind::HostedRunner);
+        assert_eq!(state.executor().kind, ExecutorBindingKind::EdgeAgent);
         assert_eq!(
             state.runtime().expect("runtime").isolation_backend,
             astra_runtime_env::RuntimeIsolationBackend::GVisorRunsc

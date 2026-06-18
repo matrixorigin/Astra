@@ -2,16 +2,15 @@
 //!
 //! These tests verify that the registry correctly routes to real provider
 //! implementations (ServerBuiltinProvider, EdgeConnectionProvider,
-//! SandboxRunnerProvider) based on capability, storage access, isolation
+//! sandbox-capable providers) based on capability, storage access, isolation
 //! level, and priority.
 
 use std::sync::Arc;
 
 use astra_runtime::capability_registry::CapabilityRegistry;
 use astra_runtime::provider::edge_connection::EdgeConnectionProvider;
-use astra_runtime::provider::sandbox_runner::SandboxRunnerProvider;
 use astra_runtime::provider::server_builtin::ServerBuiltinProvider;
-use astra_runtime::provider::traits::{ProviderError, ToolRequest};
+use astra_runtime::provider::traits::{CapabilityProvider, ProviderError, ToolRequest};
 use astra_runtime::provider::types::{ProviderKind, ToolCapability, ToolCategory};
 use astra_runtime::storage::MountType;
 use astra_runtime::storage::StorageAccess;
@@ -29,6 +28,63 @@ impl ServerToolRuntime for DummyRuntime {
             message: "dummy runtime".into(),
             retryable: false,
         }
+    }
+}
+
+struct StaticProvider {
+    kind: ProviderKind,
+    priority: u8,
+    isolation: IsolationIntent,
+    storage_accessible: bool,
+    capabilities: Vec<ToolCapability>,
+}
+
+impl StaticProvider {
+    fn sandbox(priority: u8, isolation: IsolationIntent) -> Self {
+        Self {
+            kind: ProviderKind::SandboxRuntime,
+            priority,
+            isolation,
+            storage_accessible: true,
+            capabilities: vec![
+                ToolCapability::Category(ToolCategory::Shell),
+                ToolCapability::Category(ToolCategory::FileSystem),
+            ],
+        }
+    }
+}
+
+#[async_trait]
+impl CapabilityProvider for StaticProvider {
+    fn kind(&self) -> ProviderKind {
+        self.kind
+    }
+
+    async fn capabilities(&self) -> Vec<ToolCapability> {
+        self.capabilities.clone()
+    }
+
+    async fn health_check(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
+    async fn execute(&self, _request: ToolRequest) -> ToolResult {
+        ToolResult::Error {
+            message: "static provider".into(),
+            retryable: false,
+        }
+    }
+
+    fn priority(&self) -> u8 {
+        self.priority
+    }
+
+    fn isolation_level(&self) -> IsolationIntent {
+        self.isolation
+    }
+
+    async fn storage_accessible(&self) -> bool {
+        self.storage_accessible
     }
 }
 
@@ -235,13 +291,13 @@ async fn isolation_filters_out_insufficient_providers() {
 
     // Both have FileSystem capability (server via Symbol).
     // ServerBuiltin: isolation=None → cannot satisfy Process.
-    // Let's use Shell category that both EdgeConnection and SandboxRunner handle.
+    // Let's use Shell category that both EdgeConnection and sandbox-capable provider handle.
     reg.register("edge", Arc::new(EdgeConnectionProvider::new(5)))
         .await
         .unwrap();
     reg.register(
         "sandbox",
-        Arc::new(SandboxRunnerProvider::new(20, IsolationIntent::Container)),
+        Arc::new(StaticProvider::sandbox(20, IsolationIntent::Container)),
     )
     .await
     .unwrap();
@@ -259,12 +315,12 @@ async fn isolation_filters_out_insufficient_providers() {
     let iso = resolved.isolation_level();
 
     // Both Process and Container satisfy Process.  Priority breaks ties:
-    // EdgeConnection (5) < SandboxRunner (20).  Edge wins.
+    // EdgeConnection (5) < sandbox-capable provider (20).  Edge wins.
     assert_eq!(resolved.priority(), 5);
     assert!(iso.satisfies(IsolationIntent::Process));
 }
 
-/// Requesting Container isolation — only SandboxRunnerProvider satisfies.
+/// Requesting Container isolation — only sandbox-capable provider satisfies.
 #[tokio::test]
 async fn isolation_container_only_sandbox_qualifies() {
     let reg = CapabilityRegistry::new();
@@ -274,7 +330,7 @@ async fn isolation_container_only_sandbox_qualifies() {
         .unwrap();
     reg.register(
         "sandbox",
-        Arc::new(SandboxRunnerProvider::new(10, IsolationIntent::Container)),
+        Arc::new(StaticProvider::sandbox(10, IsolationIntent::Container)),
     )
     .await
     .unwrap();
@@ -289,18 +345,18 @@ async fn isolation_container_only_sandbox_qualifies() {
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
-    assert_eq!(resolved.kind(), ProviderKind::SandboxRunner);
+    assert_eq!(resolved.kind(), ProviderKind::SandboxRuntime);
     assert_eq!(resolved.isolation_level(), IsolationIntent::Container);
 }
 
-/// Requesting Sandbox isolation — only SandboxRunnerProvider qualifies.
+/// Requesting Sandbox isolation — only sandbox-capable provider qualifies.
 #[tokio::test]
 async fn isolation_sandbox_only_highest_qualifies() {
     let reg = CapabilityRegistry::new();
 
     reg.register(
         "sandbox",
-        Arc::new(SandboxRunnerProvider::new(10, IsolationIntent::Sandbox)),
+        Arc::new(StaticProvider::sandbox(10, IsolationIntent::Sandbox)),
     )
     .await
     .unwrap();
@@ -450,7 +506,7 @@ async fn combined_storage_isolation_priority() {
         .unwrap();
     reg.register(
         "sandbox",
-        Arc::new(SandboxRunnerProvider::new(10, IsolationIntent::Container)),
+        Arc::new(StaticProvider::sandbox(10, IsolationIntent::Container)),
     )
     .await
     .unwrap();
@@ -458,7 +514,7 @@ async fn combined_storage_isolation_priority() {
     // Request FileSystem with storage + Process isolation.
     // EdgeConnection(5): FileSystem✓, storage✓, isolation=Process✓
     // EdgeConnection(1): FileSystem✓, storage✓, isolation=Process✓
-    // SandboxRunner(10): FileSystem✓, storage✓, isolation=Container✓
+    // sandbox-capable provider(10): FileSystem✓, storage✓, isolation=Container✓
     // → All qualify.  Priority: edge-1 (1) wins.
     let request = ToolRequest {
         capability: ToolCapability::Category(ToolCategory::FileSystem),
@@ -513,8 +569,6 @@ async fn combined_capability_match_but_isolation_excluded() {
 // L1.5.5 — All providers unhealthy (health check, not resolve)
 // ---------------------------------------------------------------------------
 
-use astra_runtime::provider::traits::CapabilityProvider;
-
 /// A provider that advertises FileSystem capability but always fails health
 /// checks. Used to simulate a degraded cluster where all nodes are unhealthy.
 struct UnhealthyProvider {
@@ -524,7 +578,7 @@ struct UnhealthyProvider {
 #[async_trait]
 impl CapabilityProvider for UnhealthyProvider {
     fn kind(&self) -> ProviderKind {
-        ProviderKind::SandboxRunner
+        ProviderKind::SandboxRuntime
     }
     fn isolation_level(&self) -> IsolationIntent {
         self.isolation

@@ -65,7 +65,7 @@ use crate::server::run::cloud_workspace_provisioning::CloudWorkspaceProvisioner;
 use crate::server::run::workspace_provisioning::{
     ServerWorkspaceProvisionError, ServerWorkspaceProvisioner,
 };
-use crate::server::runner_pool::ServerRunnerScheduler;
+
 use crate::turn::agentic_loop::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CancellationState,
     ContextTracePersistenceContext, EvaluationPersistenceContext, MessagingState,
@@ -93,9 +93,6 @@ use astra_core::{
 };
 use astra_runtime_env::{
     CleanupReason as RuntimeCleanupReason, PolicyIntent as RuntimePolicyIntent,
-    RunnerScheduleDecision as RuntimeRunnerScheduleDecision,
-    RunnerScheduleRequest as RuntimeRunnerScheduleRequest,
-    RunnerScheduleTarget as RuntimeRunnerScheduleTarget,
     WorkspaceOwnerScope as RuntimeWorkspaceOwnerScope,
     WorkspacePersistence as RuntimeWorkspacePersistence,
     WorkspaceProvisionError as RuntimeWorkspaceProvisionError,
@@ -113,8 +110,8 @@ use crate::server::runtime_mcp;
 use crate::server::server_loop_host::{self, ServerAgenticLoopHostBuilder};
 use crate::server::tool_transport::{
     ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy,
-    RunnerRpcTransport, ToolExecutionService, ToolTransportKind, WorkspaceAuthority,
-    WorkspaceBinding, WorkspaceBindingKind, binding_event_fields,
+    ToolExecutionService, ToolTransportKind, WorkspaceAuthority, WorkspaceBinding,
+    WorkspaceBindingKind, binding_event_fields,
 };
 use crate::server::{server_skill_subrun, server_tool_executor};
 
@@ -603,7 +600,6 @@ fn build_server_skill_executor(
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
     session_id: &str,
     edge_connection_pool: Option<&astra_server_types::edge_connection_pool::EdgeConnectionPool>,
-    runner_rpc_transport: Option<Arc<dyn RunnerRpcTransport>>,
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     memory_extraction_service: Option<&Arc<crate::session_memory::MemoryExtractionService>>,
     #[cfg(feature = "harness")] harness_sink: Option<
@@ -635,9 +631,6 @@ fn build_server_skill_executor(
     }
     if let Some(pool) = edge_connection_pool {
         subrun_executor = subrun_executor.with_edge_connection_pool(pool.clone());
-    }
-    if let Some(transport) = runner_rpc_transport {
-        subrun_executor = subrun_executor.with_runner_rpc_transport(transport);
     }
     #[cfg(feature = "harness")]
     if let Some(sink) = harness_sink {
@@ -1416,10 +1409,6 @@ pub struct AgenticRunLifecycleService {
         Option<std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>>,
     /// Live edge WebSocket connection pool (Phase 6).
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
-    /// Runner RPC transport for hosted/personal runtime executors.
-    runner_rpc_transport: Option<Arc<dyn RunnerRpcTransport>>,
-    /// Runner scheduler used to bind hosted/cloud workspaces to an online runner.
-    runner_scheduler: Option<Arc<dyn ServerRunnerScheduler>>,
     /// Durable workspace record store for cloud workspace ownership/audit.
     workspace_record_store: Option<Arc<dyn WorkspaceStateStore>>,
     /// Optional database skill provider for runtime skill resolution.
@@ -1488,8 +1477,6 @@ impl AgenticRunLifecycleService {
             )),
             resource_governor: None,
             edge_connection_pool: None,
-            runner_rpc_transport: None,
-            runner_scheduler: None,
             workspace_record_store: None,
             skill_service: None,
             mcp_registry_service: Arc::new(astra_services::UnconfiguredMcpRegistryService),
@@ -1561,19 +1548,6 @@ impl AgenticRunLifecycleService {
         svc: Arc<dyn astra_services::multi_agent::EdgeRegistryService>,
     ) -> Self {
         self.edge_registry_service = Some(svc);
-        self
-    }
-
-    pub fn with_runner_rpc_transport(mut self, transport: Arc<dyn RunnerRpcTransport>) -> Self {
-        self.runner_rpc_transport = Some(transport);
-        self
-    }
-
-    pub(crate) fn with_runner_scheduler(
-        mut self,
-        scheduler: Arc<dyn ServerRunnerScheduler>,
-    ) -> Self {
-        self.runner_scheduler = Some(scheduler);
         self
     }
 
@@ -1770,7 +1744,6 @@ impl AgenticRunLifecycleService {
             )
             .with_pool(self.shared_pool.clone())
             .with_edge_connection_pool(self.edge_connection_pool.clone())
-            .with_runner_rpc_transport(self.runner_rpc_transport.clone())
             .with_skill_service(self.skill_service.clone())
             .with_memory_extraction_service(self.memory_extraction_service.clone()),
         );
@@ -2715,7 +2688,6 @@ impl AgenticRunLifecycleService {
             skill_resolver.clone(),
             session_id,
             self.edge_connection_pool.as_ref(),
-            self.runner_rpc_transport.clone(),
             cancel_token,
             self.memory_extraction_service.as_ref(),
             #[cfg(feature = "harness")]
@@ -2947,7 +2919,7 @@ impl AgenticRunLifecycleService {
         profile
     }
 
-    /// Provision a hosted/cloud workspace record for runner-backed workspaces.
+    /// Provision a cloud workspace record for orchestrator-managed workspaces.
     async fn provision_cloud_workspace_record(
         &self,
         user_id: &str,
@@ -2974,7 +2946,7 @@ impl AgenticRunLifecycleService {
                 run_id,
                 &record,
                 format!(
-                    "workspace record persistence failed before runner scheduling: {}",
+                    "workspace record persistence failed before orchestrator binding: {}",
                     error.1.0.detail
                 ),
             )
@@ -3132,41 +3104,6 @@ impl AgenticRunLifecycleService {
                 "failed to persist workspace cleanup debt"
             );
         }
-    }
-
-    async fn schedule_cloud_workspace_runner(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        run_id: &str,
-        record: &RuntimeWorkspaceRecord,
-    ) -> Result<Option<ExecutionBindingSnapshot>, (StatusCode, Json<ErrorResponse>)> {
-        let Some(scheduler) = self.runner_scheduler.as_ref() else {
-            return Ok(None);
-        };
-        let request = runner_schedule_request_for_workspace_record(session_id, run_id, record);
-        let decision = scheduler
-            .schedule_for_user(user_id, request)
-            .await
-            .map_err(|error| {
-                error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Failed to schedule cloud workspace runner: {error}"),
-                )
-            })?;
-        if let Some(target) = decision.selected.as_ref() {
-            return Ok(Some(execution_bindings_from_schedule_target(
-                record, target,
-            )));
-        }
-        tracing::warn!(
-            target: "astra_runtime::run_lifecycle",
-            run_id = %run_id,
-            workspace_id = %record.workspace_id,
-            denials = %runner_schedule_denial_summary(&decision),
-            "cloud workspace has no schedulable runner"
-        );
-        Ok(None)
     }
 
     /// Provision a sandboxed workspace directory for server-side tool execution.
@@ -3706,112 +3643,19 @@ fn runtime_workspace_authority_from_request(
 }
 
 fn execution_bindings_from_workspace_record(
-    request: &ChatRequestData,
     record: &RuntimeWorkspaceRecord,
 ) -> ExecutionBindingSnapshot {
     let workspace = server_workspace_binding_from_workspace_record(record);
-    let executor = executor_binding_from_request(request.executor_binding.as_ref(), &workspace);
-    ExecutionBindingSnapshot::inferred(workspace, executor)
-}
-
-fn execution_bindings_from_schedule_target(
-    record: &RuntimeWorkspaceRecord,
-    target: &RuntimeRunnerScheduleTarget,
-) -> ExecutionBindingSnapshot {
-    ExecutionBindingSnapshot::new(
-        server_workspace_binding_from_workspace_record(record),
-        server_executor_binding_from_schedule_target(target),
-        target.binding.runtime.clone(),
-    )
-}
-
-fn runner_schedule_request_for_workspace_record(
-    session_id: &str,
-    run_id: &str,
-    record: &RuntimeWorkspaceRecord,
-) -> RuntimeRunnerScheduleRequest {
-    RuntimeRunnerScheduleRequest::new(
-        session_id,
-        run_id,
-        record.binding(),
-        runner_policy_for_workspace_record(record),
-    )
-    .with_workspace_record(record.clone())
-}
-
-fn runner_policy_for_workspace_record(record: &RuntimeWorkspaceRecord) -> RuntimePolicyIntent {
-    if record.authority == astra_runtime_env::WorkspaceAuthority::ReadOnly
-        || record.persistence == RuntimeWorkspacePersistence::ImmutableSnapshot
-    {
-        RuntimePolicyIntent::read_only_review()
-    } else {
-        RuntimePolicyIntent::strict_runner()
-    }
-}
-
-fn server_executor_binding_from_schedule_target(
-    target: &RuntimeRunnerScheduleTarget,
-) -> ExecutorBinding {
-    ExecutorBinding {
-        kind: server_executor_kind_from_runtime(target.binding.executor.kind),
-        executor_id: target.runner_id.clone(),
-        display_name: target.binding.executor.display_name.clone(),
-        transport: server_tool_transport_from_runtime(target.binding.executor.transport),
-        status: target.binding.executor.status,
-    }
-}
-
-fn server_executor_kind_from_runtime(
-    kind: astra_runtime_env::ExecutorBindingKind,
-) -> ExecutorBindingKind {
-    match kind {
-        astra_runtime_env::ExecutorBindingKind::EdgeAgent => ExecutorBindingKind::EdgeAgent,
-        astra_runtime_env::ExecutorBindingKind::RequestScopedMcp => ExecutorBindingKind::Mcp,
-        astra_runtime_env::ExecutorBindingKind::PersonalRunner => {
-            ExecutorBindingKind::PersonalRunner
-        }
-        astra_runtime_env::ExecutorBindingKind::HostedRunner => ExecutorBindingKind::HostedRunner,
-        astra_runtime_env::ExecutorBindingKind::EnterpriseRunner => {
-            ExecutorBindingKind::EnterpriseRunner
-        }
-        astra_runtime_env::ExecutorBindingKind::ControlPlane
-        | astra_runtime_env::ExecutorBindingKind::ServerRuntime => ExecutorBindingKind::ServerLocal,
-        astra_runtime_env::ExecutorBindingKind::LocalCli
-        | astra_runtime_env::ExecutorBindingKind::None
-        | astra_runtime_env::ExecutorBindingKind::Unknown
-        | _ => ExecutorBindingKind::Unknown,
-    }
-}
-
-fn server_tool_transport_from_runtime(
-    transport: astra_runtime_env::ToolTransportKind,
-) -> ToolTransportKind {
-    match transport {
-        astra_runtime_env::ToolTransportKind::InProcess => ToolTransportKind::ServerLocal,
-        astra_runtime_env::ToolTransportKind::EdgeWebSocket => ToolTransportKind::EdgeWs,
-        astra_runtime_env::ToolTransportKind::EdgeLedger => ToolTransportKind::EdgeLedger,
-        astra_runtime_env::ToolTransportKind::RunnerRpc => ToolTransportKind::RunnerRpc,
-        astra_runtime_env::ToolTransportKind::McpHttp => ToolTransportKind::McpHttp,
-        astra_runtime_env::ToolTransportKind::GatewayRelay => ToolTransportKind::GatewayRelay,
-        astra_runtime_env::ToolTransportKind::SandboxResidentAgent => {
-            ToolTransportKind::SandboxResidentAgent
-        }
-        astra_runtime_env::ToolTransportKind::None
-        | astra_runtime_env::ToolTransportKind::Unknown => ToolTransportKind::Unknown,
-    }
-}
-
-fn runner_schedule_denial_summary(decision: &RuntimeRunnerScheduleDecision) -> String {
-    if decision.denials.is_empty() {
-        return "no candidates".to_string();
-    }
-    decision
-        .denials
-        .iter()
-        .take(5)
-        .map(|denial| format!("{}:{:?}", denial.runner_id, denial.reason))
-        .collect::<Vec<_>>()
-        .join(", ")
+    let executor = ExecutorBinding::orchestrator_managed(
+        format!("orchestrator:{}", record.workspace_id),
+        "Orchestrator-managed executor",
+        ExecutorStatus::Online,
+    );
+    let runtime = astra_runtime_env::RuntimeBinding::kubernetes(format!(
+        "kubernetes:{}",
+        record.workspace_id
+    ));
+    ExecutionBindingSnapshot::new(workspace, executor, runtime)
 }
 
 fn server_workspace_binding_from_workspace_record(
@@ -3947,37 +3791,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 return Err(error);
             }
         };
-        let scheduled_cloud_execution_bindings =
-            if let Some(record) = cloud_workspace_record.as_ref() {
-                match self
-                    .schedule_cloud_workspace_runner(&user_id, &session_id, &run_id, record)
-                    .await
-                {
-                    Ok(bindings) => bindings,
-                    Err(error) => {
-                        self.runs.write().await.remove(&run_id);
-                        self.cleanup_cloud_workspace_after_failed_start(
-                            &user_id,
-                            &session_id,
-                            &run_id,
-                            record,
-                            format!(
-                                "runner scheduling failed before agentic loop start: {}",
-                                error.1.0.detail
-                            ),
-                        )
-                        .await;
-                        return Err(error);
-                    }
-                }
-            } else {
-                None
-            };
-        let cloud_execution_bindings = scheduled_cloud_execution_bindings.or_else(|| {
-            cloud_workspace_record
-                .as_ref()
-                .map(|record| execution_bindings_from_workspace_record(&request, record))
-        });
+        let cloud_execution_bindings = cloud_workspace_record
+            .as_ref()
+            .map(|record| execution_bindings_from_workspace_record(record));
         let cloud_workspace = cloud_workspace_record
             .as_ref()
             .map(|record| PathBuf::from(&record.root_or_volume_ref));
@@ -4209,9 +4025,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
                 if let Some(svc) = &self.edge_registry_service {
                     builder = builder.edge_registry_service(Arc::clone(svc));
-                }
-                if let Some(transport) = &self.runner_rpc_transport {
-                    builder = builder.runner_rpc_transport(Arc::clone(transport));
                 }
                 executor = executor.with_tool_execution_service(builder.build());
             }
@@ -4667,36 +4480,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let cloud_workspace_record = self
             .provision_cloud_workspace_record(&user_id, &session_id, &request, &run_id)
             .await?;
-        let scheduled_cloud_execution_bindings =
-            if let Some(record) = cloud_workspace_record.as_ref() {
-                match self
-                    .schedule_cloud_workspace_runner(&user_id, &session_id, &run_id, record)
-                    .await
-                {
-                    Ok(bindings) => bindings,
-                    Err(error) => {
-                        self.cleanup_cloud_workspace_after_failed_start(
-                            &user_id,
-                            &session_id,
-                            &run_id,
-                            record,
-                            format!(
-                                "runner scheduling failed before streaming agentic loop start: {}",
-                                error.1.0.detail
-                            ),
-                        )
-                        .await;
-                        return Err(error);
-                    }
-                }
-            } else {
-                None
-            };
-        let cloud_execution_bindings = scheduled_cloud_execution_bindings.or_else(|| {
-            cloud_workspace_record
-                .as_ref()
-                .map(|record| execution_bindings_from_workspace_record(&request, record))
-        });
+        // Orchestrator-managed architecture: executor bindings come directly
+        // from the workspace record — no server-owned executor scheduling.
+        let cloud_execution_bindings = cloud_workspace_record
+            .as_ref()
+            .map(|record| execution_bindings_from_workspace_record(record));
         let cloud_workspace = cloud_workspace_record
             .as_ref()
             .map(|record| PathBuf::from(&record.root_or_volume_ref));
@@ -5019,9 +4807,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
                 if let Some(svc) = &self.edge_registry_service {
                     builder = builder.edge_registry_service(Arc::clone(svc));
-                }
-                if let Some(transport) = &self.runner_rpc_transport {
-                    builder = builder.runner_rpc_transport(Arc::clone(transport));
                 }
                 executor = executor.with_tool_execution_service(builder.build());
             }
@@ -5969,7 +5754,6 @@ pub struct ServerSpawnAgentExecutor {
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
-    runner_rpc_transport: Option<Arc<dyn RunnerRpcTransport>>,
     skill_service: Option<Arc<dyn SkillService>>,
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
     runtime_contexts: Arc<RwLock<HashMap<String, ServerSpawnRuntimeContext>>>,
@@ -5989,7 +5773,6 @@ impl ServerSpawnAgentExecutor {
             edge_connection_pool: None,
             edge_dispatch_service: None,
             edge_registry_service: None,
-            runner_rpc_transport: None,
             skill_service: None,
             memory_extraction_service: None,
             runtime_contexts: Arc::new(RwLock::new(HashMap::new())),
@@ -6022,14 +5805,6 @@ impl ServerSpawnAgentExecutor {
         svc: Arc<dyn astra_services::multi_agent::EdgeRegistryService>,
     ) -> Self {
         self.edge_registry_service = Some(svc);
-        self
-    }
-
-    pub fn with_runner_rpc_transport(
-        mut self,
-        transport: Option<Arc<dyn RunnerRpcTransport>>,
-    ) -> Self {
-        self.runner_rpc_transport = transport;
         self
     }
 
@@ -6094,9 +5869,6 @@ impl ServerSpawnAgentExecutor {
         }
         if let Some(svc) = self.edge_registry_service.clone() {
             executor = executor.with_edge_registry_service(svc);
-        }
-        if let Some(transport) = self.runner_rpc_transport.clone() {
-            executor = executor.with_runner_rpc_transport(transport);
         }
         if let Some(service) = self.skill_service.clone() {
             executor = executor.with_skill_service(service);
@@ -6362,7 +6134,6 @@ pub struct ServerSubRunExecutor {
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
-    runner_rpc_transport: Option<Arc<dyn RunnerRpcTransport>>,
     skill_service: Option<Arc<dyn SkillService>>,
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
     /// Shared ToolExecutionService so executors share the same disabled_tools set.
@@ -6385,7 +6156,6 @@ impl ServerSubRunExecutor {
             edge_connection_pool: None,
             edge_dispatch_service: None,
             edge_registry_service: None,
-            runner_rpc_transport: None,
             skill_service: None,
             memory_extraction_service: None,
             tool_execution_service: None,
@@ -6428,11 +6198,6 @@ impl ServerSubRunExecutor {
         svc: Arc<dyn astra_services::multi_agent::EdgeRegistryService>,
     ) -> Self {
         self.edge_registry_service = Some(svc);
-        self
-    }
-
-    pub fn with_runner_rpc_transport(mut self, transport: Arc<dyn RunnerRpcTransport>) -> Self {
-        self.runner_rpc_transport = Some(transport);
         self
     }
 
@@ -6833,9 +6598,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 }
                 if let Some(svc) = &self.edge_registry_service {
                     builder = builder.edge_registry_service(Arc::clone(svc));
-                }
-                if let Some(transport) = &self.runner_rpc_transport {
-                    builder = builder.runner_rpc_transport(Arc::clone(transport));
                 }
                 executor = executor.with_tool_execution_service(builder.build());
             }
@@ -8727,15 +8489,21 @@ mod tests {
             revision: "1".to_string(),
             display_name: "Repo checkout".to_string(),
         };
-        let snapshot = execution_bindings_from_workspace_record(&request, &record);
+        let snapshot = execution_bindings_from_workspace_record(&record);
         let workspace = &snapshot.workspace;
         let executor = &snapshot.executor;
 
         assert_eq!(workspace.kind, WorkspaceBindingKind::CloudWorkspace);
         assert_eq!(workspace.cwd.as_deref(), Some("/cloud/checkouts/run-123"));
-        assert_eq!(executor.kind, ExecutorBindingKind::HostedRunner);
-        assert_eq!(executor.transport, ToolTransportKind::RunnerRpc);
-        assert!(snapshot.runtime.is_none());
+        assert_eq!(executor.kind, ExecutorBindingKind::OrchestratorManaged);
+        assert_eq!(executor.transport, ToolTransportKind::SandboxResidentAgent);
+        assert_eq!(
+            snapshot
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.launch_driver),
+            Some(astra_runtime_env::RuntimeLaunchDriver::Kubernetes)
+        );
     }
 
     #[test]
@@ -8791,7 +8559,7 @@ mod tests {
             revision: "1".to_string(),
             display_name: "Team workspace".to_string(),
         };
-        let snapshot = execution_bindings_from_workspace_record(&request, &record);
+        let snapshot = execution_bindings_from_workspace_record(&record);
         let workspace = &snapshot.workspace;
         let executor = &snapshot.executor;
 
@@ -8800,9 +8568,15 @@ mod tests {
             workspace.cwd.as_deref(),
             Some("/cloud/volumes/team-volume-1")
         );
-        assert_eq!(executor.kind, ExecutorBindingKind::HostedRunner);
-        assert_eq!(executor.transport, ToolTransportKind::RunnerRpc);
-        assert!(snapshot.runtime.is_none());
+        assert_eq!(executor.kind, ExecutorBindingKind::OrchestratorManaged);
+        assert_eq!(executor.transport, ToolTransportKind::SandboxResidentAgent);
+        assert_eq!(
+            snapshot
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.session_manager),
+            Some(astra_runtime_env::RuntimeSessionManager::ProviderManaged)
+        );
     }
 
     #[test]
@@ -8833,104 +8607,6 @@ mod tests {
             provision_request.persistence,
             RuntimeWorkspacePersistence::Session
         );
-    }
-
-    #[test]
-    fn scheduled_cloud_workspace_uses_selected_runner_executor() {
-        let record = RuntimeWorkspaceRecord {
-            workspace_id: "workspace-1".to_string(),
-            owner_scope: RuntimeWorkspaceOwnerScope::Tenant,
-            kind: astra_runtime_env::WorkspaceBindingKind::CloudWorkspace,
-            authority: astra_runtime_env::WorkspaceAuthority::ReadWrite,
-            root_or_volume_ref: "/cloud/checkouts/workspace-1".to_string(),
-            source: RuntimeWorkspaceSource::GitCheckout {
-                repository: "https://example.com/org/repo.git".to_string(),
-                reference: None,
-            },
-            persistence: RuntimeWorkspacePersistence::Session,
-            revision: "1".to_string(),
-            display_name: "Repo checkout".to_string(),
-        };
-        let registry = astra_runtime_env::ToolRegistry::builtins();
-        let binding = astra_runtime_env::RunBinding::resolve(
-            record.binding(),
-            astra_runtime_env::ExecutorBinding::hosted_runner("runner-1"),
-            astra_runtime_env::RuntimeBinding::gvisor("runtime-1"),
-            RuntimePolicyIntent::strict_runner(),
-            &registry,
-        );
-        let target = RuntimeRunnerScheduleTarget {
-            runner_id: "runner-1".to_string(),
-            binding: binding.clone(),
-            session_spec: astra_runtime_env::RuntimeSessionSpec::new("session-1", "run-1", binding)
-                .with_workspace_record(record.clone()),
-        };
-
-        let snapshot = execution_bindings_from_schedule_target(&record, &target);
-        let workspace = &snapshot.workspace;
-        let executor = &snapshot.executor;
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::CloudWorkspace);
-        assert_eq!(
-            workspace.cwd.as_deref(),
-            Some("/cloud/checkouts/workspace-1")
-        );
-        assert_eq!(executor.kind, ExecutorBindingKind::HostedRunner);
-        assert_eq!(executor.executor_id, "runner-1");
-        assert_eq!(executor.transport, ToolTransportKind::RunnerRpc);
-        assert_eq!(executor.status, ExecutorStatus::Online);
-        assert_eq!(
-            snapshot
-                .runtime
-                .as_ref()
-                .map(|runtime| runtime.isolation_backend),
-            Some(astra_runtime_env::RuntimeIsolationBackend::GVisorRunsc)
-        );
-    }
-
-    #[test]
-    fn scheduled_cloud_workspace_preserves_enterprise_runner_kind() {
-        let record = RuntimeWorkspaceRecord {
-            workspace_id: "workspace-1".to_string(),
-            owner_scope: RuntimeWorkspaceOwnerScope::Tenant,
-            kind: astra_runtime_env::WorkspaceBindingKind::CloudWorkspace,
-            authority: astra_runtime_env::WorkspaceAuthority::ReadWrite,
-            root_or_volume_ref: "/cloud/checkouts/workspace-1".to_string(),
-            source: RuntimeWorkspaceSource::Scratch,
-            persistence: RuntimeWorkspacePersistence::Session,
-            revision: "1".to_string(),
-            display_name: "Team workspace".to_string(),
-        };
-        let registry = astra_runtime_env::ToolRegistry::builtins();
-        let binding = astra_runtime_env::RunBinding::resolve(
-            record.binding(),
-            astra_runtime_env::ExecutorBinding {
-                kind: astra_runtime_env::ExecutorBindingKind::EnterpriseRunner,
-                executor_id: "enterprise-runner-1".to_string(),
-                display_name: "Enterprise runner".to_string(),
-                transport: astra_runtime_env::ToolTransportKind::RunnerRpc,
-                status: astra_runtime_env::ExecutorStatus::Online,
-            },
-            astra_runtime_env::RuntimeBinding::gvisor("runtime-1"),
-            RuntimePolicyIntent::strict_runner(),
-            &registry,
-        );
-        let target = RuntimeRunnerScheduleTarget {
-            runner_id: "enterprise-runner-1".to_string(),
-            binding: binding.clone(),
-            session_spec: astra_runtime_env::RuntimeSessionSpec::new("session-1", "run-1", binding)
-                .with_workspace_record(record.clone()),
-        };
-
-        let snapshot = execution_bindings_from_schedule_target(&record, &target);
-
-        assert_eq!(
-            snapshot.executor.kind,
-            ExecutorBindingKind::EnterpriseRunner
-        );
-        assert_eq!(snapshot.executor.executor_id, "enterprise-runner-1");
-        assert_eq!(snapshot.executor.transport, ToolTransportKind::RunnerRpc);
-        assert_eq!(snapshot.executor.status, ExecutorStatus::Online);
     }
 
     #[test]

@@ -129,7 +129,8 @@ fn recover_poisoned_lock<'a, T>(
     match result {
         Ok(guard) => guard,
         Err(poison) => {
-            let count = POISONED_LOCK_RECOVERY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let count =
+                POISONED_LOCK_RECOVERY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             tracing::error!(
                 lock = lock_name,
                 recovery_count = count,

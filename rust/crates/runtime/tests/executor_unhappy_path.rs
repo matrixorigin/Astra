@@ -1,8 +1,8 @@
 //! Unhappy-path integration tests for the server executor layer.
 //!
-//! Covers: runner lease expiry during execution, workspace partial-creation
-//! cleanup chain, cancellation race with tool completion, runner RPC
-//! timeout during simulated network partition, provider degradation between
+//! Covers: provider lease expiry during execution, workspace partial-creation
+//! cleanup chain, cancellation race with tool completion, transport timeout
+//! during simulated network partition, provider degradation between
 //! resolve and execute, and all-providers-unhealthy baseline.
 
 use std::sync::Arc;
@@ -141,7 +141,7 @@ async fn all_unhealthy_providers_resolve_works_but_health_fails() {
 
     let p1 = Arc::new(ControllableProvider::new(
         IsolationIntent::Process,
-        ProviderKind::SandboxRunner,
+        ProviderKind::SandboxRuntime,
         5,
         vec![ToolCapability::Category(ToolCategory::Shell)],
         false,
@@ -156,8 +156,8 @@ async fn all_unhealthy_providers_resolve_works_but_health_fails() {
     p1.set_healthy(false);
     p2.set_healthy(false);
 
-    reg.register("runner-1", p1).await.unwrap();
-    reg.register("runner-2", p2).await.unwrap();
+    reg.register("provider-1", p1).await.unwrap();
+    reg.register("provider-2", p2).await.unwrap();
 
     let results = reg.health_check_all().await;
     assert_eq!(results.len(), 2);
@@ -290,12 +290,12 @@ async fn provider_degrades_between_resolve_and_execute() {
 
     let p = Arc::new(ControllableProvider::new(
         IsolationIntent::Process,
-        ProviderKind::SandboxRunner,
+        ProviderKind::SandboxRuntime,
         1,
         vec![ToolCapability::Category(ToolCategory::Shell)],
         false,
     ));
-    reg.register("runner", p.clone()).await.unwrap();
+    reg.register("provider", p.clone()).await.unwrap();
 
     let request = ToolRequest {
         capability: ToolCapability::Category(ToolCategory::Shell),
@@ -320,16 +320,16 @@ async fn provider_degrades_between_resolve_and_execute() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 4: Runner lease expiry during execution
+// Test 4: Provider lease expiry during execution
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn lease_expired_runner_still_resolves_but_is_unhealthy() {
+async fn lease_expired_provider_still_resolves_but_is_unhealthy() {
     let reg = CapabilityRegistry::new();
 
-    let runner = Arc::new(ControllableProvider::new(
+    let provider = Arc::new(ControllableProvider::new(
         IsolationIntent::Container,
-        ProviderKind::SandboxRunner,
+        ProviderKind::SandboxRuntime,
         1,
         vec![
             ToolCapability::Category(ToolCategory::Shell),
@@ -337,12 +337,12 @@ async fn lease_expired_runner_still_resolves_but_is_unhealthy() {
         ],
         true,
     ));
-    reg.register("runner-expired", runner.clone())
+    reg.register("provider-expired", provider.clone())
         .await
         .unwrap();
-    assert!(runner.health_check().await.is_ok());
+    assert!(provider.health_check().await.is_ok());
 
-    runner.set_healthy(false);
+    provider.set_healthy(false);
 
     let request = ToolRequest {
         capability: ToolCapability::Category(ToolCategory::Shell),
@@ -361,19 +361,19 @@ async fn lease_expired_runner_still_resolves_but_is_unhealthy() {
 }
 
 #[tokio::test]
-async fn all_runners_lease_expired_resolve_works_health_all_fails() {
+async fn all_providers_lease_expired_resolve_works_health_all_fails() {
     let reg = CapabilityRegistry::new();
 
     for i in 0..3u8 {
         let r = Arc::new(ControllableProvider::new(
             IsolationIntent::Process,
-            ProviderKind::SandboxRunner,
+            ProviderKind::SandboxRuntime,
             i,
             vec![ToolCapability::Category(ToolCategory::Shell)],
             false,
         ));
         r.set_healthy(false);
-        reg.register(format!("runner-{i}"), r).await.unwrap();
+        reg.register(format!("provider-{i}"), r).await.unwrap();
     }
 
     let request = ToolRequest {
@@ -393,11 +393,11 @@ async fn all_runners_lease_expired_resolve_works_health_all_fails() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 5: Runner RPC timeout during network partition
+// Test 5: Transport timeout during network partition
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn hung_rpc_times_out_at_caller_level() {
+async fn hung_transport_times_out_at_caller_level() {
     let reg = CapabilityRegistry::new();
 
     let hung = Arc::new(ControllableProvider::new(
@@ -408,7 +408,7 @@ async fn hung_rpc_times_out_at_caller_level() {
         false,
     ));
     hung.set_hang(true);
-    reg.register("hung-runner", hung.clone()).await.unwrap();
+    reg.register("hung-provider", hung.clone()).await.unwrap();
 
     let request = ToolRequest {
         capability: ToolCapability::Category(ToolCategory::Shell),
@@ -423,24 +423,24 @@ async fn hung_rpc_times_out_at_caller_level() {
     let exec_result = timeout(Duration::from_millis(200), resolved.execute(request)).await;
     assert!(
         exec_result.is_err(),
-        "hung RPC should time out at caller level"
+        "hung transport call should time out at caller level"
     );
 }
 
 #[tokio::test]
-async fn network_partition_all_runners_hung() {
+async fn network_partition_all_providers_hung() {
     let reg = CapabilityRegistry::new();
 
     for i in 0..3u8 {
         let r = Arc::new(ControllableProvider::new(
             IsolationIntent::Process,
-            ProviderKind::SandboxRunner,
+            ProviderKind::SandboxRuntime,
             i,
             vec![ToolCapability::Category(ToolCategory::Shell)],
             false,
         ));
         r.set_hang(true);
-        reg.register(format!("runner-{i}"), r).await.unwrap();
+        reg.register(format!("provider-{i}"), r).await.unwrap();
     }
 
     let request = ToolRequest {
@@ -456,7 +456,7 @@ async fn network_partition_all_runners_hung() {
     let exec_result = timeout(Duration::from_millis(200), resolved.execute(request)).await;
     assert!(
         exec_result.is_err(),
-        "all runners hung -> timeout at caller level"
+        "all providers hung -> timeout at caller level"
     );
 
     let health_results = reg.health_check_all().await;

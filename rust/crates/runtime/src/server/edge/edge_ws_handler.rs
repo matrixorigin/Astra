@@ -425,7 +425,7 @@ fn validate_edge_capabilities(
         return None;
     }
 
-    // Ensure the executor is actually an edge agent (not a cloud runner
+    // Ensure the executor is actually an edge agent (not a cloud executor
     // or local CLI masquerading as edge).
     if !advert.binding.executor.is_edge_agent() {
         tracing::warn!(

@@ -87,11 +87,18 @@ pub fn validate_read_file_args(args: &Value) -> Result<(), String> {
         object.get("end_line").and_then(Value::as_u64),
     ) && start > end
     {
-        return Err(format!(
-            "Error: field `start_line` for read_file must be <= `end_line` (got {start} > {end})."
-        ));
+        return Err(reversed_read_file_range_error(start, end));
     }
     Ok(())
+}
+
+fn reversed_read_file_range_error(start: u64, end: u64) -> String {
+    format!(
+        "Error: invalid read_file line range: start_line must be <= end_line (got {start} > {end}). \
+         Origin: model_argument_error; no file was read. \
+         Next: if you intended this interval, retry with start_line={end}, end_line={start}; \
+         if {end} was a typo, retry with the corrected end_line."
+    )
 }
 
 fn validate_read_file_line_arg(
@@ -2412,7 +2419,24 @@ mod tests {
 
         assert!(result.is_error);
         assert!(
-            result.output.contains("must be <= `end_line`"),
+            result.output.contains("start_line must be <= end_line"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("Origin: model_argument_error"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("no file was read"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains("retry with start_line=2, end_line=4"),
             "got: {}",
             result.output
         );

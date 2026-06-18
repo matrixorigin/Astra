@@ -95,10 +95,8 @@ pub enum ExecutorBindingKind {
     ControlPlane,
     ServerRuntime,
     LocalCli,
-    PersonalRunner,
     EdgeAgent,
-    HostedRunner,
-    EnterpriseRunner,
+    OrchestratorManaged,
     RequestScopedMcp,
     Unknown,
 }
@@ -110,7 +108,6 @@ pub enum ToolTransportKind {
     InProcess,
     EdgeWebSocket,
     EdgeLedger,
-    RunnerRpc,
     GatewayRelay,
     SandboxResidentAgent,
     McpHttp,
@@ -166,16 +163,6 @@ impl ExecutorBinding {
         }
     }
 
-    pub fn personal_runner(executor_id: impl Into<String>) -> Self {
-        Self {
-            kind: ExecutorBindingKind::PersonalRunner,
-            executor_id: executor_id.into(),
-            display_name: "Personal runner".to_string(),
-            transport: ToolTransportKind::RunnerRpc,
-            status: ExecutorStatus::Online,
-        }
-    }
-
     pub fn edge_agent(executor_id: impl Into<String>) -> Self {
         Self {
             kind: ExecutorBindingKind::EdgeAgent,
@@ -186,12 +173,12 @@ impl ExecutorBinding {
         }
     }
 
-    pub fn hosted_runner(executor_id: impl Into<String>) -> Self {
+    pub fn orchestrator_managed(executor_id: impl Into<String>) -> Self {
         Self {
-            kind: ExecutorBindingKind::HostedRunner,
+            kind: ExecutorBindingKind::OrchestratorManaged,
             executor_id: executor_id.into(),
-            display_name: "Hosted runner".to_string(),
-            transport: ToolTransportKind::RunnerRpc,
+            display_name: "Orchestrator-managed executor".to_string(),
+            transport: ToolTransportKind::SandboxResidentAgent,
             status: ExecutorStatus::Online,
         }
     }
@@ -241,7 +228,6 @@ pub enum RuntimeLaunchDriver {
     Kubernetes,
     OpenShellGateway,
     MxcSdk,
-    RunnerRpc,
     Unknown,
 }
 
@@ -352,11 +338,30 @@ impl RuntimeBinding {
         }
     }
 
+    pub fn kubernetes(runtime_id: impl Into<String>) -> Self {
+        Self {
+            session_manager: RuntimeSessionManager::ProviderManaged,
+            isolation_backend: RuntimeIsolationBackend::ProviderManaged,
+            launch_driver: RuntimeLaunchDriver::Kubernetes,
+            runtime_id: runtime_id.into(),
+            display_name: "Kubernetes runtime".to_string(),
+            status: RuntimeStatus::Ready,
+            ephemeral: true,
+            supports_long_sessions: true,
+            interaction_channels: vec![
+                RuntimeInteractionChannel::Exec,
+                RuntimeInteractionChannel::StdinPipe,
+                RuntimeInteractionChannel::ServiceExpose,
+                RuntimeInteractionChannel::FileTransfer,
+            ],
+        }
+    }
+
     pub fn oci_container(runtime_id: impl Into<String>) -> Self {
         Self {
             session_manager: RuntimeSessionManager::AstraManaged,
             isolation_backend: RuntimeIsolationBackend::OciRuntime,
-            launch_driver: RuntimeLaunchDriver::RunnerRpc,
+            launch_driver: RuntimeLaunchDriver::Containerd,
             runtime_id: runtime_id.into(),
             display_name: "OCI container".to_string(),
             status: RuntimeStatus::Ready,
@@ -440,8 +445,8 @@ impl RunBinding {
     pub fn read_only_snapshot(root: impl Into<String>, registry: &ToolRegistry) -> Self {
         Self::resolve(
             WorkspaceBinding::cloud_workspace(root, WorkspaceAuthority::ReadOnly),
-            ExecutorBinding::hosted_runner("snapshot-runner"),
-            RuntimeBinding::oci_container("snapshot-runtime"),
+            ExecutorBinding::orchestrator_managed("snapshot-orchestrator"),
+            RuntimeBinding::kubernetes("snapshot-runtime"),
             PolicyIntent::read_only_review(),
             registry,
         )

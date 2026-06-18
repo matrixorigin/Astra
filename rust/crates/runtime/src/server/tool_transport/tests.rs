@@ -5,9 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use super::super::tool_transport_plan::{
-    EdgeBoundExecutionPlan, RunnerRpcExecutionPlan, edge_executor_id,
-};
+use super::super::tool_transport_plan::{EdgeBoundExecutionPlan, edge_executor_id};
 
 struct CountingLocalTransport {
     calls: AtomicUsize,
@@ -74,28 +72,24 @@ impl ServerLocalToolTransport for PendingLocalTransport {
     }
 }
 
-struct StaticRunnerRpcTransport {
-    prepare_calls: Mutex<Vec<astra_runtime_env::RunnerPrepareSessionRequest>>,
-    execute_calls: Mutex<Vec<astra_runtime_env::RunnerExecuteToolRequest>>,
-    prepare_error: Option<astra_runtime_env::RuntimeError>,
-    execute_error: Option<astra_runtime_env::RuntimeError>,
+struct StaticSandboxResidentAgentTransport {
+    calls: AtomicUsize,
+    error: Option<astra_runtime_env::RuntimeError>,
     output: String,
 }
 
-impl StaticRunnerRpcTransport {
+impl StaticSandboxResidentAgentTransport {
     fn new() -> Self {
         Self {
-            prepare_calls: Mutex::new(Vec::new()),
-            execute_calls: Mutex::new(Vec::new()),
-            prepare_error: None,
-            execute_error: None,
-            output: "runner-result".to_string(),
+            calls: AtomicUsize::new(0),
+            error: None,
+            output: "resident-agent-result".to_string(),
         }
     }
 
-    fn with_prepare_error(error: astra_runtime_env::RuntimeError) -> Self {
+    fn with_error(error: astra_runtime_env::RuntimeError) -> Self {
         Self {
-            prepare_error: Some(error),
+            error: Some(error),
             ..Self::new()
         }
     }
@@ -107,178 +101,66 @@ impl StaticRunnerRpcTransport {
         }
     }
 
-    fn prepare_calls(&self) -> usize {
-        self.prepare_calls.lock().expect("prepare calls lock").len()
-    }
-
-    fn first_prepare_request(&self) -> Option<astra_runtime_env::RunnerPrepareSessionRequest> {
-        self.prepare_calls
-            .lock()
-            .expect("prepare calls lock")
-            .first()
-            .cloned()
-    }
-
-    fn execute_calls(&self) -> usize {
-        self.execute_calls.lock().expect("execute calls lock").len()
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
     }
 }
 
 #[async_trait]
-impl RunnerRpcTransport for StaticRunnerRpcTransport {
-    async fn prepare_session(
-        &self,
-        _executor_id: &str,
-        request: astra_runtime_env::RunnerPrepareSessionRequest,
-    ) -> Result<astra_runtime_env::RunnerPrepareSessionResponse, astra_runtime_env::RuntimeError>
-    {
-        self.prepare_calls
-            .lock()
-            .expect("prepare calls lock")
-            .push(request.clone());
-        if let Some(error) = self.prepare_error.clone() {
-            return Ok(astra_runtime_env::RunnerPrepareSessionResponse::Rejected { error });
-        }
-        Ok(astra_runtime_env::RunnerPrepareSessionResponse::Prepared {
-            handle: Box::new(astra_runtime_env::RuntimeSessionHandle::from_spec(
-                &request.spec,
-            )),
-        })
-    }
-
+impl SandboxResidentAgentTransport for StaticSandboxResidentAgentTransport {
     async fn execute_tool(
         &self,
-        _executor_id: &str,
-        request: astra_runtime_env::RunnerExecuteToolRequest,
-    ) -> Result<astra_runtime_env::RunnerExecuteToolResponse, astra_runtime_env::RuntimeError> {
-        self.execute_calls
-            .lock()
-            .expect("execute calls lock")
-            .push(request.clone());
-        if let Some(error) = self.execute_error.clone() {
-            return Ok(astra_runtime_env::RunnerExecuteToolResponse::Rejected { error });
+        request: ToolExecutionRequest,
+        binding: astra_runtime_env::RunBinding,
+    ) -> Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = self.error.clone() {
+            return Err(error);
         }
-        Ok(astra_runtime_env::RunnerExecuteToolResponse::Completed {
-            outcome: astra_runtime_env::RuntimeToolOutcome::completed(
-                &request.invocation,
-                &self.output,
-                &request.session,
-            ),
-        })
+        Ok(runtime_outcome_for_request(
+            &request,
+            &binding,
+            &self.output,
+        ))
     }
 }
 
-struct PendingRunnerRpcTransport {
-    prepare_calls: AtomicUsize,
-    execute_calls: AtomicUsize,
+struct PendingSandboxResidentAgentTransport {
+    calls: AtomicUsize,
     execute_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
-impl PendingRunnerRpcTransport {
+impl PendingSandboxResidentAgentTransport {
     fn new(execute_started: tokio::sync::oneshot::Sender<()>) -> Self {
         Self {
-            prepare_calls: AtomicUsize::new(0),
-            execute_calls: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
             execute_started: Mutex::new(Some(execute_started)),
         }
     }
 
-    fn prepare_calls(&self) -> usize {
-        self.prepare_calls.load(Ordering::SeqCst)
-    }
-
-    fn execute_calls(&self) -> usize {
-        self.execute_calls.load(Ordering::SeqCst)
-    }
-}
-
-struct PendingPrepareRunnerRpcTransport {
-    prepare_calls: AtomicUsize,
-    execute_calls: AtomicUsize,
-    prepare_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-}
-
-impl PendingPrepareRunnerRpcTransport {
-    fn new(prepare_started: tokio::sync::oneshot::Sender<()>) -> Self {
-        Self {
-            prepare_calls: AtomicUsize::new(0),
-            execute_calls: AtomicUsize::new(0),
-            prepare_started: Mutex::new(Some(prepare_started)),
-        }
-    }
-
-    fn prepare_calls(&self) -> usize {
-        self.prepare_calls.load(Ordering::SeqCst)
-    }
-
-    fn execute_calls(&self) -> usize {
-        self.execute_calls.load(Ordering::SeqCst)
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
     }
 }
 
 #[async_trait]
-impl RunnerRpcTransport for PendingPrepareRunnerRpcTransport {
-    async fn prepare_session(
-        &self,
-        _executor_id: &str,
-        _request: astra_runtime_env::RunnerPrepareSessionRequest,
-    ) -> Result<astra_runtime_env::RunnerPrepareSessionResponse, astra_runtime_env::RuntimeError>
-    {
-        self.prepare_calls.fetch_add(1, Ordering::SeqCst);
-        let sender = self
-            .prepare_started
-            .lock()
-            .expect("prepare started lock")
-            .take();
-        if let Some(sender) = sender {
-            let _ = sender.send(());
-        }
-        std::future::pending::<()>().await;
-        unreachable!("pending runner prepare never completes")
-    }
-
+impl SandboxResidentAgentTransport for PendingSandboxResidentAgentTransport {
     async fn execute_tool(
         &self,
-        _executor_id: &str,
-        _request: astra_runtime_env::RunnerExecuteToolRequest,
-    ) -> Result<astra_runtime_env::RunnerExecuteToolResponse, astra_runtime_env::RuntimeError> {
-        self.execute_calls.fetch_add(1, Ordering::SeqCst);
-        unreachable!("execute should not run when prepare is pending")
-    }
-}
-
-#[async_trait]
-impl RunnerRpcTransport for PendingRunnerRpcTransport {
-    async fn prepare_session(
-        &self,
-        _executor_id: &str,
-        request: astra_runtime_env::RunnerPrepareSessionRequest,
-    ) -> Result<astra_runtime_env::RunnerPrepareSessionResponse, astra_runtime_env::RuntimeError>
-    {
-        self.prepare_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(astra_runtime_env::RunnerPrepareSessionResponse::Prepared {
-            handle: Box::new(astra_runtime_env::RuntimeSessionHandle::from_spec(
-                &request.spec,
-            )),
-        })
-    }
-
-    async fn execute_tool(
-        &self,
-        _executor_id: &str,
-        _request: astra_runtime_env::RunnerExecuteToolRequest,
-    ) -> Result<astra_runtime_env::RunnerExecuteToolResponse, astra_runtime_env::RuntimeError> {
-        self.execute_calls.fetch_add(1, Ordering::SeqCst);
+        _request: ToolExecutionRequest,
+        _binding: astra_runtime_env::RunBinding,
+    ) -> Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         let sender = self
             .execute_started
             .lock()
-            .expect("execute started lock")
+            .expect("resident agent execute started lock")
             .take();
         if let Some(sender) = sender {
             let _ = sender.send(());
         }
         std::future::pending::<()>().await;
-        unreachable!("pending runner execute never completes")
+        unreachable!("pending resident agent execute never completes")
     }
 }
 
@@ -359,38 +241,6 @@ impl GatewayRelayTransport for PendingGatewayRelayTransport {
         }
         std::future::pending::<()>().await;
         unreachable!("pending gateway execute never completes")
-    }
-}
-
-struct StaticSandboxResidentAgentTransport {
-    calls: AtomicUsize,
-}
-
-impl StaticSandboxResidentAgentTransport {
-    fn new() -> Self {
-        Self {
-            calls: AtomicUsize::new(0),
-        }
-    }
-
-    fn calls(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
-    }
-}
-
-#[async_trait]
-impl SandboxResidentAgentTransport for StaticSandboxResidentAgentTransport {
-    async fn execute_tool(
-        &self,
-        request: ToolExecutionRequest,
-        binding: astra_runtime_env::RunBinding,
-    ) -> Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(runtime_outcome_for_request(
-            &request,
-            &binding,
-            "resident-agent-result",
-        ))
     }
 }
 
@@ -1222,7 +1072,7 @@ fn offline_edge_binding_hides_project_tools_even_with_workspace_metadata() {
 }
 
 #[test]
-fn hosted_runner_unknown_status_hides_project_tools_until_runtime_ready() {
+fn orchestrator_managed_unknown_status_hides_project_tools_until_runtime_ready() {
     let registry = astra_runtime_env::ToolRegistry::builtins();
     let request = request(
         "read_file",
@@ -1234,10 +1084,10 @@ fn hosted_runner_unknown_status_hides_project_tools_until_runtime_ready() {
             fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
-            kind: ExecutorBindingKind::HostedRunner,
-            executor_id: "snapshot-runner".to_string(),
-            display_name: "Snapshot runner".to_string(),
-            transport: ToolTransportKind::RunnerRpc,
+            kind: ExecutorBindingKind::OrchestratorManaged,
+            executor_id: "orchestrator:snapshot".to_string(),
+            display_name: "Orchestrator-managed executor".to_string(),
+            transport: ToolTransportKind::SandboxResidentAgent,
             status: ExecutorStatus::Unknown,
         },
     );
@@ -1264,16 +1114,16 @@ fn hosted_runner_unknown_status_hides_project_tools_until_runtime_ready() {
 }
 
 #[test]
-fn hosted_runner_online_without_runtime_hides_project_tools() {
+fn orchestrator_managed_online_without_runtime_hides_project_tools() {
     let registry = astra_runtime_env::ToolRegistry::builtins();
     let request = request(
         "read_file",
         WorkspaceBinding::cloud_workspace("/workspace/project", WorkspaceAuthority::ReadWrite),
         ExecutorBinding {
-            kind: ExecutorBindingKind::HostedRunner,
-            executor_id: "snapshot-runner".to_string(),
-            display_name: "Snapshot runner".to_string(),
-            transport: ToolTransportKind::RunnerRpc,
+            kind: ExecutorBindingKind::OrchestratorManaged,
+            executor_id: "orchestrator:snapshot".to_string(),
+            display_name: "Orchestrator-managed executor".to_string(),
+            transport: ToolTransportKind::SandboxResidentAgent,
             status: ExecutorStatus::Online,
         },
     );
@@ -1330,7 +1180,7 @@ fn hosted_runner_online_without_runtime_hides_project_tools() {
 }
 
 #[tokio::test]
-async fn hosted_runner_without_runtime_blocks_stale_project_tool_call() {
+async fn orchestrator_managed_without_runtime_blocks_stale_project_tool_call() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
     let result = service
@@ -1342,10 +1192,10 @@ async fn hosted_runner_without_runtime_blocks_stale_project_tool_call() {
                     WorkspaceAuthority::ReadWrite,
                 ),
                 ExecutorBinding {
-                    kind: ExecutorBindingKind::HostedRunner,
-                    executor_id: "snapshot-runner".to_string(),
-                    display_name: "Snapshot runner".to_string(),
-                    transport: ToolTransportKind::RunnerRpc,
+                    kind: ExecutorBindingKind::OrchestratorManaged,
+                    executor_id: "orchestrator:snapshot".to_string(),
+                    display_name: "Orchestrator-managed executor".to_string(),
+                    transport: ToolTransportKind::SandboxResidentAgent,
                     status: ExecutorStatus::Online,
                 },
             ),
@@ -1372,7 +1222,7 @@ async fn hosted_runner_without_runtime_blocks_stale_project_tool_call() {
 }
 
 #[test]
-fn personal_runner_with_ready_runtime_routes_through_runner_rpc() {
+fn orchestrator_managed_with_ready_runtime_routes_through_resident_agent() {
     let registry = astra_runtime_env::ToolRegistry::builtins();
     let mut request = request(
         "read_file",
@@ -1384,10 +1234,10 @@ fn personal_runner_with_ready_runtime_routes_through_runner_rpc() {
             fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
-            kind: ExecutorBindingKind::PersonalRunner,
-            executor_id: "personal-runner-1".to_string(),
-            display_name: "Personal runner".to_string(),
-            transport: ToolTransportKind::RunnerRpc,
+            kind: ExecutorBindingKind::OrchestratorManaged,
+            executor_id: "orchestrator:personal-1".to_string(),
+            display_name: "Orchestrator-managed executor".to_string(),
+            transport: ToolTransportKind::SandboxResidentAgent,
             status: ExecutorStatus::Online,
         },
     );
@@ -1399,17 +1249,17 @@ fn personal_runner_with_ready_runtime_routes_through_runner_rpc() {
 
     assert_eq!(
         binding.executor.kind,
-        astra_runtime_env::ExecutorBindingKind::PersonalRunner
+        astra_runtime_env::ExecutorBindingKind::OrchestratorManaged
     );
     assert!(binding.tool_surface.contains("read_file"));
     assert_eq!(
         ToolExecutionService::new_for_test().routing_decision(&request),
-        ToolExecutionRouteKind::RunnerRpc
+        ToolExecutionRouteKind::SandboxResidentAgent
     );
 }
 
 #[test]
-fn enterprise_runner_with_ready_runtime_preserves_executor_kind() {
+fn orchestrator_managed_enterprise_binding_preserves_executor_kind() {
     let registry = astra_runtime_env::ToolRegistry::builtins();
     let mut request = request(
         "bash",
@@ -1421,10 +1271,10 @@ fn enterprise_runner_with_ready_runtime_preserves_executor_kind() {
             fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
-            kind: ExecutorBindingKind::EnterpriseRunner,
-            executor_id: "enterprise-runner-1".to_string(),
-            display_name: "Enterprise runner".to_string(),
-            transport: ToolTransportKind::RunnerRpc,
+            kind: ExecutorBindingKind::OrchestratorManaged,
+            executor_id: "orchestrator:enterprise-1".to_string(),
+            display_name: "Orchestrator-managed executor".to_string(),
+            transport: ToolTransportKind::SandboxResidentAgent,
             status: ExecutorStatus::Online,
         },
     );
@@ -1436,17 +1286,17 @@ fn enterprise_runner_with_ready_runtime_preserves_executor_kind() {
 
     assert_eq!(
         binding.executor.kind,
-        astra_runtime_env::ExecutorBindingKind::EnterpriseRunner
+        astra_runtime_env::ExecutorBindingKind::OrchestratorManaged
     );
     assert!(binding.tool_surface.contains("bash"));
     assert_eq!(
         ToolExecutionService::new_for_test().routing_decision(&request),
-        ToolExecutionRouteKind::RunnerRpc
+        ToolExecutionRouteKind::SandboxResidentAgent
     );
 }
 
 #[test]
-fn cloud_workspace_with_runtime_bound_hosted_runner_exposes_read_write_project_tools() {
+fn cloud_workspace_with_runtime_bound_orchestrator_exposes_read_write_project_tools() {
     let registry = astra_runtime_env::ToolRegistry::builtins();
     let mut request = request(
         "bash",
@@ -1458,15 +1308,15 @@ fn cloud_workspace_with_runtime_bound_hosted_runner_exposes_read_write_project_t
             fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
-            kind: ExecutorBindingKind::HostedRunner,
-            executor_id: "runner-1".to_string(),
-            display_name: "Hosted runner".to_string(),
-            transport: ToolTransportKind::RunnerRpc,
+            kind: ExecutorBindingKind::OrchestratorManaged,
+            executor_id: "orchestrator:workspace-1".to_string(),
+            display_name: "Orchestrator-managed executor".to_string(),
+            transport: ToolTransportKind::SandboxResidentAgent,
             status: ExecutorStatus::Online,
         },
     );
     request.runtime = Some(astra_runtime_env::RuntimeBinding::oci_container(
-        "runner-runtime",
+        "orchestrator-runtime",
     ));
 
     let binding = request.runtime_environment_binding(&registry);
@@ -1502,7 +1352,7 @@ fn explicit_runtime_binding_overrides_executor_inference() {
             fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
-            kind: ExecutorBindingKind::HostedRunner,
+            kind: ExecutorBindingKind::OrchestratorManaged,
             executor_id: "openshell-gateway".to_string(),
             display_name: "OpenShell Gateway".to_string(),
             transport: ToolTransportKind::GatewayRelay,
@@ -1544,7 +1394,7 @@ async fn gateway_relay_transport_fails_closed_until_adapter_is_configured() {
             fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
-            kind: ExecutorBindingKind::HostedRunner,
+            kind: ExecutorBindingKind::OrchestratorManaged,
             executor_id: "openshell-gateway".to_string(),
             display_name: "OpenShell Gateway".to_string(),
             transport: ToolTransportKind::GatewayRelay,
@@ -1581,7 +1431,10 @@ async fn gateway_relay_transport_fails_closed_until_adapter_is_configured() {
     assert_eq!(metadata["runtime"]["session_manager"], "nvidia_open_shell");
     assert_eq!(metadata["runtime"]["launch_driver"], "open_shell_gateway");
     assert_eq!(metadata["policy"]["revision"], 1);
-    assert_eq!(metadata["next_action"], "reconnect_runner");
+    assert_eq!(
+        metadata["next_action"],
+        "change_workspace_executor_runtime_or_policy"
+    );
     assert_eq!(
         metadata["runtime_environment"]["runtime"]["runtime_id"],
         "openshell-runtime"
@@ -1605,7 +1458,7 @@ async fn gateway_relay_executes_through_configured_transport() {
             fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
-            kind: ExecutorBindingKind::HostedRunner,
+            kind: ExecutorBindingKind::OrchestratorManaged,
             executor_id: "openshell-gateway".to_string(),
             display_name: "OpenShell Gateway".to_string(),
             transport: ToolTransportKind::GatewayRelay,
@@ -1641,7 +1494,7 @@ async fn gateway_relay_oversized_output_is_blocked_at_transport_boundary() {
         "read_file",
         WorkspaceBinding::cloud_workspace("/snapshot", WorkspaceAuthority::ReadOnly),
         ExecutorBinding {
-            kind: ExecutorBindingKind::HostedRunner,
+            kind: ExecutorBindingKind::OrchestratorManaged,
             executor_id: "openshell-gateway-1".to_string(),
             display_name: "OpenShell gateway".to_string(),
             transport: ToolTransportKind::GatewayRelay,
@@ -1680,7 +1533,7 @@ async fn gateway_relay_timeout_reports_side_effect_uncertainty() {
         "read_file",
         WorkspaceBinding::cloud_workspace("/snapshot", WorkspaceAuthority::ReadOnly),
         ExecutorBinding {
-            kind: ExecutorBindingKind::HostedRunner,
+            kind: ExecutorBindingKind::OrchestratorManaged,
             executor_id: "openshell-gateway-1".to_string(),
             display_name: "OpenShell gateway".to_string(),
             transport: ToolTransportKind::GatewayRelay,
@@ -1735,7 +1588,7 @@ async fn sandbox_resident_agent_transport_fails_closed_until_adapter_is_configur
             fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
-            kind: ExecutorBindingKind::HostedRunner,
+            kind: ExecutorBindingKind::OrchestratorManaged,
             executor_id: "openshell-agent".to_string(),
             display_name: "OpenShell resident agent".to_string(),
             transport: ToolTransportKind::SandboxResidentAgent,
@@ -1779,7 +1632,10 @@ async fn sandbox_resident_agent_transport_fails_closed_until_adapter_is_configur
     assert_eq!(metadata["runtime"]["session_manager"], "nvidia_open_shell");
     assert_eq!(metadata["runtime"]["launch_driver"], "open_shell_gateway");
     assert_eq!(metadata["policy"]["revision"], 1);
-    assert_eq!(metadata["next_action"], "reconnect_runner");
+    assert_eq!(
+        metadata["next_action"],
+        "change_workspace_executor_runtime_or_policy"
+    );
 }
 
 #[tokio::test]
@@ -1799,7 +1655,7 @@ async fn sandbox_resident_agent_executes_through_configured_transport() {
             fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
-            kind: ExecutorBindingKind::HostedRunner,
+            kind: ExecutorBindingKind::OrchestratorManaged,
             executor_id: "openshell-agent".to_string(),
             display_name: "OpenShell resident agent".to_string(),
             transport: ToolTransportKind::SandboxResidentAgent,
@@ -1823,7 +1679,7 @@ async fn sandbox_resident_agent_executes_through_configured_transport() {
     assert_eq!(metadata["runtime"]["launch_driver"], "open_shell_gateway");
 }
 
-fn hosted_snapshot_request(tool_name: &str) -> ToolExecutionRequest {
+fn cloud_snapshot_request(tool_name: &str) -> ToolExecutionRequest {
     let mut request = request(
         tool_name,
         WorkspaceBinding {
@@ -1834,15 +1690,15 @@ fn hosted_snapshot_request(tool_name: &str) -> ToolExecutionRequest {
             fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
-            kind: ExecutorBindingKind::HostedRunner,
-            executor_id: "snapshot-runner".to_string(),
-            display_name: "Snapshot runner".to_string(),
-            transport: ToolTransportKind::RunnerRpc,
+            kind: ExecutorBindingKind::OrchestratorManaged,
+            executor_id: "orchestrator:snapshot-1".to_string(),
+            display_name: "Orchestrator-managed executor".to_string(),
+            transport: ToolTransportKind::SandboxResidentAgent,
             status: ExecutorStatus::Online,
         },
     );
-    request.workspace_record = Some(hosted_snapshot_workspace_record());
-    request.runtime = Some(astra_runtime_env::RuntimeBinding::oci_container(
+    request.workspace_record = Some(cloud_snapshot_workspace_record());
+    request.runtime = Some(astra_runtime_env::RuntimeBinding::kubernetes(
         "snapshot-runtime",
     ));
     request
@@ -1859,7 +1715,7 @@ fn openshell_gateway_request(tool_name: &str) -> ToolExecutionRequest {
             fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
-            kind: ExecutorBindingKind::HostedRunner,
+            kind: ExecutorBindingKind::OrchestratorManaged,
             executor_id: "openshell-gateway".to_string(),
             display_name: "OpenShell Gateway".to_string(),
             transport: ToolTransportKind::GatewayRelay,
@@ -1886,7 +1742,7 @@ fn openshell_gateway_request(tool_name: &str) -> ToolExecutionRequest {
     request
 }
 
-fn hosted_snapshot_workspace_record() -> astra_runtime_env::WorkspaceRecord {
+fn cloud_snapshot_workspace_record() -> astra_runtime_env::WorkspaceRecord {
     astra_runtime_env::WorkspaceRecord {
         workspace_id: "snapshot-1".to_string(),
         owner_scope: astra_runtime_env::WorkspaceOwnerScope::Tenant,
@@ -1902,144 +1758,73 @@ fn hosted_snapshot_workspace_record() -> astra_runtime_env::WorkspaceRecord {
     }
 }
 
-#[test]
-fn runner_rpc_execution_plan_builds_prepare_and_execute_requests() {
-    let registry = astra_runtime_env::ToolRegistry::builtins();
-    let request = hosted_snapshot_request("read_file");
-    let binding = request.runtime_environment_binding(&registry);
-
-    let plan = RunnerRpcExecutionPlan::from_request(&request, &binding).expect("runner plan");
-    assert_eq!(plan.executor_id(), "snapshot-runner");
-
-    let prepare = plan.prepare_request();
-    assert_eq!(prepare.request_id, "prepare:call-1");
-    assert_eq!(prepare.spec.session_id, "session-1");
-    assert_eq!(prepare.spec.run_id, "run-1");
-    assert_eq!(prepare.spec.requested_tools, vec!["read_file"]);
-    assert_eq!(
-        prepare
-            .spec
-            .workspace_record
-            .as_ref()
-            .expect("workspace record")
-            .workspace_id,
-        "snapshot-1"
-    );
-
-    let policy = astra_runtime_env::CompiledRuntimePolicy::dynamic(
-        astra_runtime_env::PolicyRevision(7),
-        binding.policy.clone(),
-    );
-    let handle = astra_runtime_env::RuntimeSessionHandle::from_spec(&prepare.spec)
-        .with_policy(policy, &binding);
-    let execute = plan.execute_request(handle);
-
-    assert_eq!(execute.request_id, "execute:call-1");
-    assert_eq!(execute.idempotency_key, "user-1:session-1:call-1");
-    assert_eq!(
-        execute.invocation.idempotency_key.as_deref(),
-        Some("user-1:session-1:call-1")
-    );
-    assert_eq!(execute.invocation.call_id, "call-1");
-    assert_eq!(execute.invocation.tool_name, "read_file");
-    assert_eq!(
-        execute.invocation.policy_revision,
-        astra_runtime_env::PolicyRevision(7)
-    );
-    assert_eq!(
-        execute.session.policy.revision,
-        astra_runtime_env::PolicyRevision(7)
-    );
-}
-
-#[test]
-fn runner_rpc_execution_plan_rejects_cloud_workspace_without_record() {
-    let registry = astra_runtime_env::ToolRegistry::builtins();
-    let mut request = hosted_snapshot_request("read_file");
-    request.workspace_record = None;
-    let binding = request.runtime_environment_binding(&registry);
-
-    let error = RunnerRpcExecutionPlan::from_request(&request, &binding)
-        .expect_err("missing cloud workspace record must fail before transport");
-
-    assert_eq!(
-        error.kind,
-        astra_runtime_env::RuntimeErrorKind::RuntimeUnavailable
-    );
-    assert!(error.retryable);
-    assert!(!error.execution_started);
-    assert!(!error.side_effects_maybe);
-    assert!(error.message.contains("durable WorkspaceRecord"));
-}
-
 #[tokio::test]
-async fn hosted_runner_executes_through_runner_rpc_transport() {
-    let runner = Arc::new(StaticRunnerRpcTransport::new());
+async fn orchestrator_managed_executes_through_sandbox_resident_agent_transport() {
+    let resident = Arc::new(StaticSandboxResidentAgentTransport::new());
     let _local = CountingLocalTransport::new();
 
     let service = ToolExecutionService::builder()
-        .runner_rpc_transport(runner.clone())
+        .sandbox_resident_agent_transport(resident.clone())
         .build();
     let local = CountingLocalTransport::new();
 
     let result = service
-        .execute(hosted_snapshot_request("read_file"), &local)
+        .execute(cloud_snapshot_request("read_file"), &local)
         .await;
 
     assert!(!result.is_error, "{result:?}");
-    assert_eq!(result.output, "runner-result");
+    assert_eq!(result.output, "resident-result");
     assert_eq!(local.calls(), 0);
-    assert_eq!(runner.prepare_calls(), 1);
-    assert_eq!(runner.execute_calls(), 1);
-    let metadata = result.metadata.expect("runner metadata");
-    assert_eq!(metadata["transport"], "runner_rpc");
-    assert_eq!(metadata["executor"]["kind"], "hosted_runner");
+    assert_eq!(resident.calls(), 1);
+    let metadata = result.metadata.expect("resident metadata");
+    assert_eq!(metadata["transport"], "sandbox_resident_agent");
+    assert_eq!(metadata["executor"]["kind"], "orchestrator_managed");
     assert_eq!(
         metadata[astra_runtime_env::TOOL_RESULT_RUNTIME_SESSION]["executor_id"],
-        "snapshot-runner"
+        "orchestrator:snapshot-1"
     );
+    assert_eq!(metadata["runtime"]["launch_driver"], "kubernetes");
 }
 
 #[tokio::test]
-async fn hosted_runner_oversized_output_is_blocked_at_transport_boundary() {
+async fn orchestrator_managed_oversized_output_is_blocked_at_transport_boundary() {
     let oversized = "x".repeat(1_048_577);
-    let runner = Arc::new(StaticRunnerRpcTransport::with_output(oversized));
+    let resident = Arc::new(StaticSandboxResidentAgentTransport::with_output(oversized));
     let _local = CountingLocalTransport::new();
 
     let service = ToolExecutionService::builder()
-        .runner_rpc_transport(runner.clone())
+        .sandbox_resident_agent_transport(resident.clone())
         .build();
     let local = CountingLocalTransport::new();
 
     let result = service
-        .execute(hosted_snapshot_request("read_file"), &local)
+        .execute(cloud_snapshot_request("read_file"), &local)
         .await;
 
     assert!(result.is_error, "{result:?}");
     assert!(result.output.contains("output limit exceeded"));
     assert!(!result.output.contains(&"x".repeat(128)));
     assert_eq!(local.calls(), 0);
-    assert_eq!(runner.prepare_calls(), 1);
-    assert_eq!(runner.execute_calls(), 1);
+    assert_eq!(resident.calls(), 1);
     let metadata = result.metadata.expect("output limit metadata");
     assert_eq!(metadata["error_kind"], "output_limit_exceeded");
     assert_eq!(metadata["execution_started"], true);
     assert_eq!(metadata["side_effects_maybe"], true);
     assert_eq!(metadata["output_bytes"], 1_048_577);
     assert_eq!(metadata["max_output_bytes"], 1_048_576);
-    assert_eq!(metadata["transport"], "runner_rpc");
+    assert_eq!(metadata["transport"], "sandbox_resident_agent");
 }
 
 #[tokio::test]
-async fn hosted_runner_uses_policy_snapshot_output_limit_override() {
-    let runner = Arc::new(StaticRunnerRpcTransport::with_output("abcd"));
+async fn orchestrator_managed_uses_policy_snapshot_output_limit_override() {
+    let resident = Arc::new(StaticSandboxResidentAgentTransport::with_output("abcd"));
     let _local = CountingLocalTransport::new();
-    let _request = hosted_snapshot_request("read_file");
+    let _request = cloud_snapshot_request("read_file");
     let service = ToolExecutionService::builder()
-        .runner_rpc_transport(runner.clone())
+        .sandbox_resident_agent_transport(resident.clone())
         .build();
     let local = CountingLocalTransport::new();
-    let mut request = hosted_snapshot_request("read_file");
+    let mut request = cloud_snapshot_request("read_file");
     request.policy.max_output_bytes = Some(3);
 
     let result = service.execute(request, &local).await;
@@ -2047,8 +1832,7 @@ async fn hosted_runner_uses_policy_snapshot_output_limit_override() {
     assert!(result.is_error, "{result:?}");
     assert!(result.output.contains("output limit exceeded"));
     assert_eq!(local.calls(), 0);
-    assert_eq!(runner.prepare_calls(), 1);
-    assert_eq!(runner.execute_calls(), 1);
+    assert_eq!(resident.calls(), 1);
     let metadata = result.metadata.expect("custom output limit metadata");
     assert_eq!(metadata["error_kind"], "output_limit_exceeded");
     assert_eq!(metadata["output_bytes"], 4);
@@ -2064,15 +1848,15 @@ async fn hosted_runner_uses_policy_snapshot_output_limit_override() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn hosted_runner_prepare_timeout_reports_no_side_effects() {
+async fn orchestrator_managed_execute_timeout_reports_side_effect_uncertainty() {
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let runner = Arc::new(PendingPrepareRunnerRpcTransport::new(started_tx));
-    let _request = hosted_snapshot_request("read_file");
+    let resident = Arc::new(PendingSandboxResidentAgentTransport::new(started_tx));
+    let _request = cloud_snapshot_request("read_file");
 
     let service = ToolExecutionService::builder()
-        .runner_rpc_transport(runner.clone())
+        .sandbox_resident_agent_transport(resident.clone())
         .build();
-    let request = hosted_snapshot_request("read_file");
+    let request = cloud_snapshot_request("read_file");
 
     let handle = tokio::spawn(async move {
         let local = CountingLocalTransport::new();
@@ -2080,9 +1864,11 @@ async fn hosted_runner_prepare_timeout_reports_no_side_effects() {
         (result, local.calls())
     });
 
-    started_rx.await.expect("runner prepare should start");
+    started_rx.await.expect("resident execute should start");
     tokio::time::advance(std::time::Duration::from_secs(31)).await;
-    let (result, local_calls) = handle.await.expect("runner timeout task should not panic");
+    let (result, local_calls) = handle
+        .await
+        .expect("resident timeout task should not panic");
 
     assert!(result.is_error, "{result:?}");
     assert!(
@@ -2091,51 +1877,8 @@ async fn hosted_runner_prepare_timeout_reports_no_side_effects() {
         result.output
     );
     assert_eq!(local_calls, 0);
-    assert_eq!(runner.prepare_calls(), 1);
-    assert_eq!(runner.execute_calls(), 0);
-    let metadata = result.metadata.expect("runner prepare timeout metadata");
-    assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
-    assert_eq!(metadata["reason"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
-    assert_eq!(metadata["blocked"], true);
-    assert_eq!(metadata["execution_started"], false);
-    assert_eq!(metadata["side_effects_maybe"], false);
-    assert_eq!(metadata["next_action"], "none");
-    assert_eq!(metadata["max_execution_secs"], 30.0);
-    assert_eq!(metadata["transport"], "runner_rpc");
-    assert_eq!(metadata["runtime_error"]["kind"], "tool_timeout");
-}
-
-#[tokio::test(start_paused = true)]
-async fn hosted_runner_execute_timeout_reports_side_effect_uncertainty() {
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let runner = Arc::new(PendingRunnerRpcTransport::new(started_tx));
-    let _request = hosted_snapshot_request("read_file");
-
-    let service = ToolExecutionService::builder()
-        .runner_rpc_transport(runner.clone())
-        .build();
-    let request = hosted_snapshot_request("read_file");
-
-    let handle = tokio::spawn(async move {
-        let local = CountingLocalTransport::new();
-        let result = service.execute(request, &local).await;
-        (result, local.calls())
-    });
-
-    started_rx.await.expect("runner execute should start");
-    tokio::time::advance(std::time::Duration::from_secs(31)).await;
-    let (result, local_calls) = handle.await.expect("runner timeout task should not panic");
-
-    assert!(result.is_error, "{result:?}");
-    assert!(
-        result.output.contains("max_execution_secs"),
-        "{}",
-        result.output
-    );
-    assert_eq!(local_calls, 0);
-    assert_eq!(runner.prepare_calls(), 1);
-    assert_eq!(runner.execute_calls(), 1);
-    let metadata = result.metadata.expect("runner execute timeout metadata");
+    assert_eq!(resident.calls(), 1);
+    let metadata = result.metadata.expect("resident timeout metadata");
     assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
     assert_eq!(metadata["reason"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
     assert_eq!(metadata["blocked"], true);
@@ -2143,80 +1886,23 @@ async fn hosted_runner_execute_timeout_reports_side_effect_uncertainty() {
     assert_eq!(metadata["side_effects_maybe"], true);
     assert_eq!(metadata["next_action"], "inspect_effects_before_retry");
     assert_eq!(metadata["max_execution_secs"], 30.0);
-    assert_eq!(metadata["transport"], "runner_rpc");
+    assert_eq!(metadata["transport"], "sandbox_resident_agent");
     assert_eq!(metadata["runtime_error"]["kind"], "tool_timeout");
 }
 
 #[tokio::test]
-async fn hosted_runner_prepare_carries_workspace_record() {
-    let runner = Arc::new(StaticRunnerRpcTransport::new());
-    let service = ToolExecutionService::builder()
-        .runner_rpc_transport(runner.clone())
-        .build();
-    let local = CountingLocalTransport::new();
-    let request = hosted_snapshot_request("read_file");
-
-    let result = service.execute(request, &local).await;
-
-    assert!(!result.is_error, "{result:?}");
-    let prepare = runner
-        .first_prepare_request()
-        .expect("prepare request should be recorded");
-    let workspace = prepare
-        .spec
-        .workspace_record
-        .expect("workspace record should be carried to runner prepare");
-    assert_eq!(workspace.workspace_id, "snapshot-1");
-    assert_eq!(
-        workspace.kind,
-        astra_runtime_env::WorkspaceBindingKind::CloudWorkspace
-    );
-    assert_eq!(
-        workspace.authority,
-        astra_runtime_env::WorkspaceAuthority::ReadOnly
-    );
-}
-
-#[tokio::test]
-async fn hosted_runner_missing_workspace_record_fails_before_runner_rpc() {
-    let runner = Arc::new(StaticRunnerRpcTransport::new());
-    let _local = CountingLocalTransport::new();
-    let _request = hosted_snapshot_request("read_file");
-    let service = ToolExecutionService::builder()
-        .runner_rpc_transport(runner.clone())
-        .build();
-    let local = CountingLocalTransport::new();
-    let mut request = hosted_snapshot_request("read_file");
-    request.workspace_record = None;
-
-    let result = service.execute(request, &local).await;
-
-    assert!(result.is_error, "{result:?}");
-    assert_eq!(local.calls(), 0);
-    assert_eq!(runner.prepare_calls(), 0);
-    assert_eq!(runner.execute_calls(), 0);
-    let metadata = result.metadata.expect("runner error metadata");
-    assert_eq!(metadata["error_kind"], "runtime_unavailable");
-    assert_eq!(metadata["blocked"], true);
-    assert!(
-        result.output.contains("durable WorkspaceRecord"),
-        "{}",
-        result.output
-    );
-}
-
-#[tokio::test]
-async fn hosted_runner_without_runner_rpc_transport_does_not_fallback_to_local() {
+async fn orchestrator_managed_without_sandbox_resident_agent_transport_does_not_fallback_to_local()
+{
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
 
     let result = service
-        .execute(hosted_snapshot_request("read_file"), &local)
+        .execute(cloud_snapshot_request("read_file"), &local)
         .await;
 
     assert!(result.is_error, "{result:?}");
     assert_eq!(local.calls(), 0);
-    let metadata = result.metadata.expect("runner transport metadata");
+    let metadata = result.metadata.expect("resident agent transport metadata");
     assert_eq!(
         metadata["error_kind"],
         astra_runtime_env::RuntimeErrorKind::TransportUnavailable.to_string()
@@ -2225,34 +1911,39 @@ async fn hosted_runner_without_runner_rpc_transport_does_not_fallback_to_local()
     assert_eq!(metadata["retryable"], true);
     assert_eq!(metadata["execution_started"], false);
     assert_eq!(metadata["side_effects_maybe"], false);
-    assert_eq!(metadata["next_action"], "reconnect_runner");
+    assert_eq!(
+        metadata["next_action"],
+        "change_workspace_executor_runtime_or_policy"
+    );
     assert_eq!(metadata["runtime_error"]["kind"], "transport_unavailable");
-    assert_eq!(metadata["transport"], "runner_rpc");
+    assert_eq!(metadata["transport"], "sandbox_resident_agent");
 }
 
 #[tokio::test]
-async fn hosted_runner_prepare_rejection_skips_execute_and_local_fallback() {
-    let runner = Arc::new(StaticRunnerRpcTransport::with_prepare_error(
-        astra_runtime_env::RuntimeError::runtime_unavailable("runner pool drained"),
+async fn orchestrator_managed_transport_error_skips_local_fallback() {
+    let resident = Arc::new(StaticSandboxResidentAgentTransport::with_error(
+        astra_runtime_env::RuntimeError::runtime_unavailable("orchestrator denied execution"),
     ));
     let service = ToolExecutionService::builder()
-        .runner_rpc_transport(runner.clone())
+        .sandbox_resident_agent_transport(resident.clone())
         .build();
     let local = CountingLocalTransport::new();
 
     let result = service
-        .execute(hosted_snapshot_request("read_file"), &local)
+        .execute(cloud_snapshot_request("read_file"), &local)
         .await;
 
     assert!(result.is_error, "{result:?}");
     assert_eq!(local.calls(), 0);
-    assert_eq!(runner.prepare_calls(), 1);
-    assert_eq!(runner.execute_calls(), 0);
-    let metadata = result.metadata.expect("runner error metadata");
+    assert_eq!(resident.calls(), 1);
+    let metadata = result.metadata.expect("resident error metadata");
     assert_eq!(metadata["error_kind"], "runtime_unavailable");
-    assert_eq!(metadata["transport"], "runner_rpc");
+    assert_eq!(metadata["transport"], "sandbox_resident_agent");
     assert_eq!(metadata["blocked"], true);
-    assert_eq!(metadata["runtime_error"]["message"], "runner pool drained");
+    assert_eq!(
+        metadata["runtime_error"]["message"],
+        "orchestrator denied execution"
+    );
 }
 
 #[tokio::test]
@@ -2263,7 +1954,7 @@ async fn cloud_workspace_blocks_without_server_fallback() {
         "git",
         WorkspaceBinding {
             kind: WorkspaceBindingKind::CloudWorkspace,
-            display_name: "Hosted workspace".to_string(),
+            display_name: "Cloud workspace".to_string(),
             cwd: Some("/checkout/repo".to_string()),
             authority: WorkspaceAuthority::ReadOnly,
             fallback_policy: FallbackPolicy::Disabled,
@@ -2906,19 +2597,19 @@ async fn request_scoped_mcp_cancel_reports_mcp_binding() {
 }
 
 #[tokio::test]
-async fn hosted_runner_cancel_during_execute_reports_side_effect_uncertainty() {
+async fn orchestrator_managed_cancel_during_execute_reports_side_effect_uncertainty() {
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let runner = Arc::new(PendingRunnerRpcTransport::new(started_tx));
+    let resident = Arc::new(PendingSandboxResidentAgentTransport::new(started_tx));
     let cancel = Arc::new(CancellationToken::new());
     let _cancel_for_task = cancel.clone();
-    let _request = hosted_snapshot_request("read_file");
+    let _request = cloud_snapshot_request("read_file");
 
     let service = ToolExecutionService::builder()
-        .runner_rpc_transport(runner.clone())
+        .sandbox_resident_agent_transport(resident.clone())
         .build();
     let cancel = Arc::new(CancellationToken::new());
     let cancel_for_task = cancel.clone();
-    let request = hosted_snapshot_request("read_file");
+    let request = cloud_snapshot_request("read_file");
 
     let handle = tokio::spawn(async move {
         let local = CountingLocalTransport::new();
@@ -2930,20 +2621,19 @@ async fn hosted_runner_cancel_during_execute_reports_side_effect_uncertainty() {
 
     tokio::time::timeout(std::time::Duration::from_secs(1), started_rx)
         .await
-        .expect("runner execute should start")
-        .expect("runner execute start signal");
+        .expect("resident agent execute should start")
+        .expect("resident agent execute start signal");
     cancel.cancel();
     let (result, local_calls) = tokio::time::timeout(std::time::Duration::from_secs(1), handle)
         .await
-        .expect("runner cancel should resolve")
-        .expect("runner cancel task should not panic");
+        .expect("resident agent cancel should resolve")
+        .expect("resident agent cancel task should not panic");
 
     assert!(result.is_error, "{result:?}");
     assert!(result.output.contains("cancelled"), "{}", result.output);
     assert_eq!(local_calls, 0);
-    assert_eq!(runner.prepare_calls(), 1);
-    assert_eq!(runner.execute_calls(), 1);
-    let metadata = result.metadata.expect("runner cancel metadata");
+    assert_eq!(resident.calls(), 1);
+    let metadata = result.metadata.expect("resident agent cancel metadata");
     assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_CANCELLED);
     assert_eq!(metadata["reason"], TOOL_ERROR_KIND_CANCELLED);
     assert_eq!(metadata["cancelled"], true);
@@ -2951,9 +2641,9 @@ async fn hosted_runner_cancel_during_execute_reports_side_effect_uncertainty() {
     assert_eq!(metadata["execution_started"], true);
     assert_eq!(metadata["side_effects_maybe"], true);
     assert_eq!(metadata["next_action"], "inspect_effects_before_retry");
-    assert_eq!(metadata["transport"], "runner_rpc");
-    assert_eq!(metadata["executor"]["kind"], "hosted_runner");
-    assert_eq!(metadata["runtime"]["isolation_backend"], "oci_runtime");
+    assert_eq!(metadata["transport"], "sandbox_resident_agent");
+    assert_eq!(metadata["executor"]["kind"], "orchestrator_managed");
+    assert_eq!(metadata["runtime"]["isolation_backend"], "provider_managed");
     assert_eq!(
         metadata["runtime_environment"]["runtime"]["runtime_id"],
         "snapshot-runtime"

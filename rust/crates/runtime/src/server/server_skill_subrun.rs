@@ -34,7 +34,7 @@ use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
 use astra_turn_core::turn_guard::TurnGuard;
 
 use super::server_loop_host::ServerAgenticLoopHostBuilder;
-use super::tool_transport::{ExecutionBindingSnapshot, RunnerRpcTransport};
+use super::tool_transport::ExecutionBindingSnapshot;
 
 /// Maximum turns for a skill sub-run (matches CLI's SUBRUN_MAX_TURNS).
 pub const SUBRUN_MAX_TURNS: usize = 30;
@@ -73,8 +73,6 @@ pub struct ServerSkillSubRunExecutor {
     session_id: String,
     /// Edge connection pool for routing tool calls to connected edges.
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
-    /// Runner RPC transport for hosted/personal runtime executors.
-    runner_rpc_transport: Option<Arc<dyn RunnerRpcTransport>>,
     /// Shared tool_call dedup state from the parent host. When set, the sub-run
     /// host will observe the same emitted_tool_call_ids HashSet as the parent,
     /// preventing duplicate `tool_call` events across host instances within the
@@ -113,7 +111,6 @@ impl ServerSkillSubRunExecutor {
             request_constraints: Default::default(),
             session_id,
             edge_connection_pool: None,
-            runner_rpc_transport: None,
             #[cfg(feature = "bridge-e2e-hooks")]
             dedup_state: None,
             #[cfg(feature = "harness")]
@@ -203,11 +200,6 @@ impl ServerSkillSubRunExecutor {
         pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
     ) -> Self {
         self.edge_connection_pool = Some(pool);
-        self
-    }
-
-    pub fn with_runner_rpc_transport(mut self, transport: Arc<dyn RunnerRpcTransport>) -> Self {
-        self.runner_rpc_transport = Some(transport);
         self
     }
 
@@ -531,9 +523,6 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             let mut builder = ToolExecutionService::builder();
             if let Some(pool) = &self.edge_connection_pool {
                 builder = builder.edge_connection_pool(pool.clone());
-            }
-            if let Some(transport) = &self.runner_rpc_transport {
-                builder = builder.runner_rpc_transport(Arc::clone(transport));
             }
 
             let mut executor = super::server_tool_executor::ServerToolExecutor::new(

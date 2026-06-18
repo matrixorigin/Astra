@@ -93,6 +93,7 @@ pub fn classify_exit(command: &str, exit_code: i32) -> ExitSemantics {
         (Some("git"), 1) if command_contains_word(command, "grep") => {
             ExitSemantics::InformationalFailure
         }
+        (Some("pgrep" | "pkill" | "killall"), 1) => ExitSemantics::InformationalFailure,
         (Some("diff" | "cmp"), 1) => ExitSemantics::DomainNegative,
         (Some("false"), 1) => ExitSemantics::DomainNegative,
         (Some("test" | "["), 1) => ExitSemantics::DomainNegative,
@@ -207,7 +208,8 @@ fn split_pipeline_segments(command: &str) -> Vec<&str> {
     segments
 }
 
-fn command_family(command: &str) -> Option<String> {
+#[must_use]
+pub fn command_family(command: &str) -> Option<String> {
     // Extract the *last* command in a pipeline — the last segment determines
     // the exit code, not the first (e.g. `ls | grep foo` → `grep`).
     // Skip escaped `\|` used in regex patterns like `grep 'foo\|bar'`.
@@ -484,6 +486,20 @@ mod tests {
         let semantics = classify_exit("git grep missing -- src", 1);
         assert_eq!(semantics, ExitSemantics::InformationalFailure);
         assert!(!semantics.is_tool_error());
+    }
+
+    #[test]
+    fn process_match_commands_no_match_are_informational() {
+        for command in [
+            "pgrep missing-process-name",
+            "cd /work/repo && pgrep missing-process-name",
+            "pkill -0 missing-process-name",
+            "killall -0 missing-process-name",
+        ] {
+            let semantics = classify_exit(command, 1);
+            assert_eq!(semantics, ExitSemantics::InformationalFailure, "{command}");
+            assert!(!semantics.is_tool_error(), "{command}");
+        }
     }
 
     #[test]

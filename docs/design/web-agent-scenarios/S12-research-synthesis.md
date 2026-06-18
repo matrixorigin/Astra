@@ -58,7 +58,7 @@ structured filter / FTS 走索引路径；两周后综述撰写阶段引用原�
 
 | 编号 | 压测方式 |
 | --- | --- |
-| **A9** | 200 URL + 50 PDF 的 raw 内容（累计 ~6.8GB）**绝不进 prompt**。每个 tool 调用必须对应 1 行 `session_tool_outputs`（外加 1 行 `session_artifacts`），`preview_text` ≤ 1k token 且**必须结构化**：`fetch_url` 的 preview schema = `{url, http_status, title, first_paragraph, keywords[], relevance_score, content_type}`；`parse_pdf` 的 preview schema = `{title, authors[], year, venue, abstract, key_findings[], benchmarks[], section_count}`。同工具共用 `preview_template` 版本号（见 §8 建议 1）。context assembler 对 `byte_size > 16KB` 的 tool 输出强制走 preview 路径，artifact 原文只在 tool runner 与 OSS 之间流动。 |
+| **A9** | 200 URL + 50 PDF 的 raw 内容（累计 ~6.8GB）**绝不进 prompt**。每个 tool 调用必须对应 1 行 `session_tool_outputs`（外加 1 行 `session_artifacts`），`preview_text` ≤ 1k token 且**必须结构化**：`fetch_url` 的 preview schema = `{url, http_status, title, first_paragraph, keywords[], relevance_score, content_type}`；`parse_pdf` 的 preview schema = `{title, authors[], year, venue, abstract, key_findings[], benchmarks[], section_count}`。同工具共用 `preview_template` 版本号（见 §8 建议 1）。context assembler 对 `byte_size > 16KB` 的 tool 输出强制走 preview 路径，artifact 原文只在 tool executor 与 OSS 之间流动。 |
 | **A3** | `Tools` / `Files` 两个 UI tab 在打开时**绝不扫全表**。Tools tab 按时间倒序分页 `WHERE session_id=? ORDER BY created_at DESC LIMIT 50`，命中 `idx_tool_outputs_session_created` ；Files tab（基于 `session_artifacts`）同理。Miranda 在第 14 天打开 session 时页面 first-paint < 500ms，尽管背后有 300 行 tool_outputs + 250 行 artifacts + 6.8GB raw；UI 只读两个索引投影。展开任何单条 PDF artifact 才按需拉 OSS presigned URL。 |
 | **A10** | Miranda 反复问的三类问题走三种检索：（i）"列前 20 个相关度高的" → structured filter `WHERE tool_name='fetch_url' ORDER BY JSON_EXTRACT(preview_text, '$.relevance_score') DESC`（但注意：A10 + §SQL Performance 禁 JSON 列过滤，解决方案见 §8 建议 1 把 relevance_score 提升为一等列）；（ii）"关于 LoRA 微调的 5 篇" → tier 2 FTS `MATCH(preview_text) AGAINST ('+LoRA +fine-tun*' IN BOOLEAN MODE)`；（iii）"上周那个 BioBERT 方法论在哪" → time filter + FTS 组合 `WHERE created_at BETWEEN ... AND MATCH(preview_text) AGAINST ('BioBERT')`。FTS 在 `session_tool_outputs` 上 append-only，无 UPDATE/DELETE bloat。 |
 
@@ -113,7 +113,7 @@ schemas` 1600 / `system_static` 1200 / `recent_tail` 480。总 ≈ 3960。
 fine-tuning'、'LoRA medical'、'BioGPT'、'PEFT healthcare' 各拉 50
 条，再加 20 个 huggingface model card 和 20 个 blog。」
 
-**state 变化**：agent 发起 `fetch_url` **批量调用**（tool runner 侧
+**state 变化**：agent 发起 `fetch_url` **批量调用**（tool executor 侧
 fan-out + 并发 10），共 200 次独立 HTTP fetch。每个 URL 对应 1
 行 `session_tool_outputs`（`tool_name='fetch_url'`、`status ∈ {'ok',
 'fetch_fail', 'parse_fail'}`、`byte_size` 实际 HTML 字节 10KB–200KB、
@@ -123,7 +123,7 @@ fan-out + 并发 10），共 200 次独立 HTTP fetch。每个 URL 对应 1
 first_paragraph:"<80 char>", keywords:[...], relevance_score:0.82,
 content_type:"arxiv_abstract"}`。批量 insert 拆 10 批 × 20 行避免
 N+1。relevance_score 由一个 cheap ranker（TF-IDF + 关键词匹配）
-在 runner 侧就地计算，**不**经 LLM。
+在 executor 侧就地计算，**不**经 LLM。
 
 **manifest zone**：本轮 agent 只需 ACK 200 个 fetch 完成，不对任
 何单 URL 做 reasoning。`tool_previews` 320（1 条聚合 preview：
@@ -165,7 +165,7 @@ runtime 落 `session_state_items(category='tool_ref', item_key=
 
 **state 变化**：agent 发起 `parse_pdf` 批量调用，50 次并发。每篇：
 （a）下载 PDF raw（3–10MB）→ `session_artifacts` 新 1 行
-`artifact_type='pdf_raw'`；（b）runner 侧用 pdfminer 解析为 text
+`artifact_type='pdf_raw'`；（b）executor 侧用 pdfminer 解析为 text
 （100–500KB）→ `session_artifacts` 新 1 行 `artifact_type='pdf_
 text'`，`derived_from=<pdf_raw>`；（c）`session_tool_outputs` 新 1 行
 `tool_name='parse_pdf'`，`status='ok'`，`byte_size`=text 字节数，
@@ -214,8 +214,8 @@ method / dataset / base model / param / benchmark / key claim，存
 结构化。」
 
 **state 变化**：agent 发 50 次 `llm_extract_findings` 工具（输入=
-pdf_text artifact_ref；runner 侧直接从 OSS 流式读 text 给 LLM，
-**不**经 runtime）。每次 LLM 输出 1–3KB JSON，runner 写回两处：
+pdf_text artifact_ref；executor 侧直接从 OSS 流式读 text 给 LLM，
+**不**经 runtime）。每次 LLM 输出 1–3KB JSON，executor 写回两处：
 （a）`session_tool_outputs` 新 1 行 `tool_name='llm_extract_
 findings'`，preview 300 字符只含 `{paper_title, main_method, main_
 dataset, top_benchmark}`；（b）`session_state_items` 新 50 条
@@ -273,7 +273,7 @@ LLM 回答的首句。
 benchmark 一个数字）。agent 识别需要走 **按需 raw 切片加载**：
 对 T6 已经定位的 6 篇 LoRA 论文，逐篇做 `pdf_text_section_read`
 工具调用（input=artifact_ref + section_hint='benchmark|results|
-evaluation'），runner 侧用正则切出 benchmark 表格部分（每篇
+evaluation'），executor 侧用正则切出 benchmark 表格部分（每篇
 ~3–8KB），写入 `session_tool_outputs` 6 行新 tool 调用，preview
 300 字符结构化 `{paper_id, benchmark_name, scores:{em:0.78,
 f1:0.82, rouge:0.65}}`（schema `preview_template='benchmark_slice.
@@ -355,7 +355,7 @@ OSS presigned URL，API server 不流式代理。
 `tool_previews` 500 / `retrieved_facts` 600 / `plan_todo` 80（全 done）
 / `summary` 500 / `recent_tail` 800。总 ≈ 4600。
 
-**LLM 看不到**：final markdown 全文（runner 侧生成）；任何 PDF。
+**LLM 看不到**：final markdown 全文（executor 侧生成）；任何 PDF。
 
 ## 4. 上下文压力点
 
@@ -408,7 +408,7 @@ OSS presigned URL，API server 不流式代理。
 | `context_manifests` | ~45 行 | — | 每轮一条 |
 
 **关键不变量**：全过程 API server 进程 RSS 峰值涨幅 < 150MB（所
-有 raw 流量都在 runner↔OSS 之间）；`content_hash` 在同 URL 重
+有 raw 流量都在 executor↔OSS 之间）；`content_hash` 在同 URL 重
 抓、同 PDF 重解析时稳定（规范化剔除下载时间戳）；`session_state_
 items(finding)` 50 条在 T10 compaction 后**条数不变**。
 
@@ -507,7 +507,7 @@ mirror 到本项目 OSS，6 个月后某 URL 失效，T11 撰写需要回核时
 `session_artifacts` 的 `raw_ref` 域名分布出现 `arxiv.org` /
 `huggingface.co` 等外部域；`HEAD` 检测出现 404。**缓解**：
 artifact 写入必须强制 mirror 到项目 OSS（`raw_ref` 只能是本项目
-OSS bucket），fetch_url runner 负责下载 + 上传；外部 URL 仅作
+OSS bucket），fetch_url executor 负责下载 + 上传；外部 URL 仅作
 `source_url` 元数据留档。
 
 **F5 · preview_template 版本演进，v1 → v2 字段改名（`authors` →

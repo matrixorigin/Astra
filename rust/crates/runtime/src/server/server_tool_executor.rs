@@ -339,7 +339,7 @@ impl ServerToolExecutor {
     }
 
     /// Public accessor for transport-aware tool execution routing.
-    /// Callers wire edge, runner RPC, gateway relay, and sandbox-resident
+    /// Callers wire edge, gateway relay, and sandbox-resident
     /// agent transports through this handle instead of through
     /// `ServerToolExecutor` thin-setters.
     pub fn tool_execution_service(&mut self) -> &mut ToolExecutionService {
@@ -1664,21 +1664,21 @@ mod tests {
     }
 
     #[test]
-    fn hosted_tool_execution_request_carries_workspace_record() {
+    fn cloud_tool_execution_request_carries_workspace_record() {
         let (mut exec, _dir) = test_executor();
         exec.set_workspace_record(Some(WorkspaceRecord {
             workspace_id: "workspace-run-1".to_string(),
             owner_scope: astra_runtime_env::WorkspaceOwnerScope::Tenant,
             kind: astra_runtime_env::WorkspaceBindingKind::CloudWorkspace,
             authority: astra_runtime_env::WorkspaceAuthority::ReadWrite,
-            root_or_volume_ref: "/hosted/checkouts/workspace-run-1".to_string(),
+            root_or_volume_ref: "/cloud/checkouts/workspace-run-1".to_string(),
             source: astra_runtime_env::WorkspaceSource::GitCheckout {
                 repository: "https://example.com/org/repo.git".to_string(),
                 reference: None,
             },
             persistence: astra_runtime_env::WorkspacePersistence::Session,
             revision: "rev-1".to_string(),
-            display_name: "Hosted checkout".to_string(),
+            display_name: "Cloud checkout".to_string(),
         }));
 
         let request = exec.tool_execution_request(
@@ -1694,7 +1694,7 @@ mod tests {
         assert_eq!(record.workspace_id, "workspace-run-1");
         assert_eq!(
             record.root_or_volume_ref,
-            "/hosted/checkouts/workspace-run-1"
+            "/cloud/checkouts/workspace-run-1"
         );
         assert_eq!(
             record.kind,
@@ -2850,16 +2850,16 @@ esac
         exec.set_execution_bindings(
             WorkspaceBinding {
                 kind: WorkspaceBindingKind::CloudWorkspace,
-                display_name: "Hosted workspace".to_string(),
+                display_name: "Cloud workspace".to_string(),
                 cwd: Some("/checkout/repo".to_string()),
                 authority: WorkspaceAuthority::ReadOnly,
                 fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
             },
             ExecutorBinding {
-                kind: crate::server::tool_transport::ExecutorBindingKind::HostedRunner,
-                executor_id: "runner-1".to_string(),
-                display_name: "Hosted runner".to_string(),
-                transport: ToolTransportKind::RunnerRpc,
+                kind: crate::server::tool_transport::ExecutorBindingKind::OrchestratorManaged,
+                executor_id: "orchestrator:workspace-1".to_string(),
+                display_name: "Orchestrator-managed executor".to_string(),
+                transport: ToolTransportKind::SandboxResidentAgent,
                 status: ExecutorStatus::Online,
             },
         );
@@ -2902,7 +2902,7 @@ esac
             .iter()
             .find(|event| event["type"] == "tool_routing_decision")
             .expect("tool_routing_decision");
-        assert_eq!(routing["route"], "runner_rpc");
+        assert_eq!(routing["route"], "sandbox_resident_agent");
         assert_eq!(routing["call_id"], "call-unsupported-workspace");
 
         let failed = events

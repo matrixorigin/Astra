@@ -3327,7 +3327,12 @@ type Handler interface {
             "start_line": 3,
             "end_line": 1
         }));
-        assert!(result.contains("must be <= `end_line`"), "{result}");
+        assert!(
+            result.contains("start_line must be <= end_line"),
+            "{result}"
+        );
+        assert!(result.contains("Origin: model_argument_error"), "{result}");
+        assert!(result.contains("no file was read"), "{result}");
     }
 
     #[test]

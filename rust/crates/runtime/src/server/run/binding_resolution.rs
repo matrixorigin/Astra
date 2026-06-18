@@ -237,7 +237,7 @@ pub(crate) fn executor_binding_from_request(
         }
         WorkspaceBindingKind::EdgeWorkspace => edge_executor_binding_from_request(binding),
         WorkspaceBindingKind::CloudWorkspace => {
-            hosted_executor_binding_from_request(binding, &workspace.display_name)
+            cloud_executor_binding_from_request(binding, &workspace.display_name)
         }
         WorkspaceBindingKind::None => ExecutorBinding::server_control_plane(),
         WorkspaceBindingKind::Unknown | WorkspaceBindingKind::LocalFilesystem => ExecutorBinding {
@@ -392,16 +392,16 @@ fn edge_executor_binding_from_request(
     executor
 }
 
-fn hosted_executor_binding_from_request(
+fn cloud_executor_binding_from_request(
     binding: Option<&astra_services::runs::ExecutorBindingRequest>,
     workspace_display_name: &str,
 ) -> ExecutorBinding {
     let mut executor = ExecutorBinding {
-        kind: ExecutorBindingKind::HostedRunner,
-        executor_id: "hosted-runner".to_string(),
+        kind: ExecutorBindingKind::OrchestratorManaged,
+        executor_id: "orchestrator-managed".to_string(),
         display_name: workspace_display_name.to_string(),
-        transport: ToolTransportKind::RunnerRpc,
-        status: ExecutorStatus::Unknown,
+        transport: ToolTransportKind::SandboxResidentAgent,
+        status: ExecutorStatus::Online,
     };
     if let Some(binding) = binding {
         executor.kind = executor_kind_from_request(binding.kind);
@@ -463,19 +463,13 @@ fn executor_kind_from_request(
         astra_services::runs::ExecutorBindingRequestKind::EdgeAgent => {
             ExecutorBindingKind::EdgeAgent
         }
+        astra_services::runs::ExecutorBindingRequestKind::OrchestratorManaged => {
+            ExecutorBindingKind::OrchestratorManaged
+        }
         astra_services::runs::ExecutorBindingRequestKind::ThinClient => {
             ExecutorBindingKind::ThinClient
         }
         astra_services::runs::ExecutorBindingRequestKind::Mcp => ExecutorBindingKind::Mcp,
-        astra_services::runs::ExecutorBindingRequestKind::PersonalRunner => {
-            ExecutorBindingKind::PersonalRunner
-        }
-        astra_services::runs::ExecutorBindingRequestKind::HostedRunner => {
-            ExecutorBindingKind::HostedRunner
-        }
-        astra_services::runs::ExecutorBindingRequestKind::EnterpriseRunner => {
-            ExecutorBindingKind::EnterpriseRunner
-        }
     }
 }
 
@@ -488,8 +482,13 @@ fn tool_transport_from_request(
         }
         astra_services::runs::ToolTransportKindRequest::EdgeWs => ToolTransportKind::EdgeWs,
         astra_services::runs::ToolTransportKindRequest::EdgeLedger => ToolTransportKind::EdgeLedger,
+        astra_services::runs::ToolTransportKindRequest::GatewayRelay => {
+            ToolTransportKind::GatewayRelay
+        }
+        astra_services::runs::ToolTransportKindRequest::SandboxResidentAgent => {
+            ToolTransportKind::SandboxResidentAgent
+        }
         astra_services::runs::ToolTransportKindRequest::McpHttp => ToolTransportKind::McpHttp,
-        astra_services::runs::ToolTransportKindRequest::RunnerRpc => ToolTransportKind::RunnerRpc,
     }
 }
 
@@ -628,135 +627,6 @@ mod tests {
             resolve_request_execution_bindings_without_server_workspace(&request, &Map::new())
                 .is_none()
         );
-    }
-
-    #[test]
-    fn request_execution_bindings_preserve_hosted_runner_for_git_source() {
-        let mut request = test_request("review checkout");
-        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace,
-            display_name: Some("Cloud checkout".to_string()),
-            root: Some("/workspace/repo".to_string()),
-            source: Some(astra_services::runs::WorkspaceSourceRequest::GitCheckout {
-                repository: "https://example.com/org/repo.git".to_string(),
-                reference: None,
-            }),
-            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadOnly),
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
-        });
-        request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
-            kind: astra_services::runs::ExecutorBindingRequestKind::HostedRunner,
-            executor_id: Some("runner-1".to_string()),
-            display_name: Some("Hosted runner".to_string()),
-            transport: Some(astra_services::runs::ToolTransportKindRequest::RunnerRpc),
-            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
-        });
-
-        let (workspace, executor) =
-            resolve_request_execution_bindings(&request, Path::new("/tmp/server-workspace"));
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::CloudWorkspace);
-        assert_eq!(workspace.cwd.as_deref(), Some("/workspace/repo"));
-        assert_eq!(workspace.authority, WorkspaceAuthority::ReadOnly);
-        assert_eq!(executor.kind, ExecutorBindingKind::HostedRunner);
-        assert_eq!(executor.executor_id, "runner-1");
-        assert_eq!(executor.transport, ToolTransportKind::RunnerRpc);
-        assert_eq!(executor.status, ExecutorStatus::Online);
-    }
-
-    #[test]
-    fn request_execution_bindings_preserve_hosted_runner_for_cloud_workspace() {
-        let mut request = test_request("work in cloud volume");
-        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace,
-            display_name: Some("Team workspace".to_string()),
-            root: Some("/workspace/team".to_string()),
-            source: Some(
-                astra_services::runs::WorkspaceSourceRequest::PersistentVolume {
-                    volume_id: "team-volume-1".to_string(),
-                },
-            ),
-            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
-        });
-        request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
-            kind: astra_services::runs::ExecutorBindingRequestKind::HostedRunner,
-            executor_id: Some("runner-1".to_string()),
-            display_name: Some("Hosted runner".to_string()),
-            transport: Some(astra_services::runs::ToolTransportKindRequest::RunnerRpc),
-            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
-        });
-
-        let (workspace, executor) =
-            resolve_request_execution_bindings(&request, Path::new("/tmp/server-workspace"));
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::CloudWorkspace);
-        assert_eq!(workspace.cwd.as_deref(), Some("/workspace/team"));
-        assert_eq!(workspace.authority, WorkspaceAuthority::ReadWrite);
-        assert_eq!(executor.kind, ExecutorBindingKind::HostedRunner);
-        assert_eq!(executor.executor_id, "runner-1");
-        assert_eq!(executor.transport, ToolTransportKind::RunnerRpc);
-        assert_eq!(executor.status, ExecutorStatus::Online);
-    }
-
-    #[test]
-    fn request_execution_bindings_preserve_personal_runner_kind() {
-        let mut request = test_request("work through personal runner");
-        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace,
-            display_name: Some("Personal workspace".to_string()),
-            root: Some("/workspace/personal".to_string()),
-            source: Some(astra_services::runs::WorkspaceSourceRequest::Scratch),
-            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadOnly),
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
-        });
-        request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
-            kind: astra_services::runs::ExecutorBindingRequestKind::PersonalRunner,
-            executor_id: Some("personal-runner-1".to_string()),
-            display_name: Some("Personal runner".to_string()),
-            transport: Some(astra_services::runs::ToolTransportKindRequest::RunnerRpc),
-            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
-        });
-
-        let (workspace, executor) =
-            resolve_request_execution_bindings(&request, Path::new("/tmp/server-workspace"));
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::CloudWorkspace);
-        assert_eq!(workspace.cwd.as_deref(), Some("/workspace/personal"));
-        assert_eq!(executor.kind, ExecutorBindingKind::PersonalRunner);
-        assert_eq!(executor.executor_id, "personal-runner-1");
-        assert_eq!(executor.transport, ToolTransportKind::RunnerRpc);
-        assert_eq!(executor.status, ExecutorStatus::Online);
-    }
-
-    #[test]
-    fn request_execution_bindings_preserve_enterprise_runner_kind() {
-        let mut request = test_request("work through enterprise runner");
-        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace,
-            display_name: Some("Team workspace".to_string()),
-            root: Some("/workspace/team".to_string()),
-            source: Some(astra_services::runs::WorkspaceSourceRequest::Scratch),
-            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
-        });
-        request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
-            kind: astra_services::runs::ExecutorBindingRequestKind::EnterpriseRunner,
-            executor_id: Some("enterprise-runner-1".to_string()),
-            display_name: Some("Enterprise runner".to_string()),
-            transport: Some(astra_services::runs::ToolTransportKindRequest::RunnerRpc),
-            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
-        });
-
-        let (workspace, executor) =
-            resolve_request_execution_bindings(&request, Path::new("/tmp/server-workspace"));
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::CloudWorkspace);
-        assert_eq!(workspace.cwd.as_deref(), Some("/workspace/team"));
-        assert_eq!(executor.kind, ExecutorBindingKind::EnterpriseRunner);
-        assert_eq!(executor.executor_id, "enterprise-runner-1");
-        assert_eq!(executor.transport, ToolTransportKind::RunnerRpc);
-        assert_eq!(executor.status, ExecutorStatus::Online);
     }
 
     #[test]

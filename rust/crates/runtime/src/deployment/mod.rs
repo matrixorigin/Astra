@@ -123,7 +123,7 @@ pub struct ProviderConfig {
     pub capabilities: Vec<ToolCapability>,
     /// Routing priority (lower = preferred).
     pub priority: u8,
-    /// Optional sandbox configuration (only for SandboxRunner kind).
+    /// Optional sandbox configuration (only for SandboxRuntime kind).
     pub sandbox: Option<SandboxConfig>,
 }
 
@@ -292,7 +292,7 @@ impl DeploymentProfile {
                         )
                         .await?;
                 }
-                // Other provider kinds (EdgeConnection, SandboxRunner, McpServer)
+                // Other provider kinds (EdgeConnection, SandboxRuntime, McpServer)
                 // require their own runtime dependencies and are wired in L2+.
                 _ => {
                     tracing::warn!(

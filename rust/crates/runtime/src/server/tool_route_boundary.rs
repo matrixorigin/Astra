@@ -105,11 +105,6 @@ pub(crate) fn route_binding_event_fields(
         ToolExecutionRouteKind::RequestScopedMcp => {
             Some(request_scoped_mcp_event_fields(&request.workspace))
         }
-        ToolExecutionRouteKind::RunnerRpc => Some(delivered_binding_event_fields(
-            &request.workspace,
-            &request.executor,
-            ToolTransportKind::RunnerRpc,
-        )),
         ToolExecutionRouteKind::GatewayRelay | ToolExecutionRouteKind::SandboxResidentAgent => {
             Some(binding_event_fields(&request.workspace, &request.executor))
         }

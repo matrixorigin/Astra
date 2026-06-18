@@ -150,7 +150,7 @@ async fn build_test_router_keeps_core_routes_reachable_for_oneshot_tests() {
         ),
     )
     .await;
-    assert_ne!(runners, StatusCode::NOT_FOUND);
+    assert_eq!(runners, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

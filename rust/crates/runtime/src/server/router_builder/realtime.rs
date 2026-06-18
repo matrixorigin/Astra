@@ -228,25 +228,4 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             "/agents/edge",
             post(edge::edge_callback_handlers::post_agents_edge_register_handler),
         )
-        .route(
-            "/runners/register",
-            post(runner_pool::post_runner_register_handler),
-        )
-        .route(
-            "/runners/operator/register",
-            post(runner_pool::post_runner_operator_register_handler),
-        )
-        .route(
-            "/runners/heartbeat",
-            post(runner_pool::post_runner_heartbeat_handler),
-        )
-        .route(
-            "/runners/operator/heartbeat",
-            post(runner_pool::post_runner_operator_heartbeat_handler),
-        )
-        .route("/runners", get(runner_pool::list_runners_handler))
-        .route(
-            "/runners/schedule",
-            post(runner_pool::post_runner_schedule_handler),
-        )
 }

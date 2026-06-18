@@ -1137,7 +1137,7 @@ OpenShell 在不同集成模式下占据**不同层**：
 | 层                | Astra 原生                | OpenShell 替代                              |
 | ----------------- | ------------------------- | ------------------------------------------- |
 | 策略引擎          | ✅ 自有                   | ✅ OpenShell Policy Gateway（更强）         |
-| Sandbox Manager   | ✅ 自有（runner-manager） | ✅ OpenShell Gateway                        |
+| Sandbox Manager   | ✅ 自有（orchestrator/runtime adapter） | ✅ OpenShell Gateway                        |
 | Launch Driver     | ✅ Docker/containerd      | ✅ OpenShell Gateway（封装）                |
 | Isolation Backend | ✅ gVisor/runc 直接调用   | ✅ OpenShell 内部选择（gVisor/MXC/MicroVM） |
 | 审计证据          | ✅ 自有收集               | ✅ OpenShell 审计 + Astra 互补              |
@@ -1151,7 +1151,7 @@ OpenShell 在不同集成模式下占据**不同层**：
 │  策略引擎 · 能力注册 · Agent 编排        │
 │  执行路由器                              │
 └──────────────────┬───────────────────────┘
-                   │ RunnerRpc / OpenShell API
+                   │ sandbox resident agent / OpenShell API
                    ▼
 ┌──────────────────────────────────────────┐
 │        OpenShell Gateway                 │
@@ -1170,7 +1170,7 @@ OpenShell 在不同集成模式下占据**不同层**：
                    │
                    ▼
 ┌──────────────────────────────────────────┐
-│     Astra Runner (沙箱内进程)             │
+│     Astra Resident Agent (沙箱内进程)     │
 │  接收工具调用，执行，返回结果 + 证据       │
 └──────────────────────────────────────────┘
 ```
@@ -1629,7 +1629,7 @@ export ASTRA_AUDIT_RETENTION_DAYS=90
   策略检查         < 1ms  (内存操作)
   执行器路由       < 1ms  (内存操作)
   沙箱分配         < 5ms  (从预热池获取)
-  RunnerRpc 传输   < 2ms  (本地 Unix socket / gRPC)
+  Resident-agent 传输 < 2ms  (本地 Unix socket / gRPC)
   工具执行         N ms   (取决于工具本身)
   证据收集         < 1ms
   ─────────────────────────

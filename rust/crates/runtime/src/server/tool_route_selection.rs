@@ -12,7 +12,6 @@ pub enum ToolExecutionRouteKind {
     ServerControlPlane,
     ServerRuntime,
     EdgeBound,
-    RunnerRpc,
     GatewayRelay,
     SandboxResidentAgent,
     RequestScopedMcp,
@@ -26,22 +25,12 @@ impl ToolExecutionRouteKind {
             Self::ServerControlPlane => "server_control_plane",
             Self::ServerRuntime => "server_runtime",
             Self::EdgeBound => "edge_bound",
-            Self::RunnerRpc => "runner_rpc",
             Self::GatewayRelay => "gateway_relay",
             Self::SandboxResidentAgent => "sandbox_resident_agent",
             Self::RequestScopedMcp => "request_scoped_mcp",
             Self::Unsupported => "unsupported",
         }
     }
-}
-
-fn is_runner_rpc_executor(kind: ExecutorBindingKind) -> bool {
-    matches!(
-        kind,
-        ExecutorBindingKind::PersonalRunner
-            | ExecutorBindingKind::HostedRunner
-            | ExecutorBindingKind::EnterpriseRunner
-    )
 }
 
 /// Fallback routing via hardcoded tool-name matching.
@@ -67,11 +56,6 @@ pub(crate) fn routing_decision(request: &ToolExecutionRequest) -> ToolExecutionR
     }
     if is_server_runtime_tool(&request.tool_name) {
         return ToolExecutionRouteKind::ServerRuntime;
-    }
-    if is_runner_rpc_executor(request.executor.kind)
-        && matches!(request.executor.transport, ToolTransportKind::RunnerRpc)
-    {
-        return ToolExecutionRouteKind::RunnerRpc;
     }
     if matches!(request.executor.transport, ToolTransportKind::GatewayRelay) {
         return ToolExecutionRouteKind::GatewayRelay;

@@ -1430,15 +1430,52 @@ function executorBindingFromEvent(
   const executor = event.executor;
   if (!executor || typeof executor !== "object") return undefined;
   const raw = executor as Record<string, unknown>;
-  const kind = stringField(raw, "kind");
+  const kind = normalizeExecutorKind(stringField(raw, "kind"));
   if (!kind) return undefined;
   return {
     kind,
     executor_id: stringField(raw, "executor_id"),
     display_name: stringField(raw, "display_name"),
-    transport: stringField(raw, "transport"),
+    transport: normalizeExecutorTransport(stringField(raw, "transport")),
     status: stringField(raw, "status"),
   };
+}
+
+function normalizeExecutorKind(
+  value: string | undefined,
+): ExecutorBinding["kind"] | undefined {
+  switch (value) {
+    case "server_local":
+    case "edge_agent":
+    case "orchestrator_managed":
+    case "thin_client":
+    case "mcp":
+    case "unknown":
+      return value;
+    case undefined:
+      return undefined;
+    default:
+      return "unknown";
+  }
+}
+
+function normalizeExecutorTransport(
+  value: string | undefined,
+): ExecutorBinding["transport"] | undefined {
+  switch (value) {
+    case "server_local":
+    case "edge_ws":
+    case "edge_ledger":
+    case "gateway_relay":
+    case "sandbox_resident_agent":
+    case "mcp_http":
+    case "unknown":
+      return value;
+    case undefined:
+      return undefined;
+    default:
+      return "unknown";
+  }
 }
 
 function toolBindingFields(

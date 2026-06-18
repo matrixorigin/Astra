@@ -340,19 +340,19 @@ describe("AstraClient — Runs", () => {
       events_count: 7,
       workspace: {
         kind: "git_checkout",
-        display_name: "Hosted checkout",
+        display_name: "Cloud checkout",
         cwd: "/checkout/repo",
         authority: "read_only",
         fallback_policy: "disabled",
       },
       executor: {
-        kind: "hosted_runner",
-        executor_id: "runner-1",
-        display_name: "Hosted runner",
-        transport: "runner_rpc",
+        kind: "orchestrator_managed",
+        executor_id: "orchestrator-managed",
+        display_name: "Orchestrator-managed executor",
+        transport: "sandbox_resident_agent",
         status: "degraded",
       },
-      transport: "runner_rpc",
+      transport: "sandbox_resident_agent",
       fallback_policy: "disabled",
     });
 
@@ -361,7 +361,7 @@ describe("AstraClient — Runs", () => {
     expect(result.waitingFor).toBe("workspace_executor_unavailable");
     expect(result.workspace?.kind).toBe("git_checkout");
     expect(result.executor?.status).toBe("degraded");
-    expect(result.transport).toBe("runner_rpc");
+    expect(result.transport).toBe("sandbox_resident_agent");
     expect(result.fallbackPolicy).toBe("disabled");
   });
 

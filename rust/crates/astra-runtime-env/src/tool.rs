@@ -878,7 +878,7 @@ mod tests {
         let registry = registry();
         let binding = RunBinding::resolve(
             WorkspaceBinding::cloud_workspace("/repo", WorkspaceAuthority::ReadOnly),
-            ExecutorBinding::hosted_runner("review-runner"),
+            ExecutorBinding::orchestrator_managed("orchestrator:review"),
             RuntimeBinding::host_process("review-runtime"),
             PolicyIntent::read_only_review(),
             &registry,
@@ -912,7 +912,7 @@ mod tests {
         let registry = registry();
         let binding = RunBinding::resolve(
             WorkspaceBinding::cloud_workspace("/snapshot", WorkspaceAuthority::ReadOnly),
-            ExecutorBinding::hosted_runner("snapshot-runner"),
+            ExecutorBinding::orchestrator_managed("orchestrator:snapshot"),
             RuntimeBinding::none(),
             PolicyIntent::read_only_review(),
             &registry,
@@ -938,9 +938,9 @@ mod tests {
                 authority: WorkspaceAuthority::ReadWrite,
                 persistent: true,
             },
-            ExecutorBinding::hosted_runner("runner"),
+            ExecutorBinding::orchestrator_managed("orchestrator:workspace"),
             RuntimeBinding::oci_container("runtime"),
-            PolicyIntent::strict_runner(),
+            PolicyIntent::strict_orchestrator(),
             &registry,
         );
 
@@ -959,7 +959,7 @@ mod tests {
         let registry = registry();
         let binding = RunBinding::resolve(
             WorkspaceBinding::cloud_workspace("/workspace", WorkspaceAuthority::ReadWrite),
-            ExecutorBinding::hosted_runner("runner"),
+            ExecutorBinding::orchestrator_managed("orchestrator:workspace"),
             RuntimeBinding {
                 session_manager: crate::RuntimeSessionManager::Unknown,
                 isolation_backend: crate::RuntimeIsolationBackend::OciRuntime,
@@ -971,7 +971,7 @@ mod tests {
                 supports_long_sessions: true,
                 interaction_channels: Vec::new(),
             },
-            PolicyIntent::strict_runner(),
+            PolicyIntent::strict_orchestrator(),
             &registry,
         );
 
@@ -991,14 +991,14 @@ mod tests {
         let binding = RunBinding::resolve(
             WorkspaceBinding::cloud_workspace("/workspace", WorkspaceAuthority::ReadWrite),
             ExecutorBinding {
-                kind: crate::ExecutorBindingKind::HostedRunner,
-                executor_id: "runner".to_string(),
-                display_name: "Runner".to_string(),
+                kind: crate::ExecutorBindingKind::EdgeAgent,
+                executor_id: "edge".to_string(),
+                display_name: "Edge".to_string(),
                 transport: crate::ToolTransportKind::Unknown,
                 status: crate::ExecutorStatus::Online,
             },
             RuntimeBinding::oci_container("runtime"),
-            PolicyIntent::strict_runner(),
+            PolicyIntent::strict_orchestrator(),
             &registry,
         );
 
@@ -1013,17 +1013,21 @@ mod tests {
     }
 
     #[test]
-    fn read_only_snapshot_helper_exposes_reads_through_hosted_oci_runtime() {
+    fn read_only_snapshot_helper_exposes_reads_through_orchestrator_runtime() {
         let registry = registry();
         let binding = RunBinding::read_only_snapshot("/snapshot", &registry);
 
         assert_eq!(
             binding.runtime.session_manager,
-            crate::RuntimeSessionManager::AstraManaged
+            crate::RuntimeSessionManager::ProviderManaged
         );
         assert_eq!(
             binding.runtime.isolation_backend,
-            crate::RuntimeIsolationBackend::OciRuntime
+            crate::RuntimeIsolationBackend::ProviderManaged
+        );
+        assert_eq!(
+            binding.runtime.launch_driver,
+            crate::RuntimeLaunchDriver::Kubernetes
         );
         for tool in ["read_file", "list_dir", "grep", "glob", "git"] {
             assert!(
@@ -1044,9 +1048,9 @@ mod tests {
         let registry = registry();
         let binding = RunBinding::resolve(
             WorkspaceBinding::cloud_workspace("/repo", WorkspaceAuthority::ReadWrite),
-            ExecutorBinding::hosted_runner("gpu-runner"),
+            ExecutorBinding::orchestrator_managed("orchestrator:gpu"),
             RuntimeBinding::nvidia_openshell("openshell"),
-            PolicyIntent::strict_runner(),
+            PolicyIntent::strict_orchestrator(),
             &registry,
         );
 
@@ -1081,7 +1085,7 @@ mod tests {
         let registry = registry();
         let binding = RunBinding::resolve(
             WorkspaceBinding::cloud_workspace("/repo", WorkspaceAuthority::ReadOnly),
-            ExecutorBinding::hosted_runner("review-runner"),
+            ExecutorBinding::orchestrator_managed("orchestrator:review"),
             RuntimeBinding::host_process("review-runtime"),
             PolicyIntent::read_only_review(),
             &registry,

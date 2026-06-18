@@ -818,7 +818,7 @@ mod tests {
                     "data": {
                         "reason": "route_mismatch",
                         "workspace": {"kind": "cloud_workspace"},
-                        "executor": {"kind": "hosted_runner", "status": "degraded"}
+                        "executor": {"kind": "orchestrator_managed", "status": "degraded"}
                     },
                     "index": 6
                 }),
@@ -851,7 +851,7 @@ mod tests {
                 "run_id": "run-123",
                 "reason": "route_mismatch",
                 "workspace": {"kind": "cloud_workspace"},
-                "executor": {"kind": "hosted_runner", "status": "degraded"},
+                "executor": {"kind": "orchestrator_managed", "status": "degraded"},
                 "index": 6
             })
         );

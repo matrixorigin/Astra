@@ -36,85 +36,33 @@ struct CommandResult {
 /// Interpret exit code based on the command that produced it.
 /// Extracts the *last* command in a pipeline (that's what determines the exit code).
 fn interpret_exit_code(command: &str, code: i32) -> CommandResult {
-    let base = last_pipeline_command(command);
-    match base {
-        // grep/rg: 0=matches, 1=no matches, 2+=error
-        "grep" | "rg" | "ag" | "ack" => match code {
-            0 => CommandResult {
-                is_error: false,
-                note: None,
-            },
-            1 => CommandResult {
-                is_error: false,
-                note: Some("No matches found"),
-            },
-            _ => CommandResult {
-                is_error: true,
-                note: None,
-            },
+    match astra_tools::exit_semantics::classify_exit(command, code) {
+        astra_tools::exit_semantics::ExitSemantics::Success
+        | astra_tools::exit_semantics::ExitSemantics::DomainNegative => CommandResult {
+            is_error: false,
+            note: None,
         },
-        // diff: 0=identical, 1=differences, 2+=error
-        "diff" => match code {
-            0 | 1 => CommandResult {
-                is_error: false,
-                note: None,
-            },
-            _ => CommandResult {
-                is_error: true,
-                note: None,
-            },
+        astra_tools::exit_semantics::ExitSemantics::InformationalFailure => CommandResult {
+            is_error: false,
+            note: Some(informational_failure_note(command)),
         },
-        // test/[: 0=true, 1=false, 2+=error
-        "test" | "[" => match code {
-            0 | 1 => CommandResult {
-                is_error: false,
-                note: None,
-            },
-            _ => CommandResult {
-                is_error: true,
-                note: None,
-            },
-        },
-        // find: 0=ok, 1=partial (some dirs inaccessible), 2+=error
-        "find" | "fd" => match code {
-            0 | 1 => CommandResult {
-                is_error: false,
-                note: None,
-            },
-            _ => CommandResult {
-                is_error: true,
-                note: None,
-            },
-        },
-        // pkill/pgrep/killall: 0=matched, 1=no match, 2=syntax error, 3=fatal
-        "pkill" | "pgrep" | "killall" => match code {
-            0 => CommandResult {
-                is_error: false,
-                note: None,
-            },
-            1 => CommandResult {
-                is_error: false,
-                note: Some("No processes matched"),
-            },
-            _ => CommandResult {
-                is_error: true,
-                note: None,
-            },
-        },
-        // Default: only 0 is success
-        _ => CommandResult {
-            is_error: code != 0,
+        astra_tools::exit_semantics::ExitSemantics::TimedOut
+        | astra_tools::exit_semantics::ExitSemantics::Cancelled
+        | astra_tools::exit_semantics::ExitSemantics::Signaled
+        | astra_tools::exit_semantics::ExitSemantics::ExecutionError => CommandResult {
+            is_error: true,
             note: None,
         },
     }
 }
 
-/// Extract the base command name from the last segment of a pipeline.
-fn last_pipeline_command(command: &str) -> &str {
-    astra_tools::exit_semantics::last_pipeline_segment(command)
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
+fn informational_failure_note(command: &str) -> &'static str {
+    let family = astra_tools::exit_semantics::command_family(command);
+    if matches!(family.as_deref(), Some("pgrep" | "pkill" | "killall")) {
+        "No processes matched"
+    } else {
+        "No matches found"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4116,8 +4064,13 @@ impl ToolExecutor {
 
     fn prepare_bash_invocation(&self, args: &Value) -> Result<(String, f64), String> {
         let command = match args.get("command").and_then(Value::as_str) {
-            Some(c) => c,
-            None => return Err("Error: missing 'command'".to_string()),
+            Some(c) if !c.trim().is_empty() => c,
+            _ => {
+                return Err("Error: missing required field `command` for bash. \
+                     Origin: model_argument_error; no command was run. \
+                     Next: retry with a JSON object like {\"command\":\"pwd\"}."
+                    .to_string());
+            }
         };
         astra_tools::shell_ops::validate_bash_background_task_contract(command)?;
 
@@ -4467,8 +4420,13 @@ impl ToolExecutor {
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> String {
         let command = match args.get("command").and_then(Value::as_str) {
-            Some(c) => c,
-            None => return "Error: missing 'command'".to_string(),
+            Some(c) if !c.trim().is_empty() => c,
+            _ => {
+                return "Error: missing required field `command` for powershell. \
+                        Origin: model_argument_error; no command was run. \
+                        Next: retry with a JSON object like {\"command\":\"Get-Location\"}."
+                    .to_string();
+            }
         };
         let timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0);
 
@@ -5147,6 +5105,23 @@ mod tests {
         let executor = test_executor();
         let result = executor.bash(&serde_json::json!({}));
         assert!(result.contains("Error"), "got: {result}");
+        assert!(
+            result.contains("Origin: model_argument_error"),
+            "got: {result}"
+        );
+        assert!(result.contains("no command was run"), "got: {result}");
+    }
+
+    #[test]
+    fn bash_blank_command_returns_model_argument_error() {
+        let executor = test_executor();
+        let result = executor.bash(&serde_json::json!({"command": " \n\t "}));
+        assert!(result.contains("Error"), "got: {result}");
+        assert!(
+            result.contains("Origin: model_argument_error"),
+            "got: {result}"
+        );
+        assert!(result.contains("no command was run"), "got: {result}");
     }
 
     #[test]
@@ -5492,6 +5467,11 @@ mod tests {
         let executor = test_executor();
         let result = executor.powershell(&serde_json::json!({}));
         assert!(result.contains("Error"), "got: {result}");
+        assert!(
+            result.contains("Origin: model_argument_error"),
+            "got: {result}"
+        );
+        assert!(result.contains("no command was run"), "got: {result}");
     }
 
     #[test]
@@ -7889,6 +7869,24 @@ mod tests {
                 1,
                 false,
                 Some("No matches found"),
+            ),
+            (
+                "cd /work/repo && grep -n missing src/main.rs",
+                1,
+                false,
+                Some("No matches found"),
+            ),
+            (
+                "pgrep missing-process-name",
+                1,
+                false,
+                Some("No processes matched"),
+            ),
+            (
+                "cd /work/repo && pgrep missing-process-name",
+                1,
+                false,
+                Some("No processes matched"),
             ),
             ("cargo build", 1, true, None),
         ];

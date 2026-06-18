@@ -156,10 +156,8 @@ impl EffectiveCapabilitySet {
                         executor.kind,
                         ExecutorBindingKind::ServerRuntime
                             | ExecutorBindingKind::LocalCli
-                            | ExecutorBindingKind::PersonalRunner
                             | ExecutorBindingKind::EdgeAgent
-                            | ExecutorBindingKind::HostedRunner
-                            | ExecutorBindingKind::EnterpriseRunner
+                            | ExecutorBindingKind::OrchestratorManaged
                     ),
                 mcp_executor: executor_reachable
                     && executor_transport_known

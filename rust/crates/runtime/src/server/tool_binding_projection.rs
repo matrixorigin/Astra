@@ -142,17 +142,11 @@ fn runtime_env_executor_binding(
                 astra_runtime_env::ExecutorBindingKind::ServerRuntime
             }
             ExecutorBindingKind::EdgeAgent => astra_runtime_env::ExecutorBindingKind::EdgeAgent,
+            ExecutorBindingKind::OrchestratorManaged => {
+                astra_runtime_env::ExecutorBindingKind::OrchestratorManaged
+            }
             ExecutorBindingKind::ThinClient => astra_runtime_env::ExecutorBindingKind::ControlPlane,
             ExecutorBindingKind::Mcp => astra_runtime_env::ExecutorBindingKind::RequestScopedMcp,
-            ExecutorBindingKind::PersonalRunner => {
-                astra_runtime_env::ExecutorBindingKind::PersonalRunner
-            }
-            ExecutorBindingKind::HostedRunner => {
-                astra_runtime_env::ExecutorBindingKind::HostedRunner
-            }
-            ExecutorBindingKind::EnterpriseRunner => {
-                astra_runtime_env::ExecutorBindingKind::EnterpriseRunner
-            }
             ExecutorBindingKind::Unknown => astra_runtime_env::ExecutorBindingKind::Unknown,
         }
     };
@@ -166,7 +160,6 @@ fn runtime_env_executor_binding(
             ToolTransportKind::EdgeWs => astra_runtime_env::ToolTransportKind::EdgeWebSocket,
             ToolTransportKind::EdgeLedger => astra_runtime_env::ToolTransportKind::EdgeLedger,
             ToolTransportKind::McpHttp => astra_runtime_env::ToolTransportKind::McpHttp,
-            ToolTransportKind::RunnerRpc => astra_runtime_env::ToolTransportKind::RunnerRpc,
             ToolTransportKind::GatewayRelay => astra_runtime_env::ToolTransportKind::GatewayRelay,
             ToolTransportKind::SandboxResidentAgent => {
                 astra_runtime_env::ToolTransportKind::SandboxResidentAgent
@@ -226,11 +219,10 @@ fn runtime_env_runtime_binding(
             astra_runtime_env::RuntimeSessionManager::HostProcess,
             astra_runtime_env::RuntimeIsolationBackend::HostProcess,
         ),
-        ExecutorBindingKind::PersonalRunner
-        | ExecutorBindingKind::HostedRunner
-        | ExecutorBindingKind::EnterpriseRunner => {
-            return astra_runtime_env::RuntimeBinding::none();
-        }
+        ExecutorBindingKind::OrchestratorManaged => (
+            astra_runtime_env::RuntimeSessionManager::ProviderManaged,
+            astra_runtime_env::RuntimeIsolationBackend::ProviderManaged,
+        ),
         ExecutorBindingKind::ThinClient | ExecutorBindingKind::Mcp => (
             astra_runtime_env::RuntimeSessionManager::None,
             astra_runtime_env::RuntimeIsolationBackend::None,
@@ -253,11 +245,10 @@ fn runtime_env_runtime_binding(
         launch_driver: match executor.kind {
             ExecutorBindingKind::ServerLocal => astra_runtime_env::RuntimeLaunchDriver::InProcess,
             ExecutorBindingKind::EdgeAgent => astra_runtime_env::RuntimeLaunchDriver::HostService,
-            ExecutorBindingKind::PersonalRunner
-            | ExecutorBindingKind::HostedRunner
-            | ExecutorBindingKind::EnterpriseRunner => {
-                astra_runtime_env::RuntimeLaunchDriver::RunnerRpc
+            ExecutorBindingKind::OrchestratorManaged => {
+                astra_runtime_env::RuntimeLaunchDriver::Kubernetes
             }
+            ExecutorBindingKind::ThinClient => astra_runtime_env::RuntimeLaunchDriver::InProcess,
             _ => astra_runtime_env::RuntimeLaunchDriver::Unknown,
         },
         runtime_id: format!("runtime:{}", executor.executor_id),

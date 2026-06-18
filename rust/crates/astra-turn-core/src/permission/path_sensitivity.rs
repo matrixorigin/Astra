@@ -271,11 +271,11 @@ const SHELL_MUTATING_VERBS: &[&str] = &[
 /// leading verb mutates its file arguments.
 fn segment_has_mutating_verb(command: &str, pos: usize, candidate: &str) -> bool {
     let seg_start = command[..pos]
-        .rfind(|c| matches!(c, '|' | ';' | '\n' | '&'))
+        .rfind(['|', ';', '\n', '&'])
         .map(|i| i + 1)
         .unwrap_or(0);
     let seg_end = command[pos..]
-        .find(|c| matches!(c, '|' | ';' | '\n' | '&'))
+        .find(['|', ';', '\n', '&'])
         .map(|i| pos + i)
         .unwrap_or(command.len());
     let segment = &command[seg_start..seg_end];

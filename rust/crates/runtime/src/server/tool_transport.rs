@@ -17,7 +17,6 @@ pub(crate) use super::tool_route_boundary::{
     tool_transport_finished_event,
 };
 pub use super::tool_route_selection::ToolExecutionRouteKind;
-pub use super::tool_runner_rpc::RunnerRpcTransport;
 pub use super::tool_transport_metadata::{
     RUN_BLOCKED_REASON_EXECUTOR_OFFLINE, RUN_BLOCKED_REASON_FALLBACK_DISABLED,
     RUN_BLOCKED_REASON_ROUTE_MISMATCH, RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED,
