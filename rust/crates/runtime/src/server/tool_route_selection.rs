@@ -68,11 +68,127 @@ pub(crate) fn routing_decision(request: &ToolExecutionRequest) -> ToolExecutionR
     }
     match request.workspace.kind {
         WorkspaceBindingKind::EdgeWorkspace => return ToolExecutionRouteKind::EdgeBound,
-        WorkspaceBindingKind::ServerSandbox => return ToolExecutionRouteKind::ServerLocal,
+        WorkspaceBindingKind::ServerSandbox | WorkspaceBindingKind::LocalFilesystem => {
+            return ToolExecutionRouteKind::ServerLocal;
+        }
         WorkspaceBindingKind::CloudWorkspace
         | WorkspaceBindingKind::None
-        | WorkspaceBindingKind::Unknown
-        | WorkspaceBindingKind::LocalFilesystem => {}
+        | WorkspaceBindingKind::Unknown => {}
     }
     ToolExecutionRouteKind::Unsupported
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::tool_execution_binding::*;
+    use serde_json::json;
+
+    fn make_request(
+        tool_name: &str,
+        ws_kind: WorkspaceBindingKind,
+        transport: ToolTransportKind,
+    ) -> ToolExecutionRequest {
+        ToolExecutionRequest {
+            user_id: "test".to_string(),
+            run_id: "run-1".to_string(),
+            session_id: "session-1".to_string(),
+            tool_call_id: "call-1".to_string(),
+            tool_name: tool_name.to_string(),
+            args: json!({}),
+            executor: ExecutorBinding {
+                kind: ExecutorBindingKind::ServerLocal,
+                executor_id: String::new(),
+                display_name: String::new(),
+                transport,
+                status: ExecutorStatus::Online,
+            },
+            workspace: WorkspaceBinding {
+                kind: ws_kind,
+                display_name: String::new(),
+                cwd: None,
+                authority: WorkspaceAuthority::ReadWrite,
+                fallback_policy: FallbackPolicy::Disabled,
+            },
+            workspace_record: None,
+            runtime: None,
+            policy: ToolPolicySnapshot::default(),
+        }
+    }
+
+    #[test]
+    fn local_filesystem_routes_to_server_local() {
+        let req = make_request(
+            "bash",
+            WorkspaceBindingKind::LocalFilesystem,
+            ToolTransportKind::ServerLocal,
+        );
+        assert_eq!(routing_decision(&req), ToolExecutionRouteKind::ServerLocal);
+    }
+
+    #[test]
+    fn server_sandbox_routes_to_server_local() {
+        let req = make_request(
+            "bash",
+            WorkspaceBindingKind::ServerSandbox,
+            ToolTransportKind::ServerLocal,
+        );
+        assert_eq!(routing_decision(&req), ToolExecutionRouteKind::ServerLocal);
+    }
+
+    #[test]
+    fn edge_workspace_routes_to_edge_bound() {
+        let req = make_request(
+            "bash",
+            WorkspaceBindingKind::EdgeWorkspace,
+            ToolTransportKind::ServerLocal,
+        );
+        assert_eq!(routing_decision(&req), ToolExecutionRouteKind::EdgeBound);
+    }
+
+    #[test]
+    fn mcp_prefix_routes_to_request_scoped_mcp() {
+        let req = make_request(
+            "mcp__foo",
+            WorkspaceBindingKind::None,
+            ToolTransportKind::ServerLocal,
+        );
+        assert_eq!(
+            routing_decision(&req),
+            ToolExecutionRouteKind::RequestScopedMcp
+        );
+    }
+
+    #[test]
+    fn gateway_relay_transport_routes_to_gateway_relay() {
+        let req = make_request(
+            "bash",
+            WorkspaceBindingKind::None,
+            ToolTransportKind::GatewayRelay,
+        );
+        assert_eq!(routing_decision(&req), ToolExecutionRouteKind::GatewayRelay);
+    }
+
+    #[test]
+    fn sandbox_resident_agent_transport_routes_correctly() {
+        let req = make_request(
+            "bash",
+            WorkspaceBindingKind::None,
+            ToolTransportKind::SandboxResidentAgent,
+        );
+        assert_eq!(
+            routing_decision(&req),
+            ToolExecutionRouteKind::SandboxResidentAgent
+        );
+    }
+
+    #[test]
+    fn unknown_workspace_with_local_transport_routes_unsupported() {
+        let req = make_request(
+            "bash",
+            WorkspaceBindingKind::Unknown,
+            ToolTransportKind::ServerLocal,
+        );
+        assert_eq!(routing_decision(&req), ToolExecutionRouteKind::Unsupported);
+    }
 }
