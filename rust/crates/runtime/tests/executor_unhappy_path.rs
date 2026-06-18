@@ -131,12 +131,12 @@ impl CapabilityProvider for ControllableProvider {
 }
 
 // ---------------------------------------------------------------------------
-// Test 1: All providers unhealthy — resolve still works, but callers
-// should gate on health_check before dispatching.
+// Test 1: All providers unhealthy — resolve rejects known-bad providers
+// before dispatch.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn all_unhealthy_providers_resolve_works_but_health_fails() {
+async fn all_unhealthy_providers_resolve_returns_unhealthy() {
     let reg = CapabilityRegistry::new();
 
     let p1 = Arc::new(ControllableProvider::new(
@@ -175,8 +175,7 @@ async fn all_unhealthy_providers_resolve_works_but_health_fails() {
         session_id: "test-session".into(),
     };
     let resolved = reg.resolve(&request).await;
-    assert!(resolved.is_ok());
-    assert_eq!(resolved.unwrap().priority(), 5);
+    assert!(matches!(resolved, Err(ProviderError::Unhealthy(_))));
 }
 
 #[tokio::test]
@@ -207,10 +206,7 @@ async fn empty_registry_not_capable_vs_all_unhealthy() {
     reg.register("edge", p).await.unwrap();
 
     let result2 = reg.resolve(&request).await;
-    assert!(
-        result2.is_ok(),
-        "unhealthy providers still match by capability"
-    );
+    assert!(matches!(result2, Err(ProviderError::Unhealthy(_))));
 }
 
 // ---------------------------------------------------------------------------
@@ -333,7 +329,7 @@ async fn provider_degrades_between_resolve_and_execute() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn lease_expired_provider_still_resolves_but_is_unhealthy() {
+async fn lease_expired_provider_is_rejected_by_resolve() {
     let reg = CapabilityRegistry::new();
 
     let provider = Arc::new(ControllableProvider::new(
@@ -364,8 +360,8 @@ async fn lease_expired_provider_still_resolves_but_is_unhealthy() {
         run_id: "test-run".into(),
         session_id: "test-session".into(),
     };
-    let resolved = reg.resolve(&request).await.unwrap();
-    assert_eq!(resolved.priority(), 1);
+    let resolved = reg.resolve(&request).await;
+    assert!(matches!(resolved, Err(ProviderError::Unhealthy(_))));
 
     let results = reg.health_check_all().await;
     assert_eq!(results.len(), 1);
@@ -373,7 +369,7 @@ async fn lease_expired_provider_still_resolves_but_is_unhealthy() {
 }
 
 #[tokio::test]
-async fn all_providers_lease_expired_resolve_works_health_all_fails() {
+async fn all_providers_lease_expired_resolve_returns_unhealthy() {
     let reg = CapabilityRegistry::new();
 
     for i in 0..3u8 {
@@ -400,7 +396,10 @@ async fn all_providers_lease_expired_resolve_works_health_all_fails() {
         session_id: "test-session".into(),
     };
     let resolved = reg.resolve(&request).await;
-    assert!(resolved.is_ok(), "resolve works despite all leases expired");
+    assert!(
+        matches!(resolved, Err(ProviderError::Unhealthy(_))),
+        "resolve should reject expired leases"
+    );
 
     let results = reg.health_check_all().await;
     assert_eq!(results.len(), 3);

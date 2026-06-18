@@ -12,7 +12,7 @@ use dashmap::DashMap;
 use tracing::{debug, warn};
 
 use crate::provider::traits::{CapabilityProvider, ProviderError, ToolRequest};
-use crate::provider::types::ToolCapability;
+use crate::provider::types::{ToolCapability, ToolCategory};
 use astra_runtime_env::IsolationIntent;
 
 /// Number of consecutive failures before a provider is considered unhealthy.
@@ -239,22 +239,48 @@ impl CapabilityRegistry {
             });
         }
 
-        // Phase 2 (async): check isolation level and collect priorities.
+        // Phase 2 (async): check isolation and live provider health, then
+        // collect priorities. Circuit-breaker state captures recent execution
+        // failures; health_check() catches providers that are registered but
+        // not currently usable, such as missing transports or expired leases.
         // Carry `needs_probe` forward so Phase 3 can claim the slot.
         let isolation_required = request.isolation_required;
 
         let mut eligible: Vec<(String, u8, bool)> = Vec::with_capacity(candidates.len());
+        let mut any_isolation_match = false;
+        let mut health_failures = Vec::new();
         for (name, provider, needs_probe) in &candidates {
             let provider_isolation = provider.isolation_level();
             if provider_isolation.satisfies(isolation_required) {
-                let priority = provider.priority();
-                eligible.push((name.clone(), priority, *needs_probe));
+                any_isolation_match = true;
+                match provider.health_check().await {
+                    Ok(()) => {
+                        let priority = provider.priority();
+                        eligible.push((name.clone(), priority, *needs_probe));
+                    }
+                    Err(err) => {
+                        debug!(
+                            provider = %name,
+                            error = ?err,
+                            "provider health check failed during resolution"
+                        );
+                        health_failures.push((name.clone(), err));
+                    }
+                }
             }
         }
 
-        if eligible.is_empty() {
+        if !any_isolation_match {
             return Err(ProviderError::Isolation(format!(
                 "no provider satisfies isolation level {isolation_required:?}"
+            )));
+        }
+
+        if eligible.is_empty() {
+            return Err(ProviderError::Unhealthy(format!(
+                "all providers for {:?} failed health checks: {}",
+                request.capability,
+                summarize_health_failures(&health_failures)
             )));
         }
 
@@ -391,12 +417,27 @@ fn cap_matches(requested: &ToolCapability, offered: &ToolCapability) -> bool {
         // Same category.
         (ToolCapability::Category(a), ToolCapability::Category(b)) => a == b,
         // Named request against category offer: the category provider can
-        // handle any named tool in that category (best-effort).
+        // handle only known tools that belong to that category.
         // Category request against named offer: a provider offering only
         // one named tool cannot satisfy a full category request.
-        (ToolCapability::Named(_), ToolCapability::Category(_)) => true,
+        (ToolCapability::Named(name), ToolCapability::Category(category)) => {
+            ToolCategory::for_tool_name(name)
+                .map(|tool_category| tool_category == *category)
+                .unwrap_or(false)
+        }
         (ToolCapability::Category(_), ToolCapability::Named(_)) => false,
     }
+}
+
+fn summarize_health_failures(failures: &[(String, ProviderError)]) -> String {
+    if failures.is_empty() {
+        return "none".into();
+    }
+    failures
+        .iter()
+        .map(|(name, err)| format!("{name}: {err:?}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 // ---------------------------------------------------------------------------
@@ -676,6 +717,74 @@ mod tests {
 
         let resolved = reg.resolve(&request).await;
         assert!(resolved.is_ok());
+    }
+
+    #[tokio::test]
+    async fn named_tool_does_not_match_wrong_category_provider() {
+        let reg = CapabilityRegistry::new();
+
+        reg.register(
+            "shell-category",
+            Arc::new(stub_provider(
+                vec![ToolCapability::Category(ToolCategory::Shell)],
+                5,
+                false,
+            )),
+        )
+        .await
+        .unwrap();
+
+        let request = ToolRequest {
+            capability: ToolCapability::Named("memory".into()),
+            tool_name: "memory".into(),
+            tool_call_id: "call-wrong-category".into(),
+            parameters: serde_json::Value::Null,
+            isolation_required: IsolationIntent::None,
+            storage: None,
+            user_id: "test-user".into(),
+            run_id: "test-run".into(),
+            session_id: "test-session".into(),
+        };
+
+        let resolved = reg.resolve(&request).await;
+        assert!(
+            matches!(resolved, Err(ProviderError::NotCapable { .. })),
+            "StateManagement tool must not match Shell provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_named_tool_does_not_match_category_provider() {
+        let reg = CapabilityRegistry::new();
+
+        reg.register(
+            "filesystem-category",
+            Arc::new(stub_provider(
+                vec![ToolCapability::Category(ToolCategory::FileSystem)],
+                5,
+                true,
+            )),
+        )
+        .await
+        .unwrap();
+
+        let request = ToolRequest {
+            capability: ToolCapability::Named("unknown_tool".into()),
+            tool_name: "unknown_tool".into(),
+            tool_call_id: "call-unknown-tool".into(),
+            parameters: serde_json::Value::Null,
+            isolation_required: IsolationIntent::None,
+            storage: None,
+            user_id: "test-user".into(),
+            run_id: "test-run".into(),
+            session_id: "test-session".into(),
+        };
+
+        let resolved = reg.resolve(&request).await;
+        assert!(
+            matches!(resolved, Err(ProviderError::NotCapable { .. })),
+            "unknown named tool must not match category provider"
+        );
     }
 
     // ── list_capable ────────────────────────────────────────────────────

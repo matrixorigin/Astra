@@ -8,7 +8,6 @@
 use std::sync::Arc;
 
 use astra_runtime::capability_registry::CapabilityRegistry;
-use astra_runtime::provider::edge_connection::EdgeConnectionProvider;
 use astra_runtime::provider::server_builtin::ServerBuiltinProvider;
 use astra_runtime::provider::traits::{CapabilityProvider, ProviderError, ToolRequest};
 use astra_runtime::provider::types::{ProviderKind, ToolCapability, ToolCategory};
@@ -40,6 +39,22 @@ struct StaticProvider {
 }
 
 impl StaticProvider {
+    fn new(
+        kind: ProviderKind,
+        priority: u8,
+        isolation: IsolationIntent,
+        storage_accessible: bool,
+        capabilities: Vec<ToolCapability>,
+    ) -> Self {
+        Self {
+            kind,
+            priority,
+            isolation,
+            storage_accessible,
+            capabilities,
+        }
+    }
+
     fn sandbox(priority: u8, isolation: IsolationIntent) -> Self {
         Self {
             kind: ProviderKind::SandboxRuntime,
@@ -98,8 +113,20 @@ impl CapabilityProvider for StaticProvider {
 async fn priority_routing_lower_wins() {
     let reg = CapabilityRegistry::new();
 
-    let high_prio = Arc::new(EdgeConnectionProvider::new(10));
-    let low_prio = Arc::new(EdgeConnectionProvider::new(1));
+    let high_prio = Arc::new(StaticProvider::new(
+        ProviderKind::EdgeConnection,
+        10,
+        IsolationIntent::Process,
+        true,
+        vec![ToolCapability::Category(ToolCategory::Shell)],
+    ));
+    let low_prio = Arc::new(StaticProvider::new(
+        ProviderKind::EdgeConnection,
+        1,
+        IsolationIntent::Process,
+        true,
+        vec![ToolCapability::Category(ToolCategory::Shell)],
+    ));
 
     reg.register("edge-high", high_prio).await.unwrap();
     reg.register("edge-low", low_prio).await.unwrap();
@@ -126,15 +153,20 @@ async fn priority_routing_lower_wins() {
 async fn priority_routing_three_providers() {
     let reg = CapabilityRegistry::new();
 
-    reg.register("edge-10", Arc::new(EdgeConnectionProvider::new(10)))
+    for priority in [10, 5, 1] {
+        reg.register(
+            format!("edge-{priority}"),
+            Arc::new(StaticProvider::new(
+                ProviderKind::EdgeConnection,
+                priority,
+                IsolationIntent::Process,
+                true,
+                vec![ToolCapability::Category(ToolCategory::Shell)],
+            )),
+        )
         .await
         .unwrap();
-    reg.register("edge-5", Arc::new(EdgeConnectionProvider::new(5)))
-        .await
-        .unwrap();
-    reg.register("edge-1", Arc::new(EdgeConnectionProvider::new(1)))
-        .await
-        .unwrap();
+    }
 
     let request = ToolRequest {
         capability: ToolCapability::Category(ToolCategory::Shell),
@@ -199,21 +231,19 @@ async fn cross_kind_priority_routing() {
 async fn storage_unavailable_returns_not_capable() {
     let reg = CapabilityRegistry::new();
 
-    // Even though ServerBuiltinProvider has storage_accessible=true, let's
-    // test with a capability it doesn't cover (Shell) so no candidate matches.
-    // Actually, let's use the stub approach properly: we need to test storage
-    // filtering.  Use a custom routing policy.
-
-    // Register a FileSystem-capable provider without storage access →
-    // actually EdgeConnectionProvider has storage_accessible=true.
-    // To test the filter, we need a provider that matches capability
-    // but lacks storage.  There's no such concrete provider in L1, so
-    // we test the positive case: storage-aware match succeeds.
-
-    // Positive: EdgeConnectionProvider has FileSystem + storage.
-    reg.register("edge", Arc::new(EdgeConnectionProvider::new(5)))
-        .await
-        .unwrap();
+    // Positive: a healthy edge provider has FileSystem + storage.
+    reg.register(
+        "edge",
+        Arc::new(StaticProvider::new(
+            ProviderKind::EdgeConnection,
+            5,
+            IsolationIntent::Process,
+            true,
+            vec![ToolCapability::Category(ToolCategory::FileSystem)],
+        )),
+    )
+    .await
+    .unwrap();
 
     let request = ToolRequest {
         capability: ToolCapability::Category(ToolCategory::FileSystem),
@@ -310,9 +340,18 @@ async fn isolation_filters_out_insufficient_providers() {
     // Both have FileSystem capability (server via Symbol).
     // ServerBuiltin: isolation=None → cannot satisfy Process.
     // Let's use Shell category that both EdgeConnection and sandbox-capable provider handle.
-    reg.register("edge", Arc::new(EdgeConnectionProvider::new(5)))
-        .await
-        .unwrap();
+    reg.register(
+        "edge",
+        Arc::new(StaticProvider::new(
+            ProviderKind::EdgeConnection,
+            5,
+            IsolationIntent::Process,
+            true,
+            vec![ToolCapability::Category(ToolCategory::Shell)],
+        )),
+    )
+    .await
+    .unwrap();
     reg.register(
         "sandbox",
         Arc::new(StaticProvider::sandbox(20, IsolationIntent::Container)),
@@ -346,9 +385,18 @@ async fn isolation_filters_out_insufficient_providers() {
 async fn isolation_container_only_sandbox_qualifies() {
     let reg = CapabilityRegistry::new();
 
-    reg.register("edge", Arc::new(EdgeConnectionProvider::new(1)))
-        .await
-        .unwrap();
+    reg.register(
+        "edge",
+        Arc::new(StaticProvider::new(
+            ProviderKind::EdgeConnection,
+            1,
+            IsolationIntent::Process,
+            true,
+            vec![ToolCapability::Category(ToolCategory::Shell)],
+        )),
+    )
+    .await
+    .unwrap();
     reg.register(
         "sandbox",
         Arc::new(StaticProvider::sandbox(10, IsolationIntent::Container)),
@@ -475,9 +523,18 @@ async fn capability_match_but_isolation_excludes() {
     let reg = CapabilityRegistry::new();
 
     // EdgeConnection handles Shell category, but at Process isolation.
-    reg.register("edge", Arc::new(EdgeConnectionProvider::new(5)))
-        .await
-        .unwrap();
+    reg.register(
+        "edge",
+        Arc::new(StaticProvider::new(
+            ProviderKind::EdgeConnection,
+            5,
+            IsolationIntent::Process,
+            true,
+            vec![ToolCapability::Category(ToolCategory::Shell)],
+        )),
+    )
+    .await
+    .unwrap();
 
     let request = ToolRequest {
         capability: ToolCapability::Named("bash".into()),
@@ -505,10 +562,23 @@ async fn capability_match_but_isolation_excludes() {
 async fn named_capability_matches_category_provider() {
     let reg = CapabilityRegistry::new();
 
-    // EdgeConnectionProvider declares: Shell, FileSystem, VersionControl
-    reg.register("edge", Arc::new(EdgeConnectionProvider::new(5)))
-        .await
-        .unwrap();
+    // Edge-like provider declares: Shell, FileSystem, VersionControl.
+    reg.register(
+        "edge",
+        Arc::new(StaticProvider::new(
+            ProviderKind::EdgeConnection,
+            5,
+            IsolationIntent::Process,
+            true,
+            vec![
+                ToolCapability::Category(ToolCategory::Shell),
+                ToolCapability::Category(ToolCategory::FileSystem),
+                ToolCapability::Category(ToolCategory::VersionControl),
+            ],
+        )),
+    )
+    .await
+    .unwrap();
 
     // A Named("bash") should match Category(Shell).
     let request = ToolRequest {
@@ -537,12 +607,30 @@ async fn named_capability_matches_category_provider() {
 async fn combined_storage_isolation_priority() {
     let reg = CapabilityRegistry::new();
 
-    reg.register("edge-5", Arc::new(EdgeConnectionProvider::new(5)))
-        .await
-        .unwrap();
-    reg.register("edge-1", Arc::new(EdgeConnectionProvider::new(1)))
-        .await
-        .unwrap();
+    reg.register(
+        "edge-5",
+        Arc::new(StaticProvider::new(
+            ProviderKind::EdgeConnection,
+            5,
+            IsolationIntent::Process,
+            true,
+            vec![ToolCapability::Category(ToolCategory::FileSystem)],
+        )),
+    )
+    .await
+    .unwrap();
+    reg.register(
+        "edge-1",
+        Arc::new(StaticProvider::new(
+            ProviderKind::EdgeConnection,
+            1,
+            IsolationIntent::Process,
+            true,
+            vec![ToolCapability::Category(ToolCategory::FileSystem)],
+        )),
+    )
+    .await
+    .unwrap();
     reg.register(
         "sandbox",
         Arc::new(StaticProvider::sandbox(10, IsolationIntent::Container)),
@@ -652,8 +740,7 @@ impl CapabilityProvider for UnhealthyProvider {
 }
 
 /// When all registered providers return errors from health_check_all,
-/// the caller is informed — but resolve still picks the best capability
-/// match. This is a design gap: resolve does not incorporate health status.
+/// resolve rejects them instead of dispatching into a known-bad backend.
 #[tokio::test]
 async fn all_providers_unhealthy_health_check_reports_all_down() {
     let reg = CapabilityRegistry::new();
@@ -686,7 +773,6 @@ async fn all_providers_unhealthy_health_check_reports_all_down() {
         );
     }
 
-    // Resolution still works (design gap — health is advisory)
     let request = ToolRequest {
         capability: ToolCapability::Category(ToolCategory::FileSystem),
         tool_name: "filesystem".into(),
@@ -700,16 +786,16 @@ async fn all_providers_unhealthy_health_check_reports_all_down() {
     };
     let resolved = reg.resolve(&request).await;
     assert!(
-        resolved.is_ok(),
-        "resolve works even when all providers are unhealthy"
+        matches!(resolved, Err(ProviderError::Unhealthy(_))),
+        "resolve should reject all-unhealthy providers"
     );
 }
 
 /// When all providers are unhealthy AND a request requires a specific
-/// unhealthy provider, resolve still returns Ok — confirming health check
-/// is not integrated into routing.
+/// unhealthy provider, resolve returns Unhealthy instead of deferring failure
+/// to execute().
 #[tokio::test]
-async fn resolve_succeeds_even_when_all_providers_are_degraded() {
+async fn resolve_rejects_when_all_providers_are_degraded() {
     let reg = CapabilityRegistry::new();
 
     // Register only unhealthy providers
@@ -729,7 +815,6 @@ async fn resolve_succeeds_even_when_all_providers_are_degraded() {
     assert_eq!(results.len(), 3);
     assert!(results.iter().all(|(_, r)| r.is_err()));
 
-    // Resolve picks the first by priority (all equal here)
     let request = ToolRequest {
         capability: ToolCapability::Category(ToolCategory::FileSystem),
         tool_name: "filesystem".into(),
@@ -743,14 +828,8 @@ async fn resolve_succeeds_even_when_all_providers_are_degraded() {
     };
 
     let resolved = reg.resolve(&request).await;
-    assert!(resolved.is_ok());
-    // But executing it will fail because the provider is unhealthy internally
-    let exec_result = resolved.unwrap().execute(request).await;
-    match exec_result {
-        ToolResult::Error { message, retryable } => {
-            assert!(message.contains("unhealthy"));
-            assert!(retryable);
-        }
-        other => panic!("expected ToolResult::Error from unhealthy provider, got {other:?}"),
-    }
+    assert!(
+        matches!(resolved, Err(ProviderError::Unhealthy(_))),
+        "resolve should fail before execute when all providers are degraded"
+    );
 }

@@ -55,6 +55,54 @@ pub enum ToolCategory {
     Symbols,
 }
 
+impl ToolCategory {
+    /// Return the canonical category for a built-in tool name.
+    ///
+    /// Unknown tool names intentionally do not fall back to category providers:
+    /// a provider advertising `Shell` should not become a catch-all executor
+    /// for arbitrary named tools.
+    pub fn for_tool_name(name: &str) -> Option<Self> {
+        match name {
+            "bash" | "powershell" | "run_script" | "background_shell" => Some(Self::Shell),
+            "read_file"
+            | "write_file"
+            | "str_replace"
+            | "delete_file"
+            | "multi_edit"
+            | "rollback_file_edits"
+            | "list_dir"
+            | "grep"
+            | "glob"
+            | "publish_artifact" => Some(Self::FileSystem),
+            "git" | "git_clone" => Some(Self::VersionControl),
+            "web_search" | "web_fetch" | "github" | "tool_search" => Some(Self::ExternalApi),
+            "ask_user"
+            | "notify"
+            | "enter_plan_mode"
+            | "exit_plan_mode"
+            | "get_agent_info"
+            | "introspect"
+            | "prioritize_tool"
+            | "deprioritize_tool"
+            | "compress_context"
+            | "memory"
+            | "session"
+            | "task"
+            | "task_output"
+            | "task_stop"
+            | "task_list"
+            | "mo"
+            | "mo_query"
+            | "rollback_database_snapshots"
+            | "rollback_session_state" => Some(Self::StateManagement),
+            "agent" | "agent_fanout" => Some(Self::AgentDelegation),
+            "symbols" | "lsp" | "find_definition" | "find_references" => Some(Self::Symbols),
+            _ if name.starts_with("mcp__") => Some(Self::McpProtocol),
+            _ => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ProviderKind — where execution happens
 // ---------------------------------------------------------------------------
@@ -74,4 +122,26 @@ pub enum ProviderKind {
     SandboxRuntime,
     /// Tools served by an external MCP server.
     McpServer,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ToolCategory;
+
+    #[test]
+    fn tool_name_category_mapping_covers_control_plane_and_mcp() {
+        assert_eq!(
+            ToolCategory::for_tool_name("bash"),
+            Some(ToolCategory::Shell)
+        );
+        assert_eq!(
+            ToolCategory::for_tool_name("ask_user"),
+            Some(ToolCategory::StateManagement)
+        );
+        assert_eq!(
+            ToolCategory::for_tool_name("mcp__node_repl__js"),
+            Some(ToolCategory::McpProtocol)
+        );
+        assert_eq!(ToolCategory::for_tool_name("unknown_tool"), None);
+    }
 }
