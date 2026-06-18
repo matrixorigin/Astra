@@ -33,6 +33,13 @@ pub struct ToolRequest {
     /// Optional storage requirement — when set, the provider must
     /// have access to the given path / volume.
     pub storage: Option<StorageAccess>,
+    /// Session-scoped user identity — required for edge transport routing
+    /// and audit trails across provider boundaries.
+    pub user_id: String,
+    /// Session-scoped run identifier.
+    pub run_id: String,
+    /// Session-scoped session identifier.
+    pub session_id: String,
 }
 
 // ---------------------------------------------------------------------------

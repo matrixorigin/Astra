@@ -193,14 +193,32 @@ pub const SERVER_ALL_TOOLS: &[&str] = &[
     "memory",
     "session",
     "task",
+    "mo",
+    "mo_query",
+    "rollback_database_snapshots",
+    "rollback_session_state",
     // AgentDelegation
     "agent",
     "agent_fanout",
+    // User interaction
+    "ask_user",
+    "notify",
+    // Plan mode
+    "enter_plan_mode",
+    "exit_plan_mode",
     // Symbols / introspection
     "get_agent_info",
     "symbols",
-    // Internal
-    "notify",
+    "introspect",
+    // Tool preference
+    "prioritize_tool",
+    "deprioritize_tool",
+    // Context management
+    "compress_context",
+    // Artifact publishing
+    "publish_artifact",
+    // Programmatic scripting
+    "run_script",
 ];
 
 impl DeploymentProfile {
@@ -255,11 +273,15 @@ impl DeploymentProfile {
 
     /// Build a `CapabilityRegistry` from this deployment profile.
     ///
-    /// Requires a `ServerToolRuntime` for the builtin provider.
-    /// All other provider kinds are skipped with a warning.
+    /// Accepts service dependencies for each provider kind.  Providers whose
+    /// required services are `None` are registered anyway but will fail
+    /// health checks (defense-in-depth: the registry always reflects the
+    /// profile, even when backend wiring is deferred to a later init phase).
     pub async fn build_registry(
         &self,
         builtin_runtime: Arc<dyn ServerToolRuntime>,
+        edge_services: Option<EdgeProviderServices>,
+        sandbox_service: Option<Arc<dyn crate::provider::sandbox_runner::SandboxRuntimeService>>,
     ) -> Result<CapabilityRegistry, ProviderError> {
         let registry = CapabilityRegistry::new();
 
@@ -292,11 +314,42 @@ impl DeploymentProfile {
                         )
                         .await?;
                 }
-                // Other provider kinds (EdgeConnection, SandboxRuntime, McpServer)
-                // require their own runtime dependencies and are wired in L2+.
-                _ => {
+                ProviderKind::EdgeConnection => {
+                    let mut provider =
+                        crate::provider::edge_connection::EdgeConnectionProvider::new(
+                            provider_cfg.priority,
+                        );
+                    if let Some(ref svc) = edge_services {
+                        provider = provider
+                            .with_edge_connection_pool(svc.connection_pool.clone())
+                            .with_edge_dispatch_service(svc.dispatch_service.clone())
+                            .with_edge_registry_service(svc.registry_service.clone())
+                            .with_tool_registry(svc.tool_registry.clone());
+                    }
+                    registry
+                        .register(
+                            format!("edge-connection-p{}", provider_cfg.priority),
+                            Arc::new(provider),
+                        )
+                        .await?;
+                }
+                ProviderKind::SandboxRuntime => {
+                    let mut provider = crate::provider::sandbox_runner::SandboxRuntimeProvider::new(
+                        provider_cfg.priority,
+                    );
+                    if let Some(ref svc) = sandbox_service {
+                        provider = provider.with_sandbox_service(Arc::clone(svc));
+                    }
+                    registry
+                        .register(
+                            format!("sandbox-runtime-p{}", provider_cfg.priority),
+                            Arc::new(provider),
+                        )
+                        .await?;
+                }
+                ProviderKind::McpServer => {
                     tracing::warn!(
-                        "build_registry: skipping provider kind {:?} — requires L2+ wiring",
+                        "build_registry: MCP server provider wiring not yet implemented (kind={:?})",
                         provider_cfg.kind
                     );
                 }
@@ -305,6 +358,19 @@ impl DeploymentProfile {
 
         Ok(registry)
     }
+}
+
+/// Pre-assembled services for edge-connection providers.
+///
+/// All fields are required for the edge transport to function; the struct
+/// exists so callers can pass a single `Option<EdgeProviderServices>` instead
+/// of four separate `Option` parameters.
+#[derive(Clone)]
+pub struct EdgeProviderServices {
+    pub connection_pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
+    pub dispatch_service: Arc<dyn astra_services::multi_agent::EdgeDispatchService>,
+    pub registry_service: Arc<dyn astra_services::multi_agent::EdgeRegistryService>,
+    pub tool_registry: astra_runtime_env::ToolRegistry,
 }
 
 // ---------------------------------------------------------------------------

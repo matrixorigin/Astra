@@ -5,6 +5,7 @@
 //! dispatched.
 
 pub mod edge_connection;
+pub mod sandbox_runner;
 pub mod server_builtin;
 pub mod traits;
 pub mod types;

@@ -170,6 +170,9 @@ async fn all_unhealthy_providers_resolve_works_but_health_fails() {
         parameters: json!(null),
         isolation_required: IsolationIntent::Process,
         storage: None,
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
     let resolved = reg.resolve(&request).await;
     assert!(resolved.is_ok());
@@ -186,6 +189,9 @@ async fn empty_registry_not_capable_vs_all_unhealthy() {
         parameters: json!(null),
         isolation_required: IsolationIntent::None,
         storage: None,
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
     let result = reg.resolve(&request).await;
     assert!(matches!(result, Err(ProviderError::NotCapable { .. })));
@@ -304,6 +310,9 @@ async fn provider_degrades_between_resolve_and_execute() {
         parameters: json!({"cmd": "echo hello"}),
         isolation_required: IsolationIntent::Process,
         storage: None,
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -351,6 +360,9 @@ async fn lease_expired_provider_still_resolves_but_is_unhealthy() {
         parameters: json!(null),
         isolation_required: IsolationIntent::Container,
         storage: None,
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
     let resolved = reg.resolve(&request).await.unwrap();
     assert_eq!(resolved.priority(), 1);
@@ -383,6 +395,9 @@ async fn all_providers_lease_expired_resolve_works_health_all_fails() {
         parameters: json!(null),
         isolation_required: IsolationIntent::Process,
         storage: None,
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
     let resolved = reg.resolve(&request).await;
     assert!(resolved.is_ok(), "resolve works despite all leases expired");
@@ -417,6 +432,9 @@ async fn hung_transport_times_out_at_caller_level() {
         parameters: json!(null),
         isolation_required: IsolationIntent::Process,
         storage: None,
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
     let resolved = reg.resolve(&request).await.unwrap();
 
@@ -450,6 +468,9 @@ async fn network_partition_all_providers_hung() {
         parameters: json!(null),
         isolation_required: IsolationIntent::Process,
         storage: None,
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
     let resolved = reg.resolve(&request).await.unwrap();
 

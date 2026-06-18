@@ -1061,13 +1061,11 @@ mod tests {
             8_388_608
         );
         assert_eq!(
-            outcome.metadata[TOOL_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT]["binding"]["runtime"]
-                ["session_manager"],
+            outcome.metadata[TOOL_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT]["binding"]["runtime"]["session_manager"],
             "astra_managed"
         );
         assert_eq!(
-            outcome.metadata[TOOL_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT]["binding"]["runtime"]
-                ["isolation_backend"],
+            outcome.metadata[TOOL_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT]["binding"]["runtime"]["isolation_backend"],
             "g_visor_runsc"
         );
         assert_eq!(

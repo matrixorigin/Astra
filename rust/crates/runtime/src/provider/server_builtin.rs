@@ -150,6 +150,9 @@ mod tests {
             parameters: serde_json::Value::Null,
             isolation_required: IsolationIntent::None,
             storage: None,
+            user_id: "test-user".into(),
+            run_id: "test-run".into(),
+            session_id: "test-session".into(),
         }
     }
 

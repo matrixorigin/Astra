@@ -486,6 +486,9 @@ mod tests {
             parameters: serde_json::json!({"cmd": "ls"}),
             isolation_required: IsolationIntent::None,
             storage: None,
+            user_id: "test-user".into(),
+            run_id: "test-run".into(),
+            session_id: "test-session".into(),
         };
 
         let resolved = reg.resolve(&request).await.unwrap();
@@ -509,6 +512,9 @@ mod tests {
             parameters: serde_json::Value::Null,
             isolation_required: IsolationIntent::None,
             storage: None,
+            user_id: "test-user".into(),
+            run_id: "test-run".into(),
+            session_id: "test-session".into(),
         };
 
         let result = reg.resolve(&request).await;
@@ -541,6 +547,9 @@ mod tests {
             parameters: serde_json::Value::Null,
             isolation_required: IsolationIntent::None,
             storage: None,
+            user_id: "test-user".into(),
+            run_id: "test-run".into(),
+            session_id: "test-session".into(),
         };
 
         let resolved = reg.resolve(&request).await.unwrap();
@@ -581,6 +590,9 @@ mod tests {
                 mount_type: MountType::Bind,
                 read_only: false,
             }),
+            user_id: "test-user".into(),
+            run_id: "test-run".into(),
+            session_id: "test-session".into(),
         };
 
         // Should pick "with-storage" even though it has higher priority,
@@ -622,6 +634,9 @@ mod tests {
             parameters: serde_json::Value::Null,
             isolation_required: IsolationIntent::Container,
             storage: None,
+            user_id: "test-user".into(),
+            run_id: "test-run".into(),
+            session_id: "test-session".into(),
         };
 
         let resolved = reg.resolve(&request).await.unwrap();
@@ -654,6 +669,9 @@ mod tests {
             parameters: serde_json::Value::Null,
             isolation_required: IsolationIntent::None,
             storage: None,
+            user_id: "test-user".into(),
+            run_id: "test-run".into(),
+            session_id: "test-session".into(),
         };
 
         let resolved = reg.resolve(&request).await;
@@ -764,6 +782,9 @@ mod tests {
             parameters: serde_json::Value::Null,
             isolation_required: IsolationIntent::None,
             storage: None,
+            user_id: "test-user".into(),
+            run_id: "test-run".into(),
+            session_id: "test-session".into(),
         };
 
         let resolved = reg.resolve(&request).await.unwrap();
@@ -801,6 +822,9 @@ mod tests {
             parameters: serde_json::Value::Null,
             isolation_required: IsolationIntent::None,
             storage: None,
+            user_id: "test-user".into(),
+            run_id: "test-run".into(),
+            session_id: "test-session".into(),
         };
 
         let result = reg.resolve(&request).await;

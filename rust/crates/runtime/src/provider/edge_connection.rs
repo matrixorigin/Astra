@@ -135,9 +135,9 @@ impl CapabilityProvider for EdgeConnectionProvider {
     async fn execute(&self, request: ToolRequest) -> ToolResult {
         // Build a ToolExecutionRequest from the provider's ToolRequest.
         let exec_request = ToolExecutionRequest {
-            user_id: String::new(),
-            run_id: String::new(),
-            session_id: String::new(),
+            user_id: request.user_id.clone(),
+            run_id: request.run_id.clone(),
+            session_id: request.session_id.clone(),
             tool_name: request.tool_name.clone(),
             tool_call_id: request.tool_call_id.clone(),
             args: request.parameters.clone(),
@@ -241,6 +241,9 @@ mod tests {
             parameters: serde_json::Value::Null,
             isolation_required: IsolationIntent::Process,
             storage: None,
+            user_id: "test-user".into(),
+            run_id: "test-run".into(),
+            session_id: "test-session".into(),
         };
         let result = provider.execute(request).await;
         match result {

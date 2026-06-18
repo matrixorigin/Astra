@@ -111,6 +111,9 @@ async fn priority_routing_lower_wins() {
         parameters: serde_json::Value::Null,
         isolation_required: IsolationIntent::None,
         storage: None,
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -140,6 +143,9 @@ async fn priority_routing_three_providers() {
         parameters: serde_json::Value::Null,
         isolation_required: IsolationIntent::None,
         storage: None,
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -174,6 +180,9 @@ async fn cross_kind_priority_routing() {
         parameters: serde_json::Value::Null,
         isolation_required: IsolationIntent::None,
         storage: None,
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -217,6 +226,9 @@ async fn storage_unavailable_returns_not_capable() {
             mount_type: MountType::Bind,
             read_only: false,
         }),
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -245,6 +257,9 @@ async fn no_storage_request_matches_all() {
         parameters: serde_json::Value::Null,
         isolation_required: IsolationIntent::None,
         storage: None, // no storage constraint → all providers considered
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -273,6 +288,9 @@ async fn server_builtin_storage_access_for_agent() {
             mount_type: MountType::Bind,
             read_only: false,
         }),
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -309,6 +327,9 @@ async fn isolation_filters_out_insufficient_providers() {
         parameters: serde_json::Value::Null,
         isolation_required: IsolationIntent::Process, // Edge provides Process, Sandbox provides Container
         storage: None,
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -342,6 +363,9 @@ async fn isolation_container_only_sandbox_qualifies() {
         parameters: serde_json::Value::Null,
         isolation_required: IsolationIntent::Container,
         storage: None,
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -368,6 +392,9 @@ async fn isolation_sandbox_only_highest_qualifies() {
         parameters: serde_json::Value::Null,
         isolation_required: IsolationIntent::Sandbox,
         storage: None,
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -394,6 +421,9 @@ async fn isolation_none_available_returns_error() {
         parameters: serde_json::Value::Null,
         isolation_required: IsolationIntent::Sandbox,
         storage: None,
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
 
     let result = reg.resolve(&request).await;
@@ -423,6 +453,9 @@ async fn empty_registry_returns_not_capable() {
         parameters: serde_json::Value::Null,
         isolation_required: IsolationIntent::None,
         storage: None,
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
 
     let result = reg.resolve(&request).await;
@@ -453,6 +486,9 @@ async fn capability_match_but_isolation_excludes() {
         parameters: serde_json::Value::Null,
         isolation_required: IsolationIntent::Sandbox, // Edge only provides Process
         storage: None,
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
 
     let result = reg.resolve(&request).await;
@@ -482,6 +518,9 @@ async fn named_capability_matches_category_provider() {
         parameters: serde_json::Value::Null,
         isolation_required: IsolationIntent::None,
         storage: None,
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -527,6 +566,9 @@ async fn combined_storage_isolation_priority() {
             mount_type: MountType::Bind,
             read_only: false,
         }),
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -554,6 +596,9 @@ async fn combined_capability_match_but_isolation_excluded() {
         parameters: serde_json::Value::Null,
         isolation_required: IsolationIntent::Process, // ServerBuiltin can't satisfy
         storage: None,
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
 
     let result = reg.resolve(&request).await;
@@ -649,6 +694,9 @@ async fn all_providers_unhealthy_health_check_reports_all_down() {
         parameters: serde_json::Value::Null,
         isolation_required: IsolationIntent::Process,
         storage: None,
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
     let resolved = reg.resolve(&request).await;
     assert!(
@@ -689,6 +737,9 @@ async fn resolve_succeeds_even_when_all_providers_are_degraded() {
         parameters: serde_json::Value::Null,
         isolation_required: IsolationIntent::Process,
         storage: None,
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
     };
 
     let resolved = reg.resolve(&request).await;
