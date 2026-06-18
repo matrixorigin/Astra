@@ -1,4 +1,4 @@
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 use super::tool_execution_binding::{
     ExecutorBinding, ExecutorStatus, ToolExecutionRequest, ToolTransportKind, WorkspaceBinding,
@@ -63,7 +63,7 @@ pub(crate) fn cancelled_runtime_tool_result_for_binding(
         output: message,
         metadata: Some(metadata),
         is_error: true,
-        exit_semantics: None,
+        exit_semantics: Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
     }
 }
 
@@ -99,7 +99,7 @@ pub(crate) fn runtime_tool_timeout_result(
         output: format!("Error: {message}"),
         metadata: Some(metadata),
         is_error: true,
-        exit_semantics: None,
+        exit_semantics: Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
     }
 }
 
@@ -223,7 +223,7 @@ pub(crate) fn output_limit_exceeded_result(
         ),
         metadata: Some(metadata),
         is_error: true,
-        exit_semantics: None,
+        exit_semantics: Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
     })
 }
 

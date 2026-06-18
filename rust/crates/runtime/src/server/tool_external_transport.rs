@@ -16,13 +16,41 @@ use super::tool_transport_metadata::{
 /// Covers both gateway relay and sandbox resident agent — the execution
 /// contract is identical; the transport kind distinguishes the route in
 /// metadata and observability.
+///
+/// ## Health & Reconnection
+///
+/// Transports may be ephemeral (network connections drop, sandbox restarts).
+/// Callers SHOULD check [`health_check`] before issuing execution requests.
+/// If unhealthy, callers SHOULD attempt [`reconnect`] once before giving up.
+///
+/// Default implementations return healthy / no-op — stateless transports
+/// that never disconnect need not override them.
 #[async_trait]
 pub trait ExternalTransport: Send + Sync {
+    /// Execute a tool through the transport backend.
     async fn execute_tool(
         &self,
         request: ToolExecutionRequest,
         binding: astra_runtime_env::RunBinding,
     ) -> Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError>;
+
+    /// Verify the transport backend is reachable and ready to accept requests.
+    ///
+    /// Default: always healthy. Override for transports that can detect
+    /// connection loss (gRPC channel state, WebSocket ping, etc.).
+    async fn health_check(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Attempt to re-establish the connection to the transport backend.
+    ///
+    /// Called after [`health_check`] fails. Implementations should tear down
+    /// stale connections and create fresh ones.
+    ///
+    /// Default: no-op (transport is assumed to auto-reconnect).
+    async fn reconnect(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Legacy compatibility aliases.  New code should use `ExternalTransport`.
@@ -64,6 +92,45 @@ pub(crate) async fn execute_external_route(
             &format!("{adapter_name} transport is not configured"),
         );
     };
+
+    // Health gate: verify transport is alive before dispatching.
+    // If unhealthy, attempt one reconnect cycle.
+    if let Err(health_reason) = transport.health_check().await {
+        tracing::warn!(
+            adapter = adapter_name,
+            reason = %health_reason,
+            "External transport health check failed; attempting reconnect"
+        );
+        // Best-effort reconnect — if it fails we still try the call below
+        // so that the error handling in execute_external_transport can
+        // classify the error properly (retryable vs hard-fail).
+        if let Err(reconnect_err) = transport.reconnect().await {
+            tracing::warn!(
+                adapter = adapter_name,
+                error = %reconnect_err,
+                "External transport reconnect failed"
+            );
+        }
+        // Re-validate after reconnect attempt
+        if let Err(health_reason) = transport.health_check().await {
+            tracing::warn!(
+                adapter = adapter_name,
+                reason = %health_reason,
+                "External transport remains unhealthy after reconnect attempt"
+            );
+            return transport_adapter_unavailable_result(
+                &request,
+                binding,
+                adapter_name,
+                &format!("{adapter_name} transport is unhealthy: {health_reason}"),
+            );
+        }
+        tracing::info!(
+            adapter = adapter_name,
+            "External transport reconnected successfully"
+        );
+    }
+
     execute_external_transport(
         request,
         binding,
@@ -214,6 +281,15 @@ fn external_outcome_tool_result(
     if let Some(result) = output_limit_exceeded_result(request, binding, transport_kind, &outcome) {
         return result;
     }
+
+    let exit_semantics = map_exit_semantics(outcome.exit_semantics).or_else(|| {
+        infer_exit_semantics_from_fields(
+            outcome.side_effects_maybe,
+            outcome.is_error,
+            outcome.execution_started,
+        )
+    });
+
     let mut metadata = outcome.metadata;
     for (key, value) in
         delivered_binding_event_fields(&request.workspace, &request.executor, transport_kind)
@@ -221,11 +297,12 @@ fn external_outcome_tool_result(
         metadata.entry(key).or_insert(value);
     }
     attach_runtime_policy_metadata(&mut metadata, binding);
+
     astra_tools::ToolResult {
         output: outcome.output,
         metadata: Some(metadata),
         is_error: outcome.is_error,
-        exit_semantics: map_exit_semantics(outcome.exit_semantics),
+        exit_semantics,
     }
 }
 
@@ -241,6 +318,33 @@ fn map_exit_semantics(
         RuntimeExitSemantics::ToolError => ExitSemantics::ExecutionError,
         RuntimeExitSemantics::SideEffectUncertain => ExitSemantics::ExecutionError,
     })
+}
+
+/// Infer exit semantics from the outcome's structural fields when the
+/// transport did not explicitly classify the outcome.
+///
+/// Priority chain:
+/// 1. `side_effects_maybe` → `ExecutionError` (worst case: side effects may
+///    have occurred, and we cannot determine if the tool succeeded)
+/// 2. `is_error` → `ExecutionError`
+/// 3. `execution_started` → `Success` (tool ran and completed without
+///    reported error)
+fn infer_exit_semantics_from_fields(
+    side_effects_maybe: bool,
+    is_error: bool,
+    execution_started: bool,
+) -> Option<astra_tools::exit_semantics::ExitSemantics> {
+    use astra_tools::exit_semantics::ExitSemantics;
+    if side_effects_maybe {
+        return Some(ExitSemantics::ExecutionError);
+    }
+    if is_error {
+        return Some(ExitSemantics::ExecutionError);
+    }
+    if execution_started {
+        return Some(ExitSemantics::Success);
+    }
+    None
 }
 
 fn external_error_tool_result(
@@ -262,6 +366,251 @@ fn external_error_tool_result(
         ),
         metadata: Some(metadata),
         is_error: true,
-        exit_semantics: None,
+        exit_semantics: Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tool_execution_binding::{
+        ExecutorBinding, ToolExecutionRequest, WorkspaceBinding,
+    };
+    use super::*;
+    use astra_runtime_env::{
+        PolicyIntent, RunBinding, RuntimeBinding, RuntimeExitSemantics, RuntimeSessionHandle,
+        RuntimeSessionSpec, RuntimeToolInvocation, RuntimeToolOutcome,
+    };
+    use astra_tools::exit_semantics::ExitSemantics;
+    fn test_binding() -> RunBinding {
+        let registry = astra_runtime_env::ToolRegistry::default();
+        RunBinding::resolve(
+            astra_runtime_env::WorkspaceBinding::server_sandbox("session-1"),
+            astra_runtime_env::ExecutorBinding::local_cli(),
+            RuntimeBinding::host_process("test-host".to_string()),
+            PolicyIntent::local_developer(),
+            &registry,
+        )
+    }
+
+    fn test_request(tool_name: &str) -> ToolExecutionRequest {
+        ToolExecutionRequest {
+            user_id: "user-1".to_string(),
+            run_id: "run-1".to_string(),
+            session_id: "session-1".to_string(),
+            tool_call_id: "call-1".to_string(),
+            tool_name: tool_name.to_string(),
+            args: serde_json::json!({}),
+            workspace: WorkspaceBinding::server_sandbox("/tmp/test"),
+            workspace_record: None,
+            executor: ExecutorBinding::server_local(),
+            runtime: None,
+            policy: Default::default(),
+        }
+    }
+
+    fn test_outcome(
+        request: &ToolExecutionRequest,
+        binding: &RunBinding,
+        output: &str,
+        is_error: bool,
+        execution_started: bool,
+        side_effects_maybe: bool,
+        explicit_exit: Option<RuntimeExitSemantics>,
+    ) -> RuntimeToolOutcome {
+        let spec = RuntimeSessionSpec::new(&request.session_id, &request.run_id, binding.clone())
+            .with_requested_tools([request.tool_name.clone()]);
+        let session = RuntimeSessionHandle::from_spec(&spec);
+        let invocation = RuntimeToolInvocation::new(
+            &request.tool_call_id,
+            &request.tool_name,
+            request.args.clone(),
+            binding.clone(),
+            session.policy.revision,
+        )
+        .with_idempotency_key(format!(
+            "{}:{}:{}",
+            request.user_id, request.session_id, request.tool_call_id
+        ));
+
+        let mut outcome = if is_error {
+            RuntimeToolOutcome::failed_after_start(&invocation, output, &session)
+        } else {
+            RuntimeToolOutcome::completed(&invocation, output, &session)
+        };
+        outcome.execution_started = execution_started;
+        outcome.side_effects_maybe = side_effects_maybe;
+        outcome.exit_semantics = explicit_exit;
+        outcome
+    }
+
+    #[test]
+    fn exit_semantics_success_when_tool_completed() {
+        let binding = test_binding();
+        let request = test_request("bash");
+        let outcome = test_outcome(&request, &binding, "ok", false, true, false, None);
+        let result = external_outcome_tool_result(
+            &request,
+            &binding,
+            ToolTransportKind::SandboxResidentAgent,
+            outcome,
+        );
+        assert!(!result.is_error);
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::Success));
+    }
+
+    #[test]
+    fn exit_semantics_error_when_outcome_is_error() {
+        let binding = test_binding();
+        let request = test_request("bash");
+        let outcome = test_outcome(&request, &binding, "cmd failed", true, true, false, None);
+        let result = external_outcome_tool_result(
+            &request,
+            &binding,
+            ToolTransportKind::SandboxResidentAgent,
+            outcome,
+        );
+        assert!(result.is_error);
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::ExecutionError));
+    }
+
+    #[test]
+    fn exit_semantics_error_when_side_effects_maybe() {
+        let binding = test_binding();
+        let request = test_request("write_file");
+        let outcome = test_outcome(&request, &binding, "written", false, true, true, None);
+        let result = external_outcome_tool_result(
+            &request,
+            &binding,
+            ToolTransportKind::SandboxResidentAgent,
+            outcome,
+        );
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::ExecutionError));
+    }
+
+    #[test]
+    fn exit_semantics_none_when_not_started_and_no_error() {
+        // Tool never started, no error flags — ambiguous, should be None.
+        let binding = test_binding();
+        let request = test_request("bash");
+        let outcome = test_outcome(&request, &binding, "", false, false, false, None);
+        let result = external_outcome_tool_result(
+            &request,
+            &binding,
+            ToolTransportKind::SandboxResidentAgent,
+            outcome,
+        );
+        assert_eq!(result.exit_semantics, None);
+    }
+
+    #[test]
+    fn exit_semantics_preserves_explicit_transport_classification() {
+        let binding = test_binding();
+        let request = test_request("grep");
+        let outcome = test_outcome(
+            &request,
+            &binding,
+            "",
+            false,
+            true,
+            false,
+            Some(RuntimeExitSemantics::DomainNegative),
+        );
+        let result = external_outcome_tool_result(
+            &request,
+            &binding,
+            ToolTransportKind::SandboxResidentAgent,
+            outcome,
+        );
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::DomainNegative));
+    }
+
+    #[test]
+    fn exit_semantics_explicit_overrides_inference_even_for_side_effects() {
+        let binding = test_binding();
+        let request = test_request("bash");
+        let outcome = test_outcome(
+            &request,
+            &binding,
+            "done",
+            false,
+            true,
+            true,
+            Some(RuntimeExitSemantics::Normal),
+        );
+        let result = external_outcome_tool_result(
+            &request,
+            &binding,
+            ToolTransportKind::SandboxResidentAgent,
+            outcome,
+        );
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::Success));
+    }
+
+    #[test]
+    fn exit_semantics_transport_error_always_execution_error() {
+        let binding = test_binding();
+        let request = test_request("bash");
+        let error = astra_runtime_env::RuntimeError::new(
+            astra_runtime_env::RuntimeErrorKind::TransportDisconnected,
+            "connection lost",
+        );
+        let result = external_error_tool_result(
+            &request,
+            &binding,
+            ToolTransportKind::SandboxResidentAgent,
+            "test adapter",
+            error,
+        );
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::ExecutionError));
+    }
+
+    #[test]
+    fn exit_semantics_cancelled_result_is_execution_error() {
+        let binding = test_binding();
+        let request = test_request("bash");
+        let result = cancelled_runtime_tool_result(
+            &request,
+            &binding,
+            ToolTransportKind::SandboxResidentAgent,
+            true,
+        );
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::ExecutionError));
+    }
+
+    #[test]
+    fn exit_semantics_timeout_result_is_execution_error() {
+        let binding = test_binding();
+        let request = test_request("bash");
+        let result = runtime_tool_timeout_result(
+            &request,
+            &binding,
+            ToolTransportKind::SandboxResidentAgent,
+            true,
+            30.0,
+        );
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::ExecutionError));
+    }
+
+    #[test]
+    fn exit_semantics_output_limit_exceeded_is_execution_error() {
+        let mut binding = test_binding();
+        binding.policy.resources.max_output_bytes = Some(10);
+        let request = test_request("bash");
+        let outcome = test_outcome(
+            &request,
+            &binding,
+            "a".repeat(100).as_str(),
+            false,
+            true,
+            false,
+            None,
+        );
+        let result = external_outcome_tool_result(
+            &request,
+            &binding,
+            ToolTransportKind::SandboxResidentAgent,
+            outcome,
+        );
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::ExecutionError));
     }
 }
