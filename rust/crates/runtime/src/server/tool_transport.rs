@@ -1,4 +1,5 @@
 pub use super::tool_binding_projection::{
+    capability_filter_edge_provided_tool_schemas_for_binding,
     capability_filter_tool_schemas_for_binding, capability_filtered_server_tool_schemas,
     tool_schema_name,
 };

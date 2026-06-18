@@ -4287,11 +4287,11 @@ async fn hook_db_decision_audit_with_tools() {
             "context": {
                 "test_llm_rounds": [
                     {
-                        "tool_calls": [tool_call("tc1", "list_files", json!({"path": "."}))]
+                        "tool_calls": [tool_call("tc1", "list_dir", json!({"path": "."}))]
                     },
                     { "full_text": "Here are the files." }
                 ],
-                "edge_tools": [tool_schema("list_files"), tool_schema("read_file")]
+                "edge_tools": [tool_schema("list_dir"), tool_schema("read_file")]
             }
         }),
     )
@@ -4327,15 +4327,15 @@ async fn hook_db_decision_audit_with_tools() {
         .expect("decision_audit present");
     assert_eq!(audit.decision_type, "tool_selection");
     let tool_calls = audit.decision_output["tool_calls"].as_array().unwrap();
-    assert!(tool_calls.iter().any(|t| t.as_str() == Some("list_files")));
+    assert!(tool_calls.iter().any(|t| t.as_str() == Some("list_dir")));
 
     let skill = plan
         .skill_selection
         .as_ref()
         .expect("skill_selection present");
-    assert_eq!(skill.skill_name, "list_files");
+    assert_eq!(skill.skill_name, "list_dir");
     assert_eq!(skill.selection_method, "llm_tool_choice");
-    assert!(skill.selected_skills.contains(&"list_files".to_string()));
+    assert!(skill.selected_skills.contains(&"list_dir".to_string()));
     assert_eq!(skill.user_query, "list files");
     assert_eq!(skill.execution_success, Some(1));
 }

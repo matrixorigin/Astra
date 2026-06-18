@@ -1041,30 +1041,30 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task",
-                "description": "Durable checklist; use proactively for multi-step work, not shell commands or agents.\n\
+                "description": "Checklist; use proactively for multi-step work, not commands/agents.\n\
         ## When to Use\n\
-        3+ distinct outcomes/files/phases, approved plans, delegated deliverables, or expanding scope.\n\
+        3+ distinct outcomes/files/phases, approved plans, delegation, or expanding scope.\n\
         ## When NOT to Use\n\
-        Single edit/command/answer, pure info, or trivial work.\n\
-        One task per outcome: NOT one umbrella task. Broad work -> 3-7 leaf tasks. Mark first task `in_progress` BEFORE beginning work. Keep exactly ONE task as `in_progress` at a time. Finish immediately: `completed`, `failed` + `error_message`, or use `archive` for old history.\n\
-        Field notes: `title` is outcome; `active_form` is spinner text; `metadata` null deletes a key; `add_blocks`/`add_blocked_by` work on create/update. `subtasks` is create-only; update subtask progress with only `task_id` + `subtask_id` + `new_status`.\n\
+        Single edit/command/answer, info, or trivial work.\n\
+        One task per outcome: NOT one umbrella task. Broad work -> 3-7 leaf tasks. Mark first task `in_progress` BEFORE beginning work. Keep exactly ONE task as `in_progress` at a time. Finish `completed`, `failed` + `error_message`, or use `archive` for old history.\n\
+        Field notes: `title` is outcome; `active_form` spinner text; `metadata` null deletes a key; `add_blocks`/`add_blocked_by` work on create/update. `subtasks` is create-only; update subtask progress with only `task_id` + `subtask_id` + `new_status`.\n\
         <example>Build reimbursements: create backend, API, UI, verify tasks; mark backend in_progress BEFORE beginning work.</example>",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["create","update","list","get","stop","list_user","adopt","archive"], "description": "Operation to perform"},
-                        "source_session_id": {"type": "string", "description": "(adopt) Source session id."},
-                        "older_than_days": {"type": "integer", "description": "(archive bulk; omit task_id) Archive completed tasks older than N days. Default 30."},
-                        "user_status": {"type": "string", "enum": ["active","pending","in_progress","paused","completed","failed","cancelled","archived","all"], "description": "(list_user) Cross-session filter. Default active = open work: pending + in_progress + paused."},
-                        "title": {"type": "string", "description": "(create/update) Imperative title."},
-                        "description": {"type": "string", "description": "(create/update) Definition of done."},
-                        "task_id": {"type": "string", "description": "(update/get/stop/adopt/archive) Task id. Single-task archive stays in the current session."},
+                        "action": {"type": "string", "enum": ["create","update","list","get","stop","list_user","adopt","archive"], "description": "Operation."},
+                        "source_session_id": {"type": "string", "description": "(adopt) Source session id"},
+                        "older_than_days": {"type": "integer", "description": "(archive bulk; omit task_id) Archive completed older than N days. Default 30."},
+                        "user_status": {"type": "string", "enum": ["active","pending","in_progress","paused","completed","failed","cancelled","archived","all"], "description": "(list_user) Cross-session. Default active = open work: pending + in_progress + paused."},
+                        "title": {"type": "string", "description": "(create/update) Title."},
+                        "description": {"type": "string", "description": "(create/update) Done."},
+                        "task_id": {"type": "string", "description": "(update/get/stop/adopt/archive) Task id. Single-task archive stays in current session."},
                         "new_status": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","deleted"], "description": "(update) Status. Only one parent task may be in_progress; `paused` frees that slot; `deleted` removes the task."},
                         "status_filter": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","archived","all","active"], "description": "(list) `active` = pending + in_progress + paused."},
                         "subtask_id": {"type": "string", "description": "(update) Specific subtask id. When present, only send task_id + subtask_id + new_status."},
                         "active_form": {"type": "string", "description": "(create/update) Spinner text while in_progress."},
-                        "owner": {"type": "string", "description": "(create/update) Task owner."},
-                        "metadata": {"type": "object", "description": "(create/update) Arbitrary key-value pairs; null deletes a key on update."},
+                        "owner": {"type": "string", "description": "(create/update) Owner."},
+                        "metadata": {"type": "object", "description": "(create/update) Key-value pairs; null deletes a key on update."},
                         "add_blocks": {"type": "array", "items": {"type": "string"}, "description": "(create/update) Task ids this task blocks; edge is symmetric. Blocked tasks wait for completed blockers."},
                         "add_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(create/update) Task ids blocking this task. It cannot start until every blocker is completed or removed."},
                         "remove_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update only; never with create) Remove symmetric blocks edges."},

@@ -14,6 +14,7 @@
 //! ```
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,9 +26,10 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::server::tool_transport::{
-    ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, FallbackPolicy,
+    ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy,
     ToolExecutionRequest, ToolPolicySnapshot, WorkspaceAuthority, WorkspaceBinding,
-    WorkspaceBindingKind, binding_event_fields, capability_filter_tool_schemas_for_binding,
+    WorkspaceBindingKind, binding_event_fields,
+    capability_filter_edge_provided_tool_schemas_for_binding,
     capability_filtered_server_tool_schemas, projected_tool_end_event_fields,
     projected_tool_start_event_fields, tool_schema_name,
 };
@@ -1108,6 +1110,14 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
+    pub fn with_server_sandbox_workspace(mut self, root: impl AsRef<Path>) -> Self {
+        self.execution_bindings = Some(ExecutionBindingSnapshot::inferred(
+            WorkspaceBinding::server_sandbox(root),
+            ExecutorBinding::server_local(),
+        ));
+        self
+    }
+
     pub fn with_selection_confidence(mut self, confidence: f64) -> Self {
         self.selection_confidence = confidence;
         self
@@ -1214,7 +1224,7 @@ impl ServerAgenticLoopHostBuilder {
                 schema_runtime.as_ref(),
             )
         } else {
-            capability_filter_tool_schemas_for_binding(
+            capability_filter_edge_provided_tool_schemas_for_binding(
                 self.edge_tools,
                 &schema_workspace,
                 &schema_executor,
@@ -1222,7 +1232,7 @@ impl ServerAgenticLoopHostBuilder {
             )
         };
 
-        let valid_tools = edge_tools
+        let mut valid_tools: HashSet<String> = edge_tools
             .iter()
             .filter_map(|t| {
                 t.get("function")
@@ -1231,6 +1241,16 @@ impl ServerAgenticLoopHostBuilder {
                     .map(String::from)
             })
             .collect();
+        let admissible_extras = if server_side_tools
+            && matches!(schema_workspace.kind, WorkspaceBindingKind::EdgeWorkspace)
+            && matches!(schema_executor.kind, ExecutorBindingKind::EdgeAgent)
+            && !matches!(schema_executor.status, ExecutorStatus::Online)
+        {
+            hidden_execution_boundary_tool_names(&edge_tools)
+        } else {
+            Vec::new()
+        };
+        valid_tools.extend(admissible_extras.iter().cloned());
 
         let progress_rx = self.progress_broadcaster.as_ref().map(|b| b.subscribe());
         let progress_filter = self
@@ -1249,7 +1269,7 @@ impl ServerAgenticLoopHostBuilder {
             capabilities: self.capabilities,
             edge_profile: self.edge_profile,
             valid_tools,
-            admissible_extras: Vec::new(),
+            admissible_extras,
             selection_confidence: self.selection_confidence,
             server_side_tools,
             interactive_client: self.interactive_client,
@@ -4381,6 +4401,28 @@ fn normalize_usage_to_canonical(
     raw.clone()
 }
 
+fn hidden_execution_boundary_tool_names(visible_tools: &[Value]) -> Vec<String> {
+    let visible: HashSet<String> = visible_tools
+        .iter()
+        .filter_map(tool_schema_name)
+        .map(str::to_string)
+        .collect();
+    astra_runtime_env::ToolRegistry::builtins()
+        .iter()
+        .filter(|spec| {
+            matches!(
+                spec.required.executor,
+                astra_runtime_env::RequiredExecutor::RuntimeExecutor
+            ) || !matches!(
+                spec.required.workspace,
+                astra_runtime_env::RequiredWorkspace::None
+            )
+        })
+        .map(|spec| spec.name.clone())
+        .filter(|name| !visible.contains(name))
+        .collect()
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -4997,8 +5039,12 @@ mod tests {
                 "{hidden} must be hidden while the edge runtime is offline"
             );
             assert!(
-                !host.valid_tool_names().contains(hidden),
-                "{hidden} must not be admitted while the edge runtime is offline"
+                host.valid_tool_names().contains(hidden),
+                "{hidden} should be admitted while hidden so stale calls can report executor_offline"
+            );
+            assert!(
+                host.admissible_extras.contains(&hidden.to_string()),
+                "{hidden} should remain boundary-admissible so stale calls can report executor_offline"
             );
         }
     }

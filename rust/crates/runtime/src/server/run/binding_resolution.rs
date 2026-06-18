@@ -20,7 +20,7 @@ pub(crate) fn resolve_request_execution_bindings(
     request: &astra_services::runs::ChatRequestData,
     server_workspace: &Path,
 ) -> (WorkspaceBinding, ExecutorBinding) {
-    resolve_request_execution_bindings_from_request(request, Some(server_workspace), None)
+    resolve_request_execution_bindings_from_request(request, Some(server_workspace), None, false)
         .expect("server workspace binding resolution should always succeed")
 }
 
@@ -42,19 +42,31 @@ pub(crate) fn request_uses_server_workspace(
 pub(crate) fn resolve_request_execution_bindings_without_server_workspace(
     request: &astra_services::runs::ChatRequestData,
     edge_profile: &Map<String, Value>,
+    has_edge_tools: bool,
 ) -> Option<(WorkspaceBinding, ExecutorBinding)> {
-    resolve_request_execution_bindings_from_request(request, None, Some(edge_profile))
+    resolve_request_execution_bindings_from_request(
+        request,
+        None,
+        Some(edge_profile),
+        has_edge_tools,
+    )
 }
 
 fn resolve_request_execution_bindings_from_request(
     request: &astra_services::runs::ChatRequestData,
     server_workspace: Option<&Path>,
     edge_profile: Option<&Map<String, Value>>,
+    has_edge_tools: bool,
 ) -> Option<(WorkspaceBinding, ExecutorBinding)> {
     let workspace = match request.workspace_binding.as_ref() {
         Some(binding) => workspace_binding_from_request(binding, server_workspace)?,
         None => match server_workspace {
             Some(server_workspace) => WorkspaceBinding::server_sandbox(server_workspace),
+            None if has_edge_tools => {
+                return Some(execution_bindings_for_legacy_edge_tools(
+                    edge_profile.unwrap_or(&Map::new()),
+                ));
+            }
             None => return edge_profile.map(execution_bindings_from_edge_profile),
         },
     };
@@ -117,6 +129,35 @@ pub(crate) fn execution_bindings_from_edge_profile(
             status: ExecutorStatus::Unknown,
         },
     };
+    (workspace, executor)
+}
+
+fn execution_bindings_for_legacy_edge_tools(
+    edge_profile: &Map<String, Value>,
+) -> (WorkspaceBinding, ExecutorBinding) {
+    let cwd = first_non_empty_profile_string(edge_profile, &["cwd", "git_root"]);
+    let executor_id =
+        first_non_empty_profile_string(edge_profile, &["edge_agent_id", "agent_id", "edge_id"])
+            .unwrap_or_else(|| "edge-ledger".to_string());
+    let display_name = first_non_empty_profile_string(
+        edge_profile,
+        &["display_name", "hostname", "edge_agent_id", "agent_id"],
+    )
+    .unwrap_or_else(|| "Edge workspace".to_string());
+
+    let workspace = WorkspaceBinding {
+        kind: WorkspaceBindingKind::EdgeWorkspace,
+        display_name: display_name.clone(),
+        cwd,
+        authority: WorkspaceAuthority::ReadWrite,
+        fallback_policy: FallbackPolicy::Disabled,
+    };
+    let executor = ExecutorBinding::edge_agent(
+        executor_id,
+        display_name,
+        ToolTransportKind::EdgeLedger,
+        ExecutorStatus::Online,
+    );
     (workspace, executor)
 }
 
@@ -656,9 +697,12 @@ mod tests {
         edge_profile.insert("hostname".to_string(), Value::String("devbox".to_string()));
         let request = test_request("hello");
 
-        let (workspace, executor) =
-            resolve_request_execution_bindings_without_server_workspace(&request, &edge_profile)
-                .expect("edge profile should resolve");
+        let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
+            &request,
+            &edge_profile,
+            false,
+        )
+        .expect("edge profile should resolve");
 
         assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
         assert_eq!(workspace.cwd.as_deref(), Some("/repo"));
@@ -681,9 +725,34 @@ mod tests {
         });
 
         assert!(
-            resolve_request_execution_bindings_without_server_workspace(&request, &Map::new())
-                .is_none()
+            resolve_request_execution_bindings_without_server_workspace(
+                &request,
+                &Map::new(),
+                false
+            )
+            .is_none()
         );
+    }
+
+    #[test]
+    fn legacy_edge_tools_without_profile_still_bind_to_edge_ledger() {
+        let request = test_request("use client tools");
+
+        let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
+            &request,
+            &Map::new(),
+            true,
+        )
+        .expect("legacy edge tools should resolve to edge ledger bindings");
+
+        assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
+        assert_eq!(workspace.display_name, "Edge workspace");
+        assert_eq!(workspace.cwd, None);
+        assert_eq!(workspace.authority, WorkspaceAuthority::ReadWrite);
+        assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
+        assert_eq!(executor.executor_id, "edge-ledger");
+        assert_eq!(executor.transport, ToolTransportKind::EdgeLedger);
+        assert_eq!(executor.status, ExecutorStatus::Online);
     }
 
     #[test]

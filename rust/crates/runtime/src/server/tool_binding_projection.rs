@@ -6,6 +6,8 @@ use super::tool_execution_binding::{
     ToolTransportKind, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
 };
 
+const EDGE_CLIENT_WORKSPACE_SENTINEL_CWD: &str = "__edge_client_provided_workspace__";
+
 pub fn tool_schema_name(schema: &Value) -> Option<&str> {
     schema
         .get("function")
@@ -44,6 +46,15 @@ pub fn capability_filter_tool_schemas_for_binding(
                 .is_ok()
         })
         .collect()
+}
+
+pub fn capability_filter_edge_provided_tool_schemas_for_binding(
+    schemas: Vec<Value>,
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    runtime: Option<&astra_runtime_env::RuntimeBinding>,
+) -> Vec<Value> {
+    capability_filter_tool_schemas_for_binding(schemas, workspace, executor, runtime)
 }
 
 pub fn capability_filtered_server_tool_schemas(
@@ -108,7 +119,7 @@ fn runtime_env_workspace_binding(
     astra_runtime_env::WorkspaceBinding {
         kind,
         display_name: workspace.display_name.clone(),
-        cwd: workspace.cwd.clone(),
+        cwd: runtime_env_workspace_cwd(workspace),
         authority,
         persistent: matches!(
             workspace.kind,
@@ -117,6 +128,13 @@ fn runtime_env_workspace_binding(
                 | WorkspaceBindingKind::CloudWorkspace
         ),
     }
+}
+
+fn runtime_env_workspace_cwd(workspace: &WorkspaceBinding) -> Option<String> {
+    workspace.cwd.clone().or_else(|| {
+        matches!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace)
+            .then(|| EDGE_CLIENT_WORKSPACE_SENTINEL_CWD.to_string())
+    })
 }
 
 fn runtime_env_executor_binding(
@@ -421,6 +439,78 @@ mod tests {
                 "{expected} should be visible for a read-write server sandbox runtime"
             );
         }
+    }
+
+    #[test]
+    fn edge_provided_tools_allow_registered_project_tools_without_server_cwd() {
+        let names = schema_names(capability_filter_edge_provided_tool_schemas_for_binding(
+            vec![
+                schema("read_file"),
+                schema("write_file"),
+                schema("not_registered"),
+            ],
+            &WorkspaceBinding {
+                kind: WorkspaceBindingKind::EdgeWorkspace,
+                display_name: "Edge workspace".to_string(),
+                cwd: None,
+                authority: WorkspaceAuthority::ReadWrite,
+                fallback_policy: super::super::tool_transport::FallbackPolicy::Disabled,
+            },
+            &ExecutorBinding {
+                kind: ExecutorBindingKind::EdgeAgent,
+                executor_id: "edge-ledger".to_string(),
+                display_name: "Edge workspace".to_string(),
+                transport: ToolTransportKind::EdgeLedger,
+                status: ExecutorStatus::Online,
+            },
+            None,
+        ));
+
+        assert!(names.contains("read_file"));
+        assert!(names.contains("write_file"));
+        assert!(!names.contains("not_registered"));
+    }
+
+    #[test]
+    fn edge_workspace_without_server_cwd_projects_runtime_capabilities() {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let binding = runtime_environment_binding_for_parts(
+            "read_file",
+            &WorkspaceBinding {
+                kind: WorkspaceBindingKind::EdgeWorkspace,
+                display_name: "Edge workspace".to_string(),
+                cwd: None,
+                authority: WorkspaceAuthority::ReadWrite,
+                fallback_policy: super::super::tool_transport::FallbackPolicy::Disabled,
+            },
+            &ExecutorBinding {
+                kind: ExecutorBindingKind::EdgeAgent,
+                executor_id: "edge-ledger".to_string(),
+                display_name: "Edge workspace".to_string(),
+                transport: ToolTransportKind::EdgeLedger,
+                status: ExecutorStatus::Online,
+            },
+            None,
+            &ToolPolicySnapshot::default(),
+            &registry,
+        );
+
+        assert_eq!(
+            binding.workspace.cwd.as_deref(),
+            Some(EDGE_CLIENT_WORKSPACE_SENTINEL_CWD)
+        );
+        assert!(binding.capabilities.workspace.readable);
+        assert!(binding.capabilities.workspace.writable);
+        assert!(
+            astra_runtime_env::CapabilityResolver
+                .check_tool_call(
+                    &registry,
+                    "read_file",
+                    &serde_json::json!({"path": "src/lib.rs"}),
+                    &binding.capabilities,
+                )
+                .is_ok()
+        );
     }
 
     #[test]

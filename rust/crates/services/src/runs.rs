@@ -277,7 +277,7 @@ pub struct WorkspaceBindingRequest {
     pub kind: WorkspaceBindingRequestKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "cwd", skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<WorkspaceSourceRequest>,

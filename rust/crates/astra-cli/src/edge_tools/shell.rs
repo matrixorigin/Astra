@@ -5768,7 +5768,9 @@ mod tests {
             result.is_ok(),
             "relative path inside project should succeed: {result:?}"
         );
-        assert!(result.unwrap().starts_with(dir.path()));
+        let resolved = astra_sandbox::canonicalize_parent_and_append(&result.unwrap()).unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        assert!(resolved.starts_with(root));
     }
 
     #[test]

@@ -207,6 +207,12 @@ fn unique_path_variants(path: &Path) -> Vec<PathBuf> {
         && !variants.iter().any(|existing| existing == &canonical)
     {
         variants.push(canonical);
+    } else if let Ok(canonical_parent) = astra_sandbox::canonicalize_parent_and_append(path)
+        && !variants
+            .iter()
+            .any(|existing| existing == &canonical_parent)
+    {
+        variants.push(canonical_parent);
     }
     variants
 }
@@ -3627,7 +3633,12 @@ mod tests {
             "resolve_path_sandboxed must allow /tmp when in allowed_paths: {:?}",
             result
         );
-        assert!(result.unwrap().starts_with("/tmp"));
+        let resolved = result.unwrap();
+        assert!(
+            is_within_workspace_root(&resolved, Path::new("/tmp")),
+            "resolved temp path must stay within the configured temp root: {:?}",
+            resolved
+        );
     }
 
     /// Regression: a workspace under $TMPDIR (e.g. /tmp/.../tmpXXX) plus a

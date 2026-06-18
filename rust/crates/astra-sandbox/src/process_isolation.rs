@@ -24,6 +24,7 @@ const DEFAULT_MAX_CAPTURED_OUTPUT_BYTES: usize =
     MAX_CAPTURED_STDOUT_BYTES + MAX_CAPTURED_STDERR_BYTES;
 const READ_CHUNK_SIZE: usize = 8 * 1024;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Per-invocation isolation configuration.
 #[derive(Debug, Clone)]
@@ -466,6 +467,83 @@ async fn pump_stream<R>(
     }
 }
 
+async fn drain_stream_pumps_after_exit(
+    mut stdout_task: tokio::task::JoinHandle<()>,
+    mut stderr_task: tokio::task::JoinHandle<()>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<StreamChunk>,
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+    max_output_bytes: usize,
+    stdout_capped: &mut bool,
+    stderr_capped: &mut bool,
+) {
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+    let idle_timer = tokio::time::sleep(OUTPUT_DRAIN_TIMEOUT);
+    tokio::pin!(idle_timer);
+
+    loop {
+        if stdout_done && stderr_done {
+            break;
+        }
+
+        tokio::select! {
+            Some(chunk) = rx.recv() => {
+                let retained_bytes = stdout.len().saturating_add(stderr.len());
+                let remaining = max_output_bytes.saturating_sub(retained_bytes);
+                match chunk.stream {
+                    StreamKind::Stdout => append_capped(stdout, &chunk.bytes, remaining, stdout_capped),
+                    StreamKind::Stderr => append_capped(stderr, &chunk.bytes, remaining, stderr_capped),
+                }
+                idle_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + OUTPUT_DRAIN_TIMEOUT);
+
+                if *stdout_capped || *stderr_capped {
+                    if !stdout_done {
+                        stdout_task.abort();
+                    }
+                    if !stderr_done {
+                        stderr_task.abort();
+                    }
+                    break;
+                }
+            }
+            _ = &mut stdout_task, if !stdout_done => {
+                stdout_done = true;
+            }
+            _ = &mut stderr_task, if !stderr_done => {
+                stderr_done = true;
+            }
+            _ = &mut idle_timer => {
+                if !stdout_done {
+                    stdout_task.abort();
+                }
+                if !stderr_done {
+                    stderr_task.abort();
+                }
+                break;
+            }
+        }
+    }
+
+    if !stdout_done {
+        let _ = stdout_task.await;
+    }
+    if !stderr_done {
+        let _ = stderr_task.await;
+    }
+
+    drain_stream_chunks(
+        rx,
+        stdout,
+        stderr,
+        max_output_bytes,
+        stdout_capped,
+        stderr_capped,
+    );
+}
+
 /// Build a shell script that sets up filesystem isolation inside a new mount
 /// namespace before executing `command`.
 ///
@@ -749,6 +827,7 @@ pub async fn execute_isolated(
     let mut stderr_capped = false;
     let mut exit_code = None;
     let mut timed_out = false;
+    let mut abort_stream_pumps = false;
     let deadline = tokio::time::Instant::now() + config.timeout;
 
     loop {
@@ -764,11 +843,6 @@ pub async fn execute_isolated(
         match child.try_wait() {
             Ok(Some(status)) => {
                 exit_code = status.code();
-                // Abort I/O reader tasks immediately — grandchild processes may
-                // still hold the pipes open (e.g. a daemon surviving shell exit),
-                // which would otherwise block the pump_task.await below forever.
-                stdout_task.abort();
-                stderr_task.abort();
                 break;
             }
             Ok(None) => {}
@@ -800,8 +874,7 @@ pub async fn execute_isolated(
             let _ = child.wait().await;
             // Abort I/O reader tasks immediately — grandchild processes may
             // still hold the pipes open (e.g. `sleep` surviving shell kill).
-            stdout_task.abort();
-            stderr_task.abort();
+            abort_stream_pumps = true;
             break;
         }
 
@@ -812,17 +885,21 @@ pub async fn execute_isolated(
         .await;
     }
 
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
-    // Drain any remaining buffered chunks from before the abort/completion.
-    drain_stream_chunks(
+    if abort_stream_pumps {
+        stdout_task.abort();
+        stderr_task.abort();
+    }
+    drain_stream_pumps_after_exit(
+        stdout_task,
+        stderr_task,
         &mut rx,
         &mut stdout_bytes,
         &mut stderr_bytes,
         config.max_output_bytes,
         &mut stdout_capped,
         &mut stderr_capped,
-    );
+    )
+    .await;
 
     // ── Cleanup cgroup ───────────────────────────────────────────────
     if let Some(ref cg) = cg_path {

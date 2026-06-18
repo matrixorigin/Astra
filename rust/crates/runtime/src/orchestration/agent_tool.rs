@@ -1193,11 +1193,24 @@ pub fn normalize_agent_spawn_args(args: &Value) -> Result<Value, String> {
             .to_string());
     }
 
-    if obj.contains_key("run_in_background") {
-        return Err(
-            "unsupported `run_in_background` field for `agent(action='spawn')`. Backgrounding is a user-controlled UI action: omit this field and let the user press Ctrl+B while the live agent is running."
-                .to_string(),
-        );
+    if let Some(run_in_background) = obj.get("run_in_background") {
+        match run_in_background.as_bool() {
+            Some(false) => {
+                obj.remove("run_in_background");
+            }
+            Some(true) => {
+                return Err(
+                    "unsupported `run_in_background: true` for `agent(action='spawn')`. Backgrounding is a user-controlled UI action: omit this field and let the user press Ctrl+B while the live agent is running."
+                        .to_string(),
+                );
+            }
+            None => {
+                return Err(
+                    "invalid `run_in_background` field for `agent(action='spawn')`: expected boolean false or omit the field."
+                        .to_string(),
+                );
+            }
+        }
     }
 
     obj.remove("action");
@@ -1467,7 +1480,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_arg_normalization_rejects_run_in_background_field() {
+    fn spawn_arg_normalization_rejects_run_in_background_true() {
         let err = normalize_agent_spawn_args(&json!({
             "action": "spawn",
             "description": "Review one",
@@ -1478,6 +1491,19 @@ mod tests {
         .expect_err("model-facing spawn must not background itself");
         assert!(err.contains("run_in_background"), "{err}");
         assert!(err.contains("Ctrl+B"), "{err}");
+    }
+
+    #[test]
+    fn spawn_arg_normalization_ignores_run_in_background_false() {
+        let normalized = normalize_agent_spawn_args(&json!({
+            "action": "spawn",
+            "description": "Review one",
+            "prompt": "p1",
+            "run_in_background": false,
+            "_tool_call_id": "call-1"
+        }))
+        .expect("false is the synchronous default and should be accepted");
+        assert!(normalized.get("run_in_background").is_none());
     }
 
     #[tokio::test]

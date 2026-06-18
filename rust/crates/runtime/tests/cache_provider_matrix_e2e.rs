@@ -160,6 +160,7 @@ fn build_host_for(
         "test-user".to_string(),
         "test-session".to_string(),
     )
+    .with_server_sandbox_workspace("/tmp/astra-cache-provider-matrix")
     .with_edge_tools(sample_edge_tools())
     .with_test_llm_rounds(rounds)
     .with_llm_request_capture(capture)
