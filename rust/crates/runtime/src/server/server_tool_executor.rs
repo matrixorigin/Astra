@@ -1725,13 +1725,32 @@ mod tests {
         //    at the local-transport level (double-check via `contains`).
         let all_handled: Vec<_> = schema_names
             .iter()
-            .filter(|n| !exec.tool_engine.contains(*n))
+            .filter(|n| !exec.tool_engine.contains(n))
             .cloned()
             .collect();
         assert!(
             all_handled.is_empty(),
             "schema↔handler mismatch: {all_handled:?}"
         );
+    }
+
+    #[test]
+    fn route_selection_server_local_adapter_inventory_matches_tool_engine() {
+        let (exec, _dir) = test_executor();
+
+        for name in crate::server::tool_route_selection::SERVER_LOCAL_RUNTIME_TOOL_NAMES {
+            assert!(
+                exec.tool_engine.contains(name),
+                "route selection marks `{name}` as server-local, but ToolEngine has no handler"
+            );
+        }
+
+        for name in ["lsp", "powershell", "skill"] {
+            assert!(
+                !exec.tool_engine.contains(name),
+                "{name} must not be treated as a normal server-local ToolEngine handler"
+            );
+        }
     }
 
     #[test]

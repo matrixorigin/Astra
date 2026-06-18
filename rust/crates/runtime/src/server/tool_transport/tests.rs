@@ -737,6 +737,28 @@ async fn unknown_tool_is_denied_before_local_transport() {
 }
 
 #[tokio::test]
+async fn client_only_and_intercepted_tools_do_not_leak_to_server_local_transport() {
+    let service = ToolExecutionService::new_for_test();
+    let local = CountingLocalTransport::new();
+
+    for tool in ["lsp", "powershell", "skill"] {
+        let result = service
+            .execute(
+                request(
+                    tool,
+                    WorkspaceBinding::server_sandbox("/tmp/astra-workspace"),
+                    ExecutorBinding::server_local(),
+                ),
+                &local,
+            )
+            .await;
+
+        assert!(result.is_error, "{tool}: {result:?}");
+        assert_eq!(local.calls(), 0, "{tool} must not call local transport");
+    }
+}
+
+#[tokio::test]
 async fn policy_allowed_tools_blocks_disallowed_tool_before_local_transport() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();

@@ -166,7 +166,7 @@ pub fn server_runtime_tool_schemas(
         capabilities,
         &astra_tools::schemas::all_tool_schemas(),
     );
-    schemas.retain(|schema| !matches!(tool_schema_name(schema), Some("lsp" | "powershell")));
+    retain_server_executable_schemas(&mut schemas);
     #[cfg(unix)]
     {
         astra_tools::schemas::narrow_run_script_for_server(&mut schemas);
@@ -213,7 +213,18 @@ pub fn cli_remote_tool_schemas(
             pool.push(schema);
         }
     }
-    astra_turn_core::tool_surface::resolve(CapabilitySurface::CliRemote, capabilities, &pool)
+    let mut schemas =
+        astra_turn_core::tool_surface::resolve(CapabilitySurface::CliRemote, capabilities, &pool);
+    retain_server_executable_schemas(&mut schemas);
+    #[cfg(unix)]
+    {
+        astra_tools::schemas::narrow_run_script_for_server(&mut schemas);
+    }
+    schemas
+}
+
+fn retain_server_executable_schemas(schemas: &mut Vec<Value>) {
+    schemas.retain(|schema| !matches!(tool_schema_name(schema), Some("lsp" | "powershell")));
 }
 
 /// Return the skill source policy for a surface.
@@ -671,6 +682,33 @@ mod tests {
                     "{surface} schema `{name}` must not direct the model to unavailable local job tool: {desc}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn server_executed_surfaces_hide_client_only_runtime_tools() {
+        let caps = full_server_capabilities_for_tests();
+        let web = names(server_runtime_tool_schemas(&caps));
+        let remote = names(cli_remote_tool_schemas(Vec::new(), &caps));
+        let local = names(cli_local_tool_schemas(
+            astra_tools::schemas::all_tool_schemas(),
+            Vec::new(),
+            &caps,
+        ));
+
+        for tool in ["lsp", "powershell"] {
+            assert!(
+                !web.contains(&tool.to_string()),
+                "web/server surface must not advertise client-only tool {tool}: {web:?}"
+            );
+            assert!(
+                !remote.contains(&tool.to_string()),
+                "remote CLI executes on the server and must not advertise client-only tool {tool}: {remote:?}"
+            );
+            assert!(
+                local.contains(&tool.to_string()),
+                "local CLI should retain client-owned tool {tool}"
+            );
         }
     }
 

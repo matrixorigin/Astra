@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::sync::OnceLock;
 
 use super::tool_execution_binding::{
     ExecutorBinding, ExecutorBindingKind, ExecutorStatus, ToolExecutionRequest, ToolPolicySnapshot,
@@ -312,46 +313,21 @@ fn runtime_env_policy_intent(
     intent
 }
 
-/// Legacy hardcoded list of server control-plane tools.
-///
-/// Prefer registering these in [`CapabilityRegistry`].  This function exists
-/// only as the fallback routing table; when a tool is migrated, remove its
-/// entry from this list so the dead code is visible.
 pub(crate) fn is_server_control_plane_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "agent"
-            | "agent_fanout"
-            | "get_agent_info"
-            | "task"
-            | "enter_plan_mode"
-            | "exit_plan_mode"
-            | "ask_user"
-            | "session"
-            | "prioritize_tool"
-            | "deprioritize_tool"
-            | "introspect"
-            | "compress_context"
-            | "rollback_session_state"
-            | "notify"
-    )
+    builtin_tool_registry()
+        .get(tool_name)
+        .is_some_and(|spec| matches!(spec.class, astra_runtime_env::ToolClass::ControlPlane))
 }
 
-/// Legacy hardcoded list of server runtime tools.
-///
-/// See [`is_server_control_plane_tool`] — same migration rule applies.
 pub(crate) fn is_server_runtime_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "memory"
-            | "tool_search"
-            | "web_search"
-            | "web_fetch"
-            | "mo"
-            | "mo_query"
-            | "rollback_database_snapshots"
-            | "github"
-    )
+    builtin_tool_registry()
+        .get(tool_name)
+        .is_some_and(|spec| matches!(spec.class, astra_runtime_env::ToolClass::ServerService))
+}
+
+fn builtin_tool_registry() -> &'static astra_runtime_env::ToolRegistry {
+    static REGISTRY: OnceLock<astra_runtime_env::ToolRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(astra_runtime_env::ToolRegistry::builtins)
 }
 
 #[cfg(test)]

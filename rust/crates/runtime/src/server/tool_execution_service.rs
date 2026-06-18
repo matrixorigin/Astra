@@ -181,11 +181,10 @@ impl ToolExecutionService {
 
     /// Route a tool request to its execution kind.
     ///
-    /// Primary resolution goes through [`CapabilityRegistry::resolve`];
-    /// this function is the fallback for tools not yet registered as
-    /// capabilities.  See [`super::tool_route_selection::routing_decision`].
+    /// Primary resolution goes through the runtime tool registry: tool class
+    /// declares the owner, then the current binding selects the transport.
     pub fn routing_decision(&self, request: &ToolExecutionRequest) -> ToolExecutionRouteKind {
-        routing_decision(request)
+        routing_decision(request, &self.tool_registry)
     }
 
     pub(crate) fn cancelled_before_route_result(

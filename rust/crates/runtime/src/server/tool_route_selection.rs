@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use super::tool_binding_projection::{is_server_control_plane_tool, is_server_runtime_tool};
 use super::tool_execution_binding::{
-    ExecutorBindingKind, ToolExecutionRequest, ToolTransportKind, WorkspaceBindingKind,
+    ToolExecutionRequest, ToolTransportKind, WorkspaceBindingKind,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -33,30 +32,97 @@ impl ToolExecutionRouteKind {
     }
 }
 
-/// Fallback routing via hardcoded tool-name matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolExecutionOwner {
+    ServerControlPlane,
+    ServerRuntime,
+    RuntimeExecutor,
+    RequestScopedMcp,
+    InterceptedTurnPipeline,
+    Unknown,
+}
+
+/// Server-local adapters for workspace/runtime tools.
 ///
-/// This function runs **only** when [`CapabilityRegistry::resolve`] does not
-/// find a provider for the tool.  Every tool returned here should eventually be
-/// migrated to a registered capability so that `routing_decision` shrinks to
-/// the executor-kind / transport-kind / workspace-kind branches that cannot
-/// (by construction) be expressed as capability declarations.
-///
-/// Track migration: search for `TODO(routing-fallback)` in this file.
-pub(crate) fn routing_decision(request: &ToolExecutionRequest) -> ToolExecutionRouteKind {
-    if request.tool_name.starts_with("mcp__")
-        || matches!(request.executor.kind, ExecutorBindingKind::Mcp)
-    {
-        return ToolExecutionRouteKind::RequestScopedMcp;
+/// This is adapter inventory, not fallback routing policy. A tool may be a
+/// valid runtime-executor capability and still be unsupported by the API-server
+/// binary if no in-process adapter exists here. Edge, gateway, and
+/// orchestrator-managed runtimes advertise and execute their own adapters.
+pub(crate) const SERVER_LOCAL_RUNTIME_TOOL_NAMES: &[&str] = &[
+    "bash",
+    "git",
+    "glob",
+    "grep",
+    "list_dir",
+    "publish_artifact",
+    "read_file",
+    "run_script",
+    "str_replace",
+    "symbols",
+    "write_file",
+];
+
+pub(crate) fn server_local_runtime_tool_supported(tool_name: &str) -> bool {
+    SERVER_LOCAL_RUNTIME_TOOL_NAMES.contains(&tool_name)
+}
+
+pub(crate) fn tool_execution_owner(
+    tool_name: &str,
+    registry: &astra_runtime_env::ToolRegistry,
+) -> ToolExecutionOwner {
+    if tool_name.starts_with("mcp__") {
+        return ToolExecutionOwner::RequestScopedMcp;
     }
-    // TODO(routing-fallback): migrate these hardcoded matches to CapabilityRegistry.
-    // When a new server-control-plane tool is added, its capability should be
-    // registered in the registry — do NOT add another branch here.
-    if is_server_control_plane_tool(&request.tool_name) {
-        return ToolExecutionRouteKind::ServerControlPlane;
+    if is_intercepted_turn_pipeline_tool(tool_name) {
+        return ToolExecutionOwner::InterceptedTurnPipeline;
     }
-    if is_server_runtime_tool(&request.tool_name) {
-        return ToolExecutionRouteKind::ServerRuntime;
+
+    let Some(spec) = registry.get(tool_name) else {
+        return ToolExecutionOwner::Unknown;
+    };
+
+    match spec.class {
+        astra_runtime_env::ToolClass::ControlPlane => ToolExecutionOwner::ServerControlPlane,
+        astra_runtime_env::ToolClass::ServerService => ToolExecutionOwner::ServerRuntime,
+        astra_runtime_env::ToolClass::Mcp => ToolExecutionOwner::RequestScopedMcp,
+        _ => match spec.required.executor {
+            astra_runtime_env::RequiredExecutor::ControlPlane => {
+                ToolExecutionOwner::ServerControlPlane
+            }
+            astra_runtime_env::RequiredExecutor::ServiceExecutor => {
+                ToolExecutionOwner::ServerRuntime
+            }
+            astra_runtime_env::RequiredExecutor::McpExecutor => {
+                ToolExecutionOwner::RequestScopedMcp
+            }
+            astra_runtime_env::RequiredExecutor::RuntimeExecutor
+            | astra_runtime_env::RequiredExecutor::None => ToolExecutionOwner::RuntimeExecutor,
+            _ => ToolExecutionOwner::RuntimeExecutor,
+        },
     }
+}
+
+fn is_intercepted_turn_pipeline_tool(tool_name: &str) -> bool {
+    tool_name.eq_ignore_ascii_case(crate::turn::skill_tool::SKILL_TOOL_NAME)
+        || tool_name.eq_ignore_ascii_case(crate::turn::skill_tool::DISCOVER_SKILLS_TOOL_NAME)
+}
+
+pub(crate) fn routing_decision(
+    request: &ToolExecutionRequest,
+    registry: &astra_runtime_env::ToolRegistry,
+) -> ToolExecutionRouteKind {
+    match tool_execution_owner(&request.tool_name, registry) {
+        ToolExecutionOwner::ServerControlPlane => {
+            return ToolExecutionRouteKind::ServerControlPlane;
+        }
+        ToolExecutionOwner::ServerRuntime => return ToolExecutionRouteKind::ServerRuntime,
+        ToolExecutionOwner::RequestScopedMcp => return ToolExecutionRouteKind::RequestScopedMcp,
+        ToolExecutionOwner::InterceptedTurnPipeline | ToolExecutionOwner::Unknown => {
+            return ToolExecutionRouteKind::Unsupported;
+        }
+        ToolExecutionOwner::RuntimeExecutor => {}
+    }
+
     if matches!(request.executor.transport, ToolTransportKind::GatewayRelay) {
         return ToolExecutionRouteKind::GatewayRelay;
     }
@@ -68,12 +134,16 @@ pub(crate) fn routing_decision(request: &ToolExecutionRequest) -> ToolExecutionR
     }
     match request.workspace.kind {
         WorkspaceBindingKind::EdgeWorkspace => return ToolExecutionRouteKind::EdgeBound,
-        WorkspaceBindingKind::ServerSandbox | WorkspaceBindingKind::LocalFilesystem => {
+        WorkspaceBindingKind::ServerSandbox
+            if server_local_runtime_tool_supported(&request.tool_name) =>
+        {
             return ToolExecutionRouteKind::ServerLocal;
         }
+        WorkspaceBindingKind::LocalFilesystem => return ToolExecutionRouteKind::Unsupported,
         WorkspaceBindingKind::CloudWorkspace
         | WorkspaceBindingKind::None
         | WorkspaceBindingKind::Unknown => {}
+        WorkspaceBindingKind::ServerSandbox => {}
     }
     ToolExecutionRouteKind::Unsupported
 }
@@ -116,14 +186,21 @@ mod tests {
         }
     }
 
+    fn registry() -> astra_runtime_env::ToolRegistry {
+        astra_runtime_env::ToolRegistry::builtins()
+    }
+
     #[test]
-    fn local_filesystem_routes_to_server_local() {
+    fn local_filesystem_does_not_route_to_server_local() {
         let req = make_request(
             "bash",
             WorkspaceBindingKind::LocalFilesystem,
             ToolTransportKind::ServerLocal,
         );
-        assert_eq!(routing_decision(&req), ToolExecutionRouteKind::ServerLocal);
+        assert_eq!(
+            routing_decision(&req, &registry()),
+            ToolExecutionRouteKind::Unsupported
+        );
     }
 
     #[test]
@@ -133,7 +210,10 @@ mod tests {
             WorkspaceBindingKind::ServerSandbox,
             ToolTransportKind::ServerLocal,
         );
-        assert_eq!(routing_decision(&req), ToolExecutionRouteKind::ServerLocal);
+        assert_eq!(
+            routing_decision(&req, &registry()),
+            ToolExecutionRouteKind::ServerLocal
+        );
     }
 
     #[test]
@@ -143,7 +223,10 @@ mod tests {
             WorkspaceBindingKind::EdgeWorkspace,
             ToolTransportKind::ServerLocal,
         );
-        assert_eq!(routing_decision(&req), ToolExecutionRouteKind::EdgeBound);
+        assert_eq!(
+            routing_decision(&req, &registry()),
+            ToolExecutionRouteKind::EdgeBound
+        );
     }
 
     #[test]
@@ -154,9 +237,82 @@ mod tests {
             ToolTransportKind::ServerLocal,
         );
         assert_eq!(
-            routing_decision(&req),
+            routing_decision(&req, &registry()),
             ToolExecutionRouteKind::RequestScopedMcp
         );
+    }
+
+    #[test]
+    fn mcp_executor_kind_does_not_hijack_non_mcp_tools() {
+        for name in ["skill", "not_a_tool"] {
+            let mut req = make_request(
+                name,
+                WorkspaceBindingKind::ServerSandbox,
+                ToolTransportKind::McpHttp,
+            );
+            req.executor.kind = ExecutorBindingKind::Mcp;
+
+            assert_eq!(
+                routing_decision(&req, &registry()),
+                ToolExecutionRouteKind::Unsupported,
+                "{name} must not be routed to MCP only because the executor binding says mcp"
+            );
+        }
+    }
+
+    #[test]
+    fn server_owned_tools_ignore_workspace_runtime_transport() {
+        let control = make_request(
+            "agent",
+            WorkspaceBindingKind::EdgeWorkspace,
+            ToolTransportKind::ServerLocal,
+        );
+        assert_eq!(
+            routing_decision(&control, &registry()),
+            ToolExecutionRouteKind::ServerControlPlane
+        );
+
+        let service = make_request(
+            "web_search",
+            WorkspaceBindingKind::EdgeWorkspace,
+            ToolTransportKind::ServerLocal,
+        );
+        assert_eq!(
+            routing_decision(&service, &registry()),
+            ToolExecutionRouteKind::ServerRuntime
+        );
+    }
+
+    #[test]
+    fn intercepted_and_unknown_tools_fail_closed_before_server_local() {
+        for name in ["skill", "Skill", "discover_skills", "not_a_tool"] {
+            let req = make_request(
+                name,
+                WorkspaceBindingKind::ServerSandbox,
+                ToolTransportKind::ServerLocal,
+            );
+            assert_eq!(
+                routing_decision(&req, &registry()),
+                ToolExecutionRouteKind::Unsupported,
+                "{name} must not reach ServerLocal"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_tools_without_server_adapter_do_not_route_to_server_local() {
+        for name in ["lsp", "powershell", "git_clone", "background_shell"] {
+            let req = make_request(
+                name,
+                WorkspaceBindingKind::ServerSandbox,
+                ToolTransportKind::ServerLocal,
+            );
+            assert_eq!(
+                routing_decision(&req, &registry()),
+                ToolExecutionRouteKind::Unsupported,
+                "{name} is a runtime capability but this server binary has no local adapter"
+            );
+        }
     }
 
     #[test]
@@ -166,7 +322,10 @@ mod tests {
             WorkspaceBindingKind::None,
             ToolTransportKind::GatewayRelay,
         );
-        assert_eq!(routing_decision(&req), ToolExecutionRouteKind::GatewayRelay);
+        assert_eq!(
+            routing_decision(&req, &registry()),
+            ToolExecutionRouteKind::GatewayRelay
+        );
     }
 
     #[test]
@@ -177,7 +336,7 @@ mod tests {
             ToolTransportKind::SandboxResidentAgent,
         );
         assert_eq!(
-            routing_decision(&req),
+            routing_decision(&req, &registry()),
             ToolExecutionRouteKind::SandboxResidentAgent
         );
     }
@@ -189,6 +348,9 @@ mod tests {
             WorkspaceBindingKind::Unknown,
             ToolTransportKind::ServerLocal,
         );
-        assert_eq!(routing_decision(&req), ToolExecutionRouteKind::Unsupported);
+        assert_eq!(
+            routing_decision(&req, &registry()),
+            ToolExecutionRouteKind::Unsupported
+        );
     }
 }
