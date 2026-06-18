@@ -153,6 +153,17 @@ impl WorkspaceProvisioner for ServerWorkspaceProvisioner {
                 workspace_id: Some(request.workspace_id),
             });
         };
+        let safe_id = safe_workspace_id(&session_id).map_err(server_error_to_workspace_error)?;
+        if request.workspace_id != safe_id {
+            return Err(WorkspaceProvisionError {
+                kind: WorkspaceProvisionErrorKind::SourceKindMismatch,
+                message: format!(
+                    "server sandbox workspace_id '{}' must match source.session_id '{}'",
+                    request.workspace_id, safe_id
+                ),
+                workspace_id: Some(request.workspace_id),
+            });
+        }
         let record = self
             .provision(&session_id)
             .map_err(server_error_to_workspace_error)?;
@@ -173,6 +184,27 @@ impl WorkspaceProvisioner for ServerWorkspaceProvisioner {
         workspace: &WorkspaceRecord,
         reason: CleanupReason,
     ) -> Result<(), astra_runtime_env::WorkspaceCleanupError> {
+        if workspace.kind != WorkspaceBindingKind::ServerSandbox {
+            return Err(astra_runtime_env::WorkspaceCleanupError {
+                workspace_id: workspace.workspace_id.clone(),
+                reason,
+                message: format!(
+                    "server workspace provisioner cannot clean {:?} workspace records",
+                    workspace.kind
+                ),
+            });
+        }
+        if !matches!(workspace.source, WorkspaceSource::ServerSandbox { .. }) {
+            return Err(astra_runtime_env::WorkspaceCleanupError {
+                workspace_id: workspace.workspace_id.clone(),
+                reason,
+                message: "server workspace cleanup requires a server sandbox source".to_string(),
+            });
+        }
+        let root = PathBuf::from(&workspace.root_or_volume_ref);
+        if !root.exists() {
+            return Ok(());
+        }
         let base = self.base_dir.canonicalize().map_err(|error| {
             astra_runtime_env::WorkspaceCleanupError {
                 workspace_id: workspace.workspace_id.clone(),
@@ -183,10 +215,6 @@ impl WorkspaceProvisioner for ServerWorkspaceProvisioner {
                 ),
             }
         })?;
-        let root = PathBuf::from(&workspace.root_or_volume_ref);
-        if !root.exists() {
-            return Ok(());
-        }
         let root =
             root.canonicalize()
                 .map_err(|error| astra_runtime_env::WorkspaceCleanupError {
@@ -363,6 +391,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trait_provision_rejects_mismatched_workspace_id_and_source_session() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provisioner = ServerWorkspaceProvisioner::new(temp.path().join("workspaces"));
+        let mut request = WorkspaceProvisionRequest::server_sandbox("session-1");
+        request.workspace_id = "session-2".to_string();
+
+        let error = WorkspaceProvisioner::provision(&provisioner, request)
+            .await
+            .expect_err("mismatched request should fail");
+
+        assert_eq!(error.kind, WorkspaceProvisionErrorKind::SourceKindMismatch);
+        assert!(error.message.contains("must match source.session_id"));
+    }
+
+    #[tokio::test]
     async fn trait_cleanup_rejects_workspace_outside_base() {
         let temp = tempfile::tempdir().expect("tempdir");
         let provisioner = ServerWorkspaceProvisioner::new(temp.path().join("workspaces"));
@@ -380,5 +423,41 @@ mod tests {
             .expect_err("outside cleanup should fail");
 
         assert!(error.message.contains("outside base"));
+    }
+
+    #[tokio::test]
+    async fn trait_cleanup_rejects_non_server_workspace_records() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provisioner = ServerWorkspaceProvisioner::new(temp.path().join("workspaces"));
+        let mut record = provisioner
+            .provision("session-1")
+            .expect("workspace")
+            .workspace;
+        record.kind = WorkspaceBindingKind::CloudWorkspace;
+        record.source = WorkspaceSource::Scratch;
+
+        let error = provisioner
+            .cleanup(&record, CleanupReason::Failed)
+            .await
+            .expect_err("wrong owner should fail");
+
+        assert!(error.message.contains("cannot clean"));
+    }
+
+    #[tokio::test]
+    async fn trait_cleanup_is_idempotent_when_base_and_root_are_gone() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().join("workspaces");
+        let provisioner = ServerWorkspaceProvisioner::new(base.clone());
+        let record = provisioner
+            .provision("session-1")
+            .expect("workspace")
+            .workspace;
+        std::fs::remove_dir_all(&base).expect("remove base");
+
+        provisioner
+            .cleanup(&record, CleanupReason::Completed)
+            .await
+            .expect("missing root cleanup should be idempotent");
     }
 }

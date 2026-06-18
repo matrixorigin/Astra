@@ -306,9 +306,22 @@ impl CloudWorkspaceStorage for FilesystemCloudWorkspaceStorage {
     ) -> Result<PathBuf, WorkspaceProvisionError> {
         let base = self.canonical_base()?;
         validate_safe_segment(source_id)?;
-        let source_path = requested_root
-            .map(PathBuf::from)
-            .unwrap_or_else(|| base.join(source_kind.storage_category()).join(source_id));
+        let source_path = match requested_root {
+            Some(root) => {
+                let path = PathBuf::from(root);
+                if !path.is_absolute() {
+                    return Err(WorkspaceProvisionError::mount_failed(
+                        workspace_id,
+                        format!(
+                            "materialized workspace source root '{}' must be absolute",
+                            path.display()
+                        ),
+                    ));
+                }
+                path
+            }
+            None => base.join(source_kind.storage_category()).join(source_id),
+        };
         self.canonical_workspace_path(&base, workspace_id, &source_path)
     }
 
@@ -465,6 +478,24 @@ impl CloudWorkspaceStorage for FilesystemCloudWorkspaceStorage {
         workspace: &WorkspaceRecord,
         reason: CleanupReason,
     ) -> Result<(), WorkspaceCleanupError> {
+        let root = PathBuf::from(&workspace.root_or_volume_ref);
+        if !root.exists() {
+            if !self.base_dir.exists()
+                && canonicalize_existing_parent_and_append(&root)
+                    .zip(canonicalize_existing_parent_and_append(&self.base_dir))
+                    .is_some_and(|(root, base)| root.starts_with(base))
+            {
+                return Ok(());
+            }
+            return Err(WorkspaceCleanupError {
+                workspace_id: workspace.workspace_id.clone(),
+                reason,
+                message: format!(
+                    "failed to resolve workspace '{}'",
+                    workspace.root_or_volume_ref
+                ),
+            });
+        }
         let base = self
             .base_dir
             .canonicalize()
@@ -476,16 +507,14 @@ impl CloudWorkspaceStorage for FilesystemCloudWorkspaceStorage {
                     self.base_dir.display()
                 ),
             })?;
-        let root = PathBuf::from(&workspace.root_or_volume_ref)
-            .canonicalize()
-            .map_err(|error| WorkspaceCleanupError {
-                workspace_id: workspace.workspace_id.clone(),
-                reason,
-                message: format!(
-                    "failed to resolve workspace '{}': {error}",
-                    workspace.root_or_volume_ref
-                ),
-            })?;
+        let root = root.canonicalize().map_err(|error| WorkspaceCleanupError {
+            workspace_id: workspace.workspace_id.clone(),
+            reason,
+            message: format!(
+                "failed to resolve workspace '{}': {error}",
+                workspace.root_or_volume_ref
+            ),
+        })?;
         if !root.starts_with(&base) {
             return Err(WorkspaceCleanupError {
                 workspace_id: workspace.workspace_id.clone(),
@@ -564,11 +593,42 @@ impl WorkspaceProvisioner for CloudWorkspaceProvisioner {
         workspace: &WorkspaceRecord,
         reason: CleanupReason,
     ) -> Result<(), WorkspaceCleanupError> {
+        if workspace.kind != WorkspaceBindingKind::CloudWorkspace {
+            return Err(WorkspaceCleanupError {
+                workspace_id: workspace.workspace_id.clone(),
+                reason,
+                message: format!(
+                    "cloud workspace provisioner cannot clean {:?} workspace records",
+                    workspace.kind
+                ),
+            });
+        }
+        if matches!(workspace.source, WorkspaceSource::PersistentVolume { .. }) {
+            return Ok(());
+        }
         if matches!(
             workspace.persistence,
             WorkspacePersistence::Persistent | WorkspacePersistence::ImmutableSnapshot
         ) {
             return Ok(());
+        }
+        if !matches!(
+            workspace.source,
+            WorkspaceSource::UploadedSnapshot { .. }
+                | WorkspaceSource::Template { .. }
+                | WorkspaceSource::DatasetBundle { .. }
+                | WorkspaceSource::ArtifactBundle { .. }
+                | WorkspaceSource::GitCheckout { .. }
+                | WorkspaceSource::Scratch
+        ) {
+            return Err(WorkspaceCleanupError {
+                workspace_id: workspace.workspace_id.clone(),
+                reason,
+                message: format!(
+                    "cloud workspace cleanup does not own source {:?}",
+                    workspace.source
+                ),
+            });
         }
         self.storage.cleanup_session_workspace(workspace, reason)
     }
@@ -599,6 +659,20 @@ fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn canonicalize_existing_parent_and_append(path: &Path) -> Option<PathBuf> {
+    let mut suffix = Vec::new();
+    let mut cursor = path;
+    while !cursor.exists() {
+        suffix.push(cursor.file_name()?.to_os_string());
+        cursor = cursor.parent()?;
+    }
+    let mut resolved = cursor.canonicalize().ok()?;
+    for component in suffix.iter().rev() {
+        resolved.push(component);
+    }
+    Some(resolved)
 }
 
 #[cfg(test)]
@@ -1120,6 +1194,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn materialized_source_requested_root_must_be_absolute() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = CloudWorkspaceProvisioner::new(temp.path().join("cloud"));
+        let mut request = materialized_source_request(
+            "template-workspace-1",
+            WorkspaceSource::Template {
+                template_id: "template-1".to_string(),
+            },
+            WorkspaceAuthority::ReadOnly,
+            WorkspacePersistence::ImmutableSnapshot,
+        );
+        request.requested_root = Some("templates/template-1".to_string());
+
+        let error = provider
+            .provision(request)
+            .await
+            .expect_err("relative source root should fail");
+
+        assert_eq!(error.kind, WorkspaceProvisionErrorKind::MountFailed);
+        assert!(error.message.contains("must be absolute"));
+    }
+
+    #[tokio::test]
     async fn git_checkout_rejects_empty_repository_before_launch() {
         let temp = tempfile::tempdir().expect("tempdir");
         let provider = CloudWorkspaceProvisioner::new(temp.path().join("cloud"));
@@ -1195,10 +1292,9 @@ mod tests {
         let outside = temp.path().join("outside");
         fs::create_dir_all(&outside).expect("outside");
         let mut record = provider
-            .provision(persistent_volume_request("volume-1"))
+            .provision(scratch_request())
             .await
-            .expect("volume");
-        record.persistence = WorkspacePersistence::Session;
+            .expect("scratch");
         record.root_or_volume_ref = outside.display().to_string();
 
         let error = provider
@@ -1207,6 +1303,85 @@ mod tests {
             .expect_err("outside cleanup should fail");
 
         assert!(error.message.contains("outside cloud workspace base"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_never_deletes_persistent_volume_sources_even_if_persistence_is_wrong() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = CloudWorkspaceProvisioner::new(temp.path().join("cloud"));
+        let mut record = provider
+            .provision(persistent_volume_request("volume-1"))
+            .await
+            .expect("volume");
+        record.persistence = WorkspacePersistence::Session;
+
+        provider
+            .cleanup(&record, CleanupReason::Failed)
+            .await
+            .expect("persistent volume source should be a no-op");
+
+        assert!(Path::new(&record.root_or_volume_ref).is_dir());
+    }
+
+    #[tokio::test]
+    async fn cleanup_rejects_non_cloud_workspace_records() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = CloudWorkspaceProvisioner::new(temp.path().join("cloud"));
+        let mut record = provider
+            .provision(scratch_request())
+            .await
+            .expect("scratch");
+        record.kind = WorkspaceBindingKind::ServerSandbox;
+        record.source = WorkspaceSource::ServerSandbox {
+            session_id: "session-1".to_string(),
+        };
+
+        let error = provider
+            .cleanup(&record, CleanupReason::Failed)
+            .await
+            .expect_err("wrong owner should fail");
+
+        assert!(error.message.contains("cannot clean"));
+        assert!(Path::new(&record.root_or_volume_ref).is_dir());
+    }
+
+    #[tokio::test]
+    async fn cleanup_rejects_provider_managed_records_not_owned_by_filesystem_storage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = CloudWorkspaceProvisioner::new(temp.path().join("cloud"));
+        let mut record = provider
+            .provision(scratch_request())
+            .await
+            .expect("scratch");
+        record.source = WorkspaceSource::ProviderManaged {
+            provider: "external".to_string(),
+            reference: "workspace-1".to_string(),
+        };
+
+        let error = provider
+            .cleanup(&record, CleanupReason::Failed)
+            .await
+            .expect_err("provider-managed cleanup should fail");
+
+        assert!(error.message.contains("does not own source"));
+        assert!(Path::new(&record.root_or_volume_ref).is_dir());
+    }
+
+    #[tokio::test]
+    async fn cleanup_is_idempotent_when_base_and_root_are_gone() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().join("cloud");
+        let provider = CloudWorkspaceProvisioner::new(base.clone());
+        let record = provider
+            .provision(scratch_request())
+            .await
+            .expect("scratch");
+        fs::remove_dir_all(&base).expect("remove base");
+
+        provider
+            .cleanup(&record, CleanupReason::Completed)
+            .await
+            .expect("missing root cleanup should be idempotent");
     }
 
     fn git_available() -> bool {

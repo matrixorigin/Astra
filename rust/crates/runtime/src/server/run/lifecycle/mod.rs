@@ -8358,6 +8358,7 @@ mod tests {
         let svc = test_service().with_workspace_record_store(store.clone());
         let mut record = test_cloud_workspace_record("workspace-cleanup-debt");
         record.persistence = RuntimeWorkspacePersistence::Session;
+        record.source = RuntimeWorkspaceSource::Scratch;
         record.root_or_volume_ref = "/definitely/missing/astra-cleanup-debt".to_string();
 
         svc.cleanup_cloud_workspace_after_failed_start(
@@ -8386,6 +8387,7 @@ mod tests {
         let store = Arc::new(InMemoryWorkspaceRecordStore::new());
         let mut record = test_cloud_workspace_record("workspace-terminal-cleanup-debt");
         record.persistence = RuntimeWorkspacePersistence::Session;
+        record.source = RuntimeWorkspaceSource::Scratch;
         record.root_or_volume_ref = "/definitely/missing/astra-terminal-cleanup-debt".to_string();
 
         AgenticRunLifecycleService::cleanup_cloud_workspace_after_terminal_run(
