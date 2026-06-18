@@ -31,6 +31,15 @@ use uuid::Uuid;
 
 const HTTP_TOKEN: &str = "Bearer phase1-http-token";
 
+fn unsupported_phase1_http_method<T>(method: &str) -> Result<T, (StatusCode, Json<ErrorResponse>)> {
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(ErrorResponse::new(format!(
+            "phase1_run_durability test mock does not implement {method}"
+        ))),
+    ))
+}
+
 fn require_db_it_env() -> astra_core::MatrixOneSettings {
     assert_eq!(
         std::env::var("ASTRA_TEST_DB_IT").as_deref(),
@@ -145,28 +154,28 @@ impl AuthService for Phase1HttpAuth {
         &self,
         _request: AuthRegisterRequestData,
     ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("auth.register")
     }
 
     async fn login(
         &self,
         _request: AuthLoginRequestData,
     ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("auth.login")
     }
 
     async fn refresh(
         &self,
         _request: AuthRefreshRequestData,
     ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("auth.refresh")
     }
 
     async fn logout(
         &self,
         _request: AuthRefreshRequestData,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("auth.logout")
     }
 }
 
@@ -182,7 +191,7 @@ impl SessionService for Phase1HttpSession {
         _user_id: String,
         _request: SessionCreateRequestData,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("sessions.create_session")
     }
 
     async fn get_session(
@@ -210,14 +219,14 @@ impl SessionService for Phase1HttpSession {
         _user_id: String,
         _request: SessionUpdateRequestData,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("sessions.update_session")
     }
 
     async fn list_sessions(
         &self,
         _filter: SessionListFilter,
     ) -> Result<SessionListRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("sessions.list_sessions")
     }
 
     async fn delete_session(
@@ -225,7 +234,7 @@ impl SessionService for Phase1HttpSession {
         _session_id: String,
         _user_id: String,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("sessions.delete_session")
     }
 
     async fn get_session_activity(
@@ -235,7 +244,7 @@ impl SessionService for Phase1HttpSession {
         _limit: u32,
         _offset: u32,
     ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("sessions.get_session_activity")
     }
 }
 
@@ -257,7 +266,7 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
         _user_id: String,
         _request: ChatRequestData,
     ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("runs.create_run")
     }
 
     async fn stream_chat(
@@ -265,7 +274,7 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
         _user_id: String,
         _request: ChatRequestData,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("runs.stream_chat")
     }
 
     async fn get_run_status(
