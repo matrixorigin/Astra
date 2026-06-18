@@ -109,16 +109,20 @@ fn render_deferred_user_input(content: &str) -> String {
 pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
-) {
+) -> Result<(), astra_core::ClassifiedError> {
     let (run_control, run_id) = match (state.run_control.as_ref(), state.current_run_id.as_ref()) {
         (Some(run_control), Some(run_id)) => (run_control.clone(), run_id.clone()),
-        _ => return,
+        _ => return Ok(()),
     };
     let poll = run_control
         .poll_user_inputs(&run_id, state.deferred_input.deferred_user_input_cursor())
         .await;
     if let Some(error) = &poll.error {
         tracing::warn!(run_id, error = %error, "deferred user input poll failed");
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::DatabaseError,
+            format!("failed to poll deferred user input for run {run_id}: {error}"),
+        ));
     }
     let observed = state
         .deferred_input
@@ -127,7 +131,7 @@ pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
         .deferred_input
         .release_event_indices_to_ack(&observed.released_event_indices);
     if observed.raw_inputs.is_empty() && release_event_indices.is_empty() {
-        return;
+        return Ok(());
     }
 
     for input in &observed.raw_inputs {
@@ -153,7 +157,7 @@ pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
         .deferred_input
         .commit_observed_cursor(observed.next_cursor);
     if release_event_indices.is_empty() {
-        return;
+        return Ok(());
     }
     match run_control
         .mark_user_inputs_released(&run_id, &release_event_indices)
@@ -174,6 +178,7 @@ pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
             );
         }
     }
+    Ok(())
 }
 
 /// Record an `llm_round` event for an early-exit path (no tool calls).
@@ -427,7 +432,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         emitter.llm_call_started(turn_index as u32);
     }
 
-    inject_polled_deferred_user_inputs(host, state).await;
+    inject_polled_deferred_user_inputs(host, state).await?;
 
     // ── Nudge suppression gate ──────────────────────────────────────────
     // In PermissionMode::Auto the user has explicitly asked to let the
@@ -4618,7 +4623,9 @@ mod tests {
         state.run_control = Some(provider.clone());
         let mut host = MockHost::new(vec![]);
 
-        inject_polled_deferred_user_inputs(&mut host, &mut state).await;
+        inject_polled_deferred_user_inputs(&mut host, &mut state)
+            .await
+            .unwrap();
 
         assert_eq!(state.deferred_input.deferred_user_input_cursor(), 2);
         assert_eq!(*provider.released.lock().await, vec![1]);
@@ -4659,8 +4666,12 @@ mod tests {
         state.run_control = Some(provider.clone());
         let mut host = MockHost::new(vec![]);
 
-        inject_polled_deferred_user_inputs(&mut host, &mut state).await;
-        inject_polled_deferred_user_inputs(&mut host, &mut state).await;
+        inject_polled_deferred_user_inputs(&mut host, &mut state)
+            .await
+            .unwrap();
+        inject_polled_deferred_user_inputs(&mut host, &mut state)
+            .await
+            .unwrap();
 
         assert_eq!(state.deferred_input.deferred_user_input_cursor(), 2);
         assert_eq!(*provider.released.lock().await, vec![1]);
@@ -4699,8 +4710,12 @@ mod tests {
         state.run_control = Some(provider.clone());
         let mut host = MockHost::new(vec![]);
 
-        inject_polled_deferred_user_inputs(&mut host, &mut state).await;
-        inject_polled_deferred_user_inputs(&mut host, &mut state).await;
+        inject_polled_deferred_user_inputs(&mut host, &mut state)
+            .await
+            .unwrap();
+        inject_polled_deferred_user_inputs(&mut host, &mut state)
+            .await
+            .unwrap();
 
         assert_eq!(state.deferred_input.deferred_user_input_cursor(), 2);
         assert_eq!(*provider.released.lock().await, vec![1]);
@@ -4729,12 +4744,37 @@ mod tests {
         state.run_control = Some(provider.clone());
         let mut host = MockHost::new(vec![]);
 
-        inject_polled_deferred_user_inputs(&mut host, &mut state).await;
+        inject_polled_deferred_user_inputs(&mut host, &mut state)
+            .await
+            .unwrap();
 
         assert_eq!(state.deferred_input.deferred_user_input_cursor(), 7);
         assert_eq!(*provider.released.lock().await, vec![6]);
         assert!(state.messages.is_empty());
         assert!(state.volatile_pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deferred_user_input_poll_error_fails_closed() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-missing".into());
+        let provider = Arc::new(StubRunControlProvider::new(vec![RunQueuedInputPoll {
+            next_cursor: 4,
+            inputs: Vec::new(),
+            error: Some("run not found while polling deferred input: run-missing".into()),
+        }]));
+        state.run_control = Some(provider.clone());
+        let mut host = MockHost::new(vec![]);
+
+        let error = inject_polled_deferred_user_inputs(&mut host, &mut state)
+            .await
+            .expect_err("poll errors must stop the loop instead of being treated as empty input");
+
+        assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
+        assert!(error.message.contains("run-missing"));
+        assert_eq!(state.deferred_input.deferred_user_input_cursor(), 0);
+        assert!(state.messages.is_empty());
+        assert!(provider.released.lock().await.is_empty());
     }
 
     #[test]
