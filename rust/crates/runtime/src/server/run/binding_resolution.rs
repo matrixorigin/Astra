@@ -404,7 +404,6 @@ fn cloud_executor_binding_from_request(
         status: ExecutorStatus::Online,
     };
     if let Some(binding) = binding {
-        executor.kind = executor_kind_from_request(binding.kind);
         if let Some(executor_id) = non_empty_string(binding.executor_id.as_deref()) {
             executor.executor_id = executor_id;
         }
@@ -412,13 +411,27 @@ fn cloud_executor_binding_from_request(
             executor.display_name = display_name;
         }
         if let Some(transport) = binding.transport {
-            executor.transport = tool_transport_from_request(transport);
+            executor.transport = cloud_tool_transport_from_request(transport);
         }
         if let Some(status) = binding.status {
             executor.status = executor_status_from_request(status);
         }
     }
     executor
+}
+
+fn cloud_tool_transport_from_request(
+    transport: astra_services::runs::ToolTransportKindRequest,
+) -> ToolTransportKind {
+    match transport {
+        astra_services::runs::ToolTransportKindRequest::GatewayRelay => {
+            ToolTransportKind::GatewayRelay
+        }
+        astra_services::runs::ToolTransportKindRequest::SandboxResidentAgent => {
+            ToolTransportKind::SandboxResidentAgent
+        }
+        _ => ToolTransportKind::SandboxResidentAgent,
+    }
 }
 
 fn first_non_empty_profile_string(
@@ -450,26 +463,6 @@ fn fallback_policy_from_request(
 ) -> FallbackPolicy {
     match fallback_policy {
         astra_services::runs::FallbackPolicyRequest::Disabled => FallbackPolicy::Disabled,
-    }
-}
-
-fn executor_kind_from_request(
-    kind: astra_services::runs::ExecutorBindingRequestKind,
-) -> ExecutorBindingKind {
-    match kind {
-        astra_services::runs::ExecutorBindingRequestKind::ServerLocal => {
-            ExecutorBindingKind::ServerLocal
-        }
-        astra_services::runs::ExecutorBindingRequestKind::EdgeAgent => {
-            ExecutorBindingKind::EdgeAgent
-        }
-        astra_services::runs::ExecutorBindingRequestKind::OrchestratorManaged => {
-            ExecutorBindingKind::OrchestratorManaged
-        }
-        astra_services::runs::ExecutorBindingRequestKind::ThinClient => {
-            ExecutorBindingKind::ThinClient
-        }
-        astra_services::runs::ExecutorBindingRequestKind::Mcp => ExecutorBindingKind::Mcp,
     }
 }
 
@@ -586,6 +579,70 @@ mod tests {
         assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
         assert_eq!(executor.executor_id, "server-local-2");
         assert_eq!(executor.display_name, "Requested executor");
+    }
+
+    #[test]
+    fn cloud_workspace_executor_binding_ignores_local_executor_spoofing() {
+        let mut request = test_request("run in cloud");
+        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+            kind: astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace,
+            display_name: Some("Cloud checkout".to_string()),
+            root: Some("/cloud/checkouts/run-1".to_string()),
+            source: Some(astra_services::runs::WorkspaceSourceRequest::GitCheckout {
+                repository: "https://example.com/org/repo.git".to_string(),
+                reference: None,
+            }),
+            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
+        });
+        request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+            kind: astra_services::runs::ExecutorBindingRequestKind::ServerLocal,
+            executor_id: Some("client-claimed-local".to_string()),
+            display_name: Some("Client claimed local executor".to_string()),
+            transport: Some(astra_services::runs::ToolTransportKindRequest::ServerLocal),
+            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+        });
+
+        let (workspace, executor) =
+            resolve_request_execution_bindings(&request, Path::new("/tmp/server-workspace"));
+
+        assert_eq!(workspace.kind, WorkspaceBindingKind::CloudWorkspace);
+        assert_eq!(executor.kind, ExecutorBindingKind::OrchestratorManaged);
+        assert_eq!(executor.executor_id, "client-claimed-local");
+        assert_eq!(executor.display_name, "Client claimed local executor");
+        assert_eq!(executor.transport, ToolTransportKind::SandboxResidentAgent);
+        assert_eq!(executor.status, ExecutorStatus::Online);
+    }
+
+    #[test]
+    fn cloud_workspace_executor_binding_allows_gateway_relay_transport() {
+        let mut request = test_request("run through provider gateway");
+        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+            kind: astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace,
+            display_name: Some("OpenShell workspace".to_string()),
+            root: Some("/sandbox".to_string()),
+            source: Some(
+                astra_services::runs::WorkspaceSourceRequest::PersistentVolume {
+                    volume_id: "openshell-workspace-1".to_string(),
+                },
+            ),
+            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
+        });
+        request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+            kind: astra_services::runs::ExecutorBindingRequestKind::OrchestratorManaged,
+            executor_id: Some("openshell-gateway".to_string()),
+            display_name: Some("OpenShell Gateway".to_string()),
+            transport: Some(astra_services::runs::ToolTransportKindRequest::GatewayRelay),
+            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+        });
+
+        let (_workspace, executor) =
+            resolve_request_execution_bindings(&request, Path::new("/tmp/server-workspace"));
+
+        assert_eq!(executor.kind, ExecutorBindingKind::OrchestratorManaged);
+        assert_eq!(executor.transport, ToolTransportKind::GatewayRelay);
+        assert_eq!(executor.executor_id, "openshell-gateway");
     }
 
     #[test]
