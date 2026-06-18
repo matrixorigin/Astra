@@ -3,8 +3,6 @@ use std::time::Instant;
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::*;
 use crate::turn::agentic_loop::tool_support::edge_tool_status_exit_code;
-use astra_turn_core::edge_prompt_context::make_args_preview;
-use astra_turn_core::headless_tool_assembly::READ_ONLY_TOOLS;
 use astra_turn_core::headless_tool_postprocess::{
     HeadlessOutputEnrichSignal, append_headless_result_quality_feedback,
     enrich_headless_tool_output_for_errors_and_limits,
@@ -105,6 +103,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             idem_key,
         } = permitted;
 
+        self.begin_execution_trace(&execution, &idem_key);
+        let tool_start = Instant::now();
         execute_tool_pure(
             &mut execution,
             self.ctx.server_tool_executor,
@@ -114,24 +114,6 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             self.ctx.turn_index,
         )
         .await;
-
-        let tool_start = Instant::now();
-        let tool_idem_key = if READ_ONLY_TOOLS.contains(&execution.name.as_str()) {
-            Some(idem_key.cache_key())
-        } else {
-            None
-        };
-        let args_preview = make_args_preview(&execution.name, &execution.args);
-        self.ctx.step_recorder.begin_tool_with_key_and_args_preview(
-            &execution.name,
-            &execution.id,
-            tool_idem_key.as_deref(),
-            args_preview.as_deref(),
-        );
-
-        if let Some(emitter) = self.ctx.progress_emitter {
-            emitter.tool_executing(&execution.name, self.ctx.turn_index as u32);
-        }
 
         // P1 (tool-design-gaps plan): use `classify_tool_error` so that
         // soft errors (read_file ENOENT, str_replace not-unique, grep

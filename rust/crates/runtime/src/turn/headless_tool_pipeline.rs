@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use astra_services::session_journal::ToolCallRecord;
 use astra_thin_client::ThinClient;
@@ -9,10 +9,11 @@ use super::agentic::headless_round::{HeadlessRoundTerminal, PermissionSyncHandle
 use astra_pipeline::step_protocol::{IdempotencyKey, InMemoryIdempotencyCache};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
+use astra_turn_core::edge_prompt_context::make_args_preview;
 use astra_turn_core::guardrails::turn_guard::TurnGuard;
 use astra_turn_core::headless_tool_assembly::{
-    EdgeToolRoundRow, HeadlessResolvedToolSlot, HeadlessRoundToolIdx, resolve_headless_tool_slot,
-    take_edge_output_for_tool_call_with_duration,
+    EdgeToolRoundRow, HeadlessResolvedToolSlot, HeadlessRoundToolIdx, READ_ONLY_TOOLS,
+    resolve_headless_tool_slot, take_edge_output_for_tool_call_with_duration,
 };
 
 mod execute;
@@ -314,6 +315,29 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         self.ctx.turn_guard.record_step_abort(aborted_tools);
     }
 
+    fn begin_execution_trace(
+        &mut self,
+        execution: &HeadlessResolvedExecution,
+        idem_key: &IdempotencyKey,
+    ) {
+        let tool_idem_key = if READ_ONLY_TOOLS.contains(&execution.name.as_str()) {
+            Some(idem_key.cache_key())
+        } else {
+            None
+        };
+        let args_preview = make_args_preview(&execution.name, &execution.args);
+        self.ctx.step_recorder.begin_tool_with_key_and_args_preview(
+            &execution.name,
+            &execution.id,
+            tool_idem_key.as_deref(),
+            args_preview.as_deref(),
+        );
+
+        if let Some(emitter) = self.ctx.progress_emitter {
+            emitter.tool_executing(&execution.name, self.ctx.turn_index as u32);
+        }
+    }
+
     fn resolve_slot(&self, item: HeadlessRoundToolIdx) -> HeadlessResolvedToolSlot {
         resolve_headless_tool_slot(item, self.ctx.tool_calls, |i| {
             let edge = &self.ctx.edge_tool_round[i];
@@ -377,6 +401,14 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let session_id = self.ctx.current_session_id;
         let turn_index = self.ctx.turn_index;
 
+        let started_at: Vec<Instant> = executions
+            .iter()
+            .map(|(execution, idem_key)| {
+                self.begin_execution_trace(execution, idem_key);
+                Instant::now()
+            })
+            .collect();
+
         let futs: Vec<_> = executions
             .iter_mut()
             .map(|(exec, _)| {
@@ -386,7 +418,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         futures_util::future::join_all(futs).await;
 
         // Phase 3: post-process + record serially (fast, needs &mut self).
-        for (execution, idem_key) in executions {
+        for ((execution, idem_key), started) in executions.into_iter().zip(started_at) {
             let is_err = execution_result_is_error(
                 &execution.name,
                 &execution.result_str,
@@ -395,7 +427,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             let executed_ms = if execution.is_edge_tool && execution.edge_duration_ms > 0 {
                 execution.edge_duration_ms
             } else {
-                0
+                started.elapsed().as_millis() as u64
             };
             let executed = ExecutedExecution {
                 execution,
@@ -655,6 +687,73 @@ mod tests {
             }
             _ => panic!("expected permitted execution"),
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_batch_records_tool_starts_before_terminal_events() {
+        let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.push(EdgeToolExecResult {
+            request_id: String::new(),
+            tool: "grep".to_string(),
+            args: json!({ "pattern": "pipeline" }),
+            output: "second result".to_string(),
+            tool_result_fields: Some(edge_runtime_environment_fields()),
+            status: "ok".to_string(),
+            duration_ms: 7,
+        });
+        begin_recorded_turn(&mut harness, 2);
+
+        {
+            let mut pipeline = harness.pipeline();
+            assert!(
+                pipeline
+                    .run_batch_concurrent(&[
+                        HeadlessRoundToolIdx::SyntheticEdge(0),
+                        HeadlessRoundToolIdx::SyntheticEdge(1),
+                    ])
+                    .await,
+                "concurrent read-only batch should complete"
+            );
+        }
+
+        let tool_events = tool_trace_events(&harness);
+        assert_eq!(
+            tool_events.len(),
+            4,
+            "each concurrently executed tool should emit started+terminal trace events"
+        );
+        assert!(matches!(
+            tool_events[0].0,
+            astra_pipeline::step_protocol::StepEventType::ToolCallStarted
+        ));
+        assert!(matches!(
+            tool_events[1].0,
+            astra_pipeline::step_protocol::StepEventType::ToolCallStarted
+        ));
+        assert!(matches!(
+            tool_events[2].0,
+            astra_pipeline::step_protocol::StepEventType::ToolCallCompleted
+        ));
+        assert!(matches!(
+            tool_events[3].0,
+            astra_pipeline::step_protocol::StepEventType::ToolCallCompleted
+        ));
+        assert_eq!(
+            tool_events[2]
+                .1
+                .as_ref()
+                .and_then(|payload| payload.get("elapsed_ms"))
+                .and_then(Value::as_u64),
+            Some(12)
+        );
+        assert_eq!(
+            tool_events[3]
+                .1
+                .as_ref()
+                .and_then(|payload| payload.get("elapsed_ms"))
+                .and_then(Value::as_u64),
+            Some(7)
+        );
     }
 
     #[tokio::test]
