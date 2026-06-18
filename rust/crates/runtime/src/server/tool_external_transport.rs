@@ -318,20 +318,18 @@ where
                 return external_outcome_tool_result(&request, binding, transport_kind, outcome);
             }
             Err(error) => {
-                if !error.retryable || attempt == max_retries {
+                if !is_safe_to_retry_runtime_error(&error) || attempt == max_retries {
                     return external_error_tool_result(
                         &request,
                         binding,
                         transport_kind,
                         adapter_name,
                         if let Some(ref prev) = last_error {
-                            astra_runtime_env::RuntimeError::new(
-                                error.kind.clone(),
-                                format!(
-                                    "{} (retried {} time(s); last error: {})",
-                                    error.message, attempt, prev.message
-                                ),
-                            )
+                            let message = format!(
+                                "{} (retried {} time(s); last error: {})",
+                                error.message, attempt, prev.message
+                            );
+                            runtime_error_with_message(error, message)
                         } else {
                             error
                         },
@@ -346,6 +344,18 @@ where
 
     // Unreachable — the retry loop always returns or exhausts attempts.
     unreachable!("retry loop exited without returning");
+}
+
+fn is_safe_to_retry_runtime_error(error: &astra_runtime_env::RuntimeError) -> bool {
+    error.retryable && !error.execution_started && !error.side_effects_maybe
+}
+
+fn runtime_error_with_message(
+    mut error: astra_runtime_env::RuntimeError,
+    message: String,
+) -> astra_runtime_env::RuntimeError {
+    error.message = message;
+    error
 }
 
 fn external_outcome_tool_result(

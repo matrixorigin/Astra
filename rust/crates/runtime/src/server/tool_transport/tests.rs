@@ -3326,12 +3326,64 @@ async fn external_transport_retryable_error_exhausts_retries() {
         result.output.contains("retried 3 time(s)"),
         "error should mention retry count: {result:?}"
     );
+    let metadata = result.metadata.as_ref().expect("retry metadata");
+    assert_eq!(metadata["retryable"], true);
+    assert_eq!(metadata["execution_started"], false);
+    assert_eq!(metadata["side_effects_maybe"], false);
+    assert_eq!(
+        metadata["next_action"],
+        "change_workspace_executor_runtime_or_policy"
+    );
     assert_eq!(local.calls(), 0, "must not fall back locally");
     assert_eq!(
         result.exit_semantics,
         Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
         "exhausted retries must carry ExecutionError exit semantics"
     );
+}
+
+#[tokio::test]
+async fn external_transport_retryable_error_after_start_does_not_retry() {
+    // A disconnected transport after execution started is retryable at the
+    // run/session level, but replaying the same tool call can duplicate
+    // side effects. The transport dispatch layer must fail closed and report
+    // uncertainty instead of issuing another execute_tool call.
+    let request = cloud_snapshot_request("read_file");
+    let error = astra_runtime_env::RuntimeError::transport_disconnected("lost after tool start");
+
+    let transport = Arc::new(ReplayTransport::new(vec![
+        Err(error),
+        Ok(runtime_outcome_for_request(
+            &request,
+            &astra_runtime_env::RunBinding::resolve(
+                astra_runtime_env::WorkspaceBinding::server_sandbox("session-r-side-effect"),
+                astra_runtime_env::ExecutorBinding::local_cli(),
+                astra_runtime_env::RuntimeBinding::host_process("test-host"),
+                astra_runtime_env::PolicyIntent::local_developer(),
+                &astra_runtime_env::ToolRegistry::default(),
+            ),
+            "must-not-run",
+        )),
+    ]));
+    let service = ToolExecutionService::builder()
+        .sandbox_resident_agent_transport(transport.clone())
+        .build();
+    let local = CountingLocalTransport::new();
+
+    let result = service.execute(request, &local).await;
+
+    assert!(
+        result.is_error,
+        "side-effect-uncertain transport error should fail closed: {result:?}"
+    );
+    assert_eq!(transport.calls(), 1, "must not replay after start");
+    assert_eq!(local.calls(), 0, "must not fall back locally");
+    let metadata = result.metadata.as_ref().expect("transport metadata");
+    assert_eq!(metadata["error_kind"], "transport_disconnected");
+    assert_eq!(metadata["retryable"], true);
+    assert_eq!(metadata["execution_started"], true);
+    assert_eq!(metadata["side_effects_maybe"], true);
+    assert_eq!(metadata["next_action"], "inspect_effects_before_retry");
 }
 
 #[tokio::test(start_paused = true)]
