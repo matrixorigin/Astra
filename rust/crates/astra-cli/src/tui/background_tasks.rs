@@ -234,6 +234,14 @@ const MAX_OUTPUT_BYTES: u64 = 64 * 1024;
 /// beyond this limit are soft-rejected (return an empty id) to prevent
 /// unbounded resource consumption.  The LLM can retry or re-plan.
 const MAX_CONCURRENT_TASKS: usize = 32;
+#[cfg(not(test))]
+const MAX_RETAINED_COMPLETED_TASKS: usize = 128;
+#[cfg(test)]
+const MAX_RETAINED_COMPLETED_TASKS: usize = 3;
+#[cfg(not(test))]
+const MAX_RETAINED_FAILED_TASKS: usize = 128;
+#[cfg(test)]
+const MAX_RETAINED_FAILED_TASKS: usize = 3;
 const STALL_THRESHOLD: Duration = Duration::from_secs(45);
 const STALL_TAIL_RECHECK_COOLDOWN: Duration = Duration::from_secs(2);
 const PROMPT_PATTERNS: &[&str] = &[
@@ -593,12 +601,47 @@ impl BackgroundTaskRegistry {
         }
     }
 
-    /// Prune terminated tasks from the registry to prevent unbounded
-    /// memory growth in long-running sessions.  Tasks that have reached a
-    /// terminal state (completed / failed / killed) are removed from the
-    /// in-memory map; their output files remain on disk.
-    pub fn prune_terminated(&mut self) {
-        self.tasks.retain(|_, h| !h.status().is_terminal());
+    /// Bound retained terminal shell handles without hiding recent results.
+    ///
+    /// Recent terminal tasks stay visible after their notification so Ctrl+T
+    /// and task_output can inspect them. Failed tasks get a separate retention
+    /// cap because they drive footer attention and usually need diagnosis.
+    /// Output files remain on disk either way.
+    pub fn prune_retained_terminal_tasks(&mut self) {
+        let keep_completed = self.retained_terminal_task_ids(
+            |status| matches!(status, BgTaskStatus::Completed | BgTaskStatus::Killed),
+            MAX_RETAINED_COMPLETED_TASKS,
+        );
+        let keep_failed = self.retained_terminal_task_ids(
+            |status| status == BgTaskStatus::Failed,
+            MAX_RETAINED_FAILED_TASKS,
+        );
+        self.tasks.retain(|id, h| {
+            !matches!(
+                h.status(),
+                BgTaskStatus::Completed | BgTaskStatus::Killed | BgTaskStatus::Failed
+            ) || keep_completed.contains(id)
+                || keep_failed.contains(id)
+        });
+    }
+
+    fn retained_terminal_task_ids(
+        &self,
+        matches_status: impl Fn(BgTaskStatus) -> bool,
+        max_retained: usize,
+    ) -> std::collections::HashSet<String> {
+        let mut terminal: Vec<_> = self
+            .tasks
+            .values()
+            .filter(|h| matches_status(h.status()))
+            .map(|h| (h.id.clone(), h.ended_at_ms.unwrap_or(h.started_at_ms)))
+            .collect();
+        terminal.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        terminal
+            .into_iter()
+            .take(max_retained)
+            .map(|(id, _)| id)
+            .collect()
     }
 
     /// Kill all running tasks. Returns IDs of killed tasks.
@@ -718,10 +761,9 @@ impl BackgroundTaskRegistry {
 
     /// Poll for completed tasks. Call from the TUI tick.
     /// Returns events for tasks that finished since last poll.
-    /// Also prunes tasks that were terminal on entry, ensuring one
-    /// full tick of display + persist before removal.
+    /// Also trims old terminal handles over their retention caps.
     pub fn poll_completions(&mut self) -> Vec<BgTaskEvent> {
-        self.prune_terminated();
+        self.prune_retained_terminal_tasks();
         self.drain_join_set();
         std::mem::take(&mut self.pending_completions)
     }
@@ -2166,6 +2208,88 @@ mod tests {
         assert_eq!(reg.running_count(), 1);
         assert_eq!(reg.waiting_count(), 1);
         assert_eq!(reg.failed_count(), 1);
+    }
+
+    #[test]
+    fn poll_completions_retains_terminal_tasks_for_inspection() {
+        let tmp = crate::tests::test_temp_dir();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        for (id, status) in [
+            ("failed", BgTaskStatus::Failed),
+            ("completed", BgTaskStatus::Completed),
+        ] {
+            let (mut handle, _dir) = test_handle_with_status(status);
+            handle.id = id.to_string();
+            handle.description = id.to_string();
+            handle.stdout_path = tmp.path().join(format!("{id}.stdout"));
+            handle.stderr_path = tmp.path().join(format!("{id}.stderr"));
+            handle.ended_at_ms = Some(unix_epoch_millis());
+            std::fs::write(&handle.stdout_path, format!("{id} output\n")).unwrap();
+            std::fs::write(&handle.stderr_path, "").unwrap();
+            reg.tasks.insert(handle.id.clone(), handle);
+        }
+
+        assert!(reg.poll_completions().is_empty());
+        assert!(reg.poll_completions().is_empty());
+
+        assert_eq!(reg.failed_count(), 1);
+        assert!(reg.get("failed").is_some());
+        assert!(reg.get("completed").is_some());
+        assert!(
+            reg.get_combined_output("failed", 4096)
+                .expect("failed output")
+                .0
+                .contains("failed output")
+        );
+        assert!(
+            reg.get_combined_output("completed", 4096)
+                .expect("completed output")
+                .0
+                .contains("completed output")
+        );
+    }
+
+    #[test]
+    fn terminal_retention_prunes_old_terminal_tasks_by_status_bucket() {
+        let tmp = crate::tests::test_temp_dir();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        for idx in 0..(MAX_RETAINED_COMPLETED_TASKS + 2) {
+            let (mut handle, _dir) = test_handle_with_status(BgTaskStatus::Completed);
+            handle.id = format!("completed-{idx}");
+            handle.started_at_ms = idx as u64;
+            handle.ended_at_ms = Some(idx as u64);
+            handle.stdout_path = tmp.path().join(format!("completed-{idx}.stdout"));
+            handle.stderr_path = tmp.path().join(format!("completed-{idx}.stderr"));
+            std::fs::write(&handle.stdout_path, "ok\n").unwrap();
+            std::fs::write(&handle.stderr_path, "").unwrap();
+            reg.tasks.insert(handle.id.clone(), handle);
+        }
+        for idx in 0..(MAX_RETAINED_FAILED_TASKS + 2) {
+            let (mut handle, _dir) = test_handle_with_status(BgTaskStatus::Failed);
+            handle.id = format!("failed-{idx}");
+            handle.started_at_ms = idx as u64;
+            handle.ended_at_ms = Some(idx as u64);
+            reg.tasks.insert(handle.id.clone(), handle);
+        }
+
+        reg.prune_retained_terminal_tasks();
+
+        assert!(reg.get("completed-0").is_none());
+        assert!(reg.get("completed-1").is_none());
+        for idx in 2..(MAX_RETAINED_COMPLETED_TASKS + 2) {
+            assert!(
+                reg.get(&format!("completed-{idx}")).is_some(),
+                "newer completed task {idx} should be retained"
+            );
+        }
+        assert!(reg.get("failed-0").is_none());
+        assert!(reg.get("failed-1").is_none());
+        for idx in 2..(MAX_RETAINED_FAILED_TASKS + 2) {
+            assert!(
+                reg.get(&format!("failed-{idx}")).is_some(),
+                "newer failed task {idx} should be retained"
+            );
+        }
     }
 
     #[tokio::test]
