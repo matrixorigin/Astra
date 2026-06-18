@@ -986,10 +986,11 @@ impl RunStateStore for InMemoryRunStateStore {
             return Err("session already has an active run".to_string());
         }
         runs.insert(run_id.clone(), record);
-        let inserted = runs
-            .get(run_id.as_str())
-            .cloned()
-            .expect("inserted run must be readable");
+        let Some(inserted) = runs.get(run_id.as_str()).cloned() else {
+            return Err(format!(
+                "inserted run disappeared before projection sync: {run_id}"
+            ));
+        };
 
         // Evict oldest completed/failed runs when over capacity
         let mut evicted_ids = Vec::new();
@@ -1201,7 +1202,7 @@ impl RunStateStore for InMemoryRunStateStore {
         let updated = {
             let mut runs = self.runs.write().await;
             let Some(run) = runs.get_mut(run_id) else {
-                return Ok(());
+                return Err(format!("run not found while appending events: {run_id}"));
             };
             let start_idx = run.events.len() as i64;
             run.events.extend(events.iter().cloned());
@@ -4164,6 +4165,24 @@ mod tests {
         let loaded = store.load_run("batch-empty").await.unwrap().unwrap();
         assert_eq!(loaded.events.len(), 0);
         assert_eq!(loaded.last_event_idx, -1); // unchanged
+    }
+
+    #[tokio::test]
+    async fn append_events_batch_unknown_run_returns_error() {
+        let store = InMemoryRunStateStore::new();
+        let event = make_event("tool_result", json!({"output": "orphan"}));
+
+        let batch_error = store
+            .append_events_batch("missing-run", std::slice::from_ref(&event))
+            .await
+            .expect_err("non-empty batch append to unknown run must fail");
+        assert!(batch_error.contains("run not found"));
+
+        let single_error = store
+            .append_event("missing-run", event)
+            .await
+            .expect_err("single append delegates to batch and must also fail");
+        assert!(single_error.contains("run not found"));
     }
 
     #[tokio::test]
