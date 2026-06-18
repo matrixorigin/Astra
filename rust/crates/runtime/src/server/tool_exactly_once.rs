@@ -55,7 +55,15 @@ pub(crate) async fn enable_exactly_once(
 ) -> ExactlyOnceState {
     let mut executor = astra_pipeline::exactly_once::ExactlyOnceExecutor::new();
 
-    // Phase 1: warm from DB (crash recovery).
+    // Phase 1: warm from event stream (existing path).
+    let (warmed_cache, _completed) =
+        astra_pipeline::step_restore::warm_cache_from_events(session_id);
+    merge_warmed_event_cache(&mut executor, warmed_cache, session_id);
+
+    // Phase 2: warm from DB (crash recovery).
+    // This intentionally runs after event replay and merges into the same
+    // executor cache. DB records cover the crash window where a tool succeeded
+    // and persisted exactly-once state before the local event stream caught up.
     if let Some(ref pool) = pool {
         if let Err(e) = warm_cache_from_db(&mut executor, session_id, pool).await {
             tracing::warn!(
@@ -66,23 +74,26 @@ pub(crate) async fn enable_exactly_once(
         }
     }
 
-    // Phase 2: warm from event stream (existing path).
-    let (warmed_cache, _completed) =
-        astra_pipeline::step_restore::warm_cache_from_events(session_id);
+    ExactlyOnceState {
+        in_memory: Mutex::new(executor),
+        pool,
+        session_id: session_id.to_string(),
+    }
+}
+
+fn merge_warmed_event_cache(
+    executor: &mut astra_pipeline::exactly_once::ExactlyOnceExecutor,
+    warmed_cache: astra_pipeline::step_protocol::InMemoryIdempotencyCache,
+    session_id: &str,
+) {
     let warmed_len = warmed_cache.len();
     if warmed_len > 0 {
-        *executor.cache_mut() = warmed_cache;
+        executor.cache_mut().merge_from(warmed_cache);
         tracing::info!(
             session_id = %session_id,
             entries = warmed_len,
             "exactly-once cache warmed from event store"
         );
-    }
-
-    ExactlyOnceState {
-        in_memory: Mutex::new(executor),
-        pool,
-        session_id: session_id.to_string(),
     }
 }
 
@@ -353,4 +364,53 @@ async fn persist_result(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use astra_pipeline::step_protocol::{CachedToolResult, InMemoryIdempotencyCache};
+    use serde_json::json;
+
+    fn cached_result(tool_name: &str, output: &str, cached_at: u64) -> CachedToolResult {
+        CachedToolResult {
+            tool_name: tool_name.to_string(),
+            output: output.to_string(),
+            is_error: false,
+            cached_at,
+            context_signature: None,
+        }
+    }
+
+    #[test]
+    fn event_cache_warm_merges_without_discarding_db_warmed_entries() {
+        let mut executor = astra_pipeline::exactly_once::ExactlyOnceExecutor::new();
+        let db_args = json!({"command": "create remote issue"});
+        let db_key = exactly_once_key("bash", &db_args);
+        executor
+            .cache_mut()
+            .record(&db_key, cached_result("bash", "db-only", 10));
+
+        let event_args = json!({"command": "write local file"});
+        let event_key = exactly_once_key("bash", &event_args);
+        let mut event_cache = InMemoryIdempotencyCache::new();
+        event_cache.record(&event_key, cached_result("bash", "event-only", 11));
+
+        merge_warmed_event_cache(&mut executor, event_cache, "session-merge");
+
+        assert_eq!(
+            executor
+                .cache()
+                .check(&db_key)
+                .map(|cached| cached.output.as_str()),
+            Some("db-only")
+        );
+        assert_eq!(
+            executor
+                .cache()
+                .check(&event_key)
+                .map(|cached| cached.output.as_str()),
+            Some("event-only")
+        );
+    }
 }

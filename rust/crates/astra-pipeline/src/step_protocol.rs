@@ -1302,6 +1302,18 @@ impl InMemoryIdempotencyCache {
         self.cache.insert(cache_key.to_string(), result);
     }
 
+    /// Merge another in-memory cache into this one.
+    ///
+    /// Existing entries with the same cache key are replaced by `other`, while
+    /// unrelated entries are preserved. This is used during crash recovery when
+    /// DB-backed exactly-once records and event-stream records both contribute
+    /// valid completed tool results.
+    pub fn merge_from(&mut self, other: InMemoryIdempotencyCache) {
+        for (cache_key, result) in other.cache {
+            self.record_cache_key(&cache_key, result);
+        }
+    }
+
     /// Evict oldest entry by cached_at timestamp
     fn evict_oldest(&mut self) {
         if let Some(oldest_key) = self

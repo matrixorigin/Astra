@@ -213,15 +213,28 @@ pub(crate) fn rollback_entry_json(entry: &DatabaseSnapshotRollbackEntry) -> Valu
 }
 
 pub(crate) fn mo_create_snapshot_sql(name: &str, database: &str) -> String {
-    format!("CREATE SNAPSHOT `{name}` FOR DATABASE `{database}`")
+    format!(
+        "CREATE SNAPSHOT {} FOR DATABASE {}",
+        mo_quote_identifier(name),
+        mo_quote_identifier(database)
+    )
 }
 
 pub(crate) fn mo_restore_snapshot_sql(name: &str, account: &str, database: &str) -> String {
-    format!("RESTORE ACCOUNT `{account}` DATABASE `{database}` FROM SNAPSHOT `{name}`")
+    format!(
+        "RESTORE ACCOUNT {} DATABASE {} FROM SNAPSHOT {}",
+        mo_quote_identifier(account),
+        mo_quote_identifier(database),
+        mo_quote_identifier(name)
+    )
 }
 
 pub(crate) fn mo_drop_snapshot_sql(name: &str) -> String {
-    format!("DROP SNAPSHOT IF EXISTS `{name}`")
+    format!("DROP SNAPSHOT IF EXISTS {}", mo_quote_identifier(name))
+}
+
+fn mo_quote_identifier(identifier: &str) -> String {
+    format!("`{}`", identifier.replace('`', "``"))
 }
 
 pub(crate) fn mo_query_requires_pre_state_snapshot(sql: &str, allow_destructive: bool) -> bool {
@@ -777,6 +790,18 @@ mod tests {
         assert_eq!(
             mo_drop_snapshot_sql("snap_1"),
             "DROP SNAPSHOT IF EXISTS `snap_1`"
+        );
+    }
+
+    #[test]
+    fn snapshot_sql_escapes_identifier_backticks() {
+        assert_eq!(
+            mo_create_snapshot_sql("snap_1", "prod`tenant"),
+            "CREATE SNAPSHOT `snap_1` FOR DATABASE `prod``tenant`"
+        );
+        assert_eq!(
+            mo_restore_snapshot_sql("snap_1", "sys`acct", "prod`tenant"),
+            "RESTORE ACCOUNT `sys``acct` DATABASE `prod``tenant` FROM SNAPSHOT `snap_1`"
         );
     }
 }

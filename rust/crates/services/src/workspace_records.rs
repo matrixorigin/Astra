@@ -90,7 +90,7 @@ pub enum WorkspaceRecordStoreError {
     InvalidWorkspaceId(String),
     #[error("workspace '{workspace_id}' is already owned by another principal")]
     WorkspaceOwnerConflict { workspace_id: String },
-    #[error("workspace source '{source_key}' is already owned by another principal")]
+    #[error("workspace source '{source_key}' is already claimed by another workspace")]
     SourceOwnerConflict { source_key: String },
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
@@ -112,6 +112,8 @@ pub enum WorkspaceCleanupDebtStoreError {
     InvalidWorkspaceId(String),
     #[error("workspace cleanup debt id must not be empty")]
     InvalidDebtId,
+    #[error("workspace cleanup debt '{debt_id}' is already owned by another principal")]
+    CleanupDebtOwnerConflict { debt_id: String },
     #[error("workspace cleanup debt message must not be empty")]
     InvalidMessage,
     #[error("database error: {0}")]
@@ -206,7 +208,7 @@ impl WorkspaceRecordStore for InMemoryWorkspaceRecordStore {
         }
         if let Some(source_key) = workspace_source_key(&entry.record)
             && records.values().any(|existing| {
-                existing.owner_id != entry.owner_id
+                existing.record.workspace_id != entry.record.workspace_id
                     && workspace_source_key(&existing.record).as_deref() == Some(&source_key)
             })
         {
@@ -260,10 +262,15 @@ impl WorkspaceCleanupDebtStore for InMemoryWorkspaceRecordStore {
         entry: WorkspaceCleanupDebtEntry,
     ) -> Result<(), WorkspaceCleanupDebtStoreError> {
         validate_cleanup_debt_entry(&entry)?;
-        self.cleanup_debts
-            .write()
-            .await
-            .insert(entry.debt_id.clone(), entry);
+        let mut debts = self.cleanup_debts.write().await;
+        if let Some(existing) = debts.get(&entry.debt_id)
+            && existing.owner_id != entry.owner_id
+        {
+            return Err(WorkspaceCleanupDebtStoreError::CleanupDebtOwnerConflict {
+                debt_id: entry.debt_id,
+            });
+        }
+        debts.insert(entry.debt_id.clone(), entry);
         Ok(())
     }
 
@@ -417,9 +424,9 @@ async fn ensure_workspace_records_column(
 }
 
 /// Enforce a UNIQUE index on `source_key` so that two workspaces cannot bind
-/// to the same volume/source concurrently. Without this, the cross-owner
-/// conflict check in `upsert_workspace_record` is a racy SELECT-then-INSERT and
-/// two concurrent upserts can both succeed.
+/// to the same volume/source concurrently. Without this, the conflict check in
+/// `upsert_workspace_record` is a racy SELECT-then-INSERT and two concurrent
+/// upserts can both succeed.
 /// MySQL permits multiple NULLs in a UNIQUE index, so nullable source_key is
 /// safe.
 async fn ensure_workspace_records_source_key_unique(
@@ -495,14 +502,15 @@ impl WorkspaceRecordStore for DatabaseWorkspaceRecordStore {
             });
         }
 
-        // Check source_key cross-owner conflict.
+        // Check source_key conflict before UPDATE so production behavior
+        // matches the in-memory store and returns a domain error instead of a
+        // raw duplicate-key database error.
         if let Some(source_key) = source_key.as_ref() {
             let conflict: Option<(String,)> = sqlx::query_as(
                 "SELECT owner_id FROM workspace_records \
-                 WHERE source_key = ? AND owner_id <> ? AND workspace_id <> ? LIMIT 1",
+                 WHERE source_key = ? AND workspace_id <> ? LIMIT 1",
             )
             .bind(source_key)
-            .bind(&entry.owner_id)
             .bind(&entry.record.workspace_id)
             .fetch_optional(self.pool.get())
             .await?;
@@ -597,32 +605,70 @@ impl WorkspaceCleanupDebtStore for DatabaseWorkspaceRecordStore {
         validate_cleanup_debt_entry(&entry)?;
         let reason = serde_json_string_cleanup(&entry.reason)?;
         let record_json = serde_json::to_string(&entry.record)?;
-        sqlx::query(
+        match sqlx::query(
             "INSERT INTO workspace_cleanup_debts \
              (debt_id, owner_id, session_id, run_id, workspace_id, reason, message, attempts, \
               record_json, created_at, updated_at, resolved_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6), NULL) \
-             ON DUPLICATE KEY UPDATE \
-              owner_id = VALUES(owner_id), session_id = VALUES(session_id), \
-              run_id = VALUES(run_id), workspace_id = VALUES(workspace_id), \
-              reason = VALUES(reason), \
-              message = IF(resolved_at IS NULL, VALUES(message), message), \
-              attempts = IF(resolved_at IS NULL, GREATEST(attempts, VALUES(attempts)), attempts), \
-              record_json = IF(resolved_at IS NULL, VALUES(record_json), record_json), \
-              updated_at = NOW(6), \
-              resolved_at = resolved_at",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6), NULL)",
         )
         .bind(&entry.debt_id)
         .bind(&entry.owner_id)
         .bind(entry.session_id.as_deref())
         .bind(entry.run_id.as_deref())
         .bind(&entry.workspace_id)
+        .bind(&reason)
+        .bind(&entry.message)
+        .bind(i64::from(entry.attempts))
+        .bind(&record_json)
+        .execute(self.pool.get())
+        .await
+        {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                if !astra_core::is_duplicate_key_error(&error) {
+                    return Err(error.into());
+                }
+            }
+        }
+
+        let existing: Option<(String,)> =
+            sqlx::query_as("SELECT owner_id FROM workspace_cleanup_debts WHERE debt_id = ?")
+                .bind(&entry.debt_id)
+                .fetch_optional(self.pool.get())
+                .await?;
+        if let Some((existing_owner,)) = existing
+            && existing_owner != entry.owner_id
+        {
+            return Err(WorkspaceCleanupDebtStoreError::CleanupDebtOwnerConflict {
+                debt_id: entry.debt_id,
+            });
+        }
+
+        let update_result = sqlx::query(
+            "UPDATE workspace_cleanup_debts \
+             SET session_id = ?, run_id = ?, workspace_id = ?, reason = ?, \
+                 message = IF(resolved_at IS NULL, ?, message), \
+                 attempts = IF(resolved_at IS NULL, GREATEST(attempts, ?), attempts), \
+                 record_json = IF(resolved_at IS NULL, ?, record_json), \
+                 updated_at = NOW(6), resolved_at = resolved_at \
+             WHERE debt_id = ? AND owner_id = ?",
+        )
+        .bind(entry.session_id.as_deref())
+        .bind(entry.run_id.as_deref())
+        .bind(&entry.workspace_id)
         .bind(reason)
         .bind(&entry.message)
         .bind(i64::from(entry.attempts))
-        .bind(record_json)
+        .bind(&record_json)
+        .bind(&entry.debt_id)
+        .bind(&entry.owner_id)
         .execute(self.pool.get())
         .await?;
+        if update_result.rows_affected() == 0 {
+            return Err(WorkspaceCleanupDebtStoreError::CleanupDebtOwnerConflict {
+                debt_id: entry.debt_id,
+            });
+        }
         Ok(())
     }
 
@@ -634,7 +680,8 @@ impl WorkspaceCleanupDebtStore for DatabaseWorkspaceRecordStore {
         validate_cleanup_owner_id(owner_id)?;
         let rows = sqlx::query(
             "SELECT debt_id, owner_id, session_id, run_id, workspace_id, reason, message, \
-                    attempts, CAST(record_json AS CHAR) AS record_json \
+                    attempts, CAST(record_json AS CHAR) AS record_json, \
+                    CAST(created_at AS CHAR) AS created_at \
              FROM workspace_cleanup_debts \
              WHERE owner_id = ? AND resolved_at IS NULL \
              ORDER BY created_at DESC, debt_id ASC LIMIT ?",
@@ -670,7 +717,8 @@ impl WorkspaceCleanupDebtStore for DatabaseWorkspaceRecordStore {
     ) -> Result<Vec<WorkspaceCleanupDebtEntry>, WorkspaceCleanupDebtStoreError> {
         let rows = sqlx::query(
             "SELECT debt_id, owner_id, session_id, run_id, workspace_id, reason, message, \
-                    attempts, CAST(record_json AS CHAR) AS record_json \
+                    attempts, CAST(record_json AS CHAR) AS record_json, \
+                    CAST(created_at AS CHAR) AS created_at \
              FROM workspace_cleanup_debts \
              WHERE resolved_at IS NULL \
              ORDER BY created_at ASC",
@@ -1162,7 +1210,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_allows_same_owner_to_reuse_source_key() {
+    async fn store_rejects_same_owner_source_key_reuse() {
         let store = InMemoryWorkspaceRecordStore::new();
         store
             .upsert_workspace_record(WorkspaceRecordEntry::new(
@@ -1182,13 +1230,13 @@ mod tests {
                 record("workspace-2"),
             ))
             .await
-            .expect("same owner can reuse a persistent source");
+            .expect_err("source key cannot be reused by another workspace");
 
         let records = store
             .list_workspace_records("user-1", 10)
             .await
             .expect("list workspace records");
-        assert_eq!(records.len(), 2);
+        assert_eq!(records.len(), 1);
     }
 
     #[tokio::test]
@@ -1309,6 +1357,48 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn cleanup_debt_store_rejects_cross_owner_debt_id_takeover() {
+        let store = InMemoryWorkspaceRecordStore::new();
+        let debt = WorkspaceCleanupDebtEntry::new(
+            "user-1",
+            None,
+            None,
+            record("workspace-1"),
+            CleanupReason::Failed,
+            "first owner debt",
+        );
+        let mut takeover = WorkspaceCleanupDebtEntry::new(
+            "user-2",
+            None,
+            None,
+            record("workspace-2"),
+            CleanupReason::Failed,
+            "takeover debt",
+        );
+        takeover.debt_id = debt.debt_id.clone();
+
+        store
+            .record_cleanup_debt(debt)
+            .await
+            .expect("record first debt");
+        let error = store
+            .record_cleanup_debt(takeover)
+            .await
+            .expect_err("cross-owner debt id takeover must fail");
+
+        assert!(matches!(
+            error,
+            WorkspaceCleanupDebtStoreError::CleanupDebtOwnerConflict { .. }
+        ));
+        let debts = store
+            .list_cleanup_debts("user-1", 10)
+            .await
+            .expect("list first owner debts");
+        assert_eq!(debts.len(), 1);
+        assert_eq!(debts[0].message, "first owner debt");
     }
 
     #[tokio::test]
