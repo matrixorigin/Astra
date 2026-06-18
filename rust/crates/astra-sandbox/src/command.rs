@@ -100,25 +100,52 @@ pub fn filter_environment(policy: &SandboxPolicy) -> HashMap<String, String> {
     filtered
 }
 
-/// Returns `true` if an `rm -rf` / `rm -fr` command targets a catastrophic path
+/// Returns `true` if an `rm` command with recursive+force flags targets a catastrophic path
 /// (root, home, or top-level system directories). Project-relative paths like
 /// `rm -rf ./build` or `rm -rf target/` are safe.
 ///
-/// Uses `find()` to locate `rm -rf` anywhere in the command, so compound
-/// commands like `sudo rm -rf /` or `cd / && rm -rf *` are caught.
+/// Detects all common recursive+force variant pairs:
+///   `rm -rf`, `rm -fr`, `rm -r -f`, `rm --recursive --force`, `rm -Rf`, etc.
+///
+/// Uses `find()` to locate `rm` as a standalone word, then scans subsequent tokens
+/// for recursive + force flags before extracting the first non-flag argument as the target.
 ///
 /// Skips command-line flags (e.g. `--no-preserve-root`) to find the actual target.
 /// Treats bare `rm -rf` (no arguments) as dangerous.
 pub fn is_rm_catastrophic_rm_path(lower: &str) -> bool {
-    let rest = lower
-        .find("rm -rf")
-        .map(|i| &lower[i + 6..])
-        .or_else(|| lower.find("rm -fr").map(|i| &lower[i + 6..]))
-        .unwrap_or("")
-        .trim_start();
-    let target = rest
-        .split_whitespace()
+    // Find standalone "rm" word.
+    let rm_pos = match find_standalone_word(lower, "rm") {
+        Some(pos) => pos,
+        None => return false,
+    };
+    let after_rm = &lower[rm_pos + 2..].trim_start();
+
+    // Tokenize the remaining string into arguments.
+    let tokens: Vec<&str> = after_rm.split_whitespace().collect();
+    if tokens.is_empty() {
+        return false;
+    }
+
+    // Check that both recursive and force flags are present.
+    let has_recursive = tokens.iter().any(|t| {
+        *t == "-r"
+            || *t == "--recursive"
+            || *t == "-R"
+            || short_flag_contains(t, 'r')
+            || short_flag_contains(t, 'R')
+    });
+    let has_force = tokens
+        .iter()
+        .any(|t| *t == "-f" || *t == "--force" || short_flag_contains(t, 'f'));
+    if !has_recursive || !has_force {
+        return false;
+    }
+
+    // Find the first non-flag argument (the target path).
+    let target = tokens
+        .iter()
         .find(|t| !t.starts_with('-'))
+        .copied()
         .unwrap_or("");
 
     if target.is_empty() {
@@ -142,30 +169,35 @@ pub fn is_rm_catastrophic_rm_path(lower: &str) -> bool {
     false
 }
 
+/// Find a word that appears standalone (not part of a larger word).
+fn find_standalone_word(haystack: &str, word: &str) -> Option<usize> {
+    let mut start = 0;
+    let bytes = haystack.as_bytes();
+    while let Some(pos) = haystack[start..].find(word) {
+        let idx = start + pos;
+        let before_ok = idx == 0 || bytes.get(idx - 1).is_some_and(|b| b.is_ascii_whitespace());
+        let after_idx = idx + word.len();
+        let after_ok = after_idx == bytes.len()
+            || bytes
+                .get(after_idx)
+                .is_some_and(|b| b.is_ascii_whitespace());
+        if before_ok && after_ok {
+            return Some(idx);
+        }
+        start = idx + word.len();
+    }
+    None
+}
+
+fn short_flag_contains(flag: &str, c: char) -> bool {
+    flag.starts_with('-') && !flag.starts_with("--") && flag.chars().skip(1).any(|ch| ch == c)
+}
+
 /// Returns `true` when `cmd_name` appears as a standalone word in the
 /// lowercased command string (preceded by start-of-string or whitespace,
 /// followed by whitespace or end-of-string).
 fn is_standalone_command(lower: &str, cmd_name: &str) -> bool {
-    let mut start = 0;
-    while let Some(pos) = lower[start..].find(cmd_name) {
-        let idx = start + pos;
-        let before_ok = idx == 0
-            || lower
-                .as_bytes()
-                .get(idx - 1)
-                .is_some_and(|b| b.is_ascii_whitespace());
-        let after_idx = idx + cmd_name.len();
-        let after_ok = after_idx == lower.len()
-            || lower
-                .as_bytes()
-                .get(after_idx)
-                .is_some_and(|b| b.is_ascii_whitespace());
-        if before_ok && after_ok {
-            return true;
-        }
-        start = idx + cmd_name.len();
-    }
-    false
+    find_standalone_word(lower, cmd_name).is_some()
 }
 
 /// Analyze a command string for potentially dangerous patterns.
@@ -1057,12 +1089,39 @@ mod tests {
 
     #[test]
     fn rm_catastrophic_compound_commands() {
-        // Compound commands: find() locates rm -rf anywhere in the string
+        // Compound commands: find_standalone_word() locates rm anywhere in the string
         assert!(is_rm_catastrophic_rm_path("sudo rm -rf /"));
         assert!(is_rm_catastrophic_rm_path("sudo rm -rf /etc"));
         assert!(is_rm_catastrophic_rm_path("sudo rm -fr /usr"));
         // cd / && rm -rf foo — target is relative `foo`, not a system dir
         assert!(!is_rm_catastrophic_rm_path("cd / && rm -rf foo"));
+    }
+
+    #[test]
+    fn rm_catastrophic_variant_forms() {
+        // Separated flags
+        assert!(is_rm_catastrophic_rm_path("rm -r -f /"));
+        assert!(is_rm_catastrophic_rm_path("rm -f -r /tmp"));
+        assert!(is_rm_catastrophic_rm_path("rm --recursive --force /etc"));
+        assert!(is_rm_catastrophic_rm_path("rm --force --recursive /root"));
+        // Mixed forms
+        assert!(is_rm_catastrophic_rm_path("rm -Rf /"));
+        assert!(is_rm_catastrophic_rm_path("rm -r --force /boot"));
+        assert!(is_rm_catastrophic_rm_path("rm --recursive -f /sys"));
+        // Safe: only recursive, not force
+        assert!(!is_rm_catastrophic_rm_path("rm -r /tmp/foo"));
+        assert!(!is_rm_catastrophic_rm_path("rm --recursive node_modules"));
+        // Safe: only force, not recursive
+        assert!(!is_rm_catastrophic_rm_path("rm -f /tmp/foo"));
+        // Safe: relative target
+        assert!(!is_rm_catastrophic_rm_path("rm -r -f ./build"));
+    }
+
+    #[test]
+    fn rm_catastrophic_non_rm_word_not_confused() {
+        // "rm" as part of another word should not trigger
+        assert!(!is_rm_catastrophic_rm_path("confirm -rf /"));
+        assert!(!is_rm_catastrophic_rm_path("perm -rf /etc"));
     }
 
     #[test]

@@ -25,22 +25,29 @@ use crate::server::tool_session_state_rollback::{
 };
 use crate::server::tool_transport::tool_schema_name;
 
+/// Register a tool handler and log an error on failure (duplicate name).
+///
+/// Eliminates ~200 lines of repetitive `if let Err(error)` + `tracing::error!`
+/// boilerplate in [`server_tool_engine`].
+macro_rules! register_handler_or_log {
+    ($engine:expr, $name:expr, $handler:expr) => {
+        if let Err(error) = $engine.register_handler($name, $handler) {
+            tracing::error!(
+                target: "astra_runtime::tool_engine",
+                tool = $name,
+                error = %error,
+                "failed to register built-in server tool handler"
+            );
+        }
+    };
+}
+
 pub(super) fn server_tool_engine() -> ToolEngine<ServerToolExecutor> {
     let mut engine = ToolEngine::new();
-    if let Err(error) = engine.register_handler("notify", NotifyToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("web_search", WebSearchToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
+
+    register_handler_or_log!(engine, "notify", NotifyToolHandler);
+    register_handler_or_log!(engine, "web_search", WebSearchToolHandler);
+
     for name in [
         "web_fetch",
         "read_file",
@@ -49,197 +56,47 @@ pub(super) fn server_tool_engine() -> ToolEngine<ServerToolExecutor> {
         "glob",
         "symbols",
     ] {
-        if let Err(error) = engine.register_handler(name, DefaultExecutorToolHandler { name }) {
-            tracing::error!(
-                target: "astra_runtime::tool_engine",
-                tool = name,
-                error = %error,
-                "failed to register built-in server tool handler"
-            );
-        }
+        register_handler_or_log!(engine, name, DefaultExecutorToolHandler { name });
     }
-    if let Err(error) = engine.register_handler("write_file", WriteFileToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("str_replace", StrReplaceToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("bash", BashToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("git", DefaultExecutorToolHandler { name: "git" }) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) =
-        engine.register_handler("github", DefaultExecutorToolHandler { name: "github" })
-    {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("get_agent_info", GetAgentInfoToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("tool_search", ToolSearchToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("memory", MemoryToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("session", SessionToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("task", TaskToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("agent", AgentToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("agent_fanout", AgentFanoutToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("ask_user", AskUserToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("enter_plan_mode", EnterPlanModeToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("exit_plan_mode", ExitPlanModeToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("introspect", IntrospectToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("prioritize_tool", PrioritizeToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("deprioritize_tool", DeprioritizeToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("compress_context", CompressContextToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) =
-        engine.register_handler("rollback_session_state", RollbackSessionStateToolHandler)
-    {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("mo", MoToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("mo_query", MoQueryToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler(
+
+    register_handler_or_log!(engine, "write_file", WriteFileToolHandler);
+    register_handler_or_log!(engine, "str_replace", StrReplaceToolHandler);
+    register_handler_or_log!(engine, "bash", BashToolHandler);
+    register_handler_or_log!(engine, "git", DefaultExecutorToolHandler { name: "git" });
+    register_handler_or_log!(
+        engine,
+        "github",
+        DefaultExecutorToolHandler { name: "github" }
+    );
+    register_handler_or_log!(engine, "get_agent_info", GetAgentInfoToolHandler);
+    register_handler_or_log!(engine, "tool_search", ToolSearchToolHandler);
+    register_handler_or_log!(engine, "memory", MemoryToolHandler);
+    register_handler_or_log!(engine, "session", SessionToolHandler);
+    register_handler_or_log!(engine, "task", TaskToolHandler);
+    register_handler_or_log!(engine, "agent", AgentToolHandler);
+    register_handler_or_log!(engine, "agent_fanout", AgentFanoutToolHandler);
+    register_handler_or_log!(engine, "ask_user", AskUserToolHandler);
+    register_handler_or_log!(engine, "enter_plan_mode", EnterPlanModeToolHandler);
+    register_handler_or_log!(engine, "exit_plan_mode", ExitPlanModeToolHandler);
+    register_handler_or_log!(engine, "introspect", IntrospectToolHandler);
+    register_handler_or_log!(engine, "prioritize_tool", PrioritizeToolHandler);
+    register_handler_or_log!(engine, "deprioritize_tool", DeprioritizeToolHandler);
+    register_handler_or_log!(engine, "compress_context", CompressContextToolHandler);
+    register_handler_or_log!(
+        engine,
+        "rollback_session_state",
+        RollbackSessionStateToolHandler
+    );
+    register_handler_or_log!(engine, "mo", MoToolHandler);
+    register_handler_or_log!(engine, "mo_query", MoQueryToolHandler);
+    register_handler_or_log!(
+        engine,
         "rollback_database_snapshots",
-        RollbackDatabaseSnapshotsToolHandler,
-    ) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("publish_artifact", PublishArtifactToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
-    if let Err(error) = engine.register_handler("run_script", RunScriptToolHandler) {
-        tracing::error!(
-            target: "astra_runtime::tool_engine",
-            error = %error,
-            "failed to register built-in server tool handler"
-        );
-    }
+        RollbackDatabaseSnapshotsToolHandler
+    );
+    register_handler_or_log!(engine, "publish_artifact", PublishArtifactToolHandler);
+    register_handler_or_log!(engine, "run_script", RunScriptToolHandler);
+
     if let Err(error) = engine.register_prefix_handler("mcp__", McpToolHandler) {
         tracing::error!(
             target: "astra_runtime::tool_engine",
@@ -247,6 +104,7 @@ pub(super) fn server_tool_engine() -> ToolEngine<ServerToolExecutor> {
             "failed to register dynamic server tool handler"
         );
     }
+
     engine
 }
 

@@ -527,14 +527,26 @@ pub async fn execute_isolated(
     let ns_available = wants_ns && unshare_available();
 
     // Warn operators when namespace isolation was requested but is unavailable.
-    // This prevents silent security degradation in Strict mode.
+    // In Strict mode, this is a hard failure — security guarantees are NOT met.
     if wants_ns && !ns_available {
-        tracing::warn!(
+        tracing::error!(
             target: "astra_sandbox::process_isolation",
             "namespace isolation unavailable (unshare not found or not permitted); \
-             running without PID/mount/network namespace isolation. \
-             If this is a Strict-mode sandbox, security guarantees are NOT met."
+             refusing to execute in Strict-mode. \
+             PID/mount/network namespace isolation is required for strict sandboxing."
         );
+        return IsolatedOutput {
+            stdout: String::new(),
+            stderr: "Error: namespace isolation unavailable — strict-mode requires \
+                     PID/mount/network namespace isolation (unshare not found or not permitted)"
+                .to_string(),
+            exit_code: None,
+            timed_out: false,
+            stdout_capped: false,
+            stderr_capped: false,
+            namespace_active: false,
+            cgroup_active: false,
+        };
     }
 
     // ── Build the command ────────────────────────────────────────────

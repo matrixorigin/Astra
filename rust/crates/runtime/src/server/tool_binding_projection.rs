@@ -321,6 +321,7 @@ pub(crate) fn is_server_control_plane_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "agent"
+            | "agent_fanout"
             | "get_agent_info"
             | "task"
             | "enter_plan_mode"

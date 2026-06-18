@@ -35,6 +35,16 @@ pub enum GitSafetyViolation {
     CloneRecurseSubmodules,
     /// git submodule update --init (submodule hooks execute arbitrary code).
     SubmoduleUpdateInit,
+    /// git -C or --git-dir used (boundary escape — operates on a different repo).
+    GitBoundaryEscape { flag: &'static str },
+    /// git branch -D (force delete — loses unreachable commits).
+    BranchForceDelete,
+    /// git stash drop or git stash clear (permanently deletes stashed work).
+    StashDestructive { operation: &'static str },
+    /// git tag -d (deletes a tag — can lose versioning anchor).
+    TagDelete,
+    /// git bisect run (executes arbitrary command at each step).
+    BisectRun,
 }
 
 impl std::fmt::Display for GitSafetyViolation {
@@ -93,9 +103,24 @@ impl std::fmt::Display for GitSafetyViolation {
                 )
             }
             Self::SubmoduleUpdateInit => {
+                write!(f, "git submodule update --init may execute untrusted hooks")
+            }
+            Self::GitBoundaryEscape { flag } => {
+                write!(f, "git {flag} bypasses working directory (boundary escape)")
+            }
+            Self::BranchForceDelete => {
+                write!(f, "git branch -D permanently deletes a branch")
+            }
+            Self::StashDestructive { operation } => {
+                write!(f, "git stash {operation} permanently deletes stashed work")
+            }
+            Self::TagDelete => {
+                write!(f, "git tag -d deletes a tag and may lose versioning anchor")
+            }
+            Self::BisectRun => {
                 write!(
                     f,
-                    "git submodule update --init may execute untrusted hooks"
+                    "git bisect run executes arbitrary commands at each bisect step"
                 )
             }
         }
@@ -113,6 +138,9 @@ pub fn is_soft_violation(v: &GitSafetyViolation) -> bool {
         GitSafetyViolation::ForcePush
             | GitSafetyViolation::CdGitCompound
             | GitSafetyViolation::CommitAmend
+            | GitSafetyViolation::BranchForceDelete
+            | GitSafetyViolation::StashDestructive { .. }
+            | GitSafetyViolation::TagDelete
     )
 }
 
@@ -140,6 +168,10 @@ pub fn validate_git_command(command: &str) -> Vec<GitSafetyViolation> {
     check_submodule_update_init(&lower, &mut violations);
     check_commit_amend(&lower, &mut violations);
     check_worktree_destructive(&lower, &mut violations);
+    check_branch_force_delete(&lower, &mut violations);
+    check_stash_destructive(&lower, &mut violations);
+    check_tag_delete(&lower, &mut violations);
+    check_bisect_run(&lower, &mut violations);
 
     violations
 }
@@ -282,42 +314,68 @@ fn check_git_config_flags(command: &str, violations: &mut Vec<GitSafetyViolation
                     violations.push(GitSafetyViolation::GitExecPathFlag);
                     return;
                 }
+                if next == "-C" || next.starts_with("-C=") {
+                    violations.push(GitSafetyViolation::GitBoundaryEscape { flag: "-C" });
+                    return;
+                }
+                if next == "--git-dir" || next.starts_with("--git-dir=") {
+                    violations.push(GitSafetyViolation::GitBoundaryEscape { flag: "--git-dir" });
+                    return;
+                }
             }
         }
     }
 }
 
-fn check_rebase_exec(
-    command: &str,
-    lower: &str,
-    violations: &mut Vec<GitSafetyViolation>,
-) {
+fn check_rebase_exec(command: &str, lower: &str, violations: &mut Vec<GitSafetyViolation>) {
     if !lower.contains("rebase") {
         return;
     }
     // Check for --exec flag with a non-empty argument anywhere after "rebase".
     // git rebase --exec 'rm -rf /' branch   → "exec" can be abbreviated to 3+ chars.
     // git rebase -x 'rm -rf /' branch       → short form.
+    // git pull --rebase --exec 'rm -rf /'   → --exec forwarded to rebase.
     let words: Vec<&str> = command.split_whitespace().collect();
-    let mut in_rebase = false;
     for (i, &word) in words.iter().enumerate() {
-        if word == "git" || word.ends_with("/git") {
-            in_rebase = true;
+        if word != "git" && !word.ends_with("/git") {
             continue;
         }
-        if in_rebase && word == "rebase" {
-            // Scan subsequent words for --exec or -x
-            for &next in words.iter().skip(i + 1) {
-                if next == "--exec"
-                    || next.starts_with("--exec=")
-                    || (next == "-x" || next.starts_with("-x"))
+        // Direct: git rebase --exec ...
+        if let Some(&next) = words.get(i + 1)
+            && next == "rebase"
+        {
+            for &arg in words.iter().skip(i + 2) {
+                if arg == "--exec"
+                    || arg.starts_with("--exec=")
+                    || (arg == "-x" || arg.starts_with("-x"))
                 {
                     violations.push(GitSafetyViolation::RebaseExec);
                     return;
                 }
                 // Stop scanning at subcommand boundaries
-                if next.starts_with('-') && !next.starts_with("--exec") && next != "-x" {
+                if arg.starts_with('-') && !arg.starts_with("--exec") && arg != "-x" {
                     continue;
+                }
+            }
+            return;
+        }
+        // Indirect: git pull --rebase --exec ...
+        if let Some(&next) = words.get(i + 1)
+            && next == "pull"
+        {
+            let has_rebase_flag = words
+                .iter()
+                .skip(i + 2)
+                .any(|&w| w == "--rebase" || w == "-r" || w.starts_with("--rebase="));
+            if has_rebase_flag {
+                for &arg in words.iter().skip(i + 2) {
+                    if arg == "--exec"
+                        || arg.starts_with("--exec=")
+                        || (arg == "-x" || arg.starts_with("-x"))
+                    {
+                        violations.push(GitSafetyViolation::RebaseExec);
+                        return;
+                    }
                 }
             }
             return;
@@ -325,24 +383,16 @@ fn check_rebase_exec(
     }
 }
 
-fn check_clone_recurse_submodules(
-    lower: &str,
-    violations: &mut Vec<GitSafetyViolation>,
-) {
+fn check_clone_recurse_submodules(lower: &str, violations: &mut Vec<GitSafetyViolation>) {
     if !lower.contains("clone") {
         return;
     }
-    if lower.contains("--recurse-submodules")
-        || lower.contains("--recursive")
-    {
+    if lower.contains("--recurse-submodules") || lower.contains("--recursive") {
         violations.push(GitSafetyViolation::CloneRecurseSubmodules);
     }
 }
 
-fn check_submodule_update_init(
-    lower: &str,
-    violations: &mut Vec<GitSafetyViolation>,
-) {
+fn check_submodule_update_init(lower: &str, violations: &mut Vec<GitSafetyViolation>) {
     if !lower.contains("submodule") {
         return;
     }
@@ -401,6 +451,77 @@ fn check_worktree_destructive(lower: &str, violations: &mut Vec<GitSafetyViolati
             }
             _ => {}
         }
+    }
+}
+
+fn check_branch_force_delete(lower: &str, violations: &mut Vec<GitSafetyViolation>) {
+    if !lower.contains("branch") {
+        return;
+    }
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    for (i, &word) in words.iter().enumerate() {
+        if !word_is_git(word) {
+            continue;
+        }
+        // Look for "branch" after "git"
+        if let Some(sub) = words.get(i + 1)
+            && *sub == "branch"
+        {
+            // Check for -D (uppercase, force delete) — not -d (lowercase, safe)
+            for &arg in words.iter().skip(i + 2) {
+                if arg == "-D" {
+                    violations.push(GitSafetyViolation::BranchForceDelete);
+                    return;
+                }
+                if arg == "-d" {
+                    return; // -d is safe (refuses unmerged branches)
+                }
+            }
+        }
+    }
+}
+
+fn check_stash_destructive(lower: &str, violations: &mut Vec<GitSafetyViolation>) {
+    if !lower.contains("stash") {
+        return;
+    }
+    if lower.contains("stash drop") {
+        violations.push(GitSafetyViolation::StashDestructive { operation: "drop" });
+        return;
+    }
+    if lower.contains("stash clear") {
+        violations.push(GitSafetyViolation::StashDestructive { operation: "clear" });
+    }
+}
+
+fn check_tag_delete(lower: &str, violations: &mut Vec<GitSafetyViolation>) {
+    if !lower.contains("tag") {
+        return;
+    }
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    for (i, &word) in words.iter().enumerate() {
+        if !word_is_git(word) {
+            continue;
+        }
+        if let Some(sub) = words.get(i + 1)
+            && *sub == "tag"
+        {
+            for &arg in words.iter().skip(i + 2) {
+                if arg == "-d" || arg == "--delete" {
+                    violations.push(GitSafetyViolation::TagDelete);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn check_bisect_run(lower: &str, violations: &mut Vec<GitSafetyViolation>) {
+    if !lower.contains("bisect") {
+        return;
+    }
+    if lower.contains("bisect run") {
+        violations.push(GitSafetyViolation::BisectRun);
     }
 }
 
@@ -754,10 +875,8 @@ mod tests {
         // Plain clone is allowed
         let v = validate_git_command("git clone https://safe/repo");
         assert!(
-            !v.iter().any(|violation| matches!(
-                violation,
-                GitSafetyViolation::CloneRecurseSubmodules
-            ))
+            !v.iter()
+                .any(|violation| matches!(violation, GitSafetyViolation::CloneRecurseSubmodules))
         );
     }
 
@@ -770,20 +889,16 @@ mod tests {
         ] {
             let v = validate_git_command(cmd);
             assert!(
-                v.iter().any(|violation| matches!(
-                    violation,
-                    GitSafetyViolation::SubmoduleUpdateInit
-                )),
+                v.iter()
+                    .any(|violation| matches!(violation, GitSafetyViolation::SubmoduleUpdateInit)),
                 "should block: {cmd}"
             );
         }
         // Plain submodule status is allowed
         let v = validate_git_command("git submodule status");
         assert!(
-            !v.iter().any(|violation| matches!(
-                violation,
-                GitSafetyViolation::SubmoduleUpdateInit
-            ))
+            !v.iter()
+                .any(|violation| matches!(violation, GitSafetyViolation::SubmoduleUpdateInit))
         );
     }
 
