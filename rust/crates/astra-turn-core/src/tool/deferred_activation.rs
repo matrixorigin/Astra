@@ -36,7 +36,12 @@ pub fn activated_tool_names_from_tool_search_output(output: &str) -> Vec<String>
     let Some(query) = value.get("query").and_then(Value::as_str) else {
         return Vec::new();
     };
-    if !query.trim_start().starts_with("select:") {
+    let query = query.trim_start();
+    const SELECT_PREFIX: &str = "select:";
+    if !query
+        .get(..SELECT_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(SELECT_PREFIX))
+    {
         return Vec::new();
     }
 
@@ -110,6 +115,22 @@ mod tests {
         assert_eq!(
             activated_tool_names_from_tool_search_output(&out),
             vec!["agent_fanout".to_string()]
+        );
+    }
+
+    #[test]
+    fn select_prefix_is_case_insensitive_for_activation() {
+        let out = json!({
+            "query": " Select:GitHub",
+            "matches": [
+                {"name": "github", "description": "full", "parameters": {"type": "object"}}
+            ],
+            "missing": []
+        })
+        .to_string();
+        assert_eq!(
+            activated_tool_names_from_tool_search_output(&out),
+            vec!["github".to_string()]
         );
     }
 

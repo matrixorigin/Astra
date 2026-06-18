@@ -2514,7 +2514,9 @@ impl ServerAgenticLoopHost {
         state: &AgenticLoopState,
     ) {
         let mut extras = self.admissible_extras.clone();
+        let deferred_tool_names = self.deferred_tool_names_from_edge_profile();
         if let Some(executor) = state.server_tool_executor.as_deref() {
+            executor.set_current_activatable_tool_names(deferred_tool_names);
             executor.set_current_searchable_tool_schemas(visible_tools);
             extras.extend(executor.activated_deferred_tool_names());
         }
@@ -2523,6 +2525,19 @@ impl ServerAgenticLoopHost {
                 visible_tools,
                 &extras,
             );
+    }
+
+    fn deferred_tool_names_from_edge_profile(&self) -> HashSet<String> {
+        self.edge_profile
+            .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect()
     }
 
     /// Set the extras list (runtime-injected names + plugin names) so
@@ -3815,6 +3830,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         &self.valid_tools
     }
 
+    fn deferred_tool_names(&self) -> HashSet<String> {
+        self.deferred_tool_names_from_edge_profile()
+    }
+
     fn capabilities(&self) -> astra_turn_core::capability::CapabilitySet {
         self.capabilities.clone()
     }
@@ -4790,6 +4809,64 @@ mod tests {
         assert!(host.valid_tool_names().contains("bash"));
         assert!(host.valid_tool_names().contains("read_file"));
         assert_eq!(host.valid_tool_names().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn server_host_syncs_deferred_manifest_to_executor_activation() {
+        let mut edge_profile = Map::new();
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES
+                .to_string(),
+            json!(["agent_fanout", " "]),
+        );
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_edge_profile(edge_profile)
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let executor = Arc::new(
+            crate::server::server_tool_executor::ServerToolExecutor::new(
+                dir.path().to_path_buf(),
+                "user1".into(),
+                "sess1".into(),
+                None,
+                None,
+            ),
+        );
+        let mut state = create_test_state();
+        state.server_tool_executor = Some(Arc::clone(&executor));
+
+        let _visible = host.visible_turn_tools(&mut state);
+
+        assert!(
+            executor
+                .current_activatable_tool_names_snapshot()
+                .contains("agent_fanout"),
+            "executor must mirror edge-profile deferred names"
+        );
+        assert!(
+            <ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host)
+                .contains("agent_fanout"),
+            "validator must see the same deferred manifest"
+        );
+
+        let result = executor
+            .execute_with_metadata("tool_search", &json!({"query": "Select:agent_fanout"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(
+            parsed["matches"][0]["name"].as_str(),
+            Some("agent_fanout"),
+            "server tool_search must resolve names advertised in the deferred manifest: {}",
+            result.output
+        );
     }
 
     #[test]

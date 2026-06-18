@@ -61,7 +61,7 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
     // caller can invoke the tool immediately. This is the "deferred tool
     // activation" pattern — the LLM saw the tool name elsewhere, asked for
     // its schema, now has everything needed to call it.
-    if let Some(tool_names) = query.strip_prefix("select:") {
+    if let Some(tool_names) = select_payload(query) {
         let requested: Vec<&str> = tool_names
             .split(',')
             .map(|s| s.trim())
@@ -144,6 +144,14 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
     .to_string()
 }
 
+fn select_payload(query: &str) -> Option<&str> {
+    const SELECT_PREFIX: &str = "select:";
+    query
+        .get(..SELECT_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(SELECT_PREFIX))
+        .then(|| &query[SELECT_PREFIX.len()..])
+}
+
 #[cfg(test)]
 mod tests {
     use super::tool_search;
@@ -218,6 +226,17 @@ mod tests {
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert!(parsed["matches"].as_array().unwrap().is_empty());
         assert_eq!(parsed["missing"][0].as_str(), Some("spawn_agent"));
+    }
+
+    #[test]
+    fn select_mode_prefix_is_case_insensitive() {
+        let schemas = sample_schemas();
+        let result = tool_search(&schemas, &json!({"query": "Select:BASH"}));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["query"].as_str(), Some("Select:BASH"));
+        assert_eq!(parsed["matches"][0]["name"].as_str(), Some("bash"));
+        assert!(parsed["matches"][0].get("score").is_none());
+        assert!(parsed["missing"].as_array().unwrap().is_empty());
     }
 
     #[test]
