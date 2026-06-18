@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -84,6 +85,13 @@ pub(crate) async fn execute_external_route(
     transport: Option<Arc<dyn ExternalTransport>>,
     cancel_token: Option<Arc<CancellationToken>>,
 ) -> astra_tools::ToolResult {
+    if cancel_token
+        .as_ref()
+        .is_some_and(|token| token.is_cancelled())
+    {
+        return cancelled_runtime_tool_result(&request, binding, transport_kind, false);
+    }
+
     let Some(transport) = transport else {
         return transport_adapter_unavailable_result(
             &request,
@@ -95,7 +103,19 @@ pub(crate) async fn execute_external_route(
 
     // Health gate: verify transport is alive before dispatching.
     // If unhealthy, attempt one reconnect cycle.
-    if let Err(health_reason) = transport.health_check().await {
+    let health_check = match preflight_or_cancel(
+        &request,
+        binding,
+        transport_kind,
+        cancel_token.as_ref(),
+        transport.health_check(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(cancelled) => return cancelled,
+    };
+    if let Err(health_reason) = health_check {
         tracing::warn!(
             adapter = adapter_name,
             reason = %health_reason,
@@ -104,7 +124,19 @@ pub(crate) async fn execute_external_route(
         // Best-effort reconnect — if it fails we still try the call below
         // so that the error handling in execute_external_transport can
         // classify the error properly (retryable vs hard-fail).
-        if let Err(reconnect_err) = transport.reconnect().await {
+        let reconnect = match preflight_or_cancel(
+            &request,
+            binding,
+            transport_kind,
+            cancel_token.as_ref(),
+            transport.reconnect(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(cancelled) => return cancelled,
+        };
+        if let Err(reconnect_err) = reconnect {
             tracing::warn!(
                 adapter = adapter_name,
                 error = %reconnect_err,
@@ -112,7 +144,19 @@ pub(crate) async fn execute_external_route(
             );
         }
         // Re-validate after reconnect attempt
-        if let Err(health_reason) = transport.health_check().await {
+        let health_check = match preflight_or_cancel(
+            &request,
+            binding,
+            transport_kind,
+            cancel_token.as_ref(),
+            transport.health_check(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(cancelled) => return cancelled,
+        };
+        if let Err(health_reason) = health_check {
             tracing::warn!(
                 adapter = adapter_name,
                 reason = %health_reason,
@@ -143,6 +187,38 @@ pub(crate) async fn execute_external_route(
         },
     )
     .await
+}
+
+async fn preflight_or_cancel<T, Fut>(
+    request: &ToolExecutionRequest,
+    binding: &astra_runtime_env::RunBinding,
+    transport_kind: ToolTransportKind,
+    cancel_token: Option<&Arc<CancellationToken>>,
+    future: Fut,
+) -> Result<T, astra_tools::ToolResult>
+where
+    Fut: Future<Output = T>,
+{
+    let Some(token) = cancel_token else {
+        return Ok(future.await);
+    };
+    if token.is_cancelled() {
+        return Err(cancelled_runtime_tool_result(
+            request,
+            binding,
+            transport_kind,
+            false,
+        ));
+    }
+    tokio::select! {
+        _ = token.cancelled() => Err(cancelled_runtime_tool_result(
+            request,
+            binding,
+            transport_kind,
+            false,
+        )),
+        result = future => Ok(result),
+    }
 }
 
 pub(crate) async fn execute_gateway_relay(
@@ -381,6 +457,8 @@ mod tests {
         RuntimeSessionSpec, RuntimeToolInvocation, RuntimeToolOutcome,
     };
     use astra_tools::exit_semantics::ExitSemantics;
+    use std::time::Duration;
+
     fn test_binding() -> RunBinding {
         let registry = astra_runtime_env::ToolRegistry::default();
         RunBinding::resolve(
@@ -612,5 +690,60 @@ mod tests {
             outcome,
         );
         assert_eq!(result.exit_semantics, Some(ExitSemantics::ExecutionError));
+    }
+
+    #[derive(Debug)]
+    struct HangingHealthTransport;
+
+    #[async_trait]
+    impl ExternalTransport for HangingHealthTransport {
+        async fn execute_tool(
+            &self,
+            _request: ToolExecutionRequest,
+            _binding: astra_runtime_env::RunBinding,
+        ) -> Result<RuntimeToolOutcome, astra_runtime_env::RuntimeError> {
+            panic!("execute_tool must not run while health_check is pending");
+        }
+
+        async fn health_check(&self) -> Result<(), String> {
+            std::future::pending::<Result<(), String>>().await
+        }
+    }
+
+    #[tokio::test]
+    async fn external_preflight_health_check_observes_cancel_token() {
+        let binding = test_binding();
+        let request = test_request("bash");
+        let cancel_token = Arc::new(CancellationToken::new());
+        let cancel_after_start = Arc::clone(&cancel_token);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel_after_start.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            execute_external_route(
+                request,
+                &binding,
+                ToolTransportKind::SandboxResidentAgent,
+                "sandbox resident agent",
+                Some(Arc::new(HangingHealthTransport)),
+                Some(cancel_token),
+            ),
+        )
+        .await
+        .expect("cancelled health check should not hang");
+
+        assert!(result.is_error, "{result:?}");
+        let metadata = result.metadata.expect("cancel metadata");
+        assert_eq!(
+            metadata.get("cancelled").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            metadata.get("execution_started").and_then(|v| v.as_bool()),
+            Some(false)
+        );
     }
 }
