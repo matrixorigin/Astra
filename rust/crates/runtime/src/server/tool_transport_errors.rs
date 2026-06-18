@@ -2,9 +2,9 @@ use serde_json::Value;
 
 use super::tool_execution_binding::{ExecutorStatus, ToolExecutionRequest, WorkspaceBindingKind};
 use super::tool_transport_metadata::{
+    attach_runtime_error_metadata, attach_runtime_policy_metadata, binding_event_fields,
     RUN_BLOCKED_REASON_EXECUTOR_OFFLINE, RUN_BLOCKED_REASON_ROUTE_MISMATCH,
-    TOOL_ERROR_KIND_CAPABILITY_DENIED, attach_runtime_error_metadata,
-    attach_runtime_policy_metadata, binding_event_fields,
+    TOOL_ERROR_KIND_CAPABILITY_DENIED,
 };
 
 pub(crate) fn edge_unavailable_message(request: &ToolExecutionRequest) -> String {
@@ -66,7 +66,7 @@ pub(crate) fn capability_denied_result(
         },
         metadata: Some(metadata),
         is_error: true,
-        exit_semantics: None,
+        exit_semantics: Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
     }
 }
 
@@ -104,7 +104,7 @@ pub(crate) fn unsupported_workspace_executor_result(
         output: unsupported_workspace_executor_message(request),
         metadata: Some(metadata),
         is_error: true,
-        exit_semantics: None,
+        exit_semantics: Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
     }
 }
 
@@ -135,6 +135,6 @@ pub(crate) fn transport_adapter_unavailable_result(
         output: format!("Error: {message}. No fallback was attempted."),
         metadata: Some(metadata),
         is_error: true,
-        exit_semantics: None,
+        exit_semantics: Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
     }
 }

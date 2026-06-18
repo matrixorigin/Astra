@@ -1,7 +1,7 @@
 use super::*;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -2939,4 +2939,477 @@ fn edge_executor_id_returns_some_for_valid_id() {
         policy: ToolPolicySnapshot::default(),
     };
     assert_eq!(edge_executor_id(&request), Some("valid-edge-123"));
+}
+
+// ─── ExternalTransport health-check boundary tests ──────────────────────────
+
+/// Transport health states for boundary tests.
+#[derive(Clone)]
+enum HealthState {
+    Healthy,
+    Unhealthy(&'static str),
+    /// First health_check fails, reconnect succeeds, then healthy.
+    Reconnectable(&'static str),
+    /// First health_check fails, reconnect also fails.
+    Unrecoverable(&'static str, &'static str),
+}
+
+struct HealthStateTransport {
+    state: Mutex<HealthState>,
+    calls: AtomicUsize,
+    output: String,
+}
+
+impl HealthStateTransport {
+    fn new(state: HealthState) -> Self {
+        Self {
+            state: Mutex::new(state),
+            calls: AtomicUsize::new(0),
+            output: "health-state-result".to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl ExternalTransport for HealthStateTransport {
+    async fn execute_tool(
+        &self,
+        request: ToolExecutionRequest,
+        binding: astra_runtime_env::RunBinding,
+    ) -> Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(runtime_outcome_for_request(
+            &request,
+            &binding,
+            &self.output,
+        ))
+    }
+
+    async fn health_check(&self) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap();
+        match *state {
+            HealthState::Healthy => Ok(()),
+            HealthState::Unhealthy(reason) => Err(reason.to_string()),
+            HealthState::Reconnectable(reason) => {
+                // After reconnect succeeds, transition to Healthy
+                *state = HealthState::Healthy;
+                Err(reason.to_string())
+            }
+            HealthState::Unrecoverable(reason, _) => Err(reason.to_string()),
+        }
+    }
+
+    async fn reconnect(&self) -> Result<(), String> {
+        let state = self.state.lock().unwrap();
+        match *state {
+            HealthState::Reconnectable(_) => Ok(()),
+            HealthState::Unrecoverable(_, reconnect_err) => Err(reconnect_err.to_string()),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn external_transport_health_check_failure_returns_transport_unavailable() {
+    let transport = Arc::new(HealthStateTransport::new(HealthState::Unhealthy(
+        "connection refused",
+    )));
+    let service = ToolExecutionService::builder()
+        .sandbox_resident_agent_transport(transport)
+        .build();
+    let local = CountingLocalTransport::new();
+
+    let result = service
+        .execute(cloud_snapshot_request("read_file"), &local)
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    assert_eq!(local.calls(), 0, "must not fall back locally");
+    let metadata = result.metadata.expect("transport metadata");
+    assert_eq!(metadata["error_kind"], "transport_unavailable");
+    assert!(metadata["runtime_error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("transport is unhealthy"));
+    assert!(metadata["runtime_error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("connection refused"));
+}
+
+#[tokio::test]
+async fn external_transport_reconnect_after_health_failure_succeeds() {
+    let transport = Arc::new(HealthStateTransport::new(HealthState::Reconnectable(
+        "stale connection",
+    )));
+    let service = ToolExecutionService::builder()
+        .sandbox_resident_agent_transport(transport.clone())
+        .build();
+    let local = CountingLocalTransport::new();
+
+    let result = service
+        .execute(cloud_snapshot_request("read_file"), &local)
+        .await;
+
+    // After reconnect, the transport should be healthy and execute normally.
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(result.output, "health-state-result");
+    assert_eq!(local.calls(), 0, "must not fall back locally");
+}
+
+#[tokio::test]
+async fn external_transport_reconnect_failure_returns_transport_unavailable() {
+    let transport = Arc::new(HealthStateTransport::new(HealthState::Unrecoverable(
+        "connection refused",
+        "reconnect failed: timeout",
+    )));
+    let service = ToolExecutionService::builder()
+        .sandbox_resident_agent_transport(transport)
+        .build();
+    let local = CountingLocalTransport::new();
+
+    let result = service
+        .execute(cloud_snapshot_request("read_file"), &local)
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    assert_eq!(local.calls(), 0, "must not fall back locally");
+    let metadata = result.metadata.expect("transport metadata");
+    assert_eq!(metadata["error_kind"], "transport_unavailable");
+    assert!(metadata["runtime_error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("transport is unhealthy"));
+}
+
+// ─── ExternalTransport exit_semantics boundary tests ────────────────────────
+
+#[tokio::test]
+async fn external_transport_cancelled_result_carries_execution_error_semantics() {
+    let service = ToolExecutionService::new_for_test();
+    let local = CountingLocalTransport::new();
+    let cancel_token = CancellationToken::new();
+    cancel_token.cancel();
+
+    // Use gateway relay path — it exercises the external route code.
+    let transport = Arc::new(StaticGatewayRelayTransport::new());
+    let service = ToolExecutionService::builder()
+        .gateway_relay_transport(transport)
+        .build();
+
+    let result = service
+        .execute_with_cancel(
+            openshell_gateway_request("bash"),
+            &local,
+            Some(Arc::new(cancel_token)),
+        )
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    assert_eq!(
+        result.exit_semantics,
+        Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
+        "cancelled transport result must carry ExecutionError exit semantics"
+    );
+}
+
+#[tokio::test]
+async fn external_transport_timeout_result_carries_execution_error_semantics() {
+    // Verify that output_limit_exceeded also carries ExecutionError.
+    let oversized = "x".repeat(1_048_577);
+    let transport = Arc::new(StaticGatewayRelayTransport::with_output(oversized));
+    let service = ToolExecutionService::builder()
+        .gateway_relay_transport(transport)
+        .build();
+    let local = CountingLocalTransport::new();
+
+    let mut request = openshell_gateway_request("bash");
+    request.policy.max_output_bytes = Some(1024);
+
+    let result = service.execute(request, &local).await;
+
+    assert!(result.is_error, "{result:?}");
+    assert_eq!(
+        result.exit_semantics,
+        Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
+        "output-limit-exceeded result must carry ExecutionError exit semantics"
+    );
+}
+
+#[tokio::test]
+async fn external_transport_not_configured_result_carries_execution_error_semantics() {
+    let service = ToolExecutionService::new_for_test();
+    let local = CountingLocalTransport::new();
+
+    // No gateway relay transport configured — must return transport_unavailable.
+    let result = service
+        .execute(openshell_gateway_request("bash"), &local)
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    assert_eq!(
+        result.exit_semantics,
+        Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
+        "transport-unavailable result must carry ExecutionError exit semantics"
+    );
+}
+
+// ─── ExternalTransport retry & recovery boundary tests ──────────────────────
+
+/// A transport that replays a pre-configured sequence of responses.
+/// Each call to `execute_tool` consumes the next response in the queue.
+struct ReplayTransport {
+    responses:
+        Mutex<Vec<Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError>>>,
+    calls: AtomicUsize,
+    healthy: AtomicBool,
+}
+
+impl ReplayTransport {
+    fn new(
+        responses: Vec<
+            Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError>,
+        >,
+    ) -> Self {
+        Self {
+            responses: Mutex::new(responses),
+            calls: AtomicUsize::new(0),
+            healthy: AtomicBool::new(true),
+        }
+    }
+
+    fn with_health(healthy: bool) -> Self {
+        Self {
+            healthy: AtomicBool::new(healthy),
+            ..Self::new(vec![])
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ExternalTransport for ReplayTransport {
+    async fn execute_tool(
+        &self,
+        _request: ToolExecutionRequest,
+        _binding: astra_runtime_env::RunBinding,
+    ) -> Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut responses = self.responses.lock().unwrap();
+        if responses.is_empty() {
+            return Err(astra_runtime_env::RuntimeError::new(
+                astra_runtime_env::RuntimeErrorKind::RuntimeUnavailable,
+                "no more responses in replay queue",
+            ));
+        }
+        responses.remove(0)
+    }
+
+    async fn health_check(&self) -> Result<(), String> {
+        if self.healthy.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err("transport is unhealthy".to_string())
+        }
+    }
+}
+
+/// A transport that blocks forever (simulates a hung connection / timeout).
+struct PendingExternalTransport {
+    execute_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    calls: AtomicUsize,
+}
+
+impl PendingExternalTransport {
+    fn new(execute_started: tokio::sync::oneshot::Sender<()>) -> Self {
+        Self {
+            execute_started: Mutex::new(Some(execute_started)),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ExternalTransport for PendingExternalTransport {
+    async fn execute_tool(
+        &self,
+        _request: ToolExecutionRequest,
+        _binding: astra_runtime_env::RunBinding,
+    ) -> Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let sender = self.execute_started.lock().unwrap().take();
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
+        std::future::pending::<()>().await;
+        unreachable!("pending external transport never completes")
+    }
+}
+
+#[tokio::test]
+async fn external_transport_retryable_error_retries_then_succeeds() {
+    // Transport returns retryable errors on first 2 calls, success on 3rd.
+    let request = cloud_snapshot_request("read_file");
+    let binding = astra_runtime_env::RunBinding::resolve(
+        astra_runtime_env::WorkspaceBinding::server_sandbox("session-r1"),
+        astra_runtime_env::ExecutorBinding::local_cli(),
+        astra_runtime_env::RuntimeBinding::host_process("test-host"),
+        astra_runtime_env::PolicyIntent::local_developer(),
+        &astra_runtime_env::ToolRegistry::default(),
+    );
+    let success_outcome = runtime_outcome_for_request(&request, &binding, "retry-succeeded");
+    let retryable_err = astra_runtime_env::RuntimeError::runtime_unavailable("temporary outage");
+
+    let transport = Arc::new(ReplayTransport::new(vec![
+        Err(retryable_err.clone()),
+        Err(retryable_err.clone()),
+        Ok(success_outcome),
+    ]));
+    let service = ToolExecutionService::builder()
+        .sandbox_resident_agent_transport(transport.clone())
+        .build();
+    let local = CountingLocalTransport::new();
+
+    let result = service.execute(request, &local).await;
+
+    assert!(
+        !result.is_error,
+        "retry should eventually succeed: {result:?}"
+    );
+    assert_eq!(result.output, "retry-succeeded");
+    assert_eq!(
+        transport.calls(),
+        3,
+        "should have retried 2 times, total 3 calls"
+    );
+    assert_eq!(local.calls(), 0, "must not fall back locally");
+}
+
+#[tokio::test]
+async fn external_transport_retryable_error_exhausts_retries() {
+    // Transport always returns retryable errors — all retries exhausted.
+    let request = cloud_snapshot_request("read_file");
+    let retryable_err = astra_runtime_env::RuntimeError::runtime_unavailable("persistent outage");
+
+    let transport = Arc::new(ReplayTransport::new(vec![
+        Err(retryable_err.clone()),
+        Err(retryable_err.clone()),
+        Err(retryable_err.clone()),
+        Err(retryable_err.clone()),
+        // 4 calls: initial + retry1 + retry2 + retry3 → exhausted
+    ]));
+    let service = ToolExecutionService::builder()
+        .sandbox_resident_agent_transport(transport.clone())
+        .build();
+    let local = CountingLocalTransport::new();
+
+    let result = service.execute(request, &local).await;
+
+    assert!(
+        result.is_error,
+        "all retries exhausted, should error: {result:?}"
+    );
+    assert_eq!(transport.calls(), 4, "initial + 3 retries = 4 total calls");
+    assert!(
+        result.output.contains("retried 3 time(s)"),
+        "error should mention retry count: {result:?}"
+    );
+    assert_eq!(local.calls(), 0, "must not fall back locally");
+    assert_eq!(
+        result.exit_semantics,
+        Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
+        "exhausted retries must carry ExecutionError exit semantics"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn external_transport_timeout_then_second_call_transport_unavailable() {
+    // Scenario: a transport hangs and times out.  After the timeout the
+    // connection is considered lost.  A subsequent call hits the health
+    // gate and receives transport_unavailable with ExecutionError semantics.
+    let request = cloud_snapshot_request("read_file");
+    let local = CountingLocalTransport::new();
+
+    // ── First call: transport hangs → timeout ──
+    let (tx1, rx1) = tokio::sync::oneshot::channel();
+    let pending = Arc::new(PendingExternalTransport::new(tx1));
+    let service = ToolExecutionService::builder()
+        .sandbox_resident_agent_transport(pending.clone())
+        .build();
+
+    // Spawn the first call; it will hang inside the transport.
+    let handle = tokio::spawn({
+        let request = request.clone();
+        async move {
+            let local = CountingLocalTransport::new();
+            service.execute(request, &local).await
+        }
+    });
+
+    // Wait for the transport to start, then advance past the 30 s timeout.
+    rx1.await.expect("transport execute should start");
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    let first_result = handle.await.expect("timeout task should not panic");
+    assert!(first_result.is_error, "{first_result:?}");
+    let first_meta = first_result.metadata.as_ref().expect("timeout metadata");
+    assert_eq!(first_meta["error_kind"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
+
+    // ── Second call: transport is now unhealthy ──
+    let unhealthy = Arc::new(ReplayTransport::with_health(false));
+    let service2 = ToolExecutionService::builder()
+        .sandbox_resident_agent_transport(unhealthy)
+        .build();
+
+    let result = service2.execute(request, &local).await;
+
+    assert!(result.is_error, "{result:?}");
+    assert_eq!(local.calls(), 0, "must not fall back locally");
+    let metadata = result.metadata.expect("transport metadata");
+    assert_eq!(metadata["error_kind"], "transport_unavailable");
+    assert_eq!(
+        result.exit_semantics,
+        Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
+        "transport-unavailable must carry ExecutionError exit semantics"
+    );
+}
+
+#[tokio::test]
+async fn external_transport_concurrent_cancel_two_transport_paths() {
+    // Cancel two different transport paths (gateway relay + sandbox resident
+    // agent) concurrently and verify both report ExecutionError.
+    let cancel_token = Arc::new(CancellationToken::new());
+
+    let gateway_transport = Arc::new(StaticGatewayRelayTransport::new());
+    let sandbox_transport = Arc::new(StaticSandboxResidentAgentTransport::new());
+    let service = ToolExecutionService::builder()
+        .gateway_relay_transport(gateway_transport)
+        .sandbox_resident_agent_transport(sandbox_transport)
+        .build();
+    let local = CountingLocalTransport::new();
+
+    cancel_token.cancel();
+
+    let gateway_req = openshell_gateway_request("bash");
+    let sandbox_req = cloud_snapshot_request("read_file");
+
+    let (r1, r2) = tokio::join!(
+        service.execute_with_cancel(gateway_req, &local, Some(cancel_token.clone().into())),
+        service.execute_with_cancel(sandbox_req, &local, Some(cancel_token.clone().into())),
+    );
+
+    for (label, result) in [("gateway relay", &r1), ("sandbox resident agent", &r2)] {
+        assert!(result.is_error, "{label}: {result:?}");
+        assert_eq!(
+            result.exit_semantics,
+            Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
+            "{label}: cancelled transport result must carry ExecutionError exit semantics"
+        );
+    }
 }
