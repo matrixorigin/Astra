@@ -190,7 +190,7 @@ async fn priority_routing_three_providers() {
 async fn cross_kind_priority_routing() {
     let reg = CapabilityRegistry::new();
 
-    // ServerBuiltinProvider declares Symbol category at priority 10.
+    // ServerBuiltinProvider declares exact server-owned tools at priority 10.
     reg.register(
         "server-sym",
         Arc::new(ServerBuiltinProvider::new(10, Arc::new(DummyRuntime), None)),
@@ -206,7 +206,7 @@ async fn cross_kind_priority_routing() {
     .unwrap();
 
     let request = ToolRequest {
-        capability: ToolCapability::Category(ToolCategory::Symbols),
+        capability: ToolCapability::Named("symbols".into()),
         tool_name: "symbols".into(),
         tool_call_id: "cross-kind-1".into(),
         parameters: serde_json::Value::Null,
@@ -219,6 +219,35 @@ async fn cross_kind_priority_routing() {
 
     let resolved = reg.resolve(&request).await.unwrap();
     assert_eq!(resolved.priority(), 3);
+}
+
+#[tokio::test]
+async fn server_builtin_default_does_not_overclaim_lsp_symbols_category() {
+    let reg = CapabilityRegistry::new();
+    reg.register(
+        "server",
+        Arc::new(ServerBuiltinProvider::new(10, Arc::new(DummyRuntime), None)),
+    )
+    .await
+    .unwrap();
+
+    let request = ToolRequest {
+        capability: ToolCapability::Named("lsp".into()),
+        tool_name: "lsp".into(),
+        tool_call_id: "server-lsp-1".into(),
+        parameters: serde_json::Value::Null,
+        isolation_required: IsolationIntent::None,
+        storage: None,
+        user_id: "test-user".into(),
+        run_id: "test-run".into(),
+        session_id: "test-session".into(),
+    };
+
+    let result = reg.resolve(&request).await;
+    assert!(
+        matches!(result, Err(ProviderError::NotCapable { .. })),
+        "server builtin must not claim lsp via the broad Symbols category"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -272,7 +301,7 @@ async fn storage_unavailable_returns_not_capable() {
 async fn no_storage_request_matches_all() {
     let reg = CapabilityRegistry::new();
 
-    // ServerBuiltinProvider has StateManagement + storage.
+    // ServerBuiltinProvider has named state-management tools + storage.
     reg.register(
         "server",
         Arc::new(ServerBuiltinProvider::new(10, Arc::new(DummyRuntime), None)),
@@ -281,8 +310,8 @@ async fn no_storage_request_matches_all() {
     .unwrap();
 
     let request = ToolRequest {
-        capability: ToolCapability::Category(ToolCategory::StateManagement),
-        tool_name: "state".into(),
+        capability: ToolCapability::Named("memory".into()),
+        tool_name: "memory".into(),
         tool_call_id: "storage-2".into(),
         parameters: serde_json::Value::Null,
         isolation_required: IsolationIntent::None,
@@ -296,7 +325,7 @@ async fn no_storage_request_matches_all() {
     assert_eq!(resolved.kind(), ProviderKind::ServerBuiltin);
 }
 
-/// ServerBuiltinProvider has storage access and handles AgentDelegation.
+/// ServerBuiltinProvider has storage access and handles named agent tools.
 #[tokio::test]
 async fn server_builtin_storage_access_for_agent() {
     let reg = CapabilityRegistry::new();
@@ -308,7 +337,7 @@ async fn server_builtin_storage_access_for_agent() {
     .unwrap();
 
     let request = ToolRequest {
-        capability: ToolCapability::Category(ToolCategory::AgentDelegation),
+        capability: ToolCapability::Named("agent".into()),
         tool_name: "agent".into(),
         tool_call_id: "storage-3".into(),
         parameters: serde_json::Value::Null,
@@ -463,7 +492,7 @@ async fn isolation_none_available_returns_error() {
     .unwrap();
 
     let request = ToolRequest {
-        capability: ToolCapability::Category(ToolCategory::Symbols),
+        capability: ToolCapability::Named("symbols".into()),
         tool_name: "symbols".into(),
         tool_call_id: "iso-4".into(),
         parameters: serde_json::Value::Null,
@@ -669,7 +698,7 @@ async fn combined_storage_isolation_priority() {
 async fn combined_capability_match_but_isolation_excluded() {
     let reg = CapabilityRegistry::new();
 
-    // ServerBuiltinProvider: Symbols category, isolation=None.
+    // ServerBuiltinProvider: named symbols capability, isolation=None.
     reg.register(
         "server",
         Arc::new(ServerBuiltinProvider::new(10, Arc::new(DummyRuntime), None)),
@@ -678,7 +707,7 @@ async fn combined_capability_match_but_isolation_excluded() {
     .unwrap();
 
     let request = ToolRequest {
-        capability: ToolCapability::Category(ToolCategory::Symbols),
+        capability: ToolCapability::Named("symbols".into()),
         tool_name: "symbols".into(),
         tool_call_id: "combined-2".into(),
         parameters: serde_json::Value::Null,

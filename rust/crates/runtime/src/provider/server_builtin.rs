@@ -12,7 +12,62 @@ use std::sync::Arc;
 use super::traits::{
     CapabilityProvider, ProviderError, ServerToolRuntime, ToolRequest, ToolResult,
 };
-use super::types::{ProviderKind, ToolCapability, ToolCategory};
+use super::types::{ProviderKind, ToolCapability};
+
+/// Exact tools provided by the server builtin provider by default.
+///
+/// This is intentionally a named-tool inventory rather than category
+/// capabilities: category matching is broad enough to include tools such as
+/// `lsp` and `find_definition` that are valid runtime tools but are not
+/// server-builtin handlers.
+pub const SERVER_BUILTIN_TOOL_NAMES: &[&str] = &[
+    // Shell
+    "bash",
+    // FileSystem
+    "read_file",
+    "write_file",
+    "str_replace",
+    "list_dir",
+    "grep",
+    "glob",
+    // VersionControl
+    "git",
+    // ExternalApi
+    "web_search",
+    "web_fetch",
+    "github",
+    "tool_search",
+    // StateManagement
+    "memory",
+    "session",
+    "task",
+    "mo",
+    "mo_query",
+    "rollback_database_snapshots",
+    "rollback_session_state",
+    // AgentDelegation
+    "agent",
+    "agent_fanout",
+    // User interaction
+    "ask_user",
+    "notify",
+    // Plan mode
+    "enter_plan_mode",
+    "exit_plan_mode",
+    // Symbols / introspection
+    "get_agent_info",
+    "symbols",
+    "introspect",
+    // Tool preference
+    "prioritize_tool",
+    "deprioritize_tool",
+    // Context management
+    "compress_context",
+    // Artifact publishing
+    "publish_artifact",
+    // Programmatic scripting
+    "run_script",
+];
 
 // ---------------------------------------------------------------------------
 // ServerBuiltinProvider
@@ -28,8 +83,8 @@ use super::types::{ProviderKind, ToolCapability, ToolCategory};
 ///
 /// When `tools` is `Some(list)`, `capabilities()` returns only `Named`
 /// entries for those tools — enabling deployment profiles to control exactly
-/// which tools are available.  When `None` (default), the full category-based
-/// capabilities are declared (backward-compatible).
+/// which tools are available. When `None` (default), the provider declares the
+/// exact server-builtin inventory in [`SERVER_BUILTIN_TOOL_NAMES`].
 pub struct ServerBuiltinProvider {
     /// Priority for routing (lower = preferred).
     priority: u8,
@@ -51,7 +106,7 @@ impl ServerBuiltinProvider {
     /// Create a new provider with the given priority and execution runtime.
     ///
     /// `tools`, when provided, restricts this provider to only those
-    /// tool names.  Pass `None` for the full category-based set.
+    /// tool names. Pass `None` for the exact default server-builtin inventory.
     pub fn new(
         priority: u8,
         runtime: Arc<dyn ServerToolRuntime>,
@@ -72,24 +127,15 @@ impl CapabilityProvider for ServerBuiltinProvider {
     }
 
     async fn capabilities(&self) -> Vec<ToolCapability> {
-        if let Some(ref tools) = self.tools {
-            tools
+        match self.tools.as_deref() {
+            Some(tools) => tools
                 .iter()
-                .map(|t| ToolCapability::Named(t.clone()))
-                .collect()
-        } else {
-            vec![
-                // ── State management (server-owned) ──
-                ToolCapability::Category(ToolCategory::StateManagement),
-                // ── Agent delegation ──
-                ToolCapability::Category(ToolCategory::AgentDelegation),
-                // ── MCP protocol ──
-                ToolCapability::Category(ToolCategory::McpProtocol),
-                // ── External API ──
-                ToolCapability::Category(ToolCategory::ExternalApi),
-                // ── Symbols / LSP (can run in-server when no workspace needed) ──
-                ToolCapability::Category(ToolCategory::Symbols),
-            ]
+                .map(|tool| ToolCapability::Named(tool.clone()))
+                .collect(),
+            None => SERVER_BUILTIN_TOOL_NAMES
+                .iter()
+                .map(|tool| ToolCapability::Named((*tool).to_string()))
+                .collect(),
         }
     }
 
@@ -167,7 +213,9 @@ mod tests {
         let provider = ServerBuiltinProvider::new(10, Arc::new(TestRuntime), None);
         let caps = provider.capabilities().await;
         assert!(!caps.is_empty());
-        assert!(caps.len() >= 4);
+        assert_eq!(caps.len(), SERVER_BUILTIN_TOOL_NAMES.len());
+        assert!(caps.contains(&ToolCapability::Named("symbols".into())));
+        assert!(!caps.contains(&ToolCapability::Named("lsp".into())));
     }
 
     #[tokio::test]
@@ -205,13 +253,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_none_returns_categories() {
+    async fn tools_none_returns_exact_named_inventory() {
         let provider = ServerBuiltinProvider::new(10, Arc::new(TestRuntime), None);
         let caps = provider.capabilities().await;
-        // Without whitelist, returns categories, not named tools.
+        assert!(caps.iter().all(|c| matches!(c, ToolCapability::Named(_))));
         assert!(
-            caps.iter()
-                .any(|c| matches!(c, ToolCapability::Category(_)))
+            SERVER_BUILTIN_TOOL_NAMES
+                .iter()
+                .all(|tool| caps.contains(&ToolCapability::Named((*tool).to_string())))
         );
     }
 }

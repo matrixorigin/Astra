@@ -30,7 +30,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::capability_registry::CapabilityRegistry;
-use crate::provider::server_builtin::ServerBuiltinProvider;
+use crate::provider::server_builtin::{SERVER_BUILTIN_TOOL_NAMES, ServerBuiltinProvider};
 use crate::provider::traits::{ProviderError, ServerToolRuntime};
 use crate::provider::types::{ProviderKind, ToolCapability};
 use crate::storage::{MountType, StorageAccess, WorkspaceSource};
@@ -172,54 +172,7 @@ pub struct DeploymentProfile {
 ///
 /// Ordered by category for readability.  Each tool name maps to the
 /// underlying handler registered in `server_tool_executor/tool_handlers.rs`.
-pub const SERVER_ALL_TOOLS: &[&str] = &[
-    // Shell
-    "bash",
-    // FileSystem
-    "read_file",
-    "write_file",
-    "str_replace",
-    "list_dir",
-    "grep",
-    "glob",
-    // VersionControl
-    "git",
-    // ExternalApi
-    "web_search",
-    "web_fetch",
-    "github",
-    "tool_search",
-    // StateManagement
-    "memory",
-    "session",
-    "task",
-    "mo",
-    "mo_query",
-    "rollback_database_snapshots",
-    "rollback_session_state",
-    // AgentDelegation
-    "agent",
-    "agent_fanout",
-    // User interaction
-    "ask_user",
-    "notify",
-    // Plan mode
-    "enter_plan_mode",
-    "exit_plan_mode",
-    // Symbols / introspection
-    "get_agent_info",
-    "symbols",
-    "introspect",
-    // Tool preference
-    "prioritize_tool",
-    "deprioritize_tool",
-    // Context management
-    "compress_context",
-    // Artifact publishing
-    "publish_artifact",
-    // Programmatic scripting
-    "run_script",
-];
+pub const SERVER_ALL_TOOLS: &[&str] = SERVER_BUILTIN_TOOL_NAMES;
 
 impl DeploymentProfile {
     /// Standard server deployment with all built-in tools.
@@ -289,7 +242,7 @@ impl DeploymentProfile {
             match provider_cfg.kind {
                 ProviderKind::ServerBuiltin => {
                     let tool_names: Option<Vec<String>> = if provider_cfg.capabilities.is_empty() {
-                        None // empty → full category set
+                        None // empty -> provider default named inventory
                     } else {
                         let names: Vec<String> = provider_cfg
                             .capabilities
