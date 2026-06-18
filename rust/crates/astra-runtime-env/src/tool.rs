@@ -453,11 +453,21 @@ impl CapabilityResolver {
                 ));
             }
             RequiredWorkspace::ReadOnly if !capabilities.workspace.readable => {
+                if !capabilities.policy.filesystem_read {
+                    return Err(ToolUnavailableReason::PolicyDenied(
+                        "filesystem_read".to_string(),
+                    ));
+                }
                 return Err(ToolUnavailableReason::WorkspaceUnavailable(
                     "readable_workspace_required".to_string(),
                 ));
             }
             RequiredWorkspace::ReadWrite if !capabilities.workspace.writable => {
+                if !capabilities.policy.filesystem_write {
+                    return Err(ToolUnavailableReason::PolicyDenied(
+                        "filesystem_write".to_string(),
+                    ));
+                }
                 return Err(ToolUnavailableReason::WorkspaceUnavailable(
                     "writable_workspace_required".to_string(),
                 ));
@@ -899,9 +909,79 @@ mod tests {
                 &serde_json::json!({"action": "commit"}),
                 &binding.capabilities,
             ),
-            Err(ToolUnavailableReason::WorkspaceUnavailable(
-                "writable_workspace_required".to_string()
+            Err(ToolUnavailableReason::PolicyDenied(
+                "filesystem_write".to_string()
             ))
+        );
+
+        assert_eq!(
+            binding.tool_surface.denial_for("write_file"),
+            Some(&ToolUnavailableReason::PolicyDenied(
+                "filesystem_write".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn filesystem_policy_denials_are_reported_as_policy_denied() {
+        let registry = registry();
+        let mut no_access = PolicyIntent::local_developer();
+        no_access.filesystem = crate::FilesystemPolicy::NoAccess;
+        let binding = RunBinding::resolve(
+            WorkspaceBinding::cloud_workspace("/repo", WorkspaceAuthority::ReadWrite),
+            ExecutorBinding::orchestrator_managed("orchestrator:repo"),
+            RuntimeBinding::host_process("repo-runtime"),
+            no_access,
+            &registry,
+        );
+
+        assert_eq!(
+            binding.tool_surface.denial_for("read_file"),
+            Some(&ToolUnavailableReason::PolicyDenied(
+                "filesystem_read".to_string()
+            ))
+        );
+        assert_eq!(
+            CapabilityResolver.check_tool_call(
+                &registry,
+                "read_file",
+                &serde_json::json!({"path": "README.md"}),
+                &binding.capabilities,
+            ),
+            Err(ToolUnavailableReason::PolicyDenied(
+                "filesystem_read".to_string()
+            ))
+        );
+
+        let mut read_only_policy = PolicyIntent::local_developer();
+        read_only_policy.filesystem = crate::FilesystemPolicy::ReadOnlyWorkspace;
+        let binding = RunBinding::resolve(
+            WorkspaceBinding::cloud_workspace("/repo", WorkspaceAuthority::ReadWrite),
+            ExecutorBinding::orchestrator_managed("orchestrator:repo"),
+            RuntimeBinding::host_process("repo-runtime"),
+            read_only_policy,
+            &registry,
+        );
+
+        assert_eq!(
+            binding.tool_surface.denial_for("write_file"),
+            Some(&ToolUnavailableReason::PolicyDenied(
+                "filesystem_write".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn workspace_authority_denials_are_not_reported_as_policy_denied() {
+        let registry = registry();
+        let mut write_policy = PolicyIntent::local_developer();
+        write_policy.filesystem = crate::FilesystemPolicy::ReadWriteWorkspace;
+        let binding = RunBinding::resolve(
+            WorkspaceBinding::cloud_workspace("/repo", WorkspaceAuthority::ReadOnly),
+            ExecutorBinding::orchestrator_managed("orchestrator:repo"),
+            RuntimeBinding::host_process("repo-runtime"),
+            write_policy,
+            &registry,
         );
 
         assert_eq!(
@@ -1103,8 +1183,8 @@ mod tests {
                 &serde_json::json!({"action": "commit"}),
                 &binding.capabilities,
             ),
-            Err(ToolUnavailableReason::WorkspaceUnavailable(
-                "writable_workspace_required".to_string()
+            Err(ToolUnavailableReason::PolicyDenied(
+                "filesystem_write".to_string()
             ))
         );
         assert_eq!(

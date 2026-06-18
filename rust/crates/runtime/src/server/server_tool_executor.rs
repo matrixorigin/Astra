@@ -2969,7 +2969,7 @@ esac
 
         assert!(result.is_error, "{result:?}");
         assert!(
-            result.output.contains("writable_workspace_required")
+            result.output.contains("policy denied: filesystem_write")
                 && result.output.contains("no fallback was attempted"),
             "{}",
             result.output
