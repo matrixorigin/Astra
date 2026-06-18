@@ -82,7 +82,6 @@
 - [附录 A：术语表](#附录-a术语表)
 - [附录 B：参考文档](#附录-b参考文档)
 
-
 ## 一、执行摘要
 
 Astra 是一个**可编程的 AI Agent 执行运行时（Agentic Runtime）**。它解决的核心问题是：当 AI Agent 需要操作真实世界资源（文件系统、shell、网络、数据库、Git、第三方 API）时，如何保证**安全、可控、可审计、可复现**。
@@ -181,23 +180,44 @@ Astra:
 
 ### 3.1 核心命题：一个 Runtime，N 种形态
 
-CLI、Server、Web App 不是三个独立产品，而是**同一套 RuntimePipeline 的三种部署配置**。它们的差异仅在于：
+CLI、Server、Web App 不是三个独立产品，而是**同一份代码、同一条 RuntimePipeline**，差异只出现在**部署时的配置**（`DeploymentProfile`）：
 
-- **工具可选择性不同**——CLI 可调用本地 shell，Server 强制沙箱
-- **执行器目标不同**——CLI 直接操作本地文件，Server 操作远程 workspace
-- **安全边界不同**——CLI 受用户 OS 权限约束，Server 强制隔离
+- **隔离级别**：CLI 默认进程级（继承本地 OS 权限）；Server/Web 默认容器或微虚拟机沙箱
+- **Workspace 后端**：CLI = 当前目录；Server/Web = OpenShell 沙箱卷
+- **工具白名单**：CLI 可放行本地 shell；Server 强制策略代理
+- **存储位置**：Journal / Memory 落在本地磁盘 vs 远端 MO
 
-同一套 RuntimePipeline 代码路径覆盖所有场景——ExecutionPlan → TaskQueue → Executor → Observer 四阶段流水线，在 CLI、Server、Web App 中**完全一致**。不存在"CLI 架构"和"Server 架构"——只有一种架构，三种配置。
+ExecutionPlan → Executor → Observer 三阶段流水线，三种形态**走完全一致的代码路径**。不存在"CLI 架构"和"Server 架构"——只有一种架构，三种 `DeploymentProfile`。
+
+#### 调度边界：Astra 与编排平台的职责切分
+
+Astra 只产出**无状态的 binary**（`astra` 主进程 + resident agent 进程）。任务调度、并发控制、优先级队列、任务级重试与弹性伸缩**一律由编排平台声明式提供**，Astra 不内���任何调度器。下表划清两边各自负责什么，不含糊：
+
+| 能力                                   | Astra 进程内 | 编排平台（K8s Operator / docker-compose / CI runner） |
+| -------------------------------------- | ------------ | ----------------------------------------------------- |
+| 工具调用级超时 / 重试                  | ✅           | ❌                                                    |
+| 单次执行内的资源配额（CPU/内存/token） | ✅           | ❌                                                    |
+| Agent Loop、Skill 路由、策略检查、审计 | ✅           | ❌                                                    |
+| Pod / 容器生命周期管理                 | ❌           | ✅                                                    |
+| 多副本与 HPA 弹性伸缩                  | ❌           | ✅                                                    |
+| 任务级重试（Agent 失败重启）           | ❌           | ✅                                                    |
+| DAG 调度、优先级队列、并发上限         | ❌           | ✅                                                    |
+| 跨节点的任务路由 / 负载均衡            | ❌           | ✅                                                    |
+| 密钥 / Secret / ConfigMap 注入         | ❌           | ✅                                                    |
+
+> 一句话边界：**Astra 负责"一次工具调用怎么跑"，编排平台负责"几个 Astra 实例、什么时候重启、谁先跑"。**
 
 ```
 ┌───────────────────────────────────────────────────────────┐
 │                   Astra RuntimePipeline                    │
 │                                                           │
-│  ExecutionPlan ──► TaskQueue ──► Executor ──► Observer    │
-│       │                │            │            │        │
-│       ▼                ▼            ▼            ▼        │
-│  DeploymentProfile   Skill 池   策略路由    Journal/审计   │
+│  ExecutionPlan ──► Executor ──► Observer                  │
+│       │                │            │                      │
+│       ▼                ▼            ▼                      │
+│  DeploymentProfile   策略路由    Journal/审计               │
 │  (CLI | Server | Web)                                     │
+│                                                           │
+│  ※ 调度/并发/重试/弹性伸缩 → 部署侧 (K8s Operator 等)      │
 └───────────────────────────────────────────────────────────┘
           │                          │
     ┌─────┴──────┐            ┌──────┴──────┐
@@ -208,14 +228,15 @@ CLI、Server、Web App 不是三个独立产品，而是**同一套 RuntimePipel
 
 ### 3.2 RuntimePipeline：统一的执行引擎
 
-所有 Astra 请求——无论来自 CLI 终端、Web App 还是 API——都经过同一流水线的四个阶段：
+所有 Astra 请求——无论来自 CLI 终端、Web App 还是 API——都经过同一流水线的三个阶���：
 
 | 阶段              | 职责                           | 关键组件                               |
 | ----------------- | ------------------------------ | -------------------------------------- |
 | **ExecutionPlan** | 意图解析、任务分解、依赖分析   | Plan 引擎、Skill 路由、Context 注入    |
-| **TaskQueue**     | 任务调度、并发控制、优先级管理 | DAG 调度器、限流器、重试策略           |
 | **Executor**      | 策略驱动的多执行器路由         | Shell / Sandbox / API / Browser 执行器 |
 | **Observer**      | 结果验证、副作用追踪、审计记录 | 验证器链、Journal、回滚管理            |
+
+> 调度边界的完整定义见 §3.1 的"Astra 与编排平台职责切分表"——本节不再重复。
 
 关键不变量（所有形态共享）：
 
@@ -307,11 +328,6 @@ Provider 的激活/禁用由 `DeploymentProfile` 声明式控制，不需要修�
 
 ```
                       ┌──────────────┐
-                      │   Web App    │
-                      │ (Browser UI) │
-                      └──────┬───────┘
-                             │ WebSocket
-                      ┌──────┴───────┐
                       │  API Server  │
                       │  (axum)      │
                       └──────┬───────┘
@@ -319,8 +335,8 @@ Provider 的激活/禁用由 `DeploymentProfile` 声明式控制，不需要修�
                 ┌────────────┼────────────┐
                 │            │            │
           ┌─────┴─────┐ ┌───┴────┐ ┌─────┴─────┐
-          │   CLI     │ │ Server │ │ Scheduler │
-          │ (本地 PTY) │ │ (远程)  │ │ (异步任务) │
+          │   CLI     │ │ Server │ │  Web App  │
+          │ (本地 PTY) │ │ (远程)  │ │ (Browser) │
           └─────┬─────┘ └───┬────┘ └─────┬─────┘
                 │            │            │
                 └────────────┼────────────┘
@@ -408,14 +424,35 @@ trait WorkspaceProvider {
 
 ## 五、部署形态
 
-三种部署形态共享第三章描述的全部架构——同一个 RuntimePipeline、同一套 Skill 系统、同一套记忆模型。差异仅限于 `DeploymentProfile` 配置。
+### 5.0 核心原则：一个 Binary，N 个 Profile
+
+Astra 仓库只产出**一个可执行文件** `astra`。CLI / Server / Web 不是三个产品，也不是三份代码——它们是同一个 binary 在启动时读取不同的 `DeploymentProfile`：
+
+```
+                         ┌─────────────────────┐
+                         │   astra (单一 binary) │
+                         │                     │
+   ASTRA_DEPLOYMENT_PROFILE=cli   ──►  进程级隔离 + 本地目录
+   ASTRA_DEPLOYMENT_PROFILE=server ──►  沙箱隔离 + 远端存储 + 多租户
+   ASTRA_DEPLOYMENT_PROFILE=web    ──►  纯前端静态资源（托管在 Server 侧）
+                         │                     │
+                         │  同一条 RuntimePipeline
+                         │  同一套 Skill / 记忆 / 审计
+                         └─────────────────────┘
+```
+
+- **代码路径完全一致**：ExecutionPlan → Executor → Observer，无论 profile 如何，走的是同一份函数。
+- **差异只在启动配置**：隔离级别、Workspace 后端、工具白名单、存储位置、是否多租户——全部由环境变量 / 配置文件在进程启动时决定。
+- **不存在"CLI 架构 / Server 架构"**：仓库里没有 `astra-cli` 和 `astra-server` 两个 crate，只有一个 `astra` + 一张 profile 表。
+
+> **与编排平台的关系**：`astra` binary 是无状态的、可被任意重启的进程。它**不知道**自己跑在第几个副本上、不知道 HPA、不知道负载均衡——这些都是 K8s Operator / docker-compose / CI runner 的职责（见 §3.1 职责切分表）。Web profile 甚至不单独部署：它的静态资源由 Server profile 的进程一并托管。
 
 ### 5.1 Server（团队云）
 
 **定位**：团队共享的持久化 Agent 服务
 
 ```
-用户 ──► Web App / API ──► Astra Server ──► Sandbox Executor
+用户 ──► Web App / API ──► Astra (同一 Executor，策略=沙箱) ──► OpenShell Workspace
                               │
                               ├── Journal (远端 MO DB)
                               ├── Memory (远端 MO DB)
@@ -431,7 +468,7 @@ trait WorkspaceProvider {
 **定位**：个人开发者的本地 Agent
 
 ```
-用户 ──► Terminal (PTY) ──► Astra CLI ──► Shell Executor (本地)
+用户 ──► Terminal (PTY) ──► Astra (同一 Executor，策略=本地) ──► 当前目录 Workspace
                               │
                               ├── Journal (本地 MO DB)
                               ├── Memory (本地 MO DB)
@@ -444,14 +481,14 @@ trait WorkspaceProvider {
 
 ### 5.3 Web App（浏览器）
 
-**定位**：轻量级入口，通过 WebSocket 连接 Server
+**定位**：Server 形态的瘦客户端前端入口——浏览器里不跑 RuntimePipeline，只做 UI 和 WebSocket 传输
 
 ```
-浏览器 ──► Web App (React) ──► WebSocket ──► Astra Server
+浏览器 ──► Web App (React, 纯前端) ──► WebSocket ──► Astra (DeploymentProfile=server)
 ```
 
 - 无需安装，浏览器即用
-- 所有执行经 Server 代理——与 Server 共用完全相同的 RuntimePipeline
+- **没有独立的"Web App Runtime"**——浏览器侧只有 React UI，所有执行落到同一个 `astra` binary（以 Server profile 运行）
 - 适合演示、协作评审、轻量任务
 
 ### 5.4 三种形态配置对比
@@ -468,6 +505,8 @@ trait WorkspaceProvider {
 | **安装方式**        | brew / cargo | docker / k8s   | 浏览器打开                  |
 
 **核心结论**：不存在"CLI 架构"和"Server 架构"——只有一种架构（统一 RuntimePipeline），三种配置（DeploymentProfile）。
+
+```
 ┌──────────────────────────────────────────────────────────────┐
 │ Astra Runtime (统一核心) │
 │ │
@@ -492,9 +531,25 @@ trait WorkspaceProvider {
 
 这不是三个产品，而是**同一个 Runtime 的三种部署配置**。当你从 CLI 切换到 Server，改变的不是 Runtime 本身，而是 DeploymentProfile 的几个参数。
 
+### 5.5 理想部署形态选择指南
+
+不同场景下应优先选哪种形态，以及编排平台如何承接它：
+
+| 场景                               | 理想形态                    | 编排平台建议                                  |
+| ---------------------------------- | --------------------------- | --------------------------------------------- |
+| 个人本地开发、调试、快速脚本       | **CLI**                     | 无需编排；可选 systemd / launchd 常驻         |
+| 团队共享、多租户、跨成员记忆积累   | **Server**                  | K8s Deployment + HPA；MO 持久卷               |
+| 浏览器即用、评审协作、轻量演示     | **Web App → Server**        | 复用 Server 部署，Web 只是瘦客户端前端入口    |
+| CI/CD 自动修复、批量任务           | **Server**（无头）          | K8s Job / Argo Workflow 编排；Astra 作为 step |
+| 高安全合规、强隔离、不可信代码执行 | **Server + gVisor/microVM** | K8s + Kata/gVisor runtimeClass；NetworkPolicy |
+| 边缘 / 离线环境                    | **CLI** 或单容器 Server     | docker-compose restart 策略                   |
+
+> Web App 永远经 Server 代理执行，不存在"纯前端执行"——它只是 Server 的一个瘦客户端入口，走完全相同的 RuntimePipeline。
+
 ## 六、架构总览
 
 ### 6.1 三层架构
+
 Astra 的架构模型从内到外分为三层：
 
 ```
@@ -559,6 +614,7 @@ Astra 的架构模型从内到外分为三层：
 ```
 
 ### 6.2 执行器模型
+
 Astra 采用**策略驱动的多执行器路由**——每个工具调用根据风险等级和部署配置自动路由到合适的执行器：
 
 ```
@@ -593,9 +649,10 @@ Astra 采用**策略驱动的多执行器路由**——每个工具调用根据�
 │ OpenShellExecutor OpenShell 管理, 策略增强 │
 └──────────────────────────────────────────────────┘
 
-````
+```
 
 ### 6.3 能力提供者模型
+
 工具不是平台硬编码的。每个工具都作为**能力提供者（Capability Provider）**注册：
 
 ```yaml
@@ -623,7 +680,7 @@ Astra 采用**策略驱动的多执行器路由**——每个工具调用根据�
   网络访问: 是 (数据库连接)
   优先级: 1
   存储访问: matrixone:// ...
-````
+```
 
 **运行时解析**：
 
@@ -634,6 +691,7 @@ Astra 采用**策略驱动的多执行器路由**——每个工具调用根据�
 5. 执行、收集证据、返回结果
 
 ### 6.4 部署架构
+
 ```
                           ┌────────────────────┐
                           │   负载均衡 / 反向代理  │
@@ -663,16 +721,19 @@ Astra 采用**策略驱动的多执行器路由**——每个工具调用根据�
               └────────────┘  └───────────┘  └────────────┘
 ```
 
-- **Astra Node**：无状态，可水平扩展
+- **Astra Node**：无状态，可水平扩展——本身不感知副本数量
 - **Memoria**：Agent 记忆服务（语义/情景/程序记忆）
 - **MatrixOne**：平台状态数据库（用户、会话、事件、审计）
 - **UserVolume**：用户持久化文件存储（workspace、缓存、构建产物）
+
+> **拓扑边界**：上图的负载均衡器、多副本、HPA、PVC、Secret 全部由**编排平台**（K8s Operator / Helm chart / docker-compose）声明式提供，**不在 Astra binary 内**。这张图展示的是"Server 形态在 K8s 上的理想部署样貌"，而非 Astra 进程内置的能力。Operator 负责：把上面的 Deployment/Service/HPP/Ingress 渲染出来、滚动升级、故障重启；Astra 只负责被部署后在每个 Pod 内独立运行 Agent Loop。
 
 ---
 
 ## 七、安全模型
 
 ### 7.1 纵深防御
+
 Astra 采用三层纵深防御，每一层独立生效：
 
 ```
@@ -696,6 +757,7 @@ Astra 采用三层纵深防御，每一层独立生效：
 ```
 
 ### 7.2 隔离级别矩阵
+
 | 隔离级别      | 技术           | 文件系统     | 网络            | 系统调用      | 适用场景                     |
 | ------------- | -------------- | ------------ | --------------- | ------------- | ---------------------------- |
 | **None**      | 当前进程       | 共享         | 共享            | 共享          | 记忆读写、会话配置、任务状态 |
@@ -707,6 +769,7 @@ Astra 采用三层纵深防御，每一层独立生效：
 > \*CLI 模式下边车为独立子进程，无独立网络命名空间（macOS 限制），但通过网络隧道策略实现等效控制。
 
 ### 7.3 策略模型
+
 ```yaml
 # 策略定义示例
 policy:
@@ -747,6 +810,7 @@ policy:
 ```
 
 ### 7.4 证据链与不可否认性
+
 每次工具调用生成结构化证据（RuntimeEvidence），包含：
 
 ```yaml
@@ -785,6 +849,7 @@ evidence:
 ## 八、能力维度
 
 ### 8.1 工具能力全景
+
 | 功能域       | 工具                                                                            | Server    | CLI       | Web        | 说明                                          |
 | ------------ | ------------------------------------------------------------------------------- | --------- | --------- | ---------- | --------------------------------------------- |
 | **文件操作** | read_file, write_file, str_replace, glob, list_dir                              | ✅        | ✅        | ✅         | 支持精确行替换、glob 模式搜索、大文件分段读取 |
@@ -804,6 +869,7 @@ evidence:
 | **认证**     | —                                                                               | SSO/OAuth | API Key   | 匿名/OAuth | 多认证后端                                    |
 
 ### 8.2 记忆系统
+
 Astra 的记忆系统让 Agent 能够**跨 Session 学习**：
 
 ```
@@ -833,6 +899,7 @@ Astra 的记忆系统让 Agent 能够**跨 Session 学习**：
 - **Session 启动预热**：新 Session 自动加载相关记忆
 
 ### 8.3 多 Agent 编排
+
 Astra 支持复杂的多 Agent 协作模式：
 
 | 模式                | 描述                                   | 适用场景                               |
@@ -846,6 +913,7 @@ Astra 支持复杂的多 Agent 协作模式：
 **审查门控**：所有 Agent 产出可选经过另一个 Agent 审查后才交付给用户。
 
 ### 8.4 持续学习与自我进化
+
 Astra 平台本身也是一个 Agent——它监控自身运行并自动优化：
 
 ```
@@ -864,6 +932,7 @@ LLM 诊断: 为什么不完美？
 ```
 
 ### 8.5 上下文工程
+
 Astra 的上下文工程保证 Agent 始终在正确的上下文中工作：
 
 | 能力               | 描述                                                 |
@@ -879,6 +948,7 @@ Astra 的上下文工程保证 Agent 始终在正确的上下文中工作：
 ## 九、用户旅程
 
 ### 9.1 旅程 A：团队代码迁移（Server）
+
 **角色**：Tech Lead 张伟，带领 8 人后端团队  
 **任务**：将旧 Java 服务迁移到 Rust，约 50,000 行代码  
 **时间线**：2 周
@@ -958,6 +1028,7 @@ Day 14 — 完成
 ```
 
 ### 9.2 旅程 B：个人日常开发（CLI）
+
 **角色**：全栈开发者陈静，自由职业者  
 **场景**：维护 3 个客户项目，每天使用 Astra CLI 提升效率
 
@@ -1020,6 +1091,7 @@ Day 14 — 完成
 ```
 
 ### 9.3 旅程 C：数据工程师快速原型（Web App）
+
 **角色**：数据分析师王芳，不写生产代码，日常处理数据  
 **场景**：用 Astra Web App 快速完成任务
 
@@ -1073,6 +1145,7 @@ Day 14 — 完成
 ```
 
 ### 9.4 旅程 D：CI/CD 智能修复（Server + GitHub Integration）
+
 **角色**：DevOps 工程师 David  
 **场景**：CI 流水线集成 Astra 自动修复
 
@@ -1117,7 +1190,8 @@ Day 14 — 完成
 OpenShell 是一个企业级 AI Agent 安全平台，提供策略管理、沙箱编排、审计网关等能力。Astra 与 OpenShell 的集成不是"选 OpenShell 还是 gVisor"，而是在不同架构层上组合使用。
 
 ### 10.1 分层看 OpenShell
-回顾 Astra 的执行架构分层：
+
+回顾 Astra 的执行架构分层（注意：这里的"执行面"指**单个 Astra 进程内**的沙箱热池与单次隔离，不是集群级编排——后者属于编排平台，见 §3.1）：
 
 ```
 控制面  ─ 策略引擎 ─ Astra 自己的策略系统
@@ -1125,8 +1199,8 @@ OpenShell 是一个企业级 AI Agent 安全平台，提供策略管理、沙箱
         ─ 执行路由
         ─ Session 管理
         ──  ──  ──  ──  ──  ──  ──  ──  ──
-执行面  ─ Sandbox Manager ─ 管理沙箱生命周期
-        ─ Launch Driver  ─ 创建/销毁容器
+执行面  ─ Sandbox Manager ─ 管理本进程的沙箱热池生命周期
+        ─ Launch Driver  ─ 创建/销毁单个沙箱容器/微VM
         ─ Isolation Backend ─ 隔离边界 (gVisor/runc/MicroVM)
         ──  ──  ──  ──  ──  ──  ──  ──  ──
 数据面  ─ 审计证据 ─ 工具调用记录与证据链
@@ -1134,15 +1208,16 @@ OpenShell 是一个企业级 AI Agent 安全平台，提供策略管理、沙箱
 
 OpenShell 在不同集成模式下占据**不同层**：
 
-| 层                | Astra 原生                | OpenShell 替代                              |
-| ----------------- | ------------------------- | ------------------------------------------- |
-| 策略引擎          | ✅ 自有                   | ✅ OpenShell Policy Gateway（更强）         |
+| 层                | Astra 原生                              | OpenShell 替代                              |
+| ----------------- | --------------------------------------- | ------------------------------------------- |
+| 策略引擎          | ✅ 自有                                 | ✅ OpenShell Policy Gateway（更强）         |
 | Sandbox Manager   | ✅ 自有（orchestrator/runtime adapter） | ✅ OpenShell Gateway                        |
-| Launch Driver     | ✅ Docker/containerd      | ✅ OpenShell Gateway（封装）                |
-| Isolation Backend | ✅ gVisor/runc 直接调用   | ✅ OpenShell 内部选择（gVisor/MXC/MicroVM） |
-| 审计证据          | ✅ 自有收集               | ✅ OpenShell 审计 + Astra 互补              |
+| Launch Driver     | ✅ Docker/containerd                    | ✅ OpenShell Gateway（封装）                |
+| Isolation Backend | ✅ gVisor/runc 直接调用                 | ✅ OpenShell 内部选择（gVisor/MXC/MicroVM） |
+| 审计证据          | ✅ 自有收集                             | ✅ OpenShell 审计 + Astra 互补              |
 
 ### 10.2 集成模式一：OpenShell 作为 Sandbox Manager（推荐）
+
 **OpenShell 替换执行面的 Sandbox Manager + Launch Driver 层。**
 
 ```
@@ -1194,6 +1269,7 @@ OpenShell 在不同集成模式下占据**不同层**：
 - OpenShell 的审计和 Astra 的证据链需要关联
 
 ### 10.3 集成模式二：Astra 原生 + OpenShell 策略增强
+
 **Astra 保留执行面的控制权，但策略层对接 OpenShell Policy Gateway。**
 
 ```
@@ -1232,6 +1308,7 @@ OpenShell 在不同集成模式下占据**不同层**：
 - Astra 执行面完全自主，延迟更低
 
 ### 10.4 集成模式三：Astra 原生 + OpenShell 审计聚合
+
 **Astra 使用自己的全部栈，但把审计事件发送到 OpenShell 做聚合分析。**
 
 ```
@@ -1262,6 +1339,7 @@ OpenShell 在不同集成模式下占据**不同层**：
 - 审计在 OpenShell 集中分析，异常检测能力更强
 
 ### 10.5 集成模式四：混合模式（未来）
+
 **长期来看，Astra 和 OpenShell 的关系是分层协作，而不是二选一**：
 
 ```
@@ -1297,6 +1375,7 @@ OpenShell 在不同集成模式下占据**不同层**：
 ```
 
 ### 10.6 集成模式选择指南
+
 | 场景                    | 推荐模式                  | 理由                                           |
 | ----------------------- | ------------------------- | ---------------------------------------------- |
 | 初创团队，快速开始      | 模式三（仅审计聚合）      | 最小成本，Astra 自包含                         |
@@ -1311,6 +1390,7 @@ OpenShell 在不同集成模式下占据**不同层**：
 ## 十一、运维部署
 
 ### 11.1 Day 0：规划与准备
+
 **硬件要求**（单节点）：
 
 | 规模                      | CPU                             | 内存     | 磁盘        | 网络     |
@@ -1346,6 +1426,7 @@ OpenShell 在不同集成模式下占据**不同层**：
 ```
 
 ### 11.2 Day 1：部署
+
 **方式 A：Docker Compose（单机，推荐中小团队）**
 
 ```yaml
@@ -1495,8 +1576,10 @@ spec:
           averageUtilization: 80
 ```
 
+> **边界说明**：上面这份 `Deployment/Service/HPA` 清单**不是 Astra 仓库里的代码**，而是**编排平台侧**（K8s Operator / Helm chart）渲染出的目标态样例。Astra binary 只跑在 `containers[*].image` 指向的镜像里；副本数、HPA 阈值、PVC、Secret 全部由 Operator 声明、K8s 控制器执行。Astra 进程不感知这些字段的存在。
+
 ```bash
-# 部署
+# 部署（编排平台侧操作）
 kubectl apply -f k8s/
 
 # 验证
@@ -1505,6 +1588,7 @@ kubectl get hpa astra-server-hpa
 ```
 
 ### 11.3 Day 2：运维
+
 **监控看板**（Prometheus + Grafana）：
 
 | 指标                                    | 类型      | 告警阈值       |
@@ -1579,6 +1663,7 @@ curl -X POST https://astra.internal/admin/sessions/cleanup \
 ```
 
 ### 11.4 配置管理
+
 **多环境配置策略**：
 
 ```bash
@@ -1623,6 +1708,7 @@ export ASTRA_AUDIT_RETENTION_DAYS=90
 ## 十二、性能与可扩展性
 
 ### 12.1 延迟分析
+
 ```
 典型工具调用链路延迟分解 (Server 模式):
 
@@ -1647,21 +1733,24 @@ export ASTRA_AUDIT_RETENTION_DAYS=90
 | MicroVM (Firecracker) | < 5s    | < 200ms          |
 
 ### 12.2 扩展性
-**水平扩展**：
+
+**水平扩展（由编排平台负责）**：
 
 ```
-Astra Node 是无状态的 → 直接加节点
+Astra Node 是无状态的 → 编排平台直接加副本，Astra 自身不感知
 
-负载均衡策略:
+负载均衡策略（由部署侧的反向代理 / Ingress 实施）:
   · Session 粘性: 同一 Session 路由到同一 Node (WebSocket 连接)
   · 新 Session: 轮询到最空闲的 Node
   · 工具调用: 通过 Session 所在 Node 执行
 
-K8s HPA 自动扩缩:
+K8s HPA 自动扩缩（Operator 声明，Astra 不参与决策）:
   · CPU > 70% → 加 2 个 Pod
   · CPU < 30% → 减 1 个 Pod
   · 最小 3 Pod，最大 20 Pod
 ```
+
+> **边界**：Astra Node 本身不扩缩自己——它只是被 HPA 控制器增删的无状态进程。扩缩决策、负载均衡、Session 路由全部发生在 Astra binary 之外（Ingress / Service Mesh / Operator）。Astra 唯一与扩展性相关的内置行为是：单进程内的工具调用并发上限和沙箱池大小（属于执行面资源治理，不是集群调度）。
 
 **多租户隔离**：
 
@@ -1690,6 +1779,7 @@ K8s HPA 自动扩缩:
 - 资源配额按租户设置
 
 ### 12.3 可用性
+
 | 组件          | 可用性策略              | 目标       |
 | ------------- | ----------------------- | ---------- |
 | Astra Node    | 多副本 + HPA            | 99.9%      |
@@ -1703,6 +1793,7 @@ K8s HPA 自动扩缩:
 ## 十三、竞品定位
 
 ### 13.1 市场地图
+
 ```
               隔离能力
                 ▲
@@ -1723,6 +1814,7 @@ K8s HPA 自动扩缩:
 ```
 
 ### 13.2 差异化
+
 | 维度           | Claude Code / Cursor  | E2B / Daytona | Astra                                |
 | -------------- | --------------------- | ------------- | ------------------------------------ |
 | **定位**       | AI 编程助手           | 远程代码沙箱  | Agent 执行运行时                     |
@@ -1737,6 +1829,7 @@ K8s HPA 自动扩缩:
 | **CI/CD 集成** | 间接                  | 间接          | 原生 Webhook + 自动修复              |
 
 ### 13.3 一句话定位
+
 > **Astra 不是在和 Claude Code 竞争，Astra 是在构建让 Claude Code 类应用可以安全部署到生产环境的基础设施。** 就像 Kubernetes 不是在和你的本地 Docker 竞争——它解决的是不同层次的问题。
 
 ---
