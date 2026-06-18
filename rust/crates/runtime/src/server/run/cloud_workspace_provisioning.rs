@@ -319,16 +319,39 @@ impl CloudWorkspaceStorage for FilesystemCloudWorkspaceStorage {
     ) -> Result<PathBuf, WorkspaceProvisionError> {
         let base = self.canonical_base()?;
         let clone_path = self.path_under_base(&base, "clones", workspace_id)?;
-        if clone_path.exists() {
-            return Err(WorkspaceProvisionError::unavailable(
+        // Use atomic directory creation instead of exists()+copy to prevent
+        // TOCTOU races when two provisioner calls target the same workspace.
+        fs::create_dir_all(clone_path.parent().unwrap_or(&clone_path)).map_err(|error| {
+            WorkspaceProvisionError::unavailable(
                 workspace_id,
                 format!(
-                    "session clone workspace '{}' already exists",
+                    "failed to create session clone workspace parent '{}': {error}",
                     clone_path.display()
                 ),
-            ));
-        }
+            )
+        })?;
+        fs::create_dir(&clone_path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                WorkspaceProvisionError::unavailable(
+                    workspace_id,
+                    format!(
+                        "session clone workspace '{}' already exists",
+                        clone_path.display()
+                    ),
+                )
+            } else {
+                WorkspaceProvisionError::unavailable(
+                    workspace_id,
+                    format!(
+                        "failed to create session clone workspace '{}': {error}",
+                        clone_path.display()
+                    ),
+                )
+            }
+        })?;
         copy_dir_recursive(source_root, &clone_path).map_err(|error| {
+            // Clean up partial clone to avoid orphan directories.
+            let _ = fs::remove_dir_all(&clone_path);
             WorkspaceProvisionError::unavailable(
                 workspace_id,
                 format!(

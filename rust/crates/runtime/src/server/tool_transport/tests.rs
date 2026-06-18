@@ -1116,7 +1116,7 @@ fn orchestrator_managed_unknown_status_hides_project_tools_until_runtime_ready()
 }
 
 #[test]
-fn orchestrator_managed_online_without_runtime_hides_project_tools() {
+fn orchestrator_managed_online_derives_provider_runtime_capabilities() {
     let registry = astra_runtime_env::ToolRegistry::builtins();
     let request = request(
         "read_file",
@@ -1134,11 +1134,13 @@ fn orchestrator_managed_online_without_runtime_hides_project_tools() {
 
     assert_eq!(
         binding.runtime.session_manager,
-        astra_runtime_env::RuntimeSessionManager::None
+        astra_runtime_env::RuntimeSessionManager::ProviderManaged,
+        "online orchestrator-managed executor derives ProviderManaged session"
     );
     assert_eq!(
         binding.runtime.isolation_backend,
-        astra_runtime_env::RuntimeIsolationBackend::None
+        astra_runtime_env::RuntimeIsolationBackend::ProviderManaged,
+        "online orchestrator-managed executor derives ProviderManaged isolation"
     );
     for tool in [
         "read_file",
@@ -1155,34 +1157,14 @@ fn orchestrator_managed_online_without_runtime_hides_project_tools() {
         "lsp",
     ] {
         assert!(
-            !binding.tool_surface.contains(tool),
-            "{tool} must stay hidden without a ready runtime"
-        );
-        assert!(
-            binding.tool_surface.denial_for(tool).is_some(),
-            "{tool} must carry an explicit denial reason"
+            binding.tool_surface.contains(tool),
+            "{tool} must be available with ProviderManaged runtime"
         );
     }
-    assert_eq!(
-        binding.tool_surface.denial_for("read_file"),
-        Some(
-            &astra_runtime_env::ToolUnavailableReason::RuntimeCapabilityMissing(
-                "process".to_string()
-            )
-        )
-    );
-    assert_eq!(
-        binding.tool_surface.denial_for("bash"),
-        Some(
-            &astra_runtime_env::ToolUnavailableReason::RuntimeCapabilityMissing(
-                "process".to_string()
-            )
-        )
-    );
 }
 
 #[tokio::test]
-async fn orchestrator_managed_without_runtime_blocks_stale_project_tool_call() {
+async fn orchestrator_managed_without_transport_returns_transport_unavailable() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
     let result = service
@@ -1209,17 +1191,19 @@ async fn orchestrator_managed_without_runtime_blocks_stale_project_tool_call() {
     assert_eq!(
         local.calls(),
         0,
-        "stale project calls must not fall back locally"
+        "orchestrator-managed calls must not fall back locally"
     );
-    let metadata = result.metadata.expect("capability metadata");
-    assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_CAPABILITY_DENIED);
-    assert_eq!(metadata["reason"], TOOL_ERROR_KIND_CAPABILITY_DENIED);
+    let metadata = result.metadata.expect("transport metadata");
+    assert_eq!(metadata["error_kind"], "transport_unavailable");
+    assert_eq!(metadata["reason"], "transport_unavailable");
     assert_eq!(metadata["blocked"], true);
     assert_eq!(metadata["execution_started"], false);
-    assert_eq!(metadata["runtime_error"]["kind"], "capability_denied");
-    assert_eq!(
-        metadata["runtime_error"]["message"],
-        "tool 'bash' is denied by this run binding: runtime capability is missing: process"
+    assert_eq!(metadata["runtime_error"]["kind"], "transport_unavailable");
+    assert!(
+        metadata["runtime_error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("sandbox resident agent transport adapter unavailable")
     );
 }
 
@@ -1775,7 +1759,7 @@ async fn orchestrator_managed_executes_through_sandbox_resident_agent_transport(
         .await;
 
     assert!(!result.is_error, "{result:?}");
-    assert_eq!(result.output, "resident-result");
+    assert_eq!(result.output, "resident-agent-result");
     assert_eq!(local.calls(), 0);
     assert_eq!(resident.calls(), 1);
     let metadata = result.metadata.expect("resident metadata");

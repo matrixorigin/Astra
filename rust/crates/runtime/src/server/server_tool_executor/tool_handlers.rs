@@ -288,8 +288,14 @@ impl ToolHandler<ServerToolExecutor> for AskUserToolHandler {
         &self,
         context: &ServerToolExecutor,
         args: &Value,
-        _cancel_token: Option<&CancellationToken>,
+        cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        // P2-C: 重型 handler 入口处合作式取消检查
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::ToolResult::error(
+                "Ask user not executed: run was cancelled".to_string(),
+            );
+        }
         context.server_ask_user(args).await
     }
 }
@@ -395,8 +401,14 @@ impl ToolHandler<ServerToolExecutor> for WriteFileToolHandler {
         &self,
         context: &ServerToolExecutor,
         args: &Value,
-        _cancel_token: Option<&CancellationToken>,
+        cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        // P2-C: 重型 handler 入口处合作式取消检查
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::ToolResult::error(
+                "Write file not executed: run was cancelled".to_string(),
+            );
+        }
         let turn_index = context.journal_turn_index.load(Ordering::Relaxed);
         if args
             .get("delete")
@@ -429,8 +441,14 @@ impl ToolHandler<ServerToolExecutor> for StrReplaceToolHandler {
         &self,
         context: &ServerToolExecutor,
         args: &Value,
-        _cancel_token: Option<&CancellationToken>,
+        cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        // P2-C: 重型 handler 入口处合作式取消检查
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::ToolResult::error(
+                "Str replace not executed: run was cancelled".to_string(),
+            );
+        }
         let args = match astra_tools::fs_ops::normalize_str_replace_args(args) {
             Ok(args) => args,
             Err(error) => return tool_result_from_output(error),
@@ -648,8 +666,14 @@ impl ToolHandler<ServerToolExecutor> for PublishArtifactToolHandler {
         &self,
         context: &ServerToolExecutor,
         args: &Value,
-        _cancel_token: Option<&CancellationToken>,
+        cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        // P2-C: 重型 handler 入口处合作式取消检查
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::ToolResult::error(
+                "Publish artifact not executed: run was cancelled".to_string(),
+            );
+        }
         execute_publish_artifact(
             args,
             context.workspace_artifact_store.as_ref(),
@@ -693,8 +717,15 @@ impl DynamicToolHandler<ServerToolExecutor> for McpToolHandler {
         name: &str,
         context: &ServerToolExecutor,
         args: &Value,
-        _cancel_token: Option<&CancellationToken>,
+        cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        // P2-C: 重型 handler 入口处合作式取消检查
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::ToolResult::error(format!(
+                "MCP tool '{}' not executed: run was cancelled",
+                name
+            ));
+        }
         context.execute_mcp_tool(name, args).await
     }
 }
