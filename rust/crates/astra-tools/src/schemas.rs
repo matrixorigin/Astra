@@ -179,14 +179,14 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read file contents. Use start_line/end_line for large files. Set outline=true for function/class signatures only.",
+                "description": "Read file contents. Use exact fields only: path, start_line, end_line, outline. Do not use limit/offset/length. For the first N lines, use start_line=1 and end_line=N. For a range, start_line must be <= end_line. Set outline=true for function/class signatures only.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
-                        "start_line": {"type": "integer", "minimum": 1, "description": "First line to read (1-based)"},
-                        "end_line": {"type": "integer", "minimum": 1, "description": "Last line to read (inclusive)"},
+                        "start_line": {"type": "integer", "minimum": 1, "description": "First line to read (1-based). Must be <= end_line when end_line is provided."},
+                        "end_line": {"type": "integer", "minimum": 1, "description": "Last line to read (inclusive). Use this instead of limit/count."},
                         "outline": {"type": "boolean", "description": "Return only function/class/struct signatures with line numbers"}
                     },
                     "required": ["path"]
@@ -2025,6 +2025,51 @@ mod tests {
             !names.contains(&"run_script"),
             "run_script requires Unix domain sockets — must not appear on other platforms"
         );
+    }
+
+    #[test]
+    fn read_file_schema_exposes_only_line_range_contract() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let read_file = find_schema(&schemas, "read_file").expect("read_file schema must exist");
+        let func = read_file
+            .get("function")
+            .expect("read_file schema must include function block");
+        let desc = func
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            desc.contains("Do not use limit/offset/length")
+                && desc.contains("start_line=1")
+                && desc.contains("end_line=N"),
+            "read_file description must advertise the current line-range contract: {desc}"
+        );
+
+        let params = func
+            .get("parameters")
+            .expect("read_file schema must include parameters");
+        assert_eq!(
+            params.get("additionalProperties").and_then(Value::as_bool),
+            Some(false),
+            "read_file should reject unknown top-level fields"
+        );
+
+        let properties = params
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("read_file schema properties must be an object");
+        for name in ["path", "start_line", "end_line", "outline"] {
+            assert!(
+                properties.contains_key(name),
+                "read_file schema should expose `{name}`"
+            );
+        }
+        for legacy in ["offset", "limit", "length", "count"] {
+            assert!(
+                !properties.contains_key(legacy),
+                "read_file schema must not expose legacy/count field `{legacy}`"
+            );
+        }
     }
 
     #[test]

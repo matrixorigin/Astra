@@ -3419,9 +3419,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         } else {
             denied_output.unwrap_or_else(|| "Permission denied".to_string())
         };
-        let status = if !allowed {
-            "error"
-        } else if tool_execution_marked_error {
+        let status = if !allowed || tool_execution_marked_error {
             "error"
         } else {
             cloud_tool_result_status_label(&output)

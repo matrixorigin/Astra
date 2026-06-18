@@ -3296,6 +3296,7 @@ type Handler interface {
 
         assert!(result.contains("unknown field `file`"), "{result}");
         assert!(result.contains("Valid fields: path"), "{result}");
+        assert!(result.contains("Use `path` for the file path"), "{result}");
         assert!(
             !result.contains("missing 'path'"),
             "unknown-field contract should fire before legacy missing-path text: {result}"

@@ -24,12 +24,12 @@ const MAX_CACHED_FILE_BYTES: usize = 256 * 1024;
 const MAX_TOTAL_CACHED_BYTES: usize = 8 * 1024 * 1024;
 
 /// Shape of the last `read_file` call, for consecutive-request dedup (same
-/// offset+limit + unchanged mtime → stub before I/O).
+/// line range + unchanged mtime → stub before I/O).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReadDedupKey {
     Full,
     Outline,
-    /// Raw `start_line` / `end_line` JSON (absent key = `None`), like Claude's offset/limit.
+    /// Raw `start_line` / `end_line` JSON (absent key = `None`).
     Range {
         start_line: Option<u64>,
         end_line: Option<u64>,
@@ -345,7 +345,7 @@ impl ToolExecutor {
     }
 
     /// Identical partial read (outline or same raw line range) with unchanged
-    /// mtime — stub **before** disk read for the same offset/limit as a prior
+    /// mtime — stub **before** disk read for the same line range as a prior
     /// read. Dedup is mtime-scoped (not turn-scoped): the prior read's
     /// tool_result remains in the model's prompt across turn boundaries until
     /// compaction, which calls `clear_file_state` to invalidate dedup state.

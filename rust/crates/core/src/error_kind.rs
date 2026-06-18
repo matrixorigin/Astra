@@ -915,7 +915,7 @@ mod tests {
                 ErrorKind::ToolInvalidArgs,
             ),
             (
-                "Error: unknown field `offset` for read_file. Valid fields: path, start_line, end_line, outline.",
+                "Error: unknown field `offset` for read_file. Valid fields: path, start_line, end_line, outline. Required: path. `read_file` uses line numbers, not byte offsets; use `start_line`.",
                 ErrorKind::ToolInvalidArgs,
             ),
             (

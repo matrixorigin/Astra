@@ -171,11 +171,9 @@ pub fn is_rm_catastrophic_rm_path(lower: &str) -> bool {
 }
 
 fn normalize_rm_target_token(token: &str) -> &str {
-    let token = token.trim_matches(|ch: char| matches!(ch, '"' | '\'' | '(' | ')' | ','));
-    let end = token
-        .find(|ch: char| matches!(ch, ';' | '&' | '|'))
-        .unwrap_or(token.len());
-    token[..end].trim_matches(|ch: char| matches!(ch, '"' | '\'' | '(' | ')' | ',' | ';'))
+    let token = token.trim_matches(['"', '\'', '(', ')', ',']);
+    let end = token.find([';', '&', '|']).unwrap_or(token.len());
+    token[..end].trim_matches(['"', '\'', '(', ')', ',', ';'])
 }
 
 /// Find a word that appears standalone (not part of a larger word).
@@ -419,7 +417,7 @@ fn destructive_command(lower: &str) -> Option<&'static str> {
 }
 
 fn credential_access_target(lower: &str) -> Option<String> {
-    for fragment in lower.split(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '|' | '&')) {
+    for fragment in lower.split(|ch: char| ch.is_whitespace() || [';', '|', '&'].contains(&ch)) {
         let token = normalize_shell_token(fragment);
         if token.is_empty() {
             continue;
@@ -473,7 +471,7 @@ fn is_sensitive_dotenv_name(name: &str) -> bool {
 }
 
 fn normalize_shell_token(token: &str) -> &str {
-    token.trim_matches(|ch: char| matches!(ch, '"' | '\'' | '(' | ')' | ',' | ';'))
+    token.trim_matches(['"', '\'', '(', ')', ',', ';'])
 }
 
 fn workspace_out_write_target(lower: &str) -> Option<String> {
@@ -549,7 +547,7 @@ fn redirected_write_target(command: &str) -> Option<String> {
         }
         let rest = &command[target_index..];
         let target_end = rest
-            .find(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '&' | '|'))
+            .find(|ch: char| ch.is_whitespace() || [';', '&', '|'].contains(&ch))
             .unwrap_or(rest.len());
         let target = rest[..target_end].trim_matches(['"', '\'']);
         if is_workspace_out_path(target) {

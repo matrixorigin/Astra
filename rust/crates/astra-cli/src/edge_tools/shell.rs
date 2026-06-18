@@ -1410,7 +1410,7 @@ fn check_redirection_path_boundary(
                 if !target_in_single_quote
                     && !target_in_double_quote
                     && (target_ch.is_whitespace()
-                        || matches!(target_ch, '|' | ';' | '&' | '\n' | '\r' | '<' | '>'))
+                        || matches!(target_ch, '|' | ';' | '&' | '\n' | '\r' | '<' | '>' | ')'))
                 {
                     let raw_target = command[target_start..byte_idx].trim();
                     if let Some(target) = shell_tokenize_like_bash(raw_target).first()
@@ -1938,9 +1938,6 @@ fn check_shell_loop_path_boundary(
             }
             return Some(msg);
         }
-        if let Some((kind, subcommand)) = fanout_subcommand {
-            return Some(shell_loop_fanout_review_message(policy, kind, &subcommand));
-        }
         idx = done_idx + 1;
     }
     None
@@ -1981,11 +1978,21 @@ fn shell_loop_body_subcommand_requires_boundary_review(body: &str) -> Option<Str
         let Some(base) = first_segment_subcommand(&parts) else {
             continue;
         };
-        if subcommand_requires_boundary_review(base) {
+        if shell_loop_segment_requires_boundary_review(base, &parts) {
             return Some(base.to_string());
         }
     }
     None
+}
+
+fn shell_loop_segment_requires_boundary_review(base: &str, parts: &[String]) -> bool {
+    if is_shell_interpreter_command(base) {
+        return true;
+    }
+    if !is_boundary_sensitive_file_access_command(base) {
+        return false;
+    }
+    parts.iter().skip(1).any(|part| !part.starts_with('-'))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -5881,6 +5888,27 @@ mod tests {
     }
 
     #[test]
+    fn redirection_to_dev_null_inside_command_substitution_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(
+            &policy,
+            r#"hits=$(grep -cE "ask_user|approval" "$f" 2>/dev/null)"#,
+        );
+        assert!(
+            result.is_none(),
+            "device redirection inside command substitution should not be treated as a project file escape: {result:?}"
+        );
+    }
+
+    #[test]
+    fn redirection_to_dev_null_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        assert!(check_bash_path_boundary(&policy, "echo hi >/dev/null").is_none());
+    }
+
+    #[test]
     fn bypass_redirection_paths_caught() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::for_project("/home/user/project");
@@ -6667,6 +6695,20 @@ mod tests {
         assert!(
             result.is_none(),
             "for-loops should stay allowed for non-file-access subcommands"
+        );
+    }
+
+    #[test]
+    fn for_loop_pipeline_head_without_path_operand_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(
+            &policy,
+            r#"for f in *.rs; do echo "=== $f ==="; grep -nE "ask_user|approval" "$f" 2>/dev/null | head -8; done"#,
+        );
+        assert!(
+            result.is_none(),
+            "loop fan-out review should require an unsafe path operand, not just a stdin consumer like head: {result:?}"
         );
     }
 

@@ -3096,7 +3096,6 @@ async fn external_transport_reconnect_failure_returns_transport_unavailable() {
 
 #[tokio::test]
 async fn external_transport_cancelled_result_carries_execution_error_semantics() {
-    let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
     let cancel_token = CancellationToken::new();
     cancel_token.cancel();
@@ -3239,10 +3238,6 @@ impl PendingExternalTransport {
             execute_started: Mutex::new(Some(execute_started)),
             calls: AtomicUsize::new(0),
         }
-    }
-
-    fn calls(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
     }
 }
 
@@ -3410,8 +3405,8 @@ async fn external_transport_concurrent_cancel_two_transport_paths() {
     let sandbox_req = cloud_snapshot_request("read_file");
 
     let (r1, r2) = tokio::join!(
-        service.execute_with_cancel(gateway_req, &local, Some(cancel_token.clone().into())),
-        service.execute_with_cancel(sandbox_req, &local, Some(cancel_token.clone().into())),
+        service.execute_with_cancel(gateway_req, &local, Some(cancel_token.clone())),
+        service.execute_with_cancel(sandbox_req, &local, Some(cancel_token.clone())),
     );
 
     for (label, result) in [("gateway relay", &r1), ("sandbox resident agent", &r2)] {

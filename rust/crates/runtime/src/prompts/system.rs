@@ -707,6 +707,11 @@ fn tool_error_recovery_section() -> &'static str {
      ### Scenario: File not found (read_file / str_replace / write_file)\n\
      - Fix: `glob` with a partial pattern → confirm the real path → retry with the confirmed path.\n\
      - Anti-pattern: retrying variations like `src/foo.rs` → `./src/foo.rs` → `crates/x/src/foo.rs` hoping one sticks.\n\
+     ### Scenario: Tool schema or argument error (`unknown field`, invalid range, missing required field)\n\
+     - Fix: trust the error's valid-field list, remove unsupported fields, and retry the same structured tool once with the exact schema.\n\
+     - `read_file`: valid fields are `path`, `start_line`, `end_line`, `outline`; it does not support `offset`, `limit`, `length`, or count-style ranges. Use `start_line=1,end_line=N` for the first N lines.\n\
+     - Invalid `read_file` line range means `start_line` is after `end_line`; recompute the intended inclusive line range before retrying.\n\
+     - Anti-pattern: switching to bash/python to compensate for a malformed structured-tool call.\n\
      ### Scenario: str_replace old_str did not match\n\
      - Fix: re-read the exact target lines → copy verbatim (including leading whitespace) → retry. For multiple matches, add surrounding context lines to disambiguate.\n\
      - Anti-pattern: shortening old_str hoping for a loose match; replace_all without verifying uniqueness.\n\
@@ -2040,6 +2045,11 @@ mod tests {
         assert!(p.contains("Retry Budget"));
         assert!(p.contains("retry ONCE"));
         assert!(p.contains("File not found"));
+        assert!(p.contains("Tool schema or argument error"));
+        assert!(p.contains("read_file"));
+        assert!(p.contains("offset"));
+        assert!(p.contains("limit"));
+        assert!(p.contains("switching to bash/python"));
         assert!(p.contains("str_replace old_str did not match"));
         assert!(p.contains("bash command timeout"));
         assert!(p.contains("Truncated output"));

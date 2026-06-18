@@ -55,9 +55,11 @@ pub fn validate_read_file_args(args: &Value) -> Result<(), String> {
     };
     for key in object.keys() {
         if !READ_FILE_ALLOWED_FIELDS.contains(&key.as_str()) {
+            let hint = read_file_unknown_field_hint(key);
             return Err(format!(
-                "Error: unknown field `{key}` for read_file. Valid fields: {}. Required: path.",
-                READ_FILE_ALLOWED_FIELDS.join(", ")
+                "Error: unknown field `{key}` for read_file. Valid fields: {}. Required: path.{}",
+                READ_FILE_ALLOWED_FIELDS.join(", "),
+                hint
             ));
         }
     }
@@ -90,6 +92,17 @@ pub fn validate_read_file_args(args: &Value) -> Result<(), String> {
         return Err(reversed_read_file_range_error(start, end));
     }
     Ok(())
+}
+
+fn read_file_unknown_field_hint(key: &str) -> &'static str {
+    match key {
+        "file" | "filename" => " Use `path` for the file path.",
+        "offset" => " `read_file` uses line numbers, not byte offsets; use `start_line`.",
+        "limit" | "length" | "count" => {
+            " `read_file` does not support count-style ranges; use `start_line` and `end_line`."
+        }
+        _ => "",
+    }
 }
 
 fn reversed_read_file_range_error(start: u64, end: u64) -> String {
@@ -2162,6 +2175,11 @@ mod tests {
         );
         assert!(
             result.output.contains("Valid fields: path"),
+            "{:?}",
+            result.output
+        );
+        assert!(
+            result.output.contains("Use `path` for the file path"),
             "{:?}",
             result.output
         );

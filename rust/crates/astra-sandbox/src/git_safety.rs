@@ -280,7 +280,7 @@ fn extract_message_value(command: &str, start: usize) -> (&str, Option<char>) {
     }
 
     let end = rest
-        .find(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ';' | '&' | '|'))
+        .find(|ch: char| ch.is_ascii_whitespace() || [';', '&', '|'].contains(&ch))
         .unwrap_or(rest.len());
     (&rest[..end], None)
 }
@@ -512,10 +512,7 @@ fn check_commit_amend(lower: &str, violations: &mut Vec<GitSafetyViolation>) {
 fn check_worktree_destructive(lower: &str, violations: &mut Vec<GitSafetyViolation>) {
     let words: Vec<String> = lower
         .split_whitespace()
-        .map(|word| {
-            word.trim_matches(|ch: char| matches!(ch, ';' | '(' | ')' | '{' | '}'))
-                .to_string()
-        })
+        .map(|word| word.trim_matches([';', '(', ')', '{', '}']).to_string())
         .collect();
 
     for (idx, word) in words.iter().enumerate() {
@@ -559,10 +556,7 @@ fn check_branch_force_delete(command: &str, violations: &mut Vec<GitSafetyViolat
     }
     let words: Vec<String> = command
         .split_whitespace()
-        .map(|word| {
-            word.trim_matches(|ch: char| matches!(ch, ';' | '(' | ')' | '{' | '}'))
-                .to_string()
-        })
+        .map(|word| word.trim_matches([';', '(', ')', '{', '}']).to_string())
         .collect();
     for (i, word) in words.iter().enumerate() {
         if !word_is_git(&word.to_lowercase()) {
