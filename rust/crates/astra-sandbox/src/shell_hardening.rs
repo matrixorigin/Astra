@@ -303,8 +303,14 @@ pub fn is_dangerous_file_path(path: &str) -> bool {
     // "my.profile.rs" against ".profile".
     for &dangerous in DANGEROUS_FILE_PATHS {
         if dangerous.ends_with('/') {
-            // Directory pattern: substring match is correct (e.g. ".git/" in any position).
-            if normalized.contains(dangerous) {
+            // Directory pattern: match the directory component itself or any child path.
+            // This catches `.git` as well as `.git/config` without matching `foo.git`.
+            let dir = dangerous.trim_end_matches('/');
+            if normalized == dir
+                || normalized.ends_with(&format!("/{dir}"))
+                || normalized.contains(&format!("/{dir}/"))
+                || normalized.starts_with(&format!("{dir}/"))
+            {
                 return true;
             }
         } else {
@@ -695,6 +701,8 @@ mod tests {
 
     #[test]
     fn detects_git_internal_paths() {
+        assert!(is_dangerous_file_path(".git"));
+        assert!(is_dangerous_file_path("/home/user/.git"));
         assert!(is_dangerous_file_path(".git/config"));
         assert!(is_dangerous_file_path("/home/user/.git/hooks/pre-commit"));
         assert!(is_dangerous_file_path(".gitconfig"));
@@ -709,6 +717,8 @@ mod tests {
 
     #[test]
     fn detects_ssh_paths() {
+        assert!(is_dangerous_file_path(".ssh"));
+        assert!(is_dangerous_file_path("/home/user/.ssh"));
         assert!(is_dangerous_file_path(".ssh/id_rsa"));
         assert!(is_dangerous_file_path("~/.ssh/id_rsa"));
         assert!(is_dangerous_file_path("/home/user/.ssh/authorized_keys"));
@@ -836,6 +846,7 @@ mod tests {
     fn dangerous_path_git_internal_nested() {
         assert!(is_dangerous_file_path("repo/.git/config"));
         assert!(is_dangerous_file_path(".git/HEAD"));
+        assert!(!is_dangerous_file_path("repo/foo.git/config"));
     }
 
     // --- build_hardened_command edge cases ---

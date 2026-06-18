@@ -147,6 +147,7 @@ pub fn is_rm_catastrophic_rm_path(lower: &str) -> bool {
         .find(|t| !t.starts_with('-'))
         .copied()
         .unwrap_or("");
+    let target = normalize_rm_target_token(target);
 
     if target.is_empty() {
         return true;
@@ -167,6 +168,14 @@ pub fn is_rm_catastrophic_rm_path(lower: &str) -> bool {
         }
     }
     false
+}
+
+fn normalize_rm_target_token(token: &str) -> &str {
+    let token = token.trim_matches(|ch: char| matches!(ch, '"' | '\'' | '(' | ')' | ','));
+    let end = token
+        .find(|ch: char| matches!(ch, ';' | '&' | '|'))
+        .unwrap_or(token.len());
+    token[..end].trim_matches(|ch: char| matches!(ch, '"' | '\'' | '(' | ')' | ',' | ';'))
 }
 
 /// Find a word that appears standalone (not part of a larger word).
@@ -1091,6 +1100,9 @@ mod tests {
     fn rm_catastrophic_compound_commands() {
         // Compound commands: find_standalone_word() locates rm anywhere in the string
         assert!(is_rm_catastrophic_rm_path("sudo rm -rf /"));
+        assert!(is_rm_catastrophic_rm_path("sudo rm -rf /; echo done"));
+        assert!(is_rm_catastrophic_rm_path("sudo rm -rf /etc&&echo done"));
+        assert!(is_rm_catastrophic_rm_path("sudo rm -rf /tmp|cat"));
         assert!(is_rm_catastrophic_rm_path("sudo rm -rf /etc"));
         assert!(is_rm_catastrophic_rm_path("sudo rm -fr /usr"));
         // cd / && rm -rf foo — target is relative `foo`, not a system dir

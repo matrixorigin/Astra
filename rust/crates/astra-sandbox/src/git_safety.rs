@@ -152,9 +152,7 @@ pub fn validate_git_command(command: &str) -> Vec<GitSafetyViolation> {
     let lower = command.to_lowercase();
 
     // Only check commands that involve git (as a standalone word).
-    let is_git_command = lower.split_whitespace().any(|w| w == "git")
-        || lower.split_whitespace().any(|w| w.ends_with("/git"));
-    if !is_git_command {
+    if !contains_git_invocation(&lower) {
         return violations;
     }
 
@@ -168,7 +166,7 @@ pub fn validate_git_command(command: &str) -> Vec<GitSafetyViolation> {
     check_submodule_update_init(&lower, &mut violations);
     check_commit_amend(&lower, &mut violations);
     check_worktree_destructive(&lower, &mut violations);
-    check_branch_force_delete(&lower, &mut violations);
+    check_branch_force_delete(command, &mut violations);
     check_stash_destructive(&lower, &mut violations);
     check_tag_delete(&lower, &mut violations);
     check_bisect_run(&lower, &mut violations);
@@ -191,43 +189,138 @@ pub fn is_bare_git_repo(dir: &Path) -> bool {
 // --- Internal helpers ---
 
 fn check_commit_message(command: &str, violations: &mut Vec<GitSafetyViolation>) {
-    let Some(m_pos) = command.find("-m ") else {
-        return;
-    };
-    if !command[..m_pos].contains("commit") {
-        return;
-    }
+    let mut scan_from = 0;
+    while let Some((flag_pos, value_pos)) = next_commit_message_flag(command, scan_from) {
+        scan_from = value_pos.saturating_add(1);
+        if !git_commit_appears_before(command, flag_pos) {
+            continue;
+        }
 
-    let after_m = &command[m_pos + 3..];
+        let (msg, quote) = extract_message_value(command, value_pos);
 
-    let (msg, is_double_quoted) = if after_m.starts_with('"') {
-        (extract_quoted(after_m, '"'), true)
-    } else if after_m.starts_with('\'') {
-        (extract_quoted(after_m, '\''), false)
-    } else {
-        (after_m.split_whitespace().next().unwrap_or(""), false)
-    };
+        // Block shell expansion in double-quoted and unquoted messages.
+        // Single-quoted messages are safe because the shell does not expand inside them.
+        if quote != Some('\'') && commit_message_has_expansion(msg, violations) {
+            return;
+        }
 
-    // Block command substitution patterns inside double-quoted messages only.
-    // Single-quoted messages are safe (shell doesn't expand inside single quotes).
-    if is_double_quoted {
-        for (pattern, label) in [("$(", "$(...)"), ("`", "backtick"), ("${", "${...}")] {
-            if msg.contains(pattern) {
-                // Allow $(cat << ...) — common heredoc-based multi-line
-                // commit message pattern that reads from a literal block.
-                if pattern == "$(" && (msg.starts_with("$(cat <<") || msg.starts_with("$(< ")) {
-                    break;
-                }
-                violations.push(GitSafetyViolation::CommitMessageInjection { pattern: label });
-                return;
-            }
+        // Block messages starting with `-` (argument injection).
+        if msg.starts_with('-') {
+            violations.push(GitSafetyViolation::CommitMessageDash);
+            return;
         }
     }
+}
 
-    // Block messages starting with `-` (argument injection).
-    if msg.starts_with('-') {
-        violations.push(GitSafetyViolation::CommitMessageDash);
+fn commit_message_has_expansion(msg: &str, violations: &mut Vec<GitSafetyViolation>) -> bool {
+    for (pattern, label) in [("$(", "$(...)"), ("`", "backtick"), ("${", "${...}")] {
+        if msg.contains(pattern) {
+            // Allow $(cat << ...) — common heredoc-based multi-line
+            // commit message pattern that reads from a literal block.
+            if pattern == "$(" && (msg.starts_with("$(cat <<") || msg.starts_with("$(< ")) {
+                return false;
+            }
+            violations.push(GitSafetyViolation::CommitMessageInjection { pattern: label });
+            return true;
+        }
     }
+    false
+}
+
+fn next_commit_message_flag(command: &str, start: usize) -> Option<(usize, usize)> {
+    let mut idx = start.min(command.len());
+    while idx < command.len() {
+        let rest = &command[idx..];
+        if !is_shell_arg_start(command, idx) {
+            idx += rest.chars().next().map(char::len_utf8).unwrap_or(1);
+            continue;
+        }
+
+        if rest.starts_with("--message=") {
+            return Some((idx, idx + "--message=".len()));
+        }
+        if let Some(after_flag) = rest.strip_prefix("--message")
+            && after_flag
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_whitespace())
+        {
+            return Some((idx, skip_ascii_whitespace(command, idx + "--message".len())));
+        }
+        if rest.starts_with("-m") && !rest.starts_with("--") {
+            let after_flag = idx + 2;
+            let next = command[after_flag..].chars().next();
+            if next.is_none() {
+                return Some((idx, after_flag));
+            }
+            if next.is_some_and(|ch| ch.is_ascii_whitespace()) {
+                return Some((idx, skip_ascii_whitespace(command, after_flag)));
+            }
+            return Some((idx, after_flag));
+        }
+
+        idx += rest.chars().next().map(char::len_utf8).unwrap_or(1);
+    }
+    None
+}
+
+fn git_commit_appears_before(command: &str, end: usize) -> bool {
+    let lower = command[..end].to_lowercase();
+    shell_words(&lower).any(|word| word == "commit")
+}
+
+fn extract_message_value(command: &str, start: usize) -> (&str, Option<char>) {
+    let start = start.min(command.len());
+    let rest = &command[start..];
+    if rest.starts_with('"') {
+        return (extract_quoted(rest, '"'), Some('"'));
+    }
+    if rest.starts_with('\'') {
+        return (extract_quoted(rest, '\''), Some('\''));
+    }
+
+    let end = rest
+        .find(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ';' | '&' | '|'))
+        .unwrap_or(rest.len());
+    (&rest[..end], None)
+}
+
+fn skip_ascii_whitespace(command: &str, mut idx: usize) -> usize {
+    while idx < command.len()
+        && command[idx..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_whitespace())
+    {
+        idx += command[idx..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(1);
+    }
+    idx
+}
+
+fn is_shell_arg_start(command: &str, idx: usize) -> bool {
+    idx == 0
+        || command[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| ch.is_ascii_whitespace() || is_shell_operator_char(ch))
+}
+
+fn is_shell_operator_char(ch: char) -> bool {
+    matches!(ch, ';' | '&' | '|' | '(' | ')' | '{' | '}')
+}
+
+fn shell_words(command: &str) -> impl Iterator<Item = &str> {
+    command
+        .split(|ch: char| ch.is_ascii_whitespace() || is_shell_operator_char(ch))
+        .filter(|word| !word.is_empty())
+}
+
+fn contains_git_invocation(command: &str) -> bool {
+    shell_words(command).any(word_is_git)
 }
 
 fn check_hook_skip_flags(lower: &str, violations: &mut Vec<GitSafetyViolation>) {
@@ -283,8 +376,8 @@ fn check_force_push(lower: &str, violations: &mut Vec<GitSafetyViolation>) {
 }
 
 fn check_cd_git_compound(lower: &str, violations: &mut Vec<GitSafetyViolation>) {
-    let has_cd = lower.contains("cd ");
-    let has_git = lower.contains("git ");
+    let has_cd = shell_words(lower).any(|word| word == "cd");
+    let has_git = contains_git_invocation(lower);
     let is_compound = lower.contains("&&") || lower.contains("||") || lower.contains(';');
 
     if has_cd && has_git && is_compound {
@@ -320,6 +413,12 @@ fn check_git_config_flags(command: &str, violations: &mut Vec<GitSafetyViolation
                 }
                 if next == "--git-dir" || next.starts_with("--git-dir=") {
                     violations.push(GitSafetyViolation::GitBoundaryEscape { flag: "--git-dir" });
+                    return;
+                }
+                if next == "--work-tree" || next.starts_with("--work-tree=") {
+                    violations.push(GitSafetyViolation::GitBoundaryEscape {
+                        flag: "--work-tree",
+                    });
                     return;
                 }
             }
@@ -454,29 +553,39 @@ fn check_worktree_destructive(lower: &str, violations: &mut Vec<GitSafetyViolati
     }
 }
 
-fn check_branch_force_delete(lower: &str, violations: &mut Vec<GitSafetyViolation>) {
-    if !lower.contains("branch") {
+fn check_branch_force_delete(command: &str, violations: &mut Vec<GitSafetyViolation>) {
+    if !command.to_lowercase().contains("branch") {
         return;
     }
-    let words: Vec<&str> = lower.split_whitespace().collect();
-    for (i, &word) in words.iter().enumerate() {
-        if !word_is_git(word) {
+    let words: Vec<String> = command
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|ch: char| matches!(ch, ';' | '(' | ')' | '{' | '}'))
+                .to_string()
+        })
+        .collect();
+    for (i, word) in words.iter().enumerate() {
+        if !word_is_git(&word.to_lowercase()) {
             continue;
         }
-        // Look for "branch" after "git"
-        if let Some(sub) = words.get(i + 1)
-            && *sub == "branch"
-        {
-            // Check for -D (uppercase, force delete) — not -d (lowercase, safe)
-            for &arg in words.iter().skip(i + 2) {
-                if arg == "-D" {
-                    violations.push(GitSafetyViolation::BranchForceDelete);
-                    return;
-                }
-                if arg == "-d" {
-                    return; // -d is safe (refuses unmerged branches)
-                }
-            }
+        let Some(sub) = words.get(i + 1) else {
+            continue;
+        };
+        if sub != "branch" {
+            continue;
+        }
+
+        let args_end = command_segment_end(&words, i + 2);
+        let args = &words[i + 2..args_end];
+        if args.iter().any(|arg| arg == "-D") {
+            violations.push(GitSafetyViolation::BranchForceDelete);
+            return;
+        }
+        let has_delete = args.iter().any(|arg| arg == "-d" || arg == "--delete");
+        let has_force = args.iter().any(|arg| arg == "-f" || arg == "--force");
+        if has_delete && has_force {
+            violations.push(GitSafetyViolation::BranchForceDelete);
+            return;
         }
     }
 }
@@ -643,6 +752,9 @@ mod tests {
             r#"git commit -m "$(whoami) was here""#,
             "git commit -m \"`id` commit\"",
             r#"git commit -m "${HOME} commit""#,
+            r#"git commit --message="$(whoami) was here""#,
+            r#"git commit -m"$(whoami) was here""#,
+            r#"git commit -m$(whoami)"#,
         ] {
             let v = validate_git_command(cmd);
             assert!(
@@ -810,6 +922,11 @@ mod tests {
             v.iter()
                 .any(|v| matches!(v, GitSafetyViolation::CdGitCompound))
         );
+        let v = validate_git_command("cd /tmp/evil&&git status");
+        assert!(
+            v.iter()
+                .any(|v| matches!(v, GitSafetyViolation::CdGitCompound))
+        );
         let v = validate_git_command("git status");
         assert!(v.is_empty());
     }
@@ -822,16 +939,42 @@ mod tests {
             "git -c core.fsmonitor=evil status",
             "git --exec-path=/tmp/evil status",
             "git --config-env=core.editor=EDITOR commit",
+            "git --work-tree=/tmp/evil status",
         ] {
             let v = validate_git_command(cmd);
             assert!(
                 v.iter().any(|violation| matches!(
                     violation,
-                    GitSafetyViolation::GitConfigFlag | GitSafetyViolation::GitExecPathFlag
+                    GitSafetyViolation::GitConfigFlag
+                        | GitSafetyViolation::GitExecPathFlag
+                        | GitSafetyViolation::GitBoundaryEscape { .. }
                 )),
                 "should block: {cmd}"
             );
         }
+    }
+
+    #[test]
+    fn branch_force_delete_detected_without_lowercasing_flag() {
+        for cmd in [
+            "git branch -D old-feature",
+            "git branch --delete --force old-feature",
+            "git branch -d --force old-feature",
+        ] {
+            let v = validate_git_command(cmd);
+            assert!(
+                v.iter()
+                    .any(|violation| matches!(violation, GitSafetyViolation::BranchForceDelete)),
+                "should flag branch force delete: {cmd}; got {v:?}"
+            );
+        }
+
+        let v = validate_git_command("git branch -d old-feature");
+        assert!(
+            !v.iter()
+                .any(|violation| matches!(violation, GitSafetyViolation::BranchForceDelete)),
+            "safe branch delete should not be force delete: {v:?}"
+        );
     }
 
     #[test]

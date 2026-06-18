@@ -495,15 +495,15 @@ mount -t tmpfs -o size=32M,mode=1777 tmpfs /var/tmp 2>/dev/null || true
 # Create workspace and bind-mount the working directory.
 # We use /tmp/_astra_ws instead of /workspace because / is often not
 # writable in unprivileged user namespaces (root-owned on the host).
-# The path comes from the ASTRA_WORKING_DIR env var (no shell interpolation).
-mkdir -p /tmp/_astra_ws 2>/dev/null || true
-mount --bind "$ASTRA_WORKING_DIR" /tmp/_astra_ws 2>/dev/null || true
-cd /tmp/_astra_ws
-# Validate argument is present
-if [ $# -lt 1 ]; then
-  echo "Error: no command argument provided" >&2
+# The path comes from argv, not the environment, so callers cannot spoof it.
+# Validate arguments are present
+if [ $# -lt 2 ]; then
+  echo "Error: command and working directory arguments required" >&2
   exit 1
 fi
+mkdir -p /tmp/_astra_ws 2>/dev/null || true
+mount --bind -- "$2" /tmp/_astra_ws 2>/dev/null || true
+cd /tmp/_astra_ws
 # Execute the actual command with strict mode
 set -u
 exec bash -c "$1"
@@ -590,6 +590,7 @@ pub async fn execute_isolated(
             args.push(build_mount_namespace_wrapper());
             args.push("astra-mount-wrapper".to_string());
             args.push(command.to_string());
+            args.push(config.working_dir.display().to_string());
         } else {
             args.push(command.to_string());
         }
@@ -621,14 +622,6 @@ pub async fn execute_isolated(
     // Apply filtered environment first (untrusted).
     for (k, v) in env {
         cmd.env(k, v);
-    }
-
-    // Override ASTRA_WORKING_DIR AFTER user env to prevent sandbox escape.
-    if config.mount_namespace {
-        cmd.env(
-            "ASTRA_WORKING_DIR",
-            config.working_dir.display().to_string(),
-        );
     }
 
     let mut child = match cmd.spawn() {
@@ -1037,26 +1030,26 @@ mod tests {
         assert_eq!(out.exit_code, Some(42));
     }
 
-    /// P1-K: execute_isolated must log a warning when namespace isolation
-    /// is requested but unavailable (Strict mode silent degradation).
-    /// P1-K: IsolationConfig::strict() requests namespace isolation.
-    /// When unshare is unavailable, namespace_active must be false in output.
+    /// P1-K: execute_isolated must hard-fail when namespace isolation
+    /// is requested but unavailable (Strict mode must not silently degrade).
     #[tokio::test]
-    async fn strict_mode_without_unshare_sets_namespace_active_false() {
-        // This test runs on any machine. If unshare IS available, namespace_active
-        // will be true (correct). If not, it must be false (not silently true).
+    async fn strict_mode_without_unshare_refuses_execution() {
         let config = IsolationConfig::strict(PathBuf::from("/tmp"));
         let env =
             std::collections::HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
         let out = execute_isolated("echo ok", &env, &config).await;
-        // namespace_active must accurately reflect whether unshare was used
-        assert_eq!(
-            out.namespace_active,
-            unshare_available(),
-            "namespace_active must match unshare_available()"
-        );
-        // Either way, the command must have run
-        assert!(out.stdout.contains("ok") || out.exit_code == Some(0));
+        if unshare_available() {
+            assert!(out.namespace_active);
+            assert!(out.stdout.contains("ok") || out.exit_code == Some(0));
+        } else {
+            assert!(!out.namespace_active);
+            assert!(out.stdout.is_empty());
+            assert!(out.exit_code.is_none());
+            assert!(
+                out.stderr.contains("namespace isolation unavailable"),
+                "{out:?}"
+            );
+        }
     }
 
     /// The mount namespace wrapper script must include the workspace bind-mount
@@ -1078,10 +1071,10 @@ mod tests {
             "must mount tmpfs for /tmp"
         );
         assert!(script.contains("mount --bind"), "must bind-mount workspace");
-        // Should use env var, not hardcoded path
+        // Should use argv, not a user-controlled environment variable.
         assert!(
-            script.contains("$ASTRA_WORKING_DIR"),
-            "must reference working dir via env var"
+            script.contains("mount --bind -- \"$2\""),
+            "must reference working dir via argv with an option boundary"
         );
         assert!(
             script.contains("/tmp/_astra_ws"),
@@ -1097,10 +1090,10 @@ mod tests {
         );
     }
 
-    /// The wrapper must use environment variable for path to prevent
-    /// shell injection via directory names.
+    /// The wrapper must use argv for path to prevent shell injection via
+    /// directory names and environment spoofing.
     #[test]
-    fn build_mount_namespace_wrapper_uses_env_var_not_embedded_path() {
+    fn build_mount_namespace_wrapper_uses_argv_not_embedded_path_or_env() {
         let script = build_mount_namespace_wrapper();
         // Should NOT contain any hardcoded paths (security: no shell injection)
         assert!(
@@ -1111,10 +1104,14 @@ mod tests {
             !script.contains("/tmp/user"),
             "should not embed hardcoded paths: {script}"
         );
-        // Should use env var instead
+        // Should use argv instead of a spoofable env var.
         assert!(
-            script.contains("$ASTRA_WORKING_DIR"),
-            "must use env var for working dir: {script}"
+            script.contains("mount --bind -- \"$2\""),
+            "must use argv for working dir: {script}"
+        );
+        assert!(
+            !script.contains("ASTRA_WORKING_DIR"),
+            "must not depend on user-controlled env for working dir: {script}"
         );
     }
 

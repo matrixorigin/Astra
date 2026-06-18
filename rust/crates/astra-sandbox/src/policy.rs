@@ -1,6 +1,6 @@
 //! Sandbox policy configuration.
 
-use crate::path::normalize_path;
+use crate::path::{canonicalize_parent_and_append, normalize_path};
 use std::path::{Path, PathBuf};
 
 fn unique_path_variants(path: &Path) -> Vec<PathBuf> {
@@ -9,6 +9,12 @@ fn unique_path_variants(path: &Path) -> Vec<PathBuf> {
         && !variants.iter().any(|existing| existing == &canonical)
     {
         variants.push(canonical);
+    } else if let Ok(canonical_parent) = canonicalize_parent_and_append(path)
+        && !variants
+            .iter()
+            .any(|existing| existing == &canonical_parent)
+    {
+        variants.push(canonical_parent);
     }
     variants
 }
