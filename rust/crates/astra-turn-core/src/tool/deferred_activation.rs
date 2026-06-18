@@ -33,15 +33,20 @@ pub fn activated_tool_names_from_tool_search_output(output: &str) -> Vec<String>
     let Ok(value) = serde_json::from_str::<Value>(output) else {
         return Vec::new();
     };
+    if value.get("mode").and_then(Value::as_str) != Some("select") {
+        return Vec::new();
+    }
     let Some(query) = value.get("query").and_then(Value::as_str) else {
         return Vec::new();
     };
-    let query = query.trim_start();
-    const SELECT_PREFIX: &str = "select:";
-    if !query
-        .get(..SELECT_PREFIX.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(SELECT_PREFIX))
-    {
+    let requested = requested_tool_names_from_select_query(query);
+    if requested.is_empty() {
+        return Vec::new();
+    }
+    let Some(output_requested) = requested_tool_names_from_output(&value) else {
+        return Vec::new();
+    };
+    if !requested_tool_names_match(&requested, &output_requested) {
         return Vec::new();
     }
 
@@ -58,11 +63,68 @@ pub fn activated_tool_names_from_tool_search_output(output: &str) -> Vec<String>
         else {
             continue;
         };
+        if !requested
+            .iter()
+            .any(|requested| requested.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
         if !names.iter().any(|existing| existing == name) {
             names.push(name.to_string());
         }
     }
     names
+}
+
+fn requested_tool_names_from_select_query(query: &str) -> Vec<String> {
+    let query = query.trim_start();
+    const SELECT_PREFIX: &str = "select:";
+    if !query
+        .get(..SELECT_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(SELECT_PREFIX))
+    {
+        return Vec::new();
+    }
+
+    let mut names = Vec::new();
+    for name in query[SELECT_PREFIX.len()..]
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        if !names
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(name))
+        {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+fn requested_tool_names_from_output(value: &Value) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for name in value.get("requested")?.as_array()? {
+        let name = name.as_str()?.trim();
+        if name.is_empty() {
+            return None;
+        }
+        if !names
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(name))
+        {
+            names.push(name.to_string());
+        }
+    }
+    Some(names)
+}
+
+fn requested_tool_names_match(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
 #[must_use]
@@ -105,7 +167,9 @@ mod tests {
     #[test]
     fn select_result_activates_matched_names() {
         let out = json!({
+            "mode": "select",
             "query": "select:agent_fanout",
+            "requested": ["agent_fanout"],
             "matches": [
                 {"name": "agent_fanout", "description": "full", "parameters": {"type": "object"}}
             ],
@@ -121,7 +185,9 @@ mod tests {
     #[test]
     fn select_prefix_is_case_insensitive_for_activation() {
         let out = json!({
+            "mode": "select",
             "query": " Select:GitHub",
+            "requested": ["GitHub"],
             "matches": [
                 {"name": "github", "description": "full", "parameters": {"type": "object"}}
             ],
@@ -137,10 +203,78 @@ mod tests {
     #[test]
     fn keyword_result_does_not_activate_names() {
         let out = json!({
+            "mode": "keyword",
             "query": "agent",
             "matches": [{"name": "agent_fanout", "description": "short", "score": 0.8}]
         })
         .to_string();
         assert!(activated_tool_names_from_tool_search_output(&out).is_empty());
+    }
+
+    #[test]
+    fn legacy_select_without_mode_does_not_activate() {
+        let out = json!({
+            "query": "select:agent_fanout",
+            "requested": ["agent_fanout"],
+            "matches": [
+                {"name": "agent_fanout", "description": "full", "parameters": {"type": "object"}}
+            ],
+            "missing": []
+        })
+        .to_string();
+        assert!(activated_tool_names_from_tool_search_output(&out).is_empty());
+    }
+
+    #[test]
+    fn select_result_with_mismatched_requested_list_does_not_activate() {
+        let out = json!({
+            "mode": "select",
+            "query": "select:agent_fanout",
+            "requested": ["github"],
+            "matches": [
+                {"name": "agent_fanout", "description": "full", "parameters": {"type": "object"}}
+            ],
+            "missing": []
+        })
+        .to_string();
+        assert!(activated_tool_names_from_tool_search_output(&out).is_empty());
+    }
+
+    #[test]
+    fn select_result_ignores_matches_that_were_not_requested() {
+        let out = json!({
+            "mode": "select",
+            "query": "select:agent_fanout",
+            "requested": ["agent_fanout"],
+            "matches": [
+                {"name": "agent_fanout", "description": "full", "parameters": {"type": "object"}},
+                {"name": "github", "description": "polluted", "parameters": {"type": "object"}}
+            ],
+            "missing": []
+        })
+        .to_string();
+        assert_eq!(
+            activated_tool_names_from_tool_search_output(&out),
+            vec!["agent_fanout".to_string()]
+        );
+    }
+
+    #[test]
+    fn duplicate_select_matches_activate_once() {
+        let out = json!({
+            "mode": "select",
+            "query": "select:Agent_Fanout,agent_fanout",
+            "requested": ["Agent_Fanout"],
+            "matches": [
+                {"name": "agent_fanout", "description": "full", "parameters": {"type": "object"}},
+                {"name": "agent_fanout", "description": "full", "parameters": {"type": "object"}}
+            ],
+            "missing": []
+        })
+        .to_string();
+        assert_eq!(
+            activated_tool_names_from_tool_search_output(&out),
+            vec!["agent_fanout".to_string()]
+        );
     }
 }

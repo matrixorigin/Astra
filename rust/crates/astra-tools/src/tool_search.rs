@@ -62,22 +62,28 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
     // activation" pattern — the LLM saw the tool name elsewhere, asked for
     // its schema, now has everything needed to call it.
     if let Some(tool_names) = select_payload(query) {
-        let requested: Vec<&str> = tool_names
+        let mut requested = Vec::new();
+        for name in tool_names
             .split(',')
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .collect();
+        {
+            if !requested
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(name))
+            {
+                requested.push(name.to_string());
+            }
+        }
         let mut found = Vec::new();
         let mut missing = Vec::new();
 
-        for name in requested {
-            let name_lower = name.to_lowercase();
+        for name in &requested {
             if let Some(tool) = schemas.iter().find(|t| {
                 t.get("function")
                     .and_then(|f| f.get("name"))
                     .and_then(Value::as_str)
-                    .map(|n| n.to_lowercase() == name_lower)
-                    .unwrap_or(false)
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
             }) {
                 if let Some(func) = tool.get("function") {
                     let tool_name = func.get("name").and_then(Value::as_str).unwrap_or("");
@@ -99,12 +105,14 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
                     found.push(entry);
                 }
             } else {
-                missing.push(name.to_string());
+                missing.push(name.clone());
             }
         }
 
         return json!({
+            "mode": "select",
             "query": query,
+            "requested": requested,
             "matches": found,
             "missing": missing,
             "total_tools": schemas.len()
@@ -137,6 +145,7 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
         .collect();
 
     json!({
+        "mode": "keyword",
         "query": query,
         "matches": matches,
         "total_tools": schemas.len()
@@ -202,6 +211,8 @@ mod tests {
         let result = tool_search(&schemas, &json!({"query": "select:bash"}));
         assert!(result.contains("bash"));
         let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["mode"].as_str(), Some("select"));
+        assert_eq!(parsed["requested"][0].as_str(), Some("bash"));
         assert!(parsed["missing"].as_array().unwrap().is_empty());
 
         // Missing tool
@@ -234,9 +245,29 @@ mod tests {
         let result = tool_search(&schemas, &json!({"query": "Select:BASH"}));
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["query"].as_str(), Some("Select:BASH"));
+        assert_eq!(parsed["mode"].as_str(), Some("select"));
+        assert_eq!(parsed["requested"][0].as_str(), Some("BASH"));
         assert_eq!(parsed["matches"][0]["name"].as_str(), Some("bash"));
         assert!(parsed["matches"][0].get("score").is_none());
         assert!(parsed["missing"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn select_mode_deduplicates_requested_names() {
+        let schemas = sample_schemas();
+        let result = tool_search(&schemas, &json!({"query": "select:BASH,bash,grep"}));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let requested = parsed["requested"].as_array().unwrap();
+        assert_eq!(requested.len(), 2);
+        assert_eq!(requested[0].as_str(), Some("BASH"));
+        assert_eq!(requested[1].as_str(), Some("grep"));
+
+        let matches = parsed["matches"].as_array().unwrap();
+        let bash_count = matches
+            .iter()
+            .filter(|m| m["name"].as_str() == Some("bash"))
+            .count();
+        assert_eq!(bash_count, 1);
     }
 
     #[test]
