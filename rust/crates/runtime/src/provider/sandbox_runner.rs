@@ -120,7 +120,26 @@ impl CapabilityProvider for SandboxRuntimeProvider {
         }
     }
 
-    async fn execute(&self, request: ToolRequest) -> ToolResult {
+    async fn execute(
+        &self,
+        request: ToolRequest,
+        cancel_token: Option<&std::sync::Arc<tokio_util::sync::CancellationToken>>,
+    ) -> ToolResult {
+        // Cooperative cancellation gate: bail out before the (expensive)
+        // sandbox dispatch if the caller already cancelled. Mid-flight
+        // cancellation is unsafe here because the sandboxed process may have
+        // already mutated state — so we only honor preflight cancellation.
+        if let Some(token) = cancel_token {
+            if token.is_cancelled() {
+                return ToolResult::Error {
+                    message: format!(
+                        "SandboxRuntimeProvider: tool '{}' cancelled before dispatch",
+                        request.tool_name
+                    ),
+                    retryable: false,
+                };
+            }
+        }
         match &self.sandbox_service {
             Some(svc) => {
                 svc.execute_sandboxed(
@@ -255,7 +274,7 @@ mod tests {
     async fn execute_without_service_returns_error() {
         let provider = SandboxRuntimeProvider::new(10);
         let request = test_request("bash");
-        let result = provider.execute(request).await;
+        let result = provider.execute(request, None).await;
         match result {
             ToolResult::Error { message, .. } => {
                 assert!(message.contains("sandbox service not configured"));
@@ -269,7 +288,7 @@ mod tests {
         let provider =
             SandboxRuntimeProvider::new(10).with_sandbox_service(Arc::new(StubSandboxService));
         let request = test_request("bash");
-        let result = provider.execute(request).await;
+        let result = provider.execute(request, None).await;
         match result {
             ToolResult::Success { data, .. } => {
                 assert_eq!(data, serde_json::Value::String("sandboxed bash".into()));

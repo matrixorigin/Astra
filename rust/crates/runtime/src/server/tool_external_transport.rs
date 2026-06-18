@@ -54,29 +54,6 @@ pub trait ExternalTransport: Send + Sync {
     }
 }
 
-/// Legacy compatibility aliases.  New code should use `ExternalTransport`.
-#[async_trait]
-pub trait GatewayRelayTransport: ExternalTransport {
-    async fn execute_tool(
-        &self,
-        request: ToolExecutionRequest,
-        binding: astra_runtime_env::RunBinding,
-    ) -> Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError> {
-        <Self as ExternalTransport>::execute_tool(self, request, binding).await
-    }
-}
-
-#[async_trait]
-pub trait SandboxResidentAgentTransport: ExternalTransport {
-    async fn execute_tool(
-        &self,
-        request: ToolExecutionRequest,
-        binding: astra_runtime_env::RunBinding,
-    ) -> Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError> {
-        <Self as ExternalTransport>::execute_tool(self, request, binding).await
-    }
-}
-
 pub(crate) async fn execute_external_route(
     request: ToolExecutionRequest,
     binding: &astra_runtime_env::RunBinding,
@@ -180,11 +157,8 @@ pub(crate) async fn execute_external_route(
         binding,
         transport_kind,
         adapter_name,
+        transport,
         cancel_token,
-        move |request, binding| {
-            let t = Arc::clone(&transport);
-            async move { t.execute_tool(request, binding).await }
-        },
     )
     .await
 }
@@ -255,20 +229,14 @@ pub(crate) async fn execute_sandbox_resident_agent(
     .await
 }
 
-async fn execute_external_transport<F, Fut>(
+async fn execute_external_transport(
     request: ToolExecutionRequest,
     binding: &astra_runtime_env::RunBinding,
     transport_kind: ToolTransportKind,
     adapter_name: &'static str,
+    transport: Arc<dyn ExternalTransport>,
     cancel_token: Option<Arc<CancellationToken>>,
-    execute: F,
-) -> astra_tools::ToolResult
-where
-    F: Fn(ToolExecutionRequest, astra_runtime_env::RunBinding) -> Fut,
-    Fut: std::future::Future<
-            Output = Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError>,
-        >,
-{
+) -> astra_tools::ToolResult {
     if cancel_token
         .as_ref()
         .is_some_and(|token| token.is_cancelled())
@@ -288,6 +256,42 @@ where
             return cancelled_runtime_tool_result(&request, binding, transport_kind, attempt > 0);
         }
 
+        // Retry health gate: re-validate transport is alive before each
+        // retry attempt. The transport may have become unhealthy since the
+        // initial preflight check (network drop, sandbox restart). Best-effort
+        // reconnect — we proceed to the retry regardless so that the error
+        // classification in the match below can decide the final outcome.
+        if attempt > 0 {
+            let health_check = match preflight_or_cancel(
+                &request,
+                binding,
+                transport_kind,
+                cancel_token.as_ref(),
+                transport.health_check(),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(cancelled) => return cancelled,
+            };
+            if let Err(reason) = health_check {
+                tracing::warn!(
+                    adapter = adapter_name,
+                    attempt,
+                    reason = %reason,
+                    "Transport unhealthy before retry; attempting reconnect"
+                );
+                let _ = preflight_or_cancel(
+                    &request,
+                    binding,
+                    transport_kind,
+                    cancel_token.as_ref(),
+                    transport.reconnect(),
+                )
+                .await;
+            }
+        }
+
         // Cancellation during execution means the transport call already started.
         const CANCEL_DURING_EXEC: bool = true;
 
@@ -296,21 +300,23 @@ where
                 tokio::select! {
                     _ = token.cancelled() => return cancelled_runtime_tool_result(&request, binding, transport_kind, CANCEL_DURING_EXEC),
                     _ = tokio::time::sleep(timeout) => return runtime_tool_timeout_result(&request, binding, transport_kind, true, timeout.as_secs_f64()),
-                    response = execute(request.clone(), binding.clone()) => response,
+                    response = transport.execute_tool(request.clone(), binding.clone()) => response,
                 }
             } else {
                 tokio::select! {
                     _ = token.cancelled() => return cancelled_runtime_tool_result(&request, binding, transport_kind, CANCEL_DURING_EXEC),
-                    response = execute(request.clone(), binding.clone()) => response,
+                    response = transport.execute_tool(request.clone(), binding.clone()) => response,
                 }
             }
         } else if let Some(timeout) = execution_timeout {
             tokio::select! {
                 _ = tokio::time::sleep(timeout) => return runtime_tool_timeout_result(&request, binding, transport_kind, true, timeout.as_secs_f64()),
-                response = execute(request.clone(), binding.clone()) => response,
+                response = transport.execute_tool(request.clone(), binding.clone()) => response,
             }
         } else {
-            execute(request.clone(), binding.clone()).await
+            transport
+                .execute_tool(request.clone(), binding.clone())
+                .await
         };
 
         match response {
@@ -342,8 +348,39 @@ where
         }
     }
 
-    // Unreachable — the retry loop always returns or exhausts attempts.
-    unreachable!("retry loop exited without returning");
+    // Defensive fallback — the retry loop is designed to always return from
+    // within the loop body (Ok outcome, non-retryable error, or max-retries
+    // exhaustion). If control reaches here it indicates a logic bug in the
+    // retry/return flow. Synthesize an error result rather than panicking so
+    // a transport glitch degrades gracefully instead of crashing the process.
+    tracing::error!(
+        adapter = adapter_name,
+        tool = %request.tool_name,
+        "retry loop exited without returning — indicates a logic bug"
+    );
+    match last_error {
+        Some(error) => {
+            external_error_tool_result(&request, binding, transport_kind, adapter_name, error)
+        }
+        None => {
+            let mut metadata = delivered_binding_event_fields(
+                &request.workspace,
+                &request.executor,
+                transport_kind,
+            );
+            attach_runtime_policy_metadata(&mut metadata, binding);
+            astra_tools::ToolResult {
+                output: format!(
+                    "Error: {adapter_name} transport for tool '{}' exhausted \
+                     retries without a captured error (logic bug)",
+                    request.tool_name
+                ),
+                metadata: Some(metadata),
+                is_error: true,
+                exit_semantics: Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
+            }
+        }
+    }
 }
 
 fn is_safe_to_retry_runtime_error(error: &astra_runtime_env::RuntimeError) -> bool {

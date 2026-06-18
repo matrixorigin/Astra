@@ -83,7 +83,11 @@ impl CapabilityProvider for StaticProvider {
         Ok(())
     }
 
-    async fn execute(&self, _request: ToolRequest) -> ToolResult {
+    async fn execute(
+        &self,
+        _request: ToolRequest,
+        _cancel_token: Option<&std::sync::Arc<tokio_util::sync::CancellationToken>>,
+    ) -> ToolResult {
         ToolResult::Error {
             message: "static provider".into(),
             retryable: false,
@@ -754,7 +758,11 @@ impl CapabilityProvider for UnhealthyProvider {
     async fn capabilities(&self) -> Vec<ToolCapability> {
         vec![ToolCapability::Category(ToolCategory::FileSystem)]
     }
-    async fn execute(&self, _req: ToolRequest) -> ToolResult {
+    async fn execute(
+        &self,
+        _req: ToolRequest,
+        _cancel_token: Option<&std::sync::Arc<tokio_util::sync::CancellationToken>>,
+    ) -> ToolResult {
         ToolResult::Error {
             message: "unhealthy".into(),
             retryable: true,

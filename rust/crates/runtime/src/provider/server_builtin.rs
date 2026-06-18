@@ -144,7 +144,11 @@ impl CapabilityProvider for ServerBuiltinProvider {
         Ok(())
     }
 
-    async fn execute(&self, request: ToolRequest) -> ToolResult {
+    async fn execute(
+        &self,
+        request: ToolRequest,
+        _cancel_token: Option<&std::sync::Arc<tokio_util::sync::CancellationToken>>,
+    ) -> ToolResult {
         self.runtime
             .execute_local_tool(&request.tool_name, &request.parameters)
             .await
@@ -222,7 +226,7 @@ mod tests {
     async fn execute_delegates_to_runtime() {
         let provider = ServerBuiltinProvider::new(10, Arc::new(TestRuntime), None);
         let request = test_request("memory");
-        let result = provider.execute(request).await;
+        let result = provider.execute(request, None).await;
         match result {
             ToolResult::Success { data, .. } => {
                 let s = data.as_str().unwrap_or("");

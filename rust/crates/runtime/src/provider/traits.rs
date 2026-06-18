@@ -139,7 +139,16 @@ pub trait CapabilityProvider: Send + Sync {
     async fn health_check(&self) -> Result<(), ProviderError>;
 
     /// Execute a tool request.
-    async fn execute(&self, request: ToolRequest) -> ToolResult;
+    ///
+    /// `cancel_token` is an optional cooperative cancellation handle. Providers
+    /// SHOULD observe it: check `is_cancelled()` before dispatching and/or race
+    /// the underlying I/O against `token.cancelled()` in a `tokio::select!`.
+    /// Passing `None` means the caller has no cancellation surface (e.g. tests).
+    async fn execute(
+        &self,
+        request: ToolRequest,
+        cancel_token: Option<&std::sync::Arc<tokio_util::sync::CancellationToken>>,
+    ) -> ToolResult;
 
     /// Routing priority (lower = preferred).
     fn priority(&self) -> u8;

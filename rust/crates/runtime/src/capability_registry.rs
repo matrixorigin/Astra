@@ -472,7 +472,11 @@ mod tests {
             Ok(())
         }
 
-        async fn execute(&self, _request: ToolRequest) -> crate::provider::traits::ToolResult {
+        async fn execute(
+            &self,
+            _request: ToolRequest,
+            _cancel_token: Option<&std::sync::Arc<tokio_util::sync::CancellationToken>>,
+        ) -> crate::provider::traits::ToolResult {
             crate::provider::traits::ToolResult::Success {
                 data: serde_json::Value::Null,
                 stdout: String::new(),

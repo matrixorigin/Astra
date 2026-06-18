@@ -9,9 +9,7 @@ pub use super::tool_execution_binding::{
     WorkspaceBinding, WorkspaceBindingKind,
 };
 pub use super::tool_execution_service::ToolExecutionService;
-pub use super::tool_external_transport::{
-    ExternalTransport, GatewayRelayTransport, SandboxResidentAgentTransport,
-};
+pub use super::tool_external_transport::ExternalTransport;
 pub use super::tool_local_transport::ServerLocalToolTransport;
 pub(crate) use super::tool_route_boundary::{
     ToolRouteBoundary, attach_binding_metadata, copy_result_routing_metadata,

@@ -132,7 +132,11 @@ impl CapabilityProvider for EdgeConnectionProvider {
         Ok(())
     }
 
-    async fn execute(&self, request: ToolRequest) -> ToolResult {
+    async fn execute(
+        &self,
+        request: ToolRequest,
+        cancel_token: Option<&std::sync::Arc<tokio_util::sync::CancellationToken>>,
+    ) -> ToolResult {
         // Build a ToolExecutionRequest from the provider's ToolRequest.
         let exec_request = ToolExecutionRequest {
             user_id: request.user_id.clone(),
@@ -164,7 +168,7 @@ impl CapabilityProvider for EdgeConnectionProvider {
             self.edge_dispatch_service.clone(),
             self.edge_registry_service.clone(),
             &self.tool_registry,
-            None, // no cancellation token for now
+            cancel_token.cloned(),
         )
         .await;
 
@@ -245,7 +249,7 @@ mod tests {
             run_id: "test-run".into(),
             session_id: "test-session".into(),
         };
-        let result = provider.execute(request).await;
+        let result = provider.execute(request, None).await;
         match result {
             ToolResult::Error { .. } => {
                 // Expected — no transport is configured.

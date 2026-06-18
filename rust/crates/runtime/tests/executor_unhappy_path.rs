@@ -96,7 +96,11 @@ impl CapabilityProvider for ControllableProvider {
         self.capabilities.clone()
     }
 
-    async fn execute(&self, _req: ToolRequest) -> ToolResult {
+    async fn execute(
+        &self,
+        _req: ToolRequest,
+        _cancel_token: Option<&std::sync::Arc<tokio_util::sync::CancellationToken>>,
+    ) -> ToolResult {
         if self.hang_on_execute.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_secs(3600)).await;
             ToolResult::Error {
@@ -315,7 +319,7 @@ async fn provider_degrades_between_resolve_and_execute() {
 
     p.set_healthy(false);
 
-    let result = resolved.execute(request).await;
+    let result = resolved.execute(request, None).await;
     match result {
         ToolResult::Success { .. } => {}
         ToolResult::Error { .. } => {}
@@ -437,7 +441,7 @@ async fn hung_transport_times_out_at_caller_level() {
     };
     let resolved = reg.resolve(&request).await.unwrap();
 
-    let exec_result = timeout(Duration::from_millis(200), resolved.execute(request)).await;
+    let exec_result = timeout(Duration::from_millis(200), resolved.execute(request, None)).await;
     assert!(
         exec_result.is_err(),
         "hung transport call should time out at caller level"
@@ -473,7 +477,7 @@ async fn network_partition_all_providers_hung() {
     };
     let resolved = reg.resolve(&request).await.unwrap();
 
-    let exec_result = timeout(Duration::from_millis(200), resolved.execute(request)).await;
+    let exec_result = timeout(Duration::from_millis(200), resolved.execute(request, None)).await;
     assert!(
         exec_result.is_err(),
         "all providers hung -> timeout at caller level"
