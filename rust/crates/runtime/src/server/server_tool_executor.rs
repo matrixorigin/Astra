@@ -521,17 +521,14 @@ impl ServerToolExecutor {
     }
 
     pub fn activated_deferred_tool_names(&self) -> Vec<String> {
-        let allowed = self.current_searchable_tool_names();
+        let allowed = self.current_activatable_tool_names_snapshot();
 
         // Use zero-clone filter path to avoid cloning the entire HashSet
         let mut result = Vec::new();
         match self.activated_deferred_tools.read() {
             Ok(guard) => {
                 for name in guard.iter() {
-                    if allowed
-                        .as_ref()
-                        .map_or(true, |allowed| allowed.contains(name))
-                    {
+                    if allowed.is_empty() || allowed.contains(name) {
                         result.push(name.clone());
                     }
                 }
@@ -563,13 +560,21 @@ impl ServerToolExecutor {
         if names.is_empty() {
             return;
         }
-        let allowed = self.current_searchable_tool_names();
+        // Gate activation recording against the activatable set (deferred
+        // manifest), not the searchable set (visible). The model was told it
+        // could activate these names via `<deferred_tools>`; mirroring the
+        // CLI's `tool_admission_denial` contract. `None` (not yet configured)
+        // means no restriction — symmetric with the CLI executor.
+        let allowed: Option<HashSet<String>> = rwlock_read_clone_or_default(
+            &self.current_activatable_tool_names,
+            "current_activatable_tool_names_activation",
+        );
         let names: Vec<String> = names
             .into_iter()
             .filter(|name| {
                 allowed
                     .as_ref()
-                    .map_or(true, |allowed| allowed.contains(name))
+                    .is_none_or(|allowed| allowed.contains(name))
             })
             .collect();
         if names.is_empty() {
@@ -3779,6 +3784,14 @@ esac
             matched_names.iter().any(|n| n == "agent_fanout"),
             "deferred name from the activatable set must resolve through tool_search; got: {}",
             result.output
+        );
+        // Activation must be recorded against the activatable (deferred manifest)
+        // set, not the visible set.
+        let activated = exec.activated_deferred_tool_names();
+        assert!(
+            activated.contains(&"agent_fanout".to_string()),
+            "activated_deferred_tool_names must include agent_fanout after select: activation; got: {:?}",
+            activated
         );
     }
 
