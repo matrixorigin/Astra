@@ -41,8 +41,10 @@ fn emit_blocked_tool_result(
     tool_call_records: &mut Vec<ToolCallRecord>,
 ) {
     step_recorder.begin_tool_with_key(blocked.name, blocked.id, None);
-    step_recorder.skip_tool_with_reason(
+    step_recorder.skip_tool_with_reason_and_metadata(
         blocked.name,
+        Some(blocked.id),
+        None,
         blocked.reason_code,
         false,
         Some(&blocked.err_msg),
@@ -106,7 +108,14 @@ fn trace_short_circuit_tool_skip(
         idempotency_key,
         args_preview,
     );
-    step_recorder.skip_tool_with_reason(tool_name, reason, was_cached, output);
+    step_recorder.skip_tool_with_reason_and_metadata(
+        tool_name,
+        Some(tool_id),
+        args_preview,
+        reason,
+        was_cached,
+        output,
+    );
 }
 
 impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
@@ -323,8 +332,10 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     Some(&cache_key),
                     args_preview.as_deref(),
                 );
-                self.ctx.step_recorder.skip_tool_with_reason(
+                self.ctx.step_recorder.skip_tool_with_reason_and_metadata(
                     &slot.name,
+                    Some(&slot.id),
+                    args_preview.as_deref(),
                     REASON_REPEATED_CACHE_HIT_SUPPRESSED,
                     true,
                     Some(&body),
@@ -376,11 +387,15 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 Some(&cache_key),
                 args_preview.as_deref(),
             );
-            self.ctx.step_recorder.record_cache_hit_with_reason(
-                &slot.name,
-                cached.clone(),
-                "cached_cross_turn",
-            );
+            self.ctx
+                .step_recorder
+                .record_cache_hit_with_reason_and_metadata(
+                    &slot.name,
+                    Some(&slot.id),
+                    args_preview.as_deref(),
+                    cached.clone(),
+                    "cached_cross_turn",
+                );
             self.ctx
                 .turn_guard
                 .record_cache_hit_for_signature(&slot.name, &call_sig);

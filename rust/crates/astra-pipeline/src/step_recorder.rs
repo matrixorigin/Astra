@@ -530,7 +530,7 @@ impl StepRecorder {
         self.emit_with_payload(StepEventType::ToolCallStarted, payload);
     }
 
-    /// Record a cache hit on the current slot (sets cached_result + Skipped state).
+    /// Record a cache hit on the current slot.
     /// Call this instead of complete_tool() when the idempotency cache provides the result.
     pub fn record_cache_hit(&mut self, tool_name: &str, cached: CachedToolResult) {
         self.record_cache_hit_with_reason(tool_name, cached, "idempotency_cache_hit");
@@ -546,15 +546,43 @@ impl StepRecorder {
         cached: CachedToolResult,
         reason: &str,
     ) {
-        let slot_idx = self.slot_counter.saturating_sub(1);
+        let fallback_call_id = self
+            .active_call_id_for_tool(tool_name)
+            .filter(|call_id| !call_id.is_empty());
+        self.record_cache_hit_with_reason_and_metadata(
+            tool_name,
+            fallback_call_id.as_deref(),
+            None,
+            cached,
+            reason,
+        );
+    }
 
-        if let Some(ref mut step) = self.current_step
-            && let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize)
-        {
-            slot.cached_result = Some(cached);
-        }
-
-        self.skip_tool_with_reason(tool_name, reason, true, None);
+    /// Record a cache hit with explicit correlation metadata.
+    pub fn record_cache_hit_with_reason_and_metadata(
+        &mut self,
+        tool_name: &str,
+        call_id: Option<&str>,
+        args_preview: Option<&str>,
+        cached: CachedToolResult,
+        reason: &str,
+    ) {
+        let is_error = cached.is_error;
+        let output = cached.output.clone();
+        let cached_for_slot = cached.clone();
+        let mut extra = serde_json::Map::new();
+        extra.insert("reason".to_string(), serde_json::json!(reason));
+        self.complete_tool_inner(
+            tool_name,
+            is_error,
+            0,
+            true,
+            Some(&output),
+            call_id,
+            args_preview,
+            Some(cached_for_slot),
+            Some(extra),
+        );
     }
 
     /// Record a short-circuit skip for the current tool slot.
@@ -569,16 +597,40 @@ impl StepRecorder {
         was_cached: bool,
         output: Option<&str>,
     ) {
-        let slot_idx = self.slot_counter.saturating_sub(1);
-        let slot_meta = self.current_step.as_ref().and_then(|step| {
-            step.execution.cursor.slots.get(slot_idx as usize).map(|s| {
-                (
-                    s.call_id.clone(),
-                    s.idempotency_key.clone(),
-                    s.args_preview.clone(),
-                )
-            })
-        });
+        let fallback_call_id = self
+            .active_call_id_for_tool(tool_name)
+            .filter(|call_id| !call_id.is_empty());
+        self.skip_tool_with_reason_and_metadata(
+            tool_name,
+            fallback_call_id.as_deref(),
+            None,
+            reason,
+            was_cached,
+            output,
+        );
+    }
+
+    /// Record a short-circuit skip with explicit correlation metadata.
+    pub fn skip_tool_with_reason_and_metadata(
+        &mut self,
+        tool_name: &str,
+        call_id: Option<&str>,
+        args_preview: Option<&str>,
+        reason: &str,
+        was_cached: bool,
+        output: Option<&str>,
+    ) {
+        let (sanitized_args_preview, preview_redactions) =
+            sanitize_args_preview_for_storage(args_preview);
+        let slot_idx = self.resolve_terminal_slot_index(call_id);
+        self.ensure_terminal_slot_started(
+            slot_idx,
+            tool_name,
+            call_id,
+            sanitized_args_preview.clone(),
+            preview_redactions,
+        );
+        let slot_meta = self.slot_trace_meta(slot_idx);
 
         if let Some(ref mut step) = self.current_step {
             if let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize) {
@@ -595,6 +647,7 @@ impl StepRecorder {
 
         let mut payload = serde_json::json!({
             "tool_name": tool_name,
+            "slot_index": slot_idx,
             "reason": reason,
             "cached": was_cached,
         });
@@ -606,6 +659,9 @@ impl StepRecorder {
             if let Some(args_preview) = args_preview {
                 payload["args_preview"] = serde_json::json!(args_preview);
             }
+        }
+        if preview_redactions > 0 {
+            payload["args_preview_redactions"] = serde_json::json!(preview_redactions);
         }
         if let Some(output) = output {
             let clipped = clip_output_preview(output);
@@ -622,7 +678,17 @@ impl StepRecorder {
     /// Attach a cached result to the most recently completed slot.
     /// Called after `complete_tool()` when the result is stored in the idempotency cache.
     pub fn attach_cached_result(&mut self, cached: CachedToolResult) {
-        let slot_idx = self.slot_counter.saturating_sub(1);
+        let slot_idx = self.resolve_terminal_slot_index(None);
+        if let Some(ref mut step) = self.current_step
+            && let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize)
+        {
+            slot.cached_result = Some(cached);
+        }
+    }
+
+    /// Attach a cached result to a specific tool call.
+    pub fn attach_cached_result_for_call(&mut self, call_id: &str, cached: CachedToolResult) {
+        let slot_idx = self.resolve_terminal_slot_index(Some(call_id));
         if let Some(ref mut step) = self.current_step
             && let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize)
         {
@@ -639,7 +705,7 @@ impl StepRecorder {
         was_cached: bool,
     ) {
         self.complete_tool_inner(
-            tool_name, is_error, elapsed_ms, was_cached, None, None, None,
+            tool_name, is_error, elapsed_ms, was_cached, None, None, None, None, None,
         );
     }
 
@@ -660,6 +726,8 @@ impl StepRecorder {
             elapsed_ms,
             was_cached,
             Some(output),
+            None,
+            None,
             None,
             None,
         );
@@ -686,6 +754,8 @@ impl StepRecorder {
             Some(output),
             Some(call_id),
             args_preview,
+            None,
+            None,
         );
     }
 
@@ -698,67 +768,41 @@ impl StepRecorder {
         output: Option<&str>,
         fallback_call_id: Option<&str>,
         fallback_args_preview: Option<&str>,
+        cached_result: Option<CachedToolResult>,
+        extra_payload: Option<serde_json::Map<String, serde_json::Value>>,
     ) {
-        let slot_idx = self.slot_counter.saturating_sub(1);
         let (sanitized_fallback_args_preview, fallback_preview_redactions) =
             sanitize_args_preview_for_storage(fallback_args_preview);
+        let slot_idx = self.resolve_terminal_slot_index(fallback_call_id);
 
-        // Guarantee the event stream is always a valid span:
-        // ToolCallStarted → ToolCallCompleted/Failed/Skipped.
-        // If begin_tool was never called (fast-path dispatch where the CLI
-        // only sees the result), inject a ToolCallStarted event now. This
-        // does NOT increment slot_counter (the slot was already allocated
-        // by begin_act) — it only emits the event and marks the slot Running.
-        let needs_started = self
-            .current_step
-            .as_ref()
-            .and_then(|step| step.execution.cursor.slots.get(slot_idx as usize))
-            .is_some_and(|slot| slot.state == crate::step_protocol::SlotState::Pending);
-        if needs_started {
-            let call_id = fallback_call_id.unwrap_or("");
-            // Mark slot as Running (same as begin_tool does).
-            if let Some(ref mut step) = self.current_step
-                && let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize)
-            {
-                slot.tool_name = tool_name.to_string();
-                slot.call_id = call_id.to_string();
-                slot.state = crate::step_protocol::SlotState::Running;
-                slot.args_preview = sanitized_fallback_args_preview.clone();
-            }
-            let mut started_payload = serde_json::json!({
-                "tool_name": tool_name,
-                "slot_index": slot_idx,
-                "call_id": call_id,
-            });
-            if let Some(ap) = sanitized_fallback_args_preview.as_deref() {
-                started_payload["args_preview"] = serde_json::json!(ap);
-            }
-            if fallback_preview_redactions > 0 {
-                started_payload["args_preview_redactions"] =
-                    serde_json::json!(fallback_preview_redactions);
-            }
-            self.emit_with_payload(StepEventType::ToolCallStarted, started_payload);
-        }
+        self.ensure_terminal_slot_started(
+            slot_idx,
+            tool_name,
+            fallback_call_id,
+            sanitized_fallback_args_preview.clone(),
+            fallback_preview_redactions,
+        );
 
         // Extract trace metadata from slot before mutation.
-        let slot_meta = self.current_step.as_ref().and_then(|step| {
-            step.execution.cursor.slots.get(slot_idx as usize).map(|s| {
-                (
-                    s.call_id.clone(),
-                    s.idempotency_key.clone(),
-                    s.args_preview.clone(),
-                )
-            })
-        });
+        let slot_meta = self.slot_trace_meta(slot_idx);
 
         if let Some(ref mut step) = self.current_step {
             let state = if was_cached {
-                SlotState::Skipped
+                if is_error {
+                    SlotState::Failed
+                } else {
+                    SlotState::Completed
+                }
             } else if is_error {
                 SlotState::Failed
             } else {
                 SlotState::Completed
             };
+            if let Some(cached_result) = cached_result
+                && let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize)
+            {
+                slot.cached_result = Some(cached_result);
+            }
             step.execution.cursor.advance_slot(slot_idx as usize, state);
 
             // Track completed tool count in Act result
@@ -772,7 +816,11 @@ impl StepRecorder {
         }
 
         let event_type = if was_cached {
-            StepEventType::ToolCallSkipped
+            if is_error {
+                StepEventType::ToolCallFailed
+            } else {
+                StepEventType::ToolCallCompleted
+            }
         } else if is_error {
             StepEventType::ToolCallFailed
         } else {
@@ -781,10 +829,18 @@ impl StepRecorder {
 
         let mut payload = serde_json::json!({
             "tool_name": tool_name,
+            "slot_index": slot_idx,
             "elapsed_ms": elapsed_ms,
             "cached": was_cached,
             "is_error": is_error,
         });
+        if let Some(extra) = extra_payload {
+            if let Some(payload_obj) = payload.as_object_mut() {
+                for (key, value) in extra {
+                    payload_obj.insert(key, value);
+                }
+            }
+        }
         if let Some((call_id, idem_key, args_preview)) = slot_meta {
             let call_id = if call_id.is_empty() {
                 fallback_call_id.unwrap_or("")
@@ -837,6 +893,122 @@ impl StepRecorder {
             .push(elapsed_ms);
 
         self.checkpoint_count += 1;
+    }
+
+    fn active_call_id_for_tool(&self, tool_name: &str) -> Option<String> {
+        self.current_step.as_ref().and_then(|step| {
+            step.execution
+                .cursor
+                .slots
+                .iter()
+                .rev()
+                .find(|slot| slot.tool_name == tool_name && slot.state == SlotState::Running)
+                .map(|slot| slot.call_id.clone())
+        })
+    }
+
+    fn resolve_terminal_slot_index(&self, call_id: Option<&str>) -> usize {
+        if let Some(call_id) = call_id.filter(|value| !value.is_empty())
+            && let Some(idx) = self.find_slot_index_by_call_id(call_id)
+        {
+            return idx;
+        }
+
+        if call_id.is_none()
+            && let Some(idx) = self.find_latest_running_slot_index()
+        {
+            return idx;
+        }
+
+        if let Some(idx) = self.find_next_pending_slot_index() {
+            return idx;
+        }
+
+        self.slot_counter.saturating_sub(1) as usize
+    }
+
+    fn find_slot_index_by_call_id(&self, call_id: &str) -> Option<usize> {
+        self.current_step.as_ref().and_then(|step| {
+            step.execution
+                .cursor
+                .slots
+                .iter()
+                .position(|slot| slot.call_id == call_id)
+        })
+    }
+
+    fn find_next_pending_slot_index(&self) -> Option<usize> {
+        self.current_step.as_ref().and_then(|step| {
+            step.execution
+                .cursor
+                .slots
+                .iter()
+                .position(|slot| slot.state == SlotState::Pending)
+        })
+    }
+
+    fn find_latest_running_slot_index(&self) -> Option<usize> {
+        self.current_step.as_ref().and_then(|step| {
+            step.execution
+                .cursor
+                .slots
+                .iter()
+                .rposition(|slot| slot.state == SlotState::Running)
+        })
+    }
+
+    fn ensure_terminal_slot_started(
+        &mut self,
+        slot_idx: usize,
+        tool_name: &str,
+        fallback_call_id: Option<&str>,
+        args_preview: Option<String>,
+        args_preview_redactions: usize,
+    ) {
+        let needs_started = self
+            .current_step
+            .as_ref()
+            .and_then(|step| step.execution.cursor.slots.get(slot_idx))
+            .is_some_and(|slot| slot.state == SlotState::Pending);
+        if !needs_started {
+            return;
+        }
+
+        let call_id = fallback_call_id.unwrap_or("");
+        if let Some(ref mut step) = self.current_step
+            && let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx)
+        {
+            slot.tool_name = tool_name.to_string();
+            slot.call_id = call_id.to_string();
+            slot.state = SlotState::Running;
+            slot.args_preview = args_preview.clone();
+        }
+        self.slot_counter = self.slot_counter.max(slot_idx as u32 + 1);
+
+        let mut started_payload = serde_json::json!({
+            "tool_name": tool_name,
+            "slot_index": slot_idx,
+            "call_id": call_id,
+        });
+        if let Some(ap) = args_preview.as_deref() {
+            started_payload["args_preview"] = serde_json::json!(ap);
+        }
+        if args_preview_redactions > 0 {
+            started_payload["args_preview_redactions"] = serde_json::json!(args_preview_redactions);
+        }
+        self.emit_with_payload(StepEventType::ToolCallStarted, started_payload);
+    }
+
+    fn slot_trace_meta(&self, slot_idx: usize) -> Option<(String, Option<String>, Option<String>)> {
+        self.current_step.as_ref().and_then(|step| {
+            step.execution.cursor.slots.get(slot_idx).map(|s| {
+                (
+                    s.call_id.clone(),
+                    s.idempotency_key.clone(),
+                    s.args_preview.clone(),
+                )
+            })
+        })
     }
 
     /// Record that microcompact or compression fired this turn.
@@ -1433,7 +1605,7 @@ mod tests {
     }
 
     #[test]
-    fn recorder_cached_tool_skipped() {
+    fn recorder_cached_tool_completes_with_cached_marker() {
         let mut rec = StepRecorder::new("sess-1", "task-1");
         rec.begin_turn(0);
         rec.begin_act(1);
@@ -1441,7 +1613,16 @@ mod tests {
         rec.complete_tool("grep", false, 0, true); // cached
 
         let step = rec.current_step().unwrap();
-        assert_eq!(step.execution.cursor.slots[0].state, SlotState::Skipped);
+        assert_eq!(step.execution.cursor.slots[0].state, SlotState::Completed);
+        let last = rec.events().last().unwrap();
+        assert_eq!(last.event_type, StepEventType::ToolCallCompleted);
+        assert_eq!(
+            last.payload
+                .as_ref()
+                .and_then(|payload| payload.get("cached"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
@@ -2086,7 +2267,7 @@ mod tests {
                     event.step_id
                 );
             }
-            if event.event_type == StepEventType::ToolCallSkipped {
+            if event.event_type == StepEventType::ToolCallCompleted {
                 let payload = event.payload.as_ref().unwrap();
                 assert_eq!(
                     payload.get("reason").and_then(serde_json::Value::as_str),
@@ -2095,6 +2276,10 @@ mod tests {
                 assert_eq!(
                     payload.get("cached").and_then(serde_json::Value::as_bool),
                     Some(true)
+                );
+                assert_eq!(
+                    payload.get("output").and_then(serde_json::Value::as_str),
+                    Some("cached output")
                 );
             }
             assert_ne!(
@@ -2191,5 +2376,72 @@ mod tests {
             started_count, 1,
             "begin_tool + complete_tool must produce exactly 1 Started, not 2"
         );
+    }
+
+    #[test]
+    fn parallel_completions_are_correlated_by_call_id() {
+        let mut rec = StepRecorder::new("sess-parallel", "task-1");
+        rec.begin_turn(0);
+        rec.begin_act(3);
+        rec.begin_tool_with_key_and_args_preview("read_file", "call-a", None, Some("a.rs"));
+        rec.begin_tool_with_key_and_args_preview("read_file", "call-b", None, Some("b.rs"));
+        rec.begin_tool_with_key_and_args_preview("read_file", "call-c", None, Some("c.rs"));
+
+        rec.complete_tool_with_result_and_metadata(
+            "read_file",
+            "call-a",
+            Some("a.rs"),
+            false,
+            3,
+            false,
+            "a",
+        );
+        rec.complete_tool_with_result_and_metadata(
+            "read_file",
+            "call-b",
+            Some("b.rs"),
+            false,
+            4,
+            false,
+            "b",
+        );
+        rec.complete_tool_with_result_and_metadata(
+            "read_file",
+            "call-c",
+            Some("c.rs"),
+            false,
+            5,
+            false,
+            "c",
+        );
+
+        let completed: Vec<_> = rec
+            .events()
+            .iter()
+            .filter(|event| event.event_type == StepEventType::ToolCallCompleted)
+            .collect();
+        assert_eq!(completed.len(), 3);
+
+        for (idx, call_id, output) in [
+            (0_u64, "call-a", "a"),
+            (1_u64, "call-b", "b"),
+            (2_u64, "call-c", "c"),
+        ] {
+            let payload = completed[idx as usize].payload.as_ref().unwrap();
+            assert_eq!(
+                payload
+                    .get("slot_index")
+                    .and_then(serde_json::Value::as_u64),
+                Some(idx)
+            );
+            assert_eq!(
+                payload.get("call_id").and_then(serde_json::Value::as_str),
+                Some(call_id)
+            );
+            assert_eq!(
+                payload.get("output").and_then(serde_json::Value::as_str),
+                Some(output)
+            );
+        }
     }
 }

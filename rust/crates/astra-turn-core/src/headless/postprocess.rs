@@ -162,6 +162,7 @@ impl HeadlessStepDeadline {
 /// Mutable handles for [`record_headless_cacheable_success_and_semantic_hint`].
 pub struct HeadlessCacheableRecordCtx<'a> {
     pub result_str: &'a mut String,
+    pub call_id: Option<&'a str>,
     pub turn_index: usize,
     pub idempotency_cache: &'a mut InMemoryIdempotencyCache,
     pub step_recorder: &'a mut StepRecorder,
@@ -198,8 +199,13 @@ pub fn record_headless_cacheable_success_and_semantic_hint(
         cached_at: epoch_ms(),
         context_signature: None,
     };
-    ctx.step_recorder
-        .attach_cached_result(cached_result.clone());
+    if let Some(call_id) = ctx.call_id {
+        ctx.step_recorder
+            .attach_cached_result_for_call(call_id, cached_result.clone());
+    } else {
+        ctx.step_recorder
+            .attach_cached_result(cached_result.clone());
+    }
     ctx.idempotency_cache.record(idem_key, cached_result);
     ctx.semantic_dedup.append_near_duplicate_hint_if_any(
         ctx.result_str,

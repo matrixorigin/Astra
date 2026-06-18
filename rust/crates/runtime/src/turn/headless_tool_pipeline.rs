@@ -997,7 +997,7 @@ mod tests {
         assert_eq!(
             tool_events.len(),
             2,
-            "cached cross-turn short-circuit should emit started+skipped trace events"
+            "cached cross-turn short-circuit should emit started+completed trace events"
         );
         assert!(matches!(
             tool_events[0].0,
@@ -1022,23 +1022,38 @@ mod tests {
 
         assert!(matches!(
             tool_events[1].0,
-            astra_pipeline::step_protocol::StepEventType::ToolCallSkipped
+            astra_pipeline::step_protocol::StepEventType::ToolCallCompleted
         ));
-        let skipped_payload = tool_events[1].1.as_ref().expect("skipped payload");
+        let completed_payload = tool_events[1].1.as_ref().expect("completed payload");
         assert_eq!(
-            skipped_payload.get("reason").and_then(Value::as_str),
+            completed_payload.get("reason").and_then(Value::as_str),
             Some("cached_cross_turn")
         );
         assert_eq!(
-            skipped_payload.get("cached").and_then(Value::as_bool),
+            completed_payload.get("cached").and_then(Value::as_bool),
             Some(true)
         );
+        assert_eq!(
+            completed_payload.get("is_error").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            completed_payload.get("call_id").and_then(Value::as_str),
+            Some("call-read-a-1")
+        );
         assert!(
-            skipped_payload
+            completed_payload
                 .get("args_preview")
                 .and_then(Value::as_str)
                 .is_some_and(|preview| preview.contains("a.txt")),
-            "skipped trace should include args preview, got: {skipped_payload:?}"
+            "completed trace should include args preview, got: {completed_payload:?}"
+        );
+        assert!(
+            completed_payload
+                .get("output")
+                .and_then(Value::as_str)
+                .is_some_and(|output| output.contains("cached a.txt")),
+            "completed cache-hit trace should carry cached output, got: {completed_payload:?}"
         );
     }
 

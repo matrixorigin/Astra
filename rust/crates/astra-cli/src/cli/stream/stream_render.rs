@@ -1282,6 +1282,42 @@ impl<'a> CliSseStreamHost<'a> {
         status: String,
         duration_ms: u64,
     ) -> EdgeToolExecResult {
+        if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
+            let output_summary = self
+                .render
+                .format_output_summary(tool, &output, &status)
+                .map(|summary| summary.text)
+                .unwrap_or_default();
+            let tool_description = self.render.format_tool_description(tool, args);
+            if tool == "agent"
+                && let Some(action) = agent_control_action(args)
+            {
+                self.emit_stream_event(chat_stream::StreamEvent::AgentControlCompleted {
+                    action: action.to_string(),
+                    label: agent_control_label(args, tool_description.clone()),
+                    status: status.clone(),
+                    duration_ms,
+                    output: Some(tool_output_event_text(tool, &output)),
+                    tool_use_id: request_id.to_string(),
+                    agent_id: agent_id_from_output(&output).or_else(|| agent_id_from_args(args)),
+                });
+            }
+            self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
+                name: tool.to_string(),
+                description: tool_description,
+                status: status.clone(),
+                duration_ms,
+                output_summary: if output_summary.is_empty() {
+                    None
+                } else {
+                    Some(output_summary)
+                },
+                output: Some(tool_output_event_text(tool, &output)),
+                tool_use_id: request_id.to_string(),
+                parent_tool_use_id: None,
+            });
+        }
+
         let tool_result_fields = self.edge_tool_result_fields_with_runtime(tool_result_fields);
         let result = EdgeToolExecResult {
             request_id: request_id.to_string(),
@@ -9222,6 +9258,99 @@ mod tests {
             !second.output.contains("v1"),
             "stale cache should not replay old file contents: {}",
             second.output
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn edge_tool_cache_hit_emits_matching_tool_completed_event() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let file = temp.path().join("cached.txt");
+        std::fs::write(&file, "v1\n").expect("seed");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut tool_cache = EdgeToolCache::new(8);
+        let read_args = serde_json::json!({"path": "cached.txt"});
+        let read_sig = tool_dedup_signature("read_file", &read_args);
+        tool_cache.output_cache.insert(
+            read_sig,
+            EdgeToolCacheEntry {
+                output: "v1\n".to_string(),
+                status: "success".to_string(),
+                validation: EdgeToolCacheValidation::FileMtime {
+                    path: file.clone(),
+                    timestamp_ms: path_mtime_ms(&file),
+                },
+            },
+        );
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: std::sync::Arc::clone(&executor),
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: Some(event_tx),
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: None,
+            },
+            80,
+            false,
+        );
+
+        let result = host
+            .execute_tool("cache-read-hit", "read_file", &read_args)
+            .await;
+        assert_eq!(result.status, "success");
+        assert_eq!(result.output, "v1\n");
+
+        let started = event_rx.try_recv().expect("tool started event");
+        let completed = event_rx.try_recv().expect("tool completed event");
+        match started {
+            chat_stream::StreamEvent::ToolStarted {
+                name, tool_use_id, ..
+            } => {
+                assert_eq!(name, "read_file");
+                assert_eq!(tool_use_id, "cache-read-hit");
+            }
+            other => panic!("expected ToolStarted, got {other:?}"),
+        }
+        match completed {
+            chat_stream::StreamEvent::ToolCompleted {
+                name,
+                status,
+                output,
+                tool_use_id,
+                ..
+            } => {
+                assert_eq!(name, "read_file");
+                assert_eq!(status, "success");
+                assert_eq!(tool_use_id, "cache-read-hit");
+                assert!(output.as_deref().is_some_and(|text| text.contains("v1")));
+            }
+            other => panic!("expected ToolCompleted, got {other:?}"),
+        }
+        assert!(
+            event_rx.try_recv().is_err(),
+            "cache hit should emit exactly start and completion"
         );
     }
 

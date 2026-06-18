@@ -196,6 +196,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 &idem_key,
                 HeadlessCacheableRecordCtx {
                     result_str: &mut execution.result_str,
+                    call_id: Some(&execution.id),
                     turn_index: self.ctx.turn_index,
                     idempotency_cache: self.ctx.idempotency_cache,
                     step_recorder: self.ctx.step_recorder,
