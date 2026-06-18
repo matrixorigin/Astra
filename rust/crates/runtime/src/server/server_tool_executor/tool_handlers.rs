@@ -180,8 +180,14 @@ impl ToolHandler<ServerToolExecutor> for MemoryToolHandler {
         &self,
         context: &ServerToolExecutor,
         args: &Value,
-        _cancel_token: Option<&CancellationToken>,
+        cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        // P2-C: Cooperative cancellation check at heavy handler entry
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::ToolResult::error(
+                "Memory tool not executed: run was cancelled".to_string(),
+            );
+        }
         let Some(op) = args.get("action").and_then(Value::as_str) else {
             return astra_tools::ToolResult::error(
                 "Error: missing required parameter `action`. Use one of: remember, recall, expand, forget, update, focus, reflect, profile, feedback".to_string(),
@@ -211,8 +217,14 @@ impl ToolHandler<ServerToolExecutor> for SessionToolHandler {
         &self,
         context: &ServerToolExecutor,
         args: &Value,
-        _cancel_token: Option<&CancellationToken>,
+        cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        // P2-C: Cooperative cancellation check at heavy handler entry
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::ToolResult::error(
+                "Session tool not executed: run was cancelled".to_string(),
+            );
+        }
         crate::server::tool_session_runtime::execute_with_executor(context, args).await
     }
 }
@@ -226,8 +238,14 @@ impl ToolHandler<ServerToolExecutor> for TaskToolHandler {
         &self,
         context: &ServerToolExecutor,
         args: &Value,
-        _cancel_token: Option<&CancellationToken>,
+        cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        // P2-C: Cooperative cancellation check at heavy handler entry
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::ToolResult::error(
+                "Task tool not executed: run was cancelled".to_string(),
+            );
+        }
         crate::server::tool_task_runtime::execute_with_executor(context, args).await
     }
 }
@@ -309,8 +327,14 @@ impl ToolHandler<ServerToolExecutor> for EnterPlanModeToolHandler {
         &self,
         context: &ServerToolExecutor,
         args: &Value,
-        _cancel_token: Option<&CancellationToken>,
+        cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        // P2-C: Cooperative cancellation check at heavy handler entry
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::ToolResult::error(
+                "Enter plan mode not executed: run was cancelled".to_string(),
+            );
+        }
         astra_tools::ToolResult::text(
             execute_enter_plan_mode(
                 context.plan_repo.as_ref(),
@@ -334,8 +358,14 @@ impl ToolHandler<ServerToolExecutor> for ExitPlanModeToolHandler {
         &self,
         context: &ServerToolExecutor,
         args: &Value,
-        _cancel_token: Option<&CancellationToken>,
+        cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        // P2-C: Cooperative cancellation check at heavy handler entry
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::ToolResult::error(
+                "Exit plan mode not executed: run was cancelled".to_string(),
+            );
+        }
         astra_tools::ToolResult::text(
             execute_exit_plan_mode(
                 context.plan_repo.as_ref(),
@@ -551,8 +581,14 @@ impl ToolHandler<ServerToolExecutor> for RollbackSessionStateToolHandler {
         &self,
         context: &ServerToolExecutor,
         args: &Value,
-        _cancel_token: Option<&CancellationToken>,
+        cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        // P2-C: Cooperative cancellation check at heavy handler entry
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::ToolResult::error(
+                "Rollback session state not executed: run was cancelled".to_string(),
+            );
+        }
         tool_result_from_output(
             tool_session_state_rollback::execute_rollback_session_state(
                 RollbackSessionStateContext {
