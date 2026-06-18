@@ -350,14 +350,15 @@ async fn get_plan_unknown_id_returns_404() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn put_plan_with_stale_expected_version_returns_409() {
+async fn put_plan_natural_language_edit_returns_501_without_bumping_version() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
     let (plan_id, version) =
         seed_plan_with_subtasks(&app, &pool, "http-ver-conflict", &["a", "b"]).await;
 
-    // First edit with the correct version → 200.
+    // Natural-language edit has no backend planner/editor yet. It must fail
+    // explicitly instead of pretending success and only bumping the version.
     let (s, b) = request_json(
         app.clone(),
         "PUT",
@@ -368,18 +369,27 @@ async fn put_plan_with_stale_expected_version_returns_409() {
         })),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "first edit: {b}");
-    let v_after_first = b["version"].as_u64().unwrap();
-    assert!(v_after_first > version);
+    assert_eq!(s, StatusCode::NOT_IMPLEMENTED, "edit must be explicit: {b}");
 
-    // Second edit with the stale version → 409.
+    let stored_version: i64 = sqlx::query_scalar("SELECT version FROM plans WHERE plan_id = ?")
+        .bind(&plan_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored_version as u64, version,
+        "unsupported edit must not bump plan version"
+    );
+
+    // Stale clients are still rejected before the unsupported-edit branch so
+    // callers can distinguish concurrency mistakes from missing functionality.
     let (s, _b) = request_json(
         app.clone(),
         "PUT",
         &format!("/plans/{plan_id}"),
         Some(json!({
             "instruction": "stale edit",
-            "expected_version": version
+            "expected_version": version + 1
         })),
     )
     .await;

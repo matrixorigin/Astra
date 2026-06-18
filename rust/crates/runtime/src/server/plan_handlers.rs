@@ -109,6 +109,7 @@ pub(super) enum ApprovalPolicy {
 }
 const MAX_ERROR_LENGTH: usize = 10_000;
 const MAX_ARTIFACT_REF_LENGTH: usize = 1_000;
+const PLAN_EDIT_NOT_IMPLEMENTED_DETAIL: &str = "Natural-language plan editing is not implemented; use explicit plan create, execute, rewind, or redo-step endpoints instead.";
 
 fn validate_attempt(attempt: i32) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     if !(1..=MAX_ATTEMPT).contains(&attempt) {
@@ -891,7 +892,7 @@ pub(super) async fn update_plan_handler(
         ));
     }
 
-    let mut plan_state = state
+    let plan_state = state
         .plan_repo
         .load_owned(&plan_id, &user.user_id)
         .await
@@ -906,35 +907,10 @@ pub(super) async fn update_plan_handler(
         ));
     }
 
-    let session_hint = plan_state.session_hint.clone();
-    let expected = resolve_expected_version(&plan_state, req.expected_version);
-    state
-        .plan_repo
-        .save(&plan_id, &mut plan_state, expected)
-        .await
-        .map_err(map_plan_load_err)?;
-
-    emit_plan_journal(
-        session_hint.as_deref(),
-        astra_services::session_journal::JournalEvent::plan_edit(
-            session_hint.as_deref(),
-            "edit",
-            Some(serde_json::json!({
-                "plan_id": plan_id,
-                "instruction": instruction,
-                "version": plan_state.version,
-            })),
-        ),
-    );
-
-    Ok(Json(PlanResponse {
-        plan_id,
-        phase: PlanPhase::Refining,
-        goal: plan_state.goal,
-        version: plan_state.version,
-        plan: Some(plan_state.plan),
-        capabilities: PlanCapabilities::planning(),
-    }))
+    Err(error_response(
+        StatusCode::NOT_IMPLEMENTED,
+        PLAN_EDIT_NOT_IMPLEMENTED_DETAIL,
+    ))
 }
 
 /// `POST /plans/{plan_id}/execute` — start plan execution.
