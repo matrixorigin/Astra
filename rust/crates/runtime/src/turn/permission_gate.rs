@@ -846,7 +846,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_mode_allows_read_only_bash_by_args() {
+    async fn plan_mode_blocks_shell_even_when_args_look_read_only() {
         let inherited = InheritedPermissions {
             mode: PermissionMode::Auto,
             ..Default::default()
@@ -865,8 +865,8 @@ mod tests {
             )
             .await;
             assert!(
-                is_allowed(&result),
-                "read-only bash command `{command}` must stay available during plan authoring. Got: {result:?}"
+                matches!(result, PermissionCheckResult::Denied { .. }),
+                "shell command `{command}` must be blocked during plan authoring because bash is an unstructured execute surface. Got: {result:?}"
             );
         }
     }

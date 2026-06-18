@@ -71,7 +71,7 @@ use crate::server::tool_transport::{
 use crate::server::tool_work_surface_events::{
     WorkSurfaceEventEmitter, binding_snapshot_events, task_board_snapshot_event,
 };
-use crate::tool_sandbox::{IsolationLevel, SandboxPolicy};
+use crate::tool_sandbox::SandboxPolicy;
 use astra_turn_core::file_edit_journal::FileEditJournal;
 
 use astra_tools::plan_task_mirror;
@@ -261,15 +261,9 @@ impl ServerToolExecutor {
         cloud_base: Option<String>,
         cloud_token: Option<String>,
     ) -> Self {
-        let sandbox_policy = SandboxPolicy {
-            isolation: IsolationLevel::Strict,
-            project_root: workspace_root.clone(),
-            allowed_paths: vec![PathBuf::from("/tmp")],
-            env_allowlist: None,
-            max_execution_secs: 120.0,
-            max_output_bytes: 200_000,
-            network_allowed: false,
-        };
+        let mut sandbox_policy = SandboxPolicy::for_project(workspace_root.clone());
+        sandbox_policy.max_execution_secs = 120.0;
+        sandbox_policy.max_output_bytes = 200_000;
 
         let memoria_client =
             astra_tools::memoria::MemoriaClient::new(cloud_base.clone(), cloud_token.clone());
@@ -2915,9 +2909,11 @@ esac
             .await;
 
         assert!(!result.is_error, "{result:?}");
+        let pwd = std::fs::canonicalize(result.output.trim()).expect("canonical pwd");
+        let workspace_root = std::fs::canonicalize(exec.workspace_root()).expect("canonical root");
         assert!(
-            result.output.contains("/tmp/_astra_ws"),
-            "expected pwd to be inside mount namespace workspace, got: {}",
+            pwd == workspace_root,
+            "expected pwd to be the server-local workspace root, got: {}",
             result.output
         );
         let metadata = result.metadata.expect("binding metadata");

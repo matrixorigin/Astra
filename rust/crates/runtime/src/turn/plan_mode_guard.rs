@@ -6,9 +6,12 @@ use serde_json::Value;
 /// Argument-aware plan-mode write guard shared by server-local execution and
 /// headless permission gating.
 ///
-/// Plan mode is an authoring phase: read-only exploration and plan-control
-/// tools stay available, while write/execute-class tools and server-local
-/// state mutation tools are denied before normal permission escalation.
+/// Plan mode is an authoring phase: structured read-only exploration and
+/// plan-control tools stay available, while write/execute-class tools and
+/// server-local state mutation tools are denied before normal permission
+/// escalation. Shell-style tools are treated as execute-class even when their
+/// current arguments look read-only; argument intent cannot prove absence of
+/// side effects.
 pub(crate) fn is_plan_mode_blocked_tool(tool_name: &str, args: &Value) -> bool {
     if tool_name == "task_stop" {
         return true;
@@ -19,6 +22,9 @@ pub(crate) fn is_plan_mode_blocked_tool(tool_name: &str, args: &Value) -> bool {
     }
     if astra_turn_core::tool::schema::prune::PLAN_MODE_REQUIRED_TOOLS.contains(&tool_name) {
         return false;
+    }
+    if is_unstructured_execute_tool(tool_name) {
+        return true;
     }
     if tool_name == "git" {
         let action = args.get("action").and_then(Value::as_str).unwrap_or("");
@@ -50,6 +56,10 @@ pub(crate) fn is_plan_mode_blocked_tool(tool_name: &str, args: &Value) -> bool {
         cloud_gated_tool_kind_with_args(tool_name, Some(args)),
         Some(CloudGatedToolKind::Write | CloudGatedToolKind::Execute)
     )
+}
+
+fn is_unstructured_execute_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "bash" | "background_shell" | "powershell")
 }
 
 fn is_server_local_mutation_tool(tool_name: &str) -> bool {

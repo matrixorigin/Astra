@@ -271,6 +271,10 @@ mod tests {
     fn plan_mode_blocks_all_write_and_execute_class_tools() {
         for (tool, args) in [
             ("bash", json!({"command": "touch plan.txt"})),
+            ("bash", json!({"command": "git status --short"})),
+            ("bash", json!({"command": "ls src"})),
+            ("background_shell", json!({"command": "ls src"})),
+            ("powershell", json!({"command": "Get-ChildItem"})),
             ("write_file", json!({"path": "plan.txt", "content": "x"})),
             (
                 "str_replace",
@@ -298,8 +302,6 @@ mod tests {
     #[test]
     fn plan_mode_allows_read_only_exploration_by_args() {
         for (tool, args) in [
-            ("bash", json!({"command": "git status --short"})),
-            ("bash", json!({"command": "ls src"})),
             ("read_file", json!({"path": "src/lib.rs"})),
             ("grep", json!({"pattern": "needle", "path": "src"})),
             ("glob", json!({"pattern": "**/*.rs"})),

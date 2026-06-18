@@ -777,6 +777,8 @@ pub fn evaluate_permission(
     if explicit_approval_reason(tool_name, args).is_none()
         && is_read_only_tool_with_args(tool_name, Some(args))
         && ctx.mode() != PermissionMode::Deny
+        && !(ctx.mode() == PermissionMode::Plan
+            && is_plan_mode_unstructured_execute_tool(tool_name))
         && ctx.inherited.is_tool_allowed_by_allowlist(tool_name)
     {
         let decision = HardDecision::Allow;
@@ -1160,6 +1162,10 @@ pub fn evaluate_permission(
         will_save,
         risk_tags,
     )
+}
+
+fn is_plan_mode_unstructured_execute_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "bash" | "background_shell" | "powershell")
 }
 
 /// Preview the rule that an "Always allow" action would persist for this call.
@@ -1727,6 +1733,22 @@ mod tests {
             &ctx,
         );
         assert!(matches!(mutating_bash.decision, HardDecision::Deny { .. }));
+
+        let read_only_bash = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": "git status --short"}),
+            &ctx,
+        );
+        assert!(
+            matches!(read_only_bash.decision, HardDecision::Deny { .. }),
+            "plan mode must deny shell execution even when args look read-only: {read_only_bash:?}"
+        );
+        assert_eq!(
+            read_only_bash.source,
+            DecisionSource::Mode {
+                mode: "plan".to_string()
+            }
+        );
     }
 
     #[test]
