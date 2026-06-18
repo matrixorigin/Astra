@@ -633,7 +633,7 @@ impl StepRecorder {
         let slot_meta = self.slot_trace_meta(slot_idx);
 
         if let Some(ref mut step) = self.current_step {
-            if let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize) {
+            if let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx) {
                 slot.state = SlotState::Skipped;
             }
             if let Some(StepResult::Act {
@@ -680,7 +680,7 @@ impl StepRecorder {
     pub fn attach_cached_result(&mut self, cached: CachedToolResult) {
         let slot_idx = self.resolve_terminal_slot_index(None);
         if let Some(ref mut step) = self.current_step
-            && let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize)
+            && let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx)
         {
             slot.cached_result = Some(cached);
         }
@@ -690,7 +690,7 @@ impl StepRecorder {
     pub fn attach_cached_result_for_call(&mut self, call_id: &str, cached: CachedToolResult) {
         let slot_idx = self.resolve_terminal_slot_index(Some(call_id));
         if let Some(ref mut step) = self.current_step
-            && let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize)
+            && let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx)
         {
             slot.cached_result = Some(cached);
         }
@@ -799,11 +799,11 @@ impl StepRecorder {
                 SlotState::Completed
             };
             if let Some(cached_result) = cached_result
-                && let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize)
+                && let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx)
             {
                 slot.cached_result = Some(cached_result);
             }
-            step.execution.cursor.advance_slot(slot_idx as usize, state);
+            step.execution.cursor.advance_slot(slot_idx, state);
 
             // Track completed tool count in Act result
             if let Some(StepResult::Act {
@@ -834,11 +834,11 @@ impl StepRecorder {
             "cached": was_cached,
             "is_error": is_error,
         });
-        if let Some(extra) = extra_payload {
-            if let Some(payload_obj) = payload.as_object_mut() {
-                for (key, value) in extra {
-                    payload_obj.insert(key, value);
-                }
+        if let Some(extra) = extra_payload
+            && let Some(payload_obj) = payload.as_object_mut()
+        {
+            for (key, value) in extra {
+                payload_obj.insert(key, value);
             }
         }
         if let Some((call_id, idem_key, args_preview)) = slot_meta {

@@ -421,7 +421,8 @@ impl From<String> for ClassifiedError {
 ///
 /// **Priority order matters** — more specific patterns first:
 /// ResourceLimit > DatabaseError > ToolTimeout > Network > Auth >
-/// ToolUnavailable > ToolInvalidArgs > ToolNotFound > Unknown.
+/// ToolInvalidArgs(call contract) > ToolUnavailable >
+/// ToolInvalidArgs(generic) > ToolNotFound > Unknown.
 /// Do not reorder blocks without verifying all tests still pass.
 #[must_use]
 pub fn classify_tool_output(error_str: &str) -> ErrorKind {
@@ -535,6 +536,14 @@ pub fn classify_tool_output(error_str: &str) -> ErrorKind {
         return ErrorKind::Auth;
     }
 
+    // Tool-call contract errors are caller-fixable: wrong field, wrong
+    // parameter combination, or a tool called outside the current turn's
+    // advertised tool contract. They must not quarantine the tool as
+    // unavailable; the same tool can succeed with corrected arguments.
+    if is_tool_call_contract_error(&lower) {
+        return ErrorKind::ToolInvalidArgs;
+    }
+
     // Unavailable — check BEFORE "not found" because "command not found" should
     // be ToolUnavailable, not ToolNotFound.
     if lower.contains("not installed")
@@ -542,7 +551,6 @@ pub fn classify_tool_output(error_str: &str) -> ErrorKind {
         || lower.contains("not configured")
         || lower.contains("command not found")
         || lower.contains("no such command")
-        || lower.contains("unsupported")
         || lower.contains("not supported")
         || lower.contains("not implemented")
         || lower.contains("unavailable")
@@ -566,6 +574,7 @@ pub fn classify_tool_output(error_str: &str) -> ErrorKind {
         || lower.contains("old_str not found")
         || lower.contains("str_replace failed")
         || lower.contains("sandbox")
+        || lower.contains("unsupported")
     {
         return ErrorKind::ToolInvalidArgs;
     }
@@ -585,6 +594,68 @@ pub fn classify_tool_output(error_str: &str) -> ErrorKind {
     }
 
     ErrorKind::Unknown
+}
+
+fn is_tool_call_contract_error(lower: &str) -> bool {
+    if lower.contains("not available in this turn")
+        && (lower.contains("tools[]")
+            || lower.contains("visible")
+            || lower.contains("deferred_tools")
+            || lower.contains("tool_search"))
+    {
+        return true;
+    }
+
+    if lower.contains("unknown field")
+        || lower.contains("valid fields")
+        || lower.contains("required field")
+        || lower.contains("unsupported field")
+    {
+        return true;
+    }
+
+    let contract_violation = lower.contains("unsupported")
+        || lower.contains("not supported")
+        || lower.contains("only supports")
+        || lower.contains("only accepts")
+        || lower.contains("unknown")
+        || lower.contains("missing")
+        || lower.contains("invalid")
+        || lower.contains("malformed")
+        || lower.contains("unexpected")
+        || lower.contains("required")
+        || lower.contains("must be")
+        || lower.contains("mutually exclusive")
+        || lower.contains("cannot be used with");
+
+    contract_violation && has_tool_call_contract_subject(lower)
+}
+
+fn has_tool_call_contract_subject(lower: &str) -> bool {
+    [
+        "field",
+        "argument",
+        "arg",
+        "parameter",
+        "param",
+        "property",
+        "option",
+        "flag",
+        "key",
+        "value",
+        "payload",
+        "schema",
+        "input",
+        "json",
+        "action",
+        "status",
+        "mode",
+        "format",
+        "enum",
+        "type",
+    ]
+    .iter()
+    .any(|word| contains_word(lower, word))
 }
 
 /// True when `word` appears as a standalone word in `haystack` (already
@@ -843,9 +914,37 @@ mod tests {
                 "Error: file is too large (97716 bytes)",
                 ErrorKind::ToolInvalidArgs,
             ),
+            (
+                "Error: unknown field `offset` for read_file. Valid fields: path, start_line, end_line, outline.",
+                ErrorKind::ToolInvalidArgs,
+            ),
+            (
+                "Error: field 'subtask_id' only supports new_status updates; unsupported with subtask_id: reason",
+                ErrorKind::ToolInvalidArgs,
+            ),
+            (
+                "Error: unsupported output_mode 'xml'. Use 'content', 'files_with_matches', or 'count'.",
+                ErrorKind::ToolInvalidArgs,
+            ),
+            (
+                "Error: Tool 'task' is not available in this turn. Call only tools visible in this turn's `tools[]`.",
+                ErrorKind::ToolInvalidArgs,
+            ),
+            (
+                "Error: Tool 'agent_fanout' is not available in this turn yet. It appears in `<deferred_tools>`, so first call `tool_search`.",
+                ErrorKind::ToolInvalidArgs,
+            ),
             // ToolUnavailable
             ("command not found: rg", ErrorKind::ToolUnavailable),
             ("bash: rg: command not found", ErrorKind::ToolUnavailable),
+            (
+                "run_script is not available on this platform (requires Unix domain sockets)",
+                ErrorKind::ToolUnavailable,
+            ),
+            (
+                "restore_snapshot_state is not supported for this store",
+                ErrorKind::ToolUnavailable,
+            ),
             // Unknown
             (
                 "something completely unexpected happened",

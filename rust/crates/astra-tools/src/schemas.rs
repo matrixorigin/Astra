@@ -1047,7 +1047,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
         ## When NOT to Use\n\
         Single edit/command/answer, pure info, or trivial work.\n\
         One task per outcome: NOT one umbrella task. Broad work -> 3-7 leaf tasks. Mark first task `in_progress` BEFORE beginning work. Keep exactly ONE task as `in_progress` at a time. Finish immediately: `completed`, `failed` + `error_message`, or use `archive` for old history.\n\
-        Field notes: `title` is outcome; `active_form` is spinner text; `metadata` null deletes a key; `add_blocks`/`add_blocked_by` work on create/update. `subtasks` is create-only; update subtask progress with `subtask_id` + `new_status`.\n\
+        Field notes: `title` is outcome; `active_form` is spinner text; `metadata` null deletes a key; `add_blocks`/`add_blocked_by` work on create/update. `subtasks` is create-only; update subtask progress with only `task_id` + `subtask_id` + `new_status`.\n\
         <example>Build reimbursements: create backend, API, UI, verify tasks; mark backend in_progress BEFORE beginning work.</example>",
                 "parameters": {
                     "type": "object",
@@ -1061,7 +1061,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "task_id": {"type": "string", "description": "(update/get/stop/adopt/archive) Task id. Single-task archive stays in the current session."},
                         "new_status": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","deleted"], "description": "(update) Status. Only one parent task may be in_progress; `paused` frees that slot; `deleted` removes the task."},
                         "status_filter": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","archived","all","active"], "description": "(list) `active` = pending + in_progress + paused."},
-                        "subtask_id": {"type": "string", "description": "(update) Specific subtask id."},
+                        "subtask_id": {"type": "string", "description": "(update) Specific subtask id. When present, only send task_id + subtask_id + new_status."},
                         "active_form": {"type": "string", "description": "(create/update) Spinner text while in_progress."},
                         "owner": {"type": "string", "description": "(create/update) Task owner."},
                         "metadata": {"type": "object", "description": "(create/update) Arbitrary key-value pairs; null deletes a key on update."},
@@ -1085,7 +1085,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                 "required": ["id", "title"]
                             }
                         },
-                        "reason": {"type": "string", "description": "(update/stop/archive) Human reason. On failed update it is stored as error_message when error_message is omitted."},
+                        "reason": {"type": "string", "description": "(parent update/stop/archive only; never with subtask_id) Human reason. On failed parent update it is stored as error_message when error_message is omitted."},
                         "error_message": {"type": "string", "description": "(update) Failure/cancel reason to include when setting new_status='failed' or new_status='cancelled'."}
                     },
                     "required": ["action"],
@@ -1625,8 +1625,23 @@ mod tests {
         );
         assert!(
             desc.contains("`subtasks` is create-only")
+                && desc.contains("only `task_id` + `subtask_id` + `new_status`")
                 && desc.contains("`subtask_id` + `new_status`"),
             "task schema should explain that subtasks are create-only and subtask progress uses update fields: {desc}"
+        );
+        let subtask_id_desc = properties["subtask_id"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            subtask_id_desc.contains("only send task_id + subtask_id + new_status"),
+            "subtask_id should explain the narrow subtask-update shape: {subtask_id_desc}"
+        );
+        let reason_desc = properties["reason"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            reason_desc.contains("never with subtask_id"),
+            "reason should not be advertised for subtask updates: {reason_desc}"
         );
         assert!(
             properties["status_filter"]

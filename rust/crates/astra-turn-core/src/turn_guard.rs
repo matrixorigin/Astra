@@ -1003,6 +1003,36 @@ mod tests {
     }
 
     #[test]
+    fn tool_contract_errors_do_not_deprioritize_tool() {
+        let mut guard = TurnGuard::new();
+        let errors = [
+            "Error: field 'subtask_id' only supports new_status updates; unsupported with subtask_id: reason",
+            "Error: Tool 'task' is not available in this turn. Call only tools visible in this turn's `tools[]`.",
+            "Error: unsupported output_mode 'xml'. Use 'content', 'files_with_matches', or 'count'.",
+        ];
+
+        for error in errors {
+            let quality = guard.record_tool_result("task", error);
+            assert_eq!(quality, super::result_quality::ResultQuality::Error);
+        }
+
+        let health = guard
+            .health
+            .get("task")
+            .expect("task health should be tracked");
+        assert_eq!(health.total_calls, errors.len());
+        assert_eq!(health.total_failures, errors.len());
+        assert_eq!(
+            health.consecutive_failures, 0,
+            "caller-fixable contract errors must not count toward tool quarantine"
+        );
+        assert!(
+            !guard.health.is_deprioritized("task"),
+            "bad tool-call shape must not hide a healthy task tool"
+        );
+    }
+
+    #[test]
     fn empty_result_tracked_not_deprioritized() {
         let mut guard = TurnGuard::new();
         // 3 empty results → NOT deprioritized (just empty)
