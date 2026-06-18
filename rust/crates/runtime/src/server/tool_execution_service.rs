@@ -11,12 +11,11 @@ use super::tool_execution_binding::{
     ToolTransportKind, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
 };
 use super::tool_external_transport::{
-    GatewayRelayTransport, SandboxResidentAgentTransport, execute_gateway_relay,
-    execute_sandbox_resident_agent,
+    execute_gateway_relay, execute_sandbox_resident_agent, ExternalTransport,
 };
-use super::tool_local_transport::{ServerLocalToolTransport, execute_local_transport};
-use super::tool_route_boundary::{ToolRouteBoundary, route_binding_event_fields};
-use super::tool_route_selection::{ToolExecutionRouteKind, routing_decision};
+use super::tool_local_transport::{execute_local_transport, ServerLocalToolTransport};
+use super::tool_route_boundary::{route_binding_event_fields, ToolRouteBoundary};
+use super::tool_route_selection::{routing_decision, ToolExecutionRouteKind};
 use super::tool_transport_errors::{
     capability_denied_result, unsupported_workspace_executor_result,
 };
@@ -33,8 +32,8 @@ pub struct ToolExecutionServiceBuilder {
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
-    gateway_relay_transport: Option<Arc<dyn GatewayRelayTransport>>,
-    sandbox_resident_agent_transport: Option<Arc<dyn SandboxResidentAgentTransport>>,
+    gateway_relay_transport: Option<Arc<dyn ExternalTransport>>,
+    sandbox_resident_agent_transport: Option<Arc<dyn ExternalTransport>>,
     tool_registry: astra_runtime_env::ToolRegistry,
     disabled_tools: Arc<RwLock<HashSet<String>>>,
 }
@@ -73,14 +72,14 @@ impl ToolExecutionServiceBuilder {
         self
     }
 
-    pub fn gateway_relay_transport(mut self, transport: Arc<dyn GatewayRelayTransport>) -> Self {
+    pub fn gateway_relay_transport(mut self, transport: Arc<dyn ExternalTransport>) -> Self {
         self.gateway_relay_transport = Some(transport);
         self
     }
 
     pub fn sandbox_resident_agent_transport(
         mut self,
-        transport: Arc<dyn SandboxResidentAgentTransport>,
+        transport: Arc<dyn ExternalTransport>,
     ) -> Self {
         self.sandbox_resident_agent_transport = Some(transport);
         self
@@ -114,8 +113,8 @@ pub struct ToolExecutionService {
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
-    gateway_relay_transport: Option<Arc<dyn GatewayRelayTransport>>,
-    sandbox_resident_agent_transport: Option<Arc<dyn SandboxResidentAgentTransport>>,
+    gateway_relay_transport: Option<Arc<dyn ExternalTransport>>,
+    sandbox_resident_agent_transport: Option<Arc<dyn ExternalTransport>>,
     tool_registry: astra_runtime_env::ToolRegistry,
     /// Runtime-disabled tools (admin API). Checked before dispatch.
     disabled_tools: Arc<RwLock<HashSet<String>>>,

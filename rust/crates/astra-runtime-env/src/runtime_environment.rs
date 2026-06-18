@@ -363,6 +363,20 @@ impl RuntimeToolInvocation {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeExitSemantics {
+    /// The tool completed successfully with no semantic anomalies.
+    Normal,
+    /// The tool completed, but the output indicates a domain-negative result
+    /// (e.g. `grep` found no match, `diff` showed differences).
+    DomainNegative,
+    /// The tool failed with a non-recoverable error.
+    ToolError,
+    /// The tool result is ambiguous — side effects may have occurred.
+    SideEffectUncertain,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeToolOutcome {
     pub call_id: String,
@@ -373,6 +387,9 @@ pub struct RuntimeToolOutcome {
     pub execution_started: bool,
     pub side_effects_maybe: bool,
     pub policy_evidence: RuntimePolicyEvidence,
+    /// Exit semantics from tool execution (e.g. grep no-match, diff found).
+    /// When `Some`, carries a domain classification of the tool outcome.
+    pub exit_semantics: Option<RuntimeExitSemantics>,
 }
 
 impl RuntimeToolOutcome {
@@ -395,6 +412,7 @@ impl RuntimeToolOutcome {
             execution_started: true,
             side_effects_maybe: false,
             policy_evidence,
+            exit_semantics: None,
         }
     }
 
@@ -417,6 +435,7 @@ impl RuntimeToolOutcome {
             execution_started: true,
             side_effects_maybe: true,
             policy_evidence,
+            exit_semantics: None,
         }
     }
 }
@@ -1061,11 +1080,13 @@ mod tests {
             8_388_608
         );
         assert_eq!(
-            outcome.metadata[TOOL_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT]["binding"]["runtime"]["session_manager"],
+            outcome.metadata[TOOL_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT]["binding"]["runtime"]
+                ["session_manager"],
             "astra_managed"
         );
         assert_eq!(
-            outcome.metadata[TOOL_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT]["binding"]["runtime"]["isolation_backend"],
+            outcome.metadata[TOOL_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT]["binding"]["runtime"]
+                ["isolation_backend"],
             "g_visor_runsc"
         );
         assert_eq!(

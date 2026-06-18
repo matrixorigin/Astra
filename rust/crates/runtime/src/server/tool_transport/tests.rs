@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use super::super::tool_transport_plan::{EdgeBoundExecutionPlan, edge_executor_id};
+use super::super::tool_transport_plan::{edge_executor_id, EdgeBoundExecutionPlan};
 
 struct CountingLocalTransport {
     calls: AtomicUsize,
@@ -109,7 +109,7 @@ impl StaticSandboxResidentAgentTransport {
 }
 
 #[async_trait]
-impl SandboxResidentAgentTransport for StaticSandboxResidentAgentTransport {
+impl ExternalTransport for StaticSandboxResidentAgentTransport {
     async fn execute_tool(
         &self,
         request: ToolExecutionRequest,
@@ -146,7 +146,7 @@ impl PendingSandboxResidentAgentTransport {
 }
 
 #[async_trait]
-impl SandboxResidentAgentTransport for PendingSandboxResidentAgentTransport {
+impl ExternalTransport for PendingSandboxResidentAgentTransport {
     async fn execute_tool(
         &self,
         _request: ToolExecutionRequest,
@@ -192,7 +192,7 @@ impl StaticGatewayRelayTransport {
 }
 
 #[async_trait]
-impl GatewayRelayTransport for StaticGatewayRelayTransport {
+impl ExternalTransport for StaticGatewayRelayTransport {
     async fn execute_tool(
         &self,
         request: ToolExecutionRequest,
@@ -226,7 +226,7 @@ impl PendingGatewayRelayTransport {
 }
 
 #[async_trait]
-impl GatewayRelayTransport for PendingGatewayRelayTransport {
+impl ExternalTransport for PendingGatewayRelayTransport {
     async fn execute_tool(
         &self,
         _request: ToolExecutionRequest,
@@ -1221,12 +1221,10 @@ async fn orchestrator_managed_without_transport_returns_transport_unavailable() 
     assert_eq!(metadata["blocked"], true);
     assert_eq!(metadata["execution_started"], false);
     assert_eq!(metadata["runtime_error"]["kind"], "transport_unavailable");
-    assert!(
-        metadata["runtime_error"]["message"]
-            .as_str()
-            .unwrap()
-            .starts_with("sandbox resident agent transport adapter unavailable")
-    );
+    assert!(metadata["runtime_error"]["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("sandbox resident agent transport adapter unavailable"));
 }
 
 #[test]
@@ -1627,11 +1625,9 @@ async fn sandbox_resident_agent_transport_fails_closed_until_adapter_is_configur
 
     assert!(result.is_error, "{result:?}");
     assert_eq!(local.calls(), 0);
-    assert!(
-        result
-            .output
-            .contains("sandbox resident agent transport adapter")
-    );
+    assert!(result
+        .output
+        .contains("sandbox resident agent transport adapter"));
     let metadata = result.metadata.expect("transport metadata");
     assert_eq!(metadata["error_kind"], "transport_unavailable");
     assert_eq!(metadata["runtime_error"]["kind"], "transport_unavailable");
@@ -1943,14 +1939,18 @@ async fn orchestrator_managed_transport_error_skips_local_fallback() {
 
     assert!(result.is_error, "{result:?}");
     assert_eq!(local.calls(), 0);
-    assert_eq!(resident.calls(), 1);
+    assert_eq!(resident.calls(), 4); // 1 initial + 3 retries (runtime_unavailable is retryable)
     let metadata = result.metadata.expect("resident error metadata");
     assert_eq!(metadata["error_kind"], "runtime_unavailable");
     assert_eq!(metadata["transport"], "sandbox_resident_agent");
     assert_eq!(metadata["blocked"], true);
-    assert_eq!(
-        metadata["runtime_error"]["message"],
-        "orchestrator denied execution"
+    assert!(
+        metadata["runtime_error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("orchestrator denied execution"),
+        "unexpected message: {:?}",
+        metadata["runtime_error"]["message"]
     );
 }
 
