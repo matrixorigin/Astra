@@ -467,6 +467,11 @@ impl CapabilityResolver {
             | RequiredWorkspace::ReadWrite => {}
         }
 
+        // NOTE: filesystem_read/write policy checks are defense-in-depth.
+        // The workspace capability (workspace.readable / workspace.writable) computed in
+        // EffectiveCapabilitySet::from_bindings already encodes the policy_filesystem checks.
+        // Re-checking here ensures each requirement check is independently correct even if
+        // the workspace capability derivation changes.
         if spec.required.filesystem_read {
             // Policy-level check: workspace must be readable per policy
             if !capabilities.policy.filesystem_read {

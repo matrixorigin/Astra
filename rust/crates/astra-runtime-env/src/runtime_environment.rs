@@ -776,7 +776,13 @@ mod tests {
             &self,
             mut spec: RuntimeSessionSpec,
         ) -> Result<RuntimeSessionHandle, RuntimeError> {
-            spec.binding.runtime = self.runtime.clone();
+            spec.binding = RunBinding::resolve(
+                spec.binding.workspace.clone(),
+                spec.binding.executor.clone(),
+                self.runtime.clone(),
+                spec.binding.policy.clone(),
+                &self.registry,
+            );
             validate_runtime_session_spec(&self.registry, &spec)?;
             let mut live_sessions = self.live_sessions.lock().unwrap_or_else(|e| e.into_inner());
             if live_sessions.len() >= self.capacity {
@@ -944,7 +950,16 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_session_rejects_policy_runtime_mismatch_before_execution() {
-        let binding = gvisor_binding();
+        // Use strict_orchestrator policy which requires GVisor isolation.
+        // host_process runtime cannot satisfy GVisor.
+        let registry = ToolRegistry::builtins();
+        let binding = RunBinding::resolve(
+            WorkspaceBinding::edge_workspace("/workspace/project", WorkspaceAuthority::ReadWrite),
+            ExecutorBinding::local_cli(),
+            RuntimeBinding::gvisor("gvisor-1"),
+            PolicyIntent::strict_orchestrator(),
+            &registry,
+        );
         let runtime = FakeRuntime::new(RuntimeBinding::host_process("host-1"));
         let spec =
             RuntimeSessionSpec::new("session-1", "run-1", binding).with_requested_tools(["bash"]);
@@ -1046,11 +1061,13 @@ mod tests {
             8_388_608
         );
         assert_eq!(
-            outcome.metadata[TOOL_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT]["binding"]["runtime"]["session_manager"],
+            outcome.metadata[TOOL_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT]["binding"]["runtime"]
+                ["session_manager"],
             "astra_managed"
         );
         assert_eq!(
-            outcome.metadata[TOOL_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT]["binding"]["runtime"]["isolation_backend"],
+            outcome.metadata[TOOL_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT]["binding"]["runtime"]
+                ["isolation_backend"],
             "g_visor_runsc"
         );
         assert_eq!(
