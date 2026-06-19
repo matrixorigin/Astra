@@ -18,6 +18,10 @@ use astra_services::session_journal;
 use clap::Parser;
 use crossterm::style::Stylize;
 
+// Single source of truth: re-export from lib.rs so `crate::DEFERRED_INPUT_FINGERPRINT_SEP`
+// resolves identically in both the lib-compiled and binary-compiled copies of cli/tui modules.
+pub(crate) use astra_cli::DEFERRED_INPUT_FINGERPRINT_SEP;
+
 mod edge_tools;
 mod git_branch_cache;
 mod manifest_loader;

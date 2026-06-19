@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -16,6 +17,7 @@ pub(crate) enum TuiEvent {
 }
 
 pub(crate) struct TuiEventStream {
+    pending: VecDeque<TuiEvent>,
     crossterm_stream: EventStream,
     draw_stream: BroadcastStream<()>,
     poll_draw_first: bool,
@@ -24,10 +26,15 @@ pub(crate) struct TuiEventStream {
 impl TuiEventStream {
     pub(crate) fn new(draw_rx: broadcast::Receiver<()>) -> Self {
         Self {
+            pending: VecDeque::new(),
             crossterm_stream: EventStream::new(),
             draw_stream: BroadcastStream::new(draw_rx),
             poll_draw_first: false,
         }
+    }
+
+    pub(crate) fn push_front(&mut self, event: TuiEvent) {
+        self.pending.push_front(event);
     }
 
     fn poll_crossterm_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TuiEvent>> {
@@ -108,6 +115,10 @@ impl Stream for TuiEventStream {
     type Item = TuiEvent;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(event) = self.pending.pop_front() {
+            return Poll::Ready(Some(event));
+        }
+
         let draw_first = self.poll_draw_first;
         self.poll_draw_first = !self.poll_draw_first;
 

@@ -24,6 +24,20 @@ pub(crate) fn composer_surface_style() -> Style {
     Style::default().bg(theme.selected_bg)
 }
 
+/// Background for the deferred-follow-up queue panel.
+///
+/// Deliberately tinted *differently* from the composer surface so the
+/// queued-input band reads as a distinct region above the live input
+/// box, not as more of the same surface. A touch darker than the
+/// composer surface on dark backgrounds, a touch lighter on light ones.
+pub(crate) fn queue_panel_style() -> Style {
+    if let Some(bg) = default_bg() {
+        return Style::default().bg(queue_panel_bg(bg));
+    }
+    let theme = super::theme::current();
+    Style::default().bg(theme.selected_bg)
+}
+
 pub(crate) fn footer_surface_style() -> Style {
     if let Some(bg) = default_bg() {
         return Style::default().bg(footer_surface_bg(bg));
@@ -66,6 +80,21 @@ fn composer_surface_bg(terminal_bg: (u8, u8, u8)) -> Color {
         ((0, 0, 0), 0.06)
     } else {
         ((255, 255, 255), 0.34)
+    };
+    best_color(blend(top, terminal_bg, alpha))
+}
+
+/// Distinct tint for the queue panel. Sits between the raw terminal
+/// background and the composer surface in prominence: more present than
+/// bare bg (so the band reads as a real region, not a gap) but less
+/// lifted than the live composer (so the user's typing surface stays the
+/// focal point). Previously 0.18 white was too close to a black terminal
+/// bg — the panel vanished and the queued content looked unanchored.
+fn queue_panel_bg(terminal_bg: (u8, u8, u8)) -> Color {
+    let (top, alpha) = if is_light(terminal_bg) {
+        ((0, 0, 0), 0.10)
+    } else {
+        ((255, 255, 255), 0.26)
     };
     best_color(blend(top, terminal_bg, alpha))
 }

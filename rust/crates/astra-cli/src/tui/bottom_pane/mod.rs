@@ -48,6 +48,9 @@ use footer::Footer;
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::Widget,
 };
 use skill_popup::SkillPopup;
 use view::{BottomPaneView, CancellationEvent};
@@ -62,6 +65,7 @@ use crate::cli::chat_stream::ApprovalResponse;
 use ask_user_view::AskUserView;
 use std::sync::Arc;
 use tokio::sync::oneshot;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub(crate) struct BottomPane {
     pub composer: ChatComposer,
@@ -78,6 +82,30 @@ pub(crate) struct BottomPane {
     mention_range: Option<(usize, usize)>,
     file_provider: Option<Arc<dyn FileProvider>>,
     approval_queue: ApprovalQueue,
+    queued_followups: std::collections::VecDeque<String>,
+    /// True when the user pressed Esc/Ctrl+C to interrupt the current
+    /// run and the cancel RPC is in flight. The queue panel reflects
+    /// this intermediate state so the user isn't stuck wondering why
+    /// "Esc sends now" isn't taking effect immediately.
+    pub(crate) interrupt_pending: bool,
+}
+
+/// Outcome of popping the deferred follow-up queue on an applied signal.
+/// The server emits `__deferred_input_applied__:<preview>` per dequeued
+/// item; the client recomputes the preview from its head and compares so
+/// a missed/extra/reordered event surfaces as a *visible* failure instead
+/// of silently committing the wrong text as the user's own input.
+#[derive(Debug, PartialEq)]
+pub(crate) enum DeferredFollowupPop {
+    /// Server preview matched our head — safe to commit verbatim.
+    Applied(String),
+    /// Queue was empty when an applied signal arrived — stray/late event.
+    Empty,
+    /// Server preview didn't match our head — local and server queues are
+    /// out of sync. The entire local queue is dropped (we can no longer
+    /// trust which items were applied) and returned for the caller to
+    /// surface as a visible, recoverable warning.
+    Desync { dropped: Vec<String> },
 }
 
 impl BottomPane {
@@ -95,6 +123,8 @@ impl BottomPane {
             mention_range: None,
             file_provider: None,
             approval_queue: ApprovalQueue::new(),
+            queued_followups: std::collections::VecDeque::new(),
+            interrupt_pending: false,
         }
     }
 
@@ -168,6 +198,86 @@ impl BottomPane {
     pub fn handle_paste(&mut self, text: &str) {
         self.composer.handle_paste(text);
         self.sync_popups();
+    }
+
+    /// Queue a follow-up for the next execution boundary. Returns true
+    /// if text was actually enqueued (non-empty after trimming). Empty
+    /// input is explicitly ignored — it would produce a no-op server round
+    /// trip and a confusing empty queued row in the panel.
+    pub fn queue_deferred_followup(&mut self, text: impl Into<String>) -> bool {
+        let text = text.into();
+        if !text.trim().is_empty() {
+            self.queued_followups.push_back(text);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Pop the head of the deferred queue, but only after verifying it
+    /// matches the server's status-line fingerprint. The server dequeues
+    /// deferred inputs in strict FIFO order and emits exactly one
+    /// `__deferred_input_applied__:<preview>` status line per dequeued
+    /// item; the preview is the server's own truncation of that item's
+    /// text. By recomputing it from the head and comparing, we detect a
+    /// missed/extra/reordered event (desync) instead of silently popping
+    /// the *wrong* head and committing it to chat history as the user's
+    /// input.
+    ///
+    /// - Match → pop head, return full text for verbatim commit.
+    /// - Mismatch with a non-empty queue → the contract is broken; drop
+    ///   the queue and surface what was lost as `Desync`, so the failure
+    ///   is *visible* and recoverable rather than *silent corruption*.
+    ///   The caller commits the dropped previews as a warning cell.
+    /// - Empty queue + applied signal → stray/late event; `Empty`.
+    pub fn pop_applied_deferred_followup(&mut self, expected_preview: &str) -> DeferredFollowupPop {
+        if self.queued_followups.is_empty() {
+            return DeferredFollowupPop::Empty;
+        }
+        let head = self.queued_followups.pop_front().unwrap();
+        let head_fingerprint = deferred_input_preview_fingerprint(&head);
+        if head_fingerprint == expected_preview {
+            return DeferredFollowupPop::Applied(head);
+        }
+        // Desync: the server's preview doesn't match our head. Put it back
+        // and drop the entire local queue — we no longer know which items
+        // were applied, so committing any of them would risk the wrong
+        // text appearing as the user's own words in chat history.
+        tracing::warn!(
+            target: "astra_cli::tui",
+            expected = %expected_preview,
+            head_fingerprint = %head_fingerprint,
+            queue_depth = self.queued_followups.len() + 1,
+            "deferred follow-up desync: server preview did not match local head; \
+             dropping local queue to avoid committing the wrong user input"
+        );
+        let mut dropped = vec![head];
+        dropped.extend(self.queued_followups.drain(..));
+        DeferredFollowupPop::Desync { dropped }
+    }
+
+    /// Restore queued-but-unapplied input into the composer at run end,
+    /// preserving any draft the user is currently editing by appending
+    /// beneath it. Never silently drop user input.
+    pub fn restore_into_composer(&mut self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        if self.composer.is_empty() {
+            self.composer.set_text(text);
+        } else {
+            let existing = self.composer.text();
+            self.composer
+                .set_text(&format!("{}\n\n{}", existing.trim_end(), text));
+        }
+    }
+
+    pub fn take_deferred_followups(&mut self) -> Vec<String> {
+        self.queued_followups.drain(..).collect()
+    }
+
+    fn has_deferred_followups(&self) -> bool {
+        !self.queued_followups.is_empty()
     }
 
     pub fn set_task_status(&mut self, status: TaskStatus) {
@@ -646,8 +756,9 @@ impl BottomPane {
         }
         let content_h = self.composer.desired_height(width);
         let approval_h = self.focused_approval_height(width);
+        let queue_h = self.deferred_followup_height();
         let popup_h = self.popup_height();
-        content_h + approval_h + popup_h + 1
+        content_h + approval_h + queue_h + popup_h + 1
     }
 
     /// Top-level key routing. Dispatches to named phase handlers so
@@ -680,6 +791,13 @@ impl BottomPane {
         }
         if let Some(a) = self.handle_mention_menu_key(key) {
             return a;
+        }
+        // Esc interrupt only after popups/menus had their chance, so an
+        // open slash/mention/skill menu closes on Esc instead of
+        // aborting the whole turn.
+        if self.task_status.is_active() && self.has_deferred_followups() && key.code == KeyCode::Esc
+        {
+            return BottomPaneAction::Interrupt;
         }
         if key.code == KeyCode::BackTab {
             return BottomPaneAction::CyclePermissionMode;
@@ -1072,11 +1190,13 @@ impl BottomPane {
 
         let popup_h = self.popup_height();
         let content_h = self.composer.desired_height(area.width);
+        let queue_h = self.deferred_followup_height();
 
         let approval_h = self.focused_approval_height(area.width);
         if popup_h > 0 {
             let chunks = Layout::vertical([
                 Constraint::Length(approval_h),
+                Constraint::Length(queue_h),
                 Constraint::Length(content_h),
                 Constraint::Length(popup_h),
                 Constraint::Length(1),
@@ -1084,28 +1204,39 @@ impl BottomPane {
             .split(area);
 
             self.render_focused_approval(chunks[0], buf);
-            self.composer
-                .render(chunks[1], buf, self.task_status.is_active());
+            self.render_deferred_followups(chunks[1], buf);
+            self.composer.render(
+                chunks[2],
+                buf,
+                self.task_status.is_active(),
+                self.has_deferred_followups(),
+            );
             if let Some(ref menu) = self.slash_menu {
-                slash_popup_render::render(menu, chunks[2], buf);
+                slash_popup_render::render(menu, chunks[3], buf);
             } else if let Some(ref menu) = self.mention_menu {
-                mention_popup_render::render(menu, chunks[2], buf);
+                mention_popup_render::render(menu, chunks[3], buf);
             } else if let Some(ref popup) = self.skill_popup {
-                popup.render(chunks[2], buf);
+                popup.render(chunks[3], buf);
             }
-            self.footer.render(chunks[3], buf);
+            self.footer.render(chunks[4], buf);
         } else {
             let chunks = Layout::vertical([
                 Constraint::Length(approval_h),
+                Constraint::Length(queue_h),
                 Constraint::Length(content_h),
                 Constraint::Length(1),
             ])
             .split(area);
 
             self.render_focused_approval(chunks[0], buf);
-            self.composer
-                .render(chunks[1], buf, self.task_status.is_active());
-            self.footer.render(chunks[2], buf);
+            self.render_deferred_followups(chunks[1], buf);
+            self.composer.render(
+                chunks[2],
+                buf,
+                self.task_status.is_active(),
+                self.has_deferred_followups(),
+            );
+            self.footer.render(chunks[3], buf);
         }
     }
 
@@ -1125,17 +1256,172 @@ impl BottomPane {
             .render(area, buf);
     }
 
+    fn deferred_followup_height(&self) -> u16 {
+        if self.queued_followups.is_empty() {
+            return 0;
+        }
+        let preview_rows = self.queued_followups.len().min(2) as u16;
+        let more_row = u16::from(self.queued_followups.len() > 2);
+        1 + preview_rows + more_row
+    }
+
+    fn render_deferred_followups(&self, area: Rect, buf: &mut Buffer) {
+        if area.height == 0 || self.queued_followups.is_empty() {
+            return;
+        }
+        let theme = crate::tui::theme::current();
+
+        // Distinct panel surface: visibly darker (dark term) / darker still
+        // (light term) than the composer surface so the queue reads as its
+        // own region, not as more of the input box.
+        let panel = crate::tui::style::queue_panel_style();
+        for y in area.y..area.y + area.height {
+            buf.set_string(area.x, y, " ".repeat(area.width as usize), panel);
+        }
+        let bg = panel.bg.unwrap_or(ratatui::style::Color::Reset);
+
+        // Action-first single-line title. Both behaviors must be legible even
+        // on a 42-col terminal: the verb ("Esc sends now") leads so it
+        // survives truncation, and the auto-send clause is kept short enough
+        // ("else at next tool") to fit the budget on the snapshot width. The
+        // surprising behavior is the auto-send; it must not be the half that
+        // gets cut.
+        let title = if self.interrupt_pending {
+            "Stopping — sending on finish"
+        } else {
+            "Esc sends now · else at next tool"
+        };
+        // Title is the affordance — it tells the user what this panel IS
+        // (queued input) and what their options ARE (Esc sends now / else
+        // auto-send). That is functional instruction, not decoration, so it
+        // must be fully legible. Full-strength `accent` (no bold) reads as a
+        // header: readable, visually distinct from the bold head row and the
+        // plain tail rows below. Earlier tiers (`dim+DIM`, then `accent_dim`)
+        // crushed the instruction into near-invisibility on the low-contrast
+        // panel — the exact opposite of what an affordance needs.
+        let title_style = Style::default().fg(theme.accent).bg(bg);
+        Widget::render(
+            Line::from(Span::styled(
+                truncate_display(title, area.width as usize),
+                title_style,
+            )),
+            Rect::new(area.x, area.y, area.width, 1),
+            buf,
+        );
+
+        // Visual hierarchy on the queue band:
+        //   head — accent + bold, it's about to fire.
+        //   tail — `fg` (not `dim`): queued entries are user content that
+        //     must remain legible against the low-contrast queue surface;
+        //     `dim` (DarkGray) sat too close to the panel bg.
+        //   +N more — `accent_dim` keeps the count present without
+        //     competing with the queued text above. Dropped the DIM
+        //     modifier: it doubled up on a color already at low emphasis.
+        let head_style = Style::default()
+            .fg(theme.accent)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD);
+        let tail_style = Style::default().fg(theme.fg).bg(bg);
+        let more_style = Style::default().fg(theme.accent_dim()).bg(bg);
+
+        let preview_rows = (area.height as usize).saturating_sub(1);
+        for (idx, text) in self
+            .queued_followups
+            .iter()
+            .take(preview_rows)
+            .take(2)
+            .enumerate()
+        {
+            // Truncate by the actual column budget, not a hard-coded 100.
+            let prefix = if idx == 0 { "↳ " } else { "  " };
+            let budget = area.width.saturating_sub(prefix.width() as u16) as usize;
+            let preview = deferred_followup_preview(text, budget);
+            let line = format!("{prefix}{preview}");
+            let style = if idx == 0 { head_style } else { tail_style };
+            Widget::render(
+                Line::from(Span::styled(
+                    truncate_display(&line, area.width as usize),
+                    style,
+                )),
+                Rect::new(area.x, area.y + 1 + idx as u16, area.width, 1),
+                buf,
+            );
+        }
+        if self.queued_followups.len() > 2 && area.height >= 4 {
+            let line = format!("  +{} more", self.queued_followups.len() - 2);
+            Widget::render(
+                Line::from(Span::styled(
+                    truncate_display(&line, area.width as usize),
+                    more_style,
+                )),
+                Rect::new(area.x, area.y + 3, area.width, 1),
+                buf,
+            );
+        }
+    }
+
     pub fn cursor_position(&self, area: Rect) -> Option<(u16, u16)> {
         if let Some(view) = self.active_view() {
             return view.cursor_pos(area);
         }
 
+        let approval_h = self.focused_approval_height(area.width);
+        let queue_h = self.deferred_followup_height();
         let content_h = self.composer.desired_height(area.width);
-        let chunks =
-            Layout::vertical([Constraint::Length(content_h), Constraint::Min(0)]).split(area);
+        let chunks = Layout::vertical([
+            Constraint::Length(approval_h),
+            Constraint::Length(queue_h),
+            Constraint::Length(content_h),
+            Constraint::Min(0),
+        ])
+        .split(area);
 
-        self.composer.cursor_position(chunks[0])
+        self.composer.cursor_position(chunks[2])
     }
+}
+
+fn deferred_followup_preview(text: &str, limit: usize) -> String {
+    let single_line = text.trim().replace('\n', " ⏎ ");
+    let mut preview: String = single_line.chars().take(limit).collect();
+    if single_line.chars().count() > limit {
+        preview.push('…');
+    }
+    preview
+}
+
+/// Recompute the server's status-line fingerprint for a queued item.
+/// Uses `crate::DEFERRED_INPUT_FINGERPRINT_SEP` to byte-match the
+/// server's `deferred_input_status_line` algorithm.
+fn deferred_input_preview_fingerprint(text: &str) -> String {
+    let trimmed = text.trim();
+    let single_line = trimmed.replace('\n', crate::DEFERRED_INPUT_FINGERPRINT_SEP);
+    let mut preview: String = single_line.chars().take(80).collect();
+    if single_line.chars().count() > 80 {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn truncate_display(text: &str, max_width: usize) -> String {
+    if text.width() <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 1 {
+        return "…".to_string();
+    }
+    let keep = max_width - 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let width = ch.width().unwrap_or(0);
+        if used + width > keep {
+            break;
+        }
+        out.push(ch);
+        used += width;
+    }
+    out.push('…');
+    out
 }
 
 /// Render a one-row dim hint bar at the bottom of a view area.

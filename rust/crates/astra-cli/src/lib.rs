@@ -25,6 +25,12 @@
     clippy::unnecessary_mut_passed
 )]
 
+// Deferred input fingerprint separator: must byte-match between the
+// server's `deferred_input_status_line` (cli_loop_host.rs) and the
+// client's `deferred_input_preview_fingerprint` (bottom_pane/mod.rs).
+// Any divergent edit in one place silently breaks desync detection.
+pub const DEFERRED_INPUT_FINGERPRINT_SEP: &str = " ↩ ";
+
 // ═══════════════════════════ Top-level utility modules ═══════════════════
 pub mod diff_utils;
 pub mod edge_tools;
