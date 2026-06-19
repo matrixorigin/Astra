@@ -231,8 +231,8 @@ pub async fn run_chat_run_pause_resume_http() {
                 ]
             },
             "execution_budget": {
-                "initial_turns": 1,
-                "hard_turn_limit": 1
+                "initial_turns": 10,
+                "hard_turn_limit": 10
             }
         }),
     )
