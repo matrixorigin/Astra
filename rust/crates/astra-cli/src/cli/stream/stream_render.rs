@@ -1,6 +1,7 @@
 use crate::cli::stream::streaming_md;
 use crate::cli::tool_result_status::{
-    tool_result_status_icon, tool_result_status_is_failure, tool_result_status_is_success,
+    tool_result_status_icon, tool_result_status_is_failure, tool_result_status_is_skipped,
+    tool_result_status_is_success,
 };
 use crate::cli::{chat_stream, session::session_runtime, terminal_region, theme};
 use astra_runtime::turn::tool_side_effects::tool_call_invalidates_read_cache;
@@ -2780,7 +2781,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             // Hard cap exceeded — return a stub telling the LLM to stop.
             let body = if let Some((cached_out, _)) = self.validated_cache_entry(&dedup_sig) {
                 format!(
-                    "⛔ Cached repeat (call #{} for identical args, limit: {}). \
+                    "Cached repeat skipped (call #{} for identical args, limit: {}). \
                      The result is already in this conversation from an earlier call. \
                      Do NOT call this tool again with the same arguments.\n\n{}",
                     call_count,
@@ -2789,12 +2790,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 )
             } else {
                 format!(
-                    "⛔ Duplicate call #{} (limit: {}). This tool has been called too many times \
-                     with the same arguments. Use the results from earlier calls instead.",
+                    "Duplicate call skipped (#{}; limit: {}). This tool has already been called \
+                     too many times with the same arguments. Use the results from earlier calls instead.",
                     call_count, max_calls,
                 )
             };
-            let status = "error";
+            let status = "skipped";
             if let Some(idx) = tool_idx {
                 self.render.tool_done(idx, tool, args, status, 0, &body);
             }
@@ -4572,6 +4573,11 @@ fn tool_completion_icon(
         return (tool_result_status_icon(status), false);
     }
 
+    // Skipped is protective deduplication, not an error — show warning icon
+    if tool_result_status_is_skipped(status) {
+        return (theme::icon_warn(), true);
+    }
+
     let trimmed = output.trim();
 
     let warn_if_empty_ok_status = matches!(
@@ -4916,6 +4922,13 @@ impl StreamRenderState {
                 .map(|summary| summary.text.clone())
                 .unwrap_or_else(|| "failed".to_string());
             format!("    {}", err_msg.red())
+        } else if tool_result_status_is_skipped(status) {
+            // Skipped = protective deduplication. Show as dim warning, not red error.
+            let msg = output_summary
+                .as_ref()
+                .map(|summary| summary.text.clone())
+                .unwrap_or_else(|| "skipped (duplicate)".to_string());
+            format!("    {}", msg.dim())
         } else if is_warning {
             output_summary
                 .as_ref()
@@ -4993,6 +5006,13 @@ impl StreamRenderState {
                 .map(|summary| summary.text.clone())
                 .unwrap_or_else(|| "failed".to_string());
             format!("    {}", err_msg.red())
+        } else if tool_result_status_is_skipped(status) {
+            // Skipped = protective deduplication. Show as dim warning, not red error.
+            let msg = output_summary
+                .as_ref()
+                .map(|summary| summary.text.clone())
+                .unwrap_or_else(|| "skipped (duplicate)".to_string());
+            format!("    {}", msg.dim())
         } else if is_warning {
             output_summary
                 .as_ref()

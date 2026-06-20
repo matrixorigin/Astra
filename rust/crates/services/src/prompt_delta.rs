@@ -140,43 +140,25 @@ pub async fn persist_prompt_request(
     input: &PromptRequestPersistInput,
     plan: &PromptRequestPlan,
 ) -> Result<PromptRequestPersistResult, String> {
-    let mut tx = pool
-        .get()
-        .begin()
-        .await
-        .map_err(|error| error.to_string())?;
-    if let Some(existing) = load_existing_request(&mut tx, &plan.request_id).await? {
-        tx.rollback().await.map_err(|error| error.to_string())?;
+    let db = pool.get();
+    if let Some(existing) = load_existing_request(db, &plan.request_id).await? {
         return Ok(existing);
     }
 
-    let previous_request_id = sqlx::query(
-        "SELECT request_id
-         FROM prompt_request_records
-         WHERE session_id = ? AND source = ?
-         ORDER BY created_at DESC, turn DESC, round DESC, attempt DESC
-         LIMIT 1",
-    )
-    .bind(&input.session_id)
-    .bind(&input.source)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|error| error.to_string())?
-    .and_then(|row| row.try_get::<String, _>("request_id").ok());
-
+    let previous_request_id = load_previous_request_id(db, input).await?;
     let previous_chunks = if let Some(previous_request_id) = previous_request_id.as_deref() {
-        load_request_chunks(&mut tx, previous_request_id).await?
+        load_request_chunks(db, previous_request_id).await?
     } else {
         Vec::new()
     };
 
-    let mut previous_map = std::collections::HashMap::new();
-    for chunk in previous_chunks {
-        previous_map.insert(chunk.logical_key, chunk.chunk_hash);
-    }
-
+    let mut previous_map = previous_chunks
+        .into_iter()
+        .map(|chunk| (chunk.logical_key, chunk.chunk_hash))
+        .collect::<std::collections::HashMap<_, _>>();
     let mut delta_counts = PromptDeltaCounts::default();
     let mut delta_seq: i32 = 0;
+    let mut delta_rows = Vec::with_capacity(plan.chunks.len().saturating_add(previous_map.len()));
     for chunk in &plan.chunks {
         let previous_hash = previous_map.remove(&chunk.logical_key);
         let op = if previous_hash.as_deref() == Some(chunk.chunk_hash.as_str()) {
@@ -189,40 +171,30 @@ pub async fn persist_prompt_request(
             delta_counts.append = delta_counts.append.saturating_add(1);
             "append"
         };
-        insert_prompt_delta(
-            &mut tx,
-            PromptDeltaInsert {
-                request_id: &plan.request_id,
-                delta_seq,
-                logical_key: &chunk.logical_key,
-                chunk_kind: &chunk.chunk_kind,
-                position: chunk.position,
-                op,
-                chunk_id: Some(&chunk.chunk_id),
-                chunk_hash: Some(&chunk.chunk_hash),
-                previous_chunk_hash: previous_hash.as_deref(),
-            },
-        )
-        .await?;
+        delta_rows.push(PlannedPromptDelta {
+            delta_seq,
+            logical_key: chunk.logical_key.clone(),
+            chunk_kind: chunk.chunk_kind.clone(),
+            position: chunk.position,
+            op,
+            chunk_id: Some(chunk.chunk_id.clone()),
+            chunk_hash: Some(chunk.chunk_hash.clone()),
+            previous_chunk_hash: previous_hash,
+        });
         delta_seq = delta_seq.saturating_add(1);
     }
     for (logical_key, previous_hash) in previous_map {
         delta_counts.drop = delta_counts.drop.saturating_add(1);
-        insert_prompt_delta(
-            &mut tx,
-            PromptDeltaInsert {
-                request_id: &plan.request_id,
-                delta_seq,
-                logical_key: &logical_key,
-                chunk_kind: "drop",
-                position: delta_seq,
-                op: "drop",
-                chunk_id: None,
-                chunk_hash: None,
-                previous_chunk_hash: Some(previous_hash.as_str()),
-            },
-        )
-        .await?;
+        delta_rows.push(PlannedPromptDelta {
+            delta_seq,
+            logical_key,
+            chunk_kind: "drop".to_string(),
+            position: delta_seq,
+            op: "drop",
+            chunk_id: None,
+            chunk_hash: None,
+            previous_chunk_hash: Some(previous_hash),
+        });
         delta_seq = delta_seq.saturating_add(1);
     }
 
@@ -230,32 +202,64 @@ pub async fn persist_prompt_request(
         "summary": plan.summary_json.clone(),
         "delta_counts": delta_counts,
     });
-    sqlx::query(
-        "INSERT INTO prompt_request_records
-         (request_id, session_id, user_id, run_id, turn, round, attempt, source,
-          model, provider, max_output_tokens, message_count, tool_count,
-          previous_request_id, request_hash, summary_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-    )
-    .bind(&plan.request_id)
-    .bind(&input.session_id)
-    .bind(&input.user_id)
-    .bind(&input.run_id)
-    .bind(input.turn as i64)
-    .bind(input.round as i64)
-    .bind(input.attempt as i64)
-    .bind(&input.source)
-    .bind(&input.model)
-    .bind(&input.provider)
-    .bind(plan.max_output_tokens.map(i64::from))
-    .bind(i64::from(plan.message_count))
-    .bind(i64::from(plan.tool_count))
-    .bind(&previous_request_id)
-    .bind(&plan.request_hash)
-    .bind(summary_json.to_string())
-    .execute(&mut *tx)
-    .await
-    .map_err(|error| error.to_string())?;
+
+    let mut tx = db.begin().await.map_err(|error| error.to_string())?;
+    let write_result: Result<(), String> = async {
+        sqlx::query(
+            "INSERT INTO prompt_request_records
+             (request_id, session_id, user_id, run_id, turn, round, attempt, source,
+              model, provider, max_output_tokens, message_count, tool_count,
+              previous_request_id, request_hash, summary_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+        )
+        .bind(&plan.request_id)
+        .bind(&input.session_id)
+        .bind(&input.user_id)
+        .bind(&input.run_id)
+        .bind(input.turn as i64)
+        .bind(input.round as i64)
+        .bind(input.attempt as i64)
+        .bind(&input.source)
+        .bind(&input.model)
+        .bind(&input.provider)
+        .bind(plan.max_output_tokens.map(i64::from))
+        .bind(i64::from(plan.message_count))
+        .bind(i64::from(plan.tool_count))
+        .bind(&previous_request_id)
+        .bind(&plan.request_hash)
+        .bind(summary_json.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| error.to_string())?;
+
+        for delta in &delta_rows {
+            insert_prompt_delta(
+                &mut tx,
+                PromptDeltaInsert {
+                    request_id: &plan.request_id,
+                    delta_seq: delta.delta_seq,
+                    logical_key: &delta.logical_key,
+                    chunk_kind: &delta.chunk_kind,
+                    position: delta.position,
+                    op: delta.op,
+                    chunk_id: delta.chunk_id.as_deref(),
+                    chunk_hash: delta.chunk_hash.as_deref(),
+                    previous_chunk_hash: delta.previous_chunk_hash.as_deref(),
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Err(error) = write_result {
+        let _ = tx.rollback().await;
+        if let Some(existing) = load_existing_request(db, &plan.request_id).await? {
+            return Ok(existing);
+        }
+        return Err(error);
+    }
 
     tx.commit().await.map_err(|error| error.to_string())?;
     Ok(PromptRequestPersistResult {
@@ -372,7 +376,7 @@ fn prompt_observability_from_row(
 }
 
 async fn load_existing_request(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    pool: &sqlx::Pool<sqlx::MySql>,
     request_id: &str,
 ) -> Result<Option<PromptRequestPersistResult>, String> {
     let row = sqlx::query(
@@ -381,7 +385,7 @@ async fn load_existing_request(
          WHERE request_id = ?",
     )
     .bind(request_id)
-    .fetch_optional(&mut **tx)
+    .fetch_optional(pool)
     .await
     .map_err(|error| error.to_string())?;
     row.map(|row| {
@@ -414,8 +418,39 @@ struct ExistingPromptChunk {
     chunk_hash: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlannedPromptDelta {
+    delta_seq: i32,
+    logical_key: String,
+    chunk_kind: String,
+    position: i32,
+    op: &'static str,
+    chunk_id: Option<String>,
+    chunk_hash: Option<String>,
+    previous_chunk_hash: Option<String>,
+}
+
+async fn load_previous_request_id(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    input: &PromptRequestPersistInput,
+) -> Result<Option<String>, String> {
+    sqlx::query(
+        "SELECT request_id
+         FROM prompt_request_records
+         WHERE session_id = ? AND source = ?
+         ORDER BY created_at DESC, turn DESC, round DESC, attempt DESC
+         LIMIT 1",
+    )
+    .bind(&input.session_id)
+    .bind(&input.source)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| error.to_string())
+    .map(|row| row.and_then(|row| row.try_get::<String, _>("request_id").ok()))
+}
+
 async fn load_request_chunks(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    pool: &sqlx::Pool<sqlx::MySql>,
     request_id: &str,
 ) -> Result<Vec<ExistingPromptChunk>, String> {
     let rows = sqlx::query(
@@ -425,7 +460,7 @@ async fn load_request_chunks(
          ORDER BY position ASC, delta_seq ASC",
     )
     .bind(request_id)
-    .fetch_all(&mut **tx)
+    .fetch_all(pool)
     .await
     .map_err(|error| error.to_string())?;
     Ok(rows

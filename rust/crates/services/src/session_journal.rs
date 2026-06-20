@@ -1029,8 +1029,8 @@ impl ToolCallRecord {
 ///
 /// All emit sites bracket these markers at the start of the string
 /// (`[cached_cross_turn:`, `[Same read_file request…`, `[File already fully
-/// read…`, `[File unchanged since the earlier read…`, `⛔ Cached repeat…`,
-/// `⛔ Repeated cached read suppressed…`). We therefore anchor on the leading
+/// read…`, `[File unchanged since the earlier read…`, `Cached repeat skipped…`,
+/// `Repeated cached read skipped…`). We therefore anchor on the leading
 /// prefix instead of doing loose `contains()` over the whole payload: a tool
 /// that legitimately prints "I already read the file, refer to the docs" must
 /// not be misclassified as a cache no-op.
@@ -1040,6 +1040,9 @@ fn is_noop_or_cached_result_text(text: &str) -> bool {
         "[Same read_file request",
         "[File already fully read",
         "[File unchanged since the earlier read",
+        "Cached repeat skipped",
+        "Duplicate call skipped",
+        "Repeated cached read skipped",
         "⛔ Cached repeat",
         "⛔ Repeated cached read suppressed",
     ];
@@ -7139,7 +7142,7 @@ mod tests {
                 base_tool_record(
                     "bash",
                     false,
-                    Some("⛔ Cached repeat (call #3 for identical args, limit: 2).")
+                    Some("Cached repeat skipped (call #3 for identical args, limit: 2).")
                 )
                 .is_noop_or_cached_result()
             );

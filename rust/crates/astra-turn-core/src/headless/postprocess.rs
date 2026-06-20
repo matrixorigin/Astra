@@ -25,26 +25,32 @@ pub enum HeadlessOutputEnrichSignal {
     ResourceLimitDetectedInOutput { tool: String },
 }
 
+/// Mutable state used while enriching one headless tool result.
+pub struct HeadlessOutputEnrichCtx<'a> {
+    pub turn_guard: &'a mut TurnGuard,
+    pub restricted_tools: &'a mut HashSet<String>,
+}
+
 /// `true` when resource-limit handling forced error-quality treatment (matches CLI `resource_limit_recorded`).
 pub fn enrich_headless_tool_output_for_errors_and_limits(
     name: &str,
     result_str: &mut String,
     is_err: &mut bool,
+    source_error_kind: Option<ErrorCategory>,
     tool_already_restricted: bool,
-    turn_guard: &mut TurnGuard,
-    restricted_tools: &mut HashSet<String>,
+    ctx: &mut HeadlessOutputEnrichCtx<'_>,
     mut on_signal: impl FnMut(HeadlessOutputEnrichSignal),
 ) -> bool {
     let mut resource_limit_recorded = false;
 
     if *is_err && !tool_already_restricted {
-        let category = classify_error(result_str.as_str());
+        let category = source_error_kind.unwrap_or_else(|| classify_error(result_str.as_str()));
 
         if matches!(category, ErrorCategory::ResourceLimit) {
-            turn_guard.health.record_resource_limit_failure(name);
-            turn_guard.errors.record_error(category);
+            ctx.turn_guard.health.record_resource_limit_failure(name);
+            ctx.turn_guard.errors.record_error(category);
             resource_limit_recorded = true;
-            if restrict_resource_limited_tool(name, restricted_tools) {
+            if restrict_resource_limited_tool(name, ctx.restricted_tools) {
                 on_signal(HeadlessOutputEnrichSignal::ResourceLimitBlocked {
                     tool: name.to_string(),
                 });
@@ -56,21 +62,23 @@ pub fn enrich_headless_tool_output_for_errors_and_limits(
         }
 
         if category.is_retryable() {
-            turn_guard.errors.record_retry(false);
+            ctx.turn_guard.errors.record_retry(false);
         }
 
-        let deprioritized = turn_guard.health.deprioritized_tools();
+        let deprioritized = ctx.turn_guard.health.deprioritized_tools();
         let recovery_msg =
             build_recovery_message(name, result_str.as_str(), category, &deprioritized);
         result_str.push_str(&format!("\n{recovery_msg}"));
     }
 
     if !*is_err && !tool_already_restricted && is_resource_limit_output(result_str.as_str()) {
-        turn_guard.health.record_resource_limit_failure(name);
-        turn_guard.errors.record_error(ErrorCategory::ResourceLimit);
+        ctx.turn_guard.health.record_resource_limit_failure(name);
+        ctx.turn_guard
+            .errors
+            .record_error(ErrorCategory::ResourceLimit);
         *is_err = true;
         resource_limit_recorded = true;
-        if restrict_resource_limited_tool(name, restricted_tools) {
+        if restrict_resource_limited_tool(name, ctx.restricted_tools) {
             on_signal(HeadlessOutputEnrichSignal::ResourceLimitDetectedInOutput {
                 tool: name.to_string(),
             });
@@ -96,13 +104,14 @@ fn restrict_resource_limited_tool(name: &str, restricted_tools: &mut HashSet<Str
 pub fn append_headless_result_quality_feedback(
     name: &str,
     result_str: &mut String,
+    source_error_kind: Option<ErrorCategory>,
     resource_limit_recorded: bool,
     turn_guard: &mut TurnGuard,
 ) -> ResultQuality {
     let result_quality = if resource_limit_recorded {
         ResultQuality::Error
     } else {
-        turn_guard.record_tool_result(name, result_str.as_str())
+        turn_guard.record_tool_result_with_kind(name, result_str.as_str(), source_error_kind)
     };
     if let Some(feedback) = turn_guard.result_feedback(name, result_quality) {
         result_str.push_str(&format!("\n{feedback}"));
@@ -257,13 +266,17 @@ mod tests {
         let mut out = "out of memory".to_string();
         let mut is_err = true;
         let mut signals = Vec::new();
+        let mut ctx = HeadlessOutputEnrichCtx {
+            turn_guard: &mut tg,
+            restricted_tools: &mut restricted,
+        };
         let rec = enrich_headless_tool_output_for_errors_and_limits(
             "bash",
             &mut out,
             &mut is_err,
+            None,
             false,
-            &mut tg,
-            &mut restricted,
+            &mut ctx,
             |s| signals.push(s),
         );
         assert!(rec);
@@ -284,14 +297,18 @@ mod tests {
         let mut out = "read failed: Resource temporarily unavailable".to_string();
         let mut is_err = true;
         let mut signals = Vec::new();
+        let mut ctx = HeadlessOutputEnrichCtx {
+            turn_guard: &mut tg,
+            restricted_tools: &mut restricted,
+        };
 
         let rec = enrich_headless_tool_output_for_errors_and_limits(
             "read_file",
             &mut out,
             &mut is_err,
+            None,
             false,
-            &mut tg,
-            &mut restricted,
+            &mut ctx,
             |s| signals.push(s),
         );
 
@@ -315,13 +332,17 @@ mod tests {
         let mut out = "fork: retry: Resource temporarily unavailable".to_string();
         let mut is_err = false;
         let mut signals = Vec::new();
+        let mut ctx = HeadlessOutputEnrichCtx {
+            turn_guard: &mut tg,
+            restricted_tools: &mut restricted,
+        };
         let rec = enrich_headless_tool_output_for_errors_and_limits(
             "bash",
             &mut out,
             &mut is_err,
+            None,
             false,
-            &mut tg,
-            &mut restricted,
+            &mut ctx,
             |s| signals.push(s),
         );
         assert!(rec);
@@ -338,7 +359,7 @@ mod tests {
     fn append_feedback_after_success() {
         let mut tg = TurnGuard::new();
         let mut out = "ok".to_string();
-        let _q = append_headless_result_quality_feedback("bash", &mut out, false, &mut tg);
+        let _q = append_headless_result_quality_feedback("bash", &mut out, None, false, &mut tg);
         // May or may not append depending on classifier; string should remain valid UTF-8.
         assert!(!out.is_empty());
     }

@@ -2600,31 +2600,40 @@ impl InProcessChatTurnBridge {
                         })
                         .unwrap_or_default();
                 let memory_injections: Vec<astra_turn_core::context_assembly_trace::MemoryInjection> =
-                    memory_preview
+                    memoria_prefetch_entries
                         .iter()
                         .enumerate()
-                        .map(|(i, line)| {
+                        .map(|(i, entry)| {
                             astra_turn_core::context_assembly_trace::MemoryInjection {
-                                memory_id: format!("prefetch-{i}"),
-                                memory_type: "hybrid_retrieval".into(),
-                                tokens: prompts::estimate_str_tokens(line) as u32,
-                                relevance_score: 0.0,
+                                memory_id: format!("prefetch-{i}-{:016x}", entry.content_hash),
+                                memory_type: entry
+                                    .source
+                                    .clone()
+                                    .unwrap_or_else(|| "hybrid_retrieval".into()),
+                                tokens: entry.token_estimate,
+                                relevance_score: entry.relevance_score,
                                 content_preview:
                                     astra_turn_core::context_assembly_trace::preview_snippet(
-                                        line, 100,
+                                        &entry.content,
+                                        100,
                                     ),
                             }
                         })
                         .collect();
                 let session_memory_injection = initial_session_memory_entry.as_ref().map(|entry| {
+                    let memory_type = entry
+                        .source
+                        .clone()
+                        .unwrap_or_else(|| "session_memory".into());
                     astra_turn_core::context_assembly_trace::MemoryInjection {
                         memory_id: "session-memory".into(),
-                        memory_type: entry
-                            .source
-                            .clone()
-                            .unwrap_or_else(|| "session_memory".into()),
+                        memory_type: memory_type.clone(),
                         tokens: prompts::estimate_str_tokens(&entry.content) as u32,
-                        relevance_score: 1.0,
+                        relevance_score: if memory_type == "session_memory.reanchor" {
+                            1.0
+                        } else {
+                            0.35
+                        },
                         content_preview: astra_turn_core::context_assembly_trace::preview_snippet(
                             &entry.content,
                             100,
@@ -2672,9 +2681,9 @@ impl InProcessChatTurnBridge {
                             max_output_tokens: Some(max_output_tokens),
                         })
                     {
-                        crate::turn::llm::exchange_capture::persist_prompt_request_plan_or_log(
+                        crate::turn::llm::exchange_capture::spawn_prompt_request_plan_persist_or_log(
                             "bridge_inprocess e2e capture",
-                            shared_pool.as_ref(),
+                            shared_pool.clone(),
                             astra_services::PromptRequestPersistInput {
                                 session_id: session_id.clone(),
                                 user_id: user_id.clone(),
@@ -2689,9 +2698,8 @@ impl InProcessChatTurnBridge {
                                 model: request_capture_model.clone(),
                                 provider: provider.clone(),
                             },
-                            &prompt_request_plan,
-                        )
-                        .await;
+                            prompt_request_plan,
+                        );
                     }
                     yield render_sse(&crate::turn::llm::context::context_meta_event(
                         &breakdown,
@@ -2699,8 +2707,11 @@ impl InProcessChatTurnBridge {
                     ));
                     #[cfg(feature = "bridge-e2e-hooks")]
                     {
-                        let (t, r, tc, u_delta) =
+                        let (t, r, tc, u_delta, delay_ms) =
                             astra_turn_core::bridge_e2e_hooks::parse_llm_round(round_val);
+                        if delay_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        }
                         loop_text = t;
                         loop_reasoning = r;
                         loop_tool_calls = tc;
@@ -2755,9 +2766,9 @@ impl InProcessChatTurnBridge {
                             max_output_tokens: Some(max_output_tokens),
                         })
                     {
-                        crate::turn::llm::exchange_capture::persist_prompt_request_plan_or_log(
+                        crate::turn::llm::exchange_capture::spawn_prompt_request_plan_persist_or_log(
                             "bridge_inprocess live capture",
-                            shared_pool.as_ref(),
+                            shared_pool.clone(),
                             astra_services::PromptRequestPersistInput {
                                 session_id: session_id.clone(),
                                 user_id: user_id.clone(),
@@ -2772,9 +2783,8 @@ impl InProcessChatTurnBridge {
                                 model: request_capture_model.clone(),
                                 provider: provider.clone(),
                             },
-                            &prompt_request_plan,
-                        )
-                        .await;
+                            prompt_request_plan,
+                        );
                     }
 
                     // wip-7: emit per-channel fingerprints ONLY — no raw
@@ -3052,9 +3062,9 @@ impl InProcessChatTurnBridge {
                                     max_output_tokens: Some(max_output_tokens / 2),
                                 })
                             {
-                                crate::turn::llm::exchange_capture::persist_prompt_request_plan_or_log(
+                                crate::turn::llm::exchange_capture::spawn_prompt_request_plan_persist_or_log(
                                     "bridge_inprocess retry capture",
-                                    shared_pool.as_ref(),
+                                    shared_pool.clone(),
                                     astra_services::PromptRequestPersistInput {
                                         session_id: session_id.clone(),
                                         user_id: user_id.clone(),
@@ -3069,9 +3079,8 @@ impl InProcessChatTurnBridge {
                                         model: request_capture_model.clone(),
                                         provider: provider.clone(),
                                     },
-                                    &prompt_request_plan,
-                                )
-                                .await;
+                                    prompt_request_plan,
+                                );
                             }
 
                             // Retry LLM call

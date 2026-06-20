@@ -848,6 +848,89 @@ describe('queueDeferredRunInput', () => {
     expect(listRuns).toHaveBeenCalled();
   });
 
+  it('expires stale local cancelling UI while still suppressing the stopped backend run', async () => {
+    const cancelRun = vi.fn(
+      () =>
+        new Promise<void>(() => {
+          // Keep cancellation pending so backend polling still reports running.
+        }),
+    );
+    mockRequireRuntimeClient.mockResolvedValue({
+      sdk: { cancelRun },
+    } as never);
+    const listRuntimeSessions = vi.fn().mockResolvedValue({
+      sessions: [
+        {
+          session_id: 'chat-stop',
+          user_id: 'user-a',
+          title: 'Stop test',
+          metadata: { source: 'web_v1' },
+          status: 'active',
+          created_at: '2026-06-07T00:00:00.000Z',
+          updated_at: '2026-06-07T00:00:00.000Z',
+        },
+      ],
+      total: 1,
+      limit: 200,
+      offset: 0,
+    });
+    const listRuns = vi.fn().mockResolvedValue({
+      runs: [
+        {
+          runId: 'run-stop',
+          sessionId: 'chat-stop',
+          status: 'running',
+          waitingFor: null,
+        },
+      ],
+      total: 1,
+      limit: 200,
+      offset: 0,
+    });
+    const getSessionTranscript = vi.fn().mockResolvedValue({
+      items: [],
+      total: 0,
+      limit: 200,
+      offset: 0,
+    });
+    mockGetRuntimeClient.mockResolvedValue({
+      sdk: { listRuntimeSessions, listRuns, getSessionTranscript },
+    } as never);
+
+    const store = getStore('user-a');
+    store.chats.push({
+      id: 'chat-stop',
+      title: 'Stop test',
+      projectId: null,
+      createdAt: '2026-06-07T00:00:00.000Z',
+      lastMessageAt: '2026-06-07T00:00:00.000Z',
+      lastMessagePreview: 'hello',
+      model: 'sonnet-4.6-adaptive',
+      messages: [],
+      activeRun: {
+        runId: 'run-stop',
+        status: 'running',
+        waitingFor: null,
+        source: 'local_mutation',
+        observedAt: '2026-06-07T00:00:00.000Z',
+      },
+    });
+
+    await stopActiveRun('user-a', 'chat-stop', {
+      skipSync: true,
+      cancelTimeoutMs: 1,
+    });
+    store.chats[0].activeRun!.observedAt = new Date(
+      Date.now() - 20_000,
+    ).toISOString();
+
+    const detail = await getChatHydrated('user-a', 'chat-stop');
+
+    expect(detail?.activeRun).toBeUndefined();
+    expect(store.chats[0].locallyStoppedRuns?.['run-stop']).toBeDefined();
+    expect(listRuns).toHaveBeenCalled();
+  });
+
   it('hydrates a lost paused run before resuming it', async () => {
     const listRuntimeSessions = vi.fn().mockResolvedValue({
       sessions: [

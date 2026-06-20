@@ -42,7 +42,11 @@ mod tests {
         )
         .await;
 
-        assert!(result.contains("Agent spawning not available"));
+        assert!(result.contains("no multi-agent executor attached"));
         assert!(result.contains("\"status\":\"failed\""), "{result}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result).unwrap()["error_kind"].as_str(),
+            Some(astra_core::ErrorKind::ToolBinding.as_str())
+        );
     }
 }

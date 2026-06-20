@@ -1126,9 +1126,17 @@ impl BottomPane {
         action
     }
 
-    pub fn pre_draw_tick(&mut self, now: std::time::Instant) {
+    pub fn pre_draw_tick(&mut self, now: std::time::Instant) -> bool {
+        let mut changed = false;
         if let Some(view) = self.active_view_mut() {
             view.pre_draw_tick(now);
+        }
+        let dismiss_completed_view = self
+            .active_view()
+            .is_some_and(|view| view.is_complete() && view.completion().is_none());
+        if dismiss_completed_view {
+            self.view_stack.pop();
+            changed = true;
         }
         if self.task_status.is_active() {
             // The live status indicator already owns the "Thinking /
@@ -1145,7 +1153,9 @@ impl BottomPane {
         // Flush paste burst buffer when idle timeout expires.
         if self.composer.flush_paste_burst() {
             self.sync_popups();
+            changed = true;
         }
+        changed
     }
 
     pub fn replace_composer_text(&mut self, text: &str) {

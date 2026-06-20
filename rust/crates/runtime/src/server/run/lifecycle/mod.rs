@@ -1863,6 +1863,7 @@ impl AgenticRunLifecycleService {
         executor.set_agent_tool_context(AgentToolContext {
             run_id: run_id.to_string(),
             agent_id,
+            delegation_chain: Vec::new(),
             current_model: request.model.clone(),
             recursion_depth: 0,
             is_fork_child: false,
@@ -2791,6 +2792,8 @@ impl AgenticRunLifecycleService {
             api_token: String::new(),
             delegation_engine: None,
             delegations_this_turn: 0,
+            delegation_chain: Vec::new(),
+            self_agent_id: "orchestrator".to_string(),
             project_context: None,
             checkpoint_gate: None,
             last_llm_context_manifest_trace: None,
@@ -6102,6 +6105,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
                 .execution_metadata
                 .clone()
                 .or_else(|| context.execution_metadata.clone()),
+            delegation_chain: config.delegation_chain.clone(),
             #[cfg(feature = "harness")]
             harness_sink: context.harness_sink.clone(),
         };
@@ -6503,6 +6507,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             api_token: String::new(),
             delegation_engine: None,
             delegations_this_turn: 0,
+            delegation_chain: config.delegation_chain.clone(),
+            self_agent_id: config.agent_profile.agent_id.clone(),
             project_context: None,
             checkpoint_gate: config.checkpoint_gate.clone(),
             last_llm_context_manifest_trace: None,
@@ -7282,6 +7288,7 @@ mod tests {
             trace_context: None,
             spawn_tool_call_id: Some("call-spawn".to_string()),
             execution_metadata: Some(execution_metadata),
+            delegation_chain: Vec::new(),
         };
         let input = astra_turn_core::orchestration_spawn_tool::SpawnAgentInput {
             description: "review code".to_string(),
@@ -7364,6 +7371,7 @@ mod tests {
                 "executor": {"kind": "edge_agent", "status": "offline"},
                 "transport": "edge_ws"
             })),
+            delegation_chain: Vec::new(),
         };
         let input = astra_turn_core::orchestration_spawn_tool::SpawnAgentInput {
             description: "review code".to_string(),
@@ -7725,6 +7733,7 @@ mod tests {
             inherited_prefix: None,
             execution_metadata: None,
             is_fork_child: false,
+            delegation_chain: Vec::new(),
         }
     }
 

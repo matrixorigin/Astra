@@ -6,7 +6,8 @@ use sqlx::Row;
 use tower::util::ServiceExt;
 
 use super::harness::{
-    bootstrap, cleanup_task_rows, get_json, post_empty, post_json, post_json_with_headers, put_json,
+    self, bootstrap, cleanup_task_rows, get_json, post_empty, post_json, post_json_with_headers,
+    put_json,
 };
 
 pub async fn run_tasks_lease_with_db_assertions() {
@@ -226,7 +227,8 @@ pub async fn run_chat_run_pause_resume_http() {
             "context": {
                 "test_llm_rounds": [
                     {
-                        "full_text": "matrix e2e pause/resume completed"
+                        "full_text": "matrix e2e pause/resume completed",
+                        "delay_ms": 1500
                     }
                 ]
             },
@@ -240,6 +242,20 @@ pub async fn run_chat_run_pause_resume_http() {
     assert_eq!(st_chat, StatusCode::OK, "POST /chat: {chat_j}");
     let run_id = chat_j["run_id"].as_str().expect("run_id").to_string();
     assert!(!run_id.is_empty(), "run_id from ChatResponse");
+
+    // The mock round has a deterministic delay, so the run must be pausable here.
+    let observed_status = harness::wait_for_run_status(
+        app,
+        &run_id,
+        auth.as_str(),
+        "running",
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(
+        observed_status, "running",
+        "run should remain running long enough for pause/resume coverage"
+    );
 
     let (st_pause, pause_j) = post_empty(
         app,

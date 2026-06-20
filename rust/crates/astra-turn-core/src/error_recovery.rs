@@ -174,6 +174,12 @@ pub fn build_recovery_message(
              Do NOT retry — use an alternative tool.",
             tool_name
         ),
+        ErrorCategory::ToolBinding => format!(
+            "⚠ {} was advertised but no executor/transport was bound in this session mode. \
+             Do NOT retry the same call. Do NOT assume bash or a different tool is equivalent; \
+             continue with degraded coverage only after stating what capability was lost.",
+            tool_name
+        ),
         ErrorCategory::ResourceLimit => format!(
             "⚠ {} failed: system resource limit reached (fork/memory/disk). \
              This tool is now BLOCKED for the rest of this session. \

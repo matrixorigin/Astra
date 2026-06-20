@@ -744,6 +744,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             api_token: self.token.clone(),
             delegation_engine: None,
             delegations_this_turn: 0,
+            delegation_chain: Vec::new(),
+            self_agent_id: "skill_subrun".to_string(),
             project_context: None,
             checkpoint_gate: None,
             last_llm_context_manifest_trace: None,

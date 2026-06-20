@@ -549,6 +549,39 @@ async fn l2_lease_race_has_single_owner() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+async fn l2_recovery_ignores_live_runs_owned_by_other_pods() {
+    let pool = setup_pool().await;
+    let (run_id, session_id, user_id) = test_ids();
+    let owner_a = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("owner-a");
+    owner_a
+        .insert_run(durable_record(&run_id, &session_id, &user_id))
+        .await
+        .unwrap();
+
+    let owner_b = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("owner-b");
+    assert!(
+        owner_b
+            .find_recoverable_running_runs()
+            .await
+            .unwrap()
+            .iter()
+            .all(|run| run.run_id != run_id),
+        "startup recovery must not mark another live owner as crashed"
+    );
+
+    assert!(
+        owner_a
+            .find_recoverable_running_runs()
+            .await
+            .unwrap()
+            .iter()
+            .any(|run| run.run_id == run_id),
+        "the current owner may recover its own running run"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn l2_event_idx_and_idempotency_use_agent_runs() {
     let pool = setup_pool().await;
     let (run_id, session_id, user_id) = test_ids();

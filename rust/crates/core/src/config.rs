@@ -749,7 +749,7 @@ pub struct MatrixOneSettings {
     pub user: String,
     pub password: String,
     pub database: String,
-    /// Max connections in the shared pool (env `ASTRA_DB_POOL_MAX_CONNECTIONS`, default 40).
+    /// Max connections in the shared pool (env `ASTRA_DB_POOL_MAX_CONNECTIONS`, default 80).
     pub db_pool_max_connections: u32,
     /// Min idle connections in the shared pool (env `ASTRA_DB_POOL_MIN_CONNECTIONS`, default 1).
     pub db_pool_min_connections: u32,

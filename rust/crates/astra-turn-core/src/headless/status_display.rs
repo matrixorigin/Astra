@@ -105,7 +105,13 @@ fn fmt_file_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
             .and_then(|v| v.as_str())
             .map(|p| p.to_string()),
         "str_replace" => {
-            let path = obj.get("path").and_then(|v| v.as_str())?;
+            let path = obj.get("path").and_then(|v| v.as_str()).or_else(|| {
+                obj.get("edits")
+                    .and_then(|v| v.as_array())
+                    .and_then(|edits| edits.first())
+                    .and_then(|edit| edit.get("path"))
+                    .and_then(|v| v.as_str())
+            })?;
             let old = obj.get("old_str").and_then(|v| v.as_str());
             match old {
                 Some(s) => {
@@ -118,7 +124,26 @@ fn fmt_file_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
                         Some(format!("{path}: \"{preview}\""))
                     }
                 }
-                None => Some(path.to_string()),
+                None => {
+                    let file_count = obj
+                        .get("edits")
+                        .and_then(|v| v.as_array())
+                        .map(|edits| {
+                            let mut paths = std::collections::BTreeSet::new();
+                            for edit in edits {
+                                if let Some(path) = edit.get("path").and_then(|v| v.as_str()) {
+                                    paths.insert(path);
+                                }
+                            }
+                            paths.len()
+                        })
+                        .unwrap_or(0);
+                    if file_count > 1 {
+                        Some(format!("{path} (+{} files)", file_count - 1))
+                    } else {
+                        Some(path.to_string())
+                    }
+                }
             }
         }
         _ => None,
@@ -879,6 +904,8 @@ fn informative_error_line(result: &str) -> Option<&str> {
 /// `WHAT/WHY/NEXT` into a generic banner.
 #[must_use]
 pub fn tool_error_summary(tool_name: &str, result: &str) -> String {
+    let result = astra_core::error_kind::strip_tool_binding_sentinel(result);
+    let result = result.as_ref();
     let trimmed = result.trim();
     if trimmed.is_empty() {
         return format!("{tool_name} failed before returning output");
@@ -941,6 +968,8 @@ fn summarize_git_result(result: &str) -> Option<String> {
 /// Build a brief summary of a tool result for the status line (after execution).
 #[must_use]
 pub fn tool_result_summary(name: &str, result: &str) -> Option<String> {
+    let result = astra_core::error_kind::strip_tool_binding_sentinel(result);
+    let result = result.as_ref();
     match name {
         "read_file" | "view_file" => {
             let lines = result.lines().count();
@@ -979,7 +1008,11 @@ pub fn tool_result_summary(name: &str, result: &str) -> Option<String> {
             }
         }
         "str_replace" => {
-            if result.starts_with("Replaced successfully") {
+            if result.starts_with("Successfully applied edits to")
+                || result.starts_with("Successfully applied ")
+            {
+                Some(result.lines().next().unwrap_or("edits applied").to_string())
+            } else if result.starts_with("Replaced successfully") {
                 let line_count = result.lines().skip(1).count();
                 if line_count > 0 {
                     Some(format!("{line_count} lines changed"))
@@ -1521,6 +1554,20 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_detail_str_replace_uses_per_edit_path() {
+        let detail = tool_call_detail(
+            "str_replace",
+            &json!({
+                "edits": [
+                    {"path": "src/a.rs", "old_str": "a", "new_str": "b"},
+                    {"path": "src/b.rs", "old_str": "c", "new_str": "d"}
+                ]
+            }),
+        );
+        assert_eq!(detail.as_deref(), Some("src/a.rs (+1 files)"));
+    }
+
+    #[test]
     fn tool_call_detail_git_action_diff_staged() {
         let detail = tool_call_detail("git", &json!({"action": "diff", "staged": true}));
         assert_eq!(detail.as_deref(), Some("working tree (staged)"));
@@ -1603,6 +1650,17 @@ mod tests {
         let output = "banner\n\nError: Missing 'path' parameter";
         let summary = tool_error_summary("str_replace", output);
         assert_eq!(summary, "Error: Missing 'path' parameter");
+    }
+
+    #[test]
+    fn tool_error_summary_strips_tool_binding_sentinel() {
+        let output = format!(
+            "Error: tool `agent` runtime binding is unavailable. {}",
+            astra_core::error_kind::TOOL_BINDING_SENTINEL
+        );
+        let summary = tool_error_summary("agent", &output);
+        assert!(!summary.contains(astra_core::error_kind::TOOL_BINDING_SENTINEL));
+        assert!(summary.contains("runtime binding is unavailable"));
     }
 
     #[test]

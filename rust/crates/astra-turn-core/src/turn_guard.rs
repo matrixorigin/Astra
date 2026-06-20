@@ -100,7 +100,7 @@ pub struct TurnGuard {
     /// The last stall reflection sent (for nudge-ignore detection).
     last_reflection: Option<StallReflection>,
     /// Consecutive turns at Critical escalation. Progressive degradation:
-    /// 1st Critical → restrict to read-only tools, 2nd → force stop.
+    /// 1st Critical → strong recovery guidance, 2nd → force stop.
     critical_turns: usize,
     /// Consecutive calm turns (severity <= Info) since the last Critical.
     critical_recovery_turns: usize,
@@ -130,25 +130,17 @@ pub fn is_read_only_never_restrict(tool: &str) -> bool {
     crate::tool::categories::registry().is_never_restrict(tool)
 }
 
-/// Insert deprioritized tool names from [`TurnGuard`] into the selector
-/// restriction set (CLI parity). Read-only *category* tools are excluded —
-/// they must stay visible to the model. Non-read-only tools flagged
-/// `TASK_MGMT` are NOT exempt: a broken task tool must be quarantinable by
-/// the health tracker rather than blanket-immune (otherwise a hard
-/// circuit-breaker trip on `task`/`task_stop` can never take effect).
+/// Legacy compatibility hook for callers that used to promote soft tool-health
+/// signals into hard schema restrictions.
+///
+/// Tool health is diagnostic and advisory: it can produce warnings, retry
+/// guidance, and `avoid_tools`, but it must not hide a tool from the model. A
+/// hidden schema is a hard contract change and belongs only to permission,
+/// interaction-mode, runtime allowlist, or resource-limit enforcement.
 pub fn merge_deprioritized_tools_into_restricted(
-    turn_guard: &TurnGuard,
-    restricted: &mut HashSet<String>,
+    _turn_guard: &TurnGuard,
+    _restricted: &mut HashSet<String>,
 ) {
-    let reg = crate::tool::categories::registry();
-    for t in turn_guard.health.deprioritized_tools() {
-        // Category-only check: ReadOnly observation tools stay visible, but
-        // the TASK_MGMT flag does NOT grant immunity here.
-        if reg.is_read_only(t) {
-            continue;
-        }
-        restricted.insert(t.to_string());
-    }
 }
 
 fn insert_avoid_tool(avoid_tools: &mut HashSet<String>, tool: &str) {
@@ -171,7 +163,7 @@ fn deprioritize_warning_for_tools(tools: &[String]) -> Option<String> {
         return None;
     }
     Some(format!(
-        "⚠ The following tools have repeatedly failed and should be avoided: [{}].",
+        "⚠ The following tools have produced repeated tool-level failures; avoid blindly repeating identical calls: [{}].",
         tools.join(", ")
     ))
 }
@@ -271,6 +263,20 @@ impl TurnGuard {
     /// Record a tool result and classify its quality.
     /// Returns the quality classification for the caller's use.
     pub fn record_tool_result(&mut self, tool_name: &str, result_str: &str) -> ResultQuality {
+        self.record_tool_result_with_kind(tool_name, result_str, None)
+    }
+
+    /// Record a tool result with an error kind already classified at source.
+    ///
+    /// Use this for internal/runtime failures that carry structured metadata
+    /// such as `tool_result_fields.error_kind`. The plain string path remains a
+    /// fallback for genuinely unstructured external command output.
+    pub fn record_tool_result_with_kind(
+        &mut self,
+        tool_name: &str,
+        result_str: &str,
+        source_error_kind: Option<astra_core::ErrorKind>,
+    ) -> ResultQuality {
         let quality = result_quality::classify_result(result_str);
         match quality {
             ResultQuality::Success => {
@@ -279,13 +285,22 @@ impl TurnGuard {
             }
             ResultQuality::Error => {
                 self.round_had_error = true;
-                let category = error_recovery::classify_error(result_str);
+                let category =
+                    source_error_kind.unwrap_or_else(|| error_recovery::classify_error(result_str));
+                let shell_tool = crate::tool::categories::registry().is_shell(tool_name);
                 match category {
-                    // Permanent failures: deprioritize immediately, no retry
-                    error_recovery::ErrorCategory::ToolUnavailable
-                    | error_recovery::ErrorCategory::ResourceLimit => {
+                    // Resource exhaustion is an actual runtime safety limit,
+                    // so keep it as a hard health signal for every tool.
+                    error_recovery::ErrorCategory::ResourceLimit => {
                         self.health.record_resource_limit_failure(tool_name);
                     }
+                    // "command not found" inside bash means the requested
+                    // program is missing, not that the shell executor is
+                    // unavailable. Do not poison the shell entry point.
+                    error_recovery::ErrorCategory::ToolUnavailable if !shell_tool => {
+                        self.health.record_resource_limit_failure(tool_name);
+                    }
+                    error_recovery::ErrorCategory::ToolUnavailable => {}
                     // Schema / input-validation failures are the *caller*'s fault
                     // (bad args from the LLM), not the tool's. Don't deprioritize
                     // the tool — otherwise a few malformed calls can banish a
@@ -294,6 +309,17 @@ impl TurnGuard {
                     error_recovery::ErrorCategory::ToolInvalidArgs => {
                         self.health.record_input_validation_failure(tool_name);
                     }
+                    // Binding/protocol mismatches are a surface assembly bug:
+                    // the model was shown a tool whose executor/edge transport
+                    // was not actually attached. Record the error pressure, but
+                    // do not teach tool health that the tool implementation is
+                    // flaky or unavailable.
+                    error_recovery::ErrorCategory::ToolBinding => {}
+                    // Shell tools are generic execution surfaces. Ordinary
+                    // command exits, permission errors, and command timeouts
+                    // are facts about the requested command/environment, not
+                    // evidence that the shell tool itself is broken.
+                    _ if shell_tool => {}
                     _ => {
                         self.health.record_failure(tool_name);
                     }
@@ -425,7 +451,7 @@ impl TurnGuard {
     ///
     /// ## Critical state
     ///
-    /// First Critical turn injects a read-only restriction but does NOT
+    /// First Critical turn injects strong recovery guidance but does NOT
     /// force-stop. Second consecutive Critical turn force-stops. A prior
     /// Critical is cleared only after **two consecutive calm turns**
     /// (severity ≤ Info), giving the agent a grace period to demonstrate
@@ -667,7 +693,7 @@ impl TurnGuard {
         }
 
         // Force stop uses progressive degradation instead of immediate termination.
-        // First Critical: inject strong warning + restrict to read-only, but continue.
+        // First Critical: inject strong warning/avoid guidance, but continue.
         // Second Critical: force stop — the agent had a chance and didn't recover.
         let force_stop = if escalation == EscalationLevel::Critical {
             self.critical_turns += 1;
@@ -684,13 +710,13 @@ impl TurnGuard {
             if self.critical_turns >= 2 {
                 true // second consecutive Critical → force stop
             } else {
-                // First Critical: restrict to read-only tools
+                // First Critical: advise the model away from high-risk write/execute tools.
                 for &t in CLOUD_APPROVAL_REQUIRED_TOOLS.iter() {
                     insert_avoid_tool(&mut avoid_tools, t);
                 }
                 injections.push(
-                    "🚨 SESSION CRITICAL: Restricting to read-only tools for this turn. \
-                     You MUST make progress or answer the user. \
+                    "🚨 SESSION CRITICAL: Stop repeating failing write/execute actions. \
+                     Prefer read-only inspection or answer the user with current evidence. \
                      If the next turn also fails, the session will be terminated."
                         .to_string(),
                 );
@@ -985,13 +1011,13 @@ mod tests {
     fn tool_errors_accumulate_to_warning() {
         let mut guard = TurnGuard::new();
         // 3 failures → deprioritized
-        guard.record_tool_result("bash", "Error: permission denied");
-        guard.record_tool_result("bash", "Error: permission denied");
-        guard.record_tool_result("bash", "Error: permission denied");
+        guard.record_tool_result("test_tool", "Error: permission denied");
+        guard.record_tool_result("test_tool", "Error: permission denied");
+        guard.record_tool_result("test_tool", "Error: permission denied");
 
         let verdict = guard.evaluate();
         assert!(verdict.severity >= VerdictSeverity::Warning);
-        assert!(verdict.avoid_tools.contains(&"bash".to_string()));
+        assert!(verdict.avoid_tools.contains(&"test_tool".to_string()));
     }
 
     #[test]
@@ -1000,6 +1026,41 @@ mod tests {
         // Single "command not found" → immediate deprioritize (no consecutive threshold)
         guard.record_tool_result("mo_query", "Error: command not found");
         assert!(guard.health.is_deprioritized("mo_query"));
+    }
+
+    #[test]
+    fn shell_command_failures_do_not_deprioritize_shell_tool() {
+        let mut guard = TurnGuard::new();
+        for _ in 0..5 {
+            guard.record_tool_result(
+                "bash",
+                "Error: command failed with exit code 1\nstderr: tests failed",
+            );
+        }
+
+        assert_eq!(guard.errors.total_errors, 5);
+        assert!(
+            !guard.health.is_deprioritized("bash"),
+            "a failing command must not make the shell executor unavailable"
+        );
+        assert!(
+            !guard.evaluate().avoid_tools.contains(&"bash".to_string()),
+            "shell entry point should remain available; stall logic handles repeated identical commands"
+        );
+    }
+
+    #[test]
+    fn shell_command_not_found_does_not_deprioritize_shell_tool() {
+        let mut guard = TurnGuard::new();
+        for _ in 0..3 {
+            guard.record_tool_result("bash", "Error: command not found: rg");
+        }
+
+        assert_eq!(guard.errors.total_errors, 3);
+        assert!(
+            !guard.health.is_deprioritized("bash"),
+            "missing inner command is not shell tool unavailability"
+        );
     }
 
     #[test]
@@ -1033,6 +1094,43 @@ mod tests {
     }
 
     #[test]
+    fn tool_binding_errors_do_not_poison_tool_health() {
+        let mut guard = TurnGuard::new();
+        let quality = guard.record_tool_result_with_kind(
+            "agent_fanout",
+            "Error: headless edge protocol — tool `agent_fanout` has no matching edge execution in this turn.",
+            Some(astra_core::ErrorKind::ToolBinding),
+        );
+
+        assert_eq!(quality, super::result_quality::ResultQuality::Error);
+        assert!(guard.round_had_error);
+        assert!(
+            guard.health.get("agent_fanout").is_none(),
+            "binding failures are surface/executor bugs, not tool health failures"
+        );
+
+        let verdict = guard.evaluate();
+        assert!(
+            !verdict.avoid_tools.contains(&"agent_fanout".to_string()),
+            "binding failure must not teach future turns to avoid the correct multi-agent tool"
+        );
+    }
+
+    #[test]
+    fn legacy_tool_binding_sentinel_does_not_poison_tool_health() {
+        let mut guard = TurnGuard::new();
+        let result = format!(
+            "Error: {} legacy binding failure",
+            astra_core::error_kind::TOOL_BINDING_SENTINEL
+        );
+        let quality = guard.record_tool_result("agent_fanout", &result);
+
+        assert_eq!(quality, super::result_quality::ResultQuality::Error);
+        assert!(guard.round_had_error);
+        assert!(guard.health.get("agent_fanout").is_none());
+    }
+
+    #[test]
     fn empty_result_tracked_not_deprioritized() {
         let mut guard = TurnGuard::new();
         // 3 empty results → NOT deprioritized (just empty)
@@ -1047,29 +1145,29 @@ mod tests {
     fn flaky_tool_gets_stricter_threshold() {
         let mut guard = TurnGuard::new();
         // First cycle: 3 failures → deprioritized
-        guard.record_tool_result("bash", "Error: fail 1");
-        guard.record_tool_result("bash", "Error: fail 2");
-        guard.record_tool_result("bash", "Error: fail 3");
-        assert!(guard.health.is_deprioritized("bash"));
+        guard.record_tool_result("test_tool", "Error: fail 1");
+        guard.record_tool_result("test_tool", "Error: fail 2");
+        guard.record_tool_result("test_tool", "Error: fail 3");
+        assert!(guard.health.is_deprioritized("test_tool"));
 
         // Rehabilitate
-        guard.record_tool_result("bash", r#"{"output": "ok"}"#);
-        assert!(!guard.health.is_deprioritized("bash"));
+        guard.record_tool_result("test_tool", r#"{"output": "ok"}"#);
+        assert!(!guard.health.is_deprioritized("test_tool"));
 
         // Second cycle: 3 failures again → deprioritized
-        guard.record_tool_result("bash", "Error: fail 4");
-        guard.record_tool_result("bash", "Error: fail 5");
-        guard.record_tool_result("bash", "Error: fail 6");
-        assert!(guard.health.is_deprioritized("bash"));
+        guard.record_tool_result("test_tool", "Error: fail 4");
+        guard.record_tool_result("test_tool", "Error: fail 5");
+        guard.record_tool_result("test_tool", "Error: fail 6");
+        assert!(guard.health.is_deprioritized("test_tool"));
 
         // Rehabilitate again (now rehabilitation_count == 2)
-        guard.record_tool_result("bash", r#"{"output": "ok"}"#);
-        assert!(!guard.health.is_deprioritized("bash"));
+        guard.record_tool_result("test_tool", r#"{"output": "ok"}"#);
+        assert!(!guard.health.is_deprioritized("test_tool"));
 
         // Third cycle: only 2 failures needed (stricter threshold)
-        guard.record_tool_result("bash", "Error: fail 7");
-        guard.record_tool_result("bash", "Error: fail 8");
-        assert!(guard.health.is_deprioritized("bash"));
+        guard.record_tool_result("test_tool", "Error: fail 7");
+        guard.record_tool_result("test_tool", "Error: fail 8");
+        assert!(guard.health.is_deprioritized("test_tool"));
     }
 
     #[test]
@@ -1361,7 +1459,7 @@ mod tests {
             "pure stalls without errors should not force_stop"
         );
 
-        // 4 nudges + 3 errors → first Critical → restricted, NOT force_stop
+        // 4 nudges + 3 errors → first Critical → avoid guidance, NOT force_stop
         guard.nudge_count = 4;
         for _ in 0..3 {
             guard.record_tool_result("test_tool", "Error: something failed");
@@ -1369,14 +1467,14 @@ mod tests {
         let v = guard.evaluate();
         assert!(
             !v.force_stop,
-            "first Critical should restrict tools, not force_stop (progressive degradation)"
+            "first Critical should inject recovery guidance, not force_stop"
         );
         assert_eq!(v.severity, VerdictSeverity::Critical);
-        // Should restrict every canonical cloud-gated write/execute tool.
+        // Should advise against every canonical cloud-gated write/execute tool.
         for &tool in CLOUD_APPROVAL_REQUIRED_TOOLS.iter() {
             assert!(
                 v.avoid_tools.contains(&tool.to_string()),
-                "first Critical should restrict {tool}"
+                "first Critical should advise against {tool}"
             );
         }
 
@@ -1463,7 +1561,7 @@ mod tests {
     fn mutating_tool_errors_trigger_warning() {
         let mut guard = TurnGuard::new();
         for _ in 0..3 {
-            guard.record_tool_result("bash", "Error: command failed");
+            guard.record_tool_result("write_file", "Error: write failed");
         }
 
         let verdict = guard.evaluate();
@@ -1514,7 +1612,7 @@ mod tests {
     fn deprioritize_warning_emits_once_until_health_changes() {
         let mut guard = TurnGuard::new();
         for _ in 0..3 {
-            guard.record_tool_result("bash", "Error: command failed");
+            guard.record_tool_result("write_file", "Error: write failed");
         }
 
         let first = guard.evaluate();
@@ -1523,7 +1621,7 @@ mod tests {
             !first.injections.is_empty(),
             "new deprioritization should emit guidance once"
         );
-        assert!(first.avoid_tools.contains(&"bash".to_string()));
+        assert!(first.avoid_tools.contains(&"write_file".to_string()));
 
         let second = guard.evaluate();
         assert_eq!(
@@ -1539,7 +1637,7 @@ mod tests {
     fn successful_progress_pays_down_error_pressure() {
         let mut guard = TurnGuard::new();
         for _ in 0..3 {
-            guard.record_tool_result("bash", "Error: command failed");
+            guard.record_tool_result("write_file", "Error: write failed");
         }
         assert_eq!(guard.errors.total_errors, 3);
 
@@ -1712,7 +1810,7 @@ mod tests {
         let mut guard = TurnGuard::new();
         guard.nudge_count = 4;
         for _ in 0..3 {
-            guard.record_tool_result("bash", "Error: command failed");
+            guard.record_tool_result("write_file", "Error: write failed");
         }
 
         let first = guard.evaluate();
@@ -1790,7 +1888,7 @@ mod tests {
             guard.record_tool_calls(std::slice::from_ref(&call));
         }
         let verdict = guard.evaluate();
-        // First Critical → progressive degradation (restricted, not stopped)
+        // First Critical → progressive degradation (guided, not stopped)
         assert!(
             !verdict.force_stop,
             "first Critical should NOT force_stop (progressive degradation)"
@@ -1895,7 +1993,7 @@ mod tests {
     }
 
     #[test]
-    fn followed_true_when_avoiding_restricted_tools() {
+    fn followed_true_when_following_avoid_guidance() {
         let mut guard = TurnGuard::new();
         let calls = [make_tool_call("bash", r#"{"command":"ls"}"#)];
         guard.record_tool_calls(&calls);
@@ -1913,17 +2011,17 @@ mod tests {
             "bash should be in avoid_tools after stall"
         );
 
-        // Agent avoids the restricted tool
+        // Agent follows avoid guidance.
         guard.record_tool_calls(&[make_tool_call("read_file", r#"{"path":"bar"}"#)]);
         let outcome = guard.correction_history.last().unwrap();
         assert!(
             outcome.followed,
-            "should be true when agent avoided restricted tools"
+            "should be true when agent followed avoid guidance"
         );
     }
 
     #[test]
-    fn followed_false_when_using_restricted_tools() {
+    fn followed_false_when_ignoring_avoid_guidance() {
         let mut guard = TurnGuard::new();
         let calls = [make_tool_call("bash", r#"{"command":"ls"}"#)];
         guard.record_tool_calls(&calls);
@@ -1934,7 +2032,7 @@ mod tests {
         let outcome_record = guard.pending_correction.as_ref().unwrap();
         assert!(
             outcome_record.avoid_tools.contains(&"bash".to_string()),
-            "bash should be restricted after stall"
+            "bash should be in avoid guidance after stall"
         );
 
         // Agent ignores the correction and uses bash again
@@ -1942,7 +2040,7 @@ mod tests {
         let outcome = guard.correction_history.last().unwrap();
         assert!(
             !outcome.followed,
-            "should be false when agent used restricted tool"
+            "should be false when agent ignored avoid guidance"
         );
     }
 
@@ -2101,18 +2199,16 @@ mod tests {
         for tool in &never_restrict_tools {
             assert!(
                 !restricted.contains(*tool),
-                "read-only tool `{tool}` must not be restricted after repeated failures; \
-                 restricting it creates a false-positive cascade (see bug #2)"
+                "read-only tool `{tool}` must not be restricted after repeated failures"
             );
         }
     }
 
     #[test]
-    fn merge_still_restricts_mutating_tools_on_repeated_failure() {
-        // Guard-rail: the read-only exemption must not accidentally neutralise
-        // deprioritization for mutating tools. `bash`/`write_file` must still
-        // land in `restricted` so the model is steered away from them after
-        // repeated failures.
+    fn merge_keeps_mutating_tool_health_advisory() {
+        // Soft health guidance must not hide mutating tools from the schema.
+        // Hard restrictions live in the permission/runtime/resource-limit
+        // layers, not in repeated-failure diagnostics.
         let mut guard = TurnGuard::new();
         deprioritize_tool(&mut guard, "bash", 5);
         deprioritize_tool(&mut guard, "write_file", 5);
@@ -2120,20 +2216,13 @@ mod tests {
         let mut restricted: HashSet<String> = HashSet::new();
         super::merge_deprioritized_tools_into_restricted(&guard, &mut restricted);
 
-        assert!(
-            restricted.contains("bash"),
-            "mutating tool `bash` must still be restricted after repeated failures"
-        );
-        assert!(
-            restricted.contains("write_file"),
-            "mutating tool `write_file` must still be restricted after repeated failures"
-        );
+        assert!(restricted.is_empty(), "soft health must not restrict tools");
     }
 
     #[test]
-    fn merge_mixed_failures_exempts_only_read_only_names() {
-        // Complex case: both kinds fail repeatedly → the restriction set
-        // contains only the mutating ones.
+    fn merge_mixed_failures_remain_advisory() {
+        // Complex case: read-only and mutating tools fail repeatedly, but the
+        // old merge hook remains a no-op.
         let mut guard = TurnGuard::new();
         deprioritize_tool(&mut guard, "read_file", 8);
         deprioritize_tool(&mut guard, "grep", 4);
@@ -2143,10 +2232,7 @@ mod tests {
         let mut restricted: HashSet<String> = HashSet::new();
         super::merge_deprioritized_tools_into_restricted(&guard, &mut restricted);
 
-        assert!(!restricted.contains("read_file"));
-        assert!(!restricted.contains("grep"));
-        assert!(restricted.contains("bash"));
-        assert!(restricted.contains("str_replace"));
+        assert!(restricted.is_empty(), "soft health must not restrict tools");
     }
 
     // ── P0-B: Full stall recovery pipeline behavioral test ──────────
@@ -2430,21 +2516,19 @@ mod tests {
     }
 
     #[test]
-    fn avoid_tools_restricts_non_read_only_tools() {
+    fn deprioritized_non_read_only_tools_remain_advisory() {
         let mut guard = TurnGuard::new();
-        // bash errors → deprioritize
-        guard.record_tool_result("bash", "Error: permission denied");
-        guard.record_tool_result("bash", "Error: permission denied");
-        guard.record_tool_result("bash", "Error: permission denied");
+        // Direct health failures still produce avoid guidance.
+        deprioritize_tool(&mut guard, "write_file", 3);
 
         let verdict = guard.evaluate();
-        assert!(verdict.avoid_tools.contains(&"bash".to_string()));
+        assert!(verdict.avoid_tools.contains(&"write_file".to_string()));
 
         let mut restricted = HashSet::new();
         merge_deprioritized_tools_into_restricted(&guard, &mut restricted);
         assert!(
-            restricted.contains("bash"),
-            "non-read-only tool bash should be restricted"
+            !restricted.contains("write_file"),
+            "soft health guidance must not hide non-read-only tools"
         );
     }
 
@@ -2516,9 +2600,9 @@ mod tests {
         guard.record_cache_hit("read_file");
         guard.record_cache_hit("read_file");
         // 3. Tool errors (will trigger deprioritize warning)
-        guard.record_tool_result("bash", "Error: fail");
-        guard.record_tool_result("bash", "Error: fail");
-        guard.record_tool_result("bash", "Error: fail");
+        guard.record_tool_result("write_file", "Error: write failed");
+        guard.record_tool_result("write_file", "Error: write failed");
+        guard.record_tool_result("write_file", "Error: write failed");
 
         let verdict = guard.evaluate();
         assert!(

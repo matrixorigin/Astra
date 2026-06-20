@@ -97,19 +97,28 @@ fn session_memory_injection(
     if entry.content.trim().is_empty() {
         return None;
     }
+    let source = entry
+        .source
+        .clone()
+        .unwrap_or_else(|| "session_memory".into());
     Some(astra_turn_core::context_assembly_trace::MemoryInjection {
         memory_id: "session-memory".into(),
-        memory_type: entry
-            .source
-            .clone()
-            .unwrap_or_else(|| "session_memory".into()),
+        memory_type: source.clone(),
         tokens: (entry.content.chars().count() as u32 / 4).saturating_add(1),
-        relevance_score: 1.0,
+        relevance_score: session_memory_relevance_score(&source),
         content_preview: astra_turn_core::context_assembly_trace::preview_snippet(
             &entry.content,
             100,
         ),
     })
+}
+
+fn session_memory_relevance_score(source: &str) -> f64 {
+    if source == "session_memory.reanchor" {
+        1.0
+    } else {
+        0.35
+    }
 }
 
 fn resolve_pipeline_session_current_date(

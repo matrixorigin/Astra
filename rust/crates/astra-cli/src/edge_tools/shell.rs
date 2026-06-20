@@ -4712,26 +4712,38 @@ impl ToolExecutor {
             );
         }
 
-        // Use fd if available (faster, respects .gitignore), fall back to find
+        // Use fd if available (faster, respects .gitignore), fall back to
+        // find. The fallback lists candidate files only; Rust-side glob
+        // filtering below is authoritative so a bad shell expression cannot
+        // explode a narrow/no-match pattern into the entire repository.
         let shell_cmd = format!(
-            "cd {} && {{ fd --type f --glob {} 2>/dev/null || find . {} -o -name {} -print | sed 's|^./||'; }} | head -100",
+            "cd {} && {{ fd --type f --glob {} 2>/dev/null || find . {} -o -type f -print | sed 's|^./||'; }} | head -1000",
             shell_escape(base.to_string_lossy().as_ref()),
             shell_escape(&pattern),
-            default_find_prune_clause(),
-            shell_escape(pattern.split('/').next_back().unwrap_or(&pattern))
+            default_find_prune_clause()
         );
         let mut cmd = Command::new("bash");
         cmd.arg("-c").arg(&shell_cmd);
         // Use 15s timeout for glob/find (directory traversal)
         match run_command_with_cleanup(&mut cmd, 15.0) {
             Ok(o) => {
-                let text = String::from_utf8_lossy(&o.stdout).into_owned();
-                if text.trim().is_empty() {
+                let raw_text = String::from_utf8_lossy(&o.stdout);
+                let mut files = raw_text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .filter(|line| astra_tools::shell_ops::glob_matches_path(&pattern, line))
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                files.sort();
+                files.dedup();
+                if files.is_empty() {
                     "No files found".to_string()
                 } else {
                     // Apply per-tool output limit (centralised in per_tool_output_limit)
+                    let text = files.join("\n");
                     let limit = self.scaled_output_limit_for("glob");
-                    let line_count = text.lines().count();
+                    let line_count = files.len();
                     if text.len() > limit {
                         let end = text.floor_char_boundary(limit);
                         let cut = text[..end].rfind('\n').map(|pos| pos + 1).unwrap_or(end);
@@ -5641,6 +5653,28 @@ mod tests {
         assert!(
             result.contains("list_dir"),
             "should suggest list_dir, got: {result}"
+        );
+    }
+
+    #[test]
+    fn glob_nonexistent_pattern_prefix_does_not_return_entire_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("rust/crates/astra-thin-client/src")).unwrap();
+        std::fs::write(
+            dir.path()
+                .join("rust/crates/astra-thin-client/src/client.rs"),
+            "",
+        )
+        .unwrap();
+        let executor = ToolExecutor::new(dir.path());
+
+        let result = executor.glob(&serde_json::json!({
+            "pattern": "rust/crates/astra-orch/**/*.rs"
+        }));
+
+        assert_eq!(
+            result, "No files found",
+            "no-match glob must not fall back to unrelated workspace files: {result}"
         );
     }
 

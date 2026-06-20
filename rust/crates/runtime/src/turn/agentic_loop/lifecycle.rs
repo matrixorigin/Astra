@@ -79,6 +79,12 @@ fn is_explicit_parallel_skill_request(message: &str) -> bool {
         "多agent",
         "多个agent",
         "并行review",
+        // Chinese review phrasings — normalized form keeps CJK as-is
+        // (whitespace/dash/underscore are stripped before matching).
+        "并行审查",
+        "多角度审查",
+        "多视角审查",
+        "同时审查",
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
@@ -3322,6 +3328,7 @@ mod tests {
             state
                 .turn_guard
                 .record_tool_result("bash", "Error: command timed out");
+            state.turn_guard.health.record_failure("bash");
         }
         assert!(state.turn_guard.health.is_deprioritized("bash"));
         assert!(!state.turn_guard.tool_sigs.is_empty());

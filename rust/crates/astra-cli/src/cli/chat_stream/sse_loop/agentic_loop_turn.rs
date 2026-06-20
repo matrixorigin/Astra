@@ -2290,8 +2290,11 @@ Latest user task: review timeout handling\n\n\
             .iter()
             .filter_map(|schema| schema["function"]["name"].as_str())
             .collect();
-        assert!(!second_tool_names.contains(&"write_file"));
-        assert!(restricted_tools.contains("write_file"));
+        assert!(second_tool_names.contains(&"write_file"));
+        assert!(
+            restricted_tools.is_empty(),
+            "soft health signals must not remove visible tool schemas"
+        );
     }
 }
 

@@ -1348,6 +1348,7 @@ mod tests {
                 status: "completed".into(),
                 depends_on: vec![],
                 owner: None,
+                reason: None,
             },
             SessionSubtask {
                 id: "s2".into(),
@@ -1356,6 +1357,7 @@ mod tests {
                 status: "in_progress".into(),
                 depends_on: vec![],
                 owner: None,
+                reason: None,
             },
         ];
         let line = render_collapsed_summary(&[parent], 100).expect("non-empty");
@@ -1386,6 +1388,7 @@ mod tests {
                 status: "completed".into(),
                 depends_on: vec![],
                 owner: None,
+                reason: None,
             },
             SessionSubtask {
                 id: "exp-2".into(),
@@ -1394,6 +1397,7 @@ mod tests {
                 status: "in_progress".into(),
                 depends_on: vec!["exp-1".into()],
                 owner: None,
+                reason: None,
             },
             SessionSubtask {
                 id: "exp-3".into(),
@@ -1402,6 +1406,7 @@ mod tests {
                 status: "pending".into(),
                 depends_on: vec!["exp-2".into()],
                 owner: None,
+                reason: None,
             },
         ];
         let lines = render(&[parent], 80, 40, true);
@@ -1462,6 +1467,7 @@ mod tests {
                     status: "pending".into(),
                     depends_on: vec![],
                     owner: None,
+                    reason: None,
                 })
                 .collect();
         }

@@ -1,8 +1,8 @@
 //! Suggesting safe fallbacks when a tool is blocked at runtime.
 //!
 //! When the runtime denies a tool call (typically because the tool
-//! is in `restricted_tools` after repeated failures or because plan
-//! mode hides mutating tools), the model needs an actionable error
+//! is in `restricted_tools` because policy/permissions/runtime guards
+//! hide it), the model needs an actionable error
 //! message — not a generic "this is restricted" line, and definitely
 //! not "use bash" when bash is itself the tool that was just denied.
 //!
@@ -47,8 +47,9 @@ pub fn restricted_tool_workaround_message(
 
     let why = format!(
         "Tool '{tool_name}' is currently restricted in this session. \
-         The tool itself is not broken — repeated previous calls failed \
-         (often due to argument errors or plan-mode gating)."
+         The tool itself is not necessarily broken — current turn policy \
+         may be enforcing permissions, interaction mode, runtime allowlists, \
+         or resource-limit protection."
     );
 
     let next = match fallback {
@@ -101,6 +102,9 @@ fn pick_fallback(
         if candidate == blocked_tool {
             continue;
         }
+        if !candidate_supported_on_current_platform(candidate) {
+            continue;
+        }
         let cat = registry.category(candidate);
         if cat == blocked_category && same_category.is_none() {
             same_category = Some(candidate);
@@ -117,6 +121,17 @@ fn pick_fallback(
         return FallbackChoice::ReadOnlyOnly(name.to_string());
     }
     FallbackChoice::None
+}
+
+fn candidate_supported_on_current_platform(candidate: &str) -> bool {
+    #[cfg(not(windows))]
+    {
+        if candidate == "powershell" {
+            return false;
+        }
+    }
+    let _ = candidate;
+    true
 }
 
 #[cfg(test)]
@@ -158,6 +173,21 @@ mod tests {
         assert!(
             msg.contains("`shell`"),
             "should suggest `shell` (same Shell category). Got: {msg}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn does_not_suggest_powershell_on_non_windows() {
+        let available = set(&["powershell", "read_file"]);
+        let msg = restricted_tool_workaround_message("bash", &available, registry());
+        assert!(
+            !msg.contains("`powershell`"),
+            "must not suggest powershell on non-Windows hosts. Got: {msg}"
+        );
+        assert!(
+            msg.contains("`read_file`"),
+            "should fall back to the available read-only inspector. Got: {msg}"
         );
     }
 
@@ -219,7 +249,7 @@ mod tests {
         let available = set(&["read_file"]);
         let msg = restricted_tool_workaround_message("bash", &available, registry());
         assert!(
-            msg.contains("restricted") && (msg.contains("repeated") || msg.contains("plan-mode")),
+            msg.contains("restricted") && msg.contains("current turn policy"),
             "must explain that the block is a session-level restriction, not a transient bug. Got: {msg}"
         );
     }

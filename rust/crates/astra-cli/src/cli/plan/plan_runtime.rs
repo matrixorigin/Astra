@@ -316,6 +316,7 @@ mod tests {
             },
             user_id: "user-1".to_string(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: std::collections::HashMap::new(),
             execution_metadata: None,
         };

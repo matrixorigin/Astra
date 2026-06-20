@@ -3620,7 +3620,7 @@ fn strip_current_dir_prefix(line: &str) -> String {
     line.strip_prefix("./").unwrap_or(line).to_string()
 }
 
-fn glob_matches_path(pattern: &str, path: &str) -> bool {
+pub fn glob_matches_path(pattern: &str, path: &str) -> bool {
     let normalized_path = path.replace('\\', "/");
     let candidate = if pattern.contains('/') || pattern.contains('\\') {
         normalized_path

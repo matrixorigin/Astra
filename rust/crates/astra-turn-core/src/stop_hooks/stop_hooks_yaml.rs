@@ -282,9 +282,10 @@ fn auto_detect_verify_changes_hook(
         label: "verify-changes".into(),
         command: format!(
             "Based on the files you actually modified, run ONLY the relevant checks. \
-             Available tools: {tools_list}. \
-             Skip checks unrelated to your changes. \
-             If you only modified files outside the project (e.g. /tmp), skip all project checks."
+	             Available tools: {tools_list}. \
+	             For Cargo, pass at most one test filter per `cargo test` command; use separate commands for multiple exact tests. \
+	             Skip checks unrelated to your changes. \
+	             If you only modified files outside the project (e.g. /tmp), skip all project checks."
         ),
         working_dir: Some(project_root.to_string_lossy().to_string()),
         depends_on: Vec::new(),
@@ -632,6 +633,7 @@ hooks:
         let hooks = auto_detect_verify_changes_hook(root.path(), prof);
         assert_eq!(hooks.len(), 1);
         assert!(hooks[0].command.contains("Rust/Cargo"));
+        assert!(hooks[0].command.contains("at most one test filter"));
     }
 
     #[test]

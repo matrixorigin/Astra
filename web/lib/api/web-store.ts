@@ -89,6 +89,7 @@ type Store = {
 const AGENT_RESPONSE_TIMEOUT_MS = 30_000;
 const AGENT_STREAM_TIMEOUT_MS = 180_000;
 const LOCAL_ACTIVE_RUN_GRACE_MS = 30_000;
+const LOCAL_CANCELLING_STATUS_GRACE_MS = 15_000;
 const LOCAL_STOPPED_RUN_GRACE_MS = 30 * 60_000;
 const SESSION_SYNC_PAGE_SIZE = 200;
 const RUN_SYNC_PAGE_SIZE = 200;
@@ -242,7 +243,7 @@ function isFreshLocalActiveRun(
   const observedAt = Date.parse(activeRun.observedAt);
   const maxAge =
     activeRun.status.trim().toLowerCase() === "cancelling"
-      ? LOCAL_STOPPED_RUN_GRACE_MS
+      ? LOCAL_CANCELLING_STATUS_GRACE_MS
       : LOCAL_ACTIVE_RUN_GRACE_MS;
   return Number.isFinite(observedAt) && now - observedAt <= maxAge;
 }

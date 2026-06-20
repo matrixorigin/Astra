@@ -733,6 +733,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             api_token: token.clone(),
             delegation_engine: None,
             delegations_this_turn: 0,
+            delegation_chain: Vec::new(),
+            self_agent_id: "spawn_subrun".to_string(),
             project_context: None,
             checkpoint_gate: None,
             last_llm_context_manifest_trace: None,
@@ -1219,6 +1221,7 @@ mod tests {
                 inherited_prefix: None,
                 execution_metadata: None,
                 is_fork_child: false,
+                delegation_chain: Vec::new(),
             })
             .await
             .expect_err("token provider panic should fail execute");

@@ -1314,6 +1314,14 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     let (round_tool_calls, coaching_count): (_, Option<usize>) = {
         let new_records = &mut state.stall.tool_call_records[new_records_start..];
         let mut parallel_count_emit: Option<usize> = None;
+        for rec in new_records.iter_mut() {
+            if rec.is_synthetic_placeholder() {
+                continue;
+            }
+            if rec.round.is_none() {
+                rec.round = Some(obs_llm_round);
+            }
+        }
         if !new_records.is_empty() && turn_result.accum.tool_calls.len() > 1 {
             let batch_id = state.turn_event_buffer.as_mut().map(|b| b.next_batch_id());
             // Re-borrow after consuming turn_event_buffer's mutable access.
@@ -1874,6 +1882,7 @@ fn build_introspect_snapshot(
         forced_parallel_batching: state.stall.forced_parallel_batching,
         forced_redundant_reads_corrective: state.stall.forced_redundant_reads_corrective,
         forced_cache_waste_corrective: state.stall.forced_cache_waste_corrective,
+        forced_search_fanout_corrective: state.stall.forced_search_fanout_corrective,
         forced_exploration_family_phase2: state.stall.forced_exploration_family_phase2,
         forced_exploration_family_corrective: state.stall.forced_exploration_family_corrective,
         forced_completion_soft_stop: state.stall.forced_completion_soft_stop,

@@ -757,8 +757,17 @@ pub trait RunStateStore: Send + Sync {
     /// Find runs in WAITING status (for resume engine).
     async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String>;
 
-    /// Find runs in RUNNING status (for crash recovery — mark them failed on restart).
+    /// Find runs in RUNNING status.
     async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String>;
+
+    /// Find active runs this store owner may recover after startup.
+    ///
+    /// Implementations backed by shared durable storage must not return rows
+    /// owned by a different live pod with an unexpired lease. Otherwise one
+    /// app instance can falsely mark another instance's live run as crashed.
+    async fn find_recoverable_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+        self.find_running_runs().await
+    }
 
     /// Find the newest run that blocks starting another run in the same session.
     async fn find_blocking_session_run(
@@ -2509,6 +2518,32 @@ impl RunStateStore for DatabaseRunStateStore {
                 .fetch_all(self.pool.get())
                 .await
                 .map_err(|source| db_error("find_running_runs", "active", source).to_string())?;
+        rows.into_iter()
+            .map(run_record_from_row)
+            .collect::<DbStoreResult<Vec<_>>>()
+            .map_err(|e| e.to_string())
+    }
+
+    async fn find_recoverable_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+        let rows = sqlx::query(
+            "SELECT * FROM agent_runs
+             WHERE status IN (?, ?)
+               AND (
+                   owner_pod_id IS NULL
+                   OR owner_pod_id = ?
+                   OR owner_lease_expires_at IS NULL
+                   OR owner_lease_expires_at < NOW(6)
+               )
+             ORDER BY updated_at ASC",
+        )
+        .bind(STATUS_RUNNING)
+        .bind(STATUS_INPUT_QUEUED)
+        .bind(&self.owner_pod_id)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(|source| {
+            db_error("find_recoverable_running_runs", "active", source).to_string()
+        })?;
         rows.into_iter()
             .map(run_record_from_row)
             .collect::<DbStoreResult<Vec<_>>>()

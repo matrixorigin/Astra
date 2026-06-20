@@ -45,6 +45,11 @@ pub enum InterruptionKind {
     HarnessBlocked,
     /// Harness debug breakpoint hit → session paused.
     HarnessPaused,
+    /// Turn guard pipeline aborted the loop (e.g. repeated correction streak
+    /// exceeded the abort threshold). Captures *why* the guard pipeline halted
+    /// the turn so resumption surfaces the reason instead of an opaque final
+    /// text string.
+    GuardAbort,
 }
 
 impl InterruptionKind {
@@ -68,6 +73,7 @@ impl InterruptionKind {
             Self::StreamIdle => "stream_idle",
             Self::HarnessBlocked => "harness_blocked",
             Self::HarnessPaused => "harness_paused",
+            Self::GuardAbort => "guard_abort",
         }
     }
 
@@ -90,6 +96,7 @@ impl InterruptionKind {
             "stream_idle" => Some(Self::StreamIdle),
             "harness_blocked" => Some(Self::HarnessBlocked),
             "harness_paused" => Some(Self::HarnessPaused),
+            "guard_abort" => Some(Self::GuardAbort),
             _ => None,
         }
     }
@@ -114,6 +121,9 @@ impl InterruptionKind {
             Self::ApprovalRejected => true,
             Self::HarnessBlocked => false,
             Self::HarnessPaused => true,
+            // Guard aborts are recoverable: the next turn can proceed under a
+            // fresh guard streak. Progress made before the abort is preserved.
+            Self::GuardAbort => true,
         }
     }
 }

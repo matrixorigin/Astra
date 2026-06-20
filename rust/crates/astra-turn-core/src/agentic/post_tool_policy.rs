@@ -154,15 +154,9 @@ pub fn apply_agentic_post_tool_policy(
 
         // `avoid_tools` is advisory stall-recovery guidance. Removing those
         // tools from the visible schema changes the model contract mid-turn and
-        // can force it onto a worse surface. Only hard health-deprioritized
-        // tools become same-turn restrictions.
-        for tool in &verdict.avoid_tools {
-            if turn_guard.health.is_deprioritized(tool)
-                && !crate::guardrails::turn_guard::is_read_only_never_restrict(tool)
-            {
-                restricted_tools.insert(tool.clone());
-            }
-        }
+        // can force it onto a worse surface. Hard restrictions are owned by
+        // permission, interaction-mode, runtime allowlist, and resource-limit
+        // enforcement, not by soft health diagnostics.
 
         match verdict.severity {
             VerdictSeverity::Critical => {
@@ -299,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn reward_hacking_warning_retries_and_restricts_tools() {
+    fn reward_hacking_warning_retries_without_schema_restriction() {
         let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();
         let mut stall_events = Vec::new();
@@ -339,8 +333,7 @@ mod tests {
 
         assert_eq!(out, AgenticPostToolPolicyOutcome::RetryLlmClearToolResults);
         assert_eq!(remaining_turns, 8);
-        // read_file is read-only — it should NOT be restricted (model needs it
-        // for observation), but it should still appear in the verdict audit.
+        // Reward-hacking guidance is advisory and must not hide the schema.
         assert!(
             !restricted_tools.contains("read_file"),
             "read-only tools must not be added to restricted_tools"
@@ -461,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn health_deprioritized_tools_still_become_same_turn_restrictions() {
+    fn health_deprioritized_tools_remain_same_turn_advisory() {
         let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();
         let mut stall_events = Vec::new();
@@ -472,7 +465,7 @@ mod tests {
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
         for _ in 0..3 {
-            turn_guard.record_tool_result("bash", "Error: command failed");
+            turn_guard.health.record_failure("write_file");
         }
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
@@ -496,10 +489,10 @@ mod tests {
         });
 
         assert_eq!(out, AgenticPostToolPolicyOutcome::RetryLlmClearToolResults);
-        assert!(turn_guard.health.is_deprioritized("bash"));
+        assert!(turn_guard.health.is_deprioritized("write_file"));
         assert!(
-            restricted_tools.contains("bash"),
-            "hard health-deprioritized tools should still be hidden"
+            !restricted_tools.contains("write_file"),
+            "soft health-deprioritized tools must not be hidden"
         );
     }
 

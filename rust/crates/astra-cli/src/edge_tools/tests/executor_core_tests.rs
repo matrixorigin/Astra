@@ -1,4 +1,4 @@
-use super::test_executor;
+use super::{fanout_test_context, test_executor, test_spawner};
 use crate::edge_tools::{ToolExecutor, all_tool_schemas, truncate_output};
 use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalEventType};
 use astra_services::session_workspace::{self, ContextTraceSignal, WorkspaceMetadata};
@@ -166,7 +166,7 @@ async fn execute_with_metadata_marks_structured_str_replace_failure_as_error() {
 /// rejects it as an unknown action with an actionable redirect.
 #[tokio::test]
 async fn agent_action_delegate_is_rejected_with_redirect_to_spawn() {
-    let executor = test_executor();
+    let executor = test_executor().with_spawn_context(fanout_test_context(test_spawner()));
     let result = executor
         .execute(
             "agent",
@@ -220,7 +220,7 @@ async fn agent_action_delegate_is_rejected_with_redirect_to_spawn() {
 /// `action`, not a wrapper key.
 #[tokio::test]
 async fn agent_missing_action_with_spawn_wrapper_redirects_to_action_field() {
-    let executor = test_executor();
+    let executor = test_executor().with_spawn_context(fanout_test_context(test_spawner()));
     let result = executor
         .execute(
             "agent",

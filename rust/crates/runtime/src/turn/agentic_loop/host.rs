@@ -638,6 +638,11 @@ pub struct StallTrackingState {
     /// identical tool calls that are served from cache instead of reusing
     /// the earlier result. One-shot per turn.
     pub forced_cache_waste_corrective: bool,
+    /// Whether broad search fanout has already triggered a convergence
+    /// corrective this turn. This is intentionally advisory and one-shot: it
+    /// catches implementation tasks that keep widening search instead of
+    /// synthesizing, editing, verifying, or finishing.
+    pub forced_search_fanout_corrective: bool,
     /// Whether a broad exploration-family corrective injected a guidance
     /// message and restricted the dominant low-yield family this loop. Fires
     /// when consecutive multi-call rounds stay inside the same exploratory
@@ -1178,10 +1183,9 @@ pub struct AgenticLoopState {
     /// cleared; the bridge prunes it naturally when a later diagnosis drops the
     /// tool from its recommendation.
     pub boosted_tools: HashSet<String>,
-    /// One-shot flag set by pipeline `widen_selection` strategy. When true,
-    /// the upcoming tool-visibility assembly skips the deprioritized → restricted
-    /// merge for this turn so the LLM sees the full catalogue again. The flag
-    /// is consumed (reset to false) on use.
+    /// One-shot flag set by pipeline `widen_selection` strategy. The flag is
+    /// consumed (reset to false) on the next authoritative tool-visibility
+    /// assembly; soft health diagnostics no longer hide tools from the schema.
     pub widen_selection_pending: bool,
     pub step_recorder: StepRecorder,
 
@@ -1247,6 +1251,13 @@ pub struct AgenticLoopState {
     /// runaway delegation loops where the parent agent keeps delegating
     /// without synthesizing results.
     pub delegations_this_turn: u32,
+    /// Chain of agent_ids that led to this delegation (for circular detection).
+    /// Inherited from parent delegation and appended with parent agent_id.
+    /// Format: ["orchestrator", "coder", "reviewer"] means orchestrator→coder→reviewer.
+    pub delegation_chain: Vec<String>,
+    /// Agent ID of this agent itself. Set from delegation config for sub-agents;
+    /// falls back to "orchestrator" for the root agent.
+    pub self_agent_id: String,
 
     // ── Composite Snapshot ──
     /// Optional data snapshot provider for building composite snapshots.
@@ -2364,6 +2375,8 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         api_token: String::new(),
         delegation_engine: None,
         delegations_this_turn: 0,
+        delegation_chain: Vec::new(),
+        self_agent_id: "orchestrator".to_string(),
         run_control: None,
         project_context: None,
         checkpoint_gate: None,
@@ -2800,6 +2813,8 @@ pub(crate) mod tests {
             api_token: String::new(),
             delegation_engine: None,
             delegations_this_turn: 0,
+            delegation_chain: Vec::new(),
+            self_agent_id: "orchestrator".to_string(),
             run_control: None,
             project_context: None,
             checkpoint_gate: None,
@@ -9647,12 +9662,17 @@ mod parallel_execution_tests {
     use serde_json::json;
 
     fn tool_call_json_named(name: &str, id: &str) -> Value {
+        let arguments = if name == "bash" {
+            json!({"command": "true"})
+        } else {
+            json!({"path": format!("/tmp/{name}.txt")})
+        };
         json!({
             "id": id,
             "type": "function",
             "function": {
                 "name": name,
-                "arguments": json!({"path": format!("/tmp/{name}.txt")}).to_string()
+                "arguments": arguments.to_string()
             }
         })
     }

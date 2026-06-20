@@ -26,6 +26,7 @@ use ratatui::{
 use super::view::{BottomPaneView, CancellationEvent};
 
 pub(crate) const AGENT_DRILLDOWN_SENTINEL: &str = "__agent_drilldown__\n";
+const AUTO_DISMISS_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Sentinel emitted when the user presses `x` (or Delete) on a live row in
 /// the in-flight agents drill view. The outer event loop strips the
@@ -144,11 +145,18 @@ pub(crate) struct InFlightAgentsView {
     /// Cancelling → Cancelled in real time and can kill additional rows
     /// without re-opening Ctrl+G.
     pending_action: Option<String>,
+    /// When set, the view will auto-dismiss after this instant.
+    /// Armed when all rows become terminal (no live agents). Gives the
+    /// user ~3 seconds to see final status before the view closes itself.
+    /// Reset to None if the user interacts (key press) or if new live
+    /// rows appear.
+    auto_dismiss_at: Option<std::time::Instant>,
 }
 
 impl InFlightAgentsView {
     pub fn new(rows: Vec<AgentRow>) -> Self {
         let (live_count, failed_count) = count_rows(&rows);
+        let auto_dismiss_at = terminal_auto_dismiss_at(live_count, !rows.is_empty());
         Self {
             rows,
             live_count,
@@ -157,6 +165,7 @@ impl InFlightAgentsView {
             completed: false,
             accepted: None,
             pending_action: None,
+            auto_dismiss_at,
         }
     }
 
@@ -170,6 +179,22 @@ impl InFlightAgentsView {
         self.rows = rows;
         self.live_count = live_count;
         self.failed_count = failed_count;
+        // Arm auto-dismiss when all rows become terminal. Reset if live
+        // rows reappear (e.g. user spawns a new agent while the view is
+        // still open in the grace period).
+        if live_count == 0 && !self.rows.is_empty() {
+            if self.auto_dismiss_at.is_none() {
+                self.auto_dismiss_at = terminal_auto_dismiss_at(live_count, true);
+            }
+        } else {
+            self.auto_dismiss_at = None;
+        }
+    }
+
+    fn postpone_auto_dismiss_if_terminal(&mut self) {
+        if self.live_count == 0 && !self.rows.is_empty() {
+            self.auto_dismiss_at = terminal_auto_dismiss_at(self.live_count, true);
+        }
     }
 
     fn move_up(&mut self) {
@@ -216,6 +241,8 @@ impl InFlightAgentsView {
             self.accepted = Some(AcceptedAction::Drilldown(row.agent_id.clone()));
             self.completed = true;
         }
+        // Enter hands ownership to the drilldown completion path.
+        self.auto_dismiss_at = None;
     }
 
     /// User pressed `x` (or Delete) on the selected row.
@@ -236,6 +263,7 @@ impl InFlightAgentsView {
         {
             self.pending_action = Some(format!("{AGENT_KILL_SENTINEL}{}", row.agent_id));
         }
+        self.postpone_auto_dismiss_if_terminal();
     }
 }
 
@@ -243,6 +271,10 @@ fn count_rows(rows: &[AgentRow]) -> (usize, usize) {
     let live_count = rows.iter().filter(|row| row.status.is_live()).count();
     let failed_count = rows.iter().filter(|row| row.status.is_failed()).count();
     (live_count, failed_count)
+}
+
+fn terminal_auto_dismiss_at(live_count: usize, has_rows: bool) -> Option<std::time::Instant> {
+    (has_rows && live_count == 0).then(|| std::time::Instant::now() + AUTO_DISMISS_GRACE)
 }
 
 #[derive(Clone)]
@@ -365,6 +397,17 @@ fn format_elapsed(ms: u64) -> String {
 const PAGE_STEP: usize = 8;
 
 impl BottomPaneView for InFlightAgentsView {
+    fn pre_draw_tick(&mut self, now: std::time::Instant) {
+        // Auto-dismiss: if all rows are terminal and the grace period
+        // has elapsed, mark the view complete so the event loop pops it.
+        if let Some(dismiss_at) = self.auto_dismiss_at {
+            if now >= dismiss_at && self.live_count == 0 {
+                self.completed = true;
+                self.auto_dismiss_at = None;
+            }
+        }
+    }
+
     fn render(&self, area: Rect, buf: &mut Buffer) {
         if area.height == 0 || area.width == 0 {
             return;
@@ -465,6 +508,10 @@ impl BottomPaneView for InFlightAgentsView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        // Interaction should give the user another short look, not pin
+        // a terminal board forever. Live boards stay open until rows
+        // settle; terminal boards disappear shortly after input stops.
+        self.postpone_auto_dismiss_if_terminal();
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.move_up(),
             KeyCode::Down | KeyCode::Char('j') => self.move_down(),

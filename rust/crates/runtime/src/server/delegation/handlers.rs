@@ -385,6 +385,7 @@ mod tests {
             },
             user_id: "delegation-owner".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         }

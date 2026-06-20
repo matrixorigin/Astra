@@ -457,7 +457,7 @@ impl RunEngine {
     ///   `failed` with reason "recovered from crash".
     pub async fn recover_active_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
         let waiting = self.store.find_waiting_runs().await?;
-        let running = self.store.find_running_runs().await?;
+        let running = self.store.find_recoverable_running_runs().await?;
 
         let mut recovered_running = Vec::with_capacity(running.len());
         for mut run in running {

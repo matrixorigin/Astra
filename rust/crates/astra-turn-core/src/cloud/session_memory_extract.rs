@@ -160,6 +160,7 @@ pub fn build_extraction_prompt(current_memory: &str, recent_messages: &[Value]) 
          - Pending Todos: list tasks planned but NOT yet completed.\n\
          - Completed: list tasks finished this session, especially concrete substeps completed in the MOST RECENT turn. Only mark a task Completed if the assistant has explicitly confirmed it — do NOT infer completion from a passing mention. Cross-check: if an item appears in Completed it MUST NOT appear in Pending Todos.\n\
          - Current State: summarize what is true NOW as a neutral resumable state snapshot, not as an assistant handoff or victory lap.\n\
+         - Do not use session memory as the source of truth for live external state. Repository status, branch/commit state, running services, queues, cancellations, and verification freshness can change outside the conversation and must be rechecked when relevant.\n\
          - NEVER write completion-report phrasing such as \"the user's request is complete\", \"all done\", \"no issues remain\", \"the session is idle\", or \"no further action needed\".\n\
          - When work is complete, keep Current State concrete and minimal; preserve the task in Task Specification / Active Goals instead of replacing the whole snapshot with a final status paragraph.\n\
          - If a section has nothing meaningful to add, leave it empty instead of writing placeholders like \"None.\".";
@@ -948,6 +949,16 @@ mod tests {
                 || system.to_lowercase().contains("do not invent"),
             "system prompt must warn against inventing goals, got: {system}"
         );
+    }
+
+    #[test]
+    fn build_extraction_prompt_treats_live_external_state_as_non_authoritative() {
+        let msgs = vec![json!({"role": "user", "content": "continue"})];
+        let result = build_extraction_prompt("", &msgs);
+        let system = result[0]["content"].as_str().unwrap();
+
+        assert!(system.contains("live external state"));
+        assert!(system.contains("must be rechecked"));
     }
 
     #[test]

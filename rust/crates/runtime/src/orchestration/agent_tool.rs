@@ -16,8 +16,8 @@ use std::time::Duration;
 use futures_util::future::join_all;
 
 use astra_turn_core::orchestration::agent_result_wire::{
-    render_agent_tool_error, render_unknown_agent_result, render_wait_for_agent_status,
-    render_wait_timeout_outcome,
+    render_agent_tool_error, render_agent_tool_error_with_kind, render_unknown_agent_result,
+    render_wait_for_agent_status, render_wait_timeout_outcome,
 };
 use astra_turn_core::orchestration_fanout_group::{
     AgentFanoutGroupProjection, AgentFanoutSlotStatus, AgentFanoutStatus,
@@ -39,11 +39,26 @@ const MAX_FANOUT_SLOT_RESULT_BYTES: usize = 30_000;
 /// `get_results`/start-that-completed. If exceeded, per-slot limits
 /// are proportionally reduced until the total fits.
 const MAX_FANOUT_AGGREGATE_BYTES: usize = 60_000;
+const FANOUT_CODE_REVIEW_MIN_TURNS: u32 = 30;
 static NEXT_FANOUT_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 /// Static prose for the `Unknown` outcome. Must NOT interpolate the
 /// caller-supplied agent_id — that value already appears in the
 /// structured `agent_id` JSON field, where serde escapes it safely.
 const UNKNOWN_AGENT_ID_ERROR: &str = "Unknown agent_id. Use the exact runtime-generated agent_id returned by the earlier spawn result. The optional spawn `name` is only for send_message addressing and cannot be used with get_result.";
+
+pub fn render_agent_runtime_binding_error(tool_name: &str, action: &str) -> String {
+    render_agent_tool_error_with_kind(
+        None,
+        &format!(
+            "tool `{tool_name}` action `{action}` has no multi-agent executor attached in this session mode. \
+             The tool was advertised in the deferred manifest, but no backing executor is available, \
+             so this action cannot be executed regardless of retries or substitutions. \
+             Use only currently bound tools. Tell the user multi-agent execution is unavailable \
+             in this mode and suggest switching to a session mode that binds it."
+        ),
+        Some(astra_core::ErrorKind::ToolBinding),
+    )
+}
 
 /// Context for executing `agent` tool lifecycle actions.
 #[derive(Clone)]
@@ -52,6 +67,10 @@ pub struct AgentToolContext {
     pub run_id: String,
     /// Current agent's ID.
     pub agent_id: String,
+    /// Chain of agent_ids that led to this agent (for circular delegation detection).
+    /// Inherited from parent delegation and appended with parent agent_id.
+    /// Format: ["orchestrator", "coder", "reviewer"] means orchestrator→coder→reviewer.
+    pub delegation_chain: Vec<String>,
     /// Current active model for the parent turn. Used as the default
     /// child model when the tool call omits an explicit override.
     pub current_model: Option<String>,
@@ -85,10 +104,7 @@ pub async fn handle_agent_tool(args: &Value, ctx: Option<&AgentToolContext>) -> 
     match action {
         "spawn" => handle_agent_spawn_action(args, ctx).await,
         "get_result" => handle_agent_get_result_action(args, ctx).await,
-        "send_message" => render_agent_tool_error(
-            None,
-            "agent.send_message requires a mailbox-aware executor and is not handled by the shared spawn/get_result runtime handler.",
-        ),
+        "send_message" => render_agent_runtime_binding_error("agent", "send_message"),
         other if other.is_empty() && args.get("spawn").is_some() => render_agent_tool_error(
             None,
             "Invalid agent call shape. Use the top-level `action='spawn'` field, not a `spawn` wrapper key. Example: agent(action='spawn', description='...', prompt='...').",
@@ -439,7 +455,7 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
     let ctx = match ctx {
         Some(c) => c,
         None => {
-            return render_agent_tool_error(None, "Agent spawning not available in this context.");
+            return render_agent_runtime_binding_error("agent_fanout", "start");
         }
     };
     let mut input: AgentFanoutStartInput = match serde_json::from_value(args.clone()) {
@@ -529,6 +545,9 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
         }
     }
     let slots = std::mem::take(&mut input.slots);
+    // Budget transparency: detect silent max_turns inflation before slots
+    // are moved, then surface it in every response branch below.
+    let budget_notice = fanout_budget_adjustment_notice(&input);
     let tool_call_id = input._tool_call_id.clone();
 
     // Spawn all slots concurrently — no head-of-line blocking.
@@ -571,41 +590,85 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
         .any(|agent| agent.get("status").and_then(Value::as_str) == Some("launched"));
     if any_launched {
         let group = find_fanout_group(ctx, &group_id).await;
-        return json!({
+        let mut resp = json!({
             "status": "started",
             "group_id": group_id,
             "title": title,
             "target_count": input.target_count,
             "agents": agents,
             "fanout": group.as_ref().map(fanout_group_to_json).unwrap_or(Value::Null),
-        })
-        .to_string();
+        });
+        if let Some(notice) = &budget_notice {
+            resp.as_object_mut()
+                .unwrap()
+                .insert("budget_adjustment".into(), json!(notice));
+        }
+        // If any slot failed to spawn synchronously, inject anti-respawn
+        // instruction so the LLM doesn't try to "fix" partial starts.
+        let any_spawn_failed = agents.iter().any(|a| {
+            a.get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s == "failed")
+        });
+        if any_spawn_failed {
+            resp.as_object_mut().unwrap().insert(
+                "instruction".into(),
+                json!("Some agents failed to spawn. Do NOT retry or spawn replacements. Use agent_fanout(action='get_results', group_id=...) to collect partial results when ready."),
+            );
+        }
+        return resp.to_string();
     }
 
-    // Detect user-interrupted fanout: all slots failed with the same
-    // "agent task ended" error = the parent future was dropped (Ctrl+G).
-    // Return an explicit anti-retry signal instead of generic failure.
-    let all_failed_same = !agents.is_empty()
-        && agents.iter().all(|a| {
-            a.get("error")
-                .and_then(Value::as_str)
-                .is_some_and(|e| e.contains("agent task ended before returning"))
-        });
-    if all_failed_same {
-        return json!({
+    // Detect user-interrupted fanout: if ANY slot was user-cancelled,
+    // return an explicit anti-retry signal. Partial cancellation (2 of 3
+    // cancelled, 1 completed) must also prevent LLM from spawning
+    // replacement agents for the cancelled slots.
+    //
+    // Uses structured `finish_reason` field instead of string-matching
+    // the error message, which is fragile and breaks on format changes.
+    let any_cancelled = agents.iter().any(|a| {
+        a.get("finish_reason")
+            .and_then(Value::as_str)
+            .is_some_and(|r| r == "cancelled")
+    });
+    if any_cancelled {
+        let cancelled_count = agents
+            .iter()
+            .filter(|a| {
+                a.get("finish_reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|r| r == "cancelled")
+            })
+            .count();
+        let mut resp = json!({
             "status": "interrupted",
             "group_id": group_id,
             "title": title,
             "target_count": input.target_count,
             "cancelled_by_user": true,
-            "instruction": "All agents in this fanout were interrupted (likely by user Ctrl+G). Do NOT retry or respawn. Ask the user what to do next.",
-        })
-        .to_string();
+            "cancelled_count": cancelled_count,
+            "instruction": "Some or all agents in this fanout were interrupted (likely by user Ctrl+G). Do NOT retry or respawn replacements. Ask the user what to do next.",
+        });
+        if let Some(notice) = &budget_notice {
+            resp.as_object_mut()
+                .unwrap()
+                .insert("budget_adjustment".into(), json!(notice));
+        }
+        return resp.to_string();
     }
 
     // All agents completed synchronously — return the full results directly.
     // No separate "agents[]" field: results[] already contains status per slot.
-    render_agent_fanout_results(ctx, &group_id, tool_call_id).await
+    let mut results = render_agent_fanout_results(ctx, &group_id, tool_call_id).await;
+    if let Some(notice) = &budget_notice {
+        if let Ok(mut value) = serde_json::from_str::<Value>(&results) {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("budget_adjustment".into(), json!(notice));
+                results = value.to_string();
+            }
+        }
+    }
+    results
 }
 
 async fn handle_agent_fanout_get_results_action(
@@ -623,7 +686,7 @@ async fn handle_agent_fanout_get_results_action(
     let ctx = match ctx {
         Some(c) => c,
         None => {
-            return render_agent_tool_error(None, "Agent spawning not available in this context.");
+            return render_agent_runtime_binding_error("agent_fanout", "get_results");
         }
     };
     let input: AgentFanoutGroupInput = match serde_json::from_value(args.clone()) {
@@ -759,6 +822,30 @@ async fn render_agent_fanout_results(
     if summary.timed_out > 0 {
         obj.insert("timed_out".into(), json!(summary.timed_out));
     }
+    if summary.cancelled_by_parent_budget > 0 {
+        obj.insert(
+            "cancelled_by_parent_budget".into(),
+            json!(summary.cancelled_by_parent_budget),
+        );
+    }
+    // Anti-respawn instruction: prevent LLM from spawning additional agents
+    // to retry failed slots. The fanout group is a fixed-size contract;
+    // retries inflate the group and corrupt accounting.
+    let has_failures = summary.failed > 0
+        || summary.spawn_rejected > 0
+        || summary.timed_out > 0
+        || summary.cancelled_by_user > 0
+        || summary.cancelled_by_parent_budget > 0;
+    if has_failures {
+        obj.insert(
+            "instruction".into(),
+            json!(
+            "Do NOT retry, respawn, or spawn additional agents to replace failed/cancelled slots. \
+             The fanout group has a fixed target_count and adding agents corrupts accounting. \
+             Work with the results you have, or ask the user how to proceed."
+        ),
+        );
+    }
     response.to_string()
 }
 
@@ -786,7 +873,7 @@ async fn handle_agent_fanout_stop_slot_action(
     let ctx = match ctx {
         Some(c) => c,
         None => {
-            return render_agent_tool_error(None, "Agent spawning not available in this context.");
+            return render_agent_runtime_binding_error("agent_fanout", "stop_slot");
         }
     };
     let input: AgentFanoutStopSlotInput = match serde_json::from_value(args.clone()) {
@@ -897,6 +984,7 @@ fn fanout_slot_spawn_args(
     });
     let object = value.as_object_mut().expect("object");
     let defaults = input.defaults.as_ref();
+    let effective_max_turns = fanout_effective_max_turns(&slot, defaults);
     insert_optional_string(
         object,
         "agent_type",
@@ -909,12 +997,7 @@ fn fanout_slot_spawn_args(
         slot.model
             .or_else(|| defaults.and_then(|d| d.model.clone())),
     );
-    insert_optional_u32(
-        object,
-        "max_turns",
-        slot.max_turns
-            .or_else(|| defaults.and_then(|d| d.max_turns)),
-    );
+    insert_optional_u32(object, "max_turns", effective_max_turns);
     insert_optional_u32(
         object,
         "max_output_tokens",
@@ -946,6 +1029,84 @@ fn fanout_slot_spawn_args(
         );
     }
     value
+}
+
+fn fanout_effective_max_turns(
+    slot: &AgentFanoutStartSlot,
+    defaults: Option<&AgentFanoutDefaults>,
+) -> Option<u32> {
+    let requested = slot
+        .max_turns
+        .or_else(|| defaults.and_then(|d| d.max_turns));
+    let agent_type = slot
+        .agent_type
+        .as_deref()
+        .or_else(|| defaults.and_then(|d| d.agent_type.as_deref()))
+        .map(str::trim);
+    let complexity = slot
+        .complexity
+        .as_deref()
+        .or_else(|| defaults.and_then(|d| d.complexity.as_deref()))
+        .map(str::trim)
+        .map(str::to_ascii_lowercase);
+
+    let is_light = matches!(complexity.as_deref(), Some("light" | "short" | "quick"));
+    if is_light {
+        return requested;
+    }
+
+    let is_deep = matches!(complexity.as_deref(), Some("deep" | "thorough" | "heavy"));
+    let is_code_review = agent_type == Some("code-review");
+    let min_turns = if is_deep || is_code_review {
+        Some(FANOUT_CODE_REVIEW_MIN_TURNS)
+    } else {
+        None
+    };
+
+    match (requested, min_turns, is_deep) {
+        (Some(requested), Some(min_turns), _) => Some(requested.max(min_turns)),
+        (None, Some(min_turns), false) => Some(min_turns),
+        (None, _, _) => None,
+        (Some(requested), None, _) => Some(requested),
+    }
+}
+
+/// Detect whether the effective `max_turns` diverged from what the caller
+/// requested, and if so, produce a human-readable transparency notice.
+///
+/// First principles: a silent budget override breaks the caller's mental model
+/// of cost. When we inflate `max_turns` past the request (code-review/deep
+/// minimum), the caller must be told — both to preserve trust and to let them
+/// opt out by setting `complexity: "light"`.
+fn fanout_budget_adjustment_notice(input: &AgentFanoutStartInput) -> Option<String> {
+    let defaults = input.defaults.as_ref();
+    let mut adjustments: Vec<String> = Vec::new();
+    for (i, slot) in input.slots.iter().enumerate() {
+        let requested = slot
+            .max_turns
+            .or_else(|| defaults.and_then(|d| d.max_turns));
+        let effective = fanout_effective_max_turns(slot, defaults);
+        match (requested, effective) {
+            (Some(req), Some(eff)) if eff > req => {
+                let label = slot
+                    .slot_id
+                    .as_deref()
+                    .map(|id| format!("id={id}"))
+                    .unwrap_or_else(|| format!("slot[{i}]"));
+                adjustments.push(format!("{label}: max_turns {req} → {eff}"));
+            }
+            _ => {}
+        }
+    }
+    if adjustments.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Budget adjusted — code-review/deep agent minimum enforced ({}). \
+             Set complexity=\"light\" to honor the original max_turns.",
+            adjustments.join("; ")
+        ))
+    }
 }
 
 fn insert_optional_string(
@@ -1079,7 +1240,7 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
     let ctx = match ctx {
         Some(c) => c,
         None => {
-            return render_agent_tool_error(None, "Agent spawning not available in this context.");
+            return render_agent_runtime_binding_error("agent", "spawn");
         }
     };
 
@@ -1092,6 +1253,13 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
 
     let mut inherited_permissions = ctx.inherited_permissions.clone();
     inherited_permissions.is_background = input.run_in_background;
+
+    // Propagate delegation chain: child_chain = parent_chain + parent_agent_id.
+    // This enables circular delegation detection across agent spawn hops
+    // (e.g., A spawns B, B spawns C, C tries to spawn A → detected).
+    let mut child_delegation_chain = ctx.delegation_chain.clone();
+    child_delegation_chain.push(ctx.agent_id.clone());
+
     let spawn_ctx = SpawnContext {
         parent_run_id: ctx.run_id.clone(),
         parent_agent_id: ctx.agent_id.clone(),
@@ -1107,6 +1275,7 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
             .get("_tool_call_id")
             .and_then(Value::as_str)
             .map(ToString::to_string),
+        delegation_chain: child_delegation_chain,
     };
 
     match ctx.spawner.spawn(input, &spawn_ctx).await {
@@ -1247,7 +1416,7 @@ pub async fn handle_agent_get_result_action(
     let ctx = match ctx {
         Some(c) => c,
         None => {
-            return render_agent_tool_error(None, "Agent spawning not available in this context.");
+            return render_agent_runtime_binding_error("agent", "get_result");
         }
     };
 
@@ -1513,7 +1682,7 @@ mod tests {
             "prompt": "Test prompt"
         });
         let result = handle_agent_spawn_action(&args, None).await;
-        assert!(result.contains("not available"));
+        assert!(result.contains("unavailable"));
         assert!(result.contains("\"status\":\"failed\""), "{result}");
     }
 
@@ -1654,6 +1823,7 @@ mod tests {
         AgentToolContext {
             run_id: "run-parent".into(),
             agent_id: "root-agent".into(),
+            delegation_chain: Vec::new(),
             current_model: current_model.map(str::to_string),
             recursion_depth: 0,
             is_fork_child: false,
@@ -2046,6 +2216,42 @@ mod tests {
         assert_eq!(args["fanout_slot_index"], 1);
         assert_eq!(args["fanout_slot_id"], "storage");
         assert!(args.get("name").is_none());
+    }
+
+    #[test]
+    fn fanout_slot_spawn_args_raise_too_small_deep_review_budget() {
+        let input = AgentFanoutStartInput {
+            _action: Some("start".into()),
+            _tool_call_id: None,
+            group_id: Some("review-1".into()),
+            title: Some("review fanout".into()),
+            target_count: 4,
+            slots: Vec::new(),
+            defaults: Some(AgentFanoutDefaults {
+                agent_type: Some("code-review".into()),
+                max_turns: Some(15),
+                complexity: Some("deep".into()),
+                ..Default::default()
+            }),
+        };
+        let slot = AgentFanoutStartSlot {
+            slot_id: Some("correctness".into()),
+            description: "Review correctness".into(),
+            prompt: "Review correctness deeply".into(),
+            agent_type: None,
+            model: None,
+            max_turns: None,
+            max_output_tokens: None,
+            complexity: None,
+            isolated: None,
+            allowed_tools: None,
+        };
+
+        let args = fanout_slot_spawn_args(&input, slot, "review-1", "review fanout", 4, 1, None);
+
+        assert_eq!(args["agent_type"], "code-review");
+        assert_eq!(args["complexity"], "deep");
+        assert_eq!(args["max_turns"], 30);
     }
 
     #[tokio::test]
@@ -2535,7 +2741,7 @@ mod tests {
     #[tokio::test]
     async fn get_agent_result_no_context() {
         let result = handle_agent_get_result_action(&json!({"agent_id": "child-1"}), None).await;
-        assert!(result.contains("not available"));
+        assert!(result.contains("unavailable"));
         assert!(result.contains("\"status\":\"failed\""), "{result}");
     }
 
@@ -2605,12 +2811,37 @@ mod tests {
         .await;
         let value: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(value["status"], "failed");
+        let error = value["error"].as_str().unwrap_or("");
         assert!(
-            value["error"]
-                .as_str()
-                .unwrap_or("")
-                .contains("mailbox-aware executor"),
+            error.contains("no multi-agent executor attached"),
             "{result}"
+        );
+        assert_eq!(
+            value["error_kind"].as_str(),
+            Some(astra_core::ErrorKind::ToolBinding.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_handler_classifies_missing_spawn_binding() {
+        let result = handle_agent_tool(
+            &json!({
+                "action": "spawn",
+                "description": "Review",
+                "prompt": "Review the patch."
+            }),
+            None,
+        )
+        .await;
+        let value: Value = serde_json::from_str(&result).unwrap();
+        let error = value["error"].as_str().unwrap_or("");
+        assert!(
+            error.contains("no multi-agent executor attached"),
+            "{result}"
+        );
+        assert_eq!(
+            value["error_kind"].as_str(),
+            Some(astra_core::ErrorKind::ToolBinding.as_str())
         );
     }
 }

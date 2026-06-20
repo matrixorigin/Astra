@@ -2560,6 +2560,7 @@ mod tests {
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
+            delegation_chain: Vec::new(),
         };
         let input = SpawnAgentInput {
             description: "watch test agent".to_string(),

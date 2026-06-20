@@ -3,10 +3,11 @@
 //! Enable with crate feature `bridge-e2e-hooks`. At runtime, set `ASTRA_TEST_BRIDGE_SECRET` to a
 //! non-empty value and send the same value as header `x-mo-bridge-test-secret` on `POST /chat/turn`
 //! (forwarded to the in-process bridge). Body field `test_llm_rounds` is a JSON array of objects:
-//! `{ "full_text"?, "reasoning"?, "tool_calls"?, "usage"? }` — same shape as the internal
-//! `_inprocess_summary` payload. For streaming-failure E2E, body field `test_llm_stream_blocks`
-//! may contain raw SSE blocks (strings) that are fed directly into the bridge's in-process stream
-//! parser. **Never** enable the feature or set the env var in production.
+//! `{ "full_text"?, "reasoning"?, "tool_calls"?, "usage"?, "delay_ms"? }` — same shape as the
+//! internal `_inprocess_summary` payload, plus optional deterministic test delay. For
+//! streaming-failure E2E, body field `test_llm_stream_blocks` may contain raw SSE blocks
+//! (strings) that are fed directly into the bridge's in-process stream parser. **Never** enable
+//! the feature or set the env var in production.
 
 use axum::http::HeaderMap;
 use serde_json::{Map, Value};
@@ -29,7 +30,7 @@ pub fn authorized(headers: &HeaderMap) -> bool {
     header_str(headers, "x-mo-bridge-test-secret").as_deref() == Some(expected.as_str())
 }
 
-pub fn parse_llm_round(v: &Value) -> (String, String, Vec<Value>, Map<String, Value>) {
+pub fn parse_llm_round(v: &Value) -> (String, String, Vec<Value>, Map<String, Value>, u64) {
     let full_text = v
         .get("full_text")
         .and_then(Value::as_str)
@@ -50,7 +51,8 @@ pub fn parse_llm_round(v: &Value) -> (String, String, Vec<Value>, Map<String, Va
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    (full_text, reasoning, tool_calls, usage)
+    let delay_ms = v.get("delay_ms").and_then(Value::as_u64).unwrap_or(0);
+    (full_text, reasoning, tool_calls, usage, delay_ms)
 }
 
 pub fn parse_stream_blocks(v: &Value) -> Vec<String> {
@@ -78,31 +80,35 @@ mod tests {
             "full_text": "hello",
             "reasoning": "because",
             "tool_calls": [{"id": "1"}],
-            "usage": {"prompt_tokens": 10}
+            "usage": {"prompt_tokens": 10},
+            "delay_ms": 250
         });
-        let (ft, r, tc, u) = parse_llm_round(&v);
+        let (ft, r, tc, u, delay_ms) = parse_llm_round(&v);
         assert_eq!(ft, "hello");
         assert_eq!(r, "because");
         assert_eq!(tc.len(), 1);
         assert_eq!(u["prompt_tokens"], 10);
+        assert_eq!(delay_ms, 250);
     }
 
     #[test]
     fn parse_empty_object() {
-        let (ft, r, tc, u) = parse_llm_round(&json!({}));
+        let (ft, r, tc, u, delay_ms) = parse_llm_round(&json!({}));
         assert!(ft.is_empty());
         assert!(r.is_empty());
         assert!(tc.is_empty());
         assert!(u.is_empty());
+        assert_eq!(delay_ms, 0);
     }
 
     #[test]
     fn parse_wrong_types() {
         let v = json!({"full_text": 42, "tool_calls": "not_array", "usage": "not_object"});
-        let (ft, _, tc, u) = parse_llm_round(&v);
+        let (ft, _, tc, u, delay_ms) = parse_llm_round(&v);
         assert!(ft.is_empty());
         assert!(tc.is_empty());
         assert!(u.is_empty());
+        assert_eq!(delay_ms, 0);
     }
 
     #[test]

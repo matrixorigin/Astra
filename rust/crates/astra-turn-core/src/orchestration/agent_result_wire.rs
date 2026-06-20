@@ -442,10 +442,22 @@ pub fn render_unknown_agent_result(agent_id: &str, message: &str) -> String {
 }
 
 pub fn render_agent_tool_error(agent_id: Option<&str>, message: &str) -> String {
+    render_agent_tool_error_with_kind(agent_id, message, None)
+}
+
+pub fn render_agent_tool_error_with_kind(
+    agent_id: Option<&str>,
+    message: &str,
+    error_kind: Option<astra_core::ErrorKind>,
+) -> String {
+    let message = astra_core::error_kind::strip_tool_binding_sentinel(message);
     let mut body = json!({
         "status": AgentToolResultStatusKind::Failed.as_str(),
-        "error": message,
+        "error": message.as_ref(),
     });
+    if let Some(error_kind) = error_kind {
+        body["error_kind"] = json!(error_kind.as_str());
+    }
     if let Some(agent_id) = agent_id {
         body["agent_id"] = json!(agent_id);
     }

@@ -30,6 +30,18 @@ pub enum Capability {
     LocalBackgroundTasks,
 }
 
+impl Capability {
+    /// Whether this capability requires a runtime executor binding.
+    ///
+    /// An executor-gated capability cannot be satisfied by a service or static
+    /// feature flag; the runtime must have an active executor handle (e.g., a
+    /// spawn-context for AgentSpawner) for tools requiring this capability to
+    /// pass admission.
+    pub fn is_executor_gated(self) -> bool {
+        matches!(self, Capability::AgentSpawner)
+    }
+}
+
 /// Session-invariant set of runtime capabilities.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CapabilitySet {

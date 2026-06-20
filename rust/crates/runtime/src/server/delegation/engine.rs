@@ -205,6 +205,11 @@ pub struct SubRunConfig {
     pub inherited_prefix: Option<crate::orchestration::InheritedChildPrefix>,
     /// UI/runtime execution binding metadata inherited by this sub-run.
     pub execution_metadata: Option<serde_json::Value>,
+    /// Delegation chain from the parent — agent_ids that led to this
+    /// sub-run (for circular delegation detection). The child's
+    /// `AgenticLoopState` inherits this so subsequent delegations
+    /// from the child can detect cycles like A→B→C→A.
+    pub delegation_chain: Vec<String>,
     /// Parent session's harness snapshot sink for observe-only sub-run
     /// observation. When set, the sub-run creates a sink-only HarnessSlot
     /// so sub-run snapshots appear in the parent's history.
@@ -1480,6 +1485,47 @@ impl DelegationEngine {
         crate::orchestration::spawner::build_inherited_child_prefix(&outcome)
     }
 
+    fn ensure_source_in_delegation_chain(request: &mut DelegationRequest, source_agent_id: &str) {
+        let source_agent_id = source_agent_id.trim();
+        if source_agent_id.is_empty() {
+            return;
+        }
+        // Case-insensitive comparison: agent IDs are user-provided and may
+        // vary in casing. Normalize to lowercase for chain membership checks
+        // to prevent case-variant bypass of circular delegation detection.
+        let normalized = source_agent_id.to_lowercase();
+        if !request
+            .delegation_chain
+            .iter()
+            .any(|agent_id| agent_id.to_lowercase() == normalized)
+        {
+            request.delegation_chain.push(source_agent_id.to_string());
+        }
+    }
+
+    fn delegation_chain_for_child(
+        request: &DelegationRequest,
+        child_agent_id: &str,
+    ) -> Result<Vec<String>, String> {
+        // Normalize to lowercase for case-insensitive chain comparison.
+        // Agent IDs are user-provided and may vary in casing. A case-variant
+        // must not be allowed to bypass circular delegation detection.
+        let normalized_child = child_agent_id.to_lowercase();
+        if request
+            .delegation_chain
+            .iter()
+            .any(|agent_id| agent_id.to_lowercase() == normalized_child)
+        {
+            let mut cycle = request.delegation_chain.clone();
+            cycle.push(child_agent_id.to_string());
+            let chain_display = cycle.join(" → ");
+            return Err(format!(
+                "circular delegation detected: {chain_display}. Agent '{child_agent_id}' already exists in the delegation chain"
+            ));
+        }
+        Ok(request.delegation_chain.clone())
+    }
+
     /// Get the progress broadcaster from the underlying tracker, if configured.
     pub fn progress_broadcaster(&self) -> Option<&Arc<crate::orchestration::ProgressBroadcaster>> {
         self.tracker.progress_broadcaster()
@@ -1841,6 +1887,7 @@ impl DelegationEngine {
         request
             .context
             .remove(crate::turn::agentic::delegate_interception::FORWARD_HEADERS_CONTEXT_KEY);
+        Self::ensure_source_in_delegation_chain(&mut request, source_agent_id);
         let request_constraints = RequestConstraints::new(
             parse_request_allowlist_from_context(
                 &mut request.context,
@@ -2181,13 +2228,16 @@ impl DelegationEngine {
                 .register_cancel_token(&sub_run_id, child_cancel.clone())
                 .await;
 
-            let profile = reg.get(agent_id).cloned().unwrap_or_else(|| {
-                AgentProfile::new(
-                    agent_id,
-                    agent_id,
-                    astra_services::coordination::AgentTier::User,
-                )
-            });
+            let profile = match reg.get(agent_id) {
+                Some(p) => p.clone(),
+                None => {
+                    return Err(format!(
+                        "delegation failed: agent '{}' is not registered in AgentProfileRegistry",
+                        agent_id
+                    ));
+                }
+            };
+            let delegation_chain = Self::delegation_chain_for_child(request, agent_id)?;
 
             // Register with mailbox router and obtain a mailbox handle (if router available).
             let mailbox = if let Some(router) = &self.mailbox_router {
@@ -2263,6 +2313,8 @@ impl DelegationEngine {
                 cancel_token: Some(child_cancel),
                 inherited_prefix,
                 execution_metadata: request.execution_metadata.clone(),
+
+                delegation_chain,
                 #[cfg(feature = "harness")]
                 harness_sink: None,
             });
@@ -2289,7 +2341,7 @@ impl DelegationEngine {
         };
 
         // Store config templates for fan-out gate retry support.
-        // Maps agent_id → (AgentProfile, task, session_id, user_id, context)
+        // Maps agent_id → (AgentProfile, task, session_id, user_id, context, delegation_chain)
         let mut retry_templates: HashMap<
             String,
             (
@@ -2298,6 +2350,7 @@ impl DelegationEngine {
                 String,
                 String,
                 HashMap<String, serde_json::Value>,
+                Vec<String>,
             ),
         > = HashMap::new();
         for config in &configs {
@@ -2309,6 +2362,7 @@ impl DelegationEngine {
                     config.session_id.clone(),
                     config.user_id.clone(),
                     config.context.clone(),
+                    config.delegation_chain.clone(),
                 ),
             );
         }
@@ -2511,7 +2565,7 @@ impl DelegationEngine {
                         &request.parent_run_id,
                         per_agent_timeout,
                         || {
-                            let (profile, task, sess, uid, ctx) =
+                            let (profile, task, sess, uid, ctx, delegation_chain) =
                                 template.clone().unwrap_or_else(|| {
                                     (
                                         AgentProfile::new(
@@ -2523,6 +2577,7 @@ impl DelegationEngine {
                                         String::new(),
                                         String::new(),
                                         HashMap::new(),
+                                        Vec::new(),
                                     )
                                 });
                             let delegate_model = profile.model_override.as_deref().unwrap_or("");
@@ -2551,6 +2606,8 @@ impl DelegationEngine {
                                 cancel_token: cancel_for_retry.clone(),
                                 inherited_prefix,
                                 execution_metadata: request.execution_metadata.clone(),
+
+                                delegation_chain,
                                 #[cfg(feature = "harness")]
                                 harness_sink: None,
                             }
@@ -2659,13 +2716,16 @@ impl DelegationEngine {
                 .register_cancel_token(&sub_run_id, child_cancel.clone())
                 .await;
 
-            let profile = reg.get(agent_id).cloned().unwrap_or_else(|| {
-                AgentProfile::new(
-                    agent_id,
-                    agent_id,
-                    astra_services::coordination::AgentTier::User,
-                )
-            });
+            let profile = match reg.get(agent_id) {
+                Some(p) => p.clone(),
+                None => {
+                    return Err(format!(
+                        "delegation failed: agent '{}' is not registered in AgentProfileRegistry",
+                        agent_id
+                    ));
+                }
+            };
+            let delegation_chain = Self::delegation_chain_for_child(request, agent_id)?;
 
             let mailbox = if let Some(router) = &self.mailbox_router {
                 let addr = astra_messaging::types::AgentAddress {
@@ -2732,6 +2792,8 @@ impl DelegationEngine {
                 cancel_token: Some(child_cancel),
                 inherited_prefix: None,
                 execution_metadata: request.execution_metadata.clone(),
+
+                delegation_chain: delegation_chain.clone(),
                 #[cfg(feature = "harness")]
                 harness_sink: None,
             };
@@ -2845,6 +2907,8 @@ impl DelegationEngine {
                         cancel_token: cancel_for_retry.clone(),
                         inherited_prefix: None,
                         execution_metadata: request.execution_metadata.clone(),
+
+                        delegation_chain: delegation_chain.clone(),
                         #[cfg(feature = "harness")]
                         harness_sink: None,
                     },
@@ -2909,6 +2973,8 @@ impl DelegationEngine {
                 astra_services::coordination::AgentTier::System,
             )
         });
+        let producer_delegation_chain = Self::delegation_chain_for_child(request, producer_id)?;
+        let reviewer_delegation_chain = Self::delegation_chain_for_child(request, reviewer_id)?;
         drop(reg);
 
         for round in 0..max_rounds {
@@ -3034,6 +3100,8 @@ impl DelegationEngine {
                 cancel_token: cancel_token.cloned(),
                 inherited_prefix: None,
                 execution_metadata: request.execution_metadata.clone(),
+
+                delegation_chain: producer_delegation_chain.clone(),
                 #[cfg(feature = "harness")]
                 harness_sink: None,
             };
@@ -3141,6 +3209,8 @@ impl DelegationEngine {
                         cancel_token: cancel_for_retry.clone(),
                         inherited_prefix: None,
                         execution_metadata: request.execution_metadata.clone(),
+
+                        delegation_chain: producer_delegation_chain.clone(),
                         #[cfg(feature = "harness")]
                         harness_sink: None,
                     },
@@ -3251,6 +3321,8 @@ impl DelegationEngine {
                 cancel_token: cancel_token.cloned(),
                 inherited_prefix: None,
                 execution_metadata: request.execution_metadata.clone(),
+
+                delegation_chain: reviewer_delegation_chain.clone(),
                 #[cfg(feature = "harness")]
                 harness_sink: None,
             };
@@ -3354,6 +3426,7 @@ impl DelegationEngine {
                 astra_services::coordination::AgentTier::User,
             )
         });
+        let fork_delegation_chain = Self::delegation_chain_for_child(request, agent_id)?;
         drop(reg);
 
         // Extract parent messages for context inheritance (if provided)
@@ -3490,6 +3563,8 @@ impl DelegationEngine {
                 cancel_token: cancel_token.cloned(),
                 inherited_prefix: None,
                 execution_metadata: request.execution_metadata.clone(),
+
+                delegation_chain: fork_delegation_chain.clone(),
                 #[cfg(feature = "harness")]
                 harness_sink: None,
             };
@@ -3925,9 +4000,85 @@ mod tests {
             },
             user_id: "user-1".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         }
+    }
+
+    #[test]
+    fn delegation_engine_injects_source_agent_into_chain_once() {
+        let mut request = fan_out_request(vec!["coder"]);
+        DelegationEngine::ensure_source_in_delegation_chain(&mut request, "orch");
+        DelegationEngine::ensure_source_in_delegation_chain(&mut request, "orch");
+
+        assert_eq!(request.delegation_chain, vec!["orch".to_string()]);
+    }
+
+    #[test]
+    fn delegation_engine_rejects_child_already_in_chain() {
+        let mut request = fan_out_request(vec!["coder"]);
+        request.delegation_chain = vec!["orch".to_string(), "coder".to_string()];
+
+        let error = DelegationEngine::delegation_chain_for_child(&request, "coder").unwrap_err();
+
+        assert!(error.contains("circular delegation detected"), "{error}");
+        assert!(error.contains("orch → coder → coder"), "{error}");
+    }
+
+    #[test]
+    fn delegation_engine_rejects_self_delegation() {
+        // A → A: the most fundamental cycle. An agent must not be able to
+        // delegate to itself, even with an empty chain — `ensure_source`
+        // runs first, so the chain becomes [A] before `for_child(A)` fires.
+        let mut request = fan_out_request(vec!["coder"]);
+        DelegationEngine::ensure_source_in_delegation_chain(&mut request, "coder");
+
+        let error = DelegationEngine::delegation_chain_for_child(&request, "coder").unwrap_err();
+
+        assert!(error.contains("circular delegation detected"), "{error}");
+        assert!(error.contains("coder → coder"), "{error}");
+    }
+
+    #[test]
+    fn delegation_engine_rejects_three_hop_cycle() {
+        // A → B → C → A: a deeper cycle that a naive "immediate parent only"
+        // check would miss. The chain is walked in full.
+        let mut request = fan_out_request(vec!["coder"]);
+        request.delegation_chain = vec![
+            "orch".to_string(),
+            "coder".to_string(),
+            "reviewer".to_string(),
+        ];
+
+        let error = DelegationEngine::delegation_chain_for_child(&request, "orch").unwrap_err();
+
+        assert!(error.contains("circular delegation detected"), "{error}");
+        assert!(error.contains("orch → coder → reviewer → orch"), "{error}");
+    }
+
+    #[test]
+    fn delegation_engine_cycle_detection_is_case_insensitive() {
+        // Agent IDs are user-provided; a case variant must not bypass the
+        // chain check. `Orch` should match `orch` already in the chain.
+        let mut request = fan_out_request(vec!["coder"]);
+        request.delegation_chain = vec!["orch".to_string()];
+
+        let error = DelegationEngine::delegation_chain_for_child(&request, "Orch").unwrap_err();
+
+        assert!(error.contains("circular delegation detected"), "{error}");
+    }
+
+    #[test]
+    fn delegation_engine_admits_unrelated_child() {
+        // Sanity: a child not present in the chain is admitted and receives
+        // a copy of the current chain (which the child will later extend).
+        let mut request = fan_out_request(vec!["coder"]);
+        request.delegation_chain = vec!["orch".to_string()];
+
+        let chain =
+            DelegationEngine::delegation_chain_for_child(&request, "coder").expect("admitted");
+        assert_eq!(chain, vec!["orch".to_string()]);
     }
 
     #[tokio::test]
@@ -4040,6 +4191,7 @@ mod tests {
             },
             user_id: "user-1".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -4074,6 +4226,7 @@ mod tests {
             },
             user_id: "user-1".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -4103,6 +4256,7 @@ mod tests {
             },
             user_id: "user-1".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -4138,6 +4292,7 @@ mod tests {
             },
             user_id: "u".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -4162,6 +4317,7 @@ mod tests {
             },
             user_id: "u".into(),
             depth: 5,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -4186,6 +4342,7 @@ mod tests {
             },
             user_id: "u".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -4202,6 +4359,7 @@ mod tests {
             depth: 0,
             context: HashMap::new(),
             execution_metadata: None,
+            delegation_chain: Vec::new(),
         };
 
         de.execute(req1, "orch", None).await.unwrap();
@@ -4394,6 +4552,7 @@ mod tests {
             },
             user_id: "u".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -4428,6 +4587,7 @@ mod tests {
             },
             user_id: "u".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -4485,6 +4645,7 @@ mod tests {
             },
             user_id: "u".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -4582,6 +4743,7 @@ mod tests {
             },
             user_id: "u".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: ctx,
             execution_metadata: None,
         };
@@ -4638,6 +4800,7 @@ mod tests {
             },
             user_id: "u".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -4705,6 +4868,7 @@ mod tests {
             },
             user_id: "u".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -4774,6 +4938,7 @@ mod tests {
             },
             user_id: "u".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::from([(
                 crate::turn::agentic::delegate_interception::FORWARD_HEADERS_CONTEXT_KEY
                     .to_string(),
@@ -4930,6 +5095,7 @@ mod tests {
             },
             user_id: "u".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: ctx,
             execution_metadata: None,
         };
@@ -4973,6 +5139,8 @@ mod tests {
             cancel_token: None,
             inherited_prefix: None,
             execution_metadata: None,
+
+            delegation_chain: Vec::new(),
             #[cfg(feature = "harness")]
             harness_sink: None,
         };
@@ -5209,6 +5377,7 @@ mod tests {
             },
             user_id: "user-1".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -5237,6 +5406,7 @@ mod tests {
             },
             user_id: "user-1".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -5267,6 +5437,7 @@ mod tests {
             },
             user_id: "user-1".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -5507,6 +5678,7 @@ mod tests {
             },
             user_id: "user-1".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -5897,6 +6069,7 @@ mod tests {
             },
             user_id: "user-1".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         }
@@ -6197,6 +6370,7 @@ mod tests {
             },
             user_id: "u".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -6652,6 +6826,7 @@ mod tests {
             },
             user_id: "u".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -6693,6 +6868,7 @@ mod tests {
             },
             user_id: "u".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -6754,6 +6930,7 @@ mod tests {
             },
             user_id: "u".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -6791,6 +6968,7 @@ mod tests {
             },
             user_id: "u".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };

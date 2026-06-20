@@ -3560,6 +3560,9 @@ pub(crate) async fn run_tui_session(
                 }
             }
             _ = &mut tick => {
+                if bottom_pane.pre_draw_tick(std::time::Instant::now()) {
+                    frame_requester.schedule_frame();
+                }
                 // Re-derive permission-mode chip from live state so
                 // mode pivots driven by the agentic loop (e.g. the
                 // `exit_plan_mode` overlay handing the next turn back
@@ -3946,6 +3949,7 @@ mod tests {
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
+            delegation_chain: Vec::new(),
         }
     }
 

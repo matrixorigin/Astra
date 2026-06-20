@@ -68,8 +68,29 @@ pub struct ToolMeta {
     pub scope: Scope,
     /// Runtime capabilities required before this tool can be advertised.
     pub requires: &'static [Capability],
+    /// Calls that may be routed to schema/shape validation without an active
+    /// executor for `requires`. This is for validation-only legacy actions,
+    /// not for executing capability-gated work.
+    pub binding_validation: RuntimeBindingValidation,
     /// Estimated token cost of the full JSON schema (~JSON bytes / 4)
     pub schema_tokens: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeBindingValidation {
+    None,
+    ActionAllowlist(&'static [&'static str]),
+}
+
+impl RuntimeBindingValidation {
+    pub fn allows_action(self, action: Option<&str>) -> bool {
+        match self {
+            RuntimeBindingValidation::None => false,
+            RuntimeBindingValidation::ActionAllowlist(actions) => {
+                actions.contains(&action.unwrap_or(""))
+            }
+        }
+    }
 }
 
 // ─── Tool catalog ───────────────────────────────────────────────────────────
@@ -93,6 +114,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeEdit, IntentType::CodeRead, IntentType::Git],
         scope: Scope::Local,
         requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 35,
     },
     ToolMeta {
@@ -111,6 +133,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 35,
     },
     ToolMeta {
@@ -140,6 +163,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 35,
     },
     ToolMeta {
@@ -172,6 +196,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 25,
     },
     ToolMeta {
@@ -203,6 +228,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 40,
     },
     ToolMeta {
@@ -234,6 +260,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 25,
     },
     ToolMeta {
@@ -255,6 +282,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 40,
     },
     ToolMeta {
@@ -285,6 +313,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 25,
     },
     ToolMeta {
@@ -305,6 +334,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 20,
     },
     ToolMeta {
@@ -325,6 +355,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 25,
     },
     // ── Dynamic tools (selected per-request) ────────────────────────
@@ -379,6 +410,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeRead, IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[Capability::LSPServer],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 90,
     },
     ToolMeta {
@@ -407,6 +439,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::Git],
         scope: Scope::LocalGit,
         requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 50,
     },
     ToolMeta {
@@ -426,6 +459,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::GitHub],
         scope: Scope::External,
         requires: &[Capability::GitHubAuth],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 50,
     },
     ToolMeta {
@@ -457,6 +491,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeRead],
         scope: Scope::External,
         requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 25,
     },
     // memory_store is pinned — intrinsic memory capability. The model must
@@ -474,6 +509,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::Memory],
         scope: Scope::CrossSession,
         requires: &[Capability::MemoryService],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 40,
     },
     ToolMeta {
@@ -503,6 +539,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::Introspect],
         scope: Scope::Local,
         requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 60,
     },
     ToolMeta {
@@ -520,6 +557,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::Introspect],
         scope: Scope::Local,
         requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 25,
     },
     ToolMeta {
@@ -537,6 +575,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::Introspect],
         scope: Scope::Local,
         requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 25,
     },
     ToolMeta {
@@ -554,6 +593,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::Introspect],
         scope: Scope::Local,
         requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 25,
     },
     ToolMeta {
@@ -571,6 +611,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::Introspect],
         scope: Scope::Local,
         requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 35,
     },
     ToolMeta {
@@ -590,6 +631,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeEdit],
         scope: Scope::External,
         requires: &[Capability::Database],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 40,
     },
     ToolMeta {
@@ -607,6 +649,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::Database],
         scope: Scope::External,
         requires: &[Capability::Database],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 35,
     },
     ToolMeta {
@@ -624,6 +667,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::Database],
         scope: Scope::External,
         requires: &[Capability::Database],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 35,
     },
     ToolMeta {
@@ -634,6 +678,11 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeEdit],
         scope: Scope::External,
         requires: &[Capability::AgentSpawner],
+        binding_validation: RuntimeBindingValidation::ActionAllowlist(&[
+            "",
+            "delegate",
+            "run_chain",
+        ]),
         schema_tokens: 40,
     },
     ToolMeta {
@@ -644,12 +693,24 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "parallel agents",
             "review agents",
             "multi-agent",
+            // Chinese coverage: explicit fan-out review phrasings.
+            "多agents",
+            "多 agents",
+            "多个 agents",
+            "多视角 review",
+            "多角度 review",
             "并行代理",
+            "并行审查",
+            "并行 review",
+            "多角度审查",
+            "多视角审查",
+            "同时审查",
         ],
         pinned: true,
         intents: &[IntentType::CodeEdit],
         scope: Scope::External,
         requires: &[Capability::AgentSpawner],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 45,
     },
     ToolMeta {
@@ -665,6 +726,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[Capability::LocalBackgroundTasks],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 35,
     },
     ToolMeta {
@@ -680,6 +742,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[Capability::LocalBackgroundTasks],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 25,
     },
     ToolMeta {
@@ -695,6 +758,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[Capability::LocalBackgroundTasks],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 20,
     },
     ToolMeta {
@@ -714,6 +778,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 25,
     },
     ToolMeta {
@@ -724,6 +789,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeEdit, IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 15,
     },
     ToolMeta {
@@ -734,6 +800,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 40,
     },
     ToolMeta {
@@ -744,6 +811,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[Capability::SkillsCatalog],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 30,
     },
     ToolMeta {
@@ -754,6 +822,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeEdit],
         scope: Scope::External,
         requires: &[Capability::PlanLifecycle],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 15,
     },
     ToolMeta {
@@ -764,6 +833,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeEdit],
         scope: Scope::External,
         requires: &[Capability::PlanLifecycle],
+        binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 20,
     },
 ];
@@ -773,6 +843,23 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
 /// by cross-session learning or pattern-library heuristics.
 pub fn is_pinned_tool(name: &str) -> bool {
     TOOL_CATALOG.iter().any(|t| t.pinned && t.name == name)
+}
+
+/// Look up the static [`ToolMeta`] for a tool by name.
+///
+/// This is the single declarative source of truth for "what does this tool
+/// require at runtime?" Callers (admission checks, activation recording,
+/// capability introspection) must use this instead of hardcoding tool-name
+/// match arms — adding a new tool that needs `AgentSpawner` is then just
+/// setting `requires: &[Capability::AgentSpawner]` in the catalog entry.
+pub fn tool_meta(name: &str) -> Option<&'static ToolMeta> {
+    TOOL_CATALOG.iter().find(|t| t.name == name)
+}
+
+/// Return whether a tool call may perform validation without an active
+/// executor binding for its declared capabilities.
+pub fn tool_allows_validation_without_runtime_binding(name: &str, action: Option<&str>) -> bool {
+    tool_meta(name).is_some_and(|meta| meta.binding_validation.allows_action(action))
 }
 
 #[cfg(test)]
@@ -992,6 +1079,29 @@ mod tests {
                 tool.requires
             );
         }
+    }
+
+    #[test]
+    fn unbound_validation_policy_is_declared_in_tool_metadata() {
+        assert!(tool_allows_validation_without_runtime_binding(
+            "agent",
+            Some("run_chain")
+        ));
+        assert!(tool_allows_validation_without_runtime_binding(
+            "agent",
+            Some("delegate")
+        ));
+        assert!(tool_allows_validation_without_runtime_binding(
+            "agent", None
+        ));
+        assert!(!tool_allows_validation_without_runtime_binding(
+            "agent",
+            Some("spawn")
+        ));
+        assert!(!tool_allows_validation_without_runtime_binding(
+            "agent_fanout",
+            Some("start")
+        ));
     }
 
     #[test]

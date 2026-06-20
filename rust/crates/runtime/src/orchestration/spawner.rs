@@ -10,7 +10,7 @@ use astra_turn_core::fork_resolve::{
 };
 use astra_turn_core::orchestration_context_cache::SharedContextCache;
 use astra_turn_core::orchestration_fanout_group::{
-    AgentFanoutGroupProjection, AgentFanoutSlotIdentity, AgentFanoutSlotStatus,
+    AgentFanoutGroupProjection, AgentFanoutSlotIdentity, AgentFanoutSlotStatus, AgentFanoutStatus,
 };
 use astra_turn_core::orchestration_progress::{
     AgentProgressEvent, ProgressBroadcaster, ProgressEventType,
@@ -239,6 +239,7 @@ fn spawn_run_result_to_sync_output(
         },
         SpawnRunStatusKind::Failed | SpawnRunStatusKind::Other => SpawnAgentOutput::Failed {
             error: spawn_run_failure_message(&run_result),
+            finish_reason: run_result.finish_reason.clone(),
             duration_ms,
         },
         SpawnRunStatusKind::Completed => SpawnAgentOutput::Completed {
@@ -254,6 +255,17 @@ fn spawn_run_result_to_sync_output(
             tool_calls: run_result.tool_calls,
             duration_ms,
         },
+    }
+}
+
+fn dropped_agent_terminal_output(agent_id: &str) -> SpawnAgentOutput {
+    SpawnAgentOutput::Failed {
+        error: format!(
+            "agent executor dropped before returning a terminal result for {agent_id}; \
+             the child run was scheduled but no completion payload reached the foreground wait path"
+        ),
+        finish_reason: "executor_dropped".to_string(),
+        duration_ms: 0,
     }
 }
 
@@ -348,6 +360,11 @@ pub struct SpawnContext {
     pub spawn_tool_call_id: Option<String>,
     /// UI/runtime execution binding metadata inherited by child progress events.
     pub execution_metadata: Option<serde_json::Value>,
+    /// Delegation chain from the parent — agent_ids that led to this
+    /// child (for circular delegation detection). The child's
+    /// `AgenticLoopState` inherits this so subsequent delegations
+    /// from the child can detect cycles like A→B→C→A.
+    pub delegation_chain: Vec<String>,
 }
 
 // ─── Agent Status ───────────────────────────────────────────────────────────
@@ -491,6 +508,11 @@ pub struct SpawnRunConfig {
     /// (which differs from the original parent's, breaking the cache
     /// reuse chain). Same semantics as Claude Code's `isInForkChild()`.
     pub is_fork_child: bool,
+    /// Delegation chain from the parent — agent_ids that led to this
+    /// child (for circular delegation detection). The child's
+    /// `AgenticLoopState` inherits this so subsequent delegations
+    /// from the child can detect cycles like A→B→C→A.
+    pub delegation_chain: Vec<String>,
 }
 
 /// Payload an executor needs to consume an inherited prefix.
@@ -678,6 +700,14 @@ pub struct DynamicAgentSpawner {
     /// the pure fanout projection so runtime queries avoid scanning every
     /// group and slot.
     fanout_agent_index: Arc<RwLock<HashMap<String, String>>>,
+    /// Cached count of active fanout slots (Running status).  Derived
+    /// from fanout_groups state — never drifts because there is no
+    /// separate increment/decrement path to keep in sync.
+    ///
+    /// Updated atomically on every state transition for O(1) spawn-gate
+    /// checks.  Call `repair_fanout_slot_count` to recompute from
+    /// authoritative state (e.g. after crash recovery or poison).
+    cached_active_fanout_slots: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl DynamicAgentSpawner {
@@ -704,6 +734,7 @@ impl DynamicAgentSpawner {
             max_concurrent_agents: None,
             fanout_groups: Arc::new(RwLock::new(HashMap::new())),
             fanout_agent_index: Arc::new(RwLock::new(HashMap::new())),
+            cached_active_fanout_slots: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -920,6 +951,63 @@ impl DynamicAgentSpawner {
         Some(promoted)
     }
 
+    /// Helper to get or create a fanout group and validate it's not terminal.
+    /// Returns the group entry and any evicted agent IDs.
+    async fn get_or_validate_fanout_group(
+        &self,
+        identity: &AgentFanoutSlotIdentity,
+        group_title: Option<&str>,
+        created_by_tool_use_id: Option<&str>,
+    ) -> Result<
+        (
+            tokio::sync::RwLockWriteGuard<'_, HashMap<String, AgentFanoutGroupProjection>>,
+            Vec<String>,
+        ),
+        SpawnError,
+    > {
+        let mut groups = self.fanout_groups.write().await;
+        let is_new = !groups.contains_key(&identity.group_id);
+        let evicted_agent_ids = if is_new {
+            self.evict_terminal_fanout_group_if_full(&mut groups)
+        } else {
+            Vec::new()
+        };
+        let group = groups.entry(identity.group_id.clone()).or_insert_with(|| {
+            let mut group = AgentFanoutGroupProjection::new(
+                identity.group_id.clone(),
+                fanout_group_title(identity, group_title),
+                identity.target_count,
+            );
+            group.created_by_tool_use_id = created_by_tool_use_id.map(ToString::to_string);
+            group
+        });
+        if group.target_count != identity.target_count {
+            return Err(SpawnError::InvalidInput(format!(
+                "fanout group '{}' target_count changed from {} to {}",
+                identity.group_id, group.target_count, identity.target_count
+            )));
+        }
+        // Reject reuse of terminal groups (Finished or Incomplete) —
+        // LLM must create a new group_id for retries rather than
+        // appending to a settled group, which would corrupt the
+        // fixed-size accounting.
+        if matches!(
+            group.status,
+            AgentFanoutStatus::Finished | AgentFanoutStatus::Incomplete
+        ) {
+            let status_label = match group.status {
+                AgentFanoutStatus::Finished => "finished",
+                AgentFanoutStatus::Incomplete => "incomplete",
+                _ => unreachable!(),
+            };
+            return Err(SpawnError::InvalidInput(format!(
+                "fanout group '{}' is already {status_label} (all {} slots settled); create a new group_id for retries",
+                identity.group_id, group.target_count
+            )));
+        }
+        Ok((groups, evicted_agent_ids))
+    }
+
     async fn record_fanout_spawn_accepted(
         &self,
         identity: &AgentFanoutSlotIdentity,
@@ -929,48 +1017,31 @@ impl DynamicAgentSpawner {
         description: &str,
         created_by_tool_use_id: Option<&str>,
     ) -> Result<(), SpawnError> {
-        let evicted_agent_ids = {
-            let mut groups = self.fanout_groups.write().await;
-            let is_new = !groups.contains_key(&identity.group_id);
-            let evicted_agent_ids = if is_new {
-                self.evict_terminal_fanout_group_if_full(&mut groups)
-            } else {
-                Vec::new()
-            };
-            let group = groups.entry(identity.group_id.clone()).or_insert_with(|| {
-                let mut group = AgentFanoutGroupProjection::new(
-                    identity.group_id.clone(),
-                    fanout_group_title(identity, group_title),
-                    identity.target_count,
-                );
-                group.created_by_tool_use_id = created_by_tool_use_id.map(ToString::to_string);
-                group
-            });
-            if group.target_count != identity.target_count {
-                return Err(SpawnError::InvalidInput(format!(
-                    "fanout group '{}' target_count changed from {} to {}",
-                    identity.group_id, group.target_count, identity.target_count
-                )));
-            }
-            group
-                .set_slot_request(
-                    identity.slot_index,
-                    identity.slot_id.clone(),
-                    agent_type,
-                    description,
-                )
-                .map_err(SpawnError::InvalidInput)?;
-            group
-                .record_spawn_accepted(identity.slot_index, agent_id)
-                .map_err(SpawnError::InvalidInput)?;
-            group.touch();
-            evicted_agent_ids
-        };
+        let (mut groups, evicted_agent_ids) = self
+            .get_or_validate_fanout_group(identity, group_title, created_by_tool_use_id)
+            .await?;
+        let group = groups.get_mut(&identity.group_id).unwrap();
+        group
+            .set_slot_request(
+                identity.slot_index,
+                identity.slot_id.clone(),
+                agent_type,
+                description,
+            )
+            .map_err(SpawnError::InvalidInput)?;
+        group
+            .record_spawn_accepted(identity.slot_index, agent_id)
+            .map_err(SpawnError::InvalidInput)?;
+        group.touch();
+        drop(groups);
+
         let mut index = self.fanout_agent_index.write().await;
         for evicted_agent_id in evicted_agent_ids {
             index.remove(&evicted_agent_id);
         }
         index.insert(agent_id.to_string(), identity.group_id.clone());
+        self.cached_active_fanout_slots
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -983,43 +1054,23 @@ impl DynamicAgentSpawner {
         reason: impl Into<String>,
         created_by_tool_use_id: Option<&str>,
     ) -> Result<(), SpawnError> {
-        let evicted_agent_ids = {
-            let mut groups = self.fanout_groups.write().await;
-            let is_new = !groups.contains_key(&identity.group_id);
-            let evicted_agent_ids = if is_new {
-                self.evict_terminal_fanout_group_if_full(&mut groups)
-            } else {
-                Vec::new()
-            };
-            let group = groups.entry(identity.group_id.clone()).or_insert_with(|| {
-                let mut group = AgentFanoutGroupProjection::new(
-                    identity.group_id.clone(),
-                    fanout_group_title(identity, group_title),
-                    identity.target_count,
-                );
-                group.created_by_tool_use_id = created_by_tool_use_id.map(ToString::to_string);
-                group
-            });
-            if group.target_count != identity.target_count {
-                return Err(SpawnError::InvalidInput(format!(
-                    "fanout group '{}' target_count changed from {} to {}",
-                    identity.group_id, group.target_count, identity.target_count
-                )));
-            }
-            group
-                .set_slot_request(
-                    identity.slot_index,
-                    identity.slot_id.clone(),
-                    agent_type,
-                    description,
-                )
-                .map_err(SpawnError::InvalidInput)?;
-            group
-                .record_spawn_rejected(identity.slot_index, reason)
-                .map_err(SpawnError::InvalidInput)?;
-            group.touch();
-            evicted_agent_ids
-        };
+        let (mut groups, evicted_agent_ids) = self
+            .get_or_validate_fanout_group(identity, group_title, created_by_tool_use_id)
+            .await?;
+        let group = groups.get_mut(&identity.group_id).unwrap();
+        group
+            .set_slot_request(
+                identity.slot_index,
+                identity.slot_id.clone(),
+                agent_type,
+                description,
+            )
+            .map_err(SpawnError::InvalidInput)?;
+        group
+            .record_spawn_rejected(identity.slot_index, reason)
+            .map_err(SpawnError::InvalidInput)?;
+        group.touch();
+        drop(groups);
         if !evicted_agent_ids.is_empty() {
             let mut index = self.fanout_agent_index.write().await;
             for evicted_agent_id in evicted_agent_ids {
@@ -1061,6 +1112,13 @@ impl DynamicAgentSpawner {
         };
         let _ = group.record_terminal_by_agent(&state.agent_id, status, reason);
         group.touch();
+        self.cached_active_fanout_slots
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |current| Some(current.saturating_sub(1)),
+            )
+            .ok();
     }
 
     /// Evict the least-recently-touched terminal group when the fanout-groups
@@ -1094,6 +1152,32 @@ impl DynamicAgentSpawner {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Recompute `cached_active_fanout_slots` from the authoritative
+    /// fanout-groups state.  Call this after crash recovery, poison
+    /// recovery, or any path where the cache may have drifted.
+    ///
+    /// Returns the recomputed count.
+    pub async fn repair_fanout_slot_count(&self) -> usize {
+        let count = self.count_active_fanout_slots_from_groups().await;
+        self.cached_active_fanout_slots
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+        count
+    }
+
+    /// Authoritative count: number of slots in Running status across
+    /// all non-terminal fanout groups.  This is the single source of
+    /// truth — `cached_active_fanout_slots` is just a performance
+    /// optimization derived from this computation.
+    async fn count_active_fanout_slots_from_groups(&self) -> usize {
+        let groups = self.fanout_groups.read().await;
+        groups
+            .values()
+            .filter(|g| !g.is_terminal())
+            .flat_map(|g| g.slots.iter())
+            .filter(|s| matches!(s.status, AgentFanoutSlotStatus::Running))
+            .count()
     }
 
     async fn mark_fanout_result_collected(&self, state: &SpawnedAgentState) {
@@ -1273,6 +1357,19 @@ impl DynamicAgentSpawner {
         let fanout_slot = input
             .fanout_slot_identity()
             .map_err(SpawnError::InvalidInput)?;
+
+        // Enforce fanout boundary: if parent has active fanout groups,
+        // all spawns MUST declare fanout metadata. This prevents the LLM
+        // from spawning "orphan" agents that bypass the fixed-size group
+        // contract and corrupt accounting.
+        if fanout_slot.is_none() {
+            let active_fanout_slots = self.repair_fanout_slot_count().await;
+            if active_fanout_slots > 0 {
+                return Err(SpawnError::InvalidInput(
+                    "parent has active fanout group(s); all spawns must declare fanout_group_id, fanout_target_count, and fanout_slot_index. Use agent_fanout(action='start', ...) for new fanouts, or wait for existing fanouts to complete.".to_string()
+                ));
+            }
+        }
 
         // 1. Validate agent type
         let agent_def = match self.agent_registry.get(&input.agent_type) {
@@ -1614,6 +1711,7 @@ impl DynamicAgentSpawner {
             execution_metadata: context.execution_metadata.clone(),
             is_fork_child: inherited_prefix.is_some(),
             inherited_prefix,
+            delegation_chain: context.delegation_chain.clone(),
         };
 
         // Emit agent_spawned journal event for unified timeline.
@@ -1664,73 +1762,106 @@ impl DynamicAgentSpawner {
         let (terminal_tx, mut terminal_rx) = tokio::sync::oneshot::channel();
         let executor = Arc::clone(&executor);
         let spawner = self.clone_for_task();
+        let spawner_for_finalize_repair = spawner.clone_for_task();
         let agent_id_for_task = agent_id.clone();
         let agent_id_for_output = agent_id.clone();
         let spawn_future = async move {
             let result = AssertUnwindSafe(executor.execute(run_config))
                 .catch_unwind()
                 .await;
-            let output = match result {
-                Ok(Ok(run_result)) => {
-                    let status = spawn_run_result_to_agent_status(&run_result);
-                    spawner
-                        .finalize_background_agent(
-                            &agent_id_for_task,
-                            status,
-                            &run_result.status,
-                            Some(run_result.finish_reason.as_str()),
-                            Some(&run_result),
-                            run_result.output.as_deref(),
-                            run_result.error.as_deref(),
+            // Phase 2: turn the result into a terminal output by finalizing
+            // the agent. Wrap finalization in `catch_unwind` so a panic in
+            // `finalize_background_agent` (or the status/output builders)
+            // cannot (a) silently drop `terminal_tx` before the front-end
+            // observes a terminal state, or (b) leak a zombie entry in the
+            // active-agents / completion-notifier bookkeeping across the
+            // host task. The oneshot is guaranteed to receive a terminal
+            // output. `finalize_background_agent` is idempotent (guards on
+            // `active_agents.remove`), so even a partial-mutation panic is
+            // observable as a clean `Failed` here rather than a dropped task.
+            let finalize = AssertUnwindSafe(async move {
+                match result {
+                    Ok(Ok(run_result)) => {
+                        let status = spawn_run_result_to_agent_status(&run_result);
+                        spawner
+                            .finalize_background_agent(
+                                &agent_id_for_task,
+                                status,
+                                &run_result.status,
+                                Some(run_result.finish_reason.as_str()),
+                                Some(&run_result),
+                                run_result.output.as_deref(),
+                                run_result.error.as_deref(),
+                            )
+                            .await;
+                        let duration_ms = started_at
+                            .elapsed()
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        spawn_run_result_to_sync_output(
+                            agent_id_for_output,
+                            run_result,
+                            duration_ms,
                         )
-                        .await;
-                    let duration_ms = started_at
-                        .elapsed()
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-                    spawn_run_result_to_sync_output(agent_id_for_output, run_result, duration_ms)
-                }
-                Ok(Err(error)) => {
-                    spawner
-                        .finalize_background_agent(
-                            &agent_id_for_task,
-                            AgentStatus::Failed {
-                                error: error.clone(),
-                                finish_reason: None,
-                            },
-                            "failed",
-                            None,
-                            None,
-                            None,
-                            Some(error.as_str()),
-                        )
-                        .await;
-                    SpawnAgentOutput::Failed {
-                        error,
-                        duration_ms: 0,
+                    }
+                    Ok(Err(error)) => {
+                        spawner
+                            .finalize_background_agent(
+                                &agent_id_for_task,
+                                AgentStatus::Failed {
+                                    error: error.clone(),
+                                    finish_reason: None,
+                                },
+                                "failed",
+                                None,
+                                None,
+                                None,
+                                Some(error.as_str()),
+                            )
+                            .await;
+                        SpawnAgentOutput::Failed {
+                            error,
+                            finish_reason: "failed".to_string(),
+                            duration_ms: 0,
+                        }
+                    }
+                    Err(panic) => {
+                        let error = format!(
+                            "agent executor panicked: {}",
+                            panic_payload_message(panic.as_ref())
+                        );
+                        spawner
+                            .finalize_background_agent(
+                                &agent_id_for_task,
+                                AgentStatus::Failed {
+                                    error: error.clone(),
+                                    finish_reason: Some("panic".to_string()),
+                                },
+                                "failed",
+                                Some("panic"),
+                                None,
+                                None,
+                                Some(error.as_str()),
+                            )
+                            .await;
+                        SpawnAgentOutput::Failed {
+                            error,
+                            finish_reason: "panic".to_string(),
+                            duration_ms: 0,
+                        }
                     }
                 }
+            });
+            let output = match finalize.catch_unwind().await {
+                Ok(output) => output,
                 Err(panic) => {
-                    let error = format!(
-                        "agent executor panicked: {}",
-                        panic_payload_message(panic.as_ref())
-                    );
-                    spawner
-                        .finalize_background_agent(
-                            &agent_id_for_task,
-                            AgentStatus::Failed {
-                                error: error.clone(),
-                                finish_reason: Some("panic".to_string()),
-                            },
-                            "failed",
-                            Some("panic"),
-                            None,
-                            None,
-                            Some(error.as_str()),
-                        )
-                        .await;
+                    spawner_for_finalize_repair.repair_fanout_slot_count().await;
                     SpawnAgentOutput::Failed {
-                        error,
+                        error: format!(
+                            "agent finalization panicked: {}",
+                            panic_payload_message(panic.as_ref())
+                        ),
+                        finish_reason: "panic".to_string(),
                         duration_ms: 0,
                     }
                 }
@@ -1774,9 +1905,8 @@ impl DynamicAgentSpawner {
                     // or the JoinSet task is dropped before finalization.
                     self.background_abort_handles.write().await.remove(&agent_id);
                     self.reap_finished_agent_tasks();
-                    return Ok(terminal.unwrap_or_else(|_| SpawnAgentOutput::Failed {
-                        error: "agent task ended before returning a result".to_string(),
-                        duration_ms: 0,
+                    return Ok(terminal.unwrap_or_else(|_| {
+                        dropped_agent_terminal_output(&agent_id)
                     }));
                 }
                 _ = notify.notified() => {}
@@ -2163,6 +2293,7 @@ impl DynamicAgentSpawner {
             max_concurrent_agents: self.max_concurrent_agents,
             fanout_groups: Arc::clone(&self.fanout_groups),
             fanout_agent_index: Arc::clone(&self.fanout_agent_index),
+            cached_active_fanout_slots: Arc::clone(&self.cached_active_fanout_slots),
         }
     }
 
@@ -2688,6 +2819,7 @@ mod tests {
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
+            delegation_chain: Vec::new(),
         };
 
         let result = spawner.spawn(input, &context).await.unwrap();
@@ -2753,6 +2885,7 @@ mod tests {
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
+            delegation_chain: Vec::new(),
         };
 
         let result = spawner.spawn(input, &context).await;
@@ -2805,6 +2938,7 @@ mod tests {
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
+            delegation_chain: Vec::new(),
         };
 
         let input = SpawnAgentInput {
@@ -2858,6 +2992,7 @@ mod tests {
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
+            delegation_chain: Vec::new(),
         };
 
         // Spawn an agent in background mode
@@ -2909,6 +3044,7 @@ mod tests {
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
+            delegation_chain: Vec::new(),
         };
         let input = SpawnAgentInput {
             description: "Named agent".to_string(),
@@ -3154,6 +3290,24 @@ mod tests {
     }
 
     #[test]
+    fn dropped_terminal_output_is_internal_failure_not_user_cancel() {
+        let output = dropped_agent_terminal_output("agent-42");
+        assert!(
+            matches!(
+                output,
+                SpawnAgentOutput::Failed {
+                    ref error,
+                    ref finish_reason,
+                    duration_ms: 0
+                } if finish_reason == "executor_dropped"
+                    && error.contains("agent-42")
+                    && error.contains("no completion payload")
+            ),
+            "dropped terminal sender must be diagnosed as internal executor loss, got {output:?}"
+        );
+    }
+
+    #[test]
     fn fanout_slot_status_counts_only_budget_interruptions_as_parent_budget_cancel() {
         let budget_interrupted = AgentStatus::Completed {
             result: "partial review".to_string(),
@@ -3247,6 +3401,7 @@ mod tests {
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
+            delegation_chain: Vec::new(),
         };
         let input = SpawnAgentInput {
             description: "Background agent".to_string(),
@@ -3294,6 +3449,7 @@ mod tests {
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
+            delegation_chain: Vec::new(),
         };
         let input = SpawnAgentInput {
             description: "Depth test".to_string(),
@@ -3330,6 +3486,7 @@ mod tests {
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
+            delegation_chain: Vec::new(),
         };
         let input = SpawnAgentInput {
             description: "Sync interrupted agent".to_string(),
@@ -3365,6 +3522,7 @@ mod tests {
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
+            delegation_chain: Vec::new(),
         };
         let input = SpawnAgentInput {
             description: "Depth reject".to_string(),
@@ -3399,6 +3557,7 @@ mod tests {
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
+            delegation_chain: Vec::new(),
         };
         let input = SpawnAgentInput {
             description: "Sync agent".to_string(),
@@ -3502,6 +3661,7 @@ mod tests {
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
+            delegation_chain: Vec::new(),
         };
         let input = SpawnAgentInput {
             description: "Unknown status".to_string(),
@@ -3541,6 +3701,7 @@ mod tests {
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
+            delegation_chain: Vec::new(),
         };
         let input = SpawnAgentInput {
             description: "Waiting status".to_string(),
@@ -3594,6 +3755,7 @@ mod tests {
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
+            delegation_chain: Vec::new(),
         };
         let input = SpawnAgentInput {
             description: "Test with skills".to_string(),
@@ -3621,6 +3783,7 @@ mod tests {
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
+            delegation_chain: Vec::new(),
         };
         assert!(context.inherited_skills.is_empty());
     }
@@ -3695,6 +3858,7 @@ mod tests {
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
+            delegation_chain: Vec::new(),
         }
     }
 
@@ -3871,6 +4035,31 @@ mod tests {
                 "spawn #{i} must succeed when no cap is configured, got {result:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn spawn_gate_repairs_stale_fanout_slot_cache_before_rejecting() {
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
+        spawner
+            .cached_active_fanout_slots
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+
+        let result = spawner.spawn(make_bg_input(), &make_bg_context()).await;
+
+        assert!(
+            result.is_ok(),
+            "stale cache with no authoritative active fanout slots must be repaired before spawn gate rejects: {result:?}"
+        );
+        assert_eq!(
+            spawner
+                .cached_active_fanout_slots
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_secs(2))
+            .await;
     }
 
     #[tokio::test]
@@ -5308,6 +5497,7 @@ mod tests {
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
+            delegation_chain: Vec::new(),
         }
     }
 

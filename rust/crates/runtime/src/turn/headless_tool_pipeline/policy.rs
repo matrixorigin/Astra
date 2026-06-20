@@ -247,7 +247,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 let body = if prior_cache_hits >= self.ctx.repeated_cache_hit_suppression as usize {
                     skip_reason = REASON_REPEATED_CACHE_HIT_SUPPRESSED;
                     format!(
-                        "⛔ Repeated cached read suppressed: this exact {} request has already \
+                        "Repeated cached read skipped: this exact {} request has already \
                          been served from cache {} time(s). Use the earlier cached result in the \
                          conversation instead of calling again; if you need different evidence, \
                          change the arguments.",
@@ -255,7 +255,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     )
                 } else {
                     format!(
-                        "⛔ Cached repeat (call #{} for identical args, limit: {}). \
+                        "Cached repeat skipped (call #{} for identical args, limit: {}). \
                          The result is already in this conversation from an earlier call. \
                          Do NOT call this tool again with the same arguments.",
                         *count, self.ctx.max_identical_calls

@@ -25,6 +25,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::orchestration::{AgentProgressEvent, ProgressEventType};
 use crate::server::tool_transport::{
     ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy,
     ToolExecutionRequest, ToolPolicySnapshot, WorkspaceAuthority, WorkspaceBinding,
@@ -62,9 +63,6 @@ use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use astra_turn_core::compaction_types::CompactionTier;
 use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_core::tool_schema_prune::filter_tool_schemas_by_excluded_names;
-use astra_turn_core::turn_guard::merge_deprioritized_tools_into_restricted;
-
-use crate::orchestration::{AgentProgressEvent, ProgressEventType};
 
 const MAX_PENDING_PROGRESS_AGENTS: usize = 128;
 const MAX_PENDING_PROGRESS_PER_AGENT: usize = 8;
@@ -1970,8 +1968,11 @@ impl ServerAgenticLoopHost {
             return Err(error);
         }
 
-        let (full_text, reasoning, tool_calls, usage) =
+        let (full_text, reasoning, tool_calls, usage, delay_ms) =
             astra_turn_core::bridge_e2e_hooks::parse_llm_round(round);
+        if delay_ms > 0 {
+            sleep_ms_or_llm_cancel(delay_ms, llm_cancel_for_state(state)).await?;
+        }
 
         if !reasoning.is_empty() {
             self.push_reasoning_events(&reasoning);
@@ -2497,7 +2498,7 @@ impl ServerAgenticLoopHost {
     }
 
     /// Compute the tool schemas visible for the current turn after applying
-    /// health-based restrictions and hard request policies.
+    /// hard request policies.
     ///
     /// IMPORTANT: prompt-visible schemas must match the runtime policy the
     /// model can actually execute. Request/delegation allowlists are hard
@@ -2570,11 +2571,11 @@ impl ServerAgenticLoopHost {
     /// Compute the effective restricted-tool set for a turn by running the
     /// full restriction pipeline:
     ///
-    /// 1. widen check + deprioritized-tool merge
+    /// 1. widen check
     /// 2. runtime allowlist restrictions
     /// 3. interaction-scoped restrictions (always applied)
     /// 4. boost rescue
-    /// 5. activated-deferred-tool rescue (health-gated)
+    /// 5. activated-deferred-tool rescue
     ///
     /// `consume_widen` controls whether the `widen_selection_pending` flag is
     /// consumed (authoritative path: main turn / test helper) or merely
@@ -2589,17 +2590,10 @@ impl ServerAgenticLoopHost {
         state: &mut AgenticLoopState,
         consume_widen: bool,
     ) -> HashSet<String> {
-        // 1. widen + merge deprioritized tools into the persistent set.
-        let widen = if consume_widen {
-            std::mem::take(&mut state.widen_selection_pending)
-        } else {
-            state.widen_selection_pending
-        };
-        if !widen {
-            merge_deprioritized_tools_into_restricted(
-                &state.turn_guard,
-                &mut state.restricted_tools,
-            );
+        // 1. Consume or peek the widen flag. Soft health diagnostics are not
+        // promoted into the hard restricted-tool set.
+        if consume_widen {
+            let _ = std::mem::take(&mut state.widen_selection_pending);
         }
         // 2-5. layered restrictions from the merged base.
         let mut effective = state.restricted_tools.clone();
@@ -2614,21 +2608,15 @@ impl ServerAgenticLoopHost {
         }
         if let Some(executor) = state.server_tool_executor.as_deref() {
             for name in executor.activated_deferred_tool_names() {
-                // Rescue activated deferred tools so they're visible this turn,
-                // but NOT if the health tracker has hard-deprioritized them —
-                // a broken-but-activated tool must stay restricted so it can be
-                // quarantined rather than silently rescued every turn.
-                if !state.turn_guard.health.is_deprioritized(name.as_str()) {
-                    effective.remove(&name);
-                }
+                // Rescue activated deferred tools so they're visible this turn.
+                effective.remove(&name);
             }
         }
         effective
     }
 
     /// Compute the tool schemas visible for the current turn after applying
-    /// health-based restrictions. This is the server-path equivalent of the
-    /// CLI's deny-at-assembly behavior.
+    /// hard runtime restrictions.
     #[cfg(test)]
     fn visible_turn_tools(&mut self, state: &mut AgenticLoopState) -> Vec<Value> {
         let effective_restricted = self.compute_effective_restricted(state, true);
@@ -3298,9 +3286,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 Some(effective_max_output),
             );
             if let Some(prompt_request_plan) = prompt_request_plan.as_ref() {
-                crate::turn::llm::exchange_capture::persist_prompt_request_plan_or_log(
+                crate::turn::llm::exchange_capture::spawn_prompt_request_plan_persist_or_log(
                     "server_loop_host",
-                    self.shared_pool.as_ref(),
+                    self.shared_pool.clone(),
                     astra_services::PromptRequestPersistInput {
                         session_id: self.session_id.clone(),
                         user_id: self.user_id.clone(),
@@ -3312,9 +3300,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         model: llm_cfg.model_name.clone(),
                         provider: llm_cfg.provider.clone(),
                     },
-                    prompt_request_plan,
-                )
-                .await;
+                    prompt_request_plan.clone(),
+                );
             }
             state.step_recorder.begin_llm_round(&llm_cfg.model_name);
             let llm_round_start = std::time::Instant::now();
@@ -6327,6 +6314,8 @@ mod tests {
             api_token: "test-token".to_string(),
             delegation_engine: None,
             delegations_this_turn: 0,
+            delegation_chain: Vec::new(),
+            self_agent_id: "orchestrator".to_string(),
             project_context: None,
             checkpoint_gate: None,
             last_llm_context_manifest_trace: None,
@@ -6477,7 +6466,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_turn_tools_excludes_restricted_and_deprioritized_tools() {
+    fn visible_turn_tools_excludes_only_hard_restricted_tools() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -6496,9 +6485,21 @@ mod tests {
             .record_resource_limit_failure("bash");
 
         let visible = host.visible_turn_tools(&mut state);
+        let visible_names: HashSet<&str> = visible
+            .iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .collect();
 
-        assert!(visible.is_empty(), "both tools should be filtered out");
-        assert!(state.restricted_tools.contains("bash"));
+        assert!(visible_names.contains("bash"));
+        assert!(!visible_names.contains("read_file"));
+        assert!(
+            !state.restricted_tools.contains("bash"),
+            "soft health must not mutate hard restricted_tools"
+        );
         assert!(state.restricted_tools.contains("read_file"));
     }
 
@@ -6615,8 +6616,7 @@ mod tests {
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
-        let mut state = create_test_state();
-        merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut state.restricted_tools);
+        let state = create_test_state();
         let mut effective_restricted = state.restricted_tools.clone();
         effective_restricted.extend(interaction_scoped_tool_restrictions(
             TurnInteractionMode::Headless,
@@ -6650,8 +6650,7 @@ mod tests {
         .with_interactive_client(true)
         .build();
 
-        let mut state = create_test_state();
-        merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut state.restricted_tools);
+        let state = create_test_state();
         let mut effective_restricted = state.restricted_tools.clone();
         effective_restricted.extend(interaction_scoped_tool_restrictions(
             host.turn_interaction_mode(),

@@ -3,8 +3,12 @@
 use super::{BottomPane, BottomPaneAction};
 use crate::cli::chat_stream::ApprovalResponse;
 use crate::cli::permission_manager::PermissionMode;
+use crate::tui::bottom_pane::in_flight_agents_view::{
+    AgentRow, AgentRowStatus, InFlightAgentsView,
+};
 use crate::tui::slash_dispatch::next_permission_mode_for_cycle;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 #[test]
@@ -97,6 +101,27 @@ fn next_mode_cycle_starting_from_default() {
     assert_eq!(
         next_permission_mode_for_cycle(PermissionMode::Prompt),
         PermissionMode::Auto
+    );
+}
+
+#[test]
+fn pre_draw_tick_pops_terminal_agent_view_after_grace_period() {
+    let mut pane = BottomPane::new();
+    pane.push_view(Box::new(InFlightAgentsView::new(vec![AgentRow {
+        agent_id: "reviewer@done".into(),
+        name: "reviewer".into(),
+        child_count: 0,
+        elapsed_ms: 1200,
+        status: AgentRowStatus::Completed,
+        fanout: None,
+    }])));
+    assert!(pane.has_active_view());
+
+    pane.pre_draw_tick(Instant::now() + Duration::from_secs(4));
+
+    assert!(
+        !pane.has_active_view(),
+        "terminal agent board should auto-dismiss instead of staying pinned"
     );
 }
 

@@ -1630,7 +1630,7 @@ mod tests {
 ⚠ agent returned an error. Check the error details and either fix the arguments or try an alternative tool."#
         ));
         assert!(result_body_signals_failure(
-            r#"{"status":"failed","error":"Agent spawning not available in this context."}"#
+            r#"{"status":"failed","error":"runtime binding is unavailable in this session mode"}"#
         ));
         assert!(result_body_signals_failure(
             r#"{"error":"Failed to serialize output"}"#

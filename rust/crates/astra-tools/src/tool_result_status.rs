@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub enum ToolResultStatusKind {
     Success,
     NonSuccess,
+    /// Protective deduplication or skipped execution (not an error).
+    Skipped,
 }
 
 impl ToolResultStatusKind {
@@ -17,6 +19,8 @@ impl ToolResultStatusKind {
             "ok" | "success" | "succeeded" | "completed" | "complete" | "passed"
         ) {
             Self::Success
+        } else if normalized.as_str() == "skipped" {
+            Self::Skipped
         } else {
             Self::NonSuccess
         }
@@ -29,7 +33,12 @@ impl ToolResultStatusKind {
 
     #[must_use]
     pub fn is_failure(self) -> bool {
-        !self.is_success()
+        matches!(self, Self::NonSuccess)
+    }
+
+    #[must_use]
+    pub fn is_skipped(self) -> bool {
+        matches!(self, Self::Skipped)
     }
 }
 

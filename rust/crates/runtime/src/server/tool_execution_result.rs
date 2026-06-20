@@ -17,11 +17,24 @@ pub(crate) fn tool_result_from_output(output: String) -> astra_tools::ToolResult
             .as_ref()
             .and_then(|value| value.get("error"))
             .is_some();
-    if output.starts_with("Error:") || output.starts_with("SANDBOX_DENIED:") || json_error {
-        astra_tools::ToolResult::error(output)
-    } else {
-        astra_tools::ToolResult::text(output)
+    let mut result =
+        if output.starts_with("Error:") || output.starts_with("SANDBOX_DENIED:") || json_error {
+            astra_tools::ToolResult::error(output)
+        } else {
+            astra_tools::ToolResult::text(output)
+        };
+    if let Some(error_kind) = parsed
+        .as_ref()
+        .and_then(|value| value.get("error_kind"))
+        .and_then(Value::as_str)
+    {
+        let metadata = result.metadata.get_or_insert_with(Map::new);
+        metadata.insert(
+            "error_kind".to_string(),
+            Value::String(error_kind.to_string()),
+        );
     }
+    result
 }
 
 fn normalized_wait_reason(reason: &str) -> String {

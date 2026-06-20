@@ -235,6 +235,11 @@ const SOFT_ERROR_PATTERNS: &[&str] = &[
     "no changes detected",
     // create_file on existing file — specific pattern
     "file already exists",
+    // Execution transport/surface mismatch. No tool implementation ran, so
+    // this should not trigger rollback or mark the tool call as a hard
+    // side-effecting failure.
+    "headless edge protocol",
+    "no matching edge execution",
 ];
 
 /// Timeout/transient error patterns — soft for read-only tools, hard for mutation tools.
@@ -924,6 +929,17 @@ if let Err(e) = writeln!(file, "{line}") {
             ToolErrorSeverity::SoftError
         );
         assert!(!tool_error_triggers_rollback("str_replace", output));
+    }
+
+    #[test]
+    fn classify_headless_edge_protocol_as_soft_binding_error() {
+        let output =
+            "Error: headless edge protocol — tool `agent_fanout` has no matching edge execution";
+        assert_eq!(
+            classify_tool_error("agent_fanout", output),
+            ToolErrorSeverity::SoftError
+        );
+        assert!(!tool_error_triggers_rollback("agent_fanout", output));
     }
 
     #[test]

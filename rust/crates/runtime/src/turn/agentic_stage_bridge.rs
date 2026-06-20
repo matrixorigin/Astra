@@ -227,8 +227,8 @@ impl StrategyApplication {
 ///   that the tool-visibility pipeline removes from the effective restriction
 ///   set so the LLM always sees them when advertised by the edge catalogue).
 /// - `widen_selection` → sets the one-shot `state.widen_selection_pending`
-///   flag. The next tool-visibility assembly consumes it and skips the
-///   deprioritized → restricted merge so the full catalogue is re-exposed.
+///   flag. The next authoritative tool-visibility assembly consumes it; soft
+///   health diagnostics no longer hide tools from the schema.
 /// - `inject_context` is intentionally not applied here: context injection is
 ///   delivered textually via the tactical-action label emitted by
 ///   [`PipelineDiagnosis`].

@@ -3610,13 +3610,23 @@ esac
         assert!(result.is_error, "{result:?}");
         let value: Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(value["status"], "failed");
+        let error = value["error"].as_str().unwrap_or("");
         assert!(
-            value["error"]
-                .as_str()
-                .unwrap_or("")
-                .contains("Agent spawning not available"),
+            error.contains("no multi-agent executor attached"),
             "{}",
             result.output
+        );
+        assert_eq!(
+            value["error_kind"].as_str(),
+            Some(astra_core::ErrorKind::ToolBinding.as_str())
+        );
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("error_kind"))
+                .and_then(Value::as_str),
+            Some(astra_core::ErrorKind::ToolBinding.as_str())
         );
     }
 

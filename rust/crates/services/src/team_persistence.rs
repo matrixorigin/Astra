@@ -378,6 +378,7 @@ pub fn resolve_team(
         pattern,
         user_id: team.user_id.clone(),
         depth: 0,
+        delegation_chain: Vec::new(),
         context,
         execution_metadata: None,
     };

@@ -763,6 +763,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                         .stall
                         .forced_redundant_reads_corrective,
                     forced_cache_waste_corrective: state.stall.forced_cache_waste_corrective,
+                    forced_search_fanout_corrective: state.stall.forced_search_fanout_corrective,
                     forced_exploration_family_phase2: state.stall.forced_exploration_family_phase2,
                     forced_exploration_family_corrective: state
                         .stall

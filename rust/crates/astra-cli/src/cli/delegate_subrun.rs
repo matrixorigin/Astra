@@ -467,6 +467,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             api_token: self.token.clone(),
             delegation_engine: None,
             delegations_this_turn: 0,
+            delegation_chain: config.delegation_chain.clone(),
+            self_agent_id: profile.agent_id.clone(),
             project_context: None,
             checkpoint_gate: config.checkpoint_gate.clone(),
             last_llm_context_manifest_trace: None,
@@ -763,6 +765,7 @@ mod tests {
             },
             user_id: "test-user".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };

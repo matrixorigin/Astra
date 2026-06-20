@@ -1105,6 +1105,7 @@ mod tests {
                 status: "pending".into(),
                 depends_on: vec!["sub-0".into()],
                 owner: None,
+                reason: Some("waiting on dependency".into()),
             }],
             created_at: "2025-01-01T00:00:00Z".into(),
             updated_at: "2025-01-01T00:00:01Z".into(),
@@ -1126,7 +1127,7 @@ mod tests {
         assert_eq!(
             encoded.subtasks.as_deref(),
             Some(
-                r#"[{"id":"sub-1","title":"subtask","description":null,"status":"pending","depends_on":["sub-0"]}]"#
+                r#"[{"id":"sub-1","title":"subtask","description":null,"status":"pending","depends_on":["sub-0"],"reason":"waiting on dependency"}]"#
             )
         );
     }

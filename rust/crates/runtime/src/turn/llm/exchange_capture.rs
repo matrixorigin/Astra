@@ -313,24 +313,32 @@ pub(crate) async fn persist_configured_capture_or_log(
     }
 }
 
-pub(crate) async fn persist_prompt_request_plan_or_log(
-    context: &str,
-    shared_pool: Option<&SharedPool>,
+pub(crate) fn spawn_prompt_request_plan_persist_or_log(
+    context: &'static str,
+    shared_pool: Option<SharedPool>,
     input: astra_services::PromptRequestPersistInput,
-    plan: &astra_services::PromptRequestPlan,
+    plan: astra_services::PromptRequestPlan,
 ) {
     let Some(shared_pool) = shared_pool else {
         return;
     };
-    if let Err(error) = astra_services::persist_prompt_request(shared_pool, &input, plan).await {
-        tracing::error!(
-            target: "astra_runtime::prompt_delta",
-            %context,
-            request_id = %plan.request_id,
-            error = %error,
-            "failed to persist prompt request delta"
-        );
-    }
+    tokio::spawn(async move {
+        if let Err(error) =
+            astra_services::persist_prompt_request(&shared_pool, &input, &plan).await
+        {
+            let pool_stats = shared_pool.stats();
+            tracing::error!(
+                target: "astra_runtime::prompt_delta",
+                %context,
+                request_id = %plan.request_id,
+                db_pool_max = pool_stats.max_connections,
+                db_pool_size = pool_stats.size,
+                db_pool_idle = pool_stats.num_idle,
+                error = %error,
+                "failed to persist prompt request delta"
+            );
+        }
+    });
 }
 
 fn capture_file_path(

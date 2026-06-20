@@ -53,6 +53,8 @@ pub enum ErrorKind {
     ToolTimeout,
     /// Tool not installed, not configured, or explicitly unavailable.
     ToolUnavailable,
+    /// Runtime advertised a tool but failed to bind an executor/transport for it.
+    ToolBinding,
     /// OOM, disk full, fork exhaustion, too many open files.
     ResourceLimit,
 
@@ -94,6 +96,7 @@ impl ErrorKind {
             Self::ToolInvalidArgs => "tool_invalid_args",
             Self::ToolTimeout => "tool_timeout",
             Self::ToolUnavailable => "tool_unavailable",
+            Self::ToolBinding => "tool_binding",
             Self::ResourceLimit => "resource_limit",
             Self::DatabaseError => "database_error",
             Self::Stall => "stall",
@@ -198,6 +201,11 @@ impl ErrorKind {
                 "Tool is not available in this environment. \
                  Do NOT retry — use an alternative tool."
             }
+            Self::ToolBinding => {
+                "Tool execution binding is missing for the current session mode. \
+                 Do NOT retry the same tool call and do NOT assume a shell command \
+                 is equivalent; continue degraded only after making the lost capability explicit."
+            }
             Self::ResourceLimit => {
                 "System resource limit reached (memory/disk/processes). \
                  This tool is BLOCKED for the rest of this session. \
@@ -279,6 +287,11 @@ impl ErrorKind {
                 "Install or configure the missing tool, or remove it from the skill \
                  manifest so the agent does not pick it."
             }
+            Self::ToolBinding => {
+                "Fix the tool-surface/executor mismatch: only advertise tools whose \
+                 executor or edge transport is bound in this session mode, or wire the \
+                 missing transport before activation."
+            }
             Self::ResourceLimit => {
                 "Check system limits: `ulimit -u` (max procs), `ulimit -n` (open files). \
                  Kill orphan processes: `ps aux | grep defunct`. May need to restart \
@@ -329,6 +342,7 @@ impl ErrorKind {
             "tool_invalid_args" => Some(Self::ToolInvalidArgs),
             "tool_timeout" => Some(Self::ToolTimeout),
             "tool_unavailable" => Some(Self::ToolUnavailable),
+            "tool_binding" => Some(Self::ToolBinding),
             "resource_limit" => Some(Self::ResourceLimit),
             "database_error" => Some(Self::DatabaseError),
             "stall" => Some(Self::Stall),
@@ -369,10 +383,11 @@ impl ClassifiedError {
     /// Combines the error message with actionable guidance.
     #[must_use]
     pub fn llm_feedback(&self) -> String {
+        let message = strip_tool_binding_sentinel(&self.message);
         format!(
             "[{}] {}\n→ {}",
             self.kind.as_str(),
-            self.message,
+            message,
             self.kind.guidance()
         )
     }
@@ -380,7 +395,12 @@ impl ClassifiedError {
 
 impl std::fmt::Display for ClassifiedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{}] {}", self.kind.as_str(), self.message)
+        write!(
+            f,
+            "[{}] {}",
+            self.kind.as_str(),
+            strip_tool_binding_sentinel(&self.message)
+        )
     }
 }
 
@@ -413,20 +433,50 @@ impl From<String> for ClassifiedError {
 
 // ── Tool output fallback classifier ──────────────────────────────────────────
 
+/// Legacy marker from older binding errors.
+///
+/// New internal binding failures should carry [`ErrorKind::ToolBinding`] as
+/// structured metadata at the source instead of embedding this token in text.
+/// The constant and stripper stay to sanitize persisted or in-flight messages
+/// from older sessions.
+pub const TOOL_BINDING_SENTINEL: &str = "[tool-binding]";
+
+#[must_use]
+pub fn strip_tool_binding_sentinel(message: &str) -> std::borrow::Cow<'_, str> {
+    if !message.contains(TOOL_BINDING_SENTINEL) {
+        return std::borrow::Cow::Borrowed(message);
+    }
+    std::borrow::Cow::Owned(
+        message
+            .replace(TOOL_BINDING_SENTINEL, "")
+            .trim_end()
+            .to_string(),
+    )
+}
+
 /// The ONLY string-matching classifier in the codebase.
 ///
 /// Used exclusively for external tool output (bash, MCP tools) where we don't
 /// control the error format. All other errors are constructed with the correct
 /// [`ErrorKind`] at their source.
 ///
-/// **Priority order matters** — more specific patterns first:
+/// Internal runtime errors must be constructed with their [`ErrorKind`] at the
+/// source. This fallback deliberately does not classify binding failures by
+/// parsing human-readable binding prose.
+///
+/// For external categories, more specific patterns come first:
 /// ResourceLimit > DatabaseError > ToolTimeout > Network > Auth >
 /// ToolInvalidArgs(call contract) > ToolUnavailable >
 /// ToolInvalidArgs(generic) > ToolNotFound > Unknown.
-/// Do not reorder blocks without verifying all tests still pass.
 #[must_use]
 pub fn classify_tool_output(error_str: &str) -> ErrorKind {
     let lower = error_str.to_lowercase();
+
+    // Backward compatibility for persisted messages from sessions that emitted
+    // the legacy marker. New runtime code should not rely on this path.
+    if lower.contains(TOOL_BINDING_SENTINEL) {
+        return ErrorKind::ToolBinding;
+    }
 
     // Resource limit — never retry, block the tool
     if lower.contains("resource temporarily unavailable")
@@ -462,7 +512,7 @@ pub fn classify_tool_output(error_str: &str) -> ErrorKind {
         || lower.contains("error returned from database")
         || lower.contains("sqlx")
         || lower.contains("deadlock")
-        || lower.contains("connection pool timed out")
+        || is_database_pool_timeout(&lower)
         || (lower.contains("column") && lower.contains("group by"))
     {
         return ErrorKind::DatabaseError;
@@ -567,6 +617,8 @@ pub fn classify_tool_output(error_str: &str) -> ErrorKind {
         || lower.contains("parse error")
         || lower.contains("syntax error")
         || lower.contains("unexpected token")
+        || lower.contains("unexpected argument")
+        || lower.contains("unrecognized option")
         || lower.contains("type mismatch")
         || lower.contains("invalid json")
         || lower.contains("malformed")
@@ -694,6 +746,13 @@ pub fn is_workspace_read_before_write(lower: &str) -> bool {
         || lower.contains("read the full file before overwriting")
 }
 
+fn is_database_pool_timeout(lower: &str) -> bool {
+    lower.contains("connection pool timed out")
+        || lower.contains("pool timed out while waiting for an open connection")
+        || lower.contains("pool timed out waiting for an open connection")
+        || (lower.contains("pool timed out") && lower.contains("open connection"))
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -718,6 +777,7 @@ mod tests {
         ErrorKind::ToolInvalidArgs,
         ErrorKind::ToolTimeout,
         ErrorKind::ToolUnavailable,
+        ErrorKind::ToolBinding,
         ErrorKind::ResourceLimit,
         ErrorKind::DatabaseError,
         ErrorKind::Stall,
@@ -783,6 +843,7 @@ mod tests {
             ErrorKind::Cancelled,
             ErrorKind::ResourceLimit,
             ErrorKind::ToolTimeout,
+            ErrorKind::ToolBinding,
         ] {
             assert!(!kind.is_retryable(), "{kind:?} must NOT be retryable");
         }
@@ -826,6 +887,23 @@ mod tests {
         let fb_empty = empty.llm_feedback();
         assert!(fb_empty.contains("[unknown]"));
         assert!(fb_empty.contains("→"));
+    }
+
+    #[test]
+    fn tool_binding_sentinel_classifies_but_does_not_display() {
+        let raw = format!(
+            "Error: runtime binding unavailable {}",
+            TOOL_BINDING_SENTINEL
+        );
+        assert_eq!(classify_tool_output(&raw), ErrorKind::ToolBinding);
+
+        let error = ClassifiedError::new(ErrorKind::ToolBinding, raw);
+        let display = error.to_string();
+        let feedback = error.llm_feedback();
+        assert!(!display.contains(TOOL_BINDING_SENTINEL), "{display}");
+        assert!(!feedback.contains(TOOL_BINDING_SENTINEL), "{feedback}");
+        assert!(display.contains("runtime binding unavailable"));
+        assert!(feedback.contains("runtime binding unavailable"));
     }
 
     #[test]
@@ -927,6 +1005,10 @@ mod tests {
                 ErrorKind::ToolInvalidArgs,
             ),
             (
+                "error: unexpected argument 'edge_tools::tests::run_chain' found\n\nUsage: cargo test [OPTIONS] [TESTNAME]",
+                ErrorKind::ToolInvalidArgs,
+            ),
+            (
                 "Error: Tool 'task' is not available in this turn. Call only tools visible in this turn's `tools[]`.",
                 ErrorKind::ToolInvalidArgs,
             ),
@@ -944,6 +1026,12 @@ mod tests {
             (
                 "restore_snapshot_state is not supported for this store",
                 ErrorKind::ToolUnavailable,
+            ),
+            // Legacy ToolBinding marker. New internal binding failures carry
+            // ErrorKind structurally instead of relying on this classifier.
+            (
+                "Error: runtime binding unavailable [tool-binding]",
+                ErrorKind::ToolBinding,
             ),
             // Unknown
             (
@@ -1050,6 +1138,7 @@ mod tests {
             "SQL syntax error: column must appear in GROUP BY",
             "error returned from database: deadlock found",
             "sqlx: connection pool timed out",
+            "Error: pool timed out while waiting for an open connection",
             "deadlock detected on table x",
         ] {
             assert_eq!(classify_tool_output(st), ErrorKind::DatabaseError);

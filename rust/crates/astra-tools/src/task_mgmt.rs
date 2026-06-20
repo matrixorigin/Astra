@@ -389,6 +389,11 @@ pub struct SessionSubtask {
     /// "my work" miss subtasks of tasks they own (U-7 unhappy path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// Optional status-change note for this subtask. This is intentionally
+    /// stored on the subtask, not parent metadata, so subtask updates can
+    /// accept explanatory reasons without pretending they are parent failures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -1663,6 +1668,7 @@ fn parse_create_subtasks(
             status: SessionTaskStatusKind::Pending,
             depends_on,
             owner: explicit_owner.or_else(|| parent_owner.map(str::to_string)),
+            reason: None,
         });
     }
 
@@ -2534,7 +2540,10 @@ impl TaskManager {
         {
             return format!("Error: {error}");
         }
-        if error_message.is_none() && new_status == Some(SessionTaskStatusKind::Failed) {
+        if subtask_id.is_none()
+            && error_message.is_none()
+            && new_status == Some(SessionTaskStatusKind::Failed)
+        {
             error_message = reason.clone();
         }
         if error_message.is_some() {
@@ -2624,7 +2633,6 @@ impl TaskManager {
                 ("add_blocked_by", !proposed_blocked_by.is_empty()),
                 ("remove_blocks", !remove_blocks.is_empty()),
                 ("remove_blocked_by", !remove_blocked_by.is_empty()),
-                ("reason", reason.is_some()),
             ]
             .into_iter()
             .filter_map(|(field, present)| present.then_some(field))
@@ -2727,6 +2735,9 @@ impl TaskManager {
                             validate_subtask_status_transition(previous_status, *status)?;
                             subtask.status = *status;
                         }
+                        if let Some(note) = reason.clone() {
+                            subtask.reason = Some(note);
+                        }
                         // Copy the reconciled parent state from projected_task instead of
                         // re-running reconcile on the real task. This avoids a race where
                         // concurrent subtask updates could apply reconcile twice and
@@ -2747,6 +2758,7 @@ impl TaskManager {
                                 "subtask_id": st_id,
                                 "previous_status": previous_status,
                                 "status": final_subtask_status,
+                                "reason": reason,
                                 "message": format!("Subtask '{}' updated to '{}'", st_id, final_subtask_status)
                             })
                             .to_string(),
@@ -2859,17 +2871,25 @@ impl TaskManager {
                         }
                     }
                     if projected_status.is_in_progress() {
-                        if new_status == Some(SessionTaskStatusKind::InProgress) {
+                        let starting_now = new_status == Some(SessionTaskStatusKind::InProgress)
+                            && previous_status != SessionTaskStatusKind::InProgress;
+                        let dependency_edges_changed = !proposed_blocked_by.is_empty()
+                            || !proposed_blocks.is_empty()
+                            || !remove_blocked_by.is_empty()
+                            || !remove_blocks.is_empty();
+                        if starting_now {
                             validate_single_in_progress_slot(&tasks, &task_id)?;
                         }
-                        validate_task_can_start_after_projected_edges(
-                            &tasks,
-                            &task_id,
-                            &proposed_blocked_by,
-                            &proposed_blocks,
-                            &remove_blocked_by,
-                            &remove_blocks,
-                        )?;
+                        if starting_now || dependency_edges_changed {
+                            validate_task_can_start_after_projected_edges(
+                                &tasks,
+                                &task_id,
+                                &proposed_blocked_by,
+                                &proposed_blocks,
+                                &remove_blocked_by,
+                                &remove_blocks,
+                            )?;
+                        }
                     }
 
                     // Cycle detection on the projected graph.
@@ -4076,6 +4096,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subtask_update_accepts_reason_without_parent_metadata() {
+        let m = mgr();
+        m.create(&json!({
+            "title": "parent",
+            "subtasks": [{ "id": "verify", "title": "verify changes" }]
+        }))
+        .await;
+
+        let update = m
+            .update(&json!({
+                "task_id": "task-1",
+                "subtask_id": "verify",
+                "new_status": "completed",
+                "reason": "cargo check and focused tests passed"
+            }))
+            .await;
+
+        assert!(!update.starts_with("Error:"), "{update}");
+        assert!(
+            update.contains("cargo check and focused tests passed"),
+            "response should surface the recorded reason: {update}"
+        );
+        let task: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await).unwrap();
+        assert_eq!(
+            task.subtasks[0].reason.as_deref(),
+            Some("cargo check and focused tests passed")
+        );
+        assert!(
+            task.metadata
+                .as_ref()
+                .is_none_or(|metadata| !metadata.contains_key("reason")),
+            "subtask reason must stay on the subtask, not parent metadata: {task:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_subtask_update_accepts_reason_without_error_message_rewrite() {
+        let m = mgr();
+        m.create(&json!({
+            "title": "parent",
+            "subtasks": [{ "id": "compile", "title": "compile" }]
+        }))
+        .await;
+
+        let update = m
+            .update(&json!({
+                "task_id": "task-1",
+                "subtask_id": "compile",
+                "new_status": "failed",
+                "reason": "compiler unavailable"
+            }))
+            .await;
+
+        assert!(!update.starts_with("Error:"), "{update}");
+        let task: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await).unwrap();
+        assert_eq!(task.subtasks[0].status, SessionTaskStatusKind::Failed);
+        assert_eq!(
+            task.subtasks[0].reason.as_deref(),
+            Some("compiler unavailable")
+        );
+        assert!(
+            task.metadata
+                .as_ref()
+                .is_none_or(|metadata| !metadata.contains_key("error_message")),
+            "subtask reason must not be rewritten as parent error_message: {task:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn parent_update_rejects_empty_mutation_requests() {
         let m = mgr();
         m.create(&json!({"title": "unchanged"})).await;
@@ -4619,6 +4710,24 @@ mod tests {
         assert!(
             second.contains("\"success\":true") && second.contains("\"status\":\"in_progress\""),
             "{second}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_in_progress_is_idempotent_for_the_same_task() {
+        let m = mgr();
+        m.create(&json!({"title": "already running"})).await;
+        let first = m
+            .update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        assert!(!first.starts_with("Error:"), "{first}");
+
+        let repeat = m
+            .update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        assert!(
+            repeat.contains("\"success\":true") && repeat.contains("\"status\":\"in_progress\""),
+            "same-task in_progress repeat should be treated as idempotent success: {repeat}"
         );
     }
 
@@ -5587,6 +5696,7 @@ mod tests {
                         status: SessionTaskStatusKind::InProgress,
                         depends_on: vec![],
                         owner: None,
+                        reason: None,
                     }],
                     created_at: "".into(),
                     updated_at: "".into(),

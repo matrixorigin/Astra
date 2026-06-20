@@ -381,7 +381,11 @@ pub enum SpawnAgentOutput {
         messaging_address: Option<String>,
     },
     /// Failed to spawn.
-    Failed { error: String, duration_ms: u64 },
+    Failed {
+        error: String,
+        finish_reason: String,
+        duration_ms: u64,
+    },
 }
 
 impl SpawnAgentOutput {

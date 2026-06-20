@@ -1250,6 +1250,34 @@ impl ToolExecutor {
         }
     }
 
+    /// Rollback all file edits recorded since `checkpoint` within the
+    /// given turn, transactionally (if any undo fails, already-undone
+    /// entries are re-applied so disk state stays consistent).
+    ///
+    /// Used by `str_replace_batch` to recover from partial multi-file
+    /// write failures.
+    pub(crate) fn rollback_files_since_checkpoint(&self, turn_index: u32, checkpoint: u64) {
+        let result = match self.file_journal.lock() {
+            Ok(journal) => journal.undo_turn_since_transactional(turn_index, checkpoint),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .undo_turn_since_transactional(turn_index, checkpoint),
+        };
+        // Refresh file-state tracking for every reverted path so
+        // subsequent reads don't hit stale-timestamp guards.
+        if let Ok(paths) = &result {
+            for path in paths {
+                self.refresh_rolled_back_file_state(path);
+            }
+        }
+        if let Err(error) = result {
+            astra_core::agent_warn!(
+                "file_edit",
+                "str_replace_batch rollback failed for turn {turn_index} checkpoint {checkpoint}: {error}"
+            );
+        }
+    }
+
     pub(crate) async fn rollback_turn_actions(&self, args: &Value) -> String {
         let scope = args
             .get("scope")
@@ -1855,6 +1883,69 @@ impl ToolExecutor {
                 ),
             })
             .to_string(),
+        }
+    }
+
+    pub(crate) fn str_replace_batch(&self, args: &Value) -> String {
+        let top_path = args.get("path").and_then(Value::as_str);
+        let edits = match args.get("edits").and_then(Value::as_array) {
+            Some(e) => e,
+            None => return "Error: missing 'edits' array".to_string(),
+        };
+        if edits.is_empty() {
+            return "Error: 'edits' array is empty".to_string();
+        }
+
+        // Fast-path: same-file batch with top-level path and no per-edit paths
+        if top_path.filter(|path| !path.trim().is_empty()).is_some()
+            && edits
+                .iter()
+                .all(|edit| edit.get("path").and_then(Value::as_str).is_none())
+        {
+            return self.multi_edit(args);
+        }
+
+        let groups = match astra_tools::fs_ops::partition_edits_by_path(edits, top_path) {
+            Ok(g) => g,
+            Err(e) => return e,
+        };
+
+        // Sandbox-validate every path BEFORE touching disk.
+        // The core two-phase commit in multi_path_edit guarantees atomicity:
+        // all files are staged first, then rename() commits them atomically.
+        // No journal checkpoint, no preimage capture, no dual rollback.
+        for (path, _) in &groups {
+            if let Err(error) = self.resolve_checked(path) {
+                return error;
+            }
+        }
+
+        // Build the delegated args: top-level dry_run + per-edit paths.
+        // The core's str_replace routes to multi_path_edit for multi-file batches.
+        let dry_run = args
+            .get("dry_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let mut delegated = serde_json::Map::new();
+        delegated.insert(
+            "edits".to_string(),
+            args.get("edits").cloned().unwrap_or(Value::Null),
+        );
+        if dry_run {
+            delegated.insert("dry_run".to_string(), Value::Bool(true));
+        }
+        if let Some(allow) = args.get("allow_structural_change") {
+            delegated.insert("allow_structural_change".to_string(), allow.clone());
+        }
+
+        let result =
+            astra_tools::fs_ops::str_replace(&self.project_root, &Value::Object(delegated));
+        if result.is_error {
+            result.output
+        } else {
+            // Append success sentinel — the core doesn't emit it.
+            success_body(&result.output)
         }
     }
 
@@ -2979,6 +3070,7 @@ mod tests {
     };
     use astra_text_utils::str_preview::truncate_str;
     use astra_turn_core::tool_result_sanitize::READ_FILE_MODEL_RESULT_CHARS;
+    use astra_turn_core::tool_result_semantics::TOOL_SUCCESS_SENTINEL;
     use serde_json::{Value, json};
     use std::io::Write;
 
@@ -4717,6 +4809,116 @@ type Handler interface {
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
         let result = exe.multi_edit(&json!({"path": "f.txt", "edits": []}));
         assert!(result.contains("empty"), "result: {result}");
+    }
+
+    #[test]
+    fn str_replace_batch_accepts_per_edit_paths_for_multi_file_batch() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let a = tmpdir.path().join("a.txt");
+        let b = tmpdir.path().join("b.txt");
+        std::fs::write(&a, "alpha beta").unwrap();
+        std::fs::write(&b, "gamma delta").unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&json!({"path": "a.txt"}));
+        exe.read_file(&json!({"path": "b.txt"}));
+
+        let result = exe.str_replace_batch(&json!({
+            "edits": [
+                {"path": "a.txt", "old_str": "alpha", "new_str": "ALPHA"},
+                {"path": "b.txt", "old_str": "delta", "new_str": "DELTA"}
+            ]
+        }));
+
+        assert!(
+            result.contains("Successfully applied edits to 2 file(s)"),
+            "result: {result}"
+        );
+        assert!(result.contains(TOOL_SUCCESS_SENTINEL), "result: {result}");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "ALPHA beta\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "gamma DELTA\n");
+    }
+
+    #[test]
+    fn str_replace_batch_prevalidates_all_files_before_writing() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let a = tmpdir.path().join("a.txt");
+        let b = tmpdir.path().join("b.txt");
+        std::fs::write(&a, "alpha beta").unwrap();
+        std::fs::write(&b, "gamma delta").unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&json!({"path": "a.txt"}));
+        exe.read_file(&json!({"path": "b.txt"}));
+
+        let result = exe.str_replace_batch(&json!({
+            "edits": [
+                {"path": "a.txt", "old_str": "alpha", "new_str": "ALPHA"},
+                {"path": "b.txt", "old_str": "missing", "new_str": "MISSING"}
+            ]
+        }));
+
+        assert!(
+            result.contains("old_str not found"),
+            "missing old_str should be surfaced: {result}"
+        );
+        assert!(
+            !result.contains(TOOL_SUCCESS_SENTINEL),
+            "should not succeed: {result}"
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha beta");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "gamma delta");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn str_replace_batch_atomic_rename_handles_readonly_dest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let a = tmpdir.path().join("a.txt");
+        let b = tmpdir.path().join("b.txt");
+        std::fs::write(&a, "alpha beta").unwrap();
+        std::fs::write(&b, "gamma delta").unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&json!({"path": "a.txt"}));
+        exe.read_file(&json!({"path": "b.txt"}));
+
+        let mut readonly = std::fs::metadata(&b).unwrap().permissions();
+        readonly.set_mode(0o444);
+        std::fs::set_permissions(&b, readonly).unwrap();
+
+        let result = exe.str_replace_batch(&json!({
+            "edits": [
+                {"path": "a.txt", "old_str": "alpha", "new_str": "ALPHA"},
+                {"path": "b.txt", "old_str": "gamma", "new_str": "GAMMA"}
+            ]
+        }));
+
+        let mut writable = std::fs::metadata(&b).unwrap().permissions();
+        writable.set_mode(0o644);
+        std::fs::set_permissions(&b, writable).unwrap();
+
+        // staging + rename() replaces the directory entry atomically,
+        // so read-only destination files do not block the operation.
+        assert!(result.contains(TOOL_SUCCESS_SENTINEL), "result: {result}");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "ALPHA beta\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "GAMMA delta\n");
+    }
+
+    #[test]
+    fn str_replace_batch_requires_some_path_source() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+
+        let result = exe.str_replace_batch(&json!({
+            "edits": [
+                {"old_str": "alpha", "new_str": "ALPHA"}
+            ]
+        }));
+
+        assert!(
+            result.contains("top-level path") && result.contains("path inside every edit"),
+            "result: {result}"
+        );
     }
 
     #[test]

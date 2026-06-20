@@ -218,21 +218,22 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "str_replace",
-                "description": "Replace text in a file (diff channel — for targeted edits, not full rewrites). Supports single replacement or batched `edits`. Use exact fields only: `path` + `old_str` + `new_str`, or `path` + `edits`; do not use aliases such as old/new/original_text/replacements. Use the smallest old_str that uniquely identifies the target — typically 2-4 adjacent lines (≥3 lines preferred when new_str is large). For full-section rewrites or changes >4KB, use `write_file` with the complete file content instead. WARNING: old_str must match exactly (including whitespace); if it matches multiple locations the edit is rejected — add surrounding context lines to disambiguate, or use replace_all=true.",
+                "description": "Replace text in files (diff channel — for targeted edits, not full rewrites). Supports single replacement, same-file batched `edits`, and multi-file batched `edits` with per-edit `path`. Use exact fields only: single mode uses `path` + `old_str` + `new_str`; batch mode uses top-level `path` + `edits` or `edits[]` entries with their own `path`; do not use aliases such as old/new/original_text/replacements. Use the smallest old_str that uniquely identifies the target — typically 2-4 adjacent lines (≥3 lines preferred when new_str is large). For full-section rewrites or changes >4KB, use `write_file` with the complete file content instead. WARNING: old_str must match exactly (including whitespace); if it matches multiple locations the edit is rejected — add surrounding context lines to disambiguate, or use replace_all=true.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "path": {"type": "string", "description": "File path relative to project root"},
+                        "path": {"type": "string", "description": "File path relative to project root. Required for single mode and same-file batch mode; optional when every edits[] entry has its own path."},
                         "old_str": {"type": "string", "description": "String to replace. Required with new_str in single-edit mode; omit when using edits."},
                         "new_str": {"type": "string", "description": "Replacement text. Required with old_str in single-edit mode; omit when using edits."},
                         "edits": {
                             "type": "array",
-                            "description": "Atomic batch mode: array of {old_str, new_str} pairs. Mutually exclusive with top-level old_str/new_str.",
+                            "description": "Batch mode: array of {old_str, new_str, path?} edits. Top-level path applies to entries without path. If top-level path is omitted, every edit must include path. Mutually exclusive with top-level old_str/new_str.",
                             "items": {
                                 "type": "object",
                                 "additionalProperties": false,
                                 "properties": {
+                                    "path": {"type": "string", "description": "Optional file path for this edit; required when top-level path is omitted."},
                                     "old_str": {"type": "string"},
                                     "new_str": {"type": "string"}
                                 },
@@ -243,10 +244,10 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "replace_all": {"type": "boolean", "description": "Replace all occurrences."},
                         "allow_structural_change": {"type": "boolean", "description": "Bypass structural safety checks for intentional syntax-breaking edits."}
                     },
-                    "required": ["path"],
                     "x-astra-per-action-required": {
                         "single": ["path", "old_str", "new_str"],
-                        "batch": ["path", "edits"]
+                        "batch_same_file": ["path", "edits"],
+                        "batch_multi_file": ["edits[].path", "edits[].old_str", "edits[].new_str"]
                     }
                 }
             }
@@ -828,8 +829,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Sub-agent persona (spawn). Default: general-purpose."},
                         "model": {"type": "string", "description": "Model override (spawn). Default: parent's model."},
                         "name": {"type": "string", "description": "Addressable mailbox name (spawn). Optional; auto-generated if omitted. Not the runtime agent_id used by get_result."},
-                        "max_turns": {"type": "integer", "description": "Max turns (spawn). Explicit value wins over `complexity`."},
-                        "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Task-complexity hint scaling the default budget when `max_turns` is absent. `light`≈10 turns, `normal`=agent default, `deep`=2× default. Use `deep` for review/refactor/multi-file tasks that routinely exhaust the default."},
+                        "max_turns": {"type": "integer", "description": "Requested max turns (spawn). Runtime may raise too-small values for deep/code-review fanouts; omit it and use `complexity` when unsure."},
+                        "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Task-complexity hint scaling the default budget. `light`≈10 turns, `normal`=agent default, `deep`=2× default. Use `deep` for review/refactor/multi-file tasks that routinely exhaust the default."},
                         "isolated": {"type": "boolean", "description": "Use isolated worktree (spawn)"},
                         "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist (spawn)"},
                         "agent_id": {"type": "string", "description": "ONLY for action='get_result'. Must be the exact runtime-generated agent_id returned by a prior spawn, not the optional spawn name. Never prefill this on spawn."},
@@ -1047,7 +1048,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
         ## When NOT to Use\n\
         Single edit/command/answer, info, or trivial work.\n\
         One task per outcome: NOT one umbrella task. Broad work -> 3-7 leaf tasks. Mark first task `in_progress` BEFORE beginning work. Keep exactly ONE task as `in_progress` at a time. Finish `completed`, `failed` + `error_message`, or use `archive` for old history.\n\
-        Field notes: `title` is outcome; `active_form` spinner text; `metadata` null deletes a key; `add_blocks`/`add_blocked_by` work on create/update. `subtasks` is create-only; update subtask progress with only `task_id` + `subtask_id` + `new_status`.\n\
+        Field notes: `title` is outcome; `active_form` spinner text; `metadata` null deletes a key; `add_blocks`/`add_blocked_by` work on create/update. `subtasks` create-only; subtask update: `task_id` + `subtask_id` + `new_status` (+ `reason`).\n\
         <example>Build reimbursements: create backend, API, UI, verify tasks; mark backend in_progress BEFORE beginning work.</example>",
                 "parameters": {
                     "type": "object",
@@ -1061,7 +1062,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "task_id": {"type": "string", "description": "(update/get/stop/adopt/archive) Task id. Single-task archive stays in current session."},
                         "new_status": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","deleted"], "description": "(update) Status. Only one parent task may be in_progress; `paused` frees that slot; `deleted` removes the task."},
                         "status_filter": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","archived","all","active"], "description": "(list) `active` = pending + in_progress + paused."},
-                        "subtask_id": {"type": "string", "description": "(update) Specific subtask id. When present, only send task_id + subtask_id + new_status."},
+                        "subtask_id": {"type": "string", "description": "(update) Subtask id; use with task_id + new_status, optional reason."},
                         "active_form": {"type": "string", "description": "(create/update) Spinner text while in_progress."},
                         "owner": {"type": "string", "description": "(create/update) Owner."},
                         "metadata": {"type": "object", "description": "(create/update) Key-value pairs; null deletes a key on update."},
@@ -1085,7 +1086,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                 "required": ["id", "title"]
                             }
                         },
-                        "reason": {"type": "string", "description": "(parent update/stop/archive only; never with subtask_id) Human reason. On failed parent update it is stored as error_message when error_message is omitted."},
+                        "reason": {"type": "string", "description": "(update/stop/archive) Reason. With subtask_id, stores a subtask status note; failed parent fills error_message if omitted."},
                         "error_message": {"type": "string", "description": "(update) Failure/cancel reason to include when setting new_status='failed' or new_status='cancelled'."}
                     },
                     "required": ["action"],
@@ -1624,8 +1625,8 @@ mod tests {
             "task schema should explicitly teach when to archive finished work: {desc}"
         );
         assert!(
-            desc.contains("`subtasks` is create-only")
-                && desc.contains("only `task_id` + `subtask_id` + `new_status`")
+            desc.contains("`subtasks` create-only")
+                && desc.contains("`task_id` + `subtask_id` + `new_status`")
                 && desc.contains("`subtask_id` + `new_status`"),
             "task schema should explain that subtasks are create-only and subtask progress uses update fields: {desc}"
         );
@@ -1633,15 +1634,15 @@ mod tests {
             .as_str()
             .unwrap_or_default();
         assert!(
-            subtask_id_desc.contains("only send task_id + subtask_id + new_status"),
+            subtask_id_desc.contains("optional reason"),
             "subtask_id should explain the narrow subtask-update shape: {subtask_id_desc}"
         );
         let reason_desc = properties["reason"]["description"]
             .as_str()
             .unwrap_or_default();
         assert!(
-            reason_desc.contains("never with subtask_id"),
-            "reason should not be advertised for subtask updates: {reason_desc}"
+            reason_desc.contains("With subtask_id") && reason_desc.contains("subtask status note"),
+            "reason should be advertised for explained subtask updates: {reason_desc}"
         );
         assert!(
             properties["status_filter"]
@@ -2178,13 +2179,9 @@ mod tests {
             "str_replace parameters must avoid provider-rejected top-level schema composition"
         );
 
-        let required = params
-            .get("required")
-            .and_then(Value::as_array)
-            .expect("str_replace parameters must include required fields");
         assert!(
-            required.iter().any(|v| v == "path"),
-            "str_replace must always require path: {required:?}"
+            params.get("required").is_none(),
+            "str_replace cannot require top-level path because multi-file batch mode puts path inside edits[]"
         );
 
         let per_action = params.get("x-astra-per-action-required").expect(
@@ -2200,15 +2197,27 @@ mod tests {
                 .all(|field| single.iter().any(|value| value.as_str() == Some(*field))),
             "single mode must require path, old_str, and new_str: {single:?}"
         );
-        let batch = per_action
-            .get("batch")
+        let batch_same_file = per_action
+            .get("batch_same_file")
             .and_then(Value::as_array)
-            .expect("batch mode must be listed");
+            .expect("same-file batch mode must be listed");
         assert!(
-            ["path", "edits"]
+            ["path", "edits"].iter().all(|field| batch_same_file
                 .iter()
-                .all(|field| batch.iter().any(|value| value.as_str() == Some(*field))),
-            "batch mode must require path and edits: {batch:?}"
+                .any(|value| value.as_str() == Some(*field))),
+            "same-file batch mode must require path and edits: {batch_same_file:?}"
+        );
+        let batch_multi_file = per_action
+            .get("batch_multi_file")
+            .and_then(Value::as_array)
+            .expect("multi-file batch mode must be listed");
+        assert!(
+            ["edits[].path", "edits[].old_str", "edits[].new_str"]
+                .iter()
+                .all(|field| batch_multi_file
+                    .iter()
+                    .any(|value| value.as_str() == Some(*field))),
+            "multi-file batch mode must require path inside each edit: {batch_multi_file:?}"
         );
 
         assert_eq!(
@@ -2217,6 +2226,12 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(false),
             "batch edit entries should reject unknown fields"
+        );
+        assert!(
+            params
+                .pointer("/properties/edits/items/properties/path")
+                .is_some(),
+            "batch edit entries should advertise optional per-edit path"
         );
     }
 

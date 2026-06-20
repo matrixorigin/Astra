@@ -9,7 +9,7 @@
 
 # ── Database Connection Pool ──────────────────────────────────────────────────
 [database]
-max_connections = 10          # Max connections in pool (env: ASTRA_DB_POOL_MAX_CONNECTIONS)
+max_connections = 80          # Max connections in pool (env: ASTRA_DB_POOL_MAX_CONNECTIONS)
 min_connections = 1           # Min idle connections (env: ASTRA_DB_POOL_MIN_CONNECTIONS)
 # connect_timeout_s = 5       # Connection acquisition timeout (seconds)
 # max_lifetime_s = 300        # Max connection lifetime before recycling (seconds)
