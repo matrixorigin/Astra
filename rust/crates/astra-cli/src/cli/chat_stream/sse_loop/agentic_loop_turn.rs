@@ -124,8 +124,11 @@ fn message_has_tool_calls(m: &Value) -> bool {
         .is_some_and(|calls| !calls.is_empty())
 }
 
-fn should_skip_memory_boost(has_attachment_override: bool, history: &[(String, String)]) -> bool {
-    !history.is_empty() && has_attachment_override
+fn should_skip_memory_boost(
+    has_semantic_query_override: bool,
+    history: &[(String, String)],
+) -> bool {
+    !history.is_empty() && has_semantic_query_override
 }
 
 fn retained_history_messages(messages: &[Value]) -> &[Value] {
@@ -213,6 +216,7 @@ struct PrepareChatTurnRequest<'a> {
     registry: &'a tool_registry::ToolRegistry,
     tool_results: &'a [Value],
     all_schemas: &'a [Value],
+    valid_tool_names: &'a mut HashSet<String>,
     turn_guard: &'a TurnGuard,
     restricted_tools: &'a mut HashSet<String>,
     widen_selection_pending: &'a mut bool,
@@ -278,6 +282,23 @@ pub(crate) fn final_visible_tool_schemas_from_payload(payload: &Value) -> Vec<Va
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default()
+}
+
+fn selection_report_from_visible_schemas(
+    schemas: &[Value],
+    budget_used: u32,
+    budget_total: u32,
+) -> tool_registry::SelectionReport {
+    let tools_selected: Vec<String> = schemas
+        .iter()
+        .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
+        .collect();
+    tool_registry::SelectionReport {
+        selected_count: tools_selected.len() as u32,
+        tools_selected,
+        budget_used,
+        budget_total,
+    }
 }
 
 fn tool_schema_name(schema: &Value) -> Option<&str> {
@@ -566,30 +587,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     // leaked names into later turns — see the regression note on
     // session 19298aea in `cli_loop_host::plan_mode_restriction_names`.
 
-    let selected_tool_costs: Vec<(String, u32)> = selection_report
-        .tools_selected
-        .iter()
-        .map(|name| (name.clone(), ctx.registry.token_cost(name)))
-        .collect();
-    let selected_tool_tokens_total: u32 = selected_tool_costs.iter().map(|(_, cost)| *cost).sum();
-
-    if let Some(collector) = ctx.telem.trace_collector {
-        collector.record_tool_selection(
-            &selection_report.tools_selected,
-            &selection_strategy,
-            selection_confidence,
-            &selected_tool_costs,
-            ctx.registry.total_tool_count() as u32,
-            selection_latency_ms,
-        );
-    }
-
-    capture_first_selection_report_if_empty(
-        ctx.telem.first_selection_report,
-        ctx.telem.first_budget_pressure,
-        selection_report.clone(),
-        budget_pressure,
-    );
     ctx.executor.set_budget_pressure(budget_pressure);
 
     let surface_schemas: Vec<Value> = ctx
@@ -635,7 +632,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         &mut payload,
         turn_schemas,
         ctx.restricted_tools,
-        ctx.telem.first_selection_report.as_ref(),
+        Some(&selection_report),
         selection_confidence,
         None,
     );
@@ -643,8 +640,46 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     // capability restrictions, and interaction-mode filtering have all been
     // applied. The guard must mirror what the model actually saw.
     let final_visible_schemas = final_visible_tool_schemas_from_payload(&payload);
+    *ctx.valid_tool_names =
+        astra_turn_core::tool::deferred_activation::tool_names_from_schemas(&final_visible_schemas);
     ctx.executor
         .set_current_visible_tool_schemas(&final_visible_schemas);
+    // Telemetry truth: recompute budget_used from the ACTUAL final visible
+    // schemas, not the pre-filtering selection report.  The original
+    // `selection_report.budget_used` reflects tools that may have been
+    // stripped by capability/interaction-mode filtering, so reusing it
+    // would produce a budget number inconsistent with `tools_selected`.
+    let selected_tool_costs: Vec<(String, u32)> = final_visible_schemas
+        .iter()
+        .filter_map(|schema| {
+            tool_schema_name(schema).map(|name| (name.to_string(), ctx.registry.token_cost(name)))
+        })
+        .collect();
+    let budget_used_final: u32 = selected_tool_costs.iter().map(|(_, cost)| *cost).sum();
+    let final_selection_report = selection_report_from_visible_schemas(
+        &final_visible_schemas,
+        budget_used_final,
+        selection_report.budget_total,
+    );
+    let selected_tool_tokens_total: u32 = budget_used_final;
+
+    if let Some(collector) = ctx.telem.trace_collector {
+        collector.record_tool_selection(
+            &final_selection_report.tools_selected,
+            &selection_strategy,
+            selection_confidence,
+            &selected_tool_costs,
+            final_visible_schemas.len() as u32,
+            selection_latency_ms,
+        );
+    }
+
+    capture_first_selection_report_if_empty(
+        ctx.telem.first_selection_report,
+        ctx.telem.first_budget_pressure,
+        final_selection_report,
+        budget_pressure,
+    );
     *ctx.turn_policy = turn_policy_from_payload_edge_tools(&payload, ctx.interaction_mode);
     log_chat_turn_timing_phase(timing, "skill_merge_attach_edge_tools", &mut mark);
 
@@ -974,6 +1009,10 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub current_session_id: Option<&'a str>,
     pub tool_results: &'a [Value],
     pub all_schemas: &'a [Value],
+    /// Tool names admitted by the headless validator for the current LLM
+    /// round. This is overwritten during payload preparation from the final
+    /// `edge_tools` actually sent to the model.
+    pub valid_tool_names: &'a mut HashSet<String>,
     pub turn_guard: &'a astra_turn_core::turn_guard::TurnGuard,
     pub restricted_tools: &'a mut HashSet<String>,
     pub widen_selection_pending: &'a mut bool,
@@ -1128,6 +1167,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         current_session_id,
         tool_results,
         all_schemas,
+        valid_tool_names,
         turn_guard,
         restricted_tools,
         widen_selection_pending,
@@ -1192,6 +1232,7 @@ pub(crate) async fn fetch_chat_turn_sse(
             registry,
             tool_results,
             all_schemas,
+            valid_tool_names,
             turn_guard,
             restricted_tools,
             widen_selection_pending,
@@ -1425,7 +1466,7 @@ mod tests {
     }
 
     #[test]
-    fn active_task_attachment_skips_memory_boost_once_history_exists() {
+    fn semantic_query_override_skips_memory_boost_once_history_exists() {
         let history = vec![(
             "review 这个: aa1f419b".to_string(),
             "Need to fix timeout.".to_string(),
@@ -1597,6 +1638,7 @@ mod tests {
         let recent_tools: Vec<String> = Vec::new();
         let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
+        let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("session-1", "task-1");
         let turn_guard = TurnGuard::default();
@@ -1624,6 +1666,7 @@ mod tests {
             registry: &registry,
             tool_results: &tool_results,
             all_schemas: &all_schemas,
+            valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
@@ -1669,6 +1712,25 @@ mod tests {
             .iter()
             .filter_map(|schema| schema["function"]["name"].as_str())
             .collect();
+        let edge_tool_name_set: HashSet<String> = edge_tool_names
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        assert_eq!(
+            valid_tool_names, edge_tool_name_set,
+            "headless validator must admit exactly the tools sent in edge_tools"
+        );
+        assert_eq!(
+            first_selection_report
+                .as_ref()
+                .map(|report| report.tools_selected.clone())
+                .unwrap_or_default(),
+            edge_tool_names
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<Vec<_>>(),
+            "selection telemetry must describe the final visible tools, not raw selector candidates"
+        );
         // Plan-mode escape hatches must be present exactly once each.
         assert!(edge_tool_names.contains(&"enter_plan_mode"));
         assert!(edge_tool_names.contains(&"exit_plan_mode"));
@@ -1718,6 +1780,7 @@ mod tests {
         let recent_tools: Vec<String> = Vec::new();
         let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
+        let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("session-1", "task-1");
         let turn_guard = TurnGuard::default();
@@ -1745,6 +1808,7 @@ mod tests {
             registry: &registry,
             tool_results: &tool_results,
             all_schemas: &all_schemas,
+            valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
@@ -1800,6 +1864,17 @@ mod tests {
             edge_tool_names.contains(&"exit_plan_mode"),
             "exit_plan_mode should always be injected for cache stability"
         );
+        assert_eq!(
+            first_selection_report
+                .as_ref()
+                .map(|report| report.tools_selected.clone())
+                .unwrap_or_default(),
+            edge_tool_names
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<Vec<_>>(),
+            "selection telemetry must stay in lockstep with final payload edge_tools"
+        );
     }
 
     #[tokio::test]
@@ -1829,6 +1904,7 @@ mod tests {
         let recent_tools: Vec<String> = Vec::new();
         let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
+        let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("session-1", "task-1");
         let turn_guard = TurnGuard::default();
@@ -1856,6 +1932,7 @@ mod tests {
             registry: &registry,
             tool_results: &tool_results,
             all_schemas: &all_schemas,
+            valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
@@ -1929,13 +2006,8 @@ mod tests {
         let all_schemas = vec![schema("read_file"), schema("write_file")];
         let registry = ToolRegistry::new(all_schemas.clone()).with_budget(2);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
-        let attachment_message = "[Active task attachment]\n\
-Resume the active task/thread below unless the user explicitly changes topic.\n\
-Treat brief follow-ups as actions on this active thread, not as brand-new unrelated tasks.\n\
-If the follow-up asks to fix / patch / test / continue, apply that action to this active thread.\n\
-Latest user task: review timeout handling\n\n\
-[User follow-up]\n修复?";
-        let messages = vec![json!({"role": "user", "content": attachment_message})];
+        let message = "修复 timeout handling";
+        let messages = vec![json!({"role": "user", "content": message})];
         let history = vec![(
             "review timeout handling".to_string(),
             "Need a fix.".to_string(),
@@ -1944,6 +2016,7 @@ Latest user task: review timeout handling\n\n\
         let file_context: Vec<String> = Vec::new();
         let tool_results = Vec::new();
         let mut restricted_tools = HashSet::new();
+        let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("session-1", "task-1");
         let turn_guard = TurnGuard::default();
@@ -1958,7 +2031,7 @@ Latest user task: review timeout handling\n\n\
         let semantic_query_override =
             "Task: review timeout handling\nAssistant summary: Need a fix.\nFollow-up: 修复?";
 
-        let _payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+        let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
             runtime_volatile_texts: &[],
             ephemeral_prefix: None,
@@ -1966,7 +2039,7 @@ Latest user task: review timeout handling\n\n\
             model: None,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
-            message: attachment_message,
+            message,
             semantic_query_override: Some(semantic_query_override),
             history: &history,
             recent_tools: &recent_tools,
@@ -1974,6 +2047,7 @@ Latest user task: review timeout handling\n\n\
             registry: &registry,
             tool_results: &tool_results,
             all_schemas: &all_schemas,
+            valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
@@ -2015,7 +2089,28 @@ Latest user task: review timeout handling\n\n\
 
         let trace = trace_collector.finalize();
         assert_eq!(trace.memory.query, semantic_query_override);
-        assert!(!trace.memory.query.contains("[Active task attachment]"));
+        let edge_tool_names: Vec<String> = payload["edge_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|schema| schema["function"]["name"].as_str())
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            trace
+                .tools
+                .tools_selected
+                .iter()
+                .map(|tool| tool.tool_name.clone())
+                .collect::<Vec<_>>(),
+            edge_tool_names,
+            "context assembly trace must report final visible edge_tools"
+        );
+        assert_eq!(
+            trace.tools.tools_available as usize,
+            payload["edge_tools"].as_array().unwrap().len(),
+            "context assembly trace tools_available must be the final visible count"
+        );
     }
 
     #[tokio::test]
@@ -2050,6 +2145,7 @@ Latest user task: review timeout handling\n\n\
         let recent_tools: Vec<String> = Vec::new();
         let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
+        let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("session-1", "task-1");
         let turn_guard = TurnGuard::default();
@@ -2077,6 +2173,7 @@ Latest user task: review timeout handling\n\n\
             registry: &registry,
             tool_results: &tool_results,
             all_schemas: &all_schemas,
+            valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
@@ -2131,6 +2228,121 @@ Latest user task: review timeout handling\n\n\
     }
 
     #[tokio::test]
+    async fn prepare_chat_turn_payload_injects_activated_deferred_tools_into_edge_tools() {
+        use crate::edge_tools::ToolExecutor;
+        use astra_pipeline::step_recorder::StepRecorder;
+        use astra_runtime::{
+            tool_registry::ToolRegistry,
+            turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
+        };
+        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use std::{collections::HashSet, sync::Arc, time::Instant};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let all_schemas = vec![schema("read_file"), schema("tool_search"), schema("memory")];
+        let registry = ToolRegistry::new(all_schemas.clone()).with_budget(1);
+        let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
+        executor.set_current_visible_tool_schemas(&[schema("tool_search")]);
+        executor.set_current_activatable_tool_names(HashSet::from(["memory".to_string()]));
+        let search = executor
+            .execute("tool_search", &json!({"query": "select:memory"}))
+            .await;
+        assert!(search.contains("\"name\":\"memory\""), "{search}");
+        assert_eq!(
+            executor.activated_deferred_tool_names(),
+            vec!["memory".to_string()]
+        );
+
+        let messages = vec![json!({"role": "user", "content": "remember this"})];
+        let tool_results = Vec::new();
+        let history: Vec<(String, String)> = Vec::new();
+        let recent_tools: Vec<String> = Vec::new();
+        let file_context: Vec<String> = Vec::new();
+        let mut restricted_tools = HashSet::new();
+        let mut valid_tool_names = HashSet::new();
+        let mut widen_selection_pending = false;
+        let mut step_recorder = StepRecorder::new("session-1", "task-1");
+        let turn_guard = TurnGuard::default();
+        let skill_search = astra_core::SkillSearchSettings::default();
+        let mut turn_policy = TurnInteractionPolicy::default();
+        let mut first_memoria_ms = None;
+        let mut first_selection_report = None;
+        let mut first_budget_pressure = 0.0;
+        let mut first_context_assembly_ms = None;
+        let mut all_selected_skills = Vec::new();
+
+        let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            messages: &messages,
+            runtime_volatile_texts: &[],
+            ephemeral_prefix: None,
+            current_session_id: Some("session-1"),
+            model: None,
+            explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
+            project_root: temp_dir.path(),
+            message: "remember this",
+            semantic_query_override: None,
+            history: &history,
+            recent_tools: &recent_tools,
+            executor: executor.clone(),
+            registry: &registry,
+            tool_results: &tool_results,
+            all_schemas: &all_schemas,
+            valid_tool_names: &mut valid_tool_names,
+            turn_guard: &turn_guard,
+            restricted_tools: &mut restricted_tools,
+            widen_selection_pending: &mut widen_selection_pending,
+            step_recorder: &mut step_recorder,
+            file_context: &file_context,
+            assembly_start: Instant::now(),
+            telem: PrepareTurnTelemetry {
+                first_memoria_ms: &mut first_memoria_ms,
+                first_selection_report: &mut first_selection_report,
+                first_budget_pressure: &mut first_budget_pressure,
+                first_context_assembly_ms: &mut first_context_assembly_ms,
+                all_selected_skills: &mut all_selected_skills,
+                initial_skill_selector_shortlist: None,
+                trace_collector: None,
+            },
+            skill_search: &skill_search,
+            is_plan_subtask: false,
+            plan_subtask_id: None,
+            timing_phases: false,
+            prep_ui_phase: None,
+            skill_effort: None,
+            skill_agent_type: None,
+            tool_budget_override: None,
+            interaction_mode: TurnInteractionMode::NonInteractive,
+            turn_policy: &mut turn_policy,
+            skill_allowed_tools: None,
+            previous_confidence_fallback: None,
+            round_index: 0,
+            session_turn: 1,
+            turn_chain_id: None,
+            user_query_event_id: None,
+            denial_pressure: (0, 0),
+            recent_rejections: Vec::new(),
+            observability_hub: None,
+            append_system_prompt: None,
+            plan_mode_active: false,
+        })
+        .await;
+
+        let edge_tool_names: HashSet<String> = payload["edge_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|schema| schema["function"]["name"].as_str())
+            .map(ToString::to_string)
+            .collect();
+        assert!(edge_tool_names.contains("memory"), "{edge_tool_names:?}");
+        assert!(
+            valid_tool_names.contains("memory"),
+            "activated deferred tool must be admitted only after it is injected"
+        );
+        assert_eq!(valid_tool_names, edge_tool_names);
+    }
+
+    #[tokio::test]
     async fn prepare_chat_turn_payload_consumes_widen_selection_pending_once() {
         use crate::edge_tools::ToolExecutor;
         use astra_pipeline::step_recorder::StepRecorder;
@@ -2151,6 +2363,7 @@ Latest user task: review timeout handling\n\n\
         let recent_tools: Vec<String> = Vec::new();
         let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
+        let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = true;
         let mut step_recorder = StepRecorder::new("session-1", "task-1");
         let mut turn_guard = TurnGuard::default();
@@ -2181,6 +2394,7 @@ Latest user task: review timeout handling\n\n\
             registry: &registry,
             tool_results: &tool_results,
             all_schemas: &all_schemas,
+            valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
@@ -2245,6 +2459,7 @@ Latest user task: review timeout handling\n\n\
             registry: &registry,
             tool_results: &tool_results,
             all_schemas: &all_schemas,
+            valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,

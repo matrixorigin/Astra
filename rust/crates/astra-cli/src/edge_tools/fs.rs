@@ -259,7 +259,6 @@ impl ToolExecutor {
             }
         }
 
-        // Raw range keys for consecutive dedup.
         let start_raw = args.get("start_line").and_then(Value::as_u64);
         let end_raw = args.get("end_line").and_then(Value::as_u64);
         let has_range = start_raw.is_some() || end_raw.is_some();
@@ -716,7 +715,6 @@ impl ToolExecutor {
             };
             dedup_eligible = false;
         }
-
         self.record_read_cached_with_coverage(
             &path,
             true,
@@ -2056,8 +2054,12 @@ impl ToolExecutor {
                             })
                         {
                             let (orig_idx, _) = fuzzy_applications[prev_i];
-                            return format!(
-                                "Error: edit[{i}] fuzzy-matched the same region as edit[{orig_idx}] (both resolved to overlapping spans via whitespace-normalized match). Aborting all edits — provide distinct exact old_str values or merge the two edits."
+                            return str_replace_fail(
+                                &format!(
+                                    "edit[{i}] fuzzy-matched the same region as edit[{orig_idx}]. Aborting all edits."
+                                ),
+                                "Both edits resolved to overlapping spans via whitespace-normalized matching, so applying them separately would clobber the same file region.",
+                                "Merge those edits into one replacement for that region, or provide distinct exact old_str values copied from a fresh read_file result.",
                             );
                         }
                         if i == 0 {
@@ -3615,8 +3617,10 @@ type Handler interface {
             result.contains("start_line must be <= end_line"),
             "{result}"
         );
-        assert!(result.contains("Origin: model_argument_error"), "{result}");
-        assert!(result.contains("no file was read"), "{result}");
+        assert!(result.contains("No file was read"), "{result}");
+        assert!(result.contains("start_line=1"), "{result}");
+        assert!(result.contains("end_line=3"), "{result}");
+        assert!(!result.contains("1\ta"), "{result}");
     }
 
     #[test]

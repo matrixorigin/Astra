@@ -77,6 +77,7 @@ pub fn validate_read_file_args(args: &Value) -> Result<(), String> {
     }?;
     validate_read_file_line_arg(object, "start_line")?;
     validate_read_file_line_arg(object, "end_line")?;
+    validate_read_file_line_range(object)?;
     if let Some(value) = object.get("outline")
         && !value.is_boolean()
     {
@@ -84,13 +85,6 @@ pub fn validate_read_file_args(args: &Value) -> Result<(), String> {
             "Error: field `outline` for read_file must be a boolean. Valid fields: path, start_line, end_line, outline."
                 .to_string(),
         );
-    }
-    if let (Some(start), Some(end)) = (
-        object.get("start_line").and_then(Value::as_u64),
-        object.get("end_line").and_then(Value::as_u64),
-    ) && start > end
-    {
-        return Err(reversed_read_file_range_error(start, end));
     }
     Ok(())
 }
@@ -106,15 +100,6 @@ fn read_file_unknown_field_hint(key: &str) -> &'static str {
     }
 }
 
-fn reversed_read_file_range_error(start: u64, end: u64) -> String {
-    format!(
-        "Error: invalid read_file line range: start_line must be <= end_line (got {start} > {end}). \
-         Origin: model_argument_error; no file was read. \
-         Next: if you intended this interval, retry with start_line={end}, end_line={start}; \
-         if {end} was a typo, retry with the corrected end_line."
-    )
-}
-
 fn validate_read_file_line_arg(
     object: &serde_json::Map<String, Value>,
     field: &str,
@@ -128,6 +113,21 @@ fn validate_read_file_line_arg(
             "Error: field `{field}` for read_file must be a positive integer. Valid fields: path, start_line, end_line, outline."
         )),
     }
+}
+
+fn validate_read_file_line_range(object: &serde_json::Map<String, Value>) -> Result<(), String> {
+    let (Some(start), Some(end)) = (
+        object.get("start_line").and_then(Value::as_u64),
+        object.get("end_line").and_then(Value::as_u64),
+    ) else {
+        return Ok(());
+    };
+    if start <= end {
+        return Ok(());
+    }
+    Err(format!(
+        "Error: invalid read_file line range: start_line must be <= end_line (got {start} > {end}). No file was read. Retry with start_line={end} and end_line={start}, or choose a valid narrower range."
+    ))
 }
 
 /// Build a structured str_replace failure message.
@@ -351,11 +351,11 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
     };
     let start_line = args
         .get("start_line")
-        .and_then(|v| v.as_u64())
+        .and_then(Value::as_u64)
         .map(|l| l as usize);
     let end_line = args
         .get("end_line")
-        .and_then(|v| v.as_u64())
+        .and_then(Value::as_u64)
         .map(|l| l as usize);
     let outline = args
         .get("outline")
@@ -602,7 +602,7 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
 
     let lines: Vec<&str> = content.lines().collect();
     if lines.is_empty() {
-        return ToolResult::text("(empty file)".into());
+        return ToolResult::text("(empty file)".to_string());
     }
 
     let start_line = start_line.unwrap_or(1);
@@ -2810,7 +2810,7 @@ mod tests {
     }
 
     #[test]
-    fn read_file_rejects_reversed_ranges() {
+    fn read_file_rejects_reversed_ranges_without_reading() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("test.txt"), "a\nb\nc\nd").unwrap();
 
@@ -2819,29 +2819,28 @@ mod tests {
             &serde_json::json!({"path": "test.txt", "start_line": 4, "end_line": 2}),
         );
 
-        assert!(result.is_error);
+        assert!(result.is_error, "got: {}", result.output);
         assert!(
             result.output.contains("start_line must be <= end_line"),
             "got: {}",
             result.output
         );
         assert!(
-            result.output.contains("Origin: model_argument_error"),
+            result.output.contains("No file was read"),
             "got: {}",
             result.output
         );
         assert!(
-            result.output.contains("no file was read"),
+            result.output.contains("start_line=2"),
             "got: {}",
             result.output
         );
         assert!(
-            result
-                .output
-                .contains("retry with start_line=2, end_line=4"),
+            result.output.contains("end_line=4"),
             "got: {}",
             result.output
         );
+        assert!(!result.output.contains("2\tb"), "got: {}", result.output);
     }
 
     #[test]

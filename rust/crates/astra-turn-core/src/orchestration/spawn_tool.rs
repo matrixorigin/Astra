@@ -364,6 +364,8 @@ pub enum SpawnAgentOutput {
     Cancelled {
         agent_id: String,
         reason: String,
+        finish_reason: String,
+        cancelled_by_user: bool,
         tool_calls: u32,
         duration_ms: u64,
     },
@@ -382,6 +384,7 @@ pub enum SpawnAgentOutput {
     },
     /// Failed to spawn.
     Failed {
+        agent_id: String,
         error: String,
         finish_reason: String,
         duration_ms: u64,

@@ -23,16 +23,14 @@
 //! Usage pattern (host side):
 //!
 //! ```ignore
-//! let judged = match judge.judge(&ctx).await {
+//! let intent = match judge.judge(&ctx).await {
 //!     Ok(intent) => Some(intent),
-//!     Err(error) => { /* telemetry, then fall through */ None }
+//!     Err(error) => { /* telemetry, then proceed without explicit intent */ None }
 //! };
-//! judged.or_else(|| keyword_fallback(message, profile))
 //! ```
 //!
-//! Falling back to the keyword classifier on judge failure means the loop
-//! is never blocked on an unavailable LLM — this is the same pattern
-//! [`crate::LlmJudge`] uses for verification criteria.
+//! The judge is the only component that may classify natural-language turn
+//! intent. Runtime fallbacks must use structural facts, not keyword lists.
 
 use astra_config::user_profile::{Scenario, TurnContinuationMode, TurnIntent};
 use async_trait::async_trait;
@@ -55,9 +53,8 @@ pub struct TurnIntentJudgeContext {
 /// Errors a [`TurnIntentJudge`] may return.
 #[derive(Debug, thiserror::Error)]
 pub enum TurnIntentJudgeError {
-    /// LLM call failed (network, rate-limit, auth). The host must fall back
-    /// to the deterministic classifier on this error class — never block
-    /// the turn on a transient LLM failure.
+    /// LLM call failed (network, rate-limit, auth). The host must not block
+    /// the turn on this class; it should proceed without explicit turn intent.
     #[error("LLM transport failure: {0}")]
     Transport(String),
 
@@ -68,7 +65,8 @@ pub enum TurnIntentJudgeError {
     Malformed { raw: String },
 
     /// The judge is configured but the model was rejected (e.g. moderation
-    /// flag, unsupported region). Caller should log and fall back.
+    /// flag, unsupported region). Caller should log and continue without
+    /// explicit turn intent.
     #[error("LLM rejected: {0}")]
     Rejected(String),
 }
@@ -119,9 +117,9 @@ pub fn build_turn_intent_prompt(ctx: &TurnIntentJudgeContext) -> String {
          - requested_scenario: pick the BEST single scenario the user is asking for, or null when ambiguous.\n\
          - prohibited_scenarios: include any scenario the user explicitly rejected (e.g. \"don't review, just continue\" → [\"code_review\"]).\n\
          - continuation_mode:\n  \
-             * \"continue_current_objective\" when the user is following up on prior work (e.g. \"go on\", \"fix it\", \"继续\").\n  \
+             * \"continue_current_objective\" only when the user explicitly asks to proceed, apply, fix, run, or continue prior work (e.g. \"go on\", \"fix it\", \"继续\").\n  \
              * \"new_objective\" when starting an unrelated task.\n  \
-             * \"unknown\" when neither signal is clear.\n\
+             * \"unknown\" for status/progress/why/what-remains questions unless the user also explicitly asks to execute more work.\n\
          - Return ONLY the JSON. No prose, no markdown fences.\n\
          \n\
          Examples:\n\
@@ -130,6 +128,9 @@ pub fn build_turn_intent_prompt(ctx: &TurnIntentJudgeContext) -> String {
          \n\
          User: \"fix it\" (after assistant proposed an implementation)\n\
          {\"requested_scenario\":null,\"prohibited_scenarios\":[],\"continuation_mode\":\"continue_current_objective\"}\n\
+         \n\
+         User: \"还有什么？\" (after assistant was working on a task)\n\
+         {\"requested_scenario\":\"quick_answer\",\"prohibited_scenarios\":[],\"continuation_mode\":\"unknown\"}\n\
          \n\
          User: \"don't review this, just continue the implementation\"\n\
          {\"requested_scenario\":\"implementation\",\"prohibited_scenarios\":[\"code_review\"],\"continuation_mode\":\"continue_current_objective\"}\n\
@@ -168,8 +169,8 @@ pub fn build_turn_intent_prompt(ctx: &TurnIntentJudgeContext) -> String {
 /// Parse the judge's JSON response into a [`TurnIntent`].
 ///
 /// Strict: an unknown scenario or continuation_mode value produces `Err` so
-/// the caller can fall back to the deterministic classifier instead of
-/// silently constructing a degraded intent.
+/// the caller can ignore the explicit intent instead of silently constructing
+/// a degraded one.
 pub fn parse_turn_intent_response(raw: &str) -> Result<TurnIntent, TurnIntentJudgeError> {
     let trimmed = raw.trim();
 

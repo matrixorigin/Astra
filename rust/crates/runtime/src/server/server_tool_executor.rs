@@ -3612,7 +3612,7 @@ esac
         assert_eq!(value["status"], "failed");
         let error = value["error"].as_str().unwrap_or("");
         assert!(
-            error.contains("no multi-agent executor attached"),
+            error.contains("multi-agent executor was not attached"),
             "{}",
             result.output
         );

@@ -169,7 +169,7 @@ fn classify_task_type(
     }
 
     // Priority 2: Memory query intent (asking about stored memories)
-    if signals.is_memory && (signals.is_fetch || signals.is_followup) {
+    if signals.is_memory && signals.is_fetch {
         return TaskType::Memory;
     }
 
@@ -197,16 +197,7 @@ fn classify_task_type(
         return TaskType::Conversational;
     }
 
-    // Priority 6: Follow-up inherits domain from recent tools → Fetch
-    // "pr呢？" after github_ci_status → Fetch (not Unknown)
-    if signals.is_followup && !signals.recent_tools.is_empty() {
-        let domain = infer_domain_from_tools(&signals.recent_tools);
-        if domain.is_some() {
-            return TaskType::Fetch;
-        }
-    }
-
-    // Priority 7: Memory hints suggest domain
+    // Priority 6: Memory hints suggest domain
     if !memory_hints.is_empty() {
         let hint_text = memory_hints.join(" ").to_lowercase();
         if hint_text.contains("github") || hint_text.contains("repository") {
@@ -234,40 +225,7 @@ fn classify_task_type(
 
 // ─── Domain Extraction ───────────────────────────────────────────────────────
 
-/// Infer domain from recently-used tool names.
-///
-/// This enables context carry-forward: if the previous turn used `github_ci_status`,
-/// a follow-up like "pr呢？" inherits the GitHub domain even though "pr" alone is
-/// a weak signal.
-fn infer_domain_from_tools(tools: &[String]) -> Option<DomainHint> {
-    let github_prefixes = ["github_", "github"];
-    let git_tools = ["git"];
-    let memory_tools = ["memory"];
-    let db_tools = ["mo_query", "mo_snapshot", "mo_branch"];
-
-    let has_github = tools
-        .iter()
-        .any(|t| github_prefixes.iter().any(|p| t.starts_with(p)));
-    let has_git = tools.iter().any(|t| git_tools.contains(&t.as_str()));
-    let has_memory = tools.iter().any(|t| memory_tools.contains(&t.as_str()));
-    let has_db = tools.iter().any(|t| db_tools.contains(&t.as_str()));
-
-    if has_github {
-        return Some(DomainHint::GitHub);
-    }
-    if has_git {
-        return Some(DomainHint::Git);
-    }
-    if has_memory {
-        return Some(DomainHint::Memory);
-    }
-    if has_db {
-        return Some(DomainHint::Database);
-    }
-    None
-}
-
-/// Extract domain hint from signals + memory hints + follow-up context.
+/// Extract domain hint from explicit signals + memory hints.
 fn extract_domain_hint(signals: &ConversationState, memory_hints: &[String]) -> Option<DomainHint> {
     // Signals take priority
     if signals.is_github {
@@ -278,14 +236,6 @@ fn extract_domain_hint(signals: &ConversationState, memory_hints: &[String]) -> 
     }
     if signals.is_memory {
         return Some(DomainHint::Memory);
-    }
-
-    // Follow-up: infer domain from recent tools (context carry-forward)
-    if signals.is_followup && !signals.recent_tools.is_empty() {
-        let domain = infer_domain_from_tools(&signals.recent_tools);
-        if domain.is_some() {
-            return domain;
-        }
     }
 
     // Memory hints
@@ -618,31 +568,23 @@ mod tests {
     }
 
     #[test]
-    fn classify_followup_fetch_from_recent_github_tools() {
+    fn short_followup_does_not_inherit_fetch_from_recent_github_tools() {
         let d = analyze_with_recent("pr呢？", 2, &["github_ci_status"]);
-        assert_eq!(d.task_type, TaskType::Fetch);
+        assert_eq!(d.task_type, TaskType::Unknown);
         assert_eq!(d.domain_hint, Some(DomainHint::GitHub));
-        match &d.tool_filter {
-            ToolFilter::Domain(domains) => {
-                assert!(domains.contains(&"github".to_string()));
-                assert!(domains.contains(&"git".to_string()));
-            }
-            other => panic!("Expected Domain filter, got {:?}", other),
-        }
+        assert_eq!(d.tool_filter, ToolFilter::Wide);
     }
 
     #[test]
-    fn classify_latest_followup_from_recent_github_tools() {
+    fn short_fetch_without_domain_does_not_inherit_recent_github_tools() {
         let d = analyze_with_recent("最新的", 2, &["github_ci_status"]);
-        assert!(d.conversation_state.is_followup);
         assert_eq!(d.task_type, TaskType::Fetch);
-        assert_eq!(d.domain_hint, Some(DomainHint::GitHub));
+        assert_eq!(d.domain_hint, None);
     }
 
     #[test]
-    fn first_turn_short_question_is_not_followup() {
+    fn first_turn_short_question_keeps_explicit_domain_signal() {
         let d = analyze("pr呢？");
-        assert!(!d.conversation_state.is_followup);
         assert_eq!(d.domain_hint, Some(DomainHint::GitHub));
     }
 

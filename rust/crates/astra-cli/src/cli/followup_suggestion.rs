@@ -9,7 +9,6 @@ pub(crate) fn suggest_followup(
     let trimmed = line.trim();
     if trimmed.is_empty()
         || trimmed.starts_with('/')
-        || astra_turn_core::chat_turn_heuristics::is_short_continuation_prompt(trimmed)
         || state.plan_mode_active()
         || state.executing_plan.is_some()
         || state.plan_handle.is_some()
@@ -139,15 +138,13 @@ mod tests {
     }
 
     #[test]
-    fn suggests_continue_when_assistant_asks_to_continue() {
+    fn does_not_suggest_continue_from_phrase_match() {
         let suggestion = suggest_followup(
             "修一下这个 bug",
             &base_state(),
             &base_result(Vec::new(), "已经定位到原因了，要我继续改吗？"),
-        )
-        .expect("suggestion");
-        assert_eq!(suggestion.text, "继续");
-        assert_eq!(suggestion.kind, FollowupSuggestionKind::Continue);
+        );
+        assert_eq!(suggestion, None);
     }
 
     #[test]
@@ -166,14 +163,14 @@ mod tests {
     }
 
     #[test]
-    fn suppresses_suggestion_for_short_continuation_turns() {
-        assert_eq!(
-            suggest_followup(
-                "继续",
-                &base_state(),
-                &base_result(vec!["str_replace"], "Patched the file."),
-            ),
-            None
-        );
+    fn short_messages_are_not_special_cased_as_continuation() {
+        let suggestion = suggest_followup(
+            "继续",
+            &base_state(),
+            &base_result(vec!["str_replace"], "Patched the file."),
+        )
+        .expect("edit follow-up suggestion");
+        assert_eq!(suggestion.text, "跑一下测试");
+        assert_eq!(suggestion.kind, FollowupSuggestionKind::Validate);
     }
 }

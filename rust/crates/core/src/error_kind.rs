@@ -202,7 +202,7 @@ impl ErrorKind {
                  Do NOT retry — use an alternative tool."
             }
             Self::ToolBinding => {
-                "Tool execution binding is missing for the current session mode. \
+                "Tool execution binding is missing for this turn. \
                  Do NOT retry the same tool call and do NOT assume a shell command \
                  is equivalent; continue degraded only after making the lost capability explicit."
             }
@@ -289,7 +289,7 @@ impl ErrorKind {
             }
             Self::ToolBinding => {
                 "Fix the tool-surface/executor mismatch: only advertise tools whose \
-                 executor or edge transport is bound in this session mode, or wire the \
+                 executor or edge transport is bound for the turn, or wire the \
                  missing transport before activation."
             }
             Self::ResourceLimit => {

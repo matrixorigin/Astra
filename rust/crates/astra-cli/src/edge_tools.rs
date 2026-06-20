@@ -113,6 +113,83 @@ pub fn local_tool_schemas() -> Vec<Value> {
     local_runtime_tool_schemas(full_tool_schemas())
 }
 
+#[cfg(test)]
+fn test_visible_tool_schemas() -> Vec<Value> {
+    const EXECUTOR_LOCAL_TOOL_NAMES: &[&str] = &[
+        "adjust_config",
+        "agent",
+        "agent_fanout",
+        "ask_user",
+        "bash",
+        "brief",
+        "call_graph",
+        "compress_context",
+        "config",
+        "context_analysis",
+        "dead_code",
+        "delegate",
+        "deprioritize_tool",
+        "diagnose",
+        "enter_plan_mode",
+        "env",
+        "exit_plan_mode",
+        "extract_members",
+        "find_definition",
+        "find_references",
+        "get_agent_info",
+        "git",
+        "github",
+        "glob",
+        "grep",
+        "hover_info",
+        "introspect",
+        "list_dir",
+        "lsp",
+        "memory",
+        "mo",
+        "mo_branch",
+        "mo_query",
+        "mo_snapshot",
+        "notebook_edit",
+        "notify",
+        "prioritize_tool",
+        "query_context",
+        "read_file",
+        "reflect",
+        "rename_symbol",
+        "rollback_database_snapshots",
+        "rollback_session_state",
+        "rollback_turn_actions",
+        "run_build_test",
+        "session",
+        "share_context",
+        "str_replace",
+        "symbol_search",
+        "symbols",
+        "task",
+        "task_list",
+        "task_output",
+        "task_stop",
+        "tool_search",
+        "type_hierarchy",
+        "web_fetch",
+        "web_search",
+        "write_file",
+    ];
+
+    let mut schemas = all_tool_schemas();
+    let mut names = astra_turn_core::tool::deferred_activation::tool_names_from_schemas(&schemas);
+    for name in EXECUTOR_LOCAL_TOOL_NAMES {
+        if names.insert((*name).to_string()) {
+            schemas.push(json!({
+                "type": "function",
+                "function": { "name": name },
+            }));
+        }
+    }
+    schemas
+}
+
 /// Plan-mode write guard tool list (CLI parity with
 /// `server_tool_executor::is_plan_mode_blocked_tool`). While a plan is
 /// in `phase=planning` these tools must be short-circuited: they all
@@ -933,7 +1010,8 @@ pub struct ToolExecutor {
     plugin_schemas: std::sync::RwLock<Vec<Value>>,
     /// Tool names advertised in the current LLM request's `tools[]`.
     /// `None` means the caller has not installed a per-turn surface yet;
-    /// execution remains permissive for legacy/unit-test paths.
+    /// execution fails closed because this node cannot prove the model saw
+    /// the tool in the current request.
     current_visible_tool_names: std::sync::RwLock<Option<HashSet<String>>>,
     /// Tool names listed in this turn's `<deferred_tools>` block and therefore
     /// eligible for `tool_search(select:NAME)` activation.
@@ -988,6 +1066,20 @@ impl ToolExecutor {
         let root: PathBuf = project_root.into();
         let preferred_repos = detect_git_remote_repos(&root);
         let sandbox = astra_runtime::tool_sandbox::SandboxPolicy::for_project(&root);
+        #[cfg(test)]
+        let initial_visible_schemas = test_visible_tool_schemas();
+        #[cfg(test)]
+        let initial_visible_tool_names = Some(
+            astra_turn_core::tool::deferred_activation::tool_names_from_schemas(
+                &initial_visible_schemas,
+            ),
+        );
+        #[cfg(not(test))]
+        let initial_visible_tool_names = None;
+        #[cfg(test)]
+        let last_visible_schemas = initial_visible_schemas;
+        #[cfg(not(test))]
+        let last_visible_schemas = Vec::new();
         Self {
             project_root: root.clone(),
             cloud_base: None,
@@ -1006,10 +1098,10 @@ impl ToolExecutor {
             .build()
             .unwrap_or_else(|_| Client::new()),
             plugin_schemas: std::sync::RwLock::new(Vec::new()),
-            current_visible_tool_names: std::sync::RwLock::new(None),
+            current_visible_tool_names: std::sync::RwLock::new(initial_visible_tool_names),
             current_activatable_tool_names: std::sync::RwLock::new(None),
             activated_deferred_tools: std::sync::RwLock::new(HashSet::new()),
-            last_visible_schemas: std::sync::Mutex::new(Vec::new()),
+            last_visible_schemas: std::sync::Mutex::new(last_visible_schemas),
             last_activatable_names: std::sync::Mutex::new(None),
             sandbox_policy: std::sync::RwLock::new(Some(sandbox)),
             preferred_repos: std::sync::Mutex::new(preferred_repos),
@@ -1353,11 +1445,10 @@ impl ToolExecutor {
         }
         Some(EdgeToolRun::classified_error(
             format!(
-                "Tool `{name}` has no executor attached in this session mode. \
-             It was listed in the deferred manifest, but `tool_search(select:{name})` \
-             cannot activate a tool without a backing executor. \
-             Use only currently bound tools. Tell the user `{name}` is unavailable \
-             in this mode and suggest switching to a session mode that binds it."
+                "Tool `{name}` has no executor attached for this turn. \
+                 It was listed in the deferred manifest, but `tool_search(select:{name})` \
+                 cannot activate a tool without a backing executor. \
+                 Use only currently bound tools and report this as a runtime tool-closure error."
             ),
             astra_core::ErrorKind::ToolBinding,
         ))
@@ -5544,6 +5635,7 @@ mod tests {
                 run_id: config.run_id,
                 status: "completed".into(),
                 finish_reason: "normal".into(),
+                cancelled_by_user: None,
                 output: Some("child result".into()),
                 error: None,
                 prompt_tokens: 0,
@@ -6291,7 +6383,7 @@ mod tests {
             .await;
         let direct = &direct_outcome.output;
         assert!(
-            direct.contains("no executor attached in this session mode"),
+            direct.contains("no executor attached for this turn"),
             "unbound agent_fanout must report binding failure, got: {direct}"
         );
         assert_eq!(
@@ -6320,7 +6412,7 @@ mod tests {
             .await;
         let after = &after_outcome.output;
         assert!(
-            after.contains("no executor attached in this session mode"),
+            after.contains("no executor attached for this turn"),
             "tool_search must not silently mark unbound agent_fanout activated; got: {after}"
         );
         assert_eq!(
@@ -6350,7 +6442,7 @@ mod tests {
         let output = &outcome.output;
 
         assert!(
-            output.contains("no executor attached in this session mode"),
+            output.contains("no executor attached for this turn"),
             "future executor action must fail closed on missing binding; got: {output}"
         );
         assert_eq!(
@@ -6571,6 +6663,7 @@ mod tests {
             }
         });
         executor.set_plugin_schemas(vec![plugin]);
+        executor.set_current_activatable_tool_names(HashSet::from(["mcp__weather".to_string()]));
 
         let out = executor
             .execute(
@@ -6602,6 +6695,7 @@ mod tests {
             }
         });
         executor.set_plugin_schemas(vec![plugin.clone()]);
+        executor.set_current_activatable_tool_names(HashSet::from(["mcp__calc".to_string()]));
 
         // Simulate a prior panic-poisoned write lock.
         let arc = std::sync::Arc::new(&executor.plugin_schemas);

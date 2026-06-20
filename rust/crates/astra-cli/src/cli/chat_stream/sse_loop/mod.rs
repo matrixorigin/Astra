@@ -391,9 +391,10 @@ pub(crate) async fn stream_chat_sse(
     executor.set_plugin_schemas(mcp_plugin_schemas);
     let registry = ToolRegistry::new_runtime_surface(all_schemas.clone());
     let pinned_schema_tokens = registry.total_pinned_token_cost() as u64;
-    // Build valid_tool_names from the registry's runtime surface rather than
-    // reusing the pre-filtered schema vec directly.
-    let valid_tool_names: HashSet<String> = registry.all_schema_names().into_iter().collect();
+    // Full runtime inventory is used only for static allow/deny policy
+    // calculations. The headless validator's admitted tool set is populated
+    // per round from the final `edge_tools` payload actually sent to the model.
+    let runtime_tool_names: HashSet<String> = registry.all_schema_names().into_iter().collect();
 
     // --allowed-tools: if set, restrict to only the specified tools
     let mut initial_restricted: HashSet<String> = if let Some(cli_context) = p.cli_context {
@@ -403,7 +404,7 @@ pub(crate) async fn stream_chat_sse(
             .map(String::as_str)
             .collect();
         if !allowed.is_empty() {
-            valid_tool_names
+            runtime_tool_names
                 .iter()
                 .filter(|name| !allowed.contains(name.as_str()))
                 .cloned()
@@ -418,7 +419,7 @@ pub(crate) async fn stream_chat_sse(
             .filter(|s| !s.is_empty())
             .collect();
         if !allowed.is_empty() {
-            valid_tool_names
+            runtime_tool_names
                 .iter()
                 .filter(|name| !allowed.contains(name.as_str()))
                 .cloned()
@@ -541,7 +542,7 @@ pub(crate) async fn stream_chat_sse(
         all_schemas,
         file_context,
         perm_manager: p.perm_manager,
-        valid_tool_names,
+        valid_tool_names: HashSet::new(),
         capabilities: cli_capabilities,
         pending_clear_lines: 0,
         is_plan_subtask: p.is_plan_subtask,

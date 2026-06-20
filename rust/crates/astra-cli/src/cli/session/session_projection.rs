@@ -260,8 +260,19 @@ fn build_continuation_anchor_with_active_tasks(
         return state.continuation_anchor.clone();
     }
 
-    let user_summary = truncate_str(user_line, 220);
-    let mut sections = vec![format!("Latest user task: {user_summary}")];
+    let latest_user_task = anchor_worthy_user_input(user_line)
+        .then(|| truncate_str(user_line, 220).to_string())
+        .or_else(|| {
+            state
+                .continuation_anchor
+                .as_ref()
+                .and_then(|anchor| anchor.latest_user_task.clone())
+                .filter(|task| anchor_worthy_user_input(task))
+        });
+    let mut sections = Vec::new();
+    if let Some(user_summary) = latest_user_task.as_deref() {
+        sections.push(format!("Latest user task: {user_summary}"));
+    }
     let active_task_board = active_task_anchor_items(active_tasks);
     if let Some(task_section) = active_task_anchor_section(active_tasks) {
         sections.push(task_section);
@@ -285,7 +296,7 @@ fn build_continuation_anchor_with_active_tasks(
     } else {
         Some(ContinuationAnchor::from_parts(
             sections.join("\n"),
-            Some(user_summary.to_string()),
+            latest_user_task,
             assistant_direction,
             active_task_board,
         ))
@@ -325,8 +336,19 @@ fn rebuild_continuation_anchor_from_state_with_active_task_items(
         return;
     }
 
-    let user_summary = truncate_str(user_line, 220);
-    let mut sections = vec![format!("Latest user task: {user_summary}")];
+    let latest_user_task = anchor_worthy_user_input(user_line)
+        .then(|| truncate_str(user_line, 220).to_string())
+        .or_else(|| {
+            state
+                .continuation_anchor
+                .as_ref()
+                .and_then(|anchor| anchor.latest_user_task.clone())
+                .filter(|task| anchor_worthy_user_input(task))
+        });
+    let mut sections = Vec::new();
+    if let Some(user_summary) = latest_user_task.as_deref() {
+        sections.push(format!("Latest user task: {user_summary}"));
+    }
     if let Some(task_section) = active_task_anchor_section_from_items(&active_task_board) {
         sections.push(task_section);
     }
@@ -344,10 +366,16 @@ fn rebuild_continuation_anchor_from_state_with_active_task_items(
     ));
     state.continuation_anchor = Some(ContinuationAnchor::from_parts(
         sections.join("\n"),
-        Some(user_summary.to_string()),
+        latest_user_task,
         assistant_direction,
         active_task_board,
     ));
+}
+
+fn anchor_worthy_user_input(user_line: &str) -> bool {
+    astra_turn_types::should_store_in_memory(
+        &serde_json::json!({"role": "user", "content": user_line}),
+    )
 }
 
 pub(crate) async fn rebuild_continuation_anchor_from_live_state(state: &mut SessionState) {
@@ -508,6 +536,30 @@ mod tests {
 
         let anchor = build_continuation_anchor(&state, "", &result);
         assert_eq!(anchor.as_deref(), Some("Previous anchor content"));
+    }
+
+    #[test]
+    fn continuation_anchor_does_not_replace_task_with_low_information_followup() {
+        let state = SessionState {
+            continuation_anchor: Some(ContinuationAnchor::from_parts(
+                "Latest user task: fix tool closure telemetry",
+                Some("fix tool closure telemetry".into()),
+                None,
+                Vec::new(),
+            )),
+            ..SessionState::default()
+        };
+        let result = crate::tests::stub_stream_result("Updated telemetry to use final edge_tools.");
+
+        let anchor = build_continuation_anchor(&state, "继续", &result).expect("anchor");
+
+        assert!(anchor.contains("Latest user task: fix tool closure telemetry"));
+        assert!(!anchor.contains("Latest user task: 继续"), "{anchor}");
+        assert!(anchor.contains("Updated telemetry to use final edge_tools."));
+        assert_eq!(
+            anchor.latest_user_task.as_deref(),
+            Some("fix tool closure telemetry")
+        );
     }
 
     #[tokio::test]
@@ -718,8 +770,7 @@ mod tests {
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
         );
-        assert!(effective.contains("[Active task attachment]"));
-        assert!(effective.contains("explain borrowing"));
+        assert_eq!(effective, "continue");
 
         let user_messages: Vec<_> = messages
             .iter()

@@ -121,9 +121,10 @@ fn trace_short_circuit_tool_skip(
 impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
     pub(super) fn emit_turn_budget_stub(&mut self, slot: &HeadlessResolvedToolSlot) {
         let body = format!(
-            "⛔ Per-turn tool budget exhausted ({max_tools_per_turn} tools). \
-             Skipping this call. Prioritize the most important remaining \
-             tools in your next response — do not repeat all skipped calls.",
+            "⛔ Current-turn tool budget exhausted ({max_tools_per_turn} tools for the \
+             latest user request). Skipping this call. Do not repeat skipped calls \
+             in this turn; answer with the current state unless the user sends a \
+             new request.",
             max_tools_per_turn = self.ctx.max_tools_per_turn,
         );
         trace_short_circuit_tool_skip(

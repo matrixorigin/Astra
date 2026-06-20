@@ -175,7 +175,7 @@ pub fn build_recovery_message(
             tool_name
         ),
         ErrorCategory::ToolBinding => format!(
-            "⚠ {} was advertised but no executor/transport was bound in this session mode. \
+            "⚠ {} was advertised but no executor/transport was bound for this turn. \
              Do NOT retry the same call. Do NOT assume bash or a different tool is equivalent; \
              continue with degraded coverage only after stating what capability was lost.",
             tool_name

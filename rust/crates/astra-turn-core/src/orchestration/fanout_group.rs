@@ -64,6 +64,7 @@ pub struct AgentFanoutGroupProjection {
     pub title: String,
     pub target_count: usize,
     pub created_by_tool_use_id: Option<String>,
+    pub budget_adjustment: Option<String>,
     pub slots: Vec<AgentFanoutSlot>,
     pub status: AgentFanoutStatus,
     /// Monotonic timestamp of last mutation or access.  Used for
@@ -160,6 +161,7 @@ impl AgentFanoutGroupProjection {
             title: title.into(),
             target_count,
             created_by_tool_use_id: None,
+            budget_adjustment: None,
             slots,
             status: AgentFanoutStatus::Planned,
             last_touched: SystemTime::now(),

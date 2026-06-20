@@ -94,6 +94,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "std",
     "time",
 ] }
+unicode-normalization = "0.1"
 # Must match `tracing-opentelemetry` (0.27.x pulls opentelemetry 0.26 — keep a single OTel line).
 opentelemetry = { version = "0.26.0", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.26.0", default-features = false, features = [

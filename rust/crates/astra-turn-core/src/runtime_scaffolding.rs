@@ -4,7 +4,7 @@ pub enum RuntimeScaffoldingKind {
     AttentionManifest,
     WorkingSetManifest,
     SessionAnchor,
-    ActiveTaskAttachment,
+    ObsoleteActiveTaskAttachment,
     AlreadyFetchedInventory,
     CrossSessionProjectContext,
     PreviousRoundSummary,
@@ -15,7 +15,7 @@ pub const SYSTEM_REMINDER_WRAPPER_PREFIX: &str = "<system-reminder>";
 pub const ATTENTION_MANIFEST_PREFIX: &str = "[attention:v1]";
 pub const WORKING_SET_MANIFEST_PREFIX: &str = "[working-set:v1]";
 pub const SESSION_ANCHOR_PREFIX: &str = "[session-anchor]";
-pub const ACTIVE_TASK_ATTACHMENT_PREFIX: &str = "[Active task attachment]";
+pub const OBSOLETE_ACTIVE_TASK_ATTACHMENT_PREFIX: &str = "[Active task attachment]";
 pub const ALREADY_FETCHED_PREFIX: &str = "## Already Fetched";
 pub const CROSS_SESSION_PROJECT_CONTEXT_PREFIX: &str = "## Cross-Session Project Context";
 pub const PREVIOUS_ROUND_PREFIX: &str = "✓ Previous round:";
@@ -31,8 +31,8 @@ pub fn detect_runtime_scaffolding(content: &str) -> Option<RuntimeScaffoldingKin
         Some(RuntimeScaffoldingKind::WorkingSetManifest)
     } else if trimmed.starts_with(SESSION_ANCHOR_PREFIX) {
         Some(RuntimeScaffoldingKind::SessionAnchor)
-    } else if trimmed.starts_with(ACTIVE_TASK_ATTACHMENT_PREFIX) {
-        Some(RuntimeScaffoldingKind::ActiveTaskAttachment)
+    } else if trimmed.starts_with(OBSOLETE_ACTIVE_TASK_ATTACHMENT_PREFIX) {
+        Some(RuntimeScaffoldingKind::ObsoleteActiveTaskAttachment)
     } else if trimmed.starts_with(ALREADY_FETCHED_PREFIX) {
         Some(RuntimeScaffoldingKind::AlreadyFetchedInventory)
     } else if trimmed.starts_with(CROSS_SESSION_PROJECT_CONTEXT_PREFIX) {
@@ -56,7 +56,7 @@ pub fn is_continuation_scaffolding_for_role(role: &str, content: &str) -> bool {
                     | RuntimeScaffoldingKind::AttentionManifest
                     | RuntimeScaffoldingKind::WorkingSetManifest
                     | RuntimeScaffoldingKind::SessionAnchor
-                    | RuntimeScaffoldingKind::ActiveTaskAttachment
+                    | RuntimeScaffoldingKind::ObsoleteActiveTaskAttachment
                     | RuntimeScaffoldingKind::PreviousRoundSummary
                     | RuntimeScaffoldingKind::SequentialToolCallsWarning,
             ),
@@ -66,6 +66,7 @@ pub fn is_continuation_scaffolding_for_role(role: &str, content: &str) -> bool {
                 RuntimeScaffoldingKind::AttentionManifest
                     | RuntimeScaffoldingKind::WorkingSetManifest
                     | RuntimeScaffoldingKind::SessionAnchor
+                    | RuntimeScaffoldingKind::ObsoleteActiveTaskAttachment
                     | RuntimeScaffoldingKind::AlreadyFetchedInventory
                     | RuntimeScaffoldingKind::CrossSessionProjectContext
                     | RuntimeScaffoldingKind::PreviousRoundSummary,
@@ -104,7 +105,7 @@ mod tests {
         );
         assert_eq!(
             detect_runtime_scaffolding("[Active task attachment]\nResume the active task"),
-            Some(RuntimeScaffoldingKind::ActiveTaskAttachment)
+            Some(RuntimeScaffoldingKind::ObsoleteActiveTaskAttachment)
         );
         assert_eq!(
             detect_runtime_scaffolding("## Already Fetched (do NOT re-read)\nfoo.rs"),

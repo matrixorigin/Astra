@@ -1478,7 +1478,21 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         };
         crate::observability::on_turn_start(hub, session_id, &user_id, &state.message);
     }
-    let turn_intent = host.judge_turn_intent(state).await;
+    let turn_intent = host.judge_turn_intent(state).await.or_else(|| {
+        // Structural fallback when the LLM judge is unavailable or failed.
+        // Keeps scenario routing, continuation mode, and adaptive profiles
+        // functional under judge outages instead of collapsing to defaults.
+        let has_prior_assistant_turn = state
+            .messages
+            .iter()
+            .rev()
+            .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
+        Some(crate::turn::agentic::turn_intent::fallback_turn_intent(
+            &state.message,
+            &state.recent_tools,
+            has_prior_assistant_turn,
+        ))
+    });
     apply_adaptive_execution_profile_with_intent(state, turn_intent.as_ref());
 
     if (state.telemetry.observability_session.is_some() || state.skills.resolver.is_some())
@@ -2755,7 +2769,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_turn_iteration_infers_default_code_review_intent() {
+    async fn prepare_turn_iteration_does_not_infer_code_review_without_judge_intent() {
         let mut host = MockHost::new(Vec::new());
         let hub = make_hub();
         let session = make_session();
@@ -2773,11 +2787,11 @@ mod tests {
 
         assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
         let guard = astra_core::sync_poison::recover_rwlock_read(&session);
-        assert_eq!(guard.profile.current_scenario, Some(Scenario::CodeReview));
+        assert_ne!(guard.profile.current_scenario, Some(Scenario::CodeReview));
     }
 
     #[tokio::test]
-    async fn prepare_turn_iteration_infers_default_quick_answer_intent() {
+    async fn prepare_turn_iteration_does_not_infer_quick_answer_without_judge_intent() {
         let mut host = MockHost::new(Vec::new());
         let hub = make_hub();
         let session = make_session();
@@ -2795,7 +2809,7 @@ mod tests {
 
         assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
         let guard = astra_core::sync_poison::recover_rwlock_read(&session);
-        assert_eq!(guard.profile.current_scenario, Some(Scenario::QuickAnswer));
+        assert_ne!(guard.profile.current_scenario, Some(Scenario::QuickAnswer));
     }
 
     #[test]

@@ -15,9 +15,6 @@ pub struct ConversationState {
     pub is_conversational: bool,
     pub is_git: bool,
     pub is_github: bool,
-    /// True when the query is a short follow-up referencing previous context
-    /// (e.g., "呢" particle, "那" continuation, pronouns referencing prior topic).
-    pub is_followup: bool,
     /// True when the query asks about memory/recall/stored data.
     pub is_memory: bool,
     pub turn_count: u32,
@@ -92,8 +89,7 @@ impl ConversationState {
 
         let msg_lower = effective_msg.to_lowercase();
         // `chars` is used by signal classifiers that need a Unicode char
-        // count (not byte count) — see `is_conversational_msg`,
-        // `is_followup_msg`. Built once and reused.
+        // count (not byte count). Built once and reused.
         let chars: Vec<char> = msg_lower.chars().collect();
         // Pre-split the haystack once for all `contains_any` calls (avoids
         // O(patterns) redundant splits — see `word_boundary_match_prepared`).
@@ -231,7 +227,6 @@ impl ConversationState {
                     "star",
                 ],
             ),
-            is_followup: is_followup_msg(&msg_lower, &chars, turn_count),
             is_memory: contains_any(
                 &msg_lower,
                 &words,
@@ -269,11 +264,6 @@ impl ConversationState {
             disambiguation: None,
         };
 
-        // Follow-up with "呢" implicitly inherits fetch intent (asking "what about X?")
-        if state.is_followup && !state.is_fetch {
-            state.is_fetch = true;
-        }
-
         // Run intent disambiguation on the extracted signals
         let disambig = crate::routing_metrics::disambiguate_intents(
             state.is_fetch,
@@ -286,53 +276,6 @@ impl ConversationState {
         state.disambiguation = Some(disambig);
         state
     }
-}
-
-/// Detect follow-up patterns in short queries.
-///
-/// Follow-ups are short messages that reference the previous conversation context
-/// rather than stating a complete question. Examples:
-/// - "呢" particle: "pr呢？" = "what about PRs?" (implies continuation)
-/// - "那" continuation: "那star呢？" = "then what about stars?"
-/// - "也" comparison: "issue也看看" = "look at issues too"
-/// - Short queries on non-first turns with entity names but no verb
-///
-/// UNIVERSAL rule: length-gated (≤15 chars) + continuation particle/pattern.
-fn is_followup_msg(lower: &str, chars: &[char], turn_count: u32) -> bool {
-    // First turn cannot be a follow-up
-    if turn_count <= 1 {
-        return false;
-    }
-
-    let len = chars.len();
-
-    // Chinese continuation particles — very strong follow-up signal
-    let cn_particles = ["呢", "那", "也", "还有", "另外", "同样", "一样", "最新"];
-    if len <= 15 && cn_particles.iter().any(|p| lower.contains(p)) {
-        return true;
-    }
-
-    // English follow-up patterns
-    let en_patterns = [
-        "what about",
-        "how about",
-        "and the",
-        "same for",
-        "also",
-        "too?",
-        "as well",
-    ];
-    if len <= 30 && en_patterns.iter().any(|p| lower.contains(p)) {
-        return true;
-    }
-
-    // Very short queries (≤8 chars) on non-first turns with a question mark
-    // e.g., "pr呢？", "star?", "issues?"
-    if len <= 8 && (lower.contains('?') || lower.contains('？')) {
-        return true;
-    }
-
-    false
 }
 
 fn contains_any(lower: &str, words: &[&str], patterns: &[&str]) -> bool {
@@ -685,46 +628,6 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────
-    // is_followup_msg
-    // ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn followup_first_turn_never() {
-        let s = "pr呢？";
-        let chars: Vec<char> = s.chars().collect();
-        assert!(!is_followup_msg(s, &chars, 1));
-    }
-
-    #[test]
-    fn followup_chinese_particle() {
-        let s = "pr呢？";
-        let chars: Vec<char> = s.chars().collect();
-        assert!(is_followup_msg(s, &chars, 2));
-    }
-
-    #[test]
-    fn followup_english_pattern() {
-        let s = "what about tests?";
-        let chars: Vec<char> = s.chars().collect();
-        assert!(is_followup_msg(s, &chars, 3));
-    }
-
-    #[test]
-    fn followup_short_question_mark() {
-        let s = "star?";
-        let chars: Vec<char> = s.chars().collect();
-        assert!(is_followup_msg(s, &chars, 2));
-    }
-
-    #[test]
-    fn followup_long_message_not_followup() {
-        let s =
-            "this is a really long message that has nothing to do with follow-up patterns at all";
-        let chars: Vec<char> = s.chars().collect();
-        assert!(!is_followup_msg(s, &chars, 5));
-    }
-
-    // ──────────────────────────────────────────────────────────
     // is_conversational_msg
     // ──────────────────────────────────────────────────────────
 
@@ -819,10 +722,12 @@ mod tests {
     }
 
     #[test]
-    fn from_message_followup_sets_fetch() {
+    fn from_message_short_followup_does_not_infer_fetch() {
         let s = ConversationState::from_message("pr呢？", 2);
-        assert!(s.is_followup);
-        assert!(s.is_fetch); // follow-up inherits fetch
+        assert!(
+            !s.is_fetch,
+            "fallback selector must not infer fetch intent from short follow-up phrasing"
+        );
     }
 
     #[test]

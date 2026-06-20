@@ -3,7 +3,6 @@ pub enum FollowupSuggestionKind {
     Validate,
     Commit,
     Push,
-    Continue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,7 +83,6 @@ struct SuggestionLexicon {
     validate: &'static str,
     commit: &'static str,
     push: &'static str,
-    continue_prompt: &'static str,
 }
 
 fn suggestion_lexicon(line: &str, assistant_text: &str) -> SuggestionLexicon {
@@ -93,14 +91,12 @@ fn suggestion_lexicon(line: &str, assistant_text: &str) -> SuggestionLexicon {
             validate: "跑一下测试",
             commit: "提交一下",
             push: "推上去",
-            continue_prompt: "继续",
         }
     } else {
         SuggestionLexicon {
             validate: "run the tests",
             commit: "commit this",
             push: "push it",
-            continue_prompt: "go ahead",
         }
     }
 }
@@ -182,24 +178,7 @@ fn suggest_reply_to_assistant_question(
         });
     }
 
-    if mentions_continue_question(&lower, full_text) {
-        return Some(FollowupSuggestion {
-            text: lexicon.continue_prompt.to_string(),
-            kind: FollowupSuggestionKind::Continue,
-        });
-    }
-
     None
-}
-
-fn mentions_continue_question(lower: &str, full_text: &str) -> bool {
-    lower.contains("continue")
-        || lower.contains("keep going")
-        || lower.contains("keep working")
-        || lower.contains("go ahead")
-        || full_text.contains("继续")
-        || full_text.contains("接着")
-        || full_text.contains("往下")
 }
 
 fn mentions_test_question(lower: &str, full_text: &str) -> bool {

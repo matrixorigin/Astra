@@ -927,10 +927,8 @@ pub struct ServerAgenticLoopHost {
     /// exclude admin-disabled tools from the LLM tool surface.
     disabled_tools: Arc<tokio::sync::RwLock<HashSet<String>>>,
     /// Optional LLM-based turn intent judge. When set, every turn first asks
-    /// the judge to classify the user's message; on judge failure the host
-    /// falls back to the deterministic keyword classifier so a transient LLM
-    /// outage never blocks the session. When unset (the default), the host
-    /// uses the keyword classifier exclusively — same as the trait default.
+    /// the judge to classify the user's message. Judge failure is non-fatal:
+    /// the turn proceeds without explicit semantic intent.
     turn_intent_judge: Option<Arc<dyn astra_services::TurnIntentJudge>>,
 }
 
@@ -1371,11 +1369,9 @@ impl ServerAgenticLoopHost {
     /// Inject an LLM-based turn intent judge.
     ///
     /// The judge is consulted at the start of every user turn (see
-    /// [`AgenticLoopHost::judge_turn_intent`]); on judge failure the host
-    /// falls back to the deterministic keyword classifier so a transient
-    /// LLM outage never blocks the session. When this setter is not
-    /// called the host uses the keyword classifier exclusively, matching
-    /// the trait default.
+    /// [`AgenticLoopHost::judge_turn_intent`]); on judge failure or when this
+    /// setter is not called, the host proceeds without explicit semantic
+    /// intent.
     pub fn set_turn_intent_judge(&mut self, judge: Arc<dyn astra_services::TurnIntentJudge>) {
         self.turn_intent_judge = Some(judge);
     }
@@ -1844,6 +1840,8 @@ impl ServerAgenticLoopHost {
             &mut annotated_tools,
             &cache_cfg,
         );
+        self.sync_valid_tools_to_wire_surface_for_state(&annotated_tools, state);
+        self.last_turn_tool_schemas = annotated_tools.clone();
         let (provider, model) = self
             .mock_provider
             .clone()
@@ -2529,22 +2527,21 @@ impl ServerAgenticLoopHost {
             .collect()
     }
 
-    fn sync_valid_tools_to_visible_for_state(
+    fn sync_valid_tools_to_wire_surface_for_state(
         &mut self,
-        visible_tools: &[Value],
+        wire_tools: &[Value],
         state: &AgenticLoopState,
     ) {
         let mut extras = self.admissible_extras.clone();
         let deferred_tool_names = self.deferred_tool_names_from_edge_profile();
         if let Some(executor) = state.server_tool_executor.as_deref() {
             executor.set_current_activatable_tool_names(deferred_tool_names);
-            executor.set_current_searchable_tool_schemas(visible_tools);
+            executor.set_current_searchable_tool_schemas(wire_tools);
             extras.extend(executor.activated_deferred_tool_names());
         }
         self.valid_tools =
             crate::turn::headless_tool_pipeline::admissible_tool_names_from_visible_and_extras(
-                visible_tools,
-                &extras,
+                wire_tools, &extras,
             );
     }
 
@@ -2621,7 +2618,7 @@ impl ServerAgenticLoopHost {
     fn visible_turn_tools(&mut self, state: &mut AgenticLoopState) -> Vec<Value> {
         let effective_restricted = self.compute_effective_restricted(state, true);
         let visible = self.filtered_turn_tools(&effective_restricted);
-        self.sync_valid_tools_to_visible_for_state(&visible, state);
+        self.sync_valid_tools_to_wire_surface_for_state(&visible, state);
         visible
     }
 
@@ -2849,11 +2846,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         &mut self,
         state: &AgenticLoopState,
     ) -> Option<astra_config::user_profile::TurnIntent> {
-        // When an LLM judge is wired, route through it with keyword
-        // fallback. Otherwise fall back to the deterministic-only
-        // pathway (same as the trait default). The judge sees enough
-        // context (turn count + recent tools + has-prior-assistant)
-        // to disambiguate paraphrases the keyword classifier misses.
         match self.turn_intent_judge.as_ref() {
             Some(judge) => {
                 let has_prior_assistant_turn = state
@@ -2864,20 +2856,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 // Use 1-based turn count: llm_rounds_completed counts
                 // *prior* rounds, so the current user turn is +1.
                 let turn_count = state.llm_rounds_completed.saturating_add(1);
-                crate::turn::agentic::turn_intent::judge_turn_intent_with_llm_fallback(
+                crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
                     judge.as_ref(),
                     &state.message,
-                    state.task_profile,
                     turn_count,
                     &state.recent_tools,
                     has_prior_assistant_turn,
                 )
                 .await
             }
-            None => crate::turn::agentic::turn_intent::infer_turn_intent(
-                &state.message,
-                state.task_profile,
-            ),
+            None => None,
         }
     }
 
@@ -2931,14 +2919,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         state: &mut AgenticLoopState,
     ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
         let turn_started = Instant::now();
-
-        // Stash the tool schemas advertised to the LLM this turn so
-        // `on_turn_completed` can pass them into the fork-prefix
-        // CaptureRequest. `edge_tools` is the authoritative view —
-        // it's what gets serialized into the wire payload below.
-        // Cheap clone (schemas are small JSON values) and only keeps
-        // one turn's worth.
-        self.last_turn_tool_schemas = self.edge_tools.clone();
 
         // ── Test hook: mock LLM rounds ──────────────────────────────────
         #[cfg(feature = "bridge-e2e-hooks")]
@@ -3084,7 +3064,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
         let effective_restricted = self.compute_effective_restricted(state, true);
         let visible_tools = self.filtered_turn_tools(&effective_restricted);
-        self.sync_valid_tools_to_visible_for_state(&visible_tools, state);
 
         // Latch prompt cache config from provider info (once per turn is fine;
         // provider doesn't change within a turn).
@@ -3234,6 +3213,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         state.sticky_tool_schemas = final_tools.clone();
         // Annotate tool schemas with cache_control for Anthropic.
         crate::turn::llm::context::annotate_tool_schemas_for_cache(&mut final_tools, &cache_cfg);
+        // Runtime admission must mirror the exact tool schemas sent on the
+        // wire. Pipeline pruning, sticky schema stabilization, and cache
+        // annotation all happen after the broad edge-tool candidate set is
+        // built, so syncing earlier can admit or reject tools the model did
+        // not actually see this turn.
+        self.sync_valid_tools_to_wire_surface_for_state(&final_tools, state);
+        self.last_turn_tool_schemas = final_tools.clone();
         if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
             crate::turn::llm::context::augment_manifest_trace_with_wire(
                 trace,
@@ -4838,6 +4824,50 @@ mod tests {
         assert!(host.valid_tool_names().contains("bash"));
         assert!(host.valid_tool_names().contains("read_file"));
         assert_eq!(host.valid_tool_names().len(), 2);
+    }
+
+    #[test]
+    fn sync_valid_tools_uses_final_wire_surface_not_candidate_edge_tools() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        assert!(host.valid_tool_names().contains("read_file"));
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let executor = Arc::new(
+            crate::server::server_tool_executor::ServerToolExecutor::new(
+                dir.path().to_path_buf(),
+                "user1".into(),
+                "sess1".into(),
+                None,
+                None,
+            ),
+        );
+        let mut state = create_test_state();
+        state.server_tool_executor = Some(Arc::clone(&executor));
+
+        let wire_tools = vec![sample_edge_tools()[0].clone()];
+        host.sync_valid_tools_to_wire_surface_for_state(&wire_tools, &state);
+
+        assert!(host.valid_tool_names().contains("bash"));
+        assert!(
+            !host.valid_tool_names().contains("read_file"),
+            "runtime admission must mirror the final wire tools, not the broader edge candidate set"
+        );
+        let searchable = executor
+            .current_searchable_tool_names()
+            .expect("executor searchable names must be synced");
+        assert!(searchable.contains("bash"));
+        assert!(
+            !searchable.contains("read_file"),
+            "tool_search must also mirror the final wire tools"
+        );
     }
 
     #[tokio::test]
@@ -8620,13 +8650,11 @@ mod tests {
     // ── Turn intent judge wiring ────────────────────────────────────────
     //
     // Pin the contract that ServerAgenticLoopHost honors an injected LLM
-    // judge in preference to the deterministic keyword classifier — and
-    // falls back to the keyword classifier when the judge errors. Without
-    // this wiring the turn-intent path silently degrades to keyword-only
-    // even though a judge has been wired (the bug we're guarding against).
+    // judge and never substitutes natural-language keyword matching when the
+    // judge is absent or fails.
     mod turn_intent_judge_wiring {
         use super::*;
-        use astra_config::user_profile::{Scenario, TurnContinuationMode, TurnIntent};
+        use astra_config::user_profile::{TurnContinuationMode, TurnIntent};
         use astra_services::{TurnIntentJudge, TurnIntentJudgeContext, TurnIntentJudgeError};
         use async_trait::async_trait;
 
@@ -8715,9 +8743,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn judge_turn_intent_falls_back_to_keyword_when_judge_errors() {
-            // Message is detectable by the keyword classifier as code review.
-            // Judge errors → host MUST still produce the keyword result, not None.
+        async fn judge_turn_intent_returns_none_when_judge_errors() {
             let judge = ScriptedJudge::err(TurnIntentJudgeError::Transport(
                 "connection reset".to_string(),
             ));
@@ -8725,23 +8751,12 @@ mod tests {
 
             let mut state = crate::turn::agentic_loop::host::tests::make_state();
             state.message = "please inspect the current changes".to_string();
-            state.task_profile =
-                astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(&state.message);
 
-            let intent = host
-                .judge_turn_intent(&state)
-                .await
-                .expect("keyword fallback must produce an intent");
-            assert_eq!(
-                intent.requested_scenario,
-                Some(Scenario::CodeReview),
-                "judge transport failure must fall back to keyword classifier"
-            );
+            assert_eq!(host.judge_turn_intent(&state).await, None);
         }
 
         #[tokio::test]
-        async fn judge_turn_intent_uses_keyword_only_when_no_judge_set() {
-            // Guard against an accidental "always require a judge" refactor.
+        async fn judge_turn_intent_returns_none_when_no_judge_set() {
             let mut host = ServerAgenticLoopHostBuilder::new(
                 mock_matrixone(),
                 mock_encryptor(),
@@ -8752,11 +8767,8 @@ mod tests {
 
             let mut state = crate::turn::agentic_loop::host::tests::make_state();
             state.message = "please inspect the current changes".to_string();
-            state.task_profile =
-                astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(&state.message);
 
-            let intent = host.judge_turn_intent(&state).await.expect("intent");
-            assert_eq!(intent.requested_scenario, Some(Scenario::CodeReview));
+            assert_eq!(host.judge_turn_intent(&state).await, None);
         }
     }
 }

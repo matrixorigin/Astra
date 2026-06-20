@@ -115,12 +115,12 @@ fn is_digest_worthy(line: &str) -> bool {
     }
     // Runtime scaffolding that leaked into conversation history and was
     // then indexed by Memoria. Routed through the single source of truth
-    // in `astra_turn_types::SCAFFOLDING_BODY_PREFIXES` so new runtime
+    // in `astra_turn_types::scaffolding_body_prefixes_for_filtering` so new runtime
     // injections added there are automatically filtered here without a
     // per-site update. Pinned after observing the feedback loop in
     // session 6676c7b5 where 78 runtime-correction echoes filled a
     // 6,397c `## User Memories` block.
-    for prefix in astra_turn_types::SCAFFOLDING_BODY_PREFIXES {
+    for prefix in astra_turn_types::scaffolding_body_prefixes_for_filtering() {
         if line.starts_with(prefix) {
             return false;
         }

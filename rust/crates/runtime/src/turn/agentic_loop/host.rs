@@ -74,8 +74,6 @@ use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 use astra_turn_core::tool_registry_report::SelectionReport;
 use tokio_util::sync::CancellationToken;
 
-use crate::turn::agentic::turn_intent::infer_turn_intent;
-
 /// Anchors journal wall-clock timestamps to a single process-local epoch so
 /// later reads stay monotonic even if `SystemTime` jumps backwards.
 ///
@@ -171,11 +169,12 @@ pub trait AgenticLoopHost: Send {
 
     /// Optional semantic judge for the current user turn.
     ///
-    /// The default implementation provides a deterministic baseline from the
-    /// current message plus `TaskExecutionProfile`; hosts can override it with a
-    /// higher-fidelity classifier if they have one.
-    async fn judge_turn_intent(&mut self, state: &AgenticLoopState) -> Option<TurnIntent> {
-        infer_turn_intent(&state.message, state.task_profile)
+    /// Hosts with an LLM-backed intent judge should override this. The default
+    /// does not infer semantic continuation from text; continuing the current
+    /// objective is a high-impact decision and should come from a structured
+    /// judge result, not phrase matching.
+    async fn judge_turn_intent(&mut self, _state: &AgenticLoopState) -> Option<TurnIntent> {
+        None
     }
 
     /// Whether the host already injects round budget guidance into the system
@@ -1001,11 +1000,10 @@ pub enum VolatileKind {
     BudgetAdvisory,
     /// Tactical adaptation hint.
     TacticalAdaptation,
-    /// "Context was just compacted — continue working, do not
-    /// summarize." Injected by `handle_token_budget` after a
-    /// successful compact+spill pass so the model resumes the task
-    /// instead of misreading the smaller context as an interruption
-    /// (session 0e37eb46 regression).
+    /// Neutral compaction context note. Injected after a successful
+    /// compact+spill pass so the model understands the smaller context
+    /// without treating the note itself as a new user request or automatic
+    /// resume authorization.
     CompactResume,
     /// Circuit-breaker intermediate / soft-stop messages.
     CircuitBreaker,
@@ -2529,10 +2527,8 @@ pub(crate) mod tests {
             Ok(result)
         }
 
-        async fn judge_turn_intent(&mut self, state: &AgenticLoopState) -> Option<TurnIntent> {
-            self.turn_intent
-                .clone()
-                .or_else(|| infer_turn_intent(&state.message, state.task_profile))
+        async fn judge_turn_intent(&mut self, _state: &AgenticLoopState) -> Option<TurnIntent> {
+            self.turn_intent.clone()
         }
 
         fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
@@ -6144,7 +6140,7 @@ pub(crate) mod tests {
     // directive rides the volatile lane (not `state.messages[]`) so
     // it doesn't pollute history.
     #[tokio::test]
-    async fn compaction_injects_resume_directive_on_volatile_lane() {
+    async fn compaction_injects_context_note_on_volatile_lane() {
         let session_id = format!(
             "resume-directive-{}",
             std::time::SystemTime::now()
@@ -6187,18 +6183,19 @@ pub(crate) mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok(), "loop must complete");
 
-        // The resume directive must ride the volatile lane. We inspect
+        // The compaction context note must ride the volatile lane. We inspect
         // the lane AFTER the loop; MockHost's execute_turn never
         // drains it, so fires accumulate there for tests to observe.
-        let has_resume_directive = state.volatile_pending.iter().any(|inj| {
+        let has_context_note = state.volatile_pending.iter().any(|inj| {
             inj.content.contains("Context compacted")
-                && inj.content.to_lowercase().contains("continue")
+                && inj.content.contains("not a new user request")
+                && !inj.content.contains("Continue the task")
+                && !inj.content.contains("keep working")
         });
         assert!(
-            has_resume_directive,
-            "after compaction fires, a volatile Resume directive must be \
-             queued so the model continues instead of producing a \
-             progress summary (session 0e37eb46 regression). \
+            has_context_note,
+            "after compaction fires, a volatile context note must be \
+             queued without acting as resume authorization. \
              Current volatile_pending: {:#?}",
             state
                 .volatile_pending

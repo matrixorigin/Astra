@@ -281,10 +281,9 @@ pub struct TurnComplexitySignals {
     /// "implement / fix / refactor / 修复 / 实现" etc. Modification implies
     /// multi-step reasoning, so we do NOT dampen in that case.
     pub has_modification_intent: bool,
-    /// True when this turn is a mid-task continuation (e.g. "继续" / "continue")
-    /// where the real complexity lives in the ongoing task, not in the literal
-    /// user input. Conservative: we keep full effort here so we don't starve
-    /// multi-round work of reasoning budget.
+    /// True when an upstream structured intent judge has identified this turn
+    /// as a mid-task continuation. `from_message` deliberately leaves this
+    /// false; continuation semantics are not inferred with phrase matching.
     pub is_continuation: bool,
 }
 
@@ -310,14 +309,10 @@ impl TurnComplexitySignals {
         ]
         .iter()
         .any(|kw| lower.contains(kw));
-        let is_continuation = matches!(
-            trimmed,
-            "continue" | "Continue" | "go on" | "keep going" | "继续" | "接着" | "go" | "next"
-        );
         Self {
             input_char_len: trimmed.chars().count(),
             has_modification_intent,
-            is_continuation,
+            is_continuation: false,
         }
     }
 
@@ -1134,14 +1129,15 @@ mod tests {
     }
 
     #[test]
-    fn scale_for_turn_continuation_not_dampened() {
+    fn scale_for_turn_does_not_infer_continuation_from_phrase() {
         let cfg = ThinkingConfig::Adaptive {
             effort: ThinkingEffort::High,
         };
         let sig = TurnComplexitySignals::from_message("继续");
-        assert!(!sig.is_lightweight());
+        assert!(!sig.is_continuation);
+        assert!(sig.is_lightweight());
         let scaled = cfg.scale_for_turn(sig);
-        assert_eq!(scaled, cfg, "continuation should not dampen");
+        assert_ne!(scaled, cfg, "phrase-matched continuation should not exist");
     }
 
     #[test]

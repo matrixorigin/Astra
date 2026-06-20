@@ -634,7 +634,7 @@ fn planning_section() -> &'static str {
 /// Failure handling + resilience. Inspired by Claude Code's prompt contract.
 fn resilience_section() -> &'static str {
     "\n## Failure Handling & Resilience\n\
-     - **Context window is not your concern**: the system automatically compresses prior messages as context approaches limits. Your conversation is not limited by the context window — keep working.\n\
+     - **Context window is not your concern**: the system automatically compresses prior messages as context approaches limits. Do not stop solely because of context-window pressure; follow the latest real user request and current state.\n\
      - **Diagnose before switching**: read the error, check assumptions, try a focused fix. Don't blindly retry the same action.\n\
      - **If the user said continue, don't give up**: execute, or ask the user with a concrete blocker. Use `ask_user` only when that tool is visible or has been activated.\n\
      - **Escalate only when genuinely stuck**: investigate first; ask only for the missing decision.\n\
@@ -702,6 +702,8 @@ fn output_format_section() -> &'static str {
 /// Tool error recovery. Scenario-based: diagnose → fix → anti-pattern.
 fn tool_error_recovery_section() -> &'static str {
     "\n## Tool Error Recovery\n\
+     ### Current Turn Boundary\n\
+     The current turn is the runtime cycle for the latest user request. Visible tools, attached executors, and per-turn tool budgets are fixed for that cycle; another tool call in the same turn does not change them.\n\
      ### Retry Budget\n\
      Fix args and retry ONCE. If it fails twice, switch tool or ask the user. Never loop on the same failing call.\n\
      ### Scenario: File not found (read_file / str_replace / write_file)\n\

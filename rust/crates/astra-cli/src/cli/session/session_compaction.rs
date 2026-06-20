@@ -143,18 +143,7 @@ mod tests {
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
         );
-        assert!(
-            effective.contains("[Active task attachment]"),
-            "anchor injection must work after compaction"
-        );
-        assert!(
-            effective.contains("debug lifetime"),
-            "anchor content preserved"
-        );
-        assert!(
-            effective.contains("[User follow-up]\n继续"),
-            "user prompt appended"
-        );
+        assert_eq!(effective, "继续");
 
         let normal = crate::cli::session::session_input::build_effective_line(
             "explain Pin in detail",

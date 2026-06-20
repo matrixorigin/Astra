@@ -47,6 +47,18 @@ pub(crate) async fn execute_tool_pure(
             execution.result_str = result.output;
         }
     }
+    if execution.result_str.starts_with(EDGE_PROTOCOL_ERROR_PREFIX) {
+        let fields = execution.tool_result_fields.get_or_insert_with(Map::new);
+        fields.insert("status".to_string(), Value::String("failed".to_string()));
+        fields.insert(
+            "error_kind".to_string(),
+            Value::String(astra_core::ErrorKind::ToolBinding.as_str().to_string()),
+        );
+        fields.insert(
+            "finish_reason".to_string(),
+            Value::String("tool_binding".to_string()),
+        );
+    }
 
     execution.result_str = hydrate_reflect_placeholder_if_needed(
         api,
@@ -72,6 +84,7 @@ pub(super) fn execution_result_is_error(
 
     match classify_tool_error(name, result_str) {
         ToolErrorSeverity::HardError => true,
+        ToolErrorSeverity::InfrastructureError => true,
         ToolErrorSeverity::SoftError => false,
         // Success arm — body-wins reconciliation contract:
         //

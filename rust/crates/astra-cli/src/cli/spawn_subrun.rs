@@ -878,6 +878,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     )
                     .to_string(),
                     finish_reason: finish_reason_from_state.unwrap_or_else(|| "normal".to_string()),
+                    cancelled_by_user: None,
                     output: Some(state.final_text),
                     error: None,
                     prompt_tokens,
@@ -908,6 +909,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     status: "cancelled".to_string(),
                     finish_reason: finish_reason_from_state
                         .unwrap_or_else(|| "cancelled".to_string()),
+                    cancelled_by_user: Some(true),
                     output: if state.final_text.is_empty() {
                         None
                     } else {
@@ -937,6 +939,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     run_id,
                     status: "failed".to_string(),
                     finish_reason: finish_reason_from_state.unwrap_or_else(|| "failed".to_string()),
+                    cancelled_by_user: None,
                     output: if state.final_text.is_empty() {
                         None
                     } else {
@@ -963,6 +966,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     status: "waiting".to_string(),
                     finish_reason: finish_reason_from_state
                         .unwrap_or_else(|| "waiting".to_string()),
+                    cancelled_by_user: None,
                     output: Some(reason),
                     error: None,
                     prompt_tokens,

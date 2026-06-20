@@ -6585,7 +6585,7 @@ mod tests {
 
         let ctx = approval_scope_context_for_tool(
             "bash",
-            &serde_json::json!({"command": r#"cd rust && grep -n "restore_session_into_state\|is_low_information_followup" rust/crates/astra-cli/src/cli/session_input.rs"#}),
+            &serde_json::json!({"command": r#"cd rust && grep -n "restore_session_into_state\|clear_pending_recovery" rust/crates/astra-cli/src/cli/session/session_input.rs"#}),
             false,
             false,
         );

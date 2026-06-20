@@ -6372,7 +6372,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_complete_event_includes_followup_suggestion_from_last_user() {
+    fn turn_complete_event_does_not_suggest_continuation_from_last_user_text() {
         let messages = vec![
             json!({"role": "user", "content": "first prompt"}),
             json!({"role": "assistant", "content": "intermediate"}),
@@ -6382,7 +6382,7 @@ mod tests {
         assert_eq!(event["type"], "turn_complete");
         assert_eq!(event["has_tool_calls"], false);
         assert_eq!(event["assistant_text"], "Should I continue?");
-        assert_eq!(event["followup_suggestion"], "继续");
+        assert!(event.get("followup_suggestion").is_none(), "{event}");
     }
 
     #[test]
@@ -6419,6 +6419,10 @@ mod tests {
             );
             messages.push(json!({"role": "user", "content": format!("Next {}", i + 1)}));
         }
+        messages.push(json!({
+            "role": "assistant",
+            "content": "Still working through the remaining steps."
+        }));
 
         let config = MemoriaCompactConfig::default();
         let params = MemoriaCompactParams {
@@ -6438,26 +6442,24 @@ mod tests {
                 &messages, None, &config, &params, None, None, None,
             ));
 
-        // Compaction happened (boundary present), so we simulate what the turn loop does
+        // Compaction happened (boundary present), so we simulate what the turn loop does.
         assert!(
             result.boundary.is_some(),
             "compaction should have triggered"
         );
 
         let mut msgs = result.messages;
-        if result.boundary.is_some() && msgs.len() >= 2 {
-            msgs.push(json!({
-                "role": "user",
-                "content": "Continue the conversation from where it left off. \
-                            Do not ask the user any further questions — \
-                            pick up the current task and keep going."
-            }));
-        }
+        crate::turn::wire_assembly::maybe_append_continuation_prompt(
+            &mut msgs,
+            result.boundary.is_some(),
+        );
 
         let last = msgs.last().unwrap();
         assert_eq!(last["role"], "user");
-        assert!(last["content"].as_str().unwrap().contains("Continue"));
-        assert!(last["content"].as_str().unwrap().contains("keep going"));
+        let note = last["content"].as_str().unwrap();
+        assert!(note.contains("Context was compacted"));
+        assert!(note.contains("not a new user request"));
+        assert!(!note.contains("keep going"));
     }
 
     #[test]
@@ -6492,7 +6494,7 @@ mod tests {
             ));
 
         assert!(result.boundary.is_none(), "no compaction should happen");
-        // No continuation prompt should be added
+        // No compaction note should be added.
         assert_eq!(result.messages.len(), 3);
         assert_eq!(result.messages.last().unwrap()["role"], "assistant");
     }
@@ -7342,7 +7344,7 @@ mod tests {
         assert!(signals_done("I can't believe we completed successfully!"));
     }
 
-    // ── Fix #11: CJK detection for bilingual continuation prompt ────────
+    // ── Fix #11: CJK detection for bilingual compaction note ────────────
 
     #[test]
     fn p2_cjk_detection_chinese_content() {

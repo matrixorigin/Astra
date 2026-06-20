@@ -2202,6 +2202,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_matching_edge_execution_is_failed_tool_binding_without_rollback_class() {
+        let mut harness = PipelineHarness::new();
+        harness.valid_tool_names.insert("agent_fanout".to_string());
+        harness.tool_calls.push(json!({
+            "id": "call-agent-fanout-0",
+            "function": {
+                "name": "agent_fanout",
+                "arguments": serde_json::to_string(&json!({
+                    "action": "start",
+                    "target_count": 1,
+                    "slots": [{
+                        "id": "review",
+                        "description": "Review",
+                        "prompt": "Review this change."
+                    }]
+                })).unwrap()
+            }
+        }));
+        let mut pipeline = harness.pipeline();
+
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::Continue(v) => v,
+            _ => panic!("expected validation to pass"),
+        };
+        let permitted = match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::Continue(p) => p,
+            _ => panic!("expected permission to pass"),
+        };
+        let executed = pipeline.execute_execution(permitted).await;
+
+        assert!(
+            executed.is_err,
+            "executor-missing must be a failed tool call"
+        );
+        let fields = executed
+            .execution
+            .tool_result_fields
+            .as_ref()
+            .expect("headless protocol failure must carry structured metadata");
+        assert_eq!(fields.get("status").and_then(Value::as_str), Some("failed"));
+        assert_eq!(
+            fields.get("error_kind").and_then(Value::as_str),
+            Some(astra_core::ErrorKind::ToolBinding.as_str())
+        );
+        assert!(
+            !astra_turn_core::tool_result_semantics::tool_error_triggers_rollback(
+                "agent_fanout",
+                &executed.execution.result_str,
+            ),
+            "no executor means no tool implementation ran, so rollback is wrong"
+        );
+
+        pipeline.record_execution(executed).await;
+        let record = pipeline
+            .ctx
+            .tool_call_records
+            .last()
+            .expect("recorded tool call");
+        assert!(!record.ok, "journal must not mark executor-missing as ok");
+        assert!(
+            record
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("headless edge protocol")),
+            "journal error should preserve the executor-missing body, got {record:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn semantic_dedup_does_not_block_git_action_diff_path_after_stat_only() {
         let mut harness = PipelineHarness::new();
         harness.valid_tool_names.insert("git".to_string());

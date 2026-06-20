@@ -196,6 +196,11 @@ pub enum ToolErrorSeverity {
     Success,
     /// Soft error: recoverable, no side effects, agent can decide next step.
     SoftError,
+    /// Execution failure before the tool implementation ran.
+    ///
+    /// This is a real failed tool call for UX / tool-health purposes, but it
+    /// must not trigger rollback because no tool side effect happened.
+    InfrastructureError,
     /// Hard error: may have inconsistent state, should trigger rollback.
     HardError,
 }
@@ -235,11 +240,17 @@ const SOFT_ERROR_PATTERNS: &[&str] = &[
     "no changes detected",
     // create_file on existing file — specific pattern
     "file already exists",
-    // Execution transport/surface mismatch. No tool implementation ran, so
-    // this should not trigger rollback or mark the tool call as a hard
-    // side-effecting failure.
+];
+
+/// Tool execution infrastructure failures. These are failed tool calls but
+/// not rollback triggers because the requested tool implementation did not run.
+const INFRASTRUCTURE_ERROR_PATTERNS: &[&str] = &[
     "headless edge protocol",
     "no matching edge execution",
+    "runtime binding unavailable",
+    "runtime binding is unavailable",
+    "no executor attached",
+    "no multi-agent executor attached",
 ];
 
 /// Timeout/transient error patterns — soft for read-only tools, hard for mutation tools.
@@ -321,6 +332,15 @@ pub fn classify_tool_error(tool: &str, output: &str) -> ToolErrorSeverity {
                 // Read-only tool timeout is recoverable
                 ToolErrorSeverity::SoftError
             };
+        }
+    }
+
+    // Check execution-infrastructure errors before soft errors. These failures
+    // are not recoverable by tweaking args, and counting them as soft makes the
+    // journal report a failed executor binding as `ok=true`.
+    for pattern in INFRASTRUCTURE_ERROR_PATTERNS {
+        if lower.contains(pattern) {
+            return ToolErrorSeverity::InfrastructureError;
         }
     }
 
@@ -932,12 +952,12 @@ if let Err(e) = writeln!(file, "{line}") {
     }
 
     #[test]
-    fn classify_headless_edge_protocol_as_soft_binding_error() {
+    fn classify_headless_edge_protocol_as_infrastructure_error() {
         let output =
             "Error: headless edge protocol — tool `agent_fanout` has no matching edge execution";
         assert_eq!(
             classify_tool_error("agent_fanout", output),
-            ToolErrorSeverity::SoftError
+            ToolErrorSeverity::InfrastructureError
         );
         assert!(!tool_error_triggers_rollback("agent_fanout", output));
     }

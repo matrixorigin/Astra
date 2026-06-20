@@ -4480,17 +4480,6 @@ async fn hook_db_multiple_tools_selected() {
 
 #[tokio::test]
 async fn mock_llm_tool_flow_scenario_matrix() {
-    let attachment = "[Active task attachment]\n\
-Resume the active task/thread below unless the user explicitly changes topic.\n\
-Treat brief follow-ups as actions on this active thread, not as brand-new unrelated tasks.\n\
-If the follow-up asks to fix / patch / test / continue, apply that action to this active thread.\n\
-Latest user task: review 这个: aa1f419bc040003f5de8cdfa6b414225ade82e2b\n\
-Latest assistant summary:\n\
-## Review: `aa1f419b` — P5 git timeout, P6 compression protection\n\
-Two independent fixes in one commit. Let me review each.\n\
-P5 still has a thread leak on timeout; terminate the child before returning.\n\n\
-[User follow-up]\n修复?";
-
     let cases = vec![
         MockToolScenario {
             name: "text_only",
@@ -4592,25 +4581,6 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
             ],
             final_text: "Inspected the project files.",
             expected_query_fragments: vec!["inspect the project files"],
-        },
-        MockToolScenario {
-            name: "attachment_followup_repair",
-            message: attachment.to_string(),
-            edge_tools: vec!["str_replace"],
-            steps: vec![MockToolScenarioStep {
-                request_id: "tc-matrix-repair",
-                tool_name: "str_replace",
-                args: json!({"path": "rust/crates/astra-tools/src/git_gix.rs"}),
-                result_output: "updated helper",
-                requires_approval: true,
-            }],
-            final_text: "Patched the timeout path.",
-            expected_query_fragments: vec![
-                "[Active task attachment]",
-                "aa1f419bc040003f5de8cdfa6b414225ade82e2b",
-                "thread leak on timeout",
-                "[User follow-up]\n修复?",
-            ],
         },
     ];
 
@@ -4925,13 +4895,6 @@ async fn analysis_turn_injects_circuit_breaker_correction_after_repetition_stall
     let request = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(request["request_id"].as_str(), Some("tc-analysis-r3"));
     let status = post_tool_result(&app, "tc-analysis-r3", "src/lib.rs:12:// TODO", "success").await;
-    assert_eq!(status, StatusCode::OK);
-
-    // Round 4: circuit breaker injected correction after round 3 (repetition stall).
-    // The model still calls tools → post-LLM check aborts after this round.
-    let request = wait_for_sse(&mut rx, "tool_request", 5).await;
-    assert_eq!(request["request_id"].as_str(), Some("tc-analysis-r4"));
-    let status = post_tool_result(&app, "tc-analysis-r4", "src/lib.rs:12:// TODO", "success").await;
     assert_eq!(status, StatusCode::OK);
 
     let _events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -5600,141 +5563,6 @@ async fn complex_scenario_multi_turn_preserves_active_skills_and_invoked_state()
     })
     .await
     .expect("complex_scenario_multi_turn_preserves_active_skills_and_invoked_state exceeded 30s timeout — likely a hang regression");
-}
-
-/// Low-information repair follow-up stays scoped when the caller provides an active-task attachment.
-#[tokio::test]
-async fn low_information_followup_attachment_drives_repair_turn() {
-    let (app, hook_writer, _observer, tool_writer) = build_test_app_with_hooks();
-    let sid = format!("followup-attach-{}", uuid::Uuid::new_v4());
-
-    chat_stream_collect(
-        &app,
-        json!({
-            "session_id": &sid,
-            "message": "review f49aa28beedb75c838db442950b7076e590008ad",
-            "context": {
-                "test_llm_rounds": [{
-                    "full_text": "## Review: `f49aa28b`\nIndentation issue and unnecessary JSON round-trip."
-                }]
-            }
-        }),
-    )
-    .await;
-
-    chat_stream_collect(
-        &app,
-        json!({
-            "session_id": &sid,
-            "message": "review 这个: aa1f419bc040003f5de8cdfa6b414225ade82e2b",
-            "context": {
-                "test_llm_rounds": [{
-                    "full_text": "## Review: `aa1f419b` — P5 git timeout, P6 compression protection\nTwo independent fixes in one commit. Let me review each.\nP5 still has a thread leak on timeout; terminate the child before returning."
-                }]
-            }
-        }),
-    )
-    .await;
-
-    let attachment = "[Active task attachment]\n\
-Resume the active task/thread below unless the user explicitly changes topic.\n\
-Treat brief follow-ups as actions on this active thread, not as brand-new unrelated tasks.\n\
-If the follow-up asks to fix / patch / test / continue, apply that action to this active thread.\n\
-Latest user task: review 这个: aa1f419bc040003f5de8cdfa6b414225ade82e2b\n\
-Latest assistant summary:\n\
-## Review: `aa1f419b` — P5 git timeout, P6 compression protection\n\
-Two independent fixes in one commit. Let me review each.\n\
-P5 still has a thread leak on timeout; terminate the child before returning.\n\n\
-[User follow-up]\n修复?";
-
-    let resp = chat_stream_start(
-        &app,
-        json!({
-            "session_id": &sid,
-            "message": attachment,
-            "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [tool_call(
-                            "tc-followup-fix",
-                            "str_replace",
-                            json!({"path": "rust/crates/astra-tools/src/git_gix.rs"})
-                        )]
-                    },
-                    { "full_text": "Patched the timeout path." }
-                ],
-                "edge_tools": [tool_schema("str_replace")]
-            }
-        }),
-    )
-    .await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    wait_for_sse(&mut rx, "approval_required", 5).await;
-    let st = post_approval_respond(&app, "tc-followup-fix", "allow").await;
-    assert_eq!(st, StatusCode::OK);
-    wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc-followup-fix", "updated helper", "success").await;
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
-        .await
-        .expect("stream timed out")
-        .expect("reader task failed");
-    assert!(
-        find_events(&events, "text_delta")
-            .iter()
-            .any(|event| event["content"].as_str() == Some("Patched the timeout path.")),
-        "expected final repair text"
-    );
-
-    let hw = hook_writer.clone();
-    poll_until(
-        || {
-            let hw = hw.clone();
-            async move { hw.plans.lock().await.len() >= 3 }
-        },
-        5,
-    )
-    .await;
-    let tw = tool_writer.clone();
-    poll_until(
-        || {
-            let tw = tw.clone();
-            async move { !tw.plans.lock().await.is_empty() }
-        },
-        5,
-    )
-    .await;
-
-    let plans = hook_writer.plans.lock().await;
-    let plan = plans.last().expect("turn 3 hook plan");
-    let skill = plan
-        .skill_selection
-        .as_ref()
-        .expect("turn 3 skill selection");
-    assert!(skill.user_query.contains("[Active task attachment]"));
-    assert!(
-        skill
-            .user_query
-            .contains("aa1f419bc040003f5de8cdfa6b414225ade82e2b")
-    );
-    assert!(skill.user_query.contains("thread leak on timeout"));
-    assert!(skill.user_query.contains("[User follow-up]\n修复?"));
-    assert!(skill.selected_skills.contains(&"str_replace".to_string()));
-
-    let tool_plans = tool_writer.plans.lock().await;
-    let tool_events = &tool_plans.last().expect("tool plan").events;
-    assert!(
-        tool_events.iter().any(|event| {
-            event
-                .metadata
-                .as_ref()
-                .and_then(|meta| meta.get("tool_name"))
-                .and_then(Value::as_str)
-                == Some("str_replace")
-        }),
-        "expected persisted str_replace tool event"
-    );
 }
 
 // ── Tool Event Persistence Tests ─────────────────────────────────────────────

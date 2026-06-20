@@ -360,7 +360,7 @@ fn no_matching_edge_execution_message(name: &str) -> String {
             "Error: headless edge protocol — tool `{name}` has no matching \
              edge execution in this turn.\n\
              This plan lifecycle tool requires a trusted plan executor/review \
-             overlay, but the current session mode did not attach one. \
+             overlay, but no matching executor was bound for this turn. \
              Continue normal execution if the user already asked to implement, \
              or ask the user to switch to an interactive plan-capable surface."
         );
@@ -370,12 +370,10 @@ fn no_matching_edge_execution_message(name: &str) -> String {
         return format!(
             "Error: headless edge protocol — tool `{name}` has no matching \
              edge execution in this turn.\n\n\
-             This tool requires the multi-agent runtime, but this session mode \
-             did not attach the agent executor path that can run it. Tell the \
-             user that sub-agent execution is unavailable in this mode, continue \
-             only with currently bound tools, or ask the user to switch to a \
-             mode that binds the multi-agent runtime when parallel coverage is \
-             required."
+             This tool requires the multi-agent runtime, but no agent executor \
+             path was bound for this turn. This call cannot run in the current \
+             turn regardless of retries. Continue only with tools that are \
+             visible and executable in this turn."
         );
     }
 
@@ -394,10 +392,10 @@ fn no_matching_edge_execution_message(name: &str) -> String {
         "Error: headless edge protocol — tool `{name}` has no matching \
          edge execution in this turn. \
          This means `{name}` requires a server-side execution path that is \
-         not available in the current session mode. \
+         not bound for this turn. \
          Use only tools that have a bound executor this turn. If the user \
-         actually needs `{name}`, tell them which capability is missing and \
-         ask them to switch to a mode that binds it."
+         actually needs `{name}`, tell them which executor capability is \
+         missing in the current turn."
     )
 }
 
@@ -1416,8 +1414,8 @@ mod tests {
             "multi-agent execution must not be replaced with bash: {message}"
         );
         assert!(
-            message.contains("switch to a mode that binds"),
-            "fanout binding message must steer the user toward a bound mode: {message}"
+            message.contains("visible and executable in this turn"),
+            "fanout binding message must explain the executable-tool boundary: {message}"
         );
         assert!(
             !message.contains(astra_core::error_kind::TOOL_BINDING_SENTINEL),

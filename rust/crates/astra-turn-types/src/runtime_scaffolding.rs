@@ -32,8 +32,6 @@ use serde_json::Value;
 pub const SCAFFOLDING_BODY_PREFIXES: &[&str] = &[
     // Rollups
     "Tools used:",
-    // Task-focus manifests
-    "[Active task attachment]",
     "[Self-check",
     "[attention:v1]",
     "[session-anchor]",
@@ -54,6 +52,18 @@ pub const SCAFFOLDING_BODY_PREFIXES: &[&str] = &[
     "[compact session=",
 ];
 
+/// Prefixes from removed scaffolding formats. These are not supported
+/// interaction surfaces; they are filtered only so persisted runtime garbage
+/// cannot re-enter memory or compaction.
+pub const OBSOLETE_SCAFFOLDING_BODY_PREFIXES: &[&str] = &["[Active task attachment]"];
+
+pub fn scaffolding_body_prefixes_for_filtering() -> impl Iterator<Item = &'static str> {
+    SCAFFOLDING_BODY_PREFIXES
+        .iter()
+        .chain(OBSOLETE_SCAFFOLDING_BODY_PREFIXES.iter())
+        .copied()
+}
+
 /// True when `message` is a runtime-synthesized scaffolding message.
 ///
 /// Detection rules (applied in order):
@@ -63,6 +73,8 @@ pub const SCAFFOLDING_BODY_PREFIXES: &[&str] = &[
 /// 2. Any message whose trimmed `content` starts with one of
 ///    [`SCAFFOLDING_BODY_PREFIXES`] (applies across all roles — assistant
 ///    messages can carry runtime-stamped directives too).
+/// 3. Removed legacy scaffolding prefixes are also filtered to prevent old
+///    stored runtime text from being reintroduced.
 ///
 /// Returns `false` for genuine user/assistant conversational turns.
 ///
@@ -83,7 +95,7 @@ pub fn is_runtime_scaffolding_message(message: &Value) -> bool {
         return true;
     }
 
-    for prefix in SCAFFOLDING_BODY_PREFIXES {
+    for prefix in scaffolding_body_prefixes_for_filtering() {
         if trimmed.starts_with(prefix) {
             return true;
         }
@@ -173,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn active_task_attachment_is_scaffolding() {
+    fn obsolete_active_task_attachment_is_filtered_as_garbage() {
         assert!(is_runtime_scaffolding_message(&msg(
             "user",
             "[Active task attachment] Resume the active task below"

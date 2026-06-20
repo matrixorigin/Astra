@@ -27,6 +27,11 @@ use super::view::{BottomPaneView, CancellationEvent};
 
 pub(crate) const AGENT_DRILLDOWN_SENTINEL: &str = "__agent_drilldown__\n";
 const AUTO_DISMISS_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+/// Upper bound on an accepted agent_id extracted from a sentinel. Runtime
+/// ids follow `<name>@<uuid_prefix>` (well under 64 chars); anything larger
+/// is either garbage or an unbounded payload that could exhaust the UI /
+/// dispatch buffer. Reject instead of forwarding an oversized id.
+const MAX_AGENT_ID_LEN: usize = 128;
 
 /// Sentinel emitted when the user presses `x` (or Delete) on a live row in
 /// the in-flight agents drill view. The outer event loop strips the
@@ -49,6 +54,7 @@ pub(crate) fn parse_kill_sentinel(s: &str) -> Option<&str> {
             rest.split_once('\n').map(|(id, _)| id).unwrap_or(rest)
         })
         .filter(|id| !id.is_empty())
+        .filter(|id| id.len() <= MAX_AGENT_ID_LEN)
 }
 
 /// Strip the drill-in sentinel and return the agent_id, defensively
@@ -66,6 +72,7 @@ pub(crate) fn parse_drilldown_sentinel(s: &str) -> Option<&str> {
             rest.split_once('\n').map(|(id, _)| id).unwrap_or(rest)
         })
         .filter(|id| !id.is_empty())
+        .filter(|id| id.len() <= MAX_AGENT_ID_LEN)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +158,10 @@ pub(crate) struct InFlightAgentsView {
     /// Reset to None if the user interacts (key press) or if new live
     /// rows appear.
     auto_dismiss_at: Option<std::time::Instant>,
+    /// Last clock sample from `pre_draw_tick`. Render is sync and has no
+    /// access to the clock, so we stash the latest tick here to compute
+    /// the auto-dismiss countdown without introducing a second time source.
+    last_tick: std::time::Instant,
 }
 
 impl InFlightAgentsView {
@@ -166,6 +177,7 @@ impl InFlightAgentsView {
             accepted: None,
             pending_action: None,
             auto_dismiss_at,
+            last_tick: std::time::Instant::now(),
         }
     }
 
@@ -195,6 +207,25 @@ impl InFlightAgentsView {
         if self.live_count == 0 && !self.rows.is_empty() {
             self.auto_dismiss_at = terminal_auto_dismiss_at(self.live_count, true);
         }
+    }
+
+    /// Remaining seconds until auto-dismiss fires, rounded up. Returns
+    /// `None` when auto-dismiss is not armed (live rows still running, or
+    /// no rows at all). Drives the "closing in Ns" countdown in the header
+    /// so the user understands the view is about to close on its own.
+    fn dismiss_countdown(&self) -> Option<u64> {
+        let dismiss_at = self.auto_dismiss_at?;
+        if self.live_count != 0 {
+            return None;
+        }
+        let remaining = dismiss_at.saturating_duration_since(self.last_tick);
+        // Round up so "1.2s" shows as "2s" — better to overestimate the
+        // wait and have the view close slightly early than the reverse.
+        let secs = remaining.as_secs() + if remaining.subsec_millis() > 0 { 1 } else { 0 };
+        // Clamp to the grace window so a clock skew never reports a
+        // negative-ish or oversized number.
+        let max = AUTO_DISMISS_GRACE.as_secs().max(1);
+        Some(secs.min(max))
     }
 
     fn move_up(&mut self) {
@@ -398,6 +429,7 @@ const PAGE_STEP: usize = 8;
 
 impl BottomPaneView for InFlightAgentsView {
     fn pre_draw_tick(&mut self, now: std::time::Instant) {
+        self.last_tick = now;
         // Auto-dismiss: if all rows are terminal and the grace period
         // has elapsed, mark the view complete so the event loop pops it.
         if let Some(dismiss_at) = self.auto_dismiss_at {
@@ -429,6 +461,14 @@ impl BottomPaneView for InFlightAgentsView {
             format!("  Agents · {live} working · {done} done")
         } else {
             format!("  Agents · {live} working")
+        };
+        // Append the auto-dismiss countdown to the header when armed, so
+        // the user understands *why* the view is about to close and roughly
+        // how long they have to interact. Without this the view just
+        // vanishes after 3s, which reads as a glitch.
+        let header_text = match self.dismiss_countdown() {
+            Some(secs) => format!("{header_text}  · closing in {secs}s"),
+            None => header_text,
         };
         let header = Line::from(Span::styled(header_text, title_style));
         buf.set_line(area.x, area.y, &header, area.width);

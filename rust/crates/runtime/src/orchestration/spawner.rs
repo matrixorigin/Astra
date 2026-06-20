@@ -223,14 +223,23 @@ fn spawn_run_result_to_sync_output(
     duration_ms: u64,
 ) -> SpawnAgentOutput {
     match spawn_run_status_kind(&run_result.status) {
-        SpawnRunStatusKind::Cancelled => SpawnAgentOutput::Cancelled {
-            agent_id,
-            reason: run_result
-                .output
-                .unwrap_or_else(|| SPAWN_STATUS_CANCELLED.to_string()),
-            tool_calls: run_result.tool_calls,
-            duration_ms,
-        },
+        SpawnRunStatusKind::Cancelled => {
+            let finish_reason = if run_result.finish_reason.trim().is_empty() {
+                SPAWN_STATUS_CANCELLED.to_string()
+            } else {
+                run_result.finish_reason
+            };
+            SpawnAgentOutput::Cancelled {
+                agent_id,
+                reason: run_result
+                    .output
+                    .unwrap_or_else(|| SPAWN_STATUS_CANCELLED.to_string()),
+                finish_reason,
+                cancelled_by_user: run_result.cancelled_by_user.unwrap_or(false),
+                tool_calls: run_result.tool_calls,
+                duration_ms,
+            }
+        }
         SpawnRunStatusKind::Waiting => SpawnAgentOutput::Waiting {
             agent_id,
             reason: run_result.output.unwrap_or_default(),
@@ -238,6 +247,7 @@ fn spawn_run_result_to_sync_output(
             duration_ms,
         },
         SpawnRunStatusKind::Failed | SpawnRunStatusKind::Other => SpawnAgentOutput::Failed {
+            agent_id,
             error: spawn_run_failure_message(&run_result),
             finish_reason: run_result.finish_reason.clone(),
             duration_ms,
@@ -258,14 +268,15 @@ fn spawn_run_result_to_sync_output(
     }
 }
 
-fn dropped_agent_terminal_output(agent_id: &str) -> SpawnAgentOutput {
+fn dropped_agent_terminal_output(agent_id: &str, duration_ms: u64) -> SpawnAgentOutput {
     SpawnAgentOutput::Failed {
+        agent_id: agent_id.to_string(),
         error: format!(
             "agent executor dropped before returning a terminal result for {agent_id}; \
              the child run was scheduled but no completion payload reached the foreground wait path"
         ),
         finish_reason: "executor_dropped".to_string(),
-        duration_ms: 0,
+        duration_ms,
     }
 }
 
@@ -598,6 +609,10 @@ pub struct SpawnRunResult {
     /// `"failed"`, `"waiting"` repeat the legacy status for
     /// convenience.
     pub finish_reason: String,
+    /// Structured cancellation source. `Some(true)` means the user explicitly
+    /// cancelled the child; `Some(false)` means runtime/system cancellation.
+    /// `None` means the run did not end in the cancelled state.
+    pub cancelled_by_user: Option<bool>,
     /// Output text (if completed).
     pub output: Option<String>,
     /// Error message (if failed).
@@ -833,6 +848,20 @@ impl DynamicAgentSpawner {
         groups
     }
 
+    pub async fn set_fanout_group_budget_adjustment(
+        &self,
+        group_id: &str,
+        budget_adjustment: Option<String>,
+    ) -> bool {
+        let mut groups = self.fanout_groups.write().await;
+        let Some(group) = groups.get_mut(group_id) else {
+            return false;
+        };
+        group.budget_adjustment = budget_adjustment;
+        group.touch();
+        true
+    }
+
     pub async fn fanout_group_for_agent(
         &self,
         agent_id: &str,
@@ -968,7 +997,7 @@ impl DynamicAgentSpawner {
         let mut groups = self.fanout_groups.write().await;
         let is_new = !groups.contains_key(&identity.group_id);
         let evicted_agent_ids = if is_new {
-            self.evict_terminal_fanout_group_if_full(&mut groups)
+            self.evict_terminal_fanout_group_if_full(&mut groups)?
         } else {
             Vec::new()
         };
@@ -1020,7 +1049,19 @@ impl DynamicAgentSpawner {
         let (mut groups, evicted_agent_ids) = self
             .get_or_validate_fanout_group(identity, group_title, created_by_tool_use_id)
             .await?;
+        // Acquire the index lock while still holding `groups` to close the
+        // TOCTOU window: no concurrent eviction can race between our group
+        // mutation and our index update.  Lock ordering: groups → index
+        // (consistent across all call sites, deadlock-free).
+        let mut index = self.fanout_agent_index.write().await;
+        // Clean up evicted agent IDs unconditionally — this must happen
+        // even if the slot operations below fail, because the eviction
+        // has already removed the group from the map.
+        for evicted_agent_id in &evicted_agent_ids {
+            index.remove(evicted_agent_id);
+        }
         let group = groups.get_mut(&identity.group_id).unwrap();
+        let active_before = group.summary().active;
         group
             .set_slot_request(
                 identity.slot_index,
@@ -1032,16 +1073,10 @@ impl DynamicAgentSpawner {
         group
             .record_spawn_accepted(identity.slot_index, agent_id)
             .map_err(SpawnError::InvalidInput)?;
+        let active_after = group.summary().active;
         group.touch();
-        drop(groups);
-
-        let mut index = self.fanout_agent_index.write().await;
-        for evicted_agent_id in evicted_agent_ids {
-            index.remove(&evicted_agent_id);
-        }
+        self.adjust_cached_active_fanout_slots(active_before, active_after);
         index.insert(agent_id.to_string(), identity.group_id.clone());
-        self.cached_active_fanout_slots
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -1057,7 +1092,14 @@ impl DynamicAgentSpawner {
         let (mut groups, evicted_agent_ids) = self
             .get_or_validate_fanout_group(identity, group_title, created_by_tool_use_id)
             .await?;
+        // Acquire index lock while still holding `groups` to close the
+        // TOCTOU window (see `record_fanout_spawn_accepted`).
+        let mut index = self.fanout_agent_index.write().await;
+        for evicted_agent_id in &evicted_agent_ids {
+            index.remove(evicted_agent_id);
+        }
         let group = groups.get_mut(&identity.group_id).unwrap();
+        let active_before = group.summary().active;
         group
             .set_slot_request(
                 identity.slot_index,
@@ -1069,14 +1111,9 @@ impl DynamicAgentSpawner {
         group
             .record_spawn_rejected(identity.slot_index, reason)
             .map_err(SpawnError::InvalidInput)?;
+        let active_after = group.summary().active;
         group.touch();
-        drop(groups);
-        if !evicted_agent_ids.is_empty() {
-            let mut index = self.fanout_agent_index.write().await;
-            for evicted_agent_id in evicted_agent_ids {
-                index.remove(&evicted_agent_id);
-            }
-        }
+        self.adjust_cached_active_fanout_slots(active_before, active_after);
         Ok(())
     }
 
@@ -1108,30 +1145,43 @@ impl DynamicAgentSpawner {
         let (status, reason) = fanout_slot_status_from_agent_status(&state.status);
         let mut groups = self.fanout_groups.write().await;
         let Some(group) = groups.get_mut(&identity.group_id) else {
+            tracing::warn!(
+                target: "fanout",
+                agent_id = %state.agent_id,
+                group_id = %identity.group_id,
+                "record fanout terminal skipped: group evicted before terminal update",
+            );
             return;
         };
-        let _ = group.record_terminal_by_agent(&state.agent_id, status, reason);
+        let active_before = group.summary().active;
+        if let Err(error) = group.record_terminal_by_agent(&state.agent_id, status, reason) {
+            tracing::warn!(
+                target: "fanout",
+                agent_id = %state.agent_id,
+                group_id = %identity.group_id,
+                error = %error,
+                "record fanout terminal failed; skipping touch/budget adjust",
+            );
+            return;
+        }
+        let active_after = group.summary().active;
         group.touch();
-        self.cached_active_fanout_slots
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |current| Some(current.saturating_sub(1)),
-            )
-            .ok();
+        drop(groups);
+        self.adjust_cached_active_fanout_slots(active_before, active_after);
     }
 
     /// Evict the least-recently-touched terminal group when the fanout-groups
     /// map is at capacity.  Only terminal groups (Finished / Incomplete) are
     /// candidates — evicting a live group would corrupt in-flight agent
-    /// accounting.  If no terminal candidate exists the map is allowed to
-    /// grow one extra slot so the caller's insert can proceed.
+    /// accounting.  Returns `Err(FanoutGroupLimitExceeded)` when at capacity
+    /// and no terminal candidate is available, so the caller fails loudly
+    /// instead of leaking memory through unbounded growth.
     fn evict_terminal_fanout_group_if_full(
         &self,
         groups: &mut HashMap<String, AgentFanoutGroupProjection>,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>, SpawnError> {
         if groups.len() < MAX_FANOUT_GROUPS {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         // Find the terminal group with the oldest last_touched.
         let Some((evict_id, _)) = groups
@@ -1139,10 +1189,13 @@ impl DynamicAgentSpawner {
             .filter(|(_, g)| g.is_terminal())
             .min_by_key(|(_, g)| g.last_touched)
         else {
-            return Vec::new();
+            return Err(SpawnError::FanoutGroupLimitExceeded {
+                active: groups.len(),
+                limit: MAX_FANOUT_GROUPS,
+            });
         };
         let evict_id = evict_id.clone();
-        groups
+        Ok(groups
             .remove(&evict_id)
             .map(|group| {
                 group
@@ -1151,7 +1204,7 @@ impl DynamicAgentSpawner {
                     .filter_map(|slot| slot.agent_id)
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
     /// Recompute `cached_active_fanout_slots` from the authoritative
@@ -1164,6 +1217,28 @@ impl DynamicAgentSpawner {
         self.cached_active_fanout_slots
             .store(count, std::sync::atomic::Ordering::SeqCst);
         count
+    }
+
+    fn adjust_cached_active_fanout_slots(&self, active_before: usize, active_after: usize) {
+        match active_after.cmp(&active_before) {
+            std::cmp::Ordering::Greater => {
+                self.cached_active_fanout_slots.fetch_add(
+                    active_after - active_before,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
+            std::cmp::Ordering::Less => {
+                let delta = active_before - active_after;
+                self.cached_active_fanout_slots
+                    .fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |current| Some(current.saturating_sub(delta)),
+                    )
+                    .ok();
+            }
+            std::cmp::Ordering::Equal => {}
+        }
     }
 
     /// Authoritative count: number of slots in Running status across
@@ -1765,6 +1840,7 @@ impl DynamicAgentSpawner {
         let spawner_for_finalize_repair = spawner.clone_for_task();
         let agent_id_for_task = agent_id.clone();
         let agent_id_for_output = agent_id.clone();
+        let agent_id_for_finalize_panic = agent_id.clone();
         let spawn_future = async move {
             let result = AssertUnwindSafe(executor.execute(run_config))
                 .catch_unwind()
@@ -1805,6 +1881,10 @@ impl DynamicAgentSpawner {
                         )
                     }
                     Ok(Err(error)) => {
+                        let duration_ms = started_at
+                            .elapsed()
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
                         spawner
                             .finalize_background_agent(
                                 &agent_id_for_task,
@@ -1820,9 +1900,10 @@ impl DynamicAgentSpawner {
                             )
                             .await;
                         SpawnAgentOutput::Failed {
+                            agent_id: agent_id_for_output.clone(),
                             error,
                             finish_reason: "failed".to_string(),
-                            duration_ms: 0,
+                            duration_ms,
                         }
                     }
                     Err(panic) => {
@@ -1830,6 +1911,10 @@ impl DynamicAgentSpawner {
                             "agent executor panicked: {}",
                             panic_payload_message(panic.as_ref())
                         );
+                        let duration_ms = started_at
+                            .elapsed()
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
                         spawner
                             .finalize_background_agent(
                                 &agent_id_for_task,
@@ -1845,9 +1930,10 @@ impl DynamicAgentSpawner {
                             )
                             .await;
                         SpawnAgentOutput::Failed {
+                            agent_id: agent_id_for_output.clone(),
                             error,
                             finish_reason: "panic".to_string(),
-                            duration_ms: 0,
+                            duration_ms,
                         }
                     }
                 }
@@ -1856,13 +1942,18 @@ impl DynamicAgentSpawner {
                 Ok(output) => output,
                 Err(panic) => {
                     spawner_for_finalize_repair.repair_fanout_slot_count().await;
+                    let duration_ms = started_at
+                        .elapsed()
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
                     SpawnAgentOutput::Failed {
+                        agent_id: agent_id_for_finalize_panic.clone(),
                         error: format!(
                             "agent finalization panicked: {}",
                             panic_payload_message(panic.as_ref())
                         ),
                         finish_reason: "panic".to_string(),
-                        duration_ms: 0,
+                        duration_ms,
                     }
                 }
             };
@@ -1906,7 +1997,11 @@ impl DynamicAgentSpawner {
                     self.background_abort_handles.write().await.remove(&agent_id);
                     self.reap_finished_agent_tasks();
                     return Ok(terminal.unwrap_or_else(|_| {
-                        dropped_agent_terminal_output(&agent_id)
+                        let duration_ms = started_at
+                            .elapsed()
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        dropped_agent_terminal_output(&agent_id, duration_ms)
                     }));
                 }
                 _ = notify.notified() => {}
@@ -2574,6 +2669,17 @@ pub enum SpawnError {
     #[error("Spawn race: {0}")]
     Race(String),
 
+    /// Fired when `MAX_FANOUT_GROUPS` is reached and no terminal group is
+    /// available for LRU eviction (every group is still live). Distinct from
+    /// `ConcurrencyLimitExceeded` which caps *running* agents — this caps the
+    /// *bookkeeping map* so a long session can't leak memory through
+    /// abandoned-but-not-settled group metadata.
+    #[error(
+        "Fanout group limit reached: {active} groups (limit {limit}), all live. \
+         Wait for an existing group to settle or cancel its agents before spawning more."
+    )]
+    FanoutGroupLimitExceeded { active: usize, limit: usize },
+
     /// Concurrency cap reached. The LLM (or human caller) should wait
     /// for an outstanding agent to finish, cancel one explicitly, or
     /// retry. Carries the live counts so the caller's error message
@@ -3138,6 +3244,7 @@ mod tests {
                 run_id: config.run_id,
                 status: "completed".into(),
                 finish_reason: "normal".into(),
+                cancelled_by_user: None,
                 output: Some("ok".into()),
                 error: None,
                 prompt_tokens: 0,
@@ -3159,6 +3266,7 @@ mod tests {
                 run_id: config.run_id,
                 status: "completed".into(),
                 finish_reason: "normal".into(),
+                cancelled_by_user: None,
                 output: Some("ok".into()),
                 error: None,
                 prompt_tokens: 1,
@@ -3180,6 +3288,7 @@ mod tests {
                 run_id: config.run_id,
                 status: self.status.into(),
                 finish_reason: self.finish_reason.into(),
+                cancelled_by_user: None,
                 output: self.output.map(str::to_string),
                 error: self.error.map(str::to_string),
                 prompt_tokens: 0,
@@ -3202,6 +3311,7 @@ mod tests {
                 run_id: config.run_id,
                 status: "completed".into(),
                 finish_reason: "normal".into(),
+                cancelled_by_user: None,
                 output: Some("ok".into()),
                 error: None,
                 prompt_tokens: 0,
@@ -3232,6 +3342,7 @@ mod tests {
             run_id: "r1".into(),
             status: SPAWN_STATUS_INTERRUPTED.into(),
             finish_reason: "budget_exhausted".into(),
+            cancelled_by_user: None,
             output: Some("partial".into()),
             error: None,
             prompt_tokens: 0,
@@ -3291,14 +3402,15 @@ mod tests {
 
     #[test]
     fn dropped_terminal_output_is_internal_failure_not_user_cancel() {
-        let output = dropped_agent_terminal_output("agent-42");
+        let output = dropped_agent_terminal_output("agent-42", 500);
         assert!(
             matches!(
                 output,
                 SpawnAgentOutput::Failed {
+                    agent_id: _,
                     ref error,
                     ref finish_reason,
-                    duration_ms: 0
+                    duration_ms: 500
                 } if finish_reason == "executor_dropped"
                     && error.contains("agent-42")
                     && error.contains("no completion payload")
@@ -3823,6 +3935,7 @@ mod tests {
                 run_id: config.run_id,
                 status: "completed".into(),
                 finish_reason: "normal".into(),
+                cancelled_by_user: None,
                 output: Some("done".into()),
                 error: None,
                 prompt_tokens: 0,
@@ -3905,6 +4018,66 @@ mod tests {
             fanout_slot: None,
             execution_metadata: None,
         }
+    }
+
+    #[tokio::test]
+    async fn fanout_group_limit_rejected_when_all_live() {
+        // When the fanout-groups map is at MAX_FANOUT_GROUPS and every group
+        // is still live (Running), eviction has no terminal candidate and
+        // must surface FanoutGroupLimitExceeded instead of silently growing
+        // the map or evicting a live group.
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        {
+            let mut groups = spawner.fanout_groups.write().await;
+            for i in 0..MAX_FANOUT_GROUPS {
+                let mut g = AgentFanoutGroupProjection::new(
+                    format!("live-group-{i}"),
+                    format!("live {i}"),
+                    1,
+                );
+                g.status = AgentFanoutStatus::Running;
+                groups.insert(format!("live-group-{i}"), g);
+            }
+        }
+        let mut groups = spawner.fanout_groups.write().await;
+        let result = spawner.evict_terminal_fanout_group_if_full(&mut groups);
+        match result {
+            Err(SpawnError::FanoutGroupLimitExceeded { active, limit }) => {
+                assert_eq!(active, MAX_FANOUT_GROUPS);
+                assert_eq!(limit, MAX_FANOUT_GROUPS);
+            }
+            other => panic!("expected FanoutGroupLimitExceeded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_group_evicts_oldest_terminal_when_full() {
+        // At capacity with a mix of live and terminal groups, eviction must
+        // pick the terminal group with the oldest last_touched and leave all
+        // live groups untouched.
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let old = SystemTime::now() - Duration::from_secs(120);
+        {
+            let mut groups = spawner.fanout_groups.write().await;
+            for i in 0..(MAX_FANOUT_GROUPS - 1) {
+                let mut g =
+                    AgentFanoutGroupProjection::new(format!("live-{i}"), format!("live {i}"), 1);
+                g.status = AgentFanoutStatus::Running;
+                groups.insert(format!("live-{i}"), g);
+            }
+            // One terminal group, touched long ago — the eviction target.
+            let mut terminal = AgentFanoutGroupProjection::new("terminal-old", "terminal old", 1);
+            terminal.status = AgentFanoutStatus::Finished;
+            terminal.last_touched = old;
+            groups.insert("terminal-old".to_string(), terminal);
+        }
+        let mut groups = spawner.fanout_groups.write().await;
+        let evicted = spawner
+            .evict_terminal_fanout_group_if_full(&mut groups)
+            .expect("terminal candidate exists, eviction should succeed");
+        assert_eq!(evicted.len(), 0, "terminal group had no settled agents");
+        assert!(!groups.contains_key("terminal-old"));
+        assert_eq!(groups.len(), MAX_FANOUT_GROUPS - 1);
     }
 
     #[tokio::test]
@@ -4060,6 +4233,54 @@ mod tests {
         spawner
             .shutdown_and_wait(std::time::Duration::from_secs(2))
             .await;
+    }
+
+    #[tokio::test]
+    async fn fanout_active_slot_cache_follows_state_transition_delta_once() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let identity =
+            AgentFanoutSlotIdentity::new("review-cache", 1, 0, Some("storage".to_string()))
+                .unwrap();
+
+        spawner
+            .record_fanout_spawn_accepted(
+                &identity,
+                Some("review cache"),
+                "storage@run-1",
+                "explore",
+                "review storage",
+                Some("call-1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            spawner
+                .cached_active_fanout_slots
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "accepted running slot increments active cache"
+        );
+
+        let mut state = completed_test_state(1);
+        state.agent_id = "storage@run-1".to_string();
+        state.fanout_slot = Some(identity);
+        spawner.record_fanout_terminal_state(&state).await;
+        assert_eq!(
+            spawner
+                .cached_active_fanout_slots
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "running -> terminal decrements active cache"
+        );
+
+        spawner.record_fanout_terminal_state(&state).await;
+        assert_eq!(
+            spawner
+                .cached_active_fanout_slots
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "duplicate terminal recording must not decrement the cache again"
+        );
     }
 
     #[tokio::test]

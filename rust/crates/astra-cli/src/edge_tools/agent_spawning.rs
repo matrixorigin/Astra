@@ -42,7 +42,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.contains("no multi-agent executor attached"));
+        assert!(
+            result.contains("multi-agent executor was not attached"),
+            "{result}"
+        );
         assert!(result.contains("\"status\":\"failed\""), "{result}");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&result).unwrap()["error_kind"].as_str(),

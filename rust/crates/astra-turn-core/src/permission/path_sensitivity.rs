@@ -37,6 +37,9 @@ pub struct SensitivePathMatch {
 }
 
 pub fn classify_path_sensitivity(path: &str) -> PathSensitivity {
+    if let Some(kind) = classify_legacy_tool_result_path(path) {
+        return PathSensitivity::InternalArtifactReadOnly(kind);
+    }
     if let Some(kind) = classify_current_session_artifact_path(path) {
         return PathSensitivity::InternalArtifactReadOnly(kind);
     }
@@ -44,6 +47,23 @@ pub fn classify_path_sensitivity(path: &str) -> PathSensitivity {
         return PathSensitivity::Sensitive;
     }
     PathSensitivity::Normal
+}
+
+fn classify_legacy_tool_result_path(path: &str) -> Option<InternalPathKind> {
+    let root = dirs::home_dir()?
+        .join(".astra")
+        .join("tool-results")
+        .canonicalize()
+        .ok()?;
+    let candidate = canonicalize_existing_or_nearest(&expand_home_path(path))?;
+    let relative = candidate.strip_prefix(&root).ok()?;
+    let mut components = relative.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_artifact_file)), None) => {
+            Some(InternalPathKind::SessionToolResult)
+        }
+        _ => None,
+    }
 }
 
 fn classify_current_session_artifact_path(path: &str) -> Option<InternalPathKind> {
@@ -285,6 +305,9 @@ fn segment_has_mutating_verb(command: &str, pos: usize, candidate: &str) -> bool
     let Some(verb) = leading_shell_verb(segment) else {
         return false;
     };
+    if verb == "cp" {
+        return cp_token_is_destination(segment, candidate);
+    }
     if SHELL_MUTATING_VERBS.contains(&verb.as_str()) {
         return true;
     }
@@ -293,6 +316,24 @@ fn segment_has_mutating_verb(command: &str, pos: usize, candidate: &str) -> bool
         return true;
     }
     false
+}
+
+fn cp_token_is_destination(segment: &str, candidate: &str) -> bool {
+    let tokens = shell_like_tokens(segment);
+    let Some(verb_index) = tokens.iter().position(|token| token == "cp") else {
+        return false;
+    };
+    let operands = tokens
+        .iter()
+        .skip(verb_index + 1)
+        .filter(|token| !token.starts_with('-'))
+        .collect::<Vec<_>>();
+    let Some(destination) = operands.last() else {
+        return false;
+    };
+    shell_token_path_candidates(destination)
+        .iter()
+        .any(|path| path == candidate)
 }
 
 fn leading_shell_verb(segment: &str) -> Option<String> {
@@ -432,6 +473,31 @@ fn is_shell_path_start_boundary(ch: char) -> bool {
 mod tests {
     use super::*;
 
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
     fn create_current_session_artifact() -> (
         tempfile::TempDir,
         astra_services::session_journal::JournalDirGuard,
@@ -460,6 +526,15 @@ mod tests {
         (temp, guard, journal_path)
     }
 
+    fn create_legacy_tool_result() -> (tempfile::TempDir, EnvGuard, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let guard = EnvGuard::set("HOME", temp.path());
+        let artifact_path = temp.path().join(".astra/tool-results/call_abc.txt");
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, "persisted output").unwrap();
+        (temp, guard, artifact_path)
+    }
+
     #[test]
     fn classifies_internal_tool_results_as_read_only_artifacts() {
         let (_temp, _guard, artifact_path) = create_current_session_artifact();
@@ -471,6 +546,41 @@ mod tests {
         );
         assert!(path_requires_sensitive_gate(&artifact_path, PathAccess::Read).is_none());
         assert!(path_requires_sensitive_gate(&artifact_path, PathAccess::Write).is_some());
+    }
+
+    #[test]
+    fn classifies_legacy_global_tool_results_as_read_only_artifacts() {
+        let (_temp, _guard, artifact_path) = create_legacy_tool_result();
+        let artifact_path = artifact_path.to_string_lossy();
+
+        assert_eq!(
+            classify_path_sensitivity(&artifact_path),
+            PathSensitivity::InternalArtifactReadOnly(InternalPathKind::SessionToolResult)
+        );
+        assert!(path_requires_sensitive_gate(&artifact_path, PathAccess::Read).is_none());
+        assert!(path_requires_sensitive_gate(&artifact_path, PathAccess::Write).is_some());
+
+        let args = serde_json::json!({
+            "command": format!("cat {artifact_path}")
+        });
+        assert_eq!(sensitive_path_match_for_tool_args("bash", &args), None);
+
+        let args = serde_json::json!({
+            "command": format!("cp {artifact_path} /tmp/astra-tool-result-copy.txt")
+        });
+        assert_eq!(
+            sensitive_path_match_for_tool_args("bash", &args),
+            None,
+            "copying an internal artifact out reads the artifact; it does not mutate it"
+        );
+
+        let args = serde_json::json!({
+            "command": format!("cp /tmp/source.txt {artifact_path}")
+        });
+        assert!(
+            sensitive_path_match_for_tool_args("bash", &args).is_some(),
+            "copying into an internal artifact mutates runtime-owned state and must gate"
+        );
     }
 
     #[test]
