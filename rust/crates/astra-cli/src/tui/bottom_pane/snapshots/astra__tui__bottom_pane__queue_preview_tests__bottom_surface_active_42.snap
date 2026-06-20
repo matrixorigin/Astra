@@ -2,6 +2,6 @@
 source: crates/astra-cli/src/tui/bottom_pane/queue_preview_tests.rs
 expression: "snapshot_text(&pane, Rect::new(0, 0, 42, 5))"
 ---
-· Message astra                           
-  Queued for next tool · Ctrl+C stops     
+· Message astra
+  Enter queues for next tool · Ctrl+C sto…
   sonnet-4.6 · Ask · ~/github/astra

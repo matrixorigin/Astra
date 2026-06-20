@@ -6,7 +6,7 @@ describe('compactComposerPlaceholder', () => {
   });
 
   it('uses short visual copy for deferred input on narrow screens', () => {
-    expect(compactComposerPlaceholder('Queue a follow-up for the next tool call...')).toBe('Queue follow-up...');
+    expect(compactComposerPlaceholder('Queue a follow-up for the next execution boundary...')).toBe('Queue follow-up...');
   });
 
   it('uses short visual copy for paused and stopping runs', () => {

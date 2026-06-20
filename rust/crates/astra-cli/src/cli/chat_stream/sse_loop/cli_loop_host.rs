@@ -242,8 +242,10 @@ fn deferred_input_status_line(input: &Value) -> Option<String> {
         .or_else(|| input.as_str())
         .map(str::trim)
         .filter(|text| !text.is_empty())?;
-    let mut preview: String = text.replace('\n', " ↩ ").chars().take(80).collect();
-    if text.replace('\n', " ↩ ").chars().count() > 80 {
+    let trimmed = text.trim();
+    let single_line = trimmed.replace('\n', crate::DEFERRED_INPUT_FINGERPRINT_SEP);
+    let mut preview: String = single_line.chars().take(80).collect();
+    if single_line.chars().count() > 80 {
         preview.push_str("...");
     }
     Some(format!("__deferred_input_applied__:{preview}"))

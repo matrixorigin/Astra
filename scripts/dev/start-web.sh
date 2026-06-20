@@ -91,7 +91,7 @@ nohup env \
     ASTRA_NEXT_DIST_DIR="$NEXT_DIST_DIR" \
     PORT="$WEB_PORT" \
     bash -lc 'cd "$1"; shift; exec "$@"' bash "$WEB_DIR" \
-    node "$NEXT_BIN" dev --hostname "$WEB_HOST" --port "$WEB_PORT" \
+	node "$NEXT_BIN" dev --webpack --hostname "$WEB_HOST" --port "$WEB_PORT" \
     </dev/null \
     >> "$LOG_FILE" 2>&1 &
 PID=$!

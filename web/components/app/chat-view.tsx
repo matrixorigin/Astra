@@ -338,6 +338,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   const [resumingRun, setResumingRun] = useState(false);
   const [stoppingRun, setStoppingRun] = useState(false);
   const [runAttachRetrySignal, setRunAttachRetrySignal] = useState(0);
+  const [lastQueuedText, setLastQueuedText] = useState<string | undefined>();
 
   // ── work surface ───────────────────────────────────────────────────────────
   const [workSurface, setWorkSurface] = useState(() =>
@@ -383,6 +384,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     queueingDeferredInput,
     resumingRun,
     stoppingRun,
+    lastQueuedText,
   });
 
   // ── hooks ──────────────────────────────────────────────────────────────────
@@ -455,6 +457,18 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   );
 
   // ── effects ────────────────────────────────────────────────────────────────
+
+  // Clear last-queued text only when the active run is gone or terminal.
+  // Transient status flips such as input-queued -> running -> input-queued
+  // should keep the user's queued preview available.
+  useEffect(() => {
+    if (
+      lastQueuedText &&
+      (!detail.activeRun?.runId || isTerminalChatRunStatus(activeRunStatus))
+    ) {
+      setLastQueuedText(undefined);
+    }
+  }, [activeRunStatus, detail.activeRun?.runId, lastQueuedText]);
 
   // Cleanup on unmount
   useEffect(
@@ -739,7 +753,13 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
                   }
                   onSubmit={async ({ text, options }) => {
                     if (canQueueDeferredInput) {
-                      await stream.queueDeferredInput({ text, options });
+                      try {
+                        await stream.queueDeferredInput({ text, options });
+                        setLastQueuedText(text);
+                      } catch (error) {
+                        // API failed — don't show "queued" in UI
+                        console.error("Failed to queue deferred input:", error);
+                      }
                       return;
                     }
                     void stream.startStream({

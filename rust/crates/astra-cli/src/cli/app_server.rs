@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::cli::chat_stream::{ApprovalRequest, ApprovalResponse, StreamEvent};
 use crate::cli::cli_config::cli_utils::get_profile_and_token;
 use crate::cli::permission_manager::{PermissionLoadPolicy, PermissionManager, PermissionMode};
+use crate::cli::session::session_continuation::load_session_messages_for_continuation;
 use crate::cli::session::session_runtime;
 use crate::cli::stream::streaming_types::StreamResult;
 use crate::{ExplainMode, cli::chat_stream::BasicCliChatContext};
@@ -454,7 +455,9 @@ async fn run_turn(
         .map(str::to_string)
         .or(developer_instructions)
         .or(ctx.system_prompt.clone());
+    let continuation_messages = app_server_continuation_messages(&thread_id);
     let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
+        pre_loaded_messages: continuation_messages,
         append_system_prompt,
         cancel_token: Some(cancel),
         approval_request_tx: Some(approval_tx.clone()),
@@ -542,6 +545,10 @@ fn next_thread_id_after_turn(thread_id: &str, session_id: Option<&str>) -> Strin
         Some("") | None => thread_id.to_string(),
         Some(session_id) => session_id.to_string(),
     }
+}
+
+fn app_server_continuation_messages(thread_id: &str) -> Option<Vec<serde_json::Value>> {
+    load_session_messages_for_continuation(thread_id)
 }
 
 fn developer_instructions(params: &Value) -> Option<String> {
@@ -956,6 +963,21 @@ mod tests {
         assert_eq!(
             next_thread_id_after_turn("temp-thread", None),
             "temp-thread"
+        );
+    }
+
+    #[test]
+    fn app_server_turn_options_wire_continuation_messages() {
+        let src = include_str!("app_server.rs");
+        assert!(
+            src.contains(
+                "let continuation_messages = app_server_continuation_messages(&thread_id);"
+            ),
+            "app-server must load continuation messages for the active thread before each turn"
+        );
+        assert!(
+            src.contains("pre_loaded_messages: continuation_messages"),
+            "app-server must pass thread continuation messages into BasicCliTurnOptions"
         );
     }
 

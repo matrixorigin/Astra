@@ -18,6 +18,8 @@ use astra_services::session_journal;
 use clap::Parser;
 use crossterm::style::Stylize;
 
+pub(crate) use astra_cli::DEFERRED_INPUT_FINGERPRINT_SEP;
+
 mod edge_tools;
 mod git_branch_cache;
 mod manifest_loader;

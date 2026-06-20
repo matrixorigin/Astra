@@ -1,4 +1,4 @@
-import { deriveChatRunUiState } from '@/lib/chat-run-state';
+import { compactQueuedText, deriveChatRunUiState } from '@/lib/chat-run-state';
 import type { ChatDetail } from '@/lib/api/types';
 
 const base = {
@@ -30,12 +30,12 @@ function waitingRun(
 
 describe('deriveChatRunUiState', () => {
   it('allows queued follow-up input for active queueable statuses', () => {
-    for (const status of ['running', 'input-queued', 'waiting']) {
+    for (const status of ['running', 'input-queued', 'waiting', 'blocked']) {
       const ui = deriveChatRunUiState({ ...base, activeRun: run(status) });
 
       expect(ui.canQueueDeferredInput).toBe(true);
       expect(ui.composerDisabled).toBe(false);
-      expect(ui.composerPlaceholder).toBe('Queue a follow-up for the next tool call...');
+      expect(ui.composerPlaceholder).toBe('Queue a follow-up for the next execution boundary...');
     }
   });
 
@@ -117,5 +117,16 @@ describe('deriveChatRunUiState', () => {
 
     expect(ui.activeRunLabel).toBe('Archived');
     expect(ui.composerDisabled).toBe(false);
+  });
+});
+
+describe('compactQueuedText', () => {
+  it('does not split surrogate pairs while truncating queued text', () => {
+    const preview = compactQueuedText(`${'a'.repeat(56)}🌍 trailing text`);
+    const beforeEllipsis = preview.endsWith('…') ? preview.slice(0, -1) : preview;
+    const lastCodeUnit = beforeEllipsis.charCodeAt(beforeEllipsis.length - 1);
+
+    expect(preview.endsWith('…')).toBe(true);
+    expect(lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff).toBe(false);
   });
 });

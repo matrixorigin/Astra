@@ -957,7 +957,7 @@ describe("ChatView deferred-input unhappy paths", () => {
       />,
     );
 
-    expect(screen.getAllByText("Input queued").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Follow-up Queued").length).toBeGreaterThan(0);
 
     await user.click(screen.getByRole("button", { name: "Submit composer" }));
 

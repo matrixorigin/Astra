@@ -25,6 +25,11 @@
     clippy::unnecessary_mut_passed
 )]
 
+/// Separator used when rendering multi-line deferred input fingerprints into
+/// one status-line preview. Defined in `astra-cli` as it's only used by the
+/// CLI TUI and server status-line rendering.
+pub const DEFERRED_INPUT_FINGERPRINT_SEP: &str = " ↩ ";
+
 // ═══════════════════════════ Top-level utility modules ═══════════════════
 pub mod diff_utils;
 pub mod edge_tools;

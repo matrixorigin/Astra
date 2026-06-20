@@ -57,6 +57,7 @@ function statusLabel(status: string): string {
 function activeRunDisplayLabel(
   run: ChatDetail["activeRun"],
   archived: boolean,
+  lastQueuedText?: string,
 ): string {
   const status = normalizeChatRunStatus(run?.status);
   const waitingFor = run?.waitingFor?.trim();
@@ -67,7 +68,11 @@ function activeRunDisplayLabel(
     return "Stopping";
   }
   if (status === "input-queued") {
-    return "Input Queued";
+    const base = "Follow-up Queued";
+    if (lastQueuedText) {
+      return `${base}: "${compactQueuedText(lastQueuedText)}"`;
+    }
+    return base;
   }
   if (status === "blocked") {
     return waitingFor ? `Blocked: ${statusLabel(waitingFor)}` : "Blocked";
@@ -112,6 +117,7 @@ export function deriveChatRunUiState(params: {
   queueingDeferredInput: boolean;
   resumingRun: boolean;
   stoppingRun: boolean;
+  lastQueuedText?: string;
 }): ChatRunUiState {
   const activeRunStatus = normalizeChatRunStatus(params.activeRun?.status);
   const hasActiveRun = Boolean(params.activeRun?.runId && activeRunStatus);
@@ -146,11 +152,12 @@ export function deriveChatRunUiState(params: {
         : activeRunBlocksNewInput
           ? `Run status is ${params.activeRun?.status ?? "unknown"}. Stop it or refresh before sending.`
           : canQueueDeferredInput
-            ? "Queue a follow-up for the next tool call..."
+            ? "Queue a follow-up for the next execution boundary..."
             : "Reply to Astra...";
   const activeRunLabel = activeRunDisplayLabel(
     params.activeRun,
     params.archived,
+    params.lastQueuedText,
   );
 
   return {
@@ -164,4 +171,15 @@ export function deriveChatRunUiState(params: {
     composerPlaceholder,
     activeRunLabel,
   };
+}
+
+/// Preview a user's last queued text to show in the run status label.
+/// Truncates at ~60 characters to fit in the activity bar.
+export function compactQueuedText(text: string): string {
+  const singleLine = text.trim().replace(/\s+/g, " ");
+  const chars = Array.from(singleLine);
+  if (chars.length <= 60) {
+    return singleLine;
+  }
+  return `${chars.slice(0, 57).join("")}…`;
 }
