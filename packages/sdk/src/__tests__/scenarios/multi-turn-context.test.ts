@@ -43,7 +43,7 @@ describe('scenarios / multi-turn context wire contract', () => {
       message: 'continue from the last failed migration',
       sessionId: 'sess-multi-1',
       agentId: 'agent-planner',
-      model: 'claude-sonnet-4.6',
+      selectedModel: { model: 'claude-sonnet-4.6' },
       context: {
         previousTurns: [
           { role: 'user', content: 'migrate auth table' },
@@ -66,7 +66,7 @@ describe('scenarios / multi-turn context wire contract', () => {
       message: 'continue from the last failed migration',
       session_id: 'sess-multi-1',
       agent_id: 'agent-planner',
-      model: 'claude-sonnet-4.6',
+      selected_model: { model: 'claude-sonnet-4.6' },
       context: {
         previousTurns: [
           { role: 'user', content: 'migrate auth table' },

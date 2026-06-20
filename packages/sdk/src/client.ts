@@ -1,5 +1,8 @@
 import type {
   AstraClientConfig,
+  AgentBindingCreateRequest,
+  AgentBindingCreateResponse,
+  AgentBindingRecord,
   ApprovalRespondRequestBody,
   AuthResult,
   ChatRequest,
@@ -15,6 +18,9 @@ import type {
   EventResponse,
   MemoryEntry,
   MemorySearchResult,
+  ModelGatewayCreateRequest,
+  ModelGatewayCreateResponse,
+  ModelGatewayRecord,
   ReflectQueryParams,
   ReflectReport,
   RegisterSkillBody,
@@ -52,6 +58,7 @@ import type {
 } from "./types";
 import {
   ASTRA_EDGE_ID_HEADER,
+  PATH_AGENT_BINDINGS,
   PATH_AGENTS_EDGE,
   PATH_AGENTS_EDGE_HEARTBEAT,
   PATH_APPROVAL_RESPOND,
@@ -69,11 +76,14 @@ import {
   PATH_MEMORY_SEARCH,
   PATH_MEMORY_STORE,
   PATH_MODELS,
+  PATH_MODEL_GATEWAYS,
   PATH_RUNS,
   PATH_SESSIONS,
   PATH_SKILLS,
   PATH_SKILLS_PUBLISH,
   PATH_TOOLS_RESULT,
+  agentBindingDisablePath,
+  agentBindingPath,
   buildQueryString,
   chatRunDelegatePath,
   chatRunDelegationsPath,
@@ -90,6 +100,8 @@ import {
   eventsCausalChainPath,
   eventsSessionPath,
   joinApiPath,
+  modelGatewayDisablePath,
+  modelGatewayPath,
   sessionActivityPath,
   sessionArtifactsPath,
   sessionAuditSummaryPath,
@@ -107,6 +119,7 @@ import {
 } from "./paths";
 import { SSEClient, parseSseDataEvents } from "./sse-client";
 import { headersInitToRecord, readAstraErrorDetail } from "./http";
+import { selectedModelToWire } from "./wire";
 
 type SessionWire = RuntimeSessionResponse;
 type SessionListWire = RuntimeSessionListResponse;
@@ -199,7 +212,10 @@ function normalizeEventList(raw: EventListResponse): EventListResponse {
 export function chatRequestToWire(req: ChatRequest): Record<string, unknown> {
   const body: Record<string, unknown> = {
     message: req.message,
+    selected_model: selectedModelToWire(req.selectedModel),
   };
+  if (req.parts) body.parts = req.parts;
+  if (req.attachments) body.attachments = req.attachments;
   if (req.executionBudget) {
     body.execution_budget = {
       initial_turns: req.executionBudget.initialTurns,
@@ -208,7 +224,21 @@ export function chatRequestToWire(req: ChatRequest): Record<string, unknown> {
   }
   if (req.sessionId) body.session_id = req.sessionId;
   if (req.agentId) body.agent_id = req.agentId;
-  if (req.model) body.model = req.model;
+  if (req.agentBinding) {
+    body.agent_binding = {
+      id: req.agentBinding.id,
+      capability_server_refs: {
+        mcp: req.agentBinding.capabilityServerRefs.mcp,
+        skills: req.agentBinding.capabilityServerRefs.skills,
+      },
+    };
+  }
+  if (req.runtimeAuth) {
+    body.runtime_auth = {
+      authorization: req.runtimeAuth.authorization,
+    };
+  }
+  if (req.runtimeProfile) body.runtime_profile = req.runtimeProfile;
   if (req.context) body.context = req.context;
   if (req.explain !== undefined) body.explain = req.explain;
   if (req.planSubtaskId) body.plan_subtask_id = req.planSubtaskId;
@@ -809,6 +839,48 @@ export class AstraClient {
     return items.filter(
       (model): model is RuntimeModelListItem =>
         Boolean(model) && typeof model === "object",
+    );
+  }
+
+  // ─── Agent Binding Registry ───────────────────────────────────────
+
+  async createAgentBinding(
+    body: AgentBindingCreateRequest,
+  ): Promise<AgentBindingCreateResponse> {
+    return this.post<AgentBindingCreateResponse>(PATH_AGENT_BINDINGS, body);
+  }
+
+  async getAgentBinding(agentBindingId: string): Promise<AgentBindingRecord> {
+    return this.fetch<AgentBindingRecord>(agentBindingPath(agentBindingId));
+  }
+
+  async disableAgentBinding(
+    agentBindingId: string,
+  ): Promise<AgentBindingRecord> {
+    return this.post<AgentBindingRecord>(
+      agentBindingDisablePath(agentBindingId),
+      {},
+    );
+  }
+
+  // ─── Model Gateway Registry ───────────────────────────────────────
+
+  async createModelGateway(
+    body: ModelGatewayCreateRequest,
+  ): Promise<ModelGatewayCreateResponse> {
+    return this.post<ModelGatewayCreateResponse>(PATH_MODEL_GATEWAYS, body);
+  }
+
+  async getModelGateway(modelGatewayId: string): Promise<ModelGatewayRecord> {
+    return this.fetch<ModelGatewayRecord>(modelGatewayPath(modelGatewayId));
+  }
+
+  async disableModelGateway(
+    modelGatewayId: string,
+  ): Promise<ModelGatewayRecord> {
+    return this.post<ModelGatewayRecord>(
+      modelGatewayDisablePath(modelGatewayId),
+      {},
     );
   }
 

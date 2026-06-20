@@ -102,6 +102,14 @@ pub(super) fn build_core_state(
         DatabaseMcpRegistryService::new(settings.matrixone.clone(), Arc::clone(shared_encryptor))
             .with_pool(shared_pool.clone()),
     ))
+    .with_agent_binding_service(Arc::new(
+        astra_services::DatabaseAgentBindingService::new(settings.matrixone.clone())
+            .with_pool(shared_pool.clone()),
+    ))
+    .with_model_gateway_service(Arc::new(
+        astra_services::DatabaseModelGatewayService::new(settings.matrixone.clone())
+            .with_pool(shared_pool.clone()),
+    ))
     .with_llm_trusted_domain_service(Arc::new(
         astra_services::DatabaseLlmTrustedDomainService::new(settings.matrixone.clone())
             .with_pool(shared_pool.clone()),

@@ -273,6 +273,7 @@ mod tests {
             context_manifest_pool: None,
             context_manifest_user_id: None,
             context_manifest_model_name: None,
+            runtime_manifest: None,
             recursion_depth: 0,
             final_text: String::new(),
             final_text_streamed: false,

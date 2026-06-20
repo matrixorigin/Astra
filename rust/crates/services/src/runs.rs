@@ -334,13 +334,62 @@ impl std::fmt::Debug for RuntimeMcpBindingRequest {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectedModelRequest {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityServerRefs {
+    pub mcp: String,
+    pub skills: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBindingRuntimeRequest {
+    pub id: String,
+    pub capability_server_refs: CapabilityServerRefs,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeAuthRequest {
+    pub authorization: String,
+}
+
+impl std::fmt::Debug for RuntimeAuthRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeAuthRequest")
+            .field("authorization_present", &!self.authorization.is_empty())
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeProfileRequest {
+    RequestScopedRuntimeMcp,
+    AgentBindingRegistry,
+}
+
 #[derive(Clone, PartialEq)]
 pub struct ChatRequestData {
     pub message: String,
+    pub parts: Vec<serde_json::Value>,
+    pub attachments: Vec<serde_json::Value>,
     pub session_id: Option<String>,
     pub full_llm_capture: bool,
     pub agent_id: Option<String>,
     pub model: Option<String>,
+    pub selected_model: Option<SelectedModelRequest>,
+    pub agent_binding: Option<AgentBindingRuntimeRequest>,
+    pub runtime_auth: Option<RuntimeAuthRequest>,
+    pub runtime_profile: Option<RuntimeProfileRequest>,
     pub llm_token_service: Option<LlmTokenServiceConfig>,
     pub skill_search: Option<astra_core::SkillSearchSettings>,
     pub allow_skills: Option<Vec<String>>,
@@ -351,6 +400,8 @@ pub struct ChatRequestData {
     pub runtime_mcp_bindings: Vec<RuntimeMcpBindingRequest>,
     pub mcp_binding_ids: Option<Vec<i64>>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
+    pub edge_executor_id: Option<String>,
+    pub capabilities: Vec<String>,
     pub forward_headers: std::collections::HashMap<String, String>,
     pub execution_budget: Option<ExecutionBudget>,
     pub explain: bool,
@@ -384,9 +435,15 @@ impl std::fmt::Debug for ChatRequestData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChatRequestData")
             .field("message", &self.message)
+            .field("parts", &self.parts)
+            .field("attachments", &self.attachments)
             .field("session_id", &self.session_id)
             .field("agent_id", &self.agent_id)
             .field("model", &self.model)
+            .field("selected_model", &self.selected_model)
+            .field("agent_binding", &self.agent_binding)
+            .field("runtime_auth", &self.runtime_auth)
+            .field("runtime_profile", &self.runtime_profile)
             .field("llm_token_service", &self.llm_token_service)
             .field("skill_search", &self.skill_search)
             .field("allow_skills", &self.allow_skills)
@@ -397,6 +454,8 @@ impl std::fmt::Debug for ChatRequestData {
             .field("runtime_mcp_bindings", &self.runtime_mcp_bindings)
             .field("deprecated_mcp_binding_ids", &self.mcp_binding_ids)
             .field("context", &self.context)
+            .field("edge_executor_id", &self.edge_executor_id)
+            .field("capabilities", &self.capabilities)
             .field(
                 "forward_headers",
                 &RedactedForwardHeadersDebug(&self.forward_headers),
@@ -547,6 +606,14 @@ pub struct DurableRunRecord {
     pub total_prompt_tokens: u64,
     pub total_completion_tokens: u64,
     pub total_tool_calls: u32,
+    pub agent_binding_id: Option<String>,
+    pub agent_binding_name: Option<String>,
+    pub agent_binding_schema_version: Option<String>,
+    pub selected_model_json: Option<String>,
+    pub selected_model_name: Option<String>,
+    pub selected_model_gateway: Option<String>,
+    pub capability_server_refs_json: Option<String>,
+    pub runtime_profile: Option<String>,
     pub events: Vec<serde_json::Value>,
     pub created_at: String,
     pub updated_at: String,
@@ -2031,8 +2098,11 @@ impl RunStateStore for DatabaseRunStateStore {
                   delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
                   owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx,
                   checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
-                  total_prompt_tokens, total_completion_tokens, total_tool_calls, created_at, updated_at)
-                 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6)
+                  total_prompt_tokens, total_completion_tokens, total_tool_calls,
+                  agent_binding_id, agent_binding_name, agent_binding_schema_version,
+                  selected_model_json, selected_model_name, selected_model_gateway,
+                  capability_server_refs_json, runtime_profile, created_at, updated_at)
+                 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6)
                  FROM DUAL
                  WHERE NOT EXISTS (
                      SELECT 1
@@ -2068,6 +2138,14 @@ impl RunStateStore for DatabaseRunStateStore {
             .bind(record.total_prompt_tokens as i64)
             .bind(record.total_completion_tokens as i64)
             .bind(record.total_tool_calls as i64)
+            .bind(&record.agent_binding_id)
+            .bind(&record.agent_binding_name)
+            .bind(&record.agent_binding_schema_version)
+            .bind(&record.selected_model_json)
+            .bind(&record.selected_model_name)
+            .bind(&record.selected_model_gateway)
+            .bind(&record.capability_server_refs_json)
+            .bind(&record.runtime_profile)
             .bind(&record.user_id)
             .bind(&record.session_id)
             .execute(self.pool.get())
@@ -2080,8 +2158,11 @@ impl RunStateStore for DatabaseRunStateStore {
                   delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
                   owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx,
                   checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
-                  total_prompt_tokens, total_completion_tokens, total_tool_calls, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
+                  total_prompt_tokens, total_completion_tokens, total_tool_calls,
+                  agent_binding_id, agent_binding_name, agent_binding_schema_version,
+                  selected_model_json, selected_model_name, selected_model_gateway,
+                  capability_server_refs_json, runtime_profile, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
                  ON DUPLICATE KEY UPDATE updated_at = NOW(6)",
             )
             .bind(&record.run_id)
@@ -2109,6 +2190,14 @@ impl RunStateStore for DatabaseRunStateStore {
             .bind(record.total_prompt_tokens as i64)
             .bind(record.total_completion_tokens as i64)
             .bind(record.total_tool_calls as i64)
+            .bind(&record.agent_binding_id)
+            .bind(&record.agent_binding_name)
+            .bind(&record.agent_binding_schema_version)
+            .bind(&record.selected_model_json)
+            .bind(&record.selected_model_name)
+            .bind(&record.selected_model_gateway)
+            .bind(&record.capability_server_refs_json)
+            .bind(&record.runtime_profile)
             .execute(self.pool.get())
             .await
             .map_err(|source| db_error("insert_run", &record.run_id, source).to_string())?
@@ -2661,6 +2750,14 @@ fn run_record_from_row(row: sqlx::mysql::MySqlRow) -> DbStoreResult<DurableRunRe
             .try_get::<i64, _>("total_tool_calls")
             .unwrap_or(0)
             .max(0) as u32,
+        agent_binding_id: row.try_get("agent_binding_id").ok(),
+        agent_binding_name: row.try_get("agent_binding_name").ok(),
+        agent_binding_schema_version: row.try_get("agent_binding_schema_version").ok(),
+        selected_model_json: row.try_get("selected_model_json").ok(),
+        selected_model_name: row.try_get("selected_model_name").ok(),
+        selected_model_gateway: row.try_get("selected_model_gateway").ok(),
+        capability_server_refs_json: row.try_get("capability_server_refs_json").ok(),
+        runtime_profile: row.try_get("runtime_profile").ok(),
         events: Vec::new(),
         created_at: datetime_string(&row, "created_at").unwrap_or_default(),
         updated_at: datetime_string(&row, "updated_at").unwrap_or_default(),
@@ -3316,6 +3413,14 @@ mod tests {
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
             total_tool_calls: 0,
+            agent_binding_id: None,
+            agent_binding_name: None,
+            agent_binding_schema_version: None,
+            selected_model_json: None,
+            selected_model_name: None,
+            selected_model_gateway: None,
+            capability_server_refs_json: None,
+            runtime_profile: None,
             events: vec![],
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
@@ -3939,9 +4044,15 @@ mod tests {
 
         let request = ChatRequestData {
             message: "hi".to_string(),
+            parts: Vec::new(),
+            attachments: Vec::new(),
             session_id: Some("sess-1".to_string()),
             agent_id: None,
             model: None,
+            selected_model: None,
+            agent_binding: None,
+            runtime_auth: None,
+            runtime_profile: None,
             llm_token_service: None,
             skill_search: None,
             allow_skills: None,
@@ -3952,6 +4063,8 @@ mod tests {
             runtime_mcp_bindings: Vec::new(),
             mcp_binding_ids: None,
             context: None,
+            edge_executor_id: None,
+            capabilities: Vec::new(),
             forward_headers,
             execution_budget: Some(ExecutionBudget {
                 initial_turns: Some(10),
@@ -3969,6 +4082,65 @@ mod tests {
         assert!(!rendered.contains("Bearer secret-token"));
         assert!(!rendered.contains("ws-123"));
         assert!(!rendered.contains("__astra_connection_tokens"));
+    }
+
+    #[test]
+    fn runtime_auth_request_debug_redacts_authorization_value() {
+        let runtime_auth = RuntimeAuthRequest {
+            authorization: "Bearer secret-runtime-token".to_string(),
+        };
+
+        let rendered = format!("{runtime_auth:?}");
+
+        assert!(rendered.contains("authorization_present"));
+        assert!(!rendered.contains("secret-runtime-token"));
+        assert!(!rendered.contains("Bearer"));
+    }
+
+    #[test]
+    fn chat_request_data_debug_redacts_runtime_auth_value() {
+        let request = ChatRequestData {
+            message: "hi".to_string(),
+            parts: Vec::new(),
+            attachments: Vec::new(),
+            session_id: Some("sess-1".to_string()),
+            agent_id: None,
+            model: None,
+            selected_model: Some(SelectedModelRequest {
+                model: "gpt-4".to_string(),
+                gateway: Some("primary-gateway".to_string()),
+            }),
+            agent_binding: None,
+            runtime_auth: Some(RuntimeAuthRequest {
+                authorization: "Bearer secret-runtime-token".to_string(),
+            }),
+            runtime_profile: None,
+            llm_token_service: None,
+            skill_search: None,
+            allow_skills: None,
+            allow_skill_sources: None,
+            allow_tools: None,
+            workspace_binding: None,
+            executor_binding: None,
+            runtime_mcp_bindings: Vec::new(),
+            mcp_binding_ids: None,
+            context: None,
+            edge_executor_id: None,
+            capabilities: Vec::new(),
+            forward_headers: std::collections::HashMap::new(),
+            execution_budget: None,
+            full_llm_capture: false,
+            explain: false,
+            interaction_mode: None,
+            interactive_client: false,
+        };
+
+        let rendered = format!("{request:?}");
+
+        assert!(rendered.contains("RuntimeAuthRequest"));
+        assert!(rendered.contains("authorization_present"));
+        assert!(!rendered.contains("secret-runtime-token"));
+        assert!(!rendered.contains("Bearer secret-runtime-token"));
     }
 
     #[test]
@@ -4010,9 +4182,15 @@ mod tests {
                 "u1".to_string(),
                 ChatRequestData {
                     message: "hi".to_string(),
+                    parts: Vec::new(),
+                    attachments: Vec::new(),
                     session_id: None,
                     agent_id: None,
                     model: None,
+                    selected_model: None,
+                    agent_binding: None,
+                    runtime_auth: None,
+                    runtime_profile: None,
                     llm_token_service: None,
                     skill_search: None,
                     allow_skills: None,
@@ -4023,6 +4201,8 @@ mod tests {
                     runtime_mcp_bindings: Vec::new(),
                     mcp_binding_ids: None,
                     context: None,
+                    edge_executor_id: None,
+                    capabilities: Vec::new(),
                     forward_headers: std::collections::HashMap::new(),
                     execution_budget: Some(ExecutionBudget {
                         initial_turns: Some(25),
@@ -4078,6 +4258,14 @@ mod tests {
                 total_prompt_tokens: 0,
                 total_completion_tokens: 0,
                 total_tool_calls: 0,
+                agent_binding_id: None,
+                agent_binding_name: None,
+                agent_binding_schema_version: None,
+                selected_model_json: None,
+                selected_model_name: None,
+                selected_model_gateway: None,
+                capability_server_refs_json: None,
+                runtime_profile: None,
                 events: vec![],
                 created_at: chrono::Utc::now().to_rfc3339(),
                 updated_at: chrono::Utc::now().to_rfc3339(),

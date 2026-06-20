@@ -50,7 +50,6 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
         "messages": messages,
         "session_id": session_id,
         "agent_id": agent_id,
-        "model": model,
         "interaction_mode": interaction_mode,
         "explain": chat_turn_explain_field_json(explain_verbose, explain_on),
         "edge_executor_id": edge_executor_id,
@@ -61,6 +60,16 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
             detect_workspace_context(project_root),
         ),
     });
+    if let Some(model) = model
+        && let Some(obj) = payload.as_object_mut()
+    {
+        obj.insert(
+            "selected_model".to_string(),
+            json!({
+                "model": model,
+            }),
+        );
+    }
     if thinking.is_enabled() {
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("thinking".to_string(), thinking.to_payload_value());
@@ -170,7 +179,8 @@ mod tests {
         assert_eq!(p["messages"], json!(msgs));
         assert_eq!(p["session_id"], Value::Null);
         assert_eq!(p["agent_id"], "test-agent");
-        assert_eq!(p["model"], "gpt-test");
+        assert!(p.get("model").is_none());
+        assert_eq!(p["selected_model"]["model"], "gpt-test");
         assert_eq!(p["interaction_mode"], "auto");
         assert_eq!(p["explain"], json!(true));
         assert_eq!(p["edge_executor_id"], "edge-unit");

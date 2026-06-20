@@ -43,7 +43,10 @@ describe('scenarios / workspace stream', () => {
     } as unknown as Response);
 
     const client = new AstraClient({ baseUrl: 'http://localhost:8000', accessToken: 'at' });
-    const sse = client.streamChat({ message: 'hi' }, { onEvent: (e: StreamEvent) => order.push(e.type) });
+    const sse = client.streamChat(
+      { message: 'hi', selectedModel: { model: 'gpt' } },
+      { onEvent: (e: StreamEvent) => order.push(e.type) },
+    );
     await new Promise((r) => setTimeout(r, 120));
     sse.close();
     expect(order).toEqual(['session_info', 'text_delta', 'text_delta', 'usage', 'turn_complete']);
@@ -79,7 +82,10 @@ describe('scenarios / tool loop', () => {
     globalThis.fetch = fetchImpl;
 
     const client = new AstraClient({ baseUrl: 'http://localhost:8000', accessToken: 't' });
-    const sse = client.streamChat({ message: 'run tool' }, { onEvent: (e: StreamEvent) => seq.push(e.type) });
+    const sse = client.streamChat(
+      { message: 'run tool', selectedModel: { model: 'gpt' } },
+      { onEvent: (e: StreamEvent) => seq.push(e.type) },
+    );
     await new Promise((r) => setTimeout(r, 100));
     sse.close();
     expect(seq).toEqual(['text_delta', 'tool_call_start', 'tool_call_end', 'turn_complete']);
@@ -259,7 +265,10 @@ describe('scenarios / error ordering (turn_complete then error)', () => {
     } as unknown as Response);
 
     const client = new AstraClient({ baseUrl: 'http://localhost:8000', accessToken: 't' });
-    const sse = client.streamChat({ message: 'x' }, { onEvent: (e: StreamEvent) => types.push(e.type) });
+    const sse = client.streamChat(
+      { message: 'x', selectedModel: { model: 'gpt' } },
+      { onEvent: (e: StreamEvent) => types.push(e.type) },
+    );
     await new Promise((r) => setTimeout(r, 80));
     sse.close();
     expect(types).toEqual(['turn_complete', 'error']);

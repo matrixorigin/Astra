@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod admin_config;
+pub mod agent_bindings;
 pub mod agent_lessons;
 pub mod agents;
 pub mod artifact_policy;
@@ -28,12 +29,15 @@ pub mod llm_trusted_domains;
 pub mod marketplace;
 pub mod marketplace_stats;
 pub mod mcp_registry;
+pub mod model_gateways;
 pub mod models;
 pub mod multi_agent;
 pub mod pagination;
 pub mod personal_skills;
 pub mod prompt_delta;
 pub mod reflect;
+pub(crate) mod registry_payload;
+pub use registry_payload::validate_registered_endpoint_url;
 pub mod replay;
 pub mod resource_governor;
 pub mod runs;
@@ -102,6 +106,12 @@ pub use admin::{
 pub use admin_config::{
     ADMIN_CONFIG_ALLOWED_KEYS, ADMIN_CONFIG_KEY_REASONING_MODEL, AdminConfigService,
     DatabaseAdminConfigService, UnconfiguredAdminConfigService,
+};
+pub use agent_bindings::{
+    AgentBindingCreateRequestData, AgentBindingPayload, AgentBindingRecord, AgentBindingService,
+    AgentBindingStatus, CapabilityServerEndpoint, CapabilityServerTransport, CapabilityServerType,
+    DatabaseAgentBindingService, InMemoryAgentBindingService, RuntimePolicy, ToolMode,
+    UnconfiguredAgentBindingService, validate_agent_binding_create, validate_agent_binding_payload,
 };
 pub use agent_lessons::{
     Lesson, LessonHint, LessonKind, MIN_LESSON_ACTION_CHARS, MIN_LESSON_ACTION_WORDS, NewLesson,
@@ -209,6 +219,11 @@ pub use mcp_registry::{
     McpRegisterRequestData, McpRegisteredBindingRecord, McpRegisteredToolRecord,
     McpRegistryService, McpRuntimeBindingRecord, McpServerRequestData,
     UnconfiguredMcpRegistryService, mcp_binding_tool_namespace, mcp_schema_hash,
+};
+pub use model_gateways::{
+    DatabaseModelGatewayService, InMemoryModelGatewayService, ModelGatewayCreateRequestData,
+    ModelGatewayRecord, ModelGatewayService, ModelGatewayStatus, ModelProtocol,
+    UnconfiguredModelGatewayService,
 };
 pub use models::{
     DatabaseModelService, ModelCreateRequestData, ModelListItem, ModelRecord, ModelService,

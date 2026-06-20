@@ -829,6 +829,9 @@ pub struct ServerAgenticLoopHost {
     interaction_mode: Option<RequestedTurnInteractionMode>,
     /// `true` when this session explicitly requests full LLM request/response capture.
     full_llm_capture: bool,
+    /// Whether tool-call validation should admit Astra's static tool catalog
+    /// even when those tools are not visible in the current loop.
+    static_tool_catalog_admissible: bool,
     /// System-prompt section reminding the LLM that a plan is in-flight.
     /// Shared mutable so mid-run tool executions (enter_plan_mode /
     /// exit_plan_mode) can refresh it. `None` means no active plan; reads
@@ -948,9 +951,11 @@ pub struct ServerAgenticLoopHostBuilder {
     interactive_client: bool,
     interaction_mode: Option<RequestedTurnInteractionMode>,
     full_llm_capture: bool,
+    static_tool_catalog_admissible: bool,
     event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
     plan_resume_hint: Option<String>,
     task_board_resume_hint: Option<String>,
+    server_tool_catalog_enabled: bool,
     #[cfg(feature = "bridge-e2e-hooks")]
     test_llm_rounds: Vec<Value>,
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -994,9 +999,11 @@ impl ServerAgenticLoopHostBuilder {
             interactive_client: false,
             interaction_mode: None,
             full_llm_capture: false,
+            static_tool_catalog_admissible: true,
             event_tx: None,
             plan_resume_hint: None,
             task_board_resume_hint: None,
+            server_tool_catalog_enabled: true,
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds: Vec::new(),
             #[cfg(feature = "bridge-e2e-hooks")]
@@ -1074,6 +1081,11 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
+    pub fn with_server_tool_catalog_enabled(mut self, enabled: bool) -> Self {
+        self.server_tool_catalog_enabled = enabled;
+        self
+    }
+
     pub fn with_edge_profile(mut self, profile: Map<String, Value>) -> Self {
         self.edge_profile = profile;
         self
@@ -1122,6 +1134,12 @@ impl ServerAgenticLoopHostBuilder {
         self.full_llm_capture = full_llm_capture;
         self
     }
+
+    pub fn with_static_tool_catalog_admissible(mut self, admissible: bool) -> Self {
+        self.static_tool_catalog_admissible = admissible;
+        self
+    }
+
     #[cfg(feature = "bridge-e2e-hooks")]
     pub fn with_test_llm_rounds(mut self, rounds: Vec<Value>) -> Self {
         self.test_llm_rounds_wired = true;
@@ -1161,7 +1179,7 @@ impl ServerAgenticLoopHostBuilder {
     pub fn build(self) -> ServerAgenticLoopHost {
         // When no edge tools are provided (web-only mode), populate with
         // server-side tool schemas from astra-tools so the LLM knows what's available.
-        let server_side_tools = self.edge_tools.is_empty();
+        let server_side_tools = self.server_tool_catalog_enabled && self.edge_tools.is_empty();
         let edge_tools = if server_side_tools {
             crate::capabilities::server_runtime_tool_schemas(&self.capabilities)
         } else {
@@ -1201,6 +1219,7 @@ impl ServerAgenticLoopHostBuilder {
             interactive_client: self.interactive_client,
             interaction_mode: self.interaction_mode,
             full_llm_capture: self.full_llm_capture,
+            static_tool_catalog_admissible: self.static_tool_catalog_admissible,
             edge_callback_ledger: self.edge_callback_ledger,
             user_id: self.user_id,
             session_id: self.session_id,
@@ -2344,11 +2363,17 @@ impl ServerAgenticLoopHost {
         // `admissible_extras` piece, calling an MCP tool after
         // `tool_search(select:mcp__X)` would be rejected as unknown
         // even though the executor can dispatch it.
-        self.valid_tools =
+        self.valid_tools = if self.static_tool_catalog_admissible {
             crate::turn::headless_tool_pipeline::admissible_tool_names_from_visible_and_extras(
                 visible_tools,
                 &self.admissible_extras,
-            );
+            )
+        } else {
+            crate::turn::headless_tool_pipeline::admissible_tool_names_from_visible_and_extras_strict(
+                visible_tools,
+                &self.admissible_extras,
+            )
+        };
     }
 
     /// Set the extras list (runtime-injected names + plugin names) so
@@ -4223,6 +4248,71 @@ mod tests {
         tools
     }
 
+    #[test]
+    fn builder_populates_server_tools_by_default_when_edge_tools_empty() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(false))
+        .build();
+
+        assert!(host.server_side_tools);
+        assert!(
+            !host.edge_tools.is_empty(),
+            "web/default mode should expose server runtime tool schemas"
+        );
+    }
+
+    #[test]
+    fn builder_can_disable_server_tool_catalog_for_registry_runtime() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(false))
+        .with_server_tool_catalog_enabled(false)
+        .build();
+
+        assert!(!host.server_side_tools);
+        assert!(
+            host.edge_tools.is_empty(),
+            "Agent Binding mode starts with no local/request tool schemas"
+        );
+    }
+
+    #[test]
+    fn registry_runtime_strict_admissible_tools_excludes_static_catalog() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(false))
+        .with_server_tool_catalog_enabled(false)
+        .with_static_tool_catalog_admissible(false)
+        .build();
+        let visible = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__tools__query",
+                "description": "Binding-discovered MCP tool",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        })];
+
+        host.sync_valid_tools_to_visible(&visible);
+
+        assert!(host.valid_tool_names().contains("mcp__tools__query"));
+        assert!(!host.valid_tool_names().contains("bash"));
+        assert!(!host.valid_tool_names().contains("tool_search"));
+    }
+
     fn message_text(message: &Value) -> String {
         let Some(content) = message.get("content") else {
             return message.to_string();
@@ -5707,6 +5797,7 @@ mod tests {
             context_manifest_pool: None,
             context_manifest_user_id: None,
             context_manifest_model_name: None,
+            runtime_manifest: None,
             recursion_depth: 0,
             final_text: String::new(),
             final_text_streamed: false,

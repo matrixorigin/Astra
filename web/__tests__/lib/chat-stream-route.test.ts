@@ -694,6 +694,9 @@ describe("chat stream route proxy cancellation", () => {
     >;
     expect(fetchCalls[0]?.[1].json).toEqual(
       expect.objectContaining({
+        parts: [],
+        attachments: [],
+        selected_model: { model: "backend-model" },
         workspace_binding: {
           kind: "edge_workspace",
           display_name: "MacBook Pro",
@@ -986,6 +989,9 @@ describe("chat stream route proxy cancellation", () => {
     >;
     expect(fetchCalls[0]?.[1].json).toEqual(
       expect.objectContaining({
+        parts: [],
+        attachments: [],
+        selected_model: { model: "backend-model" },
         workspace_binding: expect.objectContaining({
           kind: "edge_workspace",
           cwd: "/Users/xupeng/github/astra",

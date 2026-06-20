@@ -104,7 +104,7 @@ fn chat_request_all_fields() {
         "message": "hello",
         "session_id": "s1",
         "agent_id": "a1",
-        "model": "gpt-4",
+        "selected_model": {"model": "gpt-4"},
         "llm_token_service": {
             "url": "http://catalog:8081/api/v1/llm-token",
             "timeout_ms": 2500
@@ -125,7 +125,12 @@ fn chat_request_all_fields() {
     assert_eq!(req.message, "hello");
     assert_eq!(req.session_id.as_deref(), Some("s1"));
     assert_eq!(req.agent_id.as_deref(), Some("a1"));
-    assert_eq!(req.model.as_deref(), Some("gpt-4"));
+    assert_eq!(
+        req.selected_model
+            .as_ref()
+            .map(|selected| selected.model.as_str()),
+        Some("gpt-4")
+    );
     assert_eq!(
         req.llm_token_service.as_ref().map(|v| v.url.as_str()),
         Some("http://catalog:8081/api/v1/llm-token")
@@ -153,6 +158,80 @@ fn chat_request_all_fields() {
     assert!(req.explain);
     let ctx = req.context.unwrap();
     assert_eq!(ctx.get("key").unwrap(), "value");
+}
+
+#[test]
+fn chat_request_rejects_legacy_top_level_model_field() {
+    let result = serde_json::from_str::<ChatRequest>(
+        r#"{"message":"hello","selected_model":{"model":"gpt-4"},"model":"gpt-4"}"#,
+    );
+    assert!(result.is_err(), "legacy top-level model must be rejected");
+    let err = result.err().unwrap();
+    assert!(
+        err.to_string().contains("unknown field `model`"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn chat_request_rejects_selected_model_string_form() {
+    let result =
+        serde_json::from_str::<ChatRequest>(r#"{"message":"hello","selected_model":"gpt-4"}"#);
+    assert!(
+        result.is_err(),
+        "selected_model must be an object, not a string"
+    );
+}
+
+#[test]
+fn chat_request_rejects_selected_model_missing_model() {
+    let result = serde_json::from_str::<ChatRequest>(r#"{"message":"hello","selected_model":{}}"#);
+    assert!(result.is_err(), "selected_model.model is required");
+    let err = result.err().unwrap();
+    assert!(
+        err.to_string().contains("missing field `model`"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn chat_request_rejects_selected_model_unknown_field() {
+    let result = serde_json::from_str::<ChatRequest>(
+        r#"{"message":"hello","selected_model":{"model":"gpt-4","provider":"openai"}}"#,
+    );
+    assert!(result.is_err(), "selected_model must reject unknown fields");
+    let err = result.err().unwrap();
+    assert!(
+        err.to_string().contains("unknown field `provider`"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn chat_request_rejects_runtime_auth_credentials_map() {
+    let result = serde_json::from_str::<ChatRequest>(
+        r#"{"message":"hello","selected_model":{"model":"gpt-4"},"runtime_auth":{"credentials":{"token":"secret"}}}"#,
+    );
+    assert!(
+        result.is_err(),
+        "runtime_auth must carry authorization, not credentials"
+    );
+}
+
+#[test]
+fn chat_request_rejects_agent_binding_model_capability_ref() {
+    let result = serde_json::from_str::<ChatRequest>(
+        r#"{"message":"hello","selected_model":{"model":"gpt-4"},"agent_binding":{"id":"ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391","capability_server_refs":{"mcp":"tools","skills":"skills","models":"models"}}}"#,
+    );
+    assert!(
+        result.is_err(),
+        "agent_binding.capability_server_refs.models must be rejected"
+    );
+    let err = result.err().unwrap();
+    assert!(
+        err.to_string().contains("unknown field `models`"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -887,9 +966,17 @@ fn chat_request_into_data_maps_all_fields() {
     ctx.insert("tool".into(), json!("calc"));
     let req = ChatRequest {
         message: "hello".into(),
+        parts: vec![json!({"type": "text", "text": "hello"})],
+        attachments: vec![json!({"id": "att-1", "kind": "file"})],
         session_id: Some("s1".into()),
         agent_id: Some("a1".into()),
-        model: Some("gpt-4".into()),
+        selected_model: Some(astra_services::runs::SelectedModelRequest {
+            model: "gpt-4".into(),
+            gateway: None,
+        }),
+        agent_binding: None,
+        runtime_auth: None,
+        runtime_profile: None,
         workspace_binding: None,
         executor_binding: None,
         llm_token_service: Some(astra_services::LlmTokenServiceRequest {
@@ -912,6 +999,8 @@ fn chat_request_into_data_maps_all_fields() {
         }],
         mcp_binding_ids: None,
         context: Some(ctx.clone()),
+        edge_executor_id: Some("edge-1".into()),
+        capabilities: vec!["bash".into(), "fs".into()],
         execution_budget: Some(ExecutionBudget {
             initial_turns: Some(3),
             hard_turn_limit: Some(7),
@@ -924,6 +1013,11 @@ fn chat_request_into_data_maps_all_fields() {
     };
     let data = chat_request_into_data(req);
     assert_eq!(data.message, "hello");
+    assert_eq!(data.parts, vec![json!({"type": "text", "text": "hello"})]);
+    assert_eq!(
+        data.attachments,
+        vec![json!({"id": "att-1", "kind": "file"})]
+    );
     assert_eq!(data.session_id.as_deref(), Some("s1"));
     assert_eq!(data.agent_id.as_deref(), Some("a1"));
     assert_eq!(data.model.as_deref(), Some("gpt-4"));
@@ -943,6 +1037,8 @@ fn chat_request_into_data_maps_all_fields() {
     assert_eq!(data.runtime_mcp_bindings[0].id, "external_nl2sql");
     assert!(data.mcp_binding_ids.is_none());
     assert_eq!(data.context, Some(ctx));
+    assert_eq!(data.edge_executor_id.as_deref(), Some("edge-1"));
+    assert_eq!(data.capabilities, vec!["bash", "fs"]);
     assert_eq!(
         data.execution_budget,
         Some(ExecutionBudget {
@@ -963,6 +1059,8 @@ fn chat_request_into_data_maps_defaults() {
     let req: ChatRequest = serde_json::from_str(r#"{"message":"test"}"#).unwrap();
     let data = chat_request_into_data(req);
     assert_eq!(data.message, "test");
+    assert!(data.parts.is_empty());
+    assert!(data.attachments.is_empty());
     assert!(data.session_id.is_none());
     assert!(data.agent_id.is_none());
     assert!(data.model.is_none());
@@ -970,6 +1068,8 @@ fn chat_request_into_data_maps_defaults() {
     assert!(data.runtime_mcp_bindings.is_empty());
     assert!(data.mcp_binding_ids.is_none());
     assert!(data.context.is_none());
+    assert!(data.edge_executor_id.is_none());
+    assert!(data.capabilities.is_empty());
     assert!(data.execution_budget.is_none());
     assert!(!data.explain);
     assert!(data.interaction_mode.is_none());
@@ -980,9 +1080,14 @@ fn chat_request_into_data_maps_defaults() {
 fn chat_request_into_data_merges_plan_subtask_into_context() {
     let req = ChatRequest {
         message: "do step".into(),
+        parts: Vec::new(),
+        attachments: Vec::new(),
         session_id: None,
         agent_id: None,
-        model: None,
+        selected_model: None,
+        agent_binding: None,
+        runtime_auth: None,
+        runtime_profile: None,
         workspace_binding: None,
         executor_binding: None,
         llm_token_service: None,
@@ -993,6 +1098,8 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         runtime_mcp_bindings: Vec::new(),
         mcp_binding_ids: None,
         context: None,
+        edge_executor_id: None,
+        capabilities: Vec::new(),
         execution_budget: None,
         explain: false,
         interaction_mode: None,

@@ -26,6 +26,24 @@ pub(super) fn sse_error_response(status: StatusCode, message: impl Into<String>)
     })])
 }
 
+pub(super) fn sse_error_response_from_error(status: StatusCode, error: ErrorResponse) -> Response {
+    let mut event = serde_json::json!({
+        "type": "error",
+        "message": error.detail,
+        "code": status_to_sse_error_code(status),
+        "retryable": status_to_sse_retryable(status),
+    });
+    if let Some(error_code) = error.error_code
+        && let Some(obj) = event.as_object_mut()
+    {
+        obj.insert(
+            "error_code".to_string(),
+            serde_json::Value::String(error_code),
+        );
+    }
+    sse_json_response(vec![event])
+}
+
 pub(super) fn sse_streaming_response(
     session_id: String,
     run_id: String,

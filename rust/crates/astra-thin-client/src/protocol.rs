@@ -11,12 +11,15 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatStreamRequest {
     pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    pub selected_model: SelectedModel,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interaction_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -47,12 +50,24 @@ pub struct ExecutionBudget {
 }
 
 impl ChatStreamRequest {
-    pub fn new(message: impl Into<String>) -> Self {
+    pub fn new(message: impl Into<String>, model: impl Into<String>) -> Self {
+        Self::with_selected_model(
+            message,
+            SelectedModel {
+                model: model.into(),
+                gateway: None,
+            },
+        )
+    }
+
+    pub fn with_selected_model(message: impl Into<String>, selected_model: SelectedModel) -> Self {
         Self {
             message: message.into(),
+            parts: Vec::new(),
+            attachments: Vec::new(),
             session_id: None,
             agent_id: None,
-            model: None,
+            selected_model,
             interaction_mode: None,
             context: None,
             execution_budget: None,
@@ -63,6 +78,14 @@ impl ChatStreamRequest {
             capabilities: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SelectedModel {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
 }
 
 /// `POST /sessions` (matches `SessionCreateRequest` on server).
@@ -656,14 +679,20 @@ fn optional_str(obj: &serde_json::Map<String, Value>, key: &str) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn chat_stream_request_serde_roundtrip() {
         let r = ChatStreamRequest {
             message: "hi".into(),
+            parts: vec![json!({"type": "text", "text": "hi"})],
+            attachments: vec![json!({"id": "att-1", "kind": "file"})],
             session_id: Some("s-1".into()),
             agent_id: None,
-            model: Some("m".into()),
+            selected_model: SelectedModel {
+                model: "m".into(),
+                gateway: None,
+            },
             interaction_mode: Some("auto".into()),
             context: None,
             execution_budget: Some(ExecutionBudget {
@@ -682,16 +711,22 @@ mod tests {
     }
 
     #[test]
-    fn chat_stream_request_defaults_leave_execution_budget_unset() {
-        let j = serde_json::json!({"message":"x"});
+    fn chat_stream_request_requires_selected_model_and_defaults_leave_execution_budget_unset() {
+        let missing_model = serde_json::json!({"message":"x"});
+        serde_json::from_value::<ChatStreamRequest>(missing_model)
+            .expect_err("selected_model is required in the thin client wire type");
+
+        let j = serde_json::json!({"message":"x","selected_model":{"model":"m"}});
         let r: ChatStreamRequest = serde_json::from_value(j).unwrap();
         assert!(r.execution_budget.is_none());
+        assert_eq!(r.selected_model.model, "m");
     }
 
     #[test]
     fn chat_stream_request_roundtrip_preserves_execution_budget() {
         let j = serde_json::json!({
             "message": "x",
+            "selected_model": {"model": "m"},
             "execution_budget": {"initial_turns": 4, "hard_turn_limit": 9}
         });
         let r: ChatStreamRequest = serde_json::from_value(j).unwrap();

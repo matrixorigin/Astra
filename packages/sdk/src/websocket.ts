@@ -1,4 +1,5 @@
 import type { StreamEvent, StreamEventType, ConnectionState } from './types';
+import { selectedModelToWire } from './wire';
 
 // ─── Event Emitter Types ────────────────────────────────────────────
 
@@ -56,7 +57,7 @@ export type ToolApproval = {
  * });
  * ws.on('text_delta', (event) => console.log(event.content));
  * await ws.connect();
- * ws.sendMessage('Hello!');
+ * ws.sendMessage('Hello!', { selectedModel: { model: 'gpt-4' } });
  * ```
  */
 export class AstraWebSocket {
@@ -180,12 +181,15 @@ export class AstraWebSocket {
   // ─── Outgoing messages ────────────────────────────────────────────
 
   /** Send a chat message to the agent. */
-  sendMessage(content: string, options?: { sessionId?: string; model?: string }): void {
+  sendMessage(
+    content: string,
+    options: { sessionId?: string; selectedModel: { model: string; gateway?: string } },
+  ): void {
     this.send({
       type: 'message',
       content,
-      ...(options?.sessionId && { session_id: options.sessionId }),
-      ...(options?.model && { model: options.model }),
+      ...(options.sessionId && { session_id: options.sessionId }),
+      selected_model: selectedModelToWire(options?.selectedModel),
     });
   }
 

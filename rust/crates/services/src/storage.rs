@@ -783,6 +783,14 @@ pub async fn ensure_core_schema(
             total_tool_calls BIGINT NOT NULL DEFAULT 0,
             request_id VARCHAR(64) NULL,
             trace_id VARCHAR(64) NULL,
+            agent_binding_id VARCHAR(64) NULL,
+            agent_binding_name VARCHAR(255) NULL,
+            agent_binding_schema_version VARCHAR(32) NULL,
+            selected_model_json LONGTEXT NULL,
+            selected_model_name VARCHAR(255) NULL,
+            selected_model_gateway VARCHAR(128) NULL,
+            capability_server_refs_json LONGTEXT NULL,
+            runtime_profile VARCHAR(64) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             CONSTRAINT chk_agent_runs_retry_scope CHECK (retry_scope IN ('node', 'subtree', 'siblings')),
@@ -792,11 +800,63 @@ pub async fn ensure_core_schema(
             INDEX idx_agent_runs_parent (parent_run_id, created_at),
             INDEX idx_agent_runs_retry_of (retry_of),
             INDEX idx_agent_runs_status_lease (status, owner_lease_expires_at),
-            INDEX idx_agent_runs_owner_lease (owner_pod_id, owner_lease_expires_at)
+            INDEX idx_agent_runs_owner_lease (owner_pod_id, owner_lease_expires_at),
+            INDEX idx_agent_runs_binding (agent_binding_id, created_at),
+            INDEX idx_agent_runs_model_gateway (selected_model_gateway, created_at)
         )",
     )
     .execute(&pool)
     .await?;
+
+    for (column, ddl) in [
+        (
+            "agent_binding_id",
+            "ALTER TABLE agent_runs ADD COLUMN agent_binding_id VARCHAR(64) NULL",
+        ),
+        (
+            "agent_binding_name",
+            "ALTER TABLE agent_runs ADD COLUMN agent_binding_name VARCHAR(255) NULL",
+        ),
+        (
+            "agent_binding_schema_version",
+            "ALTER TABLE agent_runs ADD COLUMN agent_binding_schema_version VARCHAR(32) NULL",
+        ),
+        (
+            "selected_model_json",
+            "ALTER TABLE agent_runs ADD COLUMN selected_model_json LONGTEXT NULL",
+        ),
+        (
+            "selected_model_name",
+            "ALTER TABLE agent_runs ADD COLUMN selected_model_name VARCHAR(255) NULL",
+        ),
+        (
+            "selected_model_gateway",
+            "ALTER TABLE agent_runs ADD COLUMN selected_model_gateway VARCHAR(128) NULL",
+        ),
+        (
+            "capability_server_refs_json",
+            "ALTER TABLE agent_runs ADD COLUMN capability_server_refs_json LONGTEXT NULL",
+        ),
+        (
+            "runtime_profile",
+            "ALTER TABLE agent_runs ADD COLUMN runtime_profile VARCHAR(64) NULL",
+        ),
+    ] {
+        add_column_if_missing(&pool, &settings.database, "agent_runs", column, ddl).await?;
+    }
+
+    for (index, ddl) in [
+        (
+            "idx_agent_runs_binding",
+            "ALTER TABLE agent_runs ADD INDEX idx_agent_runs_binding (agent_binding_id, created_at)",
+        ),
+        (
+            "idx_agent_runs_model_gateway",
+            "ALTER TABLE agent_runs ADD INDEX idx_agent_runs_model_gateway (selected_model_gateway, created_at)",
+        ),
+    ] {
+        add_index_if_missing(&pool, &settings.database, "agent_runs", index, ddl).await?;
+    }
 
     query(
         "CREATE TABLE IF NOT EXISTS agent_run_events (
@@ -1898,6 +1958,22 @@ pub async fn ensure_core_schema(
         );
     }
 
+    query(
+        "CREATE TABLE IF NOT EXISTS model_gateways (
+            id VARCHAR(128) PRIMARY KEY,
+            resolve_url LONGTEXT NOT NULL,
+            model_protocol VARCHAR(64) NOT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'active',
+            metadata_json LONGTEXT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            disabled_at DATETIME(6) NULL,
+            INDEX idx_model_gateways_status_created (status, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // Server-wide admin config KV store. Holds settings that the admin explicitly manages
     // via `astra-admin config set/get/unset` (first key: `reasoning_model_name`).
     query(
@@ -2176,6 +2252,28 @@ pub async fn ensure_core_schema(
         "completed_at",
         "ALTER TABLE edge_pending_dispatch ADD COLUMN completed_at DATETIME(6) NULL",
     )
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS agent_bindings (
+            id VARCHAR(64) PRIMARY KEY,
+            binding_name VARCHAR(255) NOT NULL,
+            idempotency_key VARCHAR(255) NOT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'active',
+            agent_md LONGTEXT NOT NULL,
+            capability_servers_json LONGTEXT NOT NULL,
+            runtime_policy_json LONGTEXT NOT NULL,
+            metadata_json LONGTEXT NULL,
+            binding_schema_version VARCHAR(32) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            disabled_at DATETIME(6) NULL,
+            UNIQUE KEY uq_agent_bindings_name (binding_name),
+            UNIQUE KEY uq_agent_bindings_idempotency_key (idempotency_key),
+            INDEX idx_agent_bindings_status_created (status, created_at)
+        )",
+    )
+    .execute(&pool)
     .await?;
 
     query(

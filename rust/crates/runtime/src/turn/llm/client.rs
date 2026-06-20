@@ -648,6 +648,28 @@ pub(crate) fn llm_request_url(
         .unwrap_or_else(|| llm_request_url_for_provider(base_url, provider, model_name, streaming))
 }
 
+fn acquire_registered_endpoint_permit_for_override(
+    request_url: &str,
+    completions_url_override: Option<&str>,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, astra_core::ClassifiedError> {
+    let Some(override_url) = completions_url_override
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    else {
+        return Ok(None);
+    };
+    let endpoint_url = if request_url.is_empty() {
+        override_url
+    } else {
+        request_url
+    };
+    crate::capability_endpoint_pool::try_acquire_endpoint_permit(endpoint_url)
+        .map(Some)
+        .map_err(|detail| {
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::ResourceLimit, detail)
+        })
+}
+
 /// Build the default completions URL for a given provider (no override).
 ///
 /// Anthropic uses `/v1/messages`, Bedrock uses `/model/{modelId}/converse`,
@@ -2559,6 +2581,8 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
         upstream_name,
         true,
     );
+    let _registered_endpoint_permit =
+        acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
 
     let mut last_err = String::new();
     let mut last_kind = astra_core::ErrorKind::Unknown;
@@ -3728,6 +3752,8 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
         upstream_name,
         false,
     );
+    let _registered_endpoint_permit =
+        acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
     let mut req = client.post(&url).header("content-type", "application/json");
     req = apply_provider_auth(req, provider, api_key, header_overrides);
     req = apply_llm_header_overrides(req, header_overrides);
@@ -7141,6 +7167,44 @@ mod tests {
             ),
             "https://custom.proxy/llm"
         );
+    }
+
+    #[test]
+    fn completions_url_override_uses_registered_endpoint_permit() {
+        let endpoint = format!("https://custom.proxy/llm/{}", uuid::Uuid::new_v4());
+        let mut permits = Vec::new();
+        for _ in 0..crate::capability_endpoint_pool::REGISTERED_ENDPOINT_RPC_CONCURRENCY_FOR_TESTS {
+            permits.push(
+                crate::capability_endpoint_pool::try_acquire_endpoint_permit(&endpoint)
+                    .expect("permit within endpoint limit"),
+            );
+        }
+
+        let err = acquire_registered_endpoint_permit_for_override(&endpoint, Some(&endpoint))
+            .expect_err("override endpoint over limit should reject before LLM send");
+        assert_eq!(err.kind, astra_core::ErrorKind::ResourceLimit);
+        assert!(err.message.contains("over its concurrency limit"));
+
+        drop(permits);
+        let permit = acquire_registered_endpoint_permit_for_override(&endpoint, Some(&endpoint))
+            .expect("released endpoint permits should allow override send");
+        assert!(permit.is_some());
+    }
+
+    #[test]
+    fn native_llm_url_does_not_use_registered_endpoint_permit() {
+        let endpoint = format!("https://api.openai.com/v1/{}", uuid::Uuid::new_v4());
+        let mut permits = Vec::new();
+        for _ in 0..crate::capability_endpoint_pool::REGISTERED_ENDPOINT_RPC_CONCURRENCY_FOR_TESTS {
+            permits.push(
+                crate::capability_endpoint_pool::try_acquire_endpoint_permit(&endpoint)
+                    .expect("permit within endpoint limit"),
+            );
+        }
+
+        let permit = acquire_registered_endpoint_permit_for_override(&endpoint, None)
+            .expect("native LLM URL should not use registered endpoint pool");
+        assert!(permit.is_none());
     }
 
     #[test]

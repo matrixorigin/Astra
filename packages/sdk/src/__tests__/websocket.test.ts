@@ -110,7 +110,10 @@ describe('AstraWebSocket', () => {
     const ws = new AstraWebSocket({ url: 'ws://localhost/ws' });
     await ws.connect();
 
-    ws.sendMessage('hello', { sessionId: 's1', model: 'gpt-4' });
+    ws.sendMessage('hello', {
+      sessionId: 's1',
+      selectedModel: { model: 'gpt-4' },
+    });
 
     const raw = (ws as any).ws as MockWebSocket;
     const sent = JSON.parse(raw.sent[0]);
@@ -118,8 +121,35 @@ describe('AstraWebSocket', () => {
       type: 'message',
       content: 'hello',
       session_id: 's1',
-      model: 'gpt-4',
+      selected_model: { model: 'gpt-4' },
     });
+  });
+
+  test('sendMessage preserves empty selectedModel.gateway for server-side validation', async () => {
+    const ws = new AstraWebSocket({ url: 'ws://localhost/ws' });
+    await ws.connect();
+
+    ws.sendMessage('hello', {
+      selectedModel: { model: 'kimi', gateway: '' },
+    });
+
+    const raw = (ws as any).ws as MockWebSocket;
+    const sent = JSON.parse(raw.sent[0]);
+    expect(sent).toEqual({
+      type: 'message',
+      content: 'hello',
+      selected_model: { model: 'kimi', gateway: '' },
+    });
+  });
+
+  test('sendMessage requires selectedModel.model', async () => {
+    const ws = new AstraWebSocket({ url: 'ws://localhost/ws' });
+    await ws.connect();
+
+    expect(() => ws.sendMessage('hello', {} as any)).toThrow('selectedModel.model is required');
+    expect(() => ws.sendMessage('hello', { selectedModel: { model: '' } })).toThrow(
+      'selectedModel.model is required',
+    );
   });
 
   test('cancelRun sends cancel message', async () => {

@@ -2,6 +2,21 @@ use super::bridge_prep::normalize_chat_turn_session_error;
 use super::header_utils::collect_forward_headers;
 use super::*;
 use crate::server::run::handlers::transform_stream_run_events_for_client;
+use axum::extract::rejection::JsonRejection;
+
+fn chat_request_json_rejection_to_error(
+    rejection: JsonRejection,
+) -> (StatusCode, Json<ErrorResponse>) {
+    let detail = rejection.body_text();
+    if detail.contains("selected_model") || detail.contains("SelectedModelRequest") {
+        return astra_core::error_response_coded(
+            StatusCode::BAD_REQUEST,
+            detail,
+            "selected_model_invalid",
+        );
+    }
+    error_response(StatusCode::BAD_REQUEST, detail)
+}
 
 /// Safely convert a string to a HeaderValue, returning an SSE error response on failure.
 #[allow(clippy::result_large_err)]
@@ -150,6 +165,10 @@ fn chat_stream_bridge_fallback_payload(
         "allow_skill_sources": allow_skill_sources,
         "allow_tools": allow_tools,
         "context": chat_data.context.as_ref(),
+        "parts": &chat_data.parts,
+        "attachments": &chat_data.attachments,
+        "edge_executor_id": chat_data.edge_executor_id.as_deref(),
+        "capabilities": &chat_data.capabilities,
         "edge_profile": edge_profile,
         "execution_budget": chat_data.execution_budget.as_ref(),
         "explain": chat_data.explain,
@@ -178,8 +197,9 @@ fn normalize_bridge_allowlist(entries: Option<&[String]>) -> Option<Vec<String>>
 pub(super) async fn chat_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<ChatRequest>,
+    request: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Json<ChatResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let Json(request) = request.map_err(chat_request_json_rejection_to_error)?;
     let user = state.auth_service.current_user(&headers).await?;
     let mut chat_data = chat_request_into_data(request);
     chat_data.forward_headers = collect_forward_headers(&headers);
@@ -204,11 +224,18 @@ pub(super) async fn chat_handler(
 pub(super) async fn chat_stream_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<ChatRequest>,
+    request: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Response {
+    let request = match request {
+        Ok(Json(request)) => request,
+        Err(rejection) => {
+            let (status, error) = chat_request_json_rejection_to_error(rejection);
+            return sse_error_response_from_error(status, error.0);
+        }
+    };
     let user = match state.auth_service.current_user(&headers).await {
         Ok(user) => user,
-        Err((status, error)) => return sse_error_response(status, error.0.detail),
+        Err((status, error)) => return sse_error_response_from_error(status, error.0),
     };
 
     let mut chat_data = chat_request_into_data(request);
@@ -223,7 +250,7 @@ pub(super) async fn chat_stream_handler(
     .await
     {
         Ok(resolved) => resolved,
-        Err((status, error)) => return sse_error_response(status, error.0.detail),
+        Err((status, error)) => return sse_error_response_from_error(status, error.0),
     };
     chat_data.session_id = resolved.session_id;
     chat_data.full_llm_capture = resolved.full_llm_capture;
@@ -275,7 +302,7 @@ pub(super) async fn chat_stream_handler(
                 sse_json_response(events)
             }
         }
-        Err((status, error)) => sse_error_response(status, error.0.detail),
+        Err((status, error)) => sse_error_response_from_error(status, error.0),
     }
 }
 
@@ -548,10 +575,16 @@ mod tests {
         );
         let payload = chat_stream_bridge_fallback_payload(&ChatRequestData {
             message: "hello".to_string(),
+            parts: Vec::new(),
+            attachments: Vec::new(),
             session_id: Some("s1".to_string()),
             full_llm_capture: false,
             agent_id: Some("a1".to_string()),
             model: Some("gpt-4".to_string()),
+            selected_model: None,
+            agent_binding: None,
+            runtime_auth: None,
+            runtime_profile: None,
             llm_token_service: Some(astra_services::LlmTokenServiceConfig {
                 url: "http://catalog:8081/api/v1/llm-token".to_string(),
                 timeout_ms: Some(2500),
@@ -569,6 +602,8 @@ mod tests {
             runtime_mcp_bindings: Vec::new(),
             mcp_binding_ids: Some(vec![301]),
             context: Some(context),
+            edge_executor_id: None,
+            capabilities: Vec::new(),
             forward_headers: std::collections::HashMap::new(),
             execution_budget: Some(astra_services::runs::ExecutionBudget {
                 initial_turns: Some(3),
@@ -610,10 +645,16 @@ mod tests {
     fn chat_stream_fallback_payload_normalizes_allowlists() {
         let payload = chat_stream_bridge_fallback_payload(&ChatRequestData {
             message: "hello".to_string(),
+            parts: Vec::new(),
+            attachments: Vec::new(),
             session_id: Some("s1".to_string()),
             full_llm_capture: false,
             agent_id: Some("a1".to_string()),
             model: Some("gpt-4".to_string()),
+            selected_model: None,
+            agent_binding: None,
+            runtime_auth: None,
+            runtime_profile: None,
             llm_token_service: None,
             skill_search: None,
             allow_skills: Some(vec![
@@ -636,6 +677,8 @@ mod tests {
             runtime_mcp_bindings: Vec::new(),
             mcp_binding_ids: None,
             context: None,
+            edge_executor_id: None,
+            capabilities: Vec::new(),
             forward_headers: std::collections::HashMap::new(),
             execution_budget: Some(astra_services::runs::ExecutionBudget {
                 initial_turns: Some(3),
@@ -1227,6 +1270,11 @@ mod chat_stream_bridge_fallback_tests {
     #[derive(Clone)]
     struct StubAssistantTextLifecycle;
 
+    #[derive(Clone)]
+    struct SkillDiscoveryFailureLifecycle {
+        endpoint_url: String,
+    }
+
     #[async_trait]
     impl RunLifecycleService for StubOtherNotImplementedLifecycle {
         async fn create_run(
@@ -1318,6 +1366,70 @@ mod chat_stream_bridge_fallback_tests {
                 ],
                 event_rx: None,
             })
+        }
+
+        async fn get_run_status(
+            &self,
+            _run_id: String,
+            _user_id: String,
+        ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn stream_run(
+            &self,
+            _run_id: String,
+            _user_id: String,
+            _last_index: u32,
+        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn cancel_run(
+            &self,
+            _run_id: String,
+            _user_id: String,
+        ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn list_runs(
+            &self,
+            _user_id: String,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait]
+    impl RunLifecycleService for SkillDiscoveryFailureLifecycle {
+        async fn create_run(
+            &self,
+            _user_id: String,
+            _request: ChatRequestData,
+        ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn stream_chat(
+            &self,
+            _user_id: String,
+            request: ChatRequestData,
+        ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+            let runtime_auth = request
+                .runtime_auth
+                .as_ref()
+                .expect("agent binding stream request should carry runtime auth");
+            let _ =
+                crate::server::agent_binding_skill_runtime::prepare_agent_binding_skill_resolver(
+                    "skills",
+                    &self.endpoint_url,
+                    &runtime_auth.authorization,
+                )
+                .await?;
+            unreachable!("fake skill endpoint must return non-2xx")
         }
 
         async fn get_run_status(
@@ -1619,6 +1731,110 @@ mod chat_stream_bridge_fallback_tests {
     }
 
     #[tokio::test]
+    async fn chat_stream_selected_model_shape_error_returns_typed_sse_error() {
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_session_service(Arc::new(StubSessionService))
+                .with_run_lifecycle_service(Arc::new(StubConfiguredLifecycle)),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat/stream")
+                    .header("authorization", "Bearer good-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"message":"hi","selected_model":"gpt-4"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body should be readable");
+        let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
+        assert!(text.contains("\"type\":\"error\""));
+        assert!(text.contains("\"error_code\":\"selected_model_invalid\""));
+        assert!(!text.contains("\"type\":\"session_info\""));
+    }
+
+    #[tokio::test]
+    async fn chat_stream_agent_binding_skill_discovery_error_redacts_runtime_auth_in_sse() {
+        use axum::{Router, routing::post};
+
+        let fake_skill_server = Router::new().route(
+            "/skills",
+            post(|| async {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "upstream echoed Bearer abc and abc".to_string(),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, fake_skill_server).await;
+        });
+        let lifecycle = SkillDiscoveryFailureLifecycle {
+            endpoint_url: format!("http://{addr}/skills"),
+        };
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_session_service(Arc::new(StubSessionService))
+                .with_run_lifecycle_service(Arc::new(lifecycle)),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat/stream")
+                    .header("authorization", "Bearer good-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "message": "hi",
+                            "selected_model": {"model": "gpt-4o-mini"},
+                            "agent_binding": {
+                                "id": "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391",
+                                "capability_server_refs": {
+                                    "mcp": "tools",
+                                    "skills": "skills"
+                                }
+                            },
+                            "runtime_auth": {
+                                "authorization": "Bearer abc"
+                            }
+                        }"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body should be readable");
+        let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
+        assert!(text.contains("\"type\":\"error\""));
+        assert!(text.contains("\"error_code\":\"agent_binding_discovery_failed\""));
+        assert!(text.contains("[REDACTED]"));
+        assert!(!text.contains("Bearer abc"));
+        assert!(!text.contains("abc"));
+        assert!(!text.contains("\"type\":\"session_info\""));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn chat_stream_uses_client_run_event_shape_for_live_lifecycle_streams() {
         let app = build_app(
             AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -1774,7 +1990,7 @@ mod chat_stream_bridge_fallback_tests {
                     .header("authorization", "Bearer good-token")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"message":"hi","session_id":"s1","model":"demo-model"}"#,
+                        r#"{"message":"hi","session_id":"s1","selected_model":{"model":"demo-model"}}"#,
                     ))
                     .expect("request should build"),
             )

@@ -646,6 +646,7 @@ pub(crate) async fn stream_chat_sse(
         context_manifest_pool: None,
         context_manifest_user_id: None,
         context_manifest_model_name: model_id_for_policy.map(str::to_string),
+        runtime_manifest: None,
         recursion_depth: 0,
         final_text: String::new(),
         final_text_streamed: false,

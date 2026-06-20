@@ -730,6 +730,12 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
 
   const sendMessage = useCallback(
     (content: string) => {
+      if (!config.model) {
+        dispatch({ type: "SET_ERROR", error: "selectedModel.model is required" });
+        dispatch({ type: "SET_RUN_STATUS", status: null, waitingFor: null });
+        dispatch({ type: "SET_STREAMING", isStreaming: false });
+        return;
+      }
       // Bump generation so processEvent from the previous stream is ignored.
       const generation = ++streamGenerationRef.current;
 
@@ -771,7 +777,7 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
           message: content,
           sessionId: sessionId ?? undefined,
           agentId: config.agentId,
-          model: config.model,
+          selectedModel: { model: config.model },
           allowSkills: config.allowSkills,
           allowTools: config.allowTools,
           skillSearch: config.skillSearch,

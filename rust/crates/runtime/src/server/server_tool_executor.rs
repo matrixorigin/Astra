@@ -1091,6 +1091,10 @@ pub struct ServerToolExecutor {
     /// MCP client manager for forwarding `mcp__*` tool calls to connected
     /// MCP servers. Set by `stream_chat()` after MCP discovery.
     mcp_manager: Option<Arc<tokio::sync::RwLock<astra_mcp::McpClientManager>>>,
+    /// Agent Binding MCP adapter for stateless per-call JSON-RPC over the
+    /// shared HTTP transport pool. Unlike `mcp_manager`, this never holds a
+    /// long-lived authorization-scoped MCP session.
+    agent_binding_mcp: Option<Arc<super::runtime_mcp::AgentBindingMcpRuntime>>,
     /// Plugin-registered tool schemas (e.g. MCP servers). Joined with the
     /// server-side allowlist when `tool_search(select:NAME)` runs so
     /// deferred activation reaches plugin tools. Populated by the server
@@ -1107,6 +1111,7 @@ pub struct ServerToolExecutor {
     executor_binding: ExecutorBinding,
     capabilities: astra_turn_core::capability::CapabilitySet,
     server_tool_names: HashSet<String>,
+    enforce_server_tool_capabilities: bool,
     /// Exactly-once executor for crash recovery deduplication.
     /// When active (Some), checks idempotency cache before executing tools.
     exactly_once_executor: Option<Mutex<astra_pipeline::exactly_once::ExactlyOnceExecutor>>,
@@ -1198,12 +1203,14 @@ impl ServerToolExecutor {
             plan_resume_hint_handle: None,
             plugin_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
             mcp_manager: None,
+            agent_binding_mcp: None,
             agent_tool_context: None,
             work_surface_event_tx: None,
             workspace_binding: WorkspaceBinding::server_sandbox(&workspace_root),
             executor_binding: ExecutorBinding::server_local(),
             capabilities,
             server_tool_names,
+            enforce_server_tool_capabilities: false,
             exactly_once_executor: None,
         }
     }
@@ -1376,12 +1383,31 @@ impl ServerToolExecutor {
         self
     }
 
+    pub fn with_enforce_server_tool_capabilities(mut self, enforce: bool) -> Self {
+        self.enforce_server_tool_capabilities = enforce;
+        self
+    }
+
+    pub fn with_server_builtin_tools_disabled(mut self) -> Self {
+        self.capabilities = astra_turn_core::capability::CapabilitySet::empty();
+        self.server_tool_names.clear();
+        self.enforce_server_tool_capabilities = true;
+        self
+    }
+
     /// Set the MCP client manager for forwarding `mcp__*` tool calls.
     pub fn set_mcp_manager(
         &mut self,
         manager: Arc<tokio::sync::RwLock<astra_mcp::McpClientManager>>,
     ) {
         self.mcp_manager = Some(manager);
+    }
+
+    pub(crate) fn set_agent_binding_mcp(
+        &mut self,
+        agent_binding_mcp: Arc<super::runtime_mcp::AgentBindingMcpRuntime>,
+    ) {
+        self.agent_binding_mcp = Some(agent_binding_mcp);
     }
 
     /// Install plugin-registered schemas (MCP, etc.) so
@@ -1403,6 +1429,17 @@ impl ServerToolExecutor {
     }
 
     async fn execute_mcp_tool(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
+        if let Some(agent_binding_mcp) = &self.agent_binding_mcp {
+            return match agent_binding_mcp.call_tool_by_mcp_name(name, args).await {
+                Ok(content) => astra_tools::ToolResult::text(content),
+                Err(error) => astra_tools::ToolResult::error(
+                    super::runtime_mcp::redact_mcp_error_text(&format!(
+                        "Agent Binding MCP tool '{name}' failed on server '{}': {error}",
+                        agent_binding_mcp.server_name()
+                    )),
+                ),
+            };
+        }
         let Some(mgr) = &self.mcp_manager else {
             return astra_tools::ToolResult::error(format!(
                 "Error: Tool '{name}' is not available — no MCP manager configured."
@@ -5986,6 +6023,14 @@ impl ServerLocalToolTransport for ServerToolExecutor {
                 .execute_mcp_tool(&request.tool_name, &request.args)
                 .await;
         }
+        if self.enforce_server_tool_capabilities
+            && !self.supports_server_tool_name(&request.tool_name)
+        {
+            return astra_tools::ToolResult::error(format!(
+                "Error: Tool '{}' is not available in this runtime capability surface.",
+                request.tool_name
+            ));
+        }
         self.record_resource_tool_call();
         self.execute_local_with_metadata(&request.tool_name, &request.args)
             .await
@@ -6989,6 +7034,32 @@ esac
             result.output.contains("no MCP manager configured"),
             "{}",
             result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_enforcement_blocks_local_tools_but_allows_mcp_forwarding() {
+        let (mut exec, _dir) = test_executor();
+        exec = exec.with_server_builtin_tools_disabled();
+
+        let blocked = exec
+            .execute_with_metadata("bash", &json!({"command": "echo should-not-run"}))
+            .await;
+        assert!(blocked.is_error, "{blocked:?}");
+        assert!(
+            blocked.output.contains("not available"),
+            "{}",
+            blocked.output
+        );
+
+        let mcp = exec
+            .execute_with_metadata("mcp__demo__search", &json!({"query": "hello"}))
+            .await;
+        assert!(mcp.is_error, "{mcp:?}");
+        assert!(
+            mcp.output.contains("no MCP manager configured"),
+            "{}",
+            mcp.output
         );
     }
 

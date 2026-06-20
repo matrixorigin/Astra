@@ -78,11 +78,23 @@ pub struct ChatRouteRequest {
 
 #[cfg(feature = "server")]
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatRequest {
     pub message: String,
+    #[serde(default)]
+    pub parts: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub attachments: Vec<serde_json::Value>,
     pub session_id: Option<String>,
     pub agent_id: Option<String>,
-    pub model: Option<String>,
+    #[serde(default)]
+    pub selected_model: Option<astra_services::runs::SelectedModelRequest>,
+    #[serde(default)]
+    pub agent_binding: Option<astra_services::runs::AgentBindingRuntimeRequest>,
+    #[serde(default)]
+    pub runtime_auth: Option<astra_services::runs::RuntimeAuthRequest>,
+    #[serde(default)]
+    pub runtime_profile: Option<astra_services::runs::RuntimeProfileRequest>,
     #[serde(default)]
     pub llm_token_service: Option<astra_services::LlmTokenServiceRequest>,
     #[serde(default)]
@@ -102,6 +114,10 @@ pub struct ChatRequest {
     #[serde(default)]
     pub mcp_binding_ids: Option<Vec<i64>>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    pub edge_executor_id: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     #[serde(default)]
     pub execution_budget: Option<astra_services::runs::ExecutionBudget>,
     #[serde(default)]
@@ -539,7 +555,7 @@ pub struct AdminUserRoleResponse {
 /// Messages sent from browser client to server.
 #[cfg(feature = "server")]
 #[derive(Deserialize, Debug, Clone)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum WsClientMessage {
     /// Authenticate with a Bearer token (must be first message).
     #[serde(rename = "auth")]
@@ -553,8 +569,7 @@ pub enum WsClientMessage {
         session_id: Option<String>,
         #[serde(default)]
         agent_id: Option<String>,
-        #[serde(default)]
-        model: Option<String>,
+        selected_model: astra_services::runs::SelectedModelRequest,
         #[serde(default)]
         skill_search: Option<astra_core::SkillSearchSettings>,
         #[serde(default)]
@@ -1042,10 +1057,19 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
     );
     ChatRequestData {
         message: request.message,
+        parts: request.parts,
+        attachments: request.attachments,
         session_id: request.session_id,
         full_llm_capture: false,
         agent_id: request.agent_id,
-        model: request.model,
+        model: request
+            .selected_model
+            .as_ref()
+            .map(|selected| selected.model.clone()),
+        selected_model: request.selected_model,
+        agent_binding: request.agent_binding,
+        runtime_auth: request.runtime_auth,
+        runtime_profile: request.runtime_profile,
         llm_token_service: request.llm_token_service.map(Into::into),
         skill_search: request.skill_search,
         allow_skills: request.allow_skills,
@@ -1056,6 +1080,8 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         runtime_mcp_bindings: request.runtime_mcp_bindings,
         mcp_binding_ids: request.mcp_binding_ids,
         context,
+        edge_executor_id: request.edge_executor_id,
+        capabilities: request.capabilities,
         forward_headers: std::collections::HashMap::new(),
         execution_budget: request.execution_budget,
         explain: request.explain,

@@ -200,13 +200,46 @@ pub(crate) fn binding_snapshot_events(
 pub(crate) fn run_start_context_from_request(
     request: &astra_services::runs::ChatRequestData,
     execution_bindings: Option<&(WorkspaceBinding, ExecutorBinding)>,
+    agent_binding: Option<&astra_services::AgentBindingRecord>,
 ) -> RunStartContext {
     RunStartContext {
         interaction_mode: request.interaction_mode,
         interactive_client: Some(request.interactive_client),
         execution_metadata: execution_bindings
             .map(|(workspace, executor)| binding_event_fields(workspace, executor)),
+        agent_binding_id: agent_binding.map(|binding| binding.id.clone()).or_else(|| {
+            request
+                .agent_binding
+                .as_ref()
+                .map(|binding| binding.id.clone())
+        }),
+        agent_binding_name: agent_binding.map(|binding| binding.binding_name.clone()),
+        agent_binding_schema_version: agent_binding
+            .map(|binding| binding.binding_schema_version.clone()),
+        selected_model: request.selected_model.clone(),
+        capability_server_refs: request
+            .agent_binding
+            .as_ref()
+            .map(|binding| binding.capability_server_refs.clone()),
+        runtime_profile: effective_runtime_profile(request),
     }
+}
+
+fn effective_runtime_profile(
+    request: &astra_services::runs::ChatRequestData,
+) -> Option<astra_services::runs::RuntimeProfileRequest> {
+    if request.agent_binding.is_some() {
+        return Some(astra_services::runs::RuntimeProfileRequest::AgentBindingRegistry);
+    }
+    if !request.runtime_mcp_bindings.is_empty()
+        || matches!(
+            request.runtime_profile,
+            Some(astra_services::runs::RuntimeProfileRequest::RequestScopedRuntimeMcp)
+        )
+    {
+        return Some(astra_services::runs::RuntimeProfileRequest::RequestScopedRuntimeMcp);
+    }
+    request.runtime_profile
 }
 
 pub(crate) fn executor_binding_from_request(
@@ -474,10 +507,16 @@ mod tests {
     fn test_request(message: &str) -> astra_services::runs::ChatRequestData {
         astra_services::runs::ChatRequestData {
             message: message.to_string(),
+            parts: Vec::new(),
+            attachments: Vec::new(),
             session_id: None,
             full_llm_capture: false,
             agent_id: None,
             model: None,
+            selected_model: None,
+            agent_binding: None,
+            runtime_auth: None,
+            runtime_profile: None,
             llm_token_service: None,
             skill_search: None,
             allow_skills: None,
@@ -488,12 +527,52 @@ mod tests {
             runtime_mcp_bindings: Vec::new(),
             mcp_binding_ids: None,
             context: None,
+            edge_executor_id: None,
+            capabilities: Vec::new(),
             forward_headers: std::collections::HashMap::new(),
             execution_budget: None,
             explain: false,
             interaction_mode: None,
             interactive_client: false,
         }
+    }
+
+    #[test]
+    fn run_start_context_records_effective_agent_binding_profile_when_omitted() {
+        let mut request = test_request("hello");
+        request.agent_binding = Some(astra_services::runs::AgentBindingRuntimeRequest {
+            id: "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391".to_string(),
+            capability_server_refs: astra_services::runs::CapabilityServerRefs {
+                mcp: "tools".to_string(),
+                skills: "skills".to_string(),
+            },
+        });
+
+        let context = run_start_context_from_request(&request, None, None);
+
+        assert_eq!(
+            context.runtime_profile,
+            Some(astra_services::runs::RuntimeProfileRequest::AgentBindingRegistry)
+        );
+    }
+
+    #[test]
+    fn run_start_context_records_effective_request_scoped_profile_when_implicit_mcp_allowed() {
+        let mut request = test_request("hello");
+        request.runtime_mcp_bindings = vec![astra_services::runs::RuntimeMcpBindingRequest {
+            id: "request-tools".to_string(),
+            transport: "streamable_http".to_string(),
+            url: "https://tools.example.test/mcp".to_string(),
+            auth_token: None,
+            headers: std::collections::HashMap::new(),
+        }];
+
+        let context = run_start_context_from_request(&request, None, None);
+
+        assert_eq!(
+            context.runtime_profile,
+            Some(astra_services::runs::RuntimeProfileRequest::RequestScopedRuntimeMcp)
+        );
     }
 
     #[test]

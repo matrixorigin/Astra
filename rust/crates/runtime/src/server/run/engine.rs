@@ -36,8 +36,9 @@ use std::sync::Arc;
 use astra_services::{
     DatabaseStateProjectionStore,
     runs::{
-        DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord, DurableRunRecord,
-        DurableRunStatusKind, RequestedTurnInteractionMode, RunStateStore, durable_run_status_kind,
+        CapabilityServerRefs, DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord,
+        DurableRunRecord, DurableRunStatusKind, RequestedTurnInteractionMode, RunStateStore,
+        RuntimeProfileRequest, SelectedModelRequest, durable_run_status_kind,
     },
 };
 
@@ -65,6 +66,12 @@ pub struct RunStartContext {
     pub interaction_mode: Option<RequestedTurnInteractionMode>,
     pub interactive_client: Option<bool>,
     pub execution_metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    pub agent_binding_id: Option<String>,
+    pub agent_binding_name: Option<String>,
+    pub agent_binding_schema_version: Option<String>,
+    pub selected_model: Option<SelectedModelRequest>,
+    pub capability_server_refs: Option<CapabilityServerRefs>,
+    pub runtime_profile: Option<RuntimeProfileRequest>,
 }
 
 fn requested_mode_label(mode: RequestedTurnInteractionMode) -> &'static str {
@@ -86,9 +93,16 @@ fn effective_mode_label(context: &RunStartContext) -> Option<&'static str> {
         .map(|interactive| if interactive { "prompt" } else { "headless" })
 }
 
-fn run_started_event_data(context: RunStartContext) -> serde_json::Value {
+fn runtime_profile_label(profile: RuntimeProfileRequest) -> &'static str {
+    match profile {
+        RuntimeProfileRequest::RequestScopedRuntimeMcp => "request_scoped_runtime_mcp",
+        RuntimeProfileRequest::AgentBindingRegistry => "agent_binding_registry",
+    }
+}
+
+fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
     let mut data = serde_json::Map::new();
-    if let Some(mode_label) = effective_mode_label(&context) {
+    if let Some(mode_label) = effective_mode_label(context) {
         data.insert(
             "interaction_mode".to_string(),
             serde_json::Value::String(mode_label.to_string()),
@@ -104,10 +118,44 @@ fn run_started_event_data(context: RunStartContext) -> serde_json::Value {
             serde_json::Value::Bool(interactive_client),
         );
     }
-    if let Some(metadata) = context.execution_metadata {
+    if let Some(metadata) = context.execution_metadata.as_ref() {
         for (key, value) in metadata {
-            data.entry(key).or_insert(value);
+            data.entry(key.clone()).or_insert_with(|| value.clone());
         }
+    }
+    if let Some(agent_binding_id) = context.agent_binding_id.as_ref() {
+        data.insert(
+            "agent_binding_id".to_string(),
+            serde_json::Value::String(agent_binding_id.clone()),
+        );
+    }
+    if let Some(agent_binding_name) = context.agent_binding_name.as_ref() {
+        data.insert(
+            "agent_binding_name".to_string(),
+            serde_json::Value::String(agent_binding_name.clone()),
+        );
+    }
+    if let Some(agent_binding_schema_version) = context.agent_binding_schema_version.as_ref() {
+        data.insert(
+            "agent_binding_schema_version".to_string(),
+            serde_json::Value::String(agent_binding_schema_version.clone()),
+        );
+    }
+    if let Some(selected_model) = context.selected_model.as_ref()
+        && let Ok(value) = serde_json::to_value(selected_model)
+    {
+        data.insert("selected_model".to_string(), value);
+    }
+    if let Some(capability_server_refs) = context.capability_server_refs.as_ref()
+        && let Ok(value) = serde_json::to_value(capability_server_refs)
+    {
+        data.insert("capability_server_refs".to_string(), value);
+    }
+    if let Some(runtime_profile) = context.runtime_profile {
+        data.insert(
+            "runtime_profile".to_string(),
+            serde_json::Value::String(runtime_profile_label(runtime_profile).to_string()),
+        );
     }
     serde_json::Value::Object(data)
 }
@@ -219,6 +267,27 @@ impl RunEngine {
         } else {
             (Some(run_id.to_string()), Some(run_id.to_string()), 0)
         };
+        let selected_model_json = context
+            .selected_model
+            .as_ref()
+            .and_then(|selected_model| serde_json::to_string(selected_model).ok());
+        let selected_model_name = context
+            .selected_model
+            .as_ref()
+            .map(|selected_model| selected_model.model.clone());
+        let selected_model_gateway = context
+            .selected_model
+            .as_ref()
+            .and_then(|selected_model| selected_model.gateway.clone());
+        let capability_server_refs_json = context
+            .capability_server_refs
+            .as_ref()
+            .and_then(|refs| serde_json::to_string(refs).ok());
+        let runtime_profile = context
+            .runtime_profile
+            .map(runtime_profile_label)
+            .map(str::to_string);
+        let run_started_data = run_started_event_data(&context);
         let record = DurableRunRecord {
             run_id: run_id.to_string(),
             user_id: user_id.to_string(),
@@ -245,9 +314,17 @@ impl RunEngine {
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
             total_tool_calls: 0,
+            agent_binding_id: context.agent_binding_id,
+            agent_binding_name: context.agent_binding_name,
+            agent_binding_schema_version: context.agent_binding_schema_version,
+            selected_model_json,
+            selected_model_name,
+            selected_model_gateway,
+            capability_server_refs_json,
+            runtime_profile,
             events: vec![serde_json::json!({
                 "event_type": "run_started",
-                "data": run_started_event_data(context)
+                "data": run_started_data
             })],
             created_at: now.clone(),
             updated_at: now,
@@ -923,6 +1000,7 @@ mod tests {
                     interaction_mode: Some(RequestedTurnInteractionMode::Auto),
                     interactive_client: Some(true),
                     execution_metadata: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -932,6 +1010,66 @@ mod tests {
         assert_eq!(run.events[0]["data"]["interaction_mode"], "auto");
         assert_eq!(run.events[0]["data"]["suppressed_loop_nudges"], true);
         assert_eq!(run.events[0]["data"]["interactive_client"], true);
+    }
+
+    #[tokio::test]
+    async fn start_run_with_context_persists_effective_agent_binding_runtime_profile_when_omitted()
+    {
+        let engine = test_engine();
+        let request = astra_services::runs::ChatRequestData {
+            message: "hello".to_string(),
+            parts: Vec::new(),
+            attachments: Vec::new(),
+            session_id: None,
+            full_llm_capture: false,
+            agent_id: None,
+            model: None,
+            selected_model: None,
+            agent_binding: Some(astra_services::runs::AgentBindingRuntimeRequest {
+                id: "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391".to_string(),
+                capability_server_refs: astra_services::runs::CapabilityServerRefs {
+                    mcp: "tools".to_string(),
+                    skills: "skills".to_string(),
+                },
+            }),
+            runtime_auth: None,
+            runtime_profile: None,
+            llm_token_service: None,
+            skill_search: None,
+            allow_skills: None,
+            allow_skill_sources: None,
+            allow_tools: None,
+            workspace_binding: None,
+            executor_binding: None,
+            runtime_mcp_bindings: Vec::new(),
+            mcp_binding_ids: None,
+            context: None,
+            edge_executor_id: None,
+            capabilities: Vec::new(),
+            forward_headers: std::collections::HashMap::new(),
+            execution_budget: None,
+            explain: false,
+            interaction_mode: None,
+            interactive_client: false,
+        };
+        let context = crate::server::run::binding_resolution::run_start_context_from_request(
+            &request, None, None,
+        );
+
+        engine
+            .start_run_with_context("run-agent-binding", "user-1", "sess-1", context)
+            .await
+            .unwrap();
+
+        let run = engine.load_run("run-agent-binding").await.unwrap().unwrap();
+        assert_eq!(
+            run.runtime_profile.as_deref(),
+            Some("agent_binding_registry")
+        );
+        assert_eq!(
+            run.events[0]["data"]["runtime_profile"],
+            "agent_binding_registry"
+        );
     }
 
     #[tokio::test]
@@ -946,6 +1084,7 @@ mod tests {
                     interaction_mode: None,
                     interactive_client: Some(true),
                     execution_metadata: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -968,6 +1107,7 @@ mod tests {
                     interaction_mode: Some(RequestedTurnInteractionMode::NonInteractive),
                     interactive_client: Some(false),
                     execution_metadata: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -1509,6 +1649,14 @@ mod tests {
                 total_prompt_tokens: 0,
                 total_completion_tokens: 0,
                 total_tool_calls: 0,
+                agent_binding_id: None,
+                agent_binding_name: None,
+                agent_binding_schema_version: None,
+                selected_model_json: None,
+                selected_model_name: None,
+                selected_model_gateway: None,
+                capability_server_refs_json: None,
+                runtime_profile: None,
                 events: vec![serde_json::json!({"event_type":"run_started","data":{}})],
                 created_at: now.clone(),
                 updated_at: now,

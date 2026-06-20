@@ -1091,6 +1091,7 @@ describe("chatRequestToWire", () => {
   test("maps allow_skills, allow_tools, and skill_search", () => {
     const body = chatRequestToWire({
       message: "hi",
+      selectedModel: { model: "test-model" },
       allowSkills: ["a", "b"],
       allowTools: ["t1"],
       skillSearch: {
@@ -1111,6 +1112,7 @@ describe("chatRequestToWire", () => {
   test("omits allow lists when empty", () => {
     const body = chatRequestToWire({
       message: "x",
+      selectedModel: { model: "test-model" },
       allowSkills: [],
       allowTools: [],
     });
@@ -1119,20 +1121,42 @@ describe("chatRequestToWire", () => {
   });
 
   test("default request omits execution_budget", () => {
-    const body = chatRequestToWire({ message: "m" });
+    const body = chatRequestToWire({ message: "m", selectedModel: { model: "test-model" } });
     expect(body.execution_budget).toBeUndefined();
   });
 
-  test("full snake_case mapping: session, agent, model, context, plan, edge, capabilities, budget, bindings", () => {
+  test("preserves empty selectedModel.gateway for server-side validation", () => {
+    const body = chatRequestToWire({
+      message: "m",
+      selectedModel: { model: "kimi", gateway: "" },
+    });
+
+    expect(body.selected_model).toEqual({ model: "kimi", gateway: "" });
+  });
+
+  test("full snake_case mapping: session, agent, selected model, binding, context, plan, edge, capabilities, budget, bindings", () => {
     const body = chatRequestToWire({
       message: "q",
+      parts: [{ type: "text", text: "q" }],
+      attachments: [{ id: "att-1", kind: "file" }],
       executionBudget: {
         initialTurns: 3,
         hardTurnLimit: 7,
       },
       sessionId: "sess-1",
       agentId: "ag-1",
-      model: "kimi",
+      selectedModel: { model: "kimi", gateway: "gateway-a" },
+      agentBinding: {
+        id: "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391",
+        capabilityServerRefs: {
+          mcp: "tools",
+          skills: "skills",
+        },
+      },
+      runtimeAuth: {
+        authorization: "Bearer runtime-grant",
+      },
+      runtimeProfile: "agent_binding_registry",
       context: { files: [] },
       explain: true,
       planSubtaskId: "p1",
@@ -1156,13 +1180,26 @@ describe("chatRequestToWire", () => {
     });
     expect(body).toMatchObject({
       message: "q",
+      parts: [{ type: "text", text: "q" }],
+      attachments: [{ id: "att-1", kind: "file" }],
       execution_budget: {
         initial_turns: 3,
         hard_turn_limit: 7,
       },
       session_id: "sess-1",
       agent_id: "ag-1",
-      model: "kimi",
+      selected_model: { model: "kimi", gateway: "gateway-a" },
+      agent_binding: {
+        id: "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391",
+        capability_server_refs: {
+          mcp: "tools",
+          skills: "skills",
+        },
+      },
+      runtime_auth: {
+        authorization: "Bearer runtime-grant",
+      },
+      runtime_profile: "agent_binding_registry",
       context: { files: [] },
       explain: true,
       plan_subtask_id: "p1",
@@ -1187,8 +1224,178 @@ describe("chatRequestToWire", () => {
   });
 
   test("omits undefined optional fields", () => {
-    const body = chatRequestToWire({ message: "x" });
-    expect(Object.keys(body).sort()).toEqual(["message"].sort());
+    const body = chatRequestToWire({
+      message: "x",
+      selectedModel: { model: "test-model" },
+    });
+    expect(Object.keys(body).sort()).toEqual(["message", "selected_model"].sort());
+  });
+});
+
+// ─── Agent Binding Registry ───────────────────────────────────────
+
+describe("AstraClient — Agent Binding registry", () => {
+  const createBody = {
+    idempotency_key: "idem-1",
+    binding: {
+      binding_name: "support-agent-v1",
+      agent_md: "# Support Agent",
+      capability_servers: [
+        {
+          id: "tools",
+          type: "mcp" as const,
+          transport: "streamable_http" as const,
+          endpoint_url: "https://capabilities.example.com/mcp",
+        },
+        {
+          id: "skills",
+          type: "skill" as const,
+          transport: "streamable_http" as const,
+          endpoint_url: "https://capabilities.example.com/skills",
+        },
+      ],
+      runtime_policy: {
+        max_steps: 4,
+        tool_mode: "mcp_gateway" as const,
+      },
+      metadata: { source: "test" },
+      binding_schema_version: "v1",
+    },
+  };
+
+  test("createAgentBinding POST /agent-bindings with body", async () => {
+    const response = {
+      agent_binding_id: "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391",
+      binding_name: "support-agent-v1",
+      status: "active",
+    };
+    globalThis.fetch = mockFetch(200, response);
+
+    const client = createClient();
+    const out = await client.createAgentBinding(createBody);
+
+    expect(out).toEqual(response);
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(call[0]).toBe("http://localhost:8000/agent-bindings");
+    expect(call[1].method).toBe("POST");
+    expect(JSON.parse(call[1].body)).toEqual(createBody);
+  });
+
+  test("getAgentBinding GET /agent-bindings/{id}", async () => {
+    const record = {
+      agent_binding_id: "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391",
+      binding_name: "support-agent-v1",
+      status: "active",
+      agent_md: "# Support Agent",
+      capability_servers: createBody.binding.capability_servers,
+      runtime_policy: createBody.binding.runtime_policy,
+      metadata: createBody.binding.metadata,
+      binding_schema_version: "v1",
+      created_at: "2026-06-18T00:00:00",
+      disabled_at: null,
+    };
+    globalThis.fetch = mockFetch(200, record);
+
+    const client = createClient();
+    const out = await client.getAgentBinding(record.agent_binding_id);
+
+    expect(out).toEqual(record);
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(call[0]).toBe(
+      "http://localhost:8000/agent-bindings/ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391",
+    );
+    expect(call[1].method).toBeUndefined();
+  });
+
+  test("disableAgentBinding POST /agent-bindings/{id}/disable", async () => {
+    const record = {
+      agent_binding_id: "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391",
+      binding_name: "support-agent-v1",
+      status: "disabled",
+      agent_md: "# Support Agent",
+      capability_servers: createBody.binding.capability_servers,
+      runtime_policy: createBody.binding.runtime_policy,
+      metadata: createBody.binding.metadata,
+      binding_schema_version: "v1",
+      created_at: "2026-06-18T00:00:00",
+      disabled_at: "2026-06-18T00:01:00",
+    };
+    globalThis.fetch = mockFetch(200, record);
+
+    const client = createClient();
+    const out = await client.disableAgentBinding(record.agent_binding_id);
+
+    expect(out).toEqual(record);
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(call[0]).toBe(
+      "http://localhost:8000/agent-bindings/ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391/disable",
+    );
+    expect(call[1].method).toBe("POST");
+    expect(JSON.parse(call[1].body)).toEqual({});
+  });
+});
+
+// ─── Model Gateway Registry ───────────────────────────────────────
+
+describe("AstraClient — Model Gateway registry", () => {
+  const createBody = {
+    id: "gateway-a",
+    resolve_url: "https://models.example.com/resolve",
+    model_protocol: "openai_chat_completions" as const,
+    metadata: { owner: "platform" },
+  };
+
+  test("createModelGateway POST /model-gateways with body", async () => {
+    const response = { id: "gateway-a", status: "active" };
+    globalThis.fetch = mockFetch(200, response);
+
+    const client = createClient();
+    const out = await client.createModelGateway(createBody);
+
+    expect(out).toEqual(response);
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(call[0]).toBe("http://localhost:8000/model-gateways");
+    expect(call[1].method).toBe("POST");
+    expect(JSON.parse(call[1].body)).toEqual(createBody);
+  });
+
+  test("getModelGateway GET /model-gateways/{id}", async () => {
+    const record = {
+      ...createBody,
+      status: "active",
+      created_at: "2026-06-18T00:00:00",
+      updated_at: "2026-06-18T00:00:00",
+      disabled_at: null,
+    };
+    globalThis.fetch = mockFetch(200, record);
+
+    const client = createClient();
+    const out = await client.getModelGateway("gateway-a");
+
+    expect(out).toEqual(record);
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(call[0]).toBe("http://localhost:8000/model-gateways/gateway-a");
+    expect(call[1].method).toBeUndefined();
+  });
+
+  test("disableModelGateway POST /model-gateways/{id}/disable", async () => {
+    const record = {
+      ...createBody,
+      status: "disabled",
+      created_at: "2026-06-18T00:00:00",
+      updated_at: "2026-06-18T00:01:00",
+      disabled_at: "2026-06-18T00:01:00",
+    };
+    globalThis.fetch = mockFetch(200, record);
+
+    const client = createClient();
+    const out = await client.disableModelGateway("gateway-a");
+
+    expect(out).toEqual(record);
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(call[0]).toBe("http://localhost:8000/model-gateways/gateway-a/disable");
+    expect(call[1].method).toBe("POST");
+    expect(JSON.parse(call[1].body)).toEqual({});
   });
 });
 

@@ -77,6 +77,7 @@ pub mod auto_invoke_handler;
 pub mod bash_intent;
 pub mod bridge;
 pub mod capabilities;
+pub(crate) mod capability_endpoint_pool;
 pub mod evaluation;
 pub mod learning;
 pub mod matrix_cloud_runtime;

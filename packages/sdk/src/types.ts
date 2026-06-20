@@ -245,6 +245,7 @@ export type TurnCompleteEvent = {
 export type StreamErrorEvent = {
   type: "error";
   code?: string;
+  error_code?: string;
   message: string;
   retryable?: boolean;
   retry_after_ms?: number;
@@ -733,9 +734,25 @@ export type SSEClientOptions = {
 
 export type ChatRequest = {
   message: string;
+  parts?: unknown[];
+  attachments?: unknown[];
   sessionId?: string;
   agentId?: string;
-  model?: string;
+  selectedModel: {
+    model: string;
+    gateway?: string;
+  };
+  agentBinding?: {
+    id: string;
+    capabilityServerRefs: {
+      mcp: string;
+      skills: string;
+    };
+  };
+  runtimeAuth?: {
+    authorization: string;
+  };
+  runtimeProfile?: "agent_binding_registry" | "request_scoped_runtime_mcp";
   executionBudget?: {
     initialTurns?: number;
     hardTurnLimit?: number;
@@ -754,6 +771,82 @@ export type ChatRequest = {
   skillSearch?: SkillSearchSettings;
   workspaceBinding?: WorkspaceBinding;
   executorBinding?: ExecutorBinding;
+};
+
+export type CapabilityServerType = "mcp" | "skill";
+export type CapabilityServerTransport = "streamable_http";
+export type AgentBindingStatus = "active" | "disabled" | "invalid";
+export type AgentBindingToolMode = "mcp_gateway";
+
+export type CapabilityServerEndpoint = {
+  id: string;
+  type: CapabilityServerType;
+  transport: CapabilityServerTransport;
+  endpoint_url: string;
+};
+
+export type AgentBindingRuntimePolicy = {
+  max_steps?: number | null;
+  tool_mode: AgentBindingToolMode;
+};
+
+export type AgentBindingPayload = {
+  binding_name: string;
+  agent_md: string;
+  capability_servers: CapabilityServerEndpoint[];
+  runtime_policy: AgentBindingRuntimePolicy;
+  metadata?: Record<string, unknown> | null;
+  binding_schema_version: string;
+};
+
+export type AgentBindingCreateRequest = {
+  idempotency_key: string;
+  binding: AgentBindingPayload;
+};
+
+export type AgentBindingCreateResponse = {
+  agent_binding_id: string;
+  binding_name: string;
+  status: AgentBindingStatus;
+};
+
+export type AgentBindingRecord = {
+  agent_binding_id: string;
+  binding_name: string;
+  status: AgentBindingStatus;
+  agent_md: string;
+  capability_servers: CapabilityServerEndpoint[];
+  runtime_policy: AgentBindingRuntimePolicy;
+  metadata?: Record<string, unknown> | null;
+  binding_schema_version: string;
+  created_at: string;
+  disabled_at?: string | null;
+};
+
+export type ModelProtocol = "openai_chat_completions";
+export type ModelGatewayStatus = "active" | "disabled" | "invalid";
+
+export type ModelGatewayCreateRequest = {
+  id: string;
+  resolve_url: string;
+  model_protocol: ModelProtocol;
+  metadata?: Record<string, unknown> | null;
+};
+
+export type ModelGatewayCreateResponse = {
+  id: string;
+  status: ModelGatewayStatus;
+};
+
+export type ModelGatewayRecord = {
+  id: string;
+  resolve_url: string;
+  model_protocol: ModelProtocol;
+  status: ModelGatewayStatus;
+  metadata?: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+  disabled_at?: string | null;
 };
 
 export type RunStatus = {

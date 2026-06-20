@@ -363,6 +363,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             context_manifest_pool: None,
             context_manifest_user_id: None,
             context_manifest_model_name: effective_model.clone(),
+            runtime_manifest: None,
             recursion_depth: child_recursion_depth,
             final_text: String::new(),
             final_text_streamed: false,

@@ -163,6 +163,8 @@ pub struct AppState {
     pub(crate) skill_service: Arc<dyn SkillService>,
     pub(crate) skill_config_service: Arc<dyn SkillConfigService>,
     pub(crate) mcp_registry_service: Arc<dyn astra_services::McpRegistryService>,
+    pub(crate) agent_binding_service: Arc<dyn astra_services::AgentBindingService>,
+    pub(crate) model_gateway_service: Arc<dyn astra_services::ModelGatewayService>,
     pub(crate) llm_trusted_domain_service:
         Arc<dyn astra_services::llm_trusted_domains::LlmTrustedDomainService>,
     pub(crate) evaluation_service: Arc<dyn EvaluationService>,
@@ -252,6 +254,8 @@ impl AppState {
             skill_service: Arc::new(UnconfiguredSkillService),
             skill_config_service: Arc::new(UnconfiguredSkillConfigService),
             mcp_registry_service: Arc::new(astra_services::UnconfiguredMcpRegistryService),
+            agent_binding_service: Arc::new(astra_services::UnconfiguredAgentBindingService),
+            model_gateway_service: Arc::new(astra_services::UnconfiguredModelGatewayService),
             llm_trusted_domain_service: Arc::new(
                 astra_services::llm_trusted_domains::UnconfiguredLlmTrustedDomainService,
             ),
@@ -476,6 +480,22 @@ impl AppState {
         mcp_registry_service: Arc<dyn astra_services::McpRegistryService>,
     ) -> Self {
         self.mcp_registry_service = mcp_registry_service;
+        self
+    }
+
+    pub fn with_agent_binding_service(
+        mut self,
+        agent_binding_service: Arc<dyn astra_services::AgentBindingService>,
+    ) -> Self {
+        self.agent_binding_service = agent_binding_service;
+        self
+    }
+
+    pub fn with_model_gateway_service(
+        mut self,
+        model_gateway_service: Arc<dyn astra_services::ModelGatewayService>,
+    ) -> Self {
+        self.model_gateway_service = model_gateway_service;
         self
     }
 

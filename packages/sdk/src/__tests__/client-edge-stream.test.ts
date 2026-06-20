@@ -49,7 +49,7 @@ describe('AstraClient — streamChat', () => {
       accessToken: 'tok-1',
     });
     const sse: SSEClient = client.streamChat(
-      { message: 'hello', model: 'gpt' },
+      { message: 'hello', selectedModel: { model: 'gpt' } },
       {
         onEvent: (e) => {
           if (e.type === 'session_info' || e.type === 'text_delta') events.push(e.type);
@@ -69,7 +69,7 @@ describe('AstraClient — streamChat', () => {
       JSON.stringify(
         chatRequestToWire({
           message: 'hello',
-          model: 'gpt',
+          selectedModel: { model: 'gpt' },
         }),
       ),
     );
@@ -89,7 +89,10 @@ describe('AstraClient — streamChat', () => {
       pathPrefix: '/api',
       accessToken: 'x',
     });
-    const sse = client.streamChat({ message: 'a' }, { onEvent: () => {} });
+    const sse = client.streamChat(
+      { message: 'a', selectedModel: { model: 'gpt' } },
+      { onEvent: () => {} },
+    );
     await new Promise((r) => setTimeout(r, 30));
     sse.close();
     const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;

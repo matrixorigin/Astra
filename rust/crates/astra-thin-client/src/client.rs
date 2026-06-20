@@ -1624,7 +1624,7 @@ mod tests {
             .await;
 
         let client = ThinClient::new(&srv.uri(), None).unwrap();
-        let req = ChatStreamRequest::new("ping");
+        let req = ChatStreamRequest::new("ping", "test-model");
         let evs = client.chat_stream_collect(&req, Some("tkn")).await.unwrap();
         assert_eq!(evs.len(), 3);
         assert!(matches!(
@@ -1661,7 +1661,7 @@ mod tests {
             .await;
 
         let client = ThinClient::new(&srv.uri(), None).unwrap();
-        let req = ChatStreamRequest::new("ping");
+        let req = ChatStreamRequest::new("ping", "test-model");
         let evs = client.chat_stream_collect(&req, Some("tkn")).await.unwrap();
         assert_eq!(evs.len(), 2);
         assert!(matches!(
@@ -2155,7 +2155,7 @@ mod tests {
 
         let client = ThinClient::new(&srv.uri(), None).unwrap();
         let err = client
-            .chat_stream_collect(&ChatStreamRequest::new("x"), None)
+            .chat_stream_collect(&ChatStreamRequest::new("x", "test-model"), None)
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -2364,7 +2364,7 @@ mod tests {
             .await;
 
         let client = ThinClient::new(&srv.uri(), Some("default-tok".into())).unwrap();
-        let req = ChatStreamRequest::new("hi");
+        let req = ChatStreamRequest::new("hi", "test-model");
         let evs = client
             .chat_stream_collect(&req, Some("override-tok"))
             .await
@@ -2387,7 +2387,7 @@ mod tests {
             .await;
 
         let client = ThinClient::new(&srv.uri(), Some("default-tok".into())).unwrap();
-        let req = ChatStreamRequest::new("hi");
+        let req = ChatStreamRequest::new("hi", "test-model");
         let evs = client.chat_stream_collect(&req, None).await.unwrap();
         assert_eq!(evs.len(), 1);
     }

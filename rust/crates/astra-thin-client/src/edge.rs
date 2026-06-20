@@ -42,7 +42,7 @@ mod tests {
 
     #[test]
     fn advertise_executor_fills_defaults() {
-        let mut r = ChatStreamRequest::new("hi");
+        let mut r = ChatStreamRequest::new("hi", "test-model");
         advertise_executor(&mut r, "edge-test");
         assert_eq!(r.edge_executor_id.as_deref(), Some("edge-test"));
         assert_eq!(r.capabilities, builtin_capability_preset());
@@ -50,7 +50,7 @@ mod tests {
 
     #[test]
     fn advertise_executor_respects_existing_capabilities() {
-        let mut r = ChatStreamRequest::new("hi");
+        let mut r = ChatStreamRequest::new("hi", "test-model");
         r.capabilities = vec!["bash".into()];
         advertise_executor(&mut r, "e1");
         assert_eq!(r.capabilities, vec!["bash"]);

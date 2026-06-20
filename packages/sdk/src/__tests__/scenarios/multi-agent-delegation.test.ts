@@ -60,9 +60,16 @@ describe('scenarios / multi-agent delegation', () => {
 
     const client = new AstraClient({ baseUrl: 'http://localhost:8000', accessToken: 'token' });
     const events: StreamEvent[] = [];
-    const sse = client.streamChat({ message: 'coordinate agents', sessionId: 'sess-agents' }, {
-      onEvent: (event) => events.push(event),
-    });
+    const sse = client.streamChat(
+      {
+        message: 'coordinate agents',
+        sessionId: 'sess-agents',
+        selectedModel: { model: 'gpt' },
+      },
+      {
+        onEvent: (event) => events.push(event),
+      },
+    );
     await nextTick();
     sse.close();
 

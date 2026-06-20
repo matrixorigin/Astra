@@ -24,6 +24,12 @@ pub struct RuntimeConfig {
     #[serde(default = "default_config_version")]
     pub version: String,
 
+    /// Compatibility switch for legacy chat clients that send non-empty
+    /// `runtime_mcp_bindings` without `runtime_profile=request_scoped_runtime_mcp`.
+    /// Defaults to false so request-scoped MCP remains an explicit runtime mode.
+    #[serde(default)]
+    pub allow_implicit_request_scoped_mcp: bool,
+
     /// Compression strategy configuration.
     #[serde(default)]
     pub compression: CompressionConfig,
@@ -91,9 +97,32 @@ pub struct RuntimeConfig {
     /// at defaults (the CLI prefers config values > 0 over env).
     #[serde(default)]
     pub runtime_limits: RuntimeLimitsConfig,
+
+    /// Agent Binding registry limits.
+    #[serde(default)]
+    pub agent_binding_registry: AgentBindingRegistryConfig,
 }
 
 // ─── Runtime Limits Configuration ────────────────────────────────────────────
+
+pub fn default_agent_binding_max_agent_md_bytes() -> u32 {
+    256 * 1024
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentBindingRegistryConfig {
+    /// Maximum UTF-8 byte length of a registered immutable Agent prompt.
+    #[serde(default = "default_agent_binding_max_agent_md_bytes")]
+    pub max_agent_md_bytes: u32,
+}
+
+impl Default for AgentBindingRegistryConfig {
+    fn default() -> Self {
+        Self {
+            max_agent_md_bytes: default_agent_binding_max_agent_md_bytes(),
+        }
+    }
+}
 
 /// Per-turn agentic-loop budget knobs editable via `/config`.
 ///
@@ -283,6 +312,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             version: default_config_version(),
+            allow_implicit_request_scoped_mcp: false,
             compression: CompressionConfig::default(),
             memory: MemoryConfig::default(),
             tool_selection: ToolSelectionConfig::default(),
@@ -296,6 +326,7 @@ impl Default for RuntimeConfig {
             fork_prefix: ForkPrefixConfig::default(),
             tool_surface: ToolSurfaceConfig::default(),
             runtime_limits: RuntimeLimitsConfig::default(),
+            agent_binding_registry: AgentBindingRegistryConfig::default(),
         }
     }
 }
@@ -1795,9 +1826,14 @@ impl RuntimeConfig {
             fork_prefix,
             tool_surface,
             runtime_limits,
+            agent_binding_registry,
+            allow_implicit_request_scoped_mcp,
         } = other;
 
         merge_if_non_default(&mut self.version, version, default_config_version());
+        if allow_implicit_request_scoped_mcp {
+            self.allow_implicit_request_scoped_mcp = true;
+        }
 
         let CompressionConfig {
             max_history_tokens,
@@ -2264,6 +2300,11 @@ impl RuntimeConfig {
             plan_subtask_max_turns,
             0,
         );
+        merge_if_non_default(
+            &mut self.agent_binding_registry.max_agent_md_bytes,
+            agent_binding_registry.max_agent_md_bytes,
+            default_agent_binding_max_agent_md_bytes(),
+        );
 
         self
     }
@@ -2289,6 +2330,14 @@ impl RuntimeConfig {
             && let Ok(n) = val.parse()
         {
             self.token_budget.max_turn_input_tokens = n;
+        }
+        if let Ok(val) = std::env::var("ASTRA_AGENT_BINDING_MAX_AGENT_MD_BYTES")
+            && let Ok(n) = val.parse()
+        {
+            self.agent_binding_registry.max_agent_md_bytes = n;
+        }
+        if let Ok(val) = std::env::var("ASTRA_ALLOW_IMPLICIT_REQUEST_SCOPED_MCP") {
+            self.allow_implicit_request_scoped_mcp = val == "1" || val.eq_ignore_ascii_case("true");
         }
         if let Ok(val) = std::env::var("ASTRA_CAPTURE_TRACES")
             && (val == "1" || val.to_lowercase() == "true")
@@ -2466,15 +2515,18 @@ mod tests {
         let config = RuntimeConfig::default();
         // Just verify they exist and serialize
         let toml = config.to_toml().unwrap();
+        assert!(toml.contains("allow_implicit_request_scoped_mcp = false"));
         assert!(toml.contains("[verification]"));
         assert!(toml.contains("[memory_pressure]"));
         assert!(toml.contains("[context_window]"));
+        assert!(toml.contains("[agent_binding_registry]"));
     }
 
     #[test]
     fn test_merge_applies_non_default_fields_across_sections() {
         let merged = RuntimeConfig::default().merge(RuntimeConfig {
             version: "2.0".to_string(),
+            allow_implicit_request_scoped_mcp: true,
             compression: CompressionConfig {
                 max_history_tokens: 12345,
                 compression_threshold: 0.65,
@@ -2573,9 +2625,13 @@ mod tests {
                 max_turns: 250,
                 plan_subtask_max_turns: 175,
             },
+            agent_binding_registry: AgentBindingRegistryConfig {
+                max_agent_md_bytes: 4096,
+            },
         });
 
         assert_eq!(merged.version, "2.0");
+        assert!(merged.allow_implicit_request_scoped_mcp);
         assert_eq!(merged.compression.max_history_tokens, 12345);
         assert!((merged.compression.compression_threshold - 0.65).abs() < 0.001);
         assert!(!merged.compression.preserve_tool_calls);
@@ -2640,6 +2696,7 @@ mod tests {
         assert_eq!(merged.adaptive_tuning.scenario_cooldown_turns, 10);
         assert_eq!(merged.adaptive_tuning.budget_cooldown_turns, 6);
         assert_eq!(merged.adaptive_tuning.tuning_cycle_interval, 8);
+        assert_eq!(merged.agent_binding_registry.max_agent_md_bytes, 4096);
     }
 
     #[test]

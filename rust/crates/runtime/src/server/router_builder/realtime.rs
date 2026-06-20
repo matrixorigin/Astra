@@ -99,6 +99,30 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route("/chat/turn", post(chat_handlers::chat_turn_handler))
         .route("/chat/route", post(chat_handlers::chat_route_handler))
         .route(
+            "/agent-bindings",
+            post(agent_binding_handlers::create_agent_binding_handler),
+        )
+        .route(
+            "/agent-bindings/{id}",
+            get(agent_binding_handlers::get_agent_binding_handler),
+        )
+        .route(
+            "/agent-bindings/{id}/disable",
+            post(agent_binding_handlers::disable_agent_binding_handler),
+        )
+        .route(
+            "/model-gateways",
+            post(model_gateway_handlers::create_model_gateway_handler),
+        )
+        .route(
+            "/model-gateways/{id}",
+            get(model_gateway_handlers::get_model_gateway_handler),
+        )
+        .route(
+            "/model-gateways/{id}/disable",
+            post(model_gateway_handlers::disable_model_gateway_handler),
+        )
+        .route(
             "/api/v1/mcp/register-or-update",
             post(mcp_handlers::register_or_update_handler),
         )
