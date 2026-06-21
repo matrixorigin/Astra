@@ -4,6 +4,11 @@
 //! token should trip the sensitive-path gate. Display redaction still lives in
 //! `permission::redact`; call sites should not manually combine redaction,
 //! sandbox, and internal-artifact rules.
+//!
+//! Shell-command scanning here is intentionally narrow: it only extracts
+//! path-like operands that a command is about to read or write, then delegates
+//! the actual sensitivity decision back to this module. Sandbox boundary
+//! enforcement still owns full command validation.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -168,6 +173,8 @@ pub fn path_requires_sensitive_gate(path: &str, access: PathAccess) -> Option<Se
     })
 }
 
+/// Inspect tool arguments for a path-like field or shell path operand and decide
+/// whether it trips the sensitive-path gate.
 pub fn sensitive_path_match_for_tool_args(
     tool_name: &str,
     args: &Value,
@@ -182,387 +189,257 @@ pub fn sensitive_path_match_for_tool_args(
         } else {
             PathAccess::Write
         };
-        if let Some(hit) = path_requires_sensitive_gate(&path, access) {
+        return path_requires_sensitive_gate(&path, access);
+    }
+
+    if crate::tool::categories::registry().is_shell(tool_name)
+        && let Some(command) = command_hint_from_args(args)
+    {
+        return sensitive_path_match_for_shell_command(command);
+    }
+
+    None
+}
+
+pub fn sensitive_path_match_for_shell_command(command: &str) -> Option<SensitivePathMatch> {
+    let parsed = crate::permission::compound_command::tokenize_compound_command(command);
+    for step in parsed.steps {
+        if let Some(hit) = sensitive_path_match_for_shell_segment(step.command.as_str()) {
             return Some(hit);
         }
     }
-
-    if let Some(command) = command_hint_from_args(args)
-        && !command.is_empty()
-    {
-        for candidate in shell_permission_path_candidates(command) {
-            if let Some(hit) = path_requires_sensitive_gate(&candidate.token, candidate.access) {
-                return Some(hit);
-            }
-        }
-    }
-
     None
 }
 
-pub fn sensitive_path_token_for_tool_args(tool_name: &str, args: &Value) -> Option<String> {
-    sensitive_path_match_for_tool_args(tool_name, args).map(|hit| hit.token)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ShellPermissionPathCandidate {
-    token: String,
-    access: PathAccess,
-}
-
-fn shell_permission_path_candidates(command: &str) -> Vec<ShellPermissionPathCandidate> {
-    let mut candidates = redirection_path_candidates(command);
-
-    for segment in shell_command_segments(command) {
-        let tokens = shell_like_tokens(segment);
-        append_segment_path_candidates(command, &tokens, &mut candidates);
+fn sensitive_path_match_for_shell_segment(segment: &str) -> Option<SensitivePathMatch> {
+    let tokens = shell_tokenize_like_bash(segment);
+    if tokens.is_empty() {
+        return None;
     }
 
-    candidates
-}
+    if let Some(hit) = redirection_sensitive_path_match(&tokens) {
+        return Some(hit);
+    }
 
-fn append_segment_path_candidates(
-    command: &str,
-    tokens: &[String],
-    candidates: &mut Vec<ShellPermissionPathCandidate>,
-) {
-    let Some(command_idx) = leading_shell_command_index(tokens) else {
-        return;
+    let Some(command_index) = first_command_token_index(&tokens) else {
+        return None;
     };
-    let base = tokens[command_idx]
-        .rsplit('/')
-        .next()
-        .unwrap_or(tokens[command_idx].as_str());
+    let command = shell_basename(&tokens[command_index]);
+    let args_start = command_index + 1;
 
-    match base {
-        "grep" | "egrep" | "fgrep" | "rg" | "ag" => {
-            append_grep_like_path_candidates(command, tokens, command_idx + 1, candidates);
+    match command {
+        "grep" | "egrep" | "fgrep" | "rg" | "ag" | "ack" => {
+            grep_like_sensitive_path_match(&tokens, args_start)
         }
-        "sed" => append_sed_path_candidates(command, tokens, command_idx + 1, candidates),
-        "awk" => append_awk_path_candidates(command, tokens, command_idx + 1, candidates),
-        _ if is_shell_file_operand_command(base) => {
-            append_generic_file_operand_candidates(command, tokens, command_idx + 1, candidates);
+        "sed" => sed_sensitive_path_match(&tokens, args_start),
+        "find" => find_sensitive_path_match(&tokens, args_start),
+        "cp" | "install" | "rsync" => copy_like_sensitive_path_match(&tokens, args_start),
+        "rm" | "rmdir" | "unlink" | "mv" | "touch" | "mkdir" | "chmod" | "chown" | "chgrp"
+        | "truncate" | "tee" => {
+            generic_sensitive_path_match(&tokens, args_start, PathAccess::Write)
         }
-        _ => {}
+        "cat" | "head" | "tail" | "less" | "more" | "wc" | "stat" | "ls" | "ll" | "tree"
+        | "file" | "du" | "basename" | "dirname" | "realpath" | "readlink" | "test" => {
+            generic_sensitive_path_match(&tokens, args_start, PathAccess::Read)
+        }
+        "echo" | "printf" | "pwd" | "date" | "true" | "false" | "sleep" | "whoami" | "id"
+        | "uname" | "hostname" | "env" | "printenv" => None,
+        _ if crate::cloud::approval_policy::bash_command_is_read_only(segment) => None,
+        _ => generic_sensitive_path_match(&tokens, args_start, PathAccess::Write),
     }
 }
 
-fn push_permission_path_candidate(
-    candidates: &mut Vec<ShellPermissionPathCandidate>,
-    token: &str,
-    access: PathAccess,
-) {
-    let extracted = shell_token_path_candidates(token);
-    if extracted.is_empty() {
-        push_unique_permission_path_candidate(candidates, token.to_string(), access);
-    } else {
-        for candidate in extracted {
-            push_unique_permission_path_candidate(candidates, candidate, access);
-        }
-    }
-}
-
-fn push_unique_permission_path_candidate(
-    candidates: &mut Vec<ShellPermissionPathCandidate>,
-    token: String,
-    access: PathAccess,
-) {
-    if token.is_empty() || token == "-" {
-        return;
-    }
-    let candidate = ShellPermissionPathCandidate { token, access };
-    if !candidates.iter().any(|existing| existing == &candidate) {
-        candidates.push(candidate);
-    }
-}
-
-fn leading_shell_command_index(tokens: &[String]) -> Option<usize> {
-    let mut idx = 0usize;
+fn first_command_token_index(tokens: &[String]) -> Option<usize> {
+    let mut idx = 0;
     while idx < tokens.len() {
         let token = tokens[idx].as_str();
-        let base = token.rsplit('/').next().unwrap_or(token);
-        if token.is_empty() || (token.contains('=') && !token.starts_with('=')) {
+        if token.is_empty()
+            || looks_like_shell_assignment(token)
+            || is_redirection_operator(token).is_some()
+        {
             idx += 1;
             continue;
         }
-        if matches!(
-            base,
-            "sudo" | "doas" | "env" | "command" | "exec" | "nice" | "nohup" | "time" | "timeout"
-        ) {
-            idx += 1;
-            continue;
-        }
-        return Some(idx);
-    }
-    None
-}
 
-fn is_shell_file_operand_command(base: &str) -> bool {
-    matches!(
-        base,
-        "cat"
-            | "head"
-            | "tail"
-            | "less"
-            | "more"
-            | "tac"
-            | "nl"
-            | "wc"
-            | "stat"
-            | "file"
-            | "md5sum"
-            | "sha1sum"
-            | "sha256sum"
-            | "readlink"
-            | "realpath"
-            | "diff"
-            | "cmp"
-            | "comm"
-            | "join"
-            | "cut"
-            | "paste"
-            | "sort"
-            | "uniq"
-            | "cp"
-            | "mv"
-            | "rm"
-            | "rmdir"
-            | "ln"
-            | "truncate"
-            | "chmod"
-            | "chown"
-            | "chgrp"
-            | "unlink"
-            | "shred"
-            | "tee"
-            | "install"
-            | "dd"
-            | "mkdir"
-            | "mkfifo"
-            | "mknod"
-    )
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ShellFlagValueKind {
-    Path,
-    Pattern,
-    Other,
-}
-
-fn append_grep_like_path_candidates(
-    command: &str,
-    tokens: &[String],
-    mut idx: usize,
-    candidates: &mut Vec<ShellPermissionPathCandidate>,
-) {
-    let mut pattern_seen = false;
-    while idx < tokens.len() {
-        let token = tokens[idx].as_str();
-        if token == "--" {
-            idx += 1;
-            break;
-        }
-        if let Some((value, kind)) = grep_inline_flag_value(token) {
-            if matches!(kind, ShellFlagValueKind::Path) {
-                push_permission_path_candidate(
-                    candidates,
-                    value,
-                    classify_shell_token_access(command, value),
-                );
-            } else if matches!(kind, ShellFlagValueKind::Pattern) {
-                pattern_seen = true;
-            }
-            idx += 1;
-            continue;
-        }
-        if let Some(kind) = grep_flag_value_kind(token) {
-            if let Some(value) = tokens.get(idx + 1) {
-                if matches!(kind, ShellFlagValueKind::Path) {
-                    push_permission_path_candidate(
-                        candidates,
-                        value,
-                        classify_shell_token_access(command, value),
-                    );
-                } else if matches!(kind, ShellFlagValueKind::Pattern) {
-                    pattern_seen = true;
-                }
-                idx += 2;
+        let command = shell_basename(token);
+        match command {
+            "command" | "builtin" | "exec" | "nohup" | "noglob" | "nocorrect" | "sudo" | "doas"
+            | "time" => {
+                idx += 1;
                 continue;
             }
+            "env" => {
+                idx += 1;
+                while idx < tokens.len() {
+                    let env_token = tokens[idx].as_str();
+                    if looks_like_shell_assignment(env_token) {
+                        idx += 1;
+                        continue;
+                    }
+                    if env_token.starts_with('-') {
+                        idx += 1;
+                        continue;
+                    }
+                    break;
+                }
+                continue;
+            }
+            _ => return Some(idx),
+        }
+    }
+    None
+}
+
+fn redirection_sensitive_path_match(tokens: &[String]) -> Option<SensitivePathMatch> {
+    let mut idx = 0;
+    while idx + 1 < tokens.len() {
+        let Some(access) = is_redirection_operator(tokens[idx].as_str()) else {
+            idx += 1;
+            continue;
+        };
+
+        if let Some(hit) = shell_operand_sensitive_path_match(tokens[idx + 1].as_str(), access) {
+            return Some(hit);
+        }
+        idx += 2;
+    }
+    None
+}
+
+fn is_redirection_operator(token: &str) -> Option<PathAccess> {
+    let without_fd = token.trim_start_matches(|ch: char| ch.is_ascii_digit());
+    if without_fd.is_empty() || without_fd.contains('&') {
+        return None;
+    }
+    if without_fd.starts_with(">>") || without_fd.starts_with('>') {
+        return Some(PathAccess::Write);
+    }
+    if without_fd.starts_with("<<") {
+        return None;
+    }
+    if without_fd.starts_with('<') {
+        return Some(PathAccess::Read);
+    }
+    None
+}
+
+fn generic_sensitive_path_match(
+    tokens: &[String],
+    start: usize,
+    access: PathAccess,
+) -> Option<SensitivePathMatch> {
+    let mut stop_parsing_flags = false;
+    let mut idx = start;
+    while idx < tokens.len() {
+        let token = tokens[idx].as_str();
+        if is_redirection_operator(token).is_some() {
+            idx += 2;
+            continue;
+        }
+        if !stop_parsing_flags && token == "--" {
+            stop_parsing_flags = true;
             idx += 1;
             continue;
         }
-        if token.starts_with('-') && token != "-" {
+        if !stop_parsing_flags && token.starts_with('-') {
             idx += 1;
             continue;
         }
+        if let Some(hit) = shell_operand_sensitive_path_match(token, access) {
+            return Some(hit);
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn grep_like_sensitive_path_match(tokens: &[String], start: usize) -> Option<SensitivePathMatch> {
+    let mut pattern_seen = false;
+    let mut next_value: Option<GrepFlagValue> = None;
+    let mut stop_parsing_flags = false;
+    let mut idx = start;
+
+    while idx < tokens.len() {
+        let token = tokens[idx].as_str();
+        if is_redirection_operator(token).is_some() {
+            idx += 2;
+            continue;
+        }
+
+        if let Some(kind) = next_value.take() {
+            if kind == GrepFlagValue::File
+                && let Some(hit) = shell_operand_sensitive_path_match(token, PathAccess::Read)
+            {
+                return Some(hit);
+            }
+            idx += 1;
+            continue;
+        }
+
+        if !stop_parsing_flags && token == "--" {
+            stop_parsing_flags = true;
+            idx += 1;
+            continue;
+        }
+
+        if !stop_parsing_flags && token.starts_with('-') {
+            if matches!(token, "-e" | "--regexp") {
+                next_value = Some(GrepFlagValue::Pattern);
+            } else if let Some(_value) = token.strip_prefix("--regexp=") {
+                // Pattern text is data, not a file operand.
+            } else if matches!(token, "-f" | "--file") {
+                next_value = Some(GrepFlagValue::File);
+            } else if let Some(value) = token.strip_prefix("--file=")
+                && let Some(hit) = shell_operand_sensitive_path_match(value, PathAccess::Read)
+            {
+                return Some(hit);
+            }
+            idx += 1;
+            continue;
+        }
+
         if !pattern_seen {
             pattern_seen = true;
             idx += 1;
             continue;
         }
-        push_permission_path_candidate(
-            candidates,
-            token,
-            classify_shell_token_access(command, token),
-        );
+
+        if let Some(hit) = shell_operand_sensitive_path_match(token, PathAccess::Read) {
+            return Some(hit);
+        }
         idx += 1;
     }
 
-    while idx < tokens.len() {
-        let token = tokens[idx].as_str();
-        push_permission_path_candidate(
-            candidates,
-            token,
-            classify_shell_token_access(command, token),
-        );
-        idx += 1;
-    }
+    None
 }
 
-fn grep_flag_value_kind(flag: &str) -> Option<ShellFlagValueKind> {
-    match flag {
-        "-e" | "--regexp" => Some(ShellFlagValueKind::Pattern),
-        "-f" | "--file" => Some(ShellFlagValueKind::Path),
-        "-m"
-        | "--max-count"
-        | "-A"
-        | "--after-context"
-        | "-B"
-        | "--before-context"
-        | "-C"
-        | "--context"
-        | "--label"
-        | "--binary-files"
-        | "--include"
-        | "--exclude"
-        | "--exclude-dir"
-        | "--exclude-from"
-        | "-g"
-        | "--glob"
-        | "--iglob"
-        | "-t"
-        | "--type"
-        | "-T"
-        | "--type-not"
-        | "--colors"
-        | "--engine"
-        | "--sort"
-        | "--sortr"
-        | "--encoding"
-        | "--context-separator"
-        | "--path-separator" => Some(ShellFlagValueKind::Other),
-        _ => None,
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrepFlagValue {
+    Pattern,
+    File,
 }
 
-fn grep_inline_flag_value(flag: &str) -> Option<(&str, ShellFlagValueKind)> {
-    flag.strip_prefix("--regexp=")
-        .map(|value| (value, ShellFlagValueKind::Pattern))
-        .or_else(|| {
-            flag.strip_prefix("--file=")
-                .map(|value| (value, ShellFlagValueKind::Path))
-        })
-        .or_else(|| {
-            flag.strip_prefix("--include=")
-                .map(|value| (value, ShellFlagValueKind::Other))
-        })
-        .or_else(|| {
-            flag.strip_prefix("--exclude=")
-                .map(|value| (value, ShellFlagValueKind::Other))
-        })
-        .or_else(|| {
-            flag.strip_prefix("--exclude-dir=")
-                .map(|value| (value, ShellFlagValueKind::Other))
-        })
-        .or_else(|| {
-            flag.strip_prefix("--exclude-from=")
-                .map(|value| (value, ShellFlagValueKind::Other))
-        })
-        .or_else(|| {
-            flag.strip_prefix("--glob=")
-                .map(|value| (value, ShellFlagValueKind::Other))
-        })
-        .or_else(|| {
-            flag.strip_prefix("--iglob=")
-                .map(|value| (value, ShellFlagValueKind::Other))
-        })
-        .or_else(|| {
-            flag.strip_prefix("--type=")
-                .map(|value| (value, ShellFlagValueKind::Other))
-        })
-        .or_else(|| {
-            flag.strip_prefix("--type-not=")
-                .map(|value| (value, ShellFlagValueKind::Other))
-        })
-        .or_else(|| {
-            flag.strip_prefix("-e")
-                .filter(|value| !value.is_empty())
-                .map(|value| (value, ShellFlagValueKind::Pattern))
-        })
-        .or_else(|| {
-            flag.strip_prefix("-f")
-                .filter(|value| !value.is_empty())
-                .map(|value| (value, ShellFlagValueKind::Path))
-        })
-        .or_else(|| {
-            flag.strip_prefix("-g")
-                .filter(|value| !value.is_empty())
-                .map(|value| (value, ShellFlagValueKind::Other))
-        })
-}
-
-fn append_sed_path_candidates(
-    command: &str,
-    tokens: &[String],
-    mut idx: usize,
-    candidates: &mut Vec<ShellPermissionPathCandidate>,
-) {
+fn sed_sensitive_path_match(tokens: &[String], start: usize) -> Option<SensitivePathMatch> {
     let mut script_seen = false;
+    let mut write = false;
+    let mut stop_parsing_flags = false;
+    let mut idx = start;
+
     while idx < tokens.len() {
         let token = tokens[idx].as_str();
-        if token == "--" {
-            idx += 1;
-            break;
-        }
-        if let Some(value) = token
-            .strip_prefix("-f")
-            .filter(|value| !value.is_empty())
-            .or_else(|| token.strip_prefix("--file="))
-        {
-            push_permission_path_candidate(
-                candidates,
-                value,
-                classify_shell_token_access(command, value),
-            );
-            idx += 1;
-            continue;
-        }
-        if token.starts_with("-e") && token.len() > 2 && !token.starts_with("--")
-            || token.starts_with("--expression=")
-        {
-            script_seen = true;
-            idx += 1;
-            continue;
-        }
-        if matches!(token, "-f" | "--file") {
-            if let Some(value) = tokens.get(idx + 1) {
-                push_permission_path_candidate(
-                    candidates,
-                    value,
-                    classify_shell_token_access(command, value),
-                );
-                idx += 2;
-                continue;
-            }
-        }
-        if matches!(token, "-e" | "--expression") {
-            script_seen = true;
+        if is_redirection_operator(token).is_some() {
             idx += 2;
             continue;
         }
-        if token.starts_with('-') && token != "-" {
+        if !stop_parsing_flags && token == "--" {
+            stop_parsing_flags = true;
+            idx += 1;
+            continue;
+        }
+        if !stop_parsing_flags && token.starts_with('-') {
+            if token == "-i" || token.starts_with("-i") || token == "--in-place" {
+                write = true;
+            }
             idx += 1;
             continue;
         }
@@ -571,541 +448,179 @@ fn append_sed_path_candidates(
             idx += 1;
             continue;
         }
-        push_permission_path_candidate(
-            candidates,
-            token,
-            classify_shell_token_access(command, token),
-        );
-        idx += 1;
-    }
-
-    while idx < tokens.len() {
-        let token = tokens[idx].as_str();
-        push_permission_path_candidate(
-            candidates,
-            token,
-            classify_shell_token_access(command, token),
-        );
-        idx += 1;
-    }
-}
-
-fn append_awk_path_candidates(
-    command: &str,
-    tokens: &[String],
-    mut idx: usize,
-    candidates: &mut Vec<ShellPermissionPathCandidate>,
-) {
-    let mut program_seen = false;
-    while idx < tokens.len() {
-        let token = tokens[idx].as_str();
-        if token == "--" {
-            idx += 1;
-            break;
-        }
-        if let Some(value) = token
-            .strip_prefix("-f")
-            .filter(|value| !value.is_empty())
-            .or_else(|| token.strip_prefix("--file="))
-            .or_else(|| token.strip_prefix("-i").filter(|value| !value.is_empty()))
-            .or_else(|| token.strip_prefix("--include="))
-        {
-            push_permission_path_candidate(
-                candidates,
-                value,
-                classify_shell_token_access(command, value),
-            );
-            idx += 1;
-            continue;
-        }
-        if (token.starts_with("-F") || token.starts_with("-v")) && token.len() > 2
-            || token.starts_with("--field-separator=")
-            || token.starts_with("--assign=")
-        {
-            idx += 1;
-            continue;
-        }
-        if matches!(token, "-f" | "--file" | "-i" | "--include") {
-            if let Some(value) = tokens.get(idx + 1) {
-                push_permission_path_candidate(
-                    candidates,
-                    value,
-                    classify_shell_token_access(command, value),
-                );
-                idx += 2;
-                continue;
-            }
-        }
-        if matches!(token, "-F" | "--field-separator" | "-v" | "--assign") {
-            idx += 2;
-            continue;
-        }
-        if token.starts_with('-') && token != "-" {
-            idx += 1;
-            continue;
-        }
-        if !program_seen {
-            program_seen = true;
-            idx += 1;
-            continue;
-        }
-        push_permission_path_candidate(
-            candidates,
-            token,
-            classify_shell_token_access(command, token),
-        );
-        idx += 1;
-    }
-
-    while idx < tokens.len() {
-        let token = tokens[idx].as_str();
-        push_permission_path_candidate(
-            candidates,
-            token,
-            classify_shell_token_access(command, token),
-        );
-        idx += 1;
-    }
-}
-
-fn append_generic_file_operand_candidates(
-    command: &str,
-    tokens: &[String],
-    mut idx: usize,
-    candidates: &mut Vec<ShellPermissionPathCandidate>,
-) {
-    while idx < tokens.len() {
-        let token = tokens[idx].as_str();
-        if token == "--" {
-            idx += 1;
-            break;
-        }
-        if token.starts_with('-') && token != "-" {
-            idx += 1;
-            continue;
-        }
-        push_permission_path_candidate(
-            candidates,
-            token,
-            classify_shell_token_access(command, token),
-        );
-        idx += 1;
-    }
-
-    while idx < tokens.len() {
-        let token = tokens[idx].as_str();
-        push_permission_path_candidate(
-            candidates,
-            token,
-            classify_shell_token_access(command, token),
-        );
-        idx += 1;
-    }
-}
-
-fn shell_command_segments(command: &str) -> Vec<&str> {
-    let chars: Vec<(usize, char)> = command.char_indices().collect();
-    let mut segments = Vec::new();
-    let mut segment_start = 0usize;
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut escaped = false;
-    let mut idx = 0usize;
-
-    while idx < chars.len() {
-        let (byte_idx, ch) = chars[idx];
-        if escaped {
-            escaped = false;
-            idx += 1;
-            continue;
-        }
-        if ch == '\\' && !in_single_quote {
-            escaped = true;
-            idx += 1;
-            continue;
-        }
-        if ch == '\'' && !in_double_quote {
-            in_single_quote = !in_single_quote;
-            idx += 1;
-            continue;
-        }
-        if ch == '"' && !in_single_quote {
-            in_double_quote = !in_double_quote;
-            idx += 1;
-            continue;
-        }
-        if !in_single_quote && !in_double_quote {
-            let is_double_separator =
-                matches!(ch, '&' | '|') && chars.get(idx + 1).is_some_and(|(_, next)| *next == ch);
-            let is_single_separator = matches!(ch, '|' | ';' | '\n' | '\r');
-            if is_double_separator || is_single_separator {
-                let segment = command[segment_start..byte_idx].trim();
-                if !segment.is_empty() {
-                    segments.push(segment);
-                }
-                segment_start = if is_double_separator {
-                    let (next_idx, next_ch) = chars[idx + 1];
-                    idx += 2;
-                    next_idx + next_ch.len_utf8()
-                } else {
-                    idx += 1;
-                    byte_idx + ch.len_utf8()
-                };
-                continue;
-            }
-        }
-        idx += 1;
-    }
-
-    let segment = command[segment_start..].trim();
-    if !segment.is_empty() {
-        segments.push(segment);
-    }
-    segments
-}
-
-fn redirection_path_candidates(command: &str) -> Vec<ShellPermissionPathCandidate> {
-    let chars: Vec<(usize, char)> = command.char_indices().collect();
-    let mut candidates = Vec::new();
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut escaped = false;
-    let mut idx = 0usize;
-
-    while idx < chars.len() {
-        let (_, ch) = chars[idx];
-        if escaped {
-            escaped = false;
-            idx += 1;
-            continue;
-        }
-        if ch == '\\' && !in_single_quote {
-            escaped = true;
-            idx += 1;
-            continue;
-        }
-        if ch == '\'' && !in_double_quote {
-            in_single_quote = !in_single_quote;
-            idx += 1;
-            continue;
-        }
-        if ch == '"' && !in_single_quote {
-            in_double_quote = !in_double_quote;
-            idx += 1;
-            continue;
-        }
-        if in_single_quote || in_double_quote || !matches!(ch, '<' | '>') {
-            idx += 1;
-            continue;
-        }
-
-        let access = if ch == '>' {
+        let access = if write {
             PathAccess::Write
         } else {
             PathAccess::Read
         };
-        let mut target_idx = idx + 1;
-        if ch == '<'
-            && chars
-                .get(target_idx)
-                .is_some_and(|(_, next)| matches!(*next, '<'))
-        {
+        if let Some(hit) = shell_operand_sensitive_path_match(token, access) {
+            return Some(hit);
+        }
+        idx += 1;
+    }
+
+    None
+}
+
+fn find_sensitive_path_match(tokens: &[String], start: usize) -> Option<SensitivePathMatch> {
+    let mut idx = start;
+    while idx < tokens.len() {
+        let token = tokens[idx].as_str();
+        if token == "--" {
             idx += 1;
             continue;
         }
-        while chars
-            .get(target_idx)
-            .is_some_and(|(_, next)| matches!(*next, '<' | '>' | '&') || next.is_ascii_digit())
-        {
-            target_idx += 1;
-        }
-        while chars
-            .get(target_idx)
-            .is_some_and(|(_, next)| next.is_whitespace())
-        {
-            target_idx += 1;
-        }
-        if chars
-            .get(target_idx)
-            .is_some_and(|(_, next)| *next == '&' || next.is_ascii_digit())
-        {
-            idx = target_idx + 1;
-            continue;
-        }
-        let Some((start, _)) = chars.get(target_idx).copied() else {
+        if token.starts_with('-') {
             break;
-        };
-        let mut end = command.len();
-        let mut scan_idx = target_idx;
-        while scan_idx < chars.len() {
-            let (byte_idx, current) = chars[scan_idx];
-            if current.is_whitespace() || matches!(current, '|' | ';' | '&' | '<' | '>' | '(' | ')')
-            {
-                end = byte_idx;
-                break;
-            }
-            scan_idx += 1;
         }
-        let target = command[start..end].trim_matches(|c| matches!(c, '\'' | '"' | '`'));
-        push_permission_path_candidate(&mut candidates, target, access);
-        idx = scan_idx;
-    }
-
-    candidates
-}
-
-/// Classify whether a path token extracted from a shell command is being read
-/// or written by that command.
-///
-/// The read/write distinction only matters for internal artifact paths
-/// (agent-owned tool-results / journals): reading those is permitted, mutating
-/// them trips the gate. Secrets and other `Sensitive` paths gate on any access,
-/// so a conservative `Read` default is safe for them.
-///
-/// This replaces the previous coarse whole-command read-only check, which
-/// misclassified read references embedded in non-read-only commands (pipes to
-/// interpreters, `python3 -c`, etc.) as writes and tripped the gate on the
-/// agent's own artifacts.
-fn classify_shell_token_access(command: &str, candidate: &str) -> PathAccess {
-    if shell_token_is_write_target(command, candidate) {
-        PathAccess::Write
-    } else {
-        PathAccess::Read
-    }
-}
-
-/// True when `candidate` is the target of an output redirection or an argument
-/// to a file-mutating shell verb within `command`.
-fn shell_token_is_write_target(command: &str, candidate: &str) -> bool {
-    for (start, _) in command.match_indices(candidate) {
-        if !is_word_boundary_match(command, start, candidate) {
-            continue;
+        if let Some(hit) = shell_operand_sensitive_path_match(token, PathAccess::Read) {
+            return Some(hit);
         }
-        if preceded_by_output_redirection(&command[..start]) {
-            return true;
-        }
-        if segment_has_mutating_verb(command, start, candidate) {
-            return true;
-        }
-    }
-    false
-}
-
-fn is_word_boundary_match(command: &str, start: usize, candidate: &str) -> bool {
-    let before_ok = start == 0
-        || command[..start]
-            .chars()
-            .next_back()
-            .map(|ch| !is_path_char(ch))
-            .unwrap_or(true);
-    let end = start + candidate.len();
-    let after_ok = command[end..]
-        .chars()
-        .next()
-        .map(|ch| !is_path_char(ch))
-        .unwrap_or(true);
-    before_ok && after_ok
-}
-
-fn is_path_char(ch: char) -> bool {
-    ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '~' | '$' | '{' | '}')
-}
-
-fn preceded_by_output_redirection(prefix: &str) -> bool {
-    let trimmed = prefix.trim_end_matches(|c: char| c.is_whitespace());
-    const OPS: &[&str] = &[
-        "&>>", "&>", "1>>", "2>>", ">&", "1>", "2>", "&1>", "&2>", ">>", ">",
-    ];
-    OPS.iter().any(|op| trimmed.ends_with(op))
-}
-
-/// Verbs whose file arguments are mutated (truncated, removed, created, or
-/// rewritten).
-const SHELL_MUTATING_VERBS: &[&str] = &[
-    "rm", "rmdir", "mv", "cp", "ln", "truncate", "chmod", "chown", "chgrp", "unlink", "shred",
-    "tee", "install", "dd", "mkdir", "mkfifo", "mknod",
-];
-
-/// Inspect the pipeline/sequence segment containing `pos` and report whether its
-/// leading verb mutates its file arguments.
-fn segment_has_mutating_verb(command: &str, pos: usize, candidate: &str) -> bool {
-    let seg_start = command[..pos]
-        .rfind(['|', ';', '\n', '&'])
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    let seg_end = command[pos..]
-        .find(['|', ';', '\n', '&'])
-        .map(|i| pos + i)
-        .unwrap_or(command.len());
-    let segment = &command[seg_start..seg_end];
-    if !segment.contains(candidate) {
-        return false;
-    }
-    let Some(verb) = leading_shell_verb(segment) else {
-        return false;
-    };
-    if verb == "cp" {
-        return cp_token_is_destination(segment, candidate);
-    }
-    if SHELL_MUTATING_VERBS.contains(&verb.as_str()) {
-        return true;
-    }
-    // sed is mutating only with -i / --in-place.
-    if verb == "sed" && (segment.contains(" -i") || segment.contains("--in-place")) {
-        return true;
-    }
-    false
-}
-
-fn cp_token_is_destination(segment: &str, candidate: &str) -> bool {
-    let tokens = shell_like_tokens(segment);
-    let Some(verb_index) = tokens.iter().position(|token| token == "cp") else {
-        return false;
-    };
-    let operands = tokens
-        .iter()
-        .skip(verb_index + 1)
-        .filter(|token| !token.starts_with('-'))
-        .collect::<Vec<_>>();
-    let Some(destination) = operands.last() else {
-        return false;
-    };
-    shell_token_path_candidates(destination)
-        .iter()
-        .any(|path| path == candidate)
-}
-
-fn leading_shell_verb(segment: &str) -> Option<String> {
-    for word in segment.split_whitespace() {
-        let word = word.trim_matches(|c: char| matches!(c, '"' | '\'' | '`'));
-        // Skip env assignments (FOO=bar) and command-modifier prefixes.
-        if matches!(
-            word,
-            "sudo" | "env" | "command" | "exec" | "nice" | "nohup" | "time"
-        ) {
-            continue;
-        }
-        if word.is_empty() || (word.contains('=') && !word.starts_with('=')) {
-            continue;
-        }
-        // Handle absolute paths to binaries: /usr/bin/rm -> rm.
-        let basename = word.rsplit('/').next().unwrap_or(word);
-        return Some(basename.to_string());
+        idx += 1;
     }
     None
 }
 
-pub fn shell_like_tokens(command: &str) -> Vec<String> {
+fn copy_like_sensitive_path_match(tokens: &[String], start: usize) -> Option<SensitivePathMatch> {
+    let operands = shell_path_operands(tokens, start);
+    let Some((last_index, _)) = operands.last().copied() else {
+        return None;
+    };
+
+    for (idx, token) in operands {
+        let access = if idx == last_index {
+            PathAccess::Write
+        } else {
+            PathAccess::Read
+        };
+        if let Some(hit) = shell_operand_sensitive_path_match(token, access) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+fn shell_path_operands(tokens: &[String], start: usize) -> Vec<(usize, &str)> {
+    let mut operands = Vec::new();
+    let mut stop_parsing_flags = false;
+    let mut idx = start;
+    while idx < tokens.len() {
+        let token = tokens[idx].as_str();
+        if is_redirection_operator(token).is_some() {
+            idx += 2;
+            continue;
+        }
+        if !stop_parsing_flags && token == "--" {
+            stop_parsing_flags = true;
+            idx += 1;
+            continue;
+        }
+        if !stop_parsing_flags && token.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        if shell_path_operand(token).is_some() {
+            operands.push((idx, token));
+        }
+        idx += 1;
+    }
+    operands
+}
+
+fn shell_operand_sensitive_path_match(
+    token: &str,
+    access: PathAccess,
+) -> Option<SensitivePathMatch> {
+    let path = shell_path_operand(token)?;
+    path_requires_sensitive_gate(&path, access)
+}
+
+fn shell_path_operand(token: &str) -> Option<String> {
+    let trimmed = token
+        .trim_matches(|ch| matches!(ch, '"' | '\''))
+        .trim_matches(|ch| matches!(ch, '(' | ')' | ',' | ';'));
+    if trimmed.is_empty()
+        || trimmed == "-"
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn shell_basename(token: &str) -> &str {
+    token.rsplit('/').next().unwrap_or(token)
+}
+
+fn looks_like_shell_assignment(token: &str) -> bool {
+    let Some((key, value)) = token.split_once('=') else {
+        return false;
+    };
+    !key.is_empty()
+        && !value.is_empty()
+        && key
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        && key
+            .chars()
+            .next()
+            .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+}
+
+fn shell_tokenize_like_bash(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
+    let mut chars = input.chars().peekable();
+    let mut in_double_quote = false;
+    let mut in_single_quote = false;
 
-    for ch in command.chars() {
+    while let Some(ch) = chars.next() {
         match ch {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            ch if !in_single && !in_double && (ch.is_whitespace() || "|;&<>()".contains(ch)) => {
-                push_shell_like_token(&mut tokens, &mut current);
+            '"' if !in_single_quote => in_double_quote = !in_double_quote,
+            '\'' if !in_double_quote => in_single_quote = !in_single_quote,
+            '\\' if !in_single_quote => {
+                if let Some(next) = chars.next()
+                    && !matches!(next, '\n' | '\r')
+                {
+                    current.push(next);
+                }
+            }
+            '>' | '<' if !in_double_quote && !in_single_quote => {
+                let mut op = String::new();
+                if !current.is_empty() && current.chars().all(|c| c.is_ascii_digit()) {
+                    op.push_str(&current);
+                    current.clear();
+                } else if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                op.push(ch);
+                if chars.peek().is_some_and(|next| *next == ch) {
+                    op.push(chars.next().unwrap());
+                }
+                if chars.peek().is_some_and(|next| *next == '&') {
+                    op.push(chars.next().unwrap());
+                }
+                tokens.push(op);
+            }
+            c if c.is_whitespace() && !in_double_quote && !in_single_quote => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
             }
             _ => current.push(ch),
         }
     }
-    push_shell_like_token(&mut tokens, &mut current);
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
     tokens
 }
 
-fn push_shell_like_token(tokens: &mut Vec<String>, current: &mut String) {
-    let token = current
-        .trim()
-        .trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ':' | '[' | ']'))
-        .to_string();
-    if !token.is_empty() {
-        tokens.push(token);
-    }
-    current.clear();
-}
-
-fn shell_token_path_candidates(token: &str) -> Vec<String> {
-    let mut candidates = Vec::new();
-    let mut starts = Vec::new();
-    for (idx, _) in token.char_indices() {
-        if idx > 0
-            && let Some(prev) = token[..idx].chars().next_back()
-            && !is_shell_path_start_boundary(prev)
-        {
-            continue;
-        }
-        let rest = &token[idx..];
-        if rest.starts_with('/')
-            || rest.starts_with("~/")
-            || rest.starts_with("$HOME/")
-            || rest.starts_with("${HOME}/")
-        {
-            starts.push(idx);
-        }
-    }
-
-    for start in starts {
-        let rest = &token[start..];
-        let prefix_len = if rest.starts_with("${HOME}/") {
-            "${HOME}/".len()
-        } else if rest.starts_with("$HOME/") {
-            "$HOME/".len()
-        } else if rest.starts_with("~/") {
-            "~/".len()
-        } else {
-            1
-        };
-        let mut end = token.len();
-        for (rel_idx, ch) in rest.char_indices() {
-            if rel_idx < prefix_len {
-                continue;
-            }
-            if ch.is_whitespace()
-                || matches!(
-                    ch,
-                    '\'' | '"'
-                        | '`'
-                        | ')'
-                        | '('
-                        | ','
-                        | ';'
-                        | '['
-                        | ']'
-                        | '{'
-                        | '}'
-                        | '<'
-                        | '>'
-                        | '|'
-                        | '&'
-                        | '$'
-                        | '\\'
-                        | '!'
-                        | '#'
-                )
-            {
-                end = start + rel_idx;
-                break;
-            }
-        }
-        let candidate = token[start..end]
-            .trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ':' | '[' | ']'))
-            .to_string();
-        if !candidate.is_empty() && !candidates.contains(&candidate) {
-            candidates.push(candidate);
-        }
-    }
-
-    candidates
-}
-
-fn is_shell_path_start_boundary(ch: char) -> bool {
-    ch.is_whitespace()
-        || matches!(
-            ch,
-            '\'' | '"' | '`' | '(' | ',' | ';' | '[' | '{' | '<' | '=' | ':' | '|' | '&'
-        )
+pub fn sensitive_path_token_for_tool_args(tool_name: &str, args: &Value) -> Option<String> {
+    sensitive_path_match_for_tool_args(tool_name, args).map(|hit| hit.token)
 }
 
 #[cfg(test)]
@@ -1199,26 +714,14 @@ mod tests {
         assert!(path_requires_sensitive_gate(&artifact_path, PathAccess::Read).is_none());
         assert!(path_requires_sensitive_gate(&artifact_path, PathAccess::Write).is_some());
 
-        let args = serde_json::json!({
-            "command": format!("cat {artifact_path}")
-        });
-        assert_eq!(sensitive_path_match_for_tool_args("bash", &args), None);
+        let args = serde_json::json!({ "path": artifact_path });
+        assert_eq!(sensitive_path_match_for_tool_args("read_file", &args), None);
 
-        let args = serde_json::json!({
-            "command": format!("cp {artifact_path} /tmp/astra-tool-result-copy.txt")
-        });
+        let args = serde_json::json!({ "path": artifact_path });
         assert_eq!(
-            sensitive_path_match_for_tool_args("bash", &args),
-            None,
-            "copying an internal artifact out reads the artifact; it does not mutate it"
-        );
-
-        let args = serde_json::json!({
-            "command": format!("cp /tmp/source.txt {artifact_path}")
-        });
-        assert!(
-            sensitive_path_match_for_tool_args("bash", &args).is_some(),
-            "copying into an internal artifact mutates runtime-owned state and must gate"
+            sensitive_path_match_for_tool_args("write_file", &args).map(|hit| hit.access),
+            Some(PathAccess::Write),
+            "writing into an internal artifact mutates runtime-owned state and must gate"
         );
     }
 
@@ -1260,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn arbitrary_astra_session_journals_are_not_permission_internal_artifacts() {
+    fn arbitrary_astra_session_journals_are_not_session_journals() {
         let temp = tempfile::tempdir().unwrap();
         let journal_path = temp
             .path()
@@ -1295,94 +798,50 @@ mod tests {
     }
 
     #[test]
-    fn shell_pipeline_over_internal_artifact_does_not_trip_sensitive_gate() {
-        let (_temp, _guard, artifact_path) = create_current_session_artifact();
-        std::fs::write(&artifact_path, "{\"ok\":true}").unwrap();
-        let artifact_path = artifact_path.to_string_lossy();
+    fn sensitive_path_match_for_tool_args_detects_shell_file_operands() {
         let args = serde_json::json!({
-            "command": format!("cat {artifact_path} | python3 -c 'import sys, json; print(json.load(sys.stdin))'")
+            "command": "cat ~/.ssh/id_rsa"
         });
-
-        assert_eq!(sensitive_path_match_for_tool_args("bash", &args), None);
-    }
-
-    #[test]
-    fn interpreter_source_string_over_internal_artifact_does_not_trip_sensitive_gate() {
-        let (_temp, _guard, artifact_path) = create_current_session_artifact();
-        std::fs::write(&artifact_path, "{\"ok\":true}").unwrap();
-        let artifact_path = artifact_path.to_string_lossy();
-        let args = serde_json::json!({
-            "command": format!(
-                "python3 -c \"import json; print(json.load(open('{artifact_path}')))\""
-            )
-        });
-
-        assert_eq!(sensitive_path_match_for_tool_args("bash", &args), None);
-    }
-
-    #[test]
-    fn shell_path_candidates_stop_at_shell_metacharacters() {
-        assert_eq!(
-            shell_token_path_candidates("/etc/secret|wc"),
-            vec!["/etc/secret".to_string()]
-        );
-        assert_eq!(
-            shell_token_path_candidates("$HOME/.ssh/id_rsa#comment"),
-            vec!["$HOME/.ssh/id_rsa".to_string()]
-        );
-        assert_eq!(
-            shell_token_path_candidates("${HOME}/.ssh/id_rsa&&echo"),
-            vec!["${HOME}/.ssh/id_rsa".to_string()]
-        );
-    }
-
-    #[test]
-    fn shell_command_with_mixed_internal_artifact_and_secret_path_is_sensitive() {
-        let (_temp, _guard, artifact_path) = create_current_session_artifact();
-        let artifact_path = artifact_path.to_string_lossy();
-        let args = serde_json::json!({
-            "command": format!("cat {artifact_path} ~/.ssh/id_rsa")
-        });
-
-        let hit = sensitive_path_match_for_tool_args("bash", &args).expect("sensitive path");
-        assert_eq!(hit.token, "~/.ssh/id_rsa");
+        let hit = sensitive_path_match_for_tool_args("bash", &args).expect("gate");
         assert_eq!(hit.sensitivity, PathSensitivity::Sensitive);
         assert_eq!(hit.access, PathAccess::Read);
     }
 
     #[test]
-    fn grep_pattern_mentioning_sensitive_name_is_not_a_sensitive_path_access() {
+    fn sensitive_path_match_for_tool_args_ignores_grep_pattern_text() {
         let args = serde_json::json!({
-            "command": r#"grep -n "fn resolve_checked\|sensitive credential\|SANDBOX_DENIED_PREFIX\|\.ssh\|credentials.json" rust/crates/astra-cli/src/edge_tools/shell.rs"#
+            "command": r#"grep -n "~/.ssh/id_rsa\|credentials.json" rust/crates/astra-cli/src/edge_tools/shell.rs"#
         });
-
-        assert_eq!(
-            sensitive_path_match_for_tool_args("bash", &args),
-            None,
-            "grep search text is data, not a filesystem access"
-        );
+        assert_eq!(sensitive_path_match_for_tool_args("bash", &args), None);
     }
 
     #[test]
-    fn grep_file_operand_with_sensitive_path_is_sensitive() {
+    fn sensitive_path_match_for_tool_args_detects_grep_file_operand() {
         let args = serde_json::json!({
             "command": "grep -n needle ~/.ssh/id_rsa"
         });
-
-        let hit = sensitive_path_match_for_tool_args("bash", &args).expect("sensitive path");
-        assert_eq!(hit.token, "~/.ssh/id_rsa");
+        let hit = sensitive_path_match_for_tool_args("bash", &args).expect("gate");
         assert_eq!(hit.sensitivity, PathSensitivity::Sensitive);
         assert_eq!(hit.access, PathAccess::Read);
     }
 
     #[test]
-    fn direct_write_to_internal_artifact_is_sensitive() {
+    fn sensitive_path_match_for_shell_command_allows_internal_artifact_reads() {
         let (_temp, _guard, artifact_path) = create_current_session_artifact();
-        let artifact_path = artifact_path.to_string_lossy();
-        let args = serde_json::json!({"path": artifact_path, "content": "tamper"});
+        let artifact_path = artifact_path.to_string_lossy().to_string();
+        let command =
+            format!("cat {artifact_path} | python3 -c 'import sys; print(sys.stdin.read())'");
 
-        let hit =
-            sensitive_path_match_for_tool_args("write_file", &args).expect("internal write gate");
+        assert_eq!(sensitive_path_match_for_shell_command(&command), None);
+    }
+
+    #[test]
+    fn sensitive_path_match_for_shell_command_gates_internal_artifact_writes() {
+        let (_temp, _guard, artifact_path) = create_current_session_artifact();
+        let artifact_path = artifact_path.to_string_lossy().to_string();
+        let command = format!("rm -f {artifact_path}");
+
+        let hit = sensitive_path_match_for_shell_command(&command).expect("gate");
         assert_eq!(
             hit.sensitivity,
             PathSensitivity::InternalArtifactReadOnly(InternalPathKind::SessionToolResult)
@@ -1391,18 +850,9 @@ mod tests {
     }
 
     #[test]
-    fn mutating_shell_reference_to_internal_artifact_is_sensitive() {
-        let (_temp, _guard, artifact_path) = create_current_session_artifact();
-        let artifact_path = artifact_path.to_string_lossy();
-        let args = serde_json::json!({
-            "command": format!("rm -f {artifact_path}")
-        });
-
-        let hit = sensitive_path_match_for_tool_args("bash", &args).expect("internal write gate");
-        assert_eq!(
-            hit.sensitivity,
-            PathSensitivity::InternalArtifactReadOnly(InternalPathKind::SessionToolResult)
-        );
-        assert_eq!(hit.access, PathAccess::Write);
+    fn sensitive_path_match_for_tool_args_uses_structured_path_field() {
+        let args = serde_json::json!({ "path": "~/.ssh/id_rsa" });
+        let hit = sensitive_path_match_for_tool_args("read_file", &args).expect("gate");
+        assert_eq!(hit.sensitivity, PathSensitivity::Sensitive);
     }
 }

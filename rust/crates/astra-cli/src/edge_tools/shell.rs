@@ -568,25 +568,27 @@ fn check_bash_sensitive_path_boundary(
     command: &str,
     _oldpwd: Option<&std::path::Path>,
 ) -> Option<String> {
-    let args = serde_json::json!({ "command": command });
-    let hit = astra_turn_core::permission::path_sensitivity::sensitive_path_match_for_tool_args(
-        "bash", &args,
-    )?;
-    let kind = match hit.sensitivity {
-        astra_turn_core::permission::path_sensitivity::PathSensitivity::InternalArtifactReadOnly(
-            _,
-        ) => "internal runtime artifact path",
-        astra_turn_core::permission::path_sensitivity::PathSensitivity::Sensitive => {
-            "sensitive credential path"
-        }
-        astra_turn_core::permission::path_sensitivity::PathSensitivity::Normal => {
-            "sensitive path"
-        }
+    use astra_turn_core::permission::path_sensitivity::{
+        PathSensitivity, sensitive_path_match_for_shell_command,
     };
-    Some(format!(
-        "Sandbox: Path '{}' is blocked as a {kind}",
-        hit.token
-    ))
+
+    let hit = sensitive_path_match_for_shell_command(command)?;
+    match hit.sensitivity {
+        PathSensitivity::Sensitive => {
+            return Some(format!(
+                "Sandbox: Path '{}' is blocked as a sensitive credential path",
+                hit.token
+            ));
+        }
+        PathSensitivity::InternalArtifactReadOnly(_) => {
+            return Some(format!(
+                "Sandbox: Path '{}' is blocked as an internal runtime artifact path",
+                hit.token
+            ));
+        }
+        PathSensitivity::Normal => { /* not sensitive */ }
+    }
+    None
 }
 
 fn shell_tokenize_like_bash(input: &str) -> Vec<String> {
@@ -5062,6 +5064,20 @@ mod tests {
         ToolExecutor::new(std::env::temp_dir())
     }
 
+    fn create_current_session_artifact() -> (
+        tempfile::TempDir,
+        astra_services::session_journal::JournalDirGuard,
+        std::path::PathBuf,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_root = temp.path().join("sessions");
+        let guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
+        let artifact_path = sessions_root.join("session-1/tool-results/call_abc.txt");
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, "child output").unwrap();
+        (temp, guard, artifact_path)
+    }
+
     // ── P4: Bash security layer tests (data-driven) ─────────────────────
 
     #[test]
@@ -5974,6 +5990,44 @@ mod tests {
         assert!(
             !result.starts_with(super::SANDBOX_DENIED_PREFIX),
             "sensitive paths are not expandable sandbox boundaries: {result}"
+        );
+    }
+
+    #[test]
+    fn bash_path_boundary_permissive_allows_current_session_artifact_reads() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+        let (_temp, _guard, artifact_path) = create_current_session_artifact();
+        let command = format!(
+            "cat {} | python3 -c 'import sys; print(sys.stdin.read())'",
+            artifact_path.display()
+        );
+
+        let result = check_bash_path_boundary(&policy, &command);
+
+        assert!(
+            result.is_none(),
+            "read-only shell processing of current-session artifacts must not be blocked: {result:?}"
+        );
+    }
+
+    #[test]
+    fn bash_path_boundary_permissive_blocks_current_session_artifact_writes() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+        let (_temp, _guard, artifact_path) = create_current_session_artifact();
+        let command = format!("rm -f {}", artifact_path.display());
+
+        let result = check_bash_path_boundary(&policy, &command)
+            .expect("writes to current-session artifacts must be blocked");
+
+        assert!(
+            result.contains("internal runtime artifact path"),
+            "{result}"
+        );
+        assert!(
+            !result.starts_with(super::SANDBOX_DENIED_PREFIX),
+            "internal artifact writes are not expandable sandbox boundaries: {result}"
         );
     }
 

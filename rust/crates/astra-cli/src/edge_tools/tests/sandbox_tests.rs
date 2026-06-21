@@ -47,14 +47,48 @@ fn expand_sandbox_path_adds_and_resolves() {
 }
 
 #[test]
-fn expand_sandbox_path_noop_without_policy() {
+fn expand_sandbox_path_fails_closed_without_policy() {
     let dir = tempfile::tempdir().unwrap();
     let exe = ToolExecutor::new(dir.path());
     *exe.sandbox_policy.write().unwrap() = None;
     let external = tempfile::tempdir().unwrap();
-    // Should not panic; returns Ok (no-op) when no policy is installed.
-    exe.expand_sandbox_path(external.path().to_path_buf())
-        .unwrap();
+    // Fail-closed: when no policy is installed, the expansion MUST error
+    // rather than silently returning Ok. The old behavior returned Ok(dir)
+    // without mutating any sandbox — the user believed `--add-dir` took
+    // effect, but the sandbox was never updated.
+    let err = exe
+        .expand_sandbox_path(external.path().to_path_buf())
+        .expect_err("missing sandbox policy must fail-closed, not silently no-op");
+    assert!(matches!(
+        err,
+        crate::edge_tools::SandboxExpansionError::NoSandboxPolicy
+    ));
+}
+
+#[test]
+fn expand_sandbox_path_fails_closed_on_poisoned_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = ToolExecutor::new(dir.path());
+    // Poison the sandbox_policy lock: acquire write guard and panic inside
+    // catch_unwind. The unwind drops the guard, marking the RwLock poisoned.
+    // The next write() must surface as PolicyLockPoisoned rather than
+    // silently dropping the request.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = exe.sandbox_policy.write().unwrap();
+        panic!("intentional poison");
+    }));
+
+    let external = tempfile::tempdir().unwrap();
+    let err = exe
+        .expand_sandbox_path(external.path().to_path_buf())
+        .expect_err("poisoned sandbox_policy lock must fail-closed");
+    assert!(
+        matches!(
+            err,
+            crate::edge_tools::SandboxExpansionError::PolicyLockPoisoned
+        ),
+        "expected PolicyLockPoisoned, got {err:?}"
+    );
 }
 
 #[test]

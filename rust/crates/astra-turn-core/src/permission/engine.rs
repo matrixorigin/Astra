@@ -1332,7 +1332,22 @@ fn fingerprinted_override(
     ctx: &PermissionSyncContext,
 ) -> Option<bool> {
     let json = ctx.inherited.fingerprinted_overrides.as_ref()?;
-    let overrides = serde_json::from_value::<FingerprintedOverrides>(json.clone()).ok()?;
+    // Fail-closed: a corrupt overrides blob must NOT silently fall through
+    // to broader (potentially permissive) rules. Distinguish "no overrides
+    // present" (None → caller falls through normally) from "overrides present
+    // but undecodable" (Some(false) → deny). The latter is a security signal,
+    // not a recoverable state.
+    let overrides = match serde_json::from_value::<FingerprintedOverrides>(json.clone()) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "fingerprinted_overrides blob is present but undecodable; denying tool {} as fail-closed",
+                tool_name,
+            );
+            return Some(false);
+        }
+    };
     content_aware_fingerprint_candidates(tool_name, args)
         .into_iter()
         .find_map(|fp| overrides.check(&fp))
@@ -1541,6 +1556,51 @@ mod tests {
         assert!(
             deny_idx < sandbox_idx,
             "DenyRules ({deny_idx}) must run before SandboxExpand ({sandbox_idx})"
+        );
+    }
+
+    /// Fail-closed pinning: a corrupt `fingerprinted_overrides` blob must
+    /// resolve to an explicit deny (`Some(false)`), NOT fall through to
+    /// broader rules via `None`. The old `.ok()?` path silently downgraded
+    /// to whatever the caller did next — the exact bug class this module
+    /// is supposed to prevent.
+    #[test]
+    fn fingerprinted_override_corrupt_json_denies() {
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::AcceptEdits,
+                fingerprinted_overrides: Some(serde_json::json!({"not": "a valid shape"})),
+                ..Default::default()
+            },
+        );
+        // Call the private fn directly — we're inside the module.
+        let result =
+            fingerprinted_override("bash", &serde_json::json!({"command": "echo hi"}), &ctx);
+        assert_eq!(
+            result,
+            Some(false),
+            "corrupt fingerprinted_overrides blob must fail-closed to Some(false), not fall through as None"
+        );
+    }
+
+    /// Positive pinning: a well-formed empty overrides blob must still
+    /// return `None` (no override matched) so the caller falls through
+    /// normally. This guards against the fail-closed change accidentally
+    /// treating "no overrides" the same as "corrupt overrides".
+    #[test]
+    fn fingerprinted_override_empty_blob_falls_through() {
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::AcceptEdits,
+                fingerprinted_overrides: None,
+                ..Default::default()
+            },
+        );
+        let result =
+            fingerprinted_override("bash", &serde_json::json!({"command": "echo hi"}), &ctx);
+        assert_eq!(
+            result, None,
+            "missing fingerprinted_overrides blob must fall through as None"
         );
     }
 

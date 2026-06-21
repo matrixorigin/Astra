@@ -49,9 +49,18 @@ pub(crate) fn parse_permission_command(arg: &str) -> PermissionCommandAction<'_>
     }
 }
 
+/// Next mode when cycling `/allow` with no argument.
+///
+/// `Deny` is intentionally sticky under the cycle: it is the most restrictive
+/// mode and must only be exited by an explicit `/allow prompt` (or another
+/// named mode). Cycling must never silently move a session out of `Deny`,
+/// because that would widen permissions without an explicit user action.
+/// `Deny` is likewise never a cycle *target* — it is reachable only via
+/// `/allow deny`.
 pub(crate) fn next_permission_mode_for_cycle(current: PermissionMode) -> PermissionMode {
     match current {
-        PermissionMode::Prompt | PermissionMode::Deny => PermissionMode::AcceptEdits,
+        PermissionMode::Deny => PermissionMode::Deny,
+        PermissionMode::Prompt => PermissionMode::AcceptEdits,
         PermissionMode::AcceptEdits => PermissionMode::Plan,
         PermissionMode::Plan => PermissionMode::Auto,
         PermissionMode::Auto => PermissionMode::Prompt,
@@ -233,9 +242,11 @@ mod tests {
             next_permission_mode_for_cycle(PermissionMode::Auto),
             PermissionMode::Prompt
         );
+        // `Deny` is sticky under the cycle: it must only be exited by an
+        // explicit `/allow <mode>`, never by a bare `/allow`.
         assert_eq!(
             next_permission_mode_for_cycle(PermissionMode::Deny),
-            PermissionMode::AcceptEdits
+            PermissionMode::Deny
         );
     }
 }

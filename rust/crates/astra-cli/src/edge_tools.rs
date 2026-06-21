@@ -47,6 +47,16 @@ pub enum SandboxExpansionError {
     /// children include secrets (e.g. `/etc`, `~/.ssh`, `/var/run/secrets`).
     #[error("sandbox expansion rejects system-sensitive path")]
     SystemSensitivePath,
+    /// The sandbox policy lock is poisoned. The sandbox cannot be mutated
+    /// safely — the request must be rejected rather than silently dropped.
+    #[error("sandbox policy lock is poisoned; cannot expand safely")]
+    PolicyLockPoisoned,
+    /// No sandbox policy is installed. The caller asked to expand a path
+    /// into a sandbox that doesn't exist (e.g. headless path before init).
+    /// Returning `Ok` here would be a silent no-op: the user believes
+    /// `--add-dir` took effect, but the sandbox was never updated.
+    #[error("no sandbox policy installed; cannot expand path")]
+    NoSandboxPolicy,
 }
 use crossterm::style::Stylize;
 use reqwest::Client;
@@ -4314,9 +4324,14 @@ impl ToolExecutor {
             return Err(SandboxExpansionError::SystemSensitivePath);
         }
         if let Ok(mut guard) = self.sandbox_policy.write() {
-            if let Some(ref mut policy) = *guard {
-                policy.allowed_paths.push(dir.clone());
+            match *guard {
+                Some(ref mut policy) => {
+                    policy.allowed_paths.push(dir.clone());
+                }
+                None => return Err(SandboxExpansionError::NoSandboxPolicy),
             }
+        } else {
+            return Err(SandboxExpansionError::PolicyLockPoisoned);
         }
         Ok(dir)
     }

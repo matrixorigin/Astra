@@ -167,7 +167,13 @@ async fn refresh_root_permission_context(
 ) {
     let latest = perm_manager.runtime_permission_context();
     if let Some(existing) = handle.as_ref() {
-        *existing.write().await = latest;
+        // Merge — NOT replace. Overwriting the whole context would wipe
+        // runtime telemetry (tools_blocked, recent_denials, ...) and the
+        // in-session allow/deny decisions the user already made this turn,
+        // breaking the self-model feedback loop. Only the policy half
+        // (`inherited`) is refreshed from the manager's latest snapshot.
+        let mut guard = existing.write().await;
+        guard.merge_policy_from(&latest);
     } else {
         *handle = Some(latest.into_shared());
     }
@@ -1185,6 +1191,55 @@ mod tests {
                 PermissionCheckResult::Allowed | PermissionCheckResult::AllowedImplicit { .. }
             ),
             "refreshed auto context should allow bash, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_root_permission_context_preserves_runtime_telemetry() {
+        // Regression: `refresh_root_permission_context` used to wholesale
+        // replace the context (`*existing.write().await = latest`), which
+        // wiped runtime telemetry (tools_blocked, recent_denials, ...) and
+        // broke the self-model feedback loop. It must now merge policy only.
+        let mut manager = PermissionManager::new(false);
+        manager.set_mode(PermissionMode::Auto);
+        let mut handle = Some(root_permission_context_handle(&manager));
+
+        // Seed runtime telemetry + a session deny rule into the existing handle.
+        {
+            let mut guard = handle.as_ref().unwrap().write().await;
+            guard.record_blocked_tool_with_reason("bash", Some("seeded denial"));
+            guard.apply_update(&astra_turn_core::permission::types::PermissionUpdate::deny(
+                astra_turn_core::permission::types::PermissionRule::tool("dangerous_tool"),
+            ));
+        }
+
+        // Mutate policy (mode flip) and refresh — the bug used to wipe the
+        // telemetry + session deny above.
+        manager.set_mode(PermissionMode::Prompt);
+        refresh_root_permission_context(&mut handle, &manager).await;
+
+        let guard = handle.as_ref().unwrap().read().await;
+        assert_eq!(
+            guard.telemetry().tools_blocked,
+            1,
+            "refresh must preserve runtime tools_blocked telemetry, not wipe it"
+        );
+        assert!(
+            guard
+                .telemetry()
+                .recent_denials
+                .iter()
+                .any(|name| name == "bash"),
+            "refresh must preserve recent_denials, not wipe it"
+        );
+        assert!(
+            guard.is_denied("dangerous_tool", None),
+            "refresh must preserve in-session deny rules, not wipe them"
+        );
+        assert_eq!(
+            guard.mode(),
+            PermissionMode::Prompt,
+            "refresh must still apply the fresh policy (mode flip)"
         );
     }
 

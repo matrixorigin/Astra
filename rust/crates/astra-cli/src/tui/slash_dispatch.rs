@@ -4075,9 +4075,11 @@ mod view_result_tests {
             next_permission_mode_for_cycle(PermissionMode::Auto),
             PermissionMode::Prompt
         );
+        // `Deny` is sticky under the cycle: it must only be exited by an
+        // explicit `/allow <mode>`, never by a bare `/allow`.
         assert_eq!(
             next_permission_mode_for_cycle(PermissionMode::Deny),
-            PermissionMode::AcceptEdits
+            PermissionMode::Deny
         );
     }
 

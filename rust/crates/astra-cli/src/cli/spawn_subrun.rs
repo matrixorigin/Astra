@@ -775,10 +775,20 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         let prompt_tokens = state.total_prompt;
         let completion_tokens = state.total_completion;
         let duration_ms = start_time.elapsed().as_millis() as u64;
-        let ctx = state
-            .permission_context
-            .as_ref()
-            .expect("spawned agent state must carry runtime permission context");
+        let ctx = match state.permission_context.as_ref() {
+            Some(ctx) => ctx,
+            None => {
+                // Fail with an actionable error rather than panicking the
+                // whole process. A missing permission_context means the
+                // spawn path didn't wire runtime permissions into the child
+                // agent state — surface it so the caller can fix the config
+                // instead of crashing the CLI.
+                return Err(format!(
+                    "spawned agent {agent_id} (run_id={run_id}) completed without a runtime permission_context; \
+                     the spawn path must install `permission_context` into SpawnRunConfig before delegating to the agentic loop"
+                ));
+            }
+        };
         let ctx_guard = ctx.read().await;
         let telemetry = ctx_guard.telemetry();
         let mode = match ctx_guard.mode() {

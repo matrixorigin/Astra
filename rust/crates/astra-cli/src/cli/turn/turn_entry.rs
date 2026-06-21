@@ -247,8 +247,6 @@ pub(crate) async fn handle_chat_input_with_ui(
         clear_pending_recovery_for_ordinary_chat_input(state);
     }
 
-    state.perm_manager.trust_explicit_user_paths(&line);
-
     ui.blank_line();
 
     if crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(state)

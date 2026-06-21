@@ -1047,6 +1047,20 @@ impl PermissionSyncContext {
             self.apply_update(update);
         }
     }
+    /// Refresh inherited (policy) state from a fresher context while
+    /// preserving this handle's own runtime telemetry and session overrides.
+    ///
+    /// Used by `refresh_root_permission_context` so that a periodic policy
+    /// refresh doesn't wipe the self-model feedback loop (`tools_blocked`,
+    /// `recent_denials`, ...) or forget in-session allow/deny decisions the
+    /// user already made this turn. Only the policy half (`inherited`) is
+    /// replaced; runtime accumulators stay.
+    pub fn merge_policy_from(&mut self, fresh: &PermissionSyncContext) {
+        self.inherited = fresh.inherited.clone();
+        // session_allow / session_deny / telemetry are intentionally
+        // preserved — they belong to this handle's runtime, not the policy.
+    }
+
     /// Create inherited permissions for a child agent.
     pub fn for_child(&self, is_background: bool) -> InheritedPermissions {
         let mut inherited = self.inherited.clone();
