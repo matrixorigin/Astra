@@ -24,6 +24,30 @@ use astra_turn_core::sync_utils::{
 /// The agentic loop / permission manager can detect this to prompt the user
 /// for authorization instead of letting the model silently fall back to bash.
 pub const SANDBOX_DENIED_PREFIX: &str = "SANDBOX_DENIED: ";
+
+/// Error returned by [`ToolExecutor::expand_sandbox_path`] when a path is
+/// rejected by the validation gate.
+///
+/// Every variant maps to a concrete, auditable rejection reason so callers
+/// (CLI flag parsing, TUI approval flow) can surface a precise message
+/// instead of a generic "denied".
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SandboxExpansionError {
+    /// The path was not absolute. Only absolute, concrete paths are expandable.
+    #[error("sandbox expansion requires an absolute path")]
+    NotAbsolute,
+    /// The path is the filesystem root `/`, which would open the entire
+    /// filesystem to the sandbox — always rejected.
+    #[error("sandbox expansion cannot open the filesystem root")]
+    RootPath,
+    /// The path contains a `..` component that escapes the supplied directory.
+    #[error("sandbox expansion rejects parent-dir traversal escapes")]
+    TraversalEscape,
+    /// The path is a system-sensitive directory or credential store whose
+    /// children include secrets (e.g. `/etc`, `~/.ssh`, `/var/run/secrets`).
+    #[error("sandbox expansion rejects system-sensitive path")]
+    SystemSensitivePath,
+}
 use crossterm::style::Stylize;
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -4259,12 +4283,42 @@ impl ToolExecutor {
 
     /// Expand the sandbox boundary to include an additional directory.
     /// Called when the user approves access to a path outside the project.
-    pub fn expand_sandbox_path(&self, dir: PathBuf) {
+    ///
+    /// Validates the path before mutating the policy. Rejects:
+    /// - non-absolute paths ([`SandboxExpansionError::NotAbsolute`])
+    /// - the filesystem root `/` ([`SandboxExpansionError::RootPath`])
+    /// - parent-dir (`..`) traversal escapes ([`SandboxExpansionError::TraversalEscape`])
+    /// - system-sensitive directories and credential paths
+    ///   ([`SandboxExpansionError::SystemSensitivePath`])
+    ///
+    /// This is defense-in-depth: most call paths pre-validate via
+    /// `sandbox_retry::checked_expand_path`, but this gate ensures
+    /// user-supplied inputs (e.g. `--add-dir`, `ASTRA_CLI_ADD_DIRS`)
+    /// cannot open `/` or `/etc`.
+    pub fn expand_sandbox_path(&self, dir: PathBuf) -> Result<PathBuf, SandboxExpansionError> {
+        if !dir.is_absolute() {
+            return Err(SandboxExpansionError::NotAbsolute);
+        }
+        if dir == Path::new("/") {
+            return Err(SandboxExpansionError::RootPath);
+        }
+        if dir
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(SandboxExpansionError::TraversalEscape);
+        }
+        if astra_sandbox::is_sensitive_system_dir(&dir)
+            || astra_sandbox::is_never_readable_path(&dir)
+        {
+            return Err(SandboxExpansionError::SystemSensitivePath);
+        }
         if let Ok(mut guard) = self.sandbox_policy.write() {
             if let Some(ref mut policy) = *guard {
-                policy.allowed_paths.push(dir);
+                policy.allowed_paths.push(dir.clone());
             }
         }
+        Ok(dir)
     }
 
     /// Run passive workspace checks (optional **rust-analyzer LSP**, `cargo`, `tsc`) after

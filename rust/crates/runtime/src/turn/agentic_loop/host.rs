@@ -2742,6 +2742,9 @@ pub(crate) mod tests {
     // ── State builder ───────────────────────────────────────────────────────
 
     pub(crate) fn make_state() -> AgenticLoopState {
+        let tool_policy =
+            astra_config::runtime_config::ToolSelectionConfig::default().resolve_for_model(None);
+
         AgenticLoopState {
             messages: Vec::new(),
             volatile_pending: Vec::new(),
@@ -2779,14 +2782,10 @@ pub(crate) mod tests {
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.95),
             call_counts: HashMap::new(),
-            max_identical_tool_calls: astra_config::runtime_config::RuntimeConfig::load()
-                .tool_selection
-                .effective_max_identical_calls(),
-            max_tools_per_turn: astra_config::runtime_config::RuntimeConfig::load()
-                .tool_selection
-                .effective_max_tools_per_turn(),
-            repeated_cache_hit_suppression: 3,
-            max_consecutive_empty_name: 3,
+            max_identical_tool_calls: tool_policy.max_identical_tool_calls,
+            max_tools_per_turn: tool_policy.max_tools_per_turn,
+            repeated_cache_hit_suppression: tool_policy.repeated_cache_hit_suppression,
+            max_consecutive_empty_name: tool_policy.max_consecutive_empty_name,
             stall: Default::default(),
             telemetry: Default::default(),
             skills: SkillState {
@@ -2830,7 +2829,9 @@ pub(crate) mod tests {
             max_cumulative_tokens: 0,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
             recent_file_reads: Vec::new(),
-            permission_context: None,
+            permission_context: Some(crate::orchestration::PermissionSyncContext::shared_root(
+                crate::orchestration::PermissionMode::Auto,
+            )),
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,

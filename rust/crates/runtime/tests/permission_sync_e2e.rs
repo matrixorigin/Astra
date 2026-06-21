@@ -85,7 +85,7 @@ async fn e2e_child_requests_permission_parent_approves() {
         // Create permission request
         let request = PermissionRequest::new("bash", serde_json::json!({"command": "git status"}))
             .with_hint("git status")
-            .with_suggested_rule("bash(git:*)");
+            .with_suggested_rule(r#"Bash(argv_prefix="git")"#);
 
         // Send and wait for response
         child_mailbox
@@ -148,7 +148,7 @@ async fn e2e_parent_denies_based_on_rules() {
 
     // Parent context with deny rule for dangerous commands
     let mut inherited = InheritedPermissions::new(PermissionMode::Auto);
-    inherited.add_deny(PermissionRule::parse("bash(rm -rf:*)"));
+    inherited.add_deny(PermissionRule::parse(r#"Bash(argv_prefix="rm -rf")"#));
     let parent_ctx = PermissionSyncContext::new(inherited);
     let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(parent_ctx)));
 
@@ -263,7 +263,7 @@ async fn e2e_inherited_permissions_propagate() {
     let mut parent_ctx = PermissionSyncContext::root(PermissionMode::Prompt);
 
     // Add session allow rule
-    let update = PermissionUpdate::allow(PermissionRule::parse("bash(git:*)"));
+    let update = PermissionUpdate::allow(PermissionRule::parse(r#"Bash(argv_prefix="git")"#));
     parent_ctx.apply_update(&update);
 
     // Create child's inherited permissions
@@ -290,7 +290,7 @@ async fn e2e_permission_updates_persist() {
 
     // Request with suggested rule for bash git commands
     let request = PermissionRequest::new("bash", serde_json::json!({"command": "git status"}))
-        .with_suggested_rule("bash(git:*)");
+        .with_suggested_rule(r#"Bash(argv_prefix="git")"#);
 
     let response = handler.handle_request(&request).await;
     assert!(response.approved);
@@ -352,7 +352,7 @@ async fn e2e_multi_level_delegation() {
     // Add allow rule at root level
     let mut root_ctx = root_ctx;
     root_ctx.apply_update(&PermissionUpdate::allow(PermissionRule::parse(
-        "bash(git:*)",
+        r#"Bash(argv_prefix="git")"#,
     )));
 
     // Create child inherited
@@ -361,7 +361,7 @@ async fn e2e_multi_level_delegation() {
 
     // Child adds another rule
     child_ctx.apply_update(&PermissionUpdate::allow(PermissionRule::parse(
-        "bash(npm:*)",
+        r#"Bash(argv_prefix="npm")"#,
     )));
 
     // Create grandchild inherited

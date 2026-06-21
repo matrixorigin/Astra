@@ -556,7 +556,7 @@ fn check_powershell_path_boundary(
                         policy.project_root.display(),
                     ));
                 }
-                return Some(format!("Sandbox: {error}"));
+                return Some(format!("{SANDBOX_DENIED_PREFIX}Sandbox: {error}"));
             }
         }
     }
@@ -917,7 +917,7 @@ fn validate_plain_command_path_arg(
                 policy.project_root.display(),
             ));
         }
-        return Some(format!("Sandbox: {error}"));
+        return Some(format!("{SANDBOX_DENIED_PREFIX}Sandbox: {error}"));
     }
     None
 }
@@ -5813,8 +5813,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
         *executor.sandbox_policy.write().unwrap() = Some(SandboxPolicy::permissive(dir.path()));
-        let result = executor.resolve_checked("/etc/passwd");
-        assert!(result.is_ok(), "should allow with permissive: {result:?}");
+        let result = executor.resolve_checked("/usr/bin/cat");
+        assert!(
+            result.is_ok(),
+            "should allow ordinary external path with permissive: {result:?}"
+        );
     }
 
     #[test]
@@ -5856,7 +5859,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
         *executor.sandbox_policy.write().unwrap() = Some(SandboxPolicy::for_project(dir.path()));
-        let err = executor.resolve_checked("/etc/passwd").unwrap_err();
+        let err = executor.resolve_checked("/usr/bin/cat").unwrap_err();
         assert!(
             err.starts_with(super::SANDBOX_DENIED_PREFIX),
             "boundary violation should have SANDBOX_DENIED prefix: {err}"

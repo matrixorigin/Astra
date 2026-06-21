@@ -362,11 +362,20 @@ pub(crate) async fn stream_chat_sse(
     // --add-dir: expand sandbox to include additional directories
     if let Some(cli_context) = p.cli_context {
         for dir in &cli_context.add_dirs {
-            executor.expand_sandbox_path(dir.clone());
+            if let Err(e) = executor.expand_sandbox_path(dir.clone()) {
+                astra_core::agent_warn!("sandbox", "--add-dir {} rejected: {e}", dir.display());
+            }
         }
     } else if let Ok(dirs) = std::env::var("ASTRA_CLI_ADD_DIRS") {
         for dir in dirs.split(':').filter(|s| !s.is_empty()) {
-            executor.expand_sandbox_path(PathBuf::from(dir));
+            let dir = PathBuf::from(dir);
+            if let Err(e) = executor.expand_sandbox_path(dir.clone()) {
+                astra_core::agent_warn!(
+                    "sandbox",
+                    "ASTRA_CLI_ADD_DIRS {} rejected: {e}",
+                    dir.display()
+                );
+            }
         }
     }
     let messages = load_turn_messages(p.pre_loaded_messages.take(), p.history, p.message);

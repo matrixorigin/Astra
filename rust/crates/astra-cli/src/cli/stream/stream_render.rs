@@ -1385,7 +1385,10 @@ impl<'a> CliSseStreamHost<'a> {
 
         self.resolve_sandbox_expansion_approval(tool, &sandbox_msg, &expand_dir)
             .await?;
-        self.executor.expand_sandbox_path(expand_dir);
+        if let Err(e) = self.executor.expand_sandbox_path(expand_dir) {
+            astra_core::agent_warn!("sandbox", "post-approval expansion rejected: {e}");
+            return Ok(false);
+        }
         Ok(true)
     }
 
@@ -3549,7 +3552,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 }
                             };
                             if approved {
-                                self.executor.expand_sandbox_path(expand_dir);
+                                if let Err(e) = self.executor.expand_sandbox_path(expand_dir) {
+                                    astra_core::agent_warn!(
+                                        "sandbox",
+                                        "post-approval expansion rejected: {e}"
+                                    );
+                                }
                                 outcome = execute_with_metadata_responsive(
                                     std::sync::Arc::clone(&self.executor),
                                     tool.to_string(),
@@ -4360,7 +4368,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             if !approved {
                 continue;
             }
-            self.executor.expand_sandbox_path(expand_dir);
+            if let Err(e) = self.executor.expand_sandbox_path(expand_dir) {
+                astra_core::agent_warn!("sandbox", "post-approval expansion rejected: {e}");
+                continue;
+            }
             if let Some(pm) = &mut self.perm_manager {
                 pm.record_approval(&sandbox_tool_key, Some(&args), true);
             }

@@ -133,13 +133,19 @@ const ALWAYS_DENIED_ENV_KEY_PATTERNS: &[&str] = &[
     "PRIVATE_KEY",
 ];
 
-/// Path substrings that identify credential files — NEVER readable,
-/// even in Permissive isolation. These are data-at-rest threats:
-/// secret keys, password databases, credential stores, environment
-/// files, and cloud SDK caches.
-const NEVER_READABLE_PATH_PATTERNS: &[&str] = &[
+/// Credential path substrings — data-at-rest threats: secret keys, password
+/// databases, credential stores, environment files, cloud SDK caches. These
+/// are matched as substrings against the full path string, so `.env` matches
+/// both `/home/user/.env` and `/app/.env.local`-style variants intentionally
+/// (never readable, even in Permissive isolation).
+const SENSITIVE_PATH_SUBSTRINGS: &[&str] = &[
+    // System account/password files — leak account metadata and password hashes.
+    "/etc/passwd",
     "/etc/shadow",
     "/etc/gshadow",
+    "/etc/sudoers",
+    // SSH host private keys and config.
+    "/etc/ssh/",
     ".ssh/id_",
     ".ssh/authorized_keys",
     ".ssh/identity",
@@ -162,12 +168,118 @@ const NEVER_READABLE_PATH_PATTERNS: &[&str] = &[
     "credentials.db",
 ];
 
-/// Check if a path matches any never-readable pattern.
-pub fn is_never_readable_path(path: &std::path::Path) -> bool {
+/// System directories whose entire subtree is sensitive — expanding any of
+/// these to the sandbox exposes credentials, account metadata, sudo policy,
+/// or kernel/device state. A directory is sensitive if it equals one of these
+/// prefixes or is a direct child of one.
+const SENSITIVE_SYSTEM_DIR_PREFIXES: &[&str] = &[
+    "/etc",
+    "/var/run/secrets",
+    "/var/lib/secrets",
+    "/boot",
+    "/proc",
+    "/sys",
+    "/dev",
+];
+
+/// Home-directory credential markers — match the directory itself or any
+/// descendant path. These cover credential stores that live under a user's
+/// home directory.
+const SENSITIVE_CRED_DIR_MARKERS: &[&str] = &[
+    "/.ssh",
+    "/.aws",
+    "/.kube",
+    "/.gnupg",
+    "/.azure",
+    "/.config/gh",
+    "/.config/gcloud",
+    "/.docker",
+    "/.git-credentials",
+    "/.netrc",
+];
+
+/// Credential file names — matched by the final path component. These are
+/// private keys and secret-bearing files that must never be exposed regardless
+/// of their parent directory.
+const SENSITIVE_CRED_FILE_NAMES: &[&str] = &[
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+    "id_ed25519_sk",
+    "id_dsa",
+    ".env",
+];
+
+/// Device files under `/dev` that are universally safe — they are sinks or
+/// zero sources, never secret-bearing. All other `/dev/*` entries (block
+/// devices, character devices, USB endpoints) remain sensitive.
+const SAFE_DEVICE_FILES: &[&str] = &["/dev/null", "/dev/zero", "/dev/full"];
+
+/// True if `path` is a system-sensitive **directory** subtree (`/etc`, `/boot`,
+/// `/proc`, `/sys`, `/dev`, credential dirs under `$HOME`).
+///
+/// This is the directory-level gate used to reject sandbox expansion: opening
+/// any of these to the sandbox would expose entire subtrees of secrets or
+/// kernel state. Use [`is_sensitive_path`] for the file/credential-level check.
+pub fn is_sensitive_system_dir(path: &std::path::Path) -> bool {
+    let lower = path.to_string_lossy().to_ascii_lowercase();
+    // Carve out universally-safe device sinks before the /dev prefix check.
+    // /dev/null, /dev/zero, /dev/full are deterministic sinks/sources with no
+    // secret surface; all other /dev nodes (block devices, tty, usb) stay blocked.
+    if SAFE_DEVICE_FILES.contains(&lower.as_str()) {
+        return false;
+    }
+    for prefix in SENSITIVE_SYSTEM_DIR_PREFIXES {
+        if lower == *prefix || lower.starts_with(&format!("{prefix}/")) {
+            return true;
+        }
+    }
+    for marker in SENSITIVE_CRED_DIR_MARKERS {
+        if lower == marker.trim_start_matches('/')
+            || lower.ends_with(marker)
+            || lower.contains(&format!("{marker}/"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// True if `path` is sensitive — a system file, credential, system directory,
+/// or credential-bearing path. This is the **single source of truth** for all
+/// path-sensitivity checks across the sandbox, shell-hardening, and permission
+/// layers.
+///
+/// Combines:
+/// - [`is_sensitive_system_dir`] (directory-subtree match)
+/// - [`SENSITIVE_PATH_SUBSTRINGS`] (broad credential-file substring match)
+/// - [`SENSITIVE_CRED_FILE_NAMES`] (exact file-name match)
+pub fn is_sensitive_path(path: &std::path::Path) -> bool {
+    if is_sensitive_system_dir(path) {
+        return true;
+    }
     let path_str = path.to_string_lossy();
-    NEVER_READABLE_PATH_PATTERNS
+    if SENSITIVE_PATH_SUBSTRINGS
         .iter()
-        .any(|pattern| path_str.contains(pattern))
+        .any(|p| path_str.contains(p))
+    {
+        return true;
+    }
+    if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+        && SENSITIVE_CRED_FILE_NAMES.contains(&file_name)
+    {
+        return true;
+    }
+    false
+}
+
+/// Check if a path matches any never-readable pattern.
+///
+/// Thin alias of [`is_sensitive_path`] retained as the canonical read-gating
+/// predicate name. A path that is sensitive is never readable, even in
+/// Permissive isolation.
+pub fn is_never_readable_path(path: &std::path::Path) -> bool {
+    is_sensitive_path(path)
 }
 
 /// Check if an env key matches any always-denied pattern.
@@ -356,9 +468,21 @@ mod tests {
             assert_eq!(p.isolation, isolation, "{tier:?}");
             assert_eq!(p.network_allowed, network, "{tier:?}");
             assert_eq!(p.max_execution_secs, max_secs, "{tier:?}");
-            // Permissive allows any path; others block outside
-            let passwd_ok = p.is_path_allowed(std::path::Path::new("/etc/passwd"));
-            assert_eq!(passwd_ok, tier == TrustTier::Bundled, "passwd for {tier:?}");
+            // Permissive allows arbitrary non-sensitive paths; others block
+            // outside the project root.
+            let arbitrary_ok = p.is_path_allowed(std::path::Path::new("/var/data"));
+            assert_eq!(
+                arbitrary_ok,
+                tier == TrustTier::Bundled,
+                "arbitrary path for {tier:?}"
+            );
+            // System account files are never-readable at every tier — the
+            // prior assertion that /etc/passwd was allowed in Permissive
+            // mode was the very bug fixed by review CRITICAL #1.
+            assert!(
+                !p.is_path_allowed(std::path::Path::new("/etc/passwd")),
+                "/etc/passwd must be blocked at every tier ({tier:?})"
+            );
             // Community has env allowlist
             if tier == TrustTier::Community {
                 assert!(p.env_allowlist.is_some());
@@ -417,11 +541,15 @@ mod tests {
     fn permissive_path_and_env_rules() {
         let p = SandboxPolicy::permissive("/proj");
         assert!(p.allowed_paths.is_empty());
-        // Permissive allows most paths except never-readable credential files.
+        // Permissive allows arbitrary non-sensitive paths.
         assert!(p.is_path_allowed(std::path::Path::new("/anywhere")));
-        assert!(p.is_path_allowed(std::path::Path::new("/etc/passwd")));
-        // Credential paths are always blocked.
+        assert!(p.is_path_allowed(std::path::Path::new("/var/data")));
+        // System account files and credential paths are always blocked,
+        // even in Permissive mode — review CRITICAL #1 closed the
+        // ReadShortCircuit bypass for /etc/passwd, /etc/shadow, /etc/sudoers.
+        assert!(!p.is_path_allowed(std::path::Path::new("/etc/passwd")));
         assert!(!p.is_path_allowed(std::path::Path::new("/etc/shadow")));
+        assert!(!p.is_path_allowed(std::path::Path::new("/etc/sudoers")));
         assert!(!p.is_path_allowed(std::path::Path::new("/home/user/.ssh/id_rsa")));
         // Credential env vars are always blocked, even in Permissive mode.
         assert!(!p.is_env_allowed("SECRET_KEY"));
@@ -480,6 +608,40 @@ mod tests {
         assert!(is_never_readable_path(std::path::Path::new(
             "/proj/credentials.json"
         )));
+    }
+
+    // ── System credential/account files must be never-readable (review CRITICAL #1) ──
+    // /etc/passwd, /etc/shadow, /etc/sudoers, and /etc/ssh/ contain account
+    // metadata, password hashes, and host keys. In Auto mode, read_file on
+    // these would otherwise be Allow via ReadShortCircuit unless listed here.
+
+    #[test]
+    fn never_readable_paths_block_system_account_files() {
+        assert!(is_never_readable_path(std::path::Path::new("/etc/passwd")));
+        assert!(is_never_readable_path(std::path::Path::new("/etc/shadow")));
+        assert!(is_never_readable_path(std::path::Path::new("/etc/gshadow")));
+        assert!(is_never_readable_path(std::path::Path::new("/etc/sudoers")));
+        assert!(is_never_readable_path(std::path::Path::new(
+            "/etc/sudoers.d/extra"
+        )));
+    }
+
+    #[test]
+    fn never_readable_paths_block_ssh_host_keys_directory() {
+        assert!(is_never_readable_path(std::path::Path::new(
+            "/etc/ssh/ssh_host_rsa_key"
+        )));
+        assert!(is_never_readable_path(std::path::Path::new(
+            "/etc/ssh/ssh_host_ed25519_key"
+        )));
+    }
+
+    #[test]
+    fn permissive_mode_blocks_never_readable_system_account_files() {
+        let p = SandboxPolicy::permissive("/proj");
+        assert!(!p.is_path_allowed(std::path::Path::new("/etc/passwd")));
+        assert!(!p.is_path_allowed(std::path::Path::new("/etc/shadow")));
+        assert!(!p.is_path_allowed(std::path::Path::new("/etc/sudoers")));
     }
 
     #[test]

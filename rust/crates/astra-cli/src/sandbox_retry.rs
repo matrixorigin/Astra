@@ -100,21 +100,20 @@ pub(crate) fn explicit_file_tool_path_args<'a>(tool: &str, args: &'a Value) -> V
                 );
             }
         }
-        "git" => {
-            if args.get("action").and_then(Value::as_str) == Some("worktree") {
-                let worktree_sub_action = args.get("sub_action").and_then(Value::as_str);
-                if matches!(worktree_sub_action, Some("add" | "remove")) {
-                    push_explicit_arg_path(&mut paths, args, "path");
-                }
-            }
+        "git"
+            if args.get("action").and_then(Value::as_str) == Some("worktree")
+                && matches!(
+                    args.get("sub_action").and_then(Value::as_str),
+                    Some("add" | "remove")
+                ) =>
+        {
+            push_explicit_arg_path(&mut paths, args, "path");
         }
         "rollback_file_edits" => {
             push_explicit_arg_path(&mut paths, args, "path");
         }
-        "session" => {
-            if args.get("action").and_then(Value::as_str) == Some("rollback_edits") {
-                push_explicit_arg_path(&mut paths, args, "path");
-            }
+        "session" if args.get("action").and_then(Value::as_str) == Some("rollback_edits") => {
+            push_explicit_arg_path(&mut paths, args, "path");
         }
         _ => {}
     }
@@ -403,7 +402,7 @@ fn quoted_segment_is_sensitive_path(segment: &str) -> bool {
     let Some(path) = expand_concrete_pathish(token) else {
         return false;
     };
-    path.is_absolute() && sandbox_expand_path_is_sensitive(&path)
+    path.is_absolute() && astra_sandbox::is_sensitive_path(&path)
 }
 
 fn sandbox_expand_dir_from_pathish(pathish: &str) -> Option<PathBuf> {
@@ -428,7 +427,7 @@ fn checked_expand_path(path: PathBuf, directory_arg: bool) -> Option<PathBuf> {
     if !path.is_absolute() || path == Path::new("/") {
         return None;
     }
-    if has_forbidden_component(&path) || sandbox_expand_path_is_sensitive(&path) {
+    if has_forbidden_component(&path) || astra_sandbox::is_sensitive_path(&path) {
         return None;
     }
     if directory_arg || path.is_dir() {
@@ -493,45 +492,6 @@ fn pathish_has_forbidden_segment(pathish: &str) -> bool {
     pathish
         .split(['/', '\\'])
         .any(|segment| matches!(segment, "." | ".."))
-}
-
-fn sandbox_expand_path_is_sensitive(path: &Path) -> bool {
-    let lower = path.to_string_lossy().to_ascii_lowercase();
-    if matches!(
-        lower.as_str(),
-        "/etc/shadow" | "/etc/sudoers" | "/etc/passwd"
-    ) {
-        return true;
-    }
-    if lower.starts_with("/etc/sudoers.d/") {
-        return true;
-    }
-    for marker in [
-        "/.ssh",
-        "/.aws",
-        "/.kube",
-        "/.gnupg",
-        "/.azure",
-        "/.config/gh",
-        "/.config/gcloud",
-        "/.docker/config.json",
-        "/.git-credentials",
-        "/.netrc",
-    ] {
-        if lower == marker.trim_start_matches('/')
-            || lower.ends_with(marker)
-            || lower.contains(&format!("{marker}/"))
-        {
-            return true;
-        }
-    }
-    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    matches!(
-        file_name,
-        "id_rsa" | "id_ed25519" | "id_ecdsa" | "id_ed25519_sk" | ".env"
-    )
 }
 
 /// Prefix emitted by tool executors when a call is blocked by the
@@ -936,10 +896,10 @@ mod tests {
     fn expand_dir_from_bash_with_flags_and_pipes() {
         // Scanner must pick the path token regardless of position — not
         // just `parts[1]`. Real commands have flags before the path.
-        let args = json!({"command": "head -n 50 /etc/hosts | grep localhost"});
+        let args = json!({"command": "head -n 50 /tmp/hosts | grep localhost"});
         assert_eq!(
             sandbox_expand_dir_from_args(&args),
-            Some(PathBuf::from("/etc"))
+            Some(PathBuf::from("/tmp"))
         );
     }
 
@@ -984,10 +944,10 @@ mod tests {
 
     #[test]
     fn expand_dir_handles_quoted_paths_in_command() {
-        let args = json!({"command": "cat \"/etc/hosts\""});
+        let args = json!({"command": "cat \"/tmp/hosts\""});
         assert_eq!(
             sandbox_expand_dir_from_args(&args),
-            Some(PathBuf::from("/etc"))
+            Some(PathBuf::from("/tmp"))
         );
     }
 

@@ -235,10 +235,10 @@ mod tests {
     #[test]
     fn permissive_isolation_path_validation() {
         let p = SandboxPolicy::permissive("/home/user/project");
-        // Allows absolute paths
-        let result = validate_path(&p, "/etc/passwd");
+        // Allows arbitrary absolute paths (non-sensitive).
+        let result = validate_path(&p, "/var/data/file");
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), PathBuf::from("/etc/passwd"));
+        assert_eq!(result.unwrap(), PathBuf::from("/var/data/file"));
         // Resolves relative
         let result = validate_path(&p, "src/main.rs");
         assert!(result.is_ok());
@@ -246,9 +246,16 @@ mod tests {
             result.unwrap(),
             PathBuf::from("/home/user/project/src/main.rs")
         );
-        // Allows dotdot escape
-        let result = validate_path(&p, "../../etc/passwd");
+        // Allows dotdot escape to non-sensitive paths
+        let result = validate_path(&p, "../../var/data");
         assert!(result.is_ok());
+        // System account files are blocked at every isolation level —
+        // /etc/passwd is no longer a valid permissive-mode target.
+        let result = validate_path(&p, "/etc/passwd");
+        assert!(
+            result.is_err(),
+            "/etc/passwd must be blocked in permissive mode"
+        );
     }
 
     #[test]

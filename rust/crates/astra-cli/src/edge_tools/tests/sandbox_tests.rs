@@ -6,33 +6,44 @@ use super::ToolExecutor;
 
 #[test]
 fn expand_sandbox_path_adds_and_resolves() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
+    // Use tempdir_in(CWD) so the external dir is NOT under std::env::temp_dir()
+    // (which is pre-allowed by default_temp_allowed_paths) — this isolates the
+    // test to the expansion behavior rather than the default temp allowance.
+    let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let project = base.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let exe = ToolExecutor::new(&project);
 
-    // Before expansion: /etc is not allowed
+    let external_path = base.path().join("external");
+    std::fs::create_dir(&external_path).unwrap();
+    let target = external_path.join("notes.md");
+    std::fs::write(&target, "old\n").unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+
+    // Before expansion: external file is not allowed.
     assert!(
         !exe.sandbox_policy
             .read()
             .unwrap()
             .as_ref()
             .unwrap()
-            .is_path_allowed(std::path::Path::new("/etc/passwd"))
+            .is_path_allowed(&target)
     );
-    assert!(exe.resolve_checked("/etc/passwd").is_err());
+    assert!(exe.resolve_checked(&target_str).is_err());
 
     // Expand
-    exe.expand_sandbox_path(PathBuf::from("/etc"));
+    exe.expand_sandbox_path(external_path.clone()).unwrap();
 
-    // After expansion: /etc is allowed via both APIs
+    // After expansion: target is allowed via both APIs.
     assert!(
         exe.sandbox_policy
             .read()
             .unwrap()
             .as_ref()
             .unwrap()
-            .is_path_allowed(std::path::Path::new("/etc/passwd"))
+            .is_path_allowed(&target)
     );
-    assert!(exe.resolve_checked("/etc/passwd").is_ok());
+    assert!(exe.resolve_checked(&target_str).is_ok());
 }
 
 #[test]
@@ -40,19 +51,75 @@ fn expand_sandbox_path_noop_without_policy() {
     let dir = tempfile::tempdir().unwrap();
     let exe = ToolExecutor::new(dir.path());
     *exe.sandbox_policy.write().unwrap() = None;
-    // Should not panic
-    exe.expand_sandbox_path(PathBuf::from("/etc"));
+    let external = tempfile::tempdir().unwrap();
+    // Should not panic; returns Ok (no-op) when no policy is installed.
+    exe.expand_sandbox_path(external.path().to_path_buf())
+        .unwrap();
 }
 
 #[test]
-fn expand_sandbox_to_root_opens_everything() {
+fn expand_sandbox_path_rejects_root() {
     let dir = tempfile::tempdir().unwrap();
     let exe = ToolExecutor::new(dir.path());
-    // Expanding to "/" opens the entire filesystem — this is why
-    // stream_render.rs must never pass "/" to expand_sandbox_path.
-    exe.expand_sandbox_path(PathBuf::from("/"));
-    assert!(exe.resolve_checked("/etc/passwd").is_ok());
-    assert!(exe.resolve_checked("/var/secret").is_ok());
+    // Expanding to "/" would open the entire filesystem — reject.
+    let err = exe
+        .expand_sandbox_path(PathBuf::from("/"))
+        .expect_err("root must be rejected");
+    assert!(matches!(
+        err,
+        crate::edge_tools::SandboxExpansionError::RootPath
+    ));
+    // Filesystem must remain closed.
+    assert!(exe.resolve_checked("/etc/passwd").is_err());
+    assert!(exe.resolve_checked("/var/secret").is_err());
+}
+
+#[test]
+fn expand_sandbox_path_rejects_system_sensitive_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = ToolExecutor::new(dir.path());
+    for sys in ["/etc", "/etc/passwd", "/etc/ssh", "/var/run/secrets"] {
+        let err = exe
+            .expand_sandbox_path(PathBuf::from(sys))
+            .expect_err("system-sensitive path must be rejected");
+        assert!(
+            matches!(
+                err,
+                crate::edge_tools::SandboxExpansionError::SystemSensitivePath
+            ),
+            "expected SystemSensitivePath for {sys}, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn expand_sandbox_path_rejects_parent_dir_traversal() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = ToolExecutor::new(dir.path());
+    // Absolute path with a `..` component — must be rejected as a traversal
+    // escape, not as NotAbsolute.
+    let traversal = dir.path().join("subdir/..");
+    let err = exe
+        .expand_sandbox_path(traversal)
+        .expect_err("parent-dir traversal must be rejected");
+    assert!(matches!(
+        err,
+        crate::edge_tools::SandboxExpansionError::TraversalEscape
+    ));
+}
+
+#[test]
+fn expand_sandbox_path_rejects_relative_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = ToolExecutor::new(dir.path());
+    // Only absolute, concrete paths are expandable.
+    let err = exe
+        .expand_sandbox_path(PathBuf::from("relative/path"))
+        .expect_err("relative path must be rejected");
+    assert!(matches!(
+        err,
+        crate::edge_tools::SandboxExpansionError::NotAbsolute
+    ));
 }
 
 #[test]
@@ -74,7 +141,7 @@ fn write_file_existing_external_file_respects_expanded_sandbox_boundary() {
         "{before_expand}"
     );
 
-    exe.expand_sandbox_path(external);
+    exe.expand_sandbox_path(external).unwrap();
 
     let read = exe.read_file(&serde_json::json!({
         "path": target.to_string_lossy()
@@ -96,8 +163,14 @@ async fn execute_with_metadata_sandbox_denial_is_structured_and_hides_wire_prefi
     let dir = tempfile::tempdir().unwrap();
     let exe = ToolExecutor::new(dir.path());
 
+    // Use a non-sensitive path outside the sandbox boundary so the denial
+    // routes through the structured sandbox-denial path (not the
+    // never-readable short-circuit which /etc/passwd now triggers).
     let outcome = exe
-        .execute_with_metadata("read_file", &serde_json::json!({"path": "/etc/passwd"}))
+        .execute_with_metadata(
+            "read_file",
+            &serde_json::json!({"path": "/var/astra-sandbox-test-nonexistent"}),
+        )
         .await;
 
     assert!(outcome.is_error);
@@ -124,7 +197,7 @@ async fn cancelable_bash_sandbox_denial_is_structured_and_hides_wire_prefix() {
     let outcome = exe
         .execute_with_metadata_cancelable(
             "bash",
-            &serde_json::json!({"command": "cat /etc/passwd"}),
+            &serde_json::json!({"command": "cat /var/astra-sandbox-test-nonexistent"}),
             None,
         )
         .await;

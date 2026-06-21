@@ -27,7 +27,10 @@ pub use git_safety::{
     GitSafetyViolation, is_bare_git_repo, is_soft_violation, validate_git_command,
 };
 pub use path::{SandboxPathError, canonicalize_parent_and_append, normalize_path, validate_path};
-pub use policy::{IsolationLevel, SandboxPolicy, is_never_readable_path};
+pub use policy::{
+    IsolationLevel, SandboxPolicy, is_never_readable_path, is_sensitive_path,
+    is_sensitive_system_dir,
+};
 pub use process_isolation::{
     CgroupGuard, IsolatedOutput, IsolationConfig, apply_cgroup, execute_isolated,
 };
