@@ -151,7 +151,7 @@ const NEVER_READABLE_PATH_PATTERNS: &[&str] = &[
 ];
 
 /// Check if a path matches any never-readable pattern.
-fn is_never_readable_path(path: &std::path::Path) -> bool {
+pub(crate) fn is_never_readable_path(path: &std::path::Path) -> bool {
     let path_str = path.to_string_lossy();
     NEVER_READABLE_PATH_PATTERNS
         .iter()

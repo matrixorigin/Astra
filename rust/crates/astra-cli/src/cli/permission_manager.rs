@@ -6,7 +6,8 @@ use crate::cli::workspace_trust::{
     evaluate_workspace_trust, project_permissions_hash,
 };
 use astra_runtime::tool_sandbox::{
-    CommandRisk, GitSafetyViolation, analyze_command_risks, validate_git_command,
+    CommandRisk, GitSafetyViolation, SandboxPolicy, analyze_command_risks, validate_git_command,
+    validate_path,
 };
 use astra_thin_client::ApprovalKind;
 use astra_turn_core::cloud_approval_policy::{
@@ -175,13 +176,46 @@ fn canonicalize_existing_or_parent(p: &Path) -> std::io::Result<PathBuf> {
 }
 
 /// Extract the `'{path}'` target from a sandbox-denied reason string.
-/// Returns the first single-quoted path (the one before the word "outside").
+/// Returns the first single-quoted path when the reason is an outside-project
+/// sandbox denial. This covers both `Path '...'` and `command references '...'`
+/// messages.
 fn parse_sandbox_target_path(reason: &str) -> Option<PathBuf> {
-    let needle = "Path '";
-    let start = reason.find(needle)? + needle.len();
+    if !reason.contains("outside the project") && !reason.contains("outside project") {
+        return None;
+    }
+
+    let start = reason.find('\'')? + 1;
     let rest = &reason[start..];
     let end = rest.find('\'')?;
     Some(PathBuf::from(&rest[..end]))
+}
+
+fn sandbox_expand_sensitive_target_denial(name: &str, args: &serde_json::Value) -> Option<String> {
+    if !name.starts_with("sandbox_expand:") {
+        return None;
+    }
+    let reason = args.get("reason").and_then(serde_json::Value::as_str)?;
+    let target = parse_sandbox_target_path(reason)?;
+    if !sandbox_expand_target_is_sensitive(&target) {
+        return None;
+    }
+    Some(format!(
+        "Sensitive path cannot be approved through sandbox expansion: {}",
+        target.display()
+    ))
+}
+
+fn sandbox_expand_target_is_sensitive(path: &Path) -> bool {
+    let path = path.to_string_lossy();
+    sensitive_path_match_for_request("read_file", &serde_json::json!({ "path": path.as_ref() }))
+        .is_some()
+        || validate_path(
+            &SandboxPolicy::permissive(
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            ),
+            path.as_ref(),
+        )
+        .is_err()
 }
 
 fn trim_explicit_path_token(token: &str) -> &str {
@@ -3278,6 +3312,10 @@ impl PermissionManager {
             None,
         );
 
+        if let Some(reason) = sandbox_expand_sensitive_target_denial(name, args) {
+            return PermissionDecision::Deny(reason);
+        }
+
         if matches!(envelope.source, DecisionSource::SandboxExpansion)
             && matches!(envelope.decision, HardDecision::NeedExternal { .. })
         {
@@ -5053,6 +5091,72 @@ mod tests {
         let args = serde_json::json!({"reason": "path outside project"});
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
         assert!(matches!(decision, PermissionDecision::Allow));
+    }
+
+    #[test]
+    fn sandbox_expand_auto_mode_denies_sensitive_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+        let args = serde_json::json!({
+            "reason": format!(
+                "Path '/etc/shadow' is outside the project directory '{}'.",
+                dir.path().display()
+            )
+        });
+
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+
+        match decision {
+            PermissionDecision::Deny(reason) => {
+                assert!(
+                    reason.contains("Sensitive path cannot be approved through sandbox expansion"),
+                    "unexpected denial reason: {reason}"
+                );
+            }
+            other => panic!("sensitive sandbox expansion must deny in Auto mode; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_expand_rejects_shell_reference_to_sensitive_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+        let args = serde_json::json!({
+            "reason": format!(
+                "The command references '~/.ssh/id_rsa' which is outside the project directory '{}'.",
+                dir.path().display()
+            )
+        });
+
+        let decision = pm.check_nonblocking("sandbox_expand:bash", &args);
+
+        assert!(
+            matches!(decision, PermissionDecision::Deny(ref reason) if reason.contains("Sensitive path")),
+            "home-relative credential sandbox expansion must deny; got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn sandbox_expand_allow_rule_cannot_bypass_sensitive_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        pm.settings
+            .allow
+            .push("sandbox_expand:read_file".to_string());
+        pm.cached_allow = pm.settings.parsed_allow_rules();
+        let args = serde_json::json!({
+            "reason": format!(
+                "Path '/etc/shadow' is outside the project directory '{}'.",
+                dir.path().display()
+            )
+        });
+
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+
+        assert!(
+            matches!(decision, PermissionDecision::Deny(ref reason) if reason.contains("Sensitive path")),
+            "sandbox_expand allow rules must not unlock sensitive targets; got {decision:?}"
+        );
     }
 
     #[test]

@@ -448,6 +448,10 @@ fn check_bash_path_boundary_with_oldpwd(
     command: &str,
     oldpwd: Option<&std::path::Path>,
 ) -> Option<String> {
+    if matches!(policy.isolation, IsolationLevel::Permissive) {
+        return check_bash_sensitive_path_boundary(policy, command, oldpwd);
+    }
+
     if let Some(msg) = check_shell_compound_body_path_boundary(policy, command, oldpwd) {
         return Some(msg);
     }
@@ -542,16 +546,55 @@ fn check_powershell_path_boundary(
                 policy.project_root.join(trimmed)
             };
             let path_str = resolved.to_string_lossy();
-            if let Err(e) = validate_path(policy, &path_str)
-                && e.is_boundary_violation()
+            if let Err(error) = validate_path(policy, &path_str) {
+                if error.is_boundary_violation() {
+                    return Some(format!(
+                        "{}The command references '{}' which is outside the project directory '{}'. \
+                         Ask the user for permission before accessing files outside the project.",
+                        SANDBOX_DENIED_PREFIX,
+                        trimmed,
+                        policy.project_root.display(),
+                    ));
+                }
+                return Some(format!("Sandbox: {error}"));
+            }
+        }
+    }
+    None
+}
+
+fn check_bash_sensitive_path_boundary(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    command: &str,
+    oldpwd: Option<&std::path::Path>,
+) -> Option<String> {
+    for segment in bash_command_segments(command) {
+        for raw in shell_tokenize_like_bash(segment) {
+            let token = raw
+                .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+                .trim_end_matches([';', '&', ')', ',']);
+            if token.is_empty()
+                || token.starts_with('-')
+                || token.starts_with("http://")
+                || token.starts_with("https://")
+                || token.contains('*')
+                || token.contains('?')
             {
-                return Some(format!(
-                    "{}The command references '{}' which is outside the project directory '{}'. \
-                     Ask the user for permission before accessing files outside the project.",
-                    SANDBOX_DENIED_PREFIX,
-                    trimmed,
-                    policy.project_root.display(),
-                ));
+                continue;
+            }
+            let literal = restore_escaped_shell_analysis_chars(token);
+            let resolved = if literal.starts_with('/') {
+                std::path::PathBuf::from(&literal)
+            } else if let Some(expanded) = expand_static_dir_reference(policy, token, oldpwd) {
+                expanded
+            } else {
+                policy.project_root.join(&literal)
+            };
+            let path_str = resolved.to_string_lossy();
+            if let Err(error) = validate_path(policy, &path_str)
+                && !error.is_boundary_violation()
+            {
+                return Some(format!("Sandbox: {error}"));
             }
         }
     }
@@ -876,16 +919,17 @@ fn validate_plain_command_path_arg(
         policy.project_root.join(&literal_arg)
     };
     let path_str = resolved.to_string_lossy();
-    if let Err(e) = validate_path(policy, &path_str)
-        && e.is_boundary_violation()
-    {
-        return Some(format!(
-            "{}The command references '{}' which is outside the project directory '{}'. \
-             Ask the user for permission before accessing files outside the project.",
-            SANDBOX_DENIED_PREFIX,
-            literal_arg,
-            policy.project_root.display(),
-        ));
+    if let Err(error) = validate_path(policy, &path_str) {
+        if error.is_boundary_violation() {
+            return Some(format!(
+                "{}The command references '{}' which is outside the project directory '{}'. \
+                 Ask the user for permission before accessing files outside the project.",
+                SANDBOX_DENIED_PREFIX,
+                literal_arg,
+                policy.project_root.display(),
+            ));
+        }
+        return Some(format!("Sandbox: {error}"));
     }
     None
 }
@@ -4157,9 +4201,7 @@ impl ToolExecutor {
                 .sandbox_policy
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(ref policy) = *sp_guard
-                && !matches!(policy.isolation, IsolationLevel::Permissive)
-            {
+            if let Some(ref policy) = *sp_guard {
                 if let Some(msg) = check_bash_path_boundary(policy, &command) {
                     return Err(msg);
                 }
@@ -4442,9 +4484,7 @@ impl ToolExecutor {
                 .sandbox_policy
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(ref policy) = *sp_guard
-                && !matches!(policy.isolation, IsolationLevel::Permissive)
-            {
+            if let Some(ref policy) = *sp_guard {
                 if let Some(msg) = check_powershell_path_boundary(policy, command) {
                     return msg;
                 }
@@ -5784,13 +5824,32 @@ mod tests {
     // ── resolve_checked sandbox ──────────────────────────────────────────────
 
     #[test]
-    fn resolve_checked_with_permissive_sandbox_allows_all() {
+    fn resolve_checked_with_permissive_sandbox_allows_ordinary_external_paths() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
         *executor.sandbox_policy.write().unwrap() = Some(SandboxPolicy::permissive(dir.path()));
         let result = executor.resolve_checked("/etc/passwd");
         assert!(result.is_ok(), "should allow with permissive: {result:?}");
+    }
+
+    #[test]
+    fn resolve_checked_with_permissive_sandbox_blocks_sensitive_paths() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let dir = tempfile::tempdir().unwrap();
+        let sensitive_path = dir.path().join(".ssh/id_rsa");
+        let executor = ToolExecutor::new(dir.path());
+        *executor.sandbox_policy.write().unwrap() = Some(SandboxPolicy::permissive(dir.path()));
+
+        let err = executor
+            .resolve_checked(&sensitive_path.to_string_lossy())
+            .unwrap_err();
+
+        assert!(err.contains("sensitive credential path"), "{err}");
+        assert!(
+            !err.starts_with(super::SANDBOX_DENIED_PREFIX),
+            "sensitive paths are bypass-immune, not expandable sandbox boundaries: {err}"
+        );
     }
 
     #[test]
@@ -5876,11 +5935,26 @@ mod tests {
     }
 
     #[test]
-    fn bash_path_boundary_permissive_skips_check() {
+    fn bash_path_boundary_permissive_allows_ordinary_external_paths() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::permissive("/home/user/project");
         let result = check_bash_path_boundary(&policy, "cat /etc/passwd");
         assert!(result.is_none(), "permissive mode should allow everything");
+    }
+
+    #[test]
+    fn bash_path_boundary_permissive_blocks_sensitive_paths() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+
+        let result = check_bash_path_boundary(&policy, "cat /home/user/.ssh/id_rsa")
+            .expect("permissive should still block sensitive credential paths");
+
+        assert!(result.contains("sensitive credential path"), "{result}");
+        assert!(
+            !result.starts_with(super::SANDBOX_DENIED_PREFIX),
+            "sensitive paths are not expandable sandbox boundaries: {result}"
+        );
     }
 
     #[test]

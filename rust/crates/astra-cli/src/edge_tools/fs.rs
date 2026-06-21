@@ -6,7 +6,7 @@ use super::{
     SANDBOX_DENIED_PREFIX, ToolExecutor, code_intel, fuzzy_replacer, tool_output_limit,
     truncate_output,
 };
-use astra_runtime::tool_sandbox::{IsolationLevel, validate_path};
+use astra_runtime::tool_sandbox::validate_path;
 use astra_sandbox::is_internal_safe_path;
 use astra_tools::fs_ops::{
     check_anchor_vs_replacement_size, read_to_string_lossy, str_replace_fail,
@@ -160,9 +160,7 @@ impl ToolExecutor {
                 .sandbox_policy
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(ref policy) = *sp_guard
-                && !matches!(policy.isolation, IsolationLevel::Permissive)
-            {
+            if let Some(ref policy) = *sp_guard {
                 return validate_path(policy, validation_path).map_err(|e| {
                     if e.is_boundary_violation() {
                         // Use structured prefix so the agentic loop can detect sandbox
