@@ -247,6 +247,10 @@ pub struct ServerToolExecutor {
     /// When enabled, server-local execution rejects names outside the current
     /// capability-filtered server tool surface.
     enforce_server_tool_capabilities: bool,
+    /// When false, Astra-owned built-in server tools are neither advertised nor
+    /// executable through this executor. Request-scoped MCP tools are not part of
+    /// this surface and keep their own transport path.
+    server_builtin_tools_enabled: bool,
 
     // ── Gates and callbacks ───────────────────────────────────────────────────
     /// Optional approval gate for dangerous tool execution.
@@ -335,6 +339,7 @@ impl ServerToolExecutor {
             execution_binding: ExecutionBindingState::server_sandbox(&workspace_root),
             capabilities,
             enforce_server_tool_capabilities: false,
+            server_builtin_tools_enabled: true,
             exactly_once_executor: None,
         }
     }
@@ -482,6 +487,7 @@ impl ServerToolExecutor {
     pub fn with_server_builtin_tools_disabled(mut self) -> Self {
         self.capabilities = astra_turn_core::capability::CapabilitySet::empty();
         self.enforce_server_tool_capabilities = true;
+        self.server_builtin_tools_enabled = false;
         self
     }
 
@@ -645,6 +651,9 @@ impl ServerToolExecutor {
     }
 
     fn supports_server_tool_name(&self, tool: &str) -> bool {
+        if !self.server_builtin_tools_enabled {
+            return false;
+        }
         resolved_server_tool_names(
             &self.capabilities,
             self.execution_binding.workspace(),
@@ -655,6 +664,9 @@ impl ServerToolExecutor {
     }
 
     fn capability_filtered_server_tool_schemas(&self) -> Vec<Value> {
+        if !self.server_builtin_tools_enabled {
+            return Vec::new();
+        }
         capability_filtered_server_tool_schemas(
             &self.capabilities,
             self.execution_binding.workspace(),

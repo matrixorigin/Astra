@@ -13613,9 +13613,25 @@ mod tests {
             "build_initial_state must accept execution bindings"
         );
         assert!(
-            fn_body.contains("build_server_skill_executor(")
+            fn_body.contains("build_initial_state_inner(")
                 && fn_body.contains("execution_bindings,"),
-            "build_initial_state must pass execution bindings into the skill executor builder"
+            "build_initial_state must pass execution bindings into build_initial_state_inner"
+        );
+
+        let inner_start = source[fn_start..]
+            .find("fn build_initial_state_inner(")
+            .map(|p| fn_start + p)
+            .expect("build_initial_state_inner must exist");
+        let inner_end = source[inner_start..]
+            .find("\n    fn ")
+            .or_else(|| source[inner_start..].find("\n    pub"))
+            .map(|p| inner_start + p)
+            .unwrap_or(source.len());
+        let inner_body = &source[inner_start..inner_end];
+        assert!(
+            inner_body.contains("build_server_skill_executor(")
+                && inner_body.contains("execution_bindings,"),
+            "build_initial_state_inner must pass execution bindings into the skill executor builder"
         );
     }
 

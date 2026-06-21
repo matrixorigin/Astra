@@ -4601,6 +4601,7 @@ mod tests {
         )
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(false))
         .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
         assert!(!host.server_side_tools);

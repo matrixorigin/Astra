@@ -4362,7 +4362,7 @@ mod tests {
     fn all_client_message_variants_parse() {
         let inputs = [
             r#"{"type":"auth","token":"t1"}"#,
-            r#"{"type":"message","content":"hello"}"#,
+            r#"{"type":"message","content":"hello","selected_model":{"model":"gpt-5.4"}}"#,
             r#"{"type":"cancel_run","run_id":"r1"}"#,
             r#"{"type":"tool_approval","request_id":"req-1","approved":true}"#,
             r#"{"type":"user_prompt","request_id":"req-2","answers":{"answers":[{"question":"Continue?","answers":["yes"],"multi_select":false}]}}"#,

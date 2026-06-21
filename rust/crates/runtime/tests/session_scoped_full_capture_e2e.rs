@@ -311,7 +311,10 @@ async fn browser_ws_chat_propagates_session_scoped_full_capture_over_real_websoc
         json!({
             "type": "message",
             "content": "hello over websocket",
-            "session_id": "capture-session"
+            "session_id": "capture-session",
+            "selected_model": {
+                "model": "test-model"
+            }
         })
         .to_string()
         .into(),
