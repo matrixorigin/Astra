@@ -55,8 +55,10 @@ impl std::fmt::Display for SandboxPathError {
 impl std::error::Error for SandboxPathError {}
 
 impl SandboxPathError {
-    /// Returns `true` when the error is a boundary violation (not a resolution failure).
-    /// Callers can use this to distinguish "needs user authorization" from "path is broken".
+    /// Returns `true` when the error is an expandable sandbox boundary
+    /// violation (not a resolution failure or bypass-immune sensitive path).
+    /// Callers can use this to distinguish "needs user authorization" from
+    /// "path is broken" and "path is never readable".
     pub fn is_boundary_violation(&self) -> bool {
         matches!(
             self,
@@ -398,6 +400,10 @@ mod tests {
         // Classification
         assert!(boundary.is_boundary_violation());
         assert!(symlink.is_boundary_violation());
+        let sensitive = SandboxPathError::SensitivePath {
+            requested: "~/.ssh/id_rsa".into(),
+        };
+        assert!(!sensitive.is_boundary_violation());
         assert!(!resolution.is_boundary_violation());
     }
 }

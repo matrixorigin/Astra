@@ -1400,7 +1400,7 @@ impl<'a> CliSseStreamHost<'a> {
         let decision = {
             let Some(pm) = self.perm_manager.as_mut() else {
                 return Err(format!(
-                    "Error: {sandbox_msg} (sandbox_expand:{tool} denied: no permission manager configured)"
+                    "Error: {sandbox_msg} (cannot ask to expand sandbox for {tool}: no permission manager configured)"
                 ));
             };
             crate::tool_safety_guard::ToolSafetyGuard::check_request(
@@ -1413,7 +1413,7 @@ impl<'a> CliSseStreamHost<'a> {
         match decision {
             crate::cli::permission_manager::GateOutcome::Allow => Ok(()),
             crate::cli::permission_manager::GateOutcome::Deny(reason) => Err(format!(
-                "Error: {sandbox_msg} (sandbox_expand:{tool} denied: {reason})"
+                "Error: {sandbox_msg} (sandbox expansion for {tool} denied: {reason})"
             )),
             crate::cli::permission_manager::GateOutcome::NeedApproval {
                 tool: approval_tool,
@@ -1437,7 +1437,7 @@ impl<'a> CliSseStreamHost<'a> {
                         "approval required for an external path, but no approval prompt is available in this interface"
                     };
                     return Err(format!(
-                        "Error: {sandbox_msg} (sandbox_expand:{tool} denied: {reason})"
+                        "Error: {sandbox_msg} (sandbox expansion for {tool} denied: {reason})"
                     ));
                 };
 
@@ -1497,7 +1497,7 @@ impl<'a> CliSseStreamHost<'a> {
                         pm.record_approval(&approval_tool, Some(&guard_args), false);
                     }
                     Err(format!(
-                        "Error: {sandbox_msg} (sandbox_expand:{tool} denied: user denied sandbox expansion)"
+                        "Error: {sandbox_msg} (sandbox expansion for {tool} denied: user denied)"
                     ))
                 }
             }
@@ -4284,8 +4284,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     // see why the sandbox refused to widen, instead of
                     // silently continuing with the original
                     // sandbox-denied output.
-                    outputs[pos].0.output =
-                        format!("Error: {sandbox_msg} (sandbox_expand:{tool} denied: {reason})");
+                    outputs[pos].0.output = format!(
+                        "Error: {sandbox_msg} (sandbox expansion for {tool} denied: {reason})"
+                    );
                     outputs[pos].0.is_error = true;
                     false
                 }
@@ -7169,7 +7170,10 @@ mod tests {
             !error.contains(crate::sandbox_retry::SANDBOX_DENIED_PREFIX),
             "{error}"
         );
-        assert!(error.contains("sandbox_expand:read_file denied"), "{error}");
+        assert!(
+            error.contains("sandbox expansion for read_file denied"),
+            "{error}"
+        );
         assert!(
             executor.resolve_checked(&target.to_string_lossy()).is_err(),
             "denied preflight must not expand the sandbox"

@@ -135,7 +135,8 @@ const ALWAYS_DENIED_ENV_KEY_PATTERNS: &[&str] = &[
 
 /// Path substrings that identify credential files — NEVER readable,
 /// even in Permissive isolation. These are data-at-rest threats:
-/// secret keys, password databases, credential stores.
+/// secret keys, password databases, credential stores, environment
+/// files, and cloud SDK caches.
 const NEVER_READABLE_PATH_PATTERNS: &[&str] = &[
     "/etc/shadow",
     "/etc/gshadow",
@@ -148,10 +149,21 @@ const NEVER_READABLE_PATH_PATTERNS: &[&str] = &[
     ".docker/config.json",
     ".netrc",
     "/var/run/secrets",
+    // Environment files carry app secrets (DB URLs, API tokens).
+    ".env",
+    // Cloud SDK credential caches.
+    ".kube/config",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+    ".config/gcloud/credentials",
+    // Generic credential file names.
+    "credentials.json",
+    "credentials.db",
 ];
 
 /// Check if a path matches any never-readable pattern.
-pub(crate) fn is_never_readable_path(path: &std::path::Path) -> bool {
+pub fn is_never_readable_path(path: &std::path::Path) -> bool {
     let path_str = path.to_string_lossy();
     NEVER_READABLE_PATH_PATTERNS
         .iter()
@@ -433,5 +445,49 @@ mod tests {
                 "{p:?}"
             );
         }
+    }
+
+    // ── Credential paths must be never-readable (review C2/H1) ──
+    // These are data-at-rest secrets. They must be blocked even in
+    // Permissive isolation, regardless of project root.
+
+    #[test]
+    fn never_readable_paths_block_dotenv() {
+        assert!(is_never_readable_path(std::path::Path::new(
+            "/home/user/.env"
+        )));
+        assert!(is_never_readable_path(std::path::Path::new("/proj/.env")));
+        assert!(is_never_readable_path(std::path::Path::new(".env.local")));
+    }
+
+    #[test]
+    fn never_readable_paths_block_cloud_and_pkg_credentials() {
+        assert!(is_never_readable_path(std::path::Path::new(
+            "/home/user/.kube/config"
+        )));
+        assert!(is_never_readable_path(std::path::Path::new(
+            "/home/user/.npmrc"
+        )));
+        assert!(is_never_readable_path(std::path::Path::new(
+            "/home/user/.pypirc"
+        )));
+        assert!(is_never_readable_path(std::path::Path::new(
+            "/home/user/.config/gcloud/credentials.db"
+        )));
+        assert!(is_never_readable_path(std::path::Path::new(
+            "/home/user/.git-credentials"
+        )));
+        assert!(is_never_readable_path(std::path::Path::new(
+            "/proj/credentials.json"
+        )));
+    }
+
+    #[test]
+    fn permissive_mode_blocks_never_readable_credential_paths() {
+        let p = SandboxPolicy::permissive("/proj");
+        assert!(p.is_path_allowed(std::path::Path::new("/anywhere")));
+        assert!(!p.is_path_allowed(std::path::Path::new("/home/u/.env")));
+        assert!(!p.is_path_allowed(std::path::Path::new("/home/u/.kube/config")));
+        assert!(!p.is_path_allowed(std::path::Path::new("/home/u/.npmrc")));
     }
 }

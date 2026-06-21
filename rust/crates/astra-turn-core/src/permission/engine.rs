@@ -816,7 +816,6 @@ pub fn evaluate_permission(
         && ctx.mode() != PermissionMode::Deny
         && !(ctx.mode() == PermissionMode::Plan
             && is_plan_mode_unstructured_execute_tool(tool_name))
-        && ctx.inherited.is_tool_allowed_by_allowlist(tool_name)
     {
         let decision = HardDecision::Allow;
         push_matched(
@@ -993,15 +992,11 @@ pub fn evaluate_permission(
                 )
             }
             PermissionMode::Auto => {
-                let decision = if ctx.inherited.allowed_tools.is_some()
-                    && !ctx.inherited.is_tool_allowed_by_allowlist(tool_name)
-                {
-                    HardDecision::Deny {
-                        reason: format!("Tool '{tool_name}' not in allowed tools list"),
-                    }
-                } else {
-                    HardDecision::Allow
-                };
+                // ToolAllowlist step already denied unlisted tools, so
+                // anything reaching ExplicitApproval in Auto mode is
+                // allowed (it's an explicit-approval-gated tool that
+                // the mode auto-approves).
+                let decision = HardDecision::Allow;
                 push_matched(
                     &mut trace,
                     EvaluationStep::ExplicitApproval,
@@ -1019,16 +1014,9 @@ pub fn evaluate_permission(
                 )
             }
             PermissionMode::AcceptEdits => {
-                let decision = if ctx.inherited.allowed_tools.is_some()
-                    && !ctx.inherited.is_tool_allowed_by_allowlist(tool_name)
-                {
-                    HardDecision::Deny {
-                        reason: format!("Tool '{tool_name}' not in allowed tools list"),
-                    }
-                } else {
-                    HardDecision::NeedExternal {
-                        prompt: approval_prompt(tool_name, args, prompt_reason, risk_tags.clone()),
-                    }
+                // ToolAllowlist step already denied unlisted tools.
+                let decision = HardDecision::NeedExternal {
+                    prompt: approval_prompt(tool_name, args, prompt_reason, risk_tags.clone()),
                 };
                 push_matched(
                     &mut trace,
@@ -2122,6 +2110,46 @@ mod tests {
             bash_read.source,
             DecisionSource::SensitivePath { .. }
         ));
+    }
+
+    #[test]
+    fn evaluate_grep_pattern_mentioning_sensitive_name_is_not_sensitive_in_any_mode() {
+        let args = serde_json::json!({
+            "command": r#"grep -n "fn resolve_checked\|sensitive credential\|SANDBOX_DENIED_PREFIX\|\.ssh\|credentials.json" rust/crates/astra-cli/src/edge_tools/shell.rs"#
+        });
+
+        for mode in [
+            crate::permission::types::PermissionMode::Prompt,
+            crate::permission::types::PermissionMode::AcceptEdits,
+            crate::permission::types::PermissionMode::Auto,
+        ] {
+            let ctx = crate::permission::types::PermissionSyncContext::root(mode);
+            let envelope = evaluate_permission("bash", &args, &ctx);
+            assert!(
+                !matches!(envelope.source, DecisionSource::SensitivePath { .. }),
+                "{mode:?} must not treat grep search text as a sensitive path: {envelope:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_grep_sensitive_file_operand_is_sensitive_in_any_mode() {
+        let args = serde_json::json!({
+            "command": "grep -n needle ~/.ssh/id_rsa"
+        });
+
+        for mode in [
+            crate::permission::types::PermissionMode::Prompt,
+            crate::permission::types::PermissionMode::AcceptEdits,
+            crate::permission::types::PermissionMode::Auto,
+        ] {
+            let ctx = crate::permission::types::PermissionSyncContext::root(mode);
+            let envelope = evaluate_permission("bash", &args, &ctx);
+            assert!(
+                matches!(envelope.source, DecisionSource::SensitivePath { .. }),
+                "{mode:?} must gate a real sensitive file operand: {envelope:?}"
+            );
+        }
     }
 
     #[test]

@@ -1755,7 +1755,19 @@ impl DynamicAgentSpawner {
         // 7b. Build permission context from explicit inherited permissions.
         // SpawnContext requires an envelope so a child cannot enter runtime
         // execution without an authorization context.
-        let inherited_permissions = context.inherited_permissions.clone();
+        //
+        // The agent type's `allowed_tools` is merged into
+        // `inherited_permissions` here so the permission engine's
+        // `ToolAllowlist` evaluation step enforces it as the single
+        // source of truth (review C1-arch). Previously
+        // `run_config.allowed_tools` carried the list for prompt
+        // pruning but the engine skipped the allowlist step when
+        // `inherited.allowed_tools` was `None` — letting spawned
+        // agents call tools outside their declared surface.
+        let inherited_permissions = context
+            .inherited_permissions
+            .clone()
+            .with_allowed_tools(agent_def.allowed_tools.iter().cloned());
         let permission_context =
             super::permission_sync::PermissionSyncContext::shared(inherited_permissions.clone());
 

@@ -721,6 +721,21 @@ impl InheritedPermissions {
         }
     }
 
+    /// Set the tool allowlist. When set, only these tools may execute.
+    /// Used by the spawner to carry an agent type's `allowed_tools`
+    /// into the permission engine so the `ToolAllowlist` evaluation
+    /// step enforces it. This is the single source of truth for
+    /// execution-time tool restriction.
+    pub fn with_allowed_tools(mut self, tools: impl IntoIterator<Item = String>) -> Self {
+        let set: HashSet<String> = tools
+            .into_iter()
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty() && t != "*")
+            .collect();
+        self.allowed_tools = if set.is_empty() { None } else { Some(set) };
+        self
+    }
+
     /// Add an allow rule.
     pub fn add_allow(&mut self, rule: PermissionRule) {
         if !self.allow_rules.contains(&rule) {

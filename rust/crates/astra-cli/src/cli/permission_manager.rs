@@ -6,8 +6,7 @@ use crate::cli::workspace_trust::{
     evaluate_workspace_trust, project_permissions_hash,
 };
 use astra_runtime::tool_sandbox::{
-    CommandRisk, GitSafetyViolation, SandboxPolicy, analyze_command_risks, validate_git_command,
-    validate_path,
+    CommandRisk, GitSafetyViolation, analyze_command_risks, validate_git_command,
 };
 use astra_thin_client::ApprovalKind;
 use astra_turn_core::cloud_approval_policy::{
@@ -175,19 +174,38 @@ fn canonicalize_existing_or_parent(p: &Path) -> std::io::Result<PathBuf> {
     ))
 }
 
-/// Extract the `'{path}'` target from a sandbox-denied reason string.
-/// Returns the first single-quoted path when the reason is an outside-project
-/// sandbox denial. This covers both `Path '...'` and `command references '...'`
-/// messages.
+/// Extract the filesystem path target from a sandbox-denied reason string.
+///
+/// Scans all single-quoted segments and returns the first one that
+/// looks like an absolute or home-relative filesystem path. This is
+/// robust against reason strings that quote a tool name or project
+/// root before the target path — we never misidentify a bare token
+/// like `bash` as the path.
 fn parse_sandbox_target_path(reason: &str) -> Option<PathBuf> {
     if !reason.contains("outside the project") && !reason.contains("outside project") {
         return None;
     }
 
-    let start = reason.find('\'')? + 1;
-    let rest = &reason[start..];
-    let end = rest.find('\'')?;
-    Some(PathBuf::from(&rest[..end]))
+    let mut rest = reason;
+    while let Some(start) = rest.find('\'') {
+        let after = &rest[start + 1..];
+        let end = after.find('\'')?;
+        let token = &after[..end];
+        if is_pathlike_target(token) {
+            return Some(PathBuf::from(token));
+        }
+        rest = &after[end + 1..];
+    }
+    None
+}
+
+/// A quoted token is a path target if it is absolute or home-relative.
+/// Bare tool names (e.g. `bash`) and project roots that happen to be
+/// quoted are still accepted only when they look like real paths.
+fn is_pathlike_target(token: &str) -> bool {
+    token.starts_with('/')
+        || token.starts_with("~/")
+        || (token.contains('/') && !token.contains(' '))
 }
 
 fn sandbox_expand_sensitive_target_denial(name: &str, args: &serde_json::Value) -> Option<String> {
@@ -205,17 +223,13 @@ fn sandbox_expand_sensitive_target_denial(name: &str, args: &serde_json::Value) 
     ))
 }
 
+/// Check whether a sandbox-expansion target is a sensitive path
+/// that must never be approved. This is the single source of truth
+/// reusing `astra_sandbox::policy::is_never_readable_path`, which
+/// also gates permissive-mode path access — so the sandbox expansion
+/// flow and the sandbox path validator can never disagree.
 fn sandbox_expand_target_is_sensitive(path: &Path) -> bool {
-    let path = path.to_string_lossy();
-    sensitive_path_match_for_request("read_file", &serde_json::json!({ "path": path.as_ref() }))
-        .is_some()
-        || validate_path(
-            &SandboxPolicy::permissive(
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            ),
-            path.as_ref(),
-        )
-        .is_err()
+    astra_sandbox::is_never_readable_path(path)
 }
 
 fn trim_explicit_path_token(token: &str) -> &str {
@@ -3739,7 +3753,8 @@ mod tests {
         PermissionManager, PermissionMode, PermissionRule, PermissionSettings,
         PermissionSettingsLoadError, SideEffect, cloud_always_feedback_message,
         content_aware_fingerprint, decode_mode_for_mirror, encode_mode_for_mirror,
-        format_denied_message, is_read_only_allowlisted, safe_alternative_for,
+        format_denied_message, is_read_only_allowlisted, parse_sandbox_target_path,
+        safe_alternative_for,
     };
     use crate::cli::workspace_trust::{
         TrustState, WorkspaceTrustLedger, WorkspaceTrustReason, project_permissions_hash,
@@ -8060,5 +8075,40 @@ mod tests {
         let h2 = pm.mode_mirror_handle();
         h1.stage(PermissionMode::Auto);
         assert_eq!(h2.current(), PermissionMode::Auto);
+    }
+
+    // ── parse_sandbox_target_path must extract the filesystem path ──
+    // The reason string may contain multiple single-quoted tokens
+    // (e.g. a tool name AND a path). The parser must return the
+    // path, not the first quoted token it sees.
+
+    #[test]
+    fn parse_sandbox_target_path_extracts_path_not_tool_name() {
+        // When a tool name appears in quotes before the path, the
+        // first-quote heuristic returns the tool name. We want the
+        // last quoted segment (the filesystem path).
+        let reason =
+            "Tool 'bash' references '/etc/passwd' which is outside the project directory '/proj'.";
+        let parsed = parse_sandbox_target_path(reason);
+        assert_eq!(
+            parsed.as_ref().map(std::path::Path::new),
+            Some(std::path::Path::new("/etc/passwd")),
+            "must extract the filesystem path, not the tool name"
+        );
+    }
+
+    #[test]
+    fn parse_sandbox_target_path_handles_single_quoted_path() {
+        let reason = "Path '/home/user/.env' is outside the project directory '/proj'.";
+        let parsed = parse_sandbox_target_path(reason);
+        assert_eq!(
+            parsed.as_ref().map(std::path::Path::new),
+            Some(std::path::Path::new("/home/user/.env"))
+        );
+    }
+
+    #[test]
+    fn parse_sandbox_target_path_returns_none_for_unrelated_reason() {
+        assert!(parse_sandbox_target_path("some other error").is_none());
     }
 }

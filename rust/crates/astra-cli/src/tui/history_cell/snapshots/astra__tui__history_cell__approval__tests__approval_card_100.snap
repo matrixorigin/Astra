@@ -1,5 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/approval.rs
+assertion_line: 1080
 expression: "render_at(&fixture_full(), 100)"
 ---
 ╭─ Approval · Bash
@@ -8,5 +9,5 @@ expression: "render_at(&fixture_full(), 100)"
 │ Needs approval before it runs.
 │ Remember · similar `npm test` commands in this workspace
 │
-│  Allow once   Always allow   Reject
+│  Yes   Yes, and don't ask again   No
 ╰─ ←→ move · Enter select · Esc close

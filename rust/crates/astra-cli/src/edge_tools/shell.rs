@@ -564,41 +564,29 @@ fn check_powershell_path_boundary(
 }
 
 fn check_bash_sensitive_path_boundary(
-    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    _policy: &astra_runtime::tool_sandbox::SandboxPolicy,
     command: &str,
-    oldpwd: Option<&std::path::Path>,
+    _oldpwd: Option<&std::path::Path>,
 ) -> Option<String> {
-    for segment in bash_command_segments(command) {
-        for raw in shell_tokenize_like_bash(segment) {
-            let token = raw
-                .trim_matches(|c| c == '"' || c == '\'' || c == '`')
-                .trim_end_matches([';', '&', ')', ',']);
-            if token.is_empty()
-                || token.starts_with('-')
-                || token.starts_with("http://")
-                || token.starts_with("https://")
-                || token.contains('*')
-                || token.contains('?')
-            {
-                continue;
-            }
-            let literal = restore_escaped_shell_analysis_chars(token);
-            let resolved = if literal.starts_with('/') {
-                std::path::PathBuf::from(&literal)
-            } else if let Some(expanded) = expand_static_dir_reference(policy, token, oldpwd) {
-                expanded
-            } else {
-                policy.project_root.join(&literal)
-            };
-            let path_str = resolved.to_string_lossy();
-            if let Err(error) = validate_path(policy, &path_str)
-                && !error.is_boundary_violation()
-            {
-                return Some(format!("Sandbox: {error}"));
-            }
+    let args = serde_json::json!({ "command": command });
+    let hit = astra_turn_core::permission::path_sensitivity::sensitive_path_match_for_tool_args(
+        "bash", &args,
+    )?;
+    let kind = match hit.sensitivity {
+        astra_turn_core::permission::path_sensitivity::PathSensitivity::InternalArtifactReadOnly(
+            _,
+        ) => "internal runtime artifact path",
+        astra_turn_core::permission::path_sensitivity::PathSensitivity::Sensitive => {
+            "sensitive credential path"
         }
-    }
-    None
+        astra_turn_core::permission::path_sensitivity::PathSensitivity::Normal => {
+            "sensitive path"
+        }
+    };
+    Some(format!(
+        "Sandbox: Path '{}' is blocked as a {kind}",
+        hit.token
+    ))
 }
 
 fn shell_tokenize_like_bash(input: &str) -> Vec<String> {
@@ -5892,7 +5880,11 @@ mod tests {
         ] {
             let result = check_bash_path_boundary(&policy, cmd);
             assert!(result.is_some(), "{label}: should block: {cmd}");
-            assert!(result.unwrap().starts_with(super::SANDBOX_DENIED_PREFIX));
+            let msg = result.unwrap();
+            assert!(
+                msg.starts_with(super::SANDBOX_DENIED_PREFIX),
+                "{label}: expected SANDBOX_DENIED prefix, got: {msg}"
+            );
         }
     }
 
@@ -5945,6 +5937,35 @@ mod tests {
 
         let result = check_bash_path_boundary(&policy, "cat /home/user/.ssh/id_rsa")
             .expect("permissive should still block sensitive credential paths");
+
+        assert!(result.contains("sensitive credential path"), "{result}");
+        assert!(
+            !result.starts_with(super::SANDBOX_DENIED_PREFIX),
+            "sensitive paths are not expandable sandbox boundaries: {result}"
+        );
+    }
+
+    #[test]
+    fn bash_path_boundary_permissive_allows_grep_pattern_mentioning_sensitive_name() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+        let result = check_bash_path_boundary(
+            &policy,
+            r#"grep -n "fn resolve_checked\|sensitive credential\|SANDBOX_DENIED_PREFIX\|\.ssh\|credentials.json" rust/crates/astra-cli/src/edge_tools/shell.rs"#,
+        );
+
+        assert!(
+            result.is_none(),
+            "grep search text is data, not a filesystem access: {result:?}"
+        );
+    }
+
+    #[test]
+    fn bash_path_boundary_permissive_blocks_grep_sensitive_file_operand() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "grep -n needle ~/.ssh/id_rsa")
+            .expect("permissive should still block sensitive grep operands");
 
         assert!(result.contains("sensitive credential path"), "{result}");
         assert!(

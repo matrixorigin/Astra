@@ -57,7 +57,7 @@ pub(crate) fn explicit_file_tool_path_args<'a>(tool: &str, args: &'a Value) -> V
     let mut paths = Vec::new();
     match tool {
         "read_file" | "write_file" | "str_replace" | "multi_edit" | "delete_file" | "list_dir"
-        | "grep" => {
+        | "grep" | "apply_patch" => {
             push_explicit_arg_path(&mut paths, args, "path");
         }
         "notebook_edit" => {
@@ -1313,5 +1313,24 @@ mod tests {
         // Step 3: the message body survives stripping.
         let body = sandbox_denied_message(tool_output).expect("body");
         assert!(body.contains("outside the project directory"));
+    }
+
+    // ── apply_patch must participate in preflight path extraction ──
+    // (Review C1-sandbox). Without this arm, sandbox denials for
+    // apply_patch paths never trigger the expand/retry flow.
+
+    #[test]
+    fn explicit_file_tool_path_args_covers_apply_patch() {
+        let args = json!({
+            "path": "/home/user/external-workspace/src/lib.rs",
+            "patch": "--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new"
+        });
+        let paths = super::explicit_file_tool_path_args("apply_patch", &args);
+        assert!(
+            paths.iter().any(|p| p
+                .as_ref()
+                .contains("/home/user/external-workspace/src/lib.rs")),
+            "apply_patch must surface its path for preflight; got {paths:?}"
+        );
     }
 }

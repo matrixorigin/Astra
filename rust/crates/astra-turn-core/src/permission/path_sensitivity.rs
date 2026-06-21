@@ -190,20 +190,9 @@ pub fn sensitive_path_match_for_tool_args(
     if let Some(command) = command_hint_from_args(args)
         && !command.is_empty()
     {
-        for token in shell_like_tokens(command) {
-            let extracted = shell_token_path_candidates(&token);
-            if extracted.is_empty() {
-                let access = classify_shell_token_access(command, &token);
-                if let Some(hit) = path_requires_sensitive_gate(&token, access) {
-                    return Some(hit);
-                }
-                continue;
-            }
-            for candidate in extracted {
-                let access = classify_shell_token_access(command, &candidate);
-                if let Some(hit) = path_requires_sensitive_gate(&candidate, access) {
-                    return Some(hit);
-                }
+        for candidate in shell_permission_path_candidates(command) {
+            if let Some(hit) = path_requires_sensitive_gate(&candidate.token, candidate.access) {
+                return Some(hit);
             }
         }
     }
@@ -213,6 +202,656 @@ pub fn sensitive_path_match_for_tool_args(
 
 pub fn sensitive_path_token_for_tool_args(tool_name: &str, args: &Value) -> Option<String> {
     sensitive_path_match_for_tool_args(tool_name, args).map(|hit| hit.token)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellPermissionPathCandidate {
+    token: String,
+    access: PathAccess,
+}
+
+fn shell_permission_path_candidates(command: &str) -> Vec<ShellPermissionPathCandidate> {
+    let mut candidates = redirection_path_candidates(command);
+
+    for segment in shell_command_segments(command) {
+        let tokens = shell_like_tokens(segment);
+        append_segment_path_candidates(command, &tokens, &mut candidates);
+    }
+
+    candidates
+}
+
+fn append_segment_path_candidates(
+    command: &str,
+    tokens: &[String],
+    candidates: &mut Vec<ShellPermissionPathCandidate>,
+) {
+    let Some(command_idx) = leading_shell_command_index(tokens) else {
+        return;
+    };
+    let base = tokens[command_idx]
+        .rsplit('/')
+        .next()
+        .unwrap_or(tokens[command_idx].as_str());
+
+    match base {
+        "grep" | "egrep" | "fgrep" | "rg" | "ag" => {
+            append_grep_like_path_candidates(command, tokens, command_idx + 1, candidates);
+        }
+        "sed" => append_sed_path_candidates(command, tokens, command_idx + 1, candidates),
+        "awk" => append_awk_path_candidates(command, tokens, command_idx + 1, candidates),
+        _ if is_shell_file_operand_command(base) => {
+            append_generic_file_operand_candidates(command, tokens, command_idx + 1, candidates);
+        }
+        _ => {}
+    }
+}
+
+fn push_permission_path_candidate(
+    candidates: &mut Vec<ShellPermissionPathCandidate>,
+    token: &str,
+    access: PathAccess,
+) {
+    let extracted = shell_token_path_candidates(token);
+    if extracted.is_empty() {
+        push_unique_permission_path_candidate(candidates, token.to_string(), access);
+    } else {
+        for candidate in extracted {
+            push_unique_permission_path_candidate(candidates, candidate, access);
+        }
+    }
+}
+
+fn push_unique_permission_path_candidate(
+    candidates: &mut Vec<ShellPermissionPathCandidate>,
+    token: String,
+    access: PathAccess,
+) {
+    if token.is_empty() || token == "-" {
+        return;
+    }
+    let candidate = ShellPermissionPathCandidate { token, access };
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
+}
+
+fn leading_shell_command_index(tokens: &[String]) -> Option<usize> {
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        let token = tokens[idx].as_str();
+        let base = token.rsplit('/').next().unwrap_or(token);
+        if token.is_empty() || (token.contains('=') && !token.starts_with('=')) {
+            idx += 1;
+            continue;
+        }
+        if matches!(
+            base,
+            "sudo" | "doas" | "env" | "command" | "exec" | "nice" | "nohup" | "time" | "timeout"
+        ) {
+            idx += 1;
+            continue;
+        }
+        return Some(idx);
+    }
+    None
+}
+
+fn is_shell_file_operand_command(base: &str) -> bool {
+    matches!(
+        base,
+        "cat"
+            | "head"
+            | "tail"
+            | "less"
+            | "more"
+            | "tac"
+            | "nl"
+            | "wc"
+            | "stat"
+            | "file"
+            | "md5sum"
+            | "sha1sum"
+            | "sha256sum"
+            | "readlink"
+            | "realpath"
+            | "diff"
+            | "cmp"
+            | "comm"
+            | "join"
+            | "cut"
+            | "paste"
+            | "sort"
+            | "uniq"
+            | "cp"
+            | "mv"
+            | "rm"
+            | "rmdir"
+            | "ln"
+            | "truncate"
+            | "chmod"
+            | "chown"
+            | "chgrp"
+            | "unlink"
+            | "shred"
+            | "tee"
+            | "install"
+            | "dd"
+            | "mkdir"
+            | "mkfifo"
+            | "mknod"
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellFlagValueKind {
+    Path,
+    Pattern,
+    Other,
+}
+
+fn append_grep_like_path_candidates(
+    command: &str,
+    tokens: &[String],
+    mut idx: usize,
+    candidates: &mut Vec<ShellPermissionPathCandidate>,
+) {
+    let mut pattern_seen = false;
+    while idx < tokens.len() {
+        let token = tokens[idx].as_str();
+        if token == "--" {
+            idx += 1;
+            break;
+        }
+        if let Some((value, kind)) = grep_inline_flag_value(token) {
+            if matches!(kind, ShellFlagValueKind::Path) {
+                push_permission_path_candidate(
+                    candidates,
+                    value,
+                    classify_shell_token_access(command, value),
+                );
+            } else if matches!(kind, ShellFlagValueKind::Pattern) {
+                pattern_seen = true;
+            }
+            idx += 1;
+            continue;
+        }
+        if let Some(kind) = grep_flag_value_kind(token) {
+            if let Some(value) = tokens.get(idx + 1) {
+                if matches!(kind, ShellFlagValueKind::Path) {
+                    push_permission_path_candidate(
+                        candidates,
+                        value,
+                        classify_shell_token_access(command, value),
+                    );
+                } else if matches!(kind, ShellFlagValueKind::Pattern) {
+                    pattern_seen = true;
+                }
+                idx += 2;
+                continue;
+            }
+            idx += 1;
+            continue;
+        }
+        if token.starts_with('-') && token != "-" {
+            idx += 1;
+            continue;
+        }
+        if !pattern_seen {
+            pattern_seen = true;
+            idx += 1;
+            continue;
+        }
+        push_permission_path_candidate(
+            candidates,
+            token,
+            classify_shell_token_access(command, token),
+        );
+        idx += 1;
+    }
+
+    while idx < tokens.len() {
+        let token = tokens[idx].as_str();
+        push_permission_path_candidate(
+            candidates,
+            token,
+            classify_shell_token_access(command, token),
+        );
+        idx += 1;
+    }
+}
+
+fn grep_flag_value_kind(flag: &str) -> Option<ShellFlagValueKind> {
+    match flag {
+        "-e" | "--regexp" => Some(ShellFlagValueKind::Pattern),
+        "-f" | "--file" => Some(ShellFlagValueKind::Path),
+        "-m"
+        | "--max-count"
+        | "-A"
+        | "--after-context"
+        | "-B"
+        | "--before-context"
+        | "-C"
+        | "--context"
+        | "--label"
+        | "--binary-files"
+        | "--include"
+        | "--exclude"
+        | "--exclude-dir"
+        | "--exclude-from"
+        | "-g"
+        | "--glob"
+        | "--iglob"
+        | "-t"
+        | "--type"
+        | "-T"
+        | "--type-not"
+        | "--colors"
+        | "--engine"
+        | "--sort"
+        | "--sortr"
+        | "--encoding"
+        | "--context-separator"
+        | "--path-separator" => Some(ShellFlagValueKind::Other),
+        _ => None,
+    }
+}
+
+fn grep_inline_flag_value(flag: &str) -> Option<(&str, ShellFlagValueKind)> {
+    flag.strip_prefix("--regexp=")
+        .map(|value| (value, ShellFlagValueKind::Pattern))
+        .or_else(|| {
+            flag.strip_prefix("--file=")
+                .map(|value| (value, ShellFlagValueKind::Path))
+        })
+        .or_else(|| {
+            flag.strip_prefix("--include=")
+                .map(|value| (value, ShellFlagValueKind::Other))
+        })
+        .or_else(|| {
+            flag.strip_prefix("--exclude=")
+                .map(|value| (value, ShellFlagValueKind::Other))
+        })
+        .or_else(|| {
+            flag.strip_prefix("--exclude-dir=")
+                .map(|value| (value, ShellFlagValueKind::Other))
+        })
+        .or_else(|| {
+            flag.strip_prefix("--exclude-from=")
+                .map(|value| (value, ShellFlagValueKind::Other))
+        })
+        .or_else(|| {
+            flag.strip_prefix("--glob=")
+                .map(|value| (value, ShellFlagValueKind::Other))
+        })
+        .or_else(|| {
+            flag.strip_prefix("--iglob=")
+                .map(|value| (value, ShellFlagValueKind::Other))
+        })
+        .or_else(|| {
+            flag.strip_prefix("--type=")
+                .map(|value| (value, ShellFlagValueKind::Other))
+        })
+        .or_else(|| {
+            flag.strip_prefix("--type-not=")
+                .map(|value| (value, ShellFlagValueKind::Other))
+        })
+        .or_else(|| {
+            flag.strip_prefix("-e")
+                .filter(|value| !value.is_empty())
+                .map(|value| (value, ShellFlagValueKind::Pattern))
+        })
+        .or_else(|| {
+            flag.strip_prefix("-f")
+                .filter(|value| !value.is_empty())
+                .map(|value| (value, ShellFlagValueKind::Path))
+        })
+        .or_else(|| {
+            flag.strip_prefix("-g")
+                .filter(|value| !value.is_empty())
+                .map(|value| (value, ShellFlagValueKind::Other))
+        })
+}
+
+fn append_sed_path_candidates(
+    command: &str,
+    tokens: &[String],
+    mut idx: usize,
+    candidates: &mut Vec<ShellPermissionPathCandidate>,
+) {
+    let mut script_seen = false;
+    while idx < tokens.len() {
+        let token = tokens[idx].as_str();
+        if token == "--" {
+            idx += 1;
+            break;
+        }
+        if let Some(value) = token
+            .strip_prefix("-f")
+            .filter(|value| !value.is_empty())
+            .or_else(|| token.strip_prefix("--file="))
+        {
+            push_permission_path_candidate(
+                candidates,
+                value,
+                classify_shell_token_access(command, value),
+            );
+            idx += 1;
+            continue;
+        }
+        if token.starts_with("-e") && token.len() > 2 && !token.starts_with("--")
+            || token.starts_with("--expression=")
+        {
+            script_seen = true;
+            idx += 1;
+            continue;
+        }
+        if matches!(token, "-f" | "--file") {
+            if let Some(value) = tokens.get(idx + 1) {
+                push_permission_path_candidate(
+                    candidates,
+                    value,
+                    classify_shell_token_access(command, value),
+                );
+                idx += 2;
+                continue;
+            }
+        }
+        if matches!(token, "-e" | "--expression") {
+            script_seen = true;
+            idx += 2;
+            continue;
+        }
+        if token.starts_with('-') && token != "-" {
+            idx += 1;
+            continue;
+        }
+        if !script_seen {
+            script_seen = true;
+            idx += 1;
+            continue;
+        }
+        push_permission_path_candidate(
+            candidates,
+            token,
+            classify_shell_token_access(command, token),
+        );
+        idx += 1;
+    }
+
+    while idx < tokens.len() {
+        let token = tokens[idx].as_str();
+        push_permission_path_candidate(
+            candidates,
+            token,
+            classify_shell_token_access(command, token),
+        );
+        idx += 1;
+    }
+}
+
+fn append_awk_path_candidates(
+    command: &str,
+    tokens: &[String],
+    mut idx: usize,
+    candidates: &mut Vec<ShellPermissionPathCandidate>,
+) {
+    let mut program_seen = false;
+    while idx < tokens.len() {
+        let token = tokens[idx].as_str();
+        if token == "--" {
+            idx += 1;
+            break;
+        }
+        if let Some(value) = token
+            .strip_prefix("-f")
+            .filter(|value| !value.is_empty())
+            .or_else(|| token.strip_prefix("--file="))
+            .or_else(|| token.strip_prefix("-i").filter(|value| !value.is_empty()))
+            .or_else(|| token.strip_prefix("--include="))
+        {
+            push_permission_path_candidate(
+                candidates,
+                value,
+                classify_shell_token_access(command, value),
+            );
+            idx += 1;
+            continue;
+        }
+        if (token.starts_with("-F") || token.starts_with("-v")) && token.len() > 2
+            || token.starts_with("--field-separator=")
+            || token.starts_with("--assign=")
+        {
+            idx += 1;
+            continue;
+        }
+        if matches!(token, "-f" | "--file" | "-i" | "--include") {
+            if let Some(value) = tokens.get(idx + 1) {
+                push_permission_path_candidate(
+                    candidates,
+                    value,
+                    classify_shell_token_access(command, value),
+                );
+                idx += 2;
+                continue;
+            }
+        }
+        if matches!(token, "-F" | "--field-separator" | "-v" | "--assign") {
+            idx += 2;
+            continue;
+        }
+        if token.starts_with('-') && token != "-" {
+            idx += 1;
+            continue;
+        }
+        if !program_seen {
+            program_seen = true;
+            idx += 1;
+            continue;
+        }
+        push_permission_path_candidate(
+            candidates,
+            token,
+            classify_shell_token_access(command, token),
+        );
+        idx += 1;
+    }
+
+    while idx < tokens.len() {
+        let token = tokens[idx].as_str();
+        push_permission_path_candidate(
+            candidates,
+            token,
+            classify_shell_token_access(command, token),
+        );
+        idx += 1;
+    }
+}
+
+fn append_generic_file_operand_candidates(
+    command: &str,
+    tokens: &[String],
+    mut idx: usize,
+    candidates: &mut Vec<ShellPermissionPathCandidate>,
+) {
+    while idx < tokens.len() {
+        let token = tokens[idx].as_str();
+        if token == "--" {
+            idx += 1;
+            break;
+        }
+        if token.starts_with('-') && token != "-" {
+            idx += 1;
+            continue;
+        }
+        push_permission_path_candidate(
+            candidates,
+            token,
+            classify_shell_token_access(command, token),
+        );
+        idx += 1;
+    }
+
+    while idx < tokens.len() {
+        let token = tokens[idx].as_str();
+        push_permission_path_candidate(
+            candidates,
+            token,
+            classify_shell_token_access(command, token),
+        );
+        idx += 1;
+    }
+}
+
+fn shell_command_segments(command: &str) -> Vec<&str> {
+    let chars: Vec<(usize, char)> = command.char_indices().collect();
+    let mut segments = Vec::new();
+    let mut segment_start = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+    let mut idx = 0usize;
+
+    while idx < chars.len() {
+        let (byte_idx, ch) = chars[idx];
+        if escaped {
+            escaped = false;
+            idx += 1;
+            continue;
+        }
+        if ch == '\\' && !in_single_quote {
+            escaped = true;
+            idx += 1;
+            continue;
+        }
+        if ch == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            idx += 1;
+            continue;
+        }
+        if ch == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            idx += 1;
+            continue;
+        }
+        if !in_single_quote && !in_double_quote {
+            let is_double_separator =
+                matches!(ch, '&' | '|') && chars.get(idx + 1).is_some_and(|(_, next)| *next == ch);
+            let is_single_separator = matches!(ch, '|' | ';' | '\n' | '\r');
+            if is_double_separator || is_single_separator {
+                let segment = command[segment_start..byte_idx].trim();
+                if !segment.is_empty() {
+                    segments.push(segment);
+                }
+                segment_start = if is_double_separator {
+                    let (next_idx, next_ch) = chars[idx + 1];
+                    idx += 2;
+                    next_idx + next_ch.len_utf8()
+                } else {
+                    idx += 1;
+                    byte_idx + ch.len_utf8()
+                };
+                continue;
+            }
+        }
+        idx += 1;
+    }
+
+    let segment = command[segment_start..].trim();
+    if !segment.is_empty() {
+        segments.push(segment);
+    }
+    segments
+}
+
+fn redirection_path_candidates(command: &str) -> Vec<ShellPermissionPathCandidate> {
+    let chars: Vec<(usize, char)> = command.char_indices().collect();
+    let mut candidates = Vec::new();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+    let mut idx = 0usize;
+
+    while idx < chars.len() {
+        let (_, ch) = chars[idx];
+        if escaped {
+            escaped = false;
+            idx += 1;
+            continue;
+        }
+        if ch == '\\' && !in_single_quote {
+            escaped = true;
+            idx += 1;
+            continue;
+        }
+        if ch == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            idx += 1;
+            continue;
+        }
+        if ch == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            idx += 1;
+            continue;
+        }
+        if in_single_quote || in_double_quote || !matches!(ch, '<' | '>') {
+            idx += 1;
+            continue;
+        }
+
+        let access = if ch == '>' {
+            PathAccess::Write
+        } else {
+            PathAccess::Read
+        };
+        let mut target_idx = idx + 1;
+        if ch == '<'
+            && chars
+                .get(target_idx)
+                .is_some_and(|(_, next)| matches!(*next, '<'))
+        {
+            idx += 1;
+            continue;
+        }
+        while chars
+            .get(target_idx)
+            .is_some_and(|(_, next)| matches!(*next, '<' | '>' | '&') || next.is_ascii_digit())
+        {
+            target_idx += 1;
+        }
+        while chars
+            .get(target_idx)
+            .is_some_and(|(_, next)| next.is_whitespace())
+        {
+            target_idx += 1;
+        }
+        if chars
+            .get(target_idx)
+            .is_some_and(|(_, next)| *next == '&' || next.is_ascii_digit())
+        {
+            idx = target_idx + 1;
+            continue;
+        }
+        let Some((start, _)) = chars.get(target_idx).copied() else {
+            break;
+        };
+        let mut end = command.len();
+        let mut scan_idx = target_idx;
+        while scan_idx < chars.len() {
+            let (byte_idx, current) = chars[scan_idx];
+            if current.is_whitespace() || matches!(current, '|' | ';' | '&' | '<' | '>' | '(' | ')')
+            {
+                end = byte_idx;
+                break;
+            }
+            scan_idx += 1;
+        }
+        let target = command[start..end].trim_matches(|c| matches!(c, '\'' | '"' | '`'));
+        push_permission_path_candidate(&mut candidates, target, access);
+        idx = scan_idx;
+    }
+
+    candidates
 }
 
 /// Classify whether a path token extracted from a shell command is being read
@@ -703,6 +1342,31 @@ mod tests {
         let artifact_path = artifact_path.to_string_lossy();
         let args = serde_json::json!({
             "command": format!("cat {artifact_path} ~/.ssh/id_rsa")
+        });
+
+        let hit = sensitive_path_match_for_tool_args("bash", &args).expect("sensitive path");
+        assert_eq!(hit.token, "~/.ssh/id_rsa");
+        assert_eq!(hit.sensitivity, PathSensitivity::Sensitive);
+        assert_eq!(hit.access, PathAccess::Read);
+    }
+
+    #[test]
+    fn grep_pattern_mentioning_sensitive_name_is_not_a_sensitive_path_access() {
+        let args = serde_json::json!({
+            "command": r#"grep -n "fn resolve_checked\|sensitive credential\|SANDBOX_DENIED_PREFIX\|\.ssh\|credentials.json" rust/crates/astra-cli/src/edge_tools/shell.rs"#
+        });
+
+        assert_eq!(
+            sensitive_path_match_for_tool_args("bash", &args),
+            None,
+            "grep search text is data, not a filesystem access"
+        );
+    }
+
+    #[test]
+    fn grep_file_operand_with_sensitive_path_is_sensitive() {
+        let args = serde_json::json!({
+            "command": "grep -n needle ~/.ssh/id_rsa"
         });
 
         let hit = sensitive_path_match_for_tool_args("bash", &args).expect("sensitive path");
