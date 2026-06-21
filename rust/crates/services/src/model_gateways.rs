@@ -194,7 +194,7 @@ impl ModelGatewayService for InMemoryModelGatewayService {
             .expect("model gateway lock poisoned")
             .get(&id)
             .map(|stored| stored.record.clone())
-            .ok_or_else(|| model_gateway_not_found())
+            .ok_or_else(model_gateway_not_found)
     }
 
     async fn disable_gateway(
