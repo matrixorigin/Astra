@@ -35,7 +35,7 @@ pub enum PermissionCheckResult {
 /// Check permission for a tool call.
 ///
 /// Flow:
-/// 1. If no permission_context, always allow (legacy mode)
+/// 1. If no permission_context, fail closed
 /// 2. Check PermissionSyncContext.is_allowed()
 /// 3. If denied and have mailbox, request permission from the parent
 /// 4. Return result
@@ -44,8 +44,9 @@ pub enum PermissionCheckResult {
 ///
 /// * `tool_name` — Name of the tool being invoked (e.g. `"bash"`, `"edit_file"`).
 /// * `args` — Optional JSON string of tool arguments, used for rule matching.
-/// * `permission_context` — Shared permission rules for this agent. `None` means
-///   legacy/unrestricted mode (all tools allowed).
+/// * `permission_context` — Shared permission rules for this agent. `None`
+///   means the caller failed to provide an authorization context, so the gate
+///   denies the tool call.
 /// * `mailbox` — Agent's mailbox for requesting permission from the parent.
 ///   `None` when no parent is available (root agent or standalone mode).
 /// * `timeout` — Maximum time to wait for a parent permission response.
@@ -56,9 +57,10 @@ pub async fn check_tool_permission(
     mailbox: Option<&mut AgentMailbox>,
     timeout: Duration,
 ) -> PermissionCheckResult {
-    // No permission context = legacy mode, always allow
     let Some(ctx) = permission_context else {
-        return PermissionCheckResult::Allowed;
+        return PermissionCheckResult::Denied {
+            reason: "no permission context configured".to_string(),
+        };
     };
 
     let normalized_args = args
@@ -234,7 +236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_context_always_allowed() {
+    async fn no_context_fails_closed() {
         let result = check_tool_permission(
             "edit",
             Some("src/main.rs"),
@@ -243,7 +245,12 @@ mod tests {
             Duration::from_secs(5),
         )
         .await;
-        assert!(is_allowed(&result));
+        match result {
+            PermissionCheckResult::Denied { reason } => {
+                assert!(reason.contains("no permission context"));
+            }
+            other => panic!("missing permission context must deny, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -378,27 +385,12 @@ mod tests {
         assert_eq!(telemetry.tools_blocked, 1);
     }
 
-    /// REGRESSION: a sub-agent in `Prompt` mode whose tool IS in the
-    /// agent_type's `allowed_tools` allowlist must be auto-approved
-    /// without trying to ask the parent. The user already authorized
-    /// the spawn action that created this sub-agent, knowing its
-    /// agent_type's tool surface (e.g. `code-review` ⇒ bash, grep,
-    /// glob, view). Asking them again per-tool-call is friction
-    /// without consent value.
-    ///
-    /// The pre-fix bug (session 2a98814b): sub-agents inherited
-    /// Prompt mode, fell through to the "request parent" branch, but
-    /// the orchestrator mailbox was never registered in
-    /// `initialize_multi_agent_runtime` — so `request_permission`
-    /// returned `MailboxError::AgentNotFound("orchestrator@run-...")`
-    /// and the tool call was denied. 4 review agents spawned, all
-    /// returned 0 tool calls, useless output.
-    ///
-    /// Fix: extend the local-approve fast path so it also fires when
-    /// `allowed_tools.is_some()` AND the tool is in the list,
-    /// regardless of mode. The allowlist IS the consent.
+    /// `allowed_tools` is a tool-surface boundary, not consent to run
+    /// mutating or executing tools. In Prompt mode, allowlisted bash
+    /// still needs a parent approval sink; without one, the gate denies
+    /// instead of silently executing.
     #[tokio::test]
-    async fn allowlisted_tool_auto_approves_in_prompt_mode_without_mailbox() {
+    async fn allowlisted_execute_tool_denies_in_prompt_mode_without_mailbox() {
         let inherited = InheritedPermissions {
             mode: PermissionMode::Prompt,
             allow_rules: vec![],
@@ -422,27 +414,25 @@ mod tests {
         // production state on a fresh REPL).
         let result = check_tool_permission(
             "bash",
-            Some(r#"{"command":"git show HEAD"}"#),
+            Some(r#"{"command":"touch prompt-mode-allowlist-denied.txt"}"#),
             Some(&ctx),
             None,
             Duration::from_secs(1),
         )
         .await;
         assert!(
-            is_allowed(&result),
-            "tool in agent_type allowlist must auto-approve in Prompt mode; \
-             got {result:?}. Pre-fix this would have hit the 'mailbox = None' \
-             branch and denied the call."
+            matches!(result, PermissionCheckResult::Denied { .. }),
+            "allowlisted execute tools must still require approval in Prompt mode; got {result:?}"
         );
 
         let telemetry = ctx.read().await.telemetry();
         assert_eq!(
             telemetry.permission_requests, 0,
-            "must NOT send a mailbox request — the allowlist is the consent"
+            "without a mailbox the gate should fail before sending a request"
         );
         assert_eq!(
-            telemetry.tools_blocked, 0,
-            "must NOT block the call — allowlisted tools bypass the prompt path"
+            telemetry.tools_blocked, 1,
+            "missing approval sink should be recorded as a blocked tool"
         );
     }
 
@@ -685,8 +675,8 @@ mod tests {
 
         // No allowlist set — Prompt mode falls through to the
         // request-parent flow that this test is exercising. (When an
-        // allowlist IS set, allowlisted tools auto-approve locally;
-        // see `allowlisted_tool_auto_approves_in_prompt_mode_without_mailbox`.)
+        // allowlist IS set, mutating/execute tools still need approval;
+        // see `allowlisted_execute_tool_denies_in_prompt_mode_without_mailbox`.)
         let inherited = InheritedPermissions {
             mode: PermissionMode::Prompt,
             allow_rules: vec![],

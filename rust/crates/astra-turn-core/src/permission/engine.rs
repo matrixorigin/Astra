@@ -170,7 +170,7 @@ pub enum TraceOutcome {
     Matched(HardDecision),
 }
 
-/// The 11 fixed evaluation slots. Plan v3 §P2 freezes the order:
+/// The fixed evaluation slots. Plan v3 §P2 freezes the order:
 /// any future change must update both this enum and the
 /// `evaluation_order_is_stable` pinning test, so the rule-precedence
 /// contract can't drift silently.
@@ -187,6 +187,7 @@ pub enum EvaluationStep {
     SensitivePath,
     ExecuteHardDeny,
     SandboxExpand,
+    ToolAllowlist,
     AskRules,
     ReadShortCircuit,
     SessionOverride,
@@ -197,7 +198,7 @@ pub enum EvaluationStep {
 
 /// Canonical ordering. Any reorder must change this constant AND
 /// flip the pinning test in `tests::evaluation_order_is_stable`.
-pub const EVALUATION_ORDER: [EvaluationStep; 13] = [
+pub const EVALUATION_ORDER: [EvaluationStep; 14] = [
     EvaluationStep::SchemaIdentity,
     EvaluationStep::DenyRules,
     EvaluationStep::SafetyMiddleware,
@@ -205,6 +206,7 @@ pub const EVALUATION_ORDER: [EvaluationStep; 13] = [
     EvaluationStep::SensitivePath,
     EvaluationStep::ExecuteHardDeny,
     EvaluationStep::SandboxExpand,
+    EvaluationStep::ToolAllowlist,
     EvaluationStep::AskRules,
     EvaluationStep::ReadShortCircuit,
     EvaluationStep::SessionOverride,
@@ -753,6 +755,40 @@ pub fn evaluate_permission(
         "not a sandbox expansion",
     );
 
+    if ctx.inherited.allowed_tools.is_some() {
+        if !ctx.inherited.is_tool_allowed_by_allowlist(tool_name) {
+            let decision = HardDecision::Deny {
+                reason: format!("Tool '{tool_name}' not in allowed tools list"),
+            };
+            push_matched(
+                &mut trace,
+                EvaluationStep::ToolAllowlist,
+                &decision,
+                "tool not in allowed_tools",
+            );
+            return envelope(
+                decision,
+                DecisionSource::Mode {
+                    mode: "agent policy allowlist".to_string(),
+                },
+                trace,
+                will_save,
+                risk_tags,
+            );
+        }
+        push_skipped(
+            &mut trace,
+            EvaluationStep::ToolAllowlist,
+            "tool in allowed_tools; continuing to permission mode",
+        );
+    } else {
+        push_skipped(
+            &mut trace,
+            EvaluationStep::ToolAllowlist,
+            "no tool allowlist",
+        );
+    }
+
     if let Some(rule) = ctx
         .inherited
         .ask_rule_with_context(tool_name, &rule_match_context)
@@ -1065,18 +1101,6 @@ pub fn evaluate_permission(
 
     let mode = ctx.mode();
     let (decision, mode_label) = match mode {
-        PermissionMode::Auto if ctx.inherited.allowed_tools.is_some() => {
-            if ctx.inherited.is_tool_allowed_by_allowlist(tool_name) {
-                (HardDecision::Allow, "agent policy allowlist".to_string())
-            } else {
-                (
-                    HardDecision::Deny {
-                        reason: format!("Tool '{tool_name}' not in allowed tools list"),
-                    },
-                    "agent policy allowlist".to_string(),
-                )
-            }
-        }
         PermissionMode::Auto => (HardDecision::Allow, mode.to_string()),
         PermissionMode::Plan => (
             HardDecision::Deny {
@@ -1084,30 +1108,6 @@ pub fn evaluate_permission(
             },
             mode.to_string(),
         ),
-        PermissionMode::AcceptEdits if ctx.inherited.allowed_tools.is_some() => {
-            if !ctx.inherited.is_tool_allowed_by_allowlist(tool_name) {
-                (
-                    HardDecision::Deny {
-                        reason: format!("Tool '{tool_name}' not in allowed tools list"),
-                    },
-                    "agent policy allowlist".to_string(),
-                )
-            } else if accept_edits_auto_allows(tool_name, args) {
-                (HardDecision::Allow, mode.to_string())
-            } else {
-                (
-                    HardDecision::NeedExternal {
-                        prompt: approval_prompt(
-                            tool_name,
-                            args,
-                            "Write/execute tool requires approval".to_string(),
-                            risk_tags.clone(),
-                        ),
-                    },
-                    mode.to_string(),
-                )
-            }
-        }
         PermissionMode::AcceptEdits => {
             if accept_edits_auto_allows(tool_name, args) {
                 (HardDecision::Allow, mode.to_string())
@@ -1131,18 +1131,6 @@ pub fn evaluate_permission(
             },
             mode.to_string(),
         ),
-        PermissionMode::Prompt if ctx.inherited.allowed_tools.is_some() => {
-            if ctx.inherited.is_tool_allowed_by_allowlist(tool_name) {
-                (HardDecision::Allow, "agent policy allowlist".to_string())
-            } else {
-                (
-                    HardDecision::Deny {
-                        reason: format!("Tool '{tool_name}' not in allowed tools list"),
-                    },
-                    "agent policy allowlist".to_string(),
-                )
-            }
-        }
         PermissionMode::Prompt => (
             HardDecision::NeedExternal {
                 prompt: approval_prompt(
@@ -1543,6 +1531,7 @@ mod tests {
                 EvaluationStep::SensitivePath,
                 EvaluationStep::ExecuteHardDeny,
                 EvaluationStep::SandboxExpand,
+                EvaluationStep::ToolAllowlist,
                 EvaluationStep::AskRules,
                 EvaluationStep::ReadShortCircuit,
                 EvaluationStep::SessionOverride,
@@ -1733,7 +1722,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_mode_allowlist_locally_allows_listed_non_explicit_tool() {
+    fn prompt_mode_allowlist_does_not_locally_allow_listed_write_tool() {
         let ctx = crate::permission::types::PermissionSyncContext::new(
             crate::permission::types::InheritedPermissions {
                 mode: crate::permission::types::PermissionMode::Prompt,
@@ -1747,17 +1736,21 @@ mod tests {
             &ctx,
         );
 
-        assert!(matches!(envelope.decision, HardDecision::Allow));
+        assert!(
+            matches!(envelope.decision, HardDecision::NeedExternal { .. }),
+            "allowed_tools restricts the child tool surface but must not approve writes in Prompt mode; got {:?}",
+            envelope.decision
+        );
         assert_eq!(
             envelope.source,
             DecisionSource::Mode {
-                mode: "agent policy allowlist".to_string()
+                mode: "prompt".to_string()
             }
         );
     }
 
     #[test]
-    fn prompt_mode_allowlist_blocks_unlisted_tool() {
+    fn prompt_mode_allowlist_blocks_unlisted_explicit_tool_before_prompting() {
         let ctx = crate::permission::types::PermissionSyncContext::new(
             crate::permission::types::InheritedPermissions {
                 mode: crate::permission::types::PermissionMode::Prompt,
@@ -1775,6 +1768,25 @@ mod tests {
                 mode: "agent policy allowlist".to_string()
             }
         );
+    }
+
+    #[test]
+    fn prompt_mode_allowlist_still_allows_listed_read_only_tool() {
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::Prompt,
+                allowed_tools: Some(std::collections::HashSet::from(["read_file".to_string()])),
+                ..Default::default()
+            },
+        );
+        let envelope = evaluate_permission(
+            "read_file",
+            &serde_json::json!({"path": "src/lib.rs"}),
+            &ctx,
+        );
+
+        assert!(matches!(envelope.decision, HardDecision::Allow));
+        assert_eq!(envelope.source, DecisionSource::ReadShortCircuit);
     }
 
     #[test]
@@ -2264,10 +2276,12 @@ mod tests {
         );
 
         assert!(matches!(envelope.decision, HardDecision::Deny { .. }));
-        assert!(matches!(
+        assert_eq!(
             envelope.source,
-            DecisionSource::ExplicitApprovalGate { .. }
-        ));
+            DecisionSource::Mode {
+                mode: "agent policy allowlist".to_string()
+            }
+        );
     }
 
     #[test]
@@ -2349,10 +2363,12 @@ mod tests {
             evaluate_permission("bash", &serde_json::json!({"command": "cargo test"}), &ctx);
 
         assert!(matches!(envelope.decision, HardDecision::Deny { .. }));
-        assert!(matches!(
+        assert_eq!(
             envelope.source,
-            DecisionSource::ExplicitApprovalGate { .. }
-        ));
+            DecisionSource::Mode {
+                mode: "agent policy allowlist".to_string()
+            }
+        );
     }
 
     // ── Issue #326 P5 / R2 Major 5: MCP capability metadata ──

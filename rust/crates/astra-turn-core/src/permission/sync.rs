@@ -385,13 +385,7 @@ impl PermissionRequestHandler {
                         }
                     }
                 } else {
-                    // No callback: auto-approve for non-background, deny for background
-                    let ctx = self.sync_context.read().await;
-                    if ctx.inherited.is_background {
-                        PermissionResponse::deny("no permission handler configured")
-                    } else {
-                        PermissionResponse::approve()
-                    }
+                    PermissionResponse::deny("no permission handler configured")
                 }
             }
         }
@@ -571,6 +565,42 @@ mod handler_tests {
         assert_eq!(
             response.reason.as_deref(),
             Some("bash still needs approval")
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_prompt_without_callback_fails_closed_for_foreground_agent() {
+        let ctx = PermissionSyncContext::root(PermissionMode::Prompt);
+        let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)));
+
+        let request = PermissionRequest::new("write_file", serde_json::json!({"path": "out.txt"}));
+        let response = handler.handle_request(&request).await;
+
+        assert!(!response.approved);
+        assert!(
+            response
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no permission handler configured")),
+            "missing callback should fail closed with an actionable reason, got {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_accept_edits_without_callback_fails_closed_for_mutation() {
+        let ctx = PermissionSyncContext::root(PermissionMode::AcceptEdits);
+        let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)));
+
+        let request = PermissionRequest::new("bash", serde_json::json!({"command": "npm test"}));
+        let response = handler.handle_request(&request).await;
+
+        assert!(!response.approved);
+        assert!(
+            response
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no permission handler configured")),
+            "missing callback should fail closed with an actionable reason, got {response:?}"
         );
     }
 
