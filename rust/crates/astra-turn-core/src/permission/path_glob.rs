@@ -13,8 +13,8 @@
 //!
 //! 1. The permission rule grammar is small — a few hundred globs at
 //!    most across user + project files. Performance isn't the issue.
-//! 2. We need *exact* compatibility with the v2 rule grammar's
-//!    quoting rules, so a hand-rolled matcher avoids the
+//! 2. We need *exact* compatibility with the permission rule
+//!    grammar's quoting rules, so a hand-rolled matcher avoids the
 //!    impedance-mismatch of "what does globset escape vs what does
 //!    permission_rule_grammar escape".
 //! 3. The glob alphabet here is intentionally a subset of gitignore;

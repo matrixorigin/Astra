@@ -649,10 +649,10 @@ pub struct ToolSelectionConfig {
 
     /// Mid-loop guard: number of consecutive single-tool rounds tolerated
     /// before the runtime injects a parallel-batching corrective. 0 = use
-    /// default (5 — one above the prompt-layer nudge at streak 4 so the
-    /// soft→hard cascade is preserved). Lower values intervene more
-    /// aggressively; higher values give the model more rope before
-    /// correction.
+    /// default (8 — two above the prompt-layer nudge at streak 6 so the
+    /// model has room to self-correct before hard intervention). Lower values
+    /// intervene more aggressively; higher values give the model more room
+    /// before correction.
     #[serde(default)]
     pub parallel_batching_force_streak: u32,
 
@@ -954,11 +954,11 @@ impl ToolSelectionConfig {
 
     /// Resolved parallel-batching force streak threshold.
     ///
-    /// Default = [`MIN_PARALLEL_BATCHING_FORCE_STREAK`] (currently
-    /// `PARALLEL_BATCHING_NUDGE_THRESHOLD + 1`: the nudge fires at streak 4;
-    /// the force is one round later so the model gets exactly one chance to
-    /// self-correct before we inject a hard `user`-role corrective).
-    /// Floor must stay strictly above `PARALLEL_BATCHING_NUDGE_THRESHOLD` (=4
+    /// Default = [`DEFAULT_PARALLEL_BATCHING_FORCE_STREAK`] (currently
+    /// 8). The minimum remains [`MIN_PARALLEL_BATCHING_FORCE_STREAK`]
+    /// (`PARALLEL_BATCHING_NUDGE_THRESHOLD + 1`) so explicit low overrides
+    /// cannot invert the soft→hard cascade.
+    /// Floor must stay strictly above `PARALLEL_BATCHING_NUDGE_THRESHOLD` (=6
     /// in `astra_runtime::prompts::system`) so the soft→hard cascade is
     /// preserved even when a user explicitly sets a small override; otherwise
     /// the runtime hard corrective fires before the prompt-layer ever nudges.
@@ -1025,11 +1025,16 @@ fn resolve_threshold_with_cap(value: u32, default: u32, floor: u32, cap: u32) ->
 }
 
 /// Minimum admitted value for `parallel_batching_force_streak` (global and
-/// per-model). Mirrors `PARALLEL_BATCHING_NUDGE_THRESHOLD` (=4) in the
+/// per-model). Mirrors `PARALLEL_BATCHING_NUDGE_THRESHOLD` (=6) in the
 /// runtime: the hard corrective MUST fire strictly later than the prompt
-/// nudge, so the floor is `nudge + 1 = 5`. Both `effective_*` and
+/// nudge, so the floor is `nudge + 1 = 7`. Both `effective_*` and
 /// `apply_profile` use this constant — they MUST stay in lockstep.
-pub const MIN_PARALLEL_BATCHING_FORCE_STREAK: u32 = 5;
+pub const MIN_PARALLEL_BATCHING_FORCE_STREAK: u32 = 7;
+/// Default value for `parallel_batching_force_streak`.
+///
+/// Kept one round above the minimum so the normal path is relaxed while still
+/// allowing explicit low overrides to clamp at the safe floor.
+pub const DEFAULT_PARALLEL_BATCHING_FORCE_STREAK: u32 = 8;
 /// Upper bound for `parallel_batching_force_streak` to keep the hard
 /// corrective reachable even under pathological user overrides.
 pub const MAX_PARALLEL_BATCHING_FORCE_STREAK: u32 = 50;
@@ -1037,7 +1042,7 @@ pub const MAX_PARALLEL_BATCHING_FORCE_STREAK: u32 = 50;
 fn resolve_parallel_batching_force_streak(value: u32) -> u32 {
     resolve_threshold_with_cap(
         value,
-        MIN_PARALLEL_BATCHING_FORCE_STREAK,
+        DEFAULT_PARALLEL_BATCHING_FORCE_STREAK,
         MIN_PARALLEL_BATCHING_FORCE_STREAK,
         MAX_PARALLEL_BATCHING_FORCE_STREAK,
     )
@@ -2790,12 +2795,12 @@ mod tests {
 
     #[test]
     fn parallel_batching_force_streak_default_and_floor() {
-        // 0 → default 5 (must stay above PARALLEL_BATCHING_NUDGE_THRESHOLD=4
-        // so the prompt-side nudge fires before the runtime force corrective).
+        // 0 → relaxed default. The floor remains lower than the default, but
+        // still above the runtime prompt-side nudge threshold.
         let cfg = ToolSelectionConfig::default();
         assert_eq!(
             cfg.effective_parallel_batching_force_streak(),
-            MIN_PARALLEL_BATCHING_FORCE_STREAK
+            DEFAULT_PARALLEL_BATCHING_FORCE_STREAK
         );
         // explicit override respected
         let cfg = ToolSelectionConfig {
@@ -2812,7 +2817,7 @@ mod tests {
             MAX_PARALLEL_BATCHING_FORCE_STREAK
         );
         // pathological override 1 floors to MIN_PARALLEL_BATCHING_FORCE_STREAK
-        // (5 — strictly above PARALLEL_BATCHING_NUDGE_THRESHOLD=4 to preserve
+        // (strictly above PARALLEL_BATCHING_NUDGE_THRESHOLD=6 to preserve
         // the soft→hard cascade).
         let cfg = ToolSelectionConfig {
             parallel_batching_force_streak: 1,
@@ -2822,8 +2827,8 @@ mod tests {
             cfg.effective_parallel_batching_force_streak(),
             MIN_PARALLEL_BATCHING_FORCE_STREAK
         );
-        // any value at or below the nudge threshold (4) is clamped up
-        for low in 2..=4 {
+        // any value at or below the runtime nudge threshold (6) is clamped up
+        for low in 2..=6 {
             let cfg = ToolSelectionConfig {
                 parallel_batching_force_streak: low,
                 ..Default::default()
@@ -2851,9 +2856,9 @@ mod tests {
         );
 
         // Mid-range pathological overrides must also clamp — a profile that
-        // sets force=4 would let the hard corrective fire on the same round
-        // the prompt-layer first nudges, breaking the cascade.
-        for low in 2..=4 {
+        // sets force at/below the nudge threshold would let the hard corrective
+        // fire on the same round the prompt-layer first nudges.
+        for low in 2..=6 {
             let mut cfg = ToolSelectionConfig::default();
             cfg.model_profiles.push(ModelPolicyProfile {
                 model_match: "flash".to_string(),

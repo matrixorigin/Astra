@@ -35,7 +35,7 @@ use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
 use serde_json::{Value, json};
 
 use super::effects::ChatTurnPrepLineGuard;
-use super::permission_manager::{PermissionManager, PermissionMode};
+use super::permission_manager::PermissionManager;
 use crate::cli::chat_stream::turn_policy_from_payload_edge_tools;
 use crate::cli::stream::stream_render::{EdgeSseContext, RenderPolicy, consume_turn_sse};
 use crate::edge_tools;
@@ -236,6 +236,16 @@ impl AgenticLoopHost for SubRunHost {
         let tool_surface = astra_runtime::tool_registry::surface::ToolSurface::from_runtime_config(
             &self.all_schemas,
         );
+        let activatable_tool_names: std::collections::HashSet<String> = tool_surface
+            .deferred()
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        let activatable_for_wire: Vec<String> = {
+            let mut names: Vec<String> = activatable_tool_names.iter().cloned().collect();
+            names.sort();
+            names
+        };
         if let Some(deferred_tools_text) = tool_surface.deferred_block_text(effective_model) {
             let deferred_tools_context_window =
                 prompts::budget_for_model(effective_model).model_limit;
@@ -245,7 +255,9 @@ impl AgenticLoopHost for SubRunHost {
                     astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT:
                         deferred_tools_text,
                     astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW:
-                        deferred_tools_context_window
+                        deferred_tools_context_window,
+                    astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES:
+                        activatable_for_wire,
                 }),
             );
         }
@@ -253,6 +265,15 @@ impl AgenticLoopHost for SubRunHost {
             self.inherited_prefix.as_ref(),
             tool_surface.pinned_schemas(),
         );
+        self.executor
+            .set_current_visible_tool_schemas(&schemas_to_use);
+        // Mirror the deferred manifest onto the executor so a deferred-tool
+        // call inside the sub-run gets the activation hint instead of the
+        // bare "Unknown tool" denial. Without this, the parent's executor
+        // (cloned via `Arc`) would still hold the parent turn's set, which
+        // can drift from this sub-run's surface.
+        self.executor
+            .set_current_activatable_tool_names(activatable_tool_names);
         astra_runtime::turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools(
             &mut payload,
             schemas_to_use,
@@ -447,15 +468,15 @@ impl AgenticLoopHost for SubRunHost {
 /// Creates a fresh [`SubRunHost`] and [`AgenticLoopState`] for each sub-run,
 /// then runs [`run_agentic_loop_with_host`] to completion.
 ///
-/// Inherits the parent session's full [`PermissionMode`] (Auto/Prompt/Deny)
-/// so that fork sub-runs enforce the same approval policy as the parent.
+/// Inherits the parent session's full permission envelope so that fork
+/// sub-runs enforce the same mode, rules, and session approvals as the parent.
 pub(crate) struct CliSkillSubRunExecutor {
     api: astra_thin_client::ThinClient,
     token: String,
     default_model: Option<String>,
     project_root: PathBuf,
-    /// Full permission mode inherited from the parent session.
-    permission_mode: PermissionMode,
+    /// Full permission envelope inherited from the parent session.
+    inherited_permissions: astra_runtime::orchestration::InheritedPermissions,
     /// Parent cancellation token — propagated so Ctrl+C / stop interrupts subruns.
     cancel_token: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
     /// Skill resolver inherited from parent — enables nested skill invocations.
@@ -472,15 +493,16 @@ impl CliSkillSubRunExecutor {
         token: String,
         default_model: Option<String>,
         project_root: PathBuf,
-        permission_mode: PermissionMode,
+        mut inherited_permissions: astra_runtime::orchestration::InheritedPermissions,
         cancel_token: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
     ) -> Self {
+        inherited_permissions.is_background = true;
         Self {
             api,
             token,
             default_model,
             project_root,
-            permission_mode,
+            inherited_permissions,
             cancel_token,
             skill_resolver: None,
             skill_search: SkillSearchSettings::default(),
@@ -548,11 +570,11 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         // Issue #326 P5b: skill subruns are headless — never read
         // project allow rules. Deny rules and the user-level rule
         // file are still honoured (apply_load_policy(HeadlessSafe)).
-        let perm_manager = PermissionManager::with_load_policy(
-            self.permission_mode,
+        let perm_manager = PermissionManager::with_inherited(
             &self.project_root,
-            &super::permission_manager::PermissionLoadPolicy::HeadlessSafe,
+            self.inherited_permissions.clone(),
         );
+        let permission_context = perm_manager.runtime_permission_handle();
 
         let executor = edge_tools::ToolExecutor::new(&self.project_root)
             .with_cloud(self.api.api_origin(), &self.token);
@@ -724,6 +746,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             api_token: self.token.clone(),
             delegation_engine: None,
             delegations_this_turn: 0,
+            delegation_chain: Vec::new(),
+            self_agent_id: "skill_subrun".to_string(),
             project_context: None,
             checkpoint_gate: None,
             last_llm_context_manifest_trace: None,
@@ -743,7 +767,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             max_cumulative_tokens: SUBRUN_MAX_CUMULATIVE_TOKENS,
             thinking,
             recent_file_reads: Vec::new(),
-            permission_context: None,
+            permission_context: Some(permission_context),
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
@@ -970,12 +994,14 @@ mod tests {
 
     #[tokio::test]
     async fn cli_skill_subrun_rejects_when_recursion_depth_limit_reached() {
+        let inherited_permissions =
+            astra_runtime::orchestration::InheritedPermissions::new(PermissionMode::Deny);
         let executor = CliSkillSubRunExecutor::new(
             astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
             "token".to_string(),
             Some("test-model".to_string()),
             PathBuf::from("."),
-            PermissionMode::Deny,
+            inherited_permissions,
             None,
         );
         let allowed_tools: Vec<String> = Vec::new();
@@ -996,6 +1022,26 @@ mod tests {
             .unwrap_err();
 
         assert!(err.contains("recursion depth 3 reached maximum 3"));
+    }
+
+    #[test]
+    fn cli_skill_subrun_constructor_marks_permissions_background() {
+        let inherited_permissions =
+            astra_runtime::orchestration::InheritedPermissions::new(PermissionMode::Auto);
+        let executor = CliSkillSubRunExecutor::new(
+            astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
+            "token".to_string(),
+            None,
+            PathBuf::from("."),
+            inherited_permissions,
+            None,
+        );
+
+        assert_eq!(
+            executor.inherited_permissions.mode,
+            astra_runtime::orchestration::PermissionMode::Auto
+        );
+        assert!(executor.inherited_permissions.is_background);
     }
 
     // ── Phase-R10 adversarial contract pins (CLI-side constants) ────────

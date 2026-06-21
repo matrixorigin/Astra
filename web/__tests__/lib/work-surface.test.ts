@@ -968,51 +968,51 @@ describe('work surface reducer', () => {
   it('projects unavailable workspace executor as an execution-boundary block', () => {
     const state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
       type: 'tool_transport_failed',
-      call_id: 'call-hosted',
+      call_id: 'call-cloud',
       tool: 'bash',
       success: false,
       error:
-        "Error: workspace 'Hosted checkout' (git_checkout) is not routed to an available executor transport. No server fallback was attempted.",
+        "Error: workspace 'Cloud checkout' (git_checkout) is not routed to an available executor transport. No server fallback was attempted.",
       error_kind: 'workspace_executor_unavailable',
       reason: 'workspace_executor_unavailable',
       blocked: true,
       workspace: {
         kind: 'git_checkout',
-        display_name: 'Hosted checkout',
+        display_name: 'Cloud checkout',
         cwd: '/checkout/repo',
         authority: 'read_only',
         fallback_policy: 'disabled',
       },
       executor: {
-        kind: 'hosted_runner',
-        executor_id: 'runner-1',
-        display_name: 'Hosted runner',
-        transport: 'runner_rpc',
+        kind: 'orchestrator_managed',
+        executor_id: 'orchestrator-managed',
+        display_name: 'Orchestrator-managed executor',
+        transport: 'sandbox_resident_agent',
         status: 'degraded',
       },
-      transport: 'runner_rpc',
+      transport: 'sandbox_resident_agent',
       fallback_policy: 'disabled',
     });
 
     expect(state.runStatus).toBe('blocked');
     expect(state.tools[0]).toMatchObject({
-      callId: 'call-hosted',
+      callId: 'call-cloud',
       tool: 'bash',
       status: 'error',
       errorKind: 'workspace_executor_unavailable',
       blocked: true,
       workspace: { kind: 'git_checkout', cwd: '/checkout/repo' },
-      executor: { kind: 'hosted_runner', status: 'degraded' },
-      transport: 'runner_rpc',
+      executor: { kind: 'orchestrator_managed', status: 'degraded' },
+      transport: 'sandbox_resident_agent',
       fallbackPolicy: 'disabled',
     });
     expect(state.blocked).toMatchObject({
       reason: 'workspace_executor_unavailable',
       tool: 'bash',
-      callId: 'call-hosted',
+      callId: 'call-cloud',
       workspace: { kind: 'git_checkout', cwd: '/checkout/repo' },
-      executor: { kind: 'hosted_runner', status: 'degraded' },
-      transport: 'runner_rpc',
+      executor: { kind: 'orchestrator_managed', status: 'degraded' },
+      transport: 'sandbox_resident_agent',
       fallbackPolicy: 'disabled',
     });
   });

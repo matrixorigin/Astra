@@ -475,10 +475,46 @@ mod edge_callback_insert_tests {
     //! point is to lock in the "at-most-once" contract broken by the
     //! previous `contains_key` short-circuit.
 
-    use super::{LedgerInsertError, insert_approval_ledger_entry, insert_ledger_entry};
+    use super::{
+        EdgeRegisterRequest, LedgerInsertError, insert_approval_ledger_entry, insert_ledger_entry,
+    };
     use astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn edge_register_request_accepts_runtime_environment_advertisement() {
+        let request: EdgeRegisterRequest = serde_json::from_value(json!({
+            "edge_agent_id": "edge-a",
+            "hostname": "host-a",
+            "worktree_path": "/workspace/project",
+            "capabilities": {
+                "schema_version": 1,
+                "binding": {
+                    "workspace": {
+                        "kind": "edge_workspace",
+                        "cwd": "/workspace/project",
+                        "authority": "read_write"
+                    },
+                    "executor": {
+                        "kind": "edge_agent",
+                        "executor_id": "edge-a"
+                    },
+                    "runtime": {
+                        "provider": "host_process"
+                    }
+                }
+            }
+        }))
+        .expect("edge register request");
+
+        assert_eq!(request.edge_agent_id, "edge-a");
+        assert_eq!(request.worktree_path.as_deref(), Some("/workspace/project"));
+        assert_eq!(
+            request.capabilities.as_ref().unwrap()["binding"]["runtime"]["provider"],
+            "host_process"
+        );
+    }
 
     #[test]
     fn duplicate_tool_insert_different_payload_is_conflict() {
@@ -629,6 +665,7 @@ mod edge_callback_insert_tests {
             output: Some("actual".to_string()),
             duration_ms: Some(1),
             result_hash: Some("wrong".to_string()),
+            tool_result_fields: None,
         };
         assert_eq!(
             super::validate_tool_result_request(&body),

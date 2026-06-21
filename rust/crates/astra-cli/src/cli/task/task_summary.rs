@@ -155,6 +155,7 @@ mod tests {
             status: status.into(),
             depends_on: Vec::new(),
             owner: None,
+            reason: None,
         }
     }
 

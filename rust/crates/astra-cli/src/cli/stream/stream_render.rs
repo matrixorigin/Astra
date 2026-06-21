@@ -1,6 +1,7 @@
 use crate::cli::stream::streaming_md;
 use crate::cli::tool_result_status::{
-    tool_result_status_icon, tool_result_status_is_failure, tool_result_status_is_success,
+    tool_result_status_icon, tool_result_status_is_failure, tool_result_status_is_skipped,
+    tool_result_status_is_success,
 };
 use crate::cli::{chat_stream, session::session_runtime, terminal_region, theme};
 use astra_runtime::turn::tool_side_effects::tool_call_invalidates_read_cache;
@@ -9,7 +10,6 @@ use astra_tools::git_gix::{git_worktree_is_clean, head_short};
 use astra_turn_core::chat_turn_sse_dispatch::{
     ChatTurnSseAccum, EdgeApprovalRequest, SseRenderEffect, dispatch_chat_turn_sse_event_block,
 };
-use astra_turn_core::headless_tool_assembly::READ_ONLY_TOOLS;
 use astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity;
 use astra_turn_core::sse_edge_stderr_lines::{
     edge_sse_post_approval_fail_line, edge_sse_post_tool_result_fail_line,
@@ -64,7 +64,11 @@ fn agent_fanout_slot_from_args(args: &Value) -> Option<AgentFanoutSlotIdentity> 
     let group_id = args.get("fanout_group_id")?.as_str()?;
     let target_count = args.get("fanout_target_count")?.as_u64()? as usize;
     let slot_index = args.get("fanout_slot_index")?.as_u64()? as usize;
-    AgentFanoutSlotIdentity::new(group_id, target_count, slot_index).ok()
+    let slot_id = args
+        .get("fanout_slot_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    AgentFanoutSlotIdentity::new(group_id, target_count, slot_index, slot_id).ok()
 }
 
 fn agent_fanout_title_from_args(args: &Value) -> Option<String> {
@@ -98,7 +102,7 @@ fn tool_output_event_text(tool: &str, output: &str) -> String {
 // CLI formatting utilities
 use crate::cli::cli_config::cli_formatting::{
     colorize_diff_summary, compact_unified_diff_preview, extract_cli_diff_block, format_byte_size,
-    format_duration_suffix, github_repo_display, shorten_path, truncate_line,
+    format_duration_suffix, shorten_path, truncate_line,
 };
 
 // Effects module types
@@ -401,11 +405,11 @@ fn persist_scoped_allow_rule(
         };
         astra_core::agent_warn!(
             "permission",
-            "Always allow for {remember_preview} is session-only; failed to save rule {rule} to {target_label}: {err}"
+            "Don't ask again for {remember_preview} is session-only; failed to save rule {rule} to {target_label}: {err}"
         );
         if let Some(tx) = save_warning_tx {
             let _ = tx.send(chat_stream::StreamEvent::StatusLine(format!(
-                "Failed to save Always allow for {remember_preview} to {target_label}: {err}"
+                "Failed to save don't-ask-again rule for {remember_preview} to {target_label}: {err}"
             )));
         }
     }
@@ -510,7 +514,7 @@ impl RenderPolicy {
 ///
 /// Mirrors the headless round's `InMemoryIdempotencyCache` + `call_counts`, but
 /// scoped to edge-path tool calls (`tool_request` SSE events).  Cacheable tools
-/// (read_file, grep, git_log, …) get their output stored and replayed on repeat.
+/// (read_file, grep, git(action=log), …) get their output stored and replayed on repeat.
 /// All tools get a hard call-count limit to prevent runaway repetition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum EdgeToolCacheValidation {
@@ -555,11 +559,61 @@ impl EdgeToolCache {
 
     fn reset_read_only_after_workspace_mutation(&mut self) {
         self.output_cache.clear();
-        self.call_counts.retain(|sig, _| {
-            let tool_name = sig.split_once(':').map_or(sig.as_str(), |(name, _)| name);
-            !READ_ONLY_TOOLS.contains(&tool_name)
-        });
+        self.call_counts
+            .retain(|sig, _| !dedup_signature_is_cacheable_read(sig));
     }
+}
+
+fn edge_tool_is_cacheable_read(tool: &str, args: &Value) -> bool {
+    if matches!(
+        tool,
+        "bash"
+            | "powershell"
+            | "web_search"
+            | "web_fetch"
+            | "memory"
+            | "task"
+            | "agent"
+            | "mo_query"
+            | "mo_snapshot"
+            | "mo_branch"
+    ) {
+        return false;
+    }
+
+    astra_turn_core::tool::categories::classify(tool, Some(args))
+        .category
+        .is_read_only()
+}
+
+fn dedup_signature_is_cacheable_read(signature: &str) -> bool {
+    let Some((tool, args_json)) = signature.split_once(':') else {
+        return false;
+    };
+    serde_json::from_str::<Value>(args_json)
+        .ok()
+        .is_some_and(|args| edge_tool_is_cacheable_read(tool, &args))
+}
+
+fn git_action_supports_batch_transaction_boundary(args: &Value) -> bool {
+    matches!(
+        args.get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("status"),
+        "status"
+            | "diff"
+            | "log"
+            | "show"
+            | "blame"
+            | "file_history"
+            | "log_search"
+            | "contributors"
+            | "commit"
+            | "stash"
+            | "checkout_file"
+            | "worktree"
+            | "revert_commit"
+    )
 }
 
 fn path_mtime_ms(path: &Path) -> u128 {
@@ -1124,8 +1178,7 @@ impl<'a> CliSseStreamHost<'a> {
                 (timestamp_ms > 0)
                     .then_some(EdgeToolCacheValidation::DirectoryMtime { path, timestamp_ms })
             }
-            "git_status" | "git_diff" | "git_log" | "git_show" | "git_blame"
-            | "git_file_history" | "git_contributors" | "git_log_search" => {
+            "git" if edge_tool_is_cacheable_read(tool, args) => {
                 if !git_worktree_is_clean(&self.executor.project_root).unwrap_or(false) {
                     return None;
                 }
@@ -1186,6 +1239,24 @@ impl<'a> CliSseStreamHost<'a> {
         }
     }
 
+    fn edge_runtime_environment_advertisement(&self) -> Value {
+        astra_thin_client::edge_runtime_environment_capabilities(
+            &self.edge_agent_id,
+            self.executor.project_root.to_string_lossy().as_ref(),
+        )
+    }
+
+    fn edge_tool_result_fields_with_runtime(
+        &self,
+        fields: Option<Map<String, Value>>,
+    ) -> Map<String, Value> {
+        let mut fields = fields.unwrap_or_default();
+        fields
+            .entry("runtime_environment_advertisement".to_string())
+            .or_insert_with(|| self.edge_runtime_environment_advertisement());
+        fields
+    }
+
     /// Build an `EdgeToolExecResult` and post it to the cloud API.
     /// Used for cache-hit and dedup-limit early returns inside `execute_tool`.
     async fn finish_edge_tool(
@@ -1212,29 +1283,228 @@ impl<'a> CliSseStreamHost<'a> {
         status: String,
         duration_ms: u64,
     ) -> EdgeToolExecResult {
+        if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
+            let output_summary = self
+                .render
+                .format_output_summary(tool, &output, &status)
+                .map(|summary| summary.text)
+                .unwrap_or_default();
+            let tool_description = self.render.format_tool_description(tool, args);
+            if tool == "agent"
+                && let Some(action) = agent_control_action(args)
+            {
+                self.emit_stream_event(chat_stream::StreamEvent::AgentControlCompleted {
+                    action: action.to_string(),
+                    label: agent_control_label(args, tool_description.clone()),
+                    status: status.clone(),
+                    duration_ms,
+                    output: Some(tool_output_event_text(tool, &output)),
+                    tool_use_id: request_id.to_string(),
+                    agent_id: agent_id_from_output(&output).or_else(|| agent_id_from_args(args)),
+                });
+            }
+            self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
+                name: tool.to_string(),
+                description: tool_description,
+                status: status.clone(),
+                duration_ms,
+                output_summary: if output_summary.is_empty() {
+                    None
+                } else {
+                    Some(output_summary)
+                },
+                output: Some(tool_output_event_text(tool, &output)),
+                tool_use_id: request_id.to_string(),
+                parent_tool_use_id: None,
+            });
+        }
+
+        let tool_result_fields = self.edge_tool_result_fields_with_runtime(tool_result_fields);
         let result = EdgeToolExecResult {
             request_id: request_id.to_string(),
             tool: tool.to_string(),
             args: args.clone(),
             output: output.clone(),
-            tool_result_fields,
+            tool_result_fields: Some(tool_result_fields.clone()),
             status: status.clone(),
             duration_ms,
         };
         self.edge_tool_round.push(result.clone());
 
-        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+        let body = astra_thin_client::ToolResultRequest::new_with_hash_and_fields(
             request_id.to_string(),
             Some(self.edge_agent_id.clone()),
             status,
             output,
             duration_ms,
+            Some(tool_result_fields),
         );
         // ── Reconnection dedup: only record when server acked the result ──
         if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
             crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
         }
         result
+    }
+
+    async fn preflight_explicit_path_sandbox_expansion(
+        &mut self,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> Result<bool, String> {
+        let mut expanded = false;
+        for target in crate::sandbox_retry::explicit_file_tool_path_targets(tool, args) {
+            expanded |= self
+                .preflight_explicit_path_sandbox_expansion_target(&target)
+                .await?;
+        }
+        Ok(expanded)
+    }
+
+    async fn preflight_explicit_path_sandbox_expansion_target(
+        &mut self,
+        target: &crate::sandbox_retry::ExplicitPathPreflightTarget,
+    ) -> Result<bool, String> {
+        let tool = target.tool.as_str();
+        let args = &target.args;
+        let Err(resolve_error) = self.executor.resolve_checked(&target.path) else {
+            return Ok(false);
+        };
+        let Some(sandbox_msg) = crate::sandbox_retry::sandbox_denied_message(&resolve_error)
+            .map(|message| message.into_owned())
+        else {
+            return Ok(false);
+        };
+        let Some(expand_dir) =
+            crate::sandbox_retry::sandbox_expand_dir_from_denial(args, &sandbox_msg)
+        else {
+            return Err(crate::sandbox_retry::sandbox_retry_no_expand_dir_output(
+                tool,
+                &sandbox_msg,
+            ));
+        };
+
+        self.resolve_sandbox_expansion_approval(tool, &sandbox_msg, &expand_dir)
+            .await?;
+        if let Err(e) = self.executor.expand_sandbox_path(expand_dir) {
+            astra_core::agent_warn!("sandbox", "post-approval expansion rejected: {e}");
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    async fn resolve_sandbox_expansion_approval(
+        &mut self,
+        tool: &str,
+        sandbox_msg: &str,
+        expand_dir: &Path,
+    ) -> Result<(), String> {
+        let sandbox_tool_key = format!("sandbox_expand:{tool}");
+        let guard_args = serde_json::json!({"reason": sandbox_msg});
+        let decision = {
+            let Some(pm) = self.perm_manager.as_mut() else {
+                return Err(format!(
+                    "Error: {sandbox_msg} (cannot ask to expand sandbox for {tool}: no permission manager configured)"
+                ));
+            };
+            crate::tool_safety_guard::ToolSafetyGuard::check_request(
+                Some(&mut **pm),
+                &sandbox_tool_key,
+                &guard_args,
+            )
+        };
+
+        match decision {
+            crate::cli::permission_manager::GateOutcome::Allow => Ok(()),
+            crate::cli::permission_manager::GateOutcome::Deny(reason) => Err(format!(
+                "Error: {sandbox_msg} (sandbox expansion for {tool} denied: {reason})"
+            )),
+            crate::cli::permission_manager::GateOutcome::NeedApproval {
+                tool: approval_tool,
+                header,
+                detail,
+                reason,
+            } => {
+                use crate::cli::chat_stream::ApprovalResponse;
+
+                let Some(tx) = &self.approval_request_tx else {
+                    astra_core::agent_warn!(
+                        "permission",
+                        "Denied sandbox expansion {sandbox_tool_key}: approval prompt unavailable. reason={reason}"
+                    );
+                    if let Some(pm) = self.perm_manager.as_mut() {
+                        pm.record_approval(&approval_tool, Some(&guard_args), false);
+                    }
+                    let reason = if self.render_policy.is_silent() {
+                        "approval required for an external path, but this run cannot ask for approvals in the current mode"
+                    } else {
+                        "approval required for an external path, but no approval prompt is available in this interface"
+                    };
+                    return Err(format!(
+                        "Error: {sandbox_msg} (sandbox expansion for {tool} denied: {reason})"
+                    ));
+                };
+
+                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(chat_stream::ApprovalRequest::bare(
+                    approval_tool.clone(),
+                    format!("🔒 {header}"),
+                    detail,
+                    reason,
+                    guard_args.clone(),
+                    resp_tx,
+                ));
+                let response = if let Some(token) = self.cancel_token {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => ApprovalResponse::Deny,
+                        r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
+                    }
+                } else {
+                    resp_rx.await.unwrap_or(ApprovalResponse::Deny)
+                };
+
+                if response.is_approved() {
+                    let save_warning_tx = self.stream_event_tx.clone();
+                    if let Some(pm) = self.perm_manager.as_mut() {
+                        let workspace_untrusted = !pm.project_allow_rules_active();
+                        let always_scope =
+                            approval_default_always_scope(&approval_scope_context_for_tool(
+                                &approval_tool,
+                                &guard_args,
+                                false,
+                                workspace_untrusted,
+                            ));
+                        let selected_scope = response.always_scope(always_scope);
+                        apply_approval_memory_action(
+                            pm,
+                            approval_memory_action(&response, always_scope, true),
+                            &approval_tool,
+                            &guard_args,
+                            response.match_target(),
+                            save_warning_tx.as_ref(),
+                        );
+                        if matches!(
+                            selected_scope,
+                            Some(
+                                astra_turn_core::permission::scope::AllowScope::Project
+                                    | astra_turn_core::permission::scope::AllowScope::RestOfSession
+                                    | astra_turn_core::permission::scope::AllowScope::User
+                            )
+                        ) {
+                            pm.trust_sandbox_root(expand_dir.to_path_buf());
+                        }
+                    }
+                    Ok(())
+                } else {
+                    if let Some(pm) = self.perm_manager.as_mut() {
+                        pm.record_approval(&approval_tool, Some(&guard_args), false);
+                    }
+                    Err(format!(
+                        "Error: {sandbox_msg} (sandbox expansion for {tool} denied: user denied)"
+                    ))
+                }
+            }
+        }
     }
 }
 
@@ -1362,6 +1632,9 @@ impl<'a> CliSseStreamHost<'a> {
                 .map(str::trim)
                 .is_some_and(astra_turn_core::cloud_approval_policy::bash_command_is_read_only);
         }
+        if tool == "git" {
+            return git_action_supports_batch_transaction_boundary(args);
+        }
         is_tool_concurrency_safe(tool, Some(args))
             || matches!(
                 tool,
@@ -1370,9 +1643,6 @@ impl<'a> CliSseStreamHost<'a> {
                     | "str_replace"
                     | "multi_edit"
                     | "rename_symbol"
-                    | "git_commit"
-                    | "git_checkout_file"
-                    | "git_stash"
                     | "notebook_edit"
                     | "mo_query"
             )
@@ -1739,7 +2009,7 @@ impl<'a> CliSseStreamHost<'a> {
         Self::bash_boundary_violation(
             tool,
             args,
-            "Error: non-read-only bash commands do not participate in rollback_on_failure batch transactions. Use structured mutation tools (write_file, git_*, rollback-aware editors), use run_build_test when available for build/test work, or keep bash read-only inside this transaction.",
+            "Error: non-read-only bash commands do not participate in rollback_on_failure batch transactions. Use structured mutation tools (write_file, git(action=...), rollback-aware editors), run project-native build/test commands through visible tools after this transaction, or keep bash read-only inside this transaction.",
         )
     }
 
@@ -1789,23 +2059,25 @@ impl<'a> CliSseStreamHost<'a> {
             });
         }
 
+        let tool_result_fields = self.edge_tool_result_fields_with_runtime(tool_result_fields);
         let result = EdgeToolExecResult {
             request_id: req.request_id.clone(),
             tool: req.tool.clone(),
             args: req.args.clone(),
             output: output.clone(),
-            tool_result_fields,
+            tool_result_fields: Some(tool_result_fields.clone()),
             status: status.to_string(),
             duration_ms,
         };
         self.edge_tool_round.push(result.clone());
 
-        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+        let body = astra_thin_client::ToolResultRequest::new_with_hash_and_fields(
             req.request_id.clone(),
             Some(self.edge_agent_id.clone()),
             status.to_string(),
             output,
             duration_ms,
+            Some(tool_result_fields),
         );
         // ── Reconnection dedup: only record when server acked the result ──
         if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
@@ -2670,7 +2942,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             // Hard cap exceeded — return a stub telling the LLM to stop.
             let body = if let Some((cached_out, _)) = self.validated_cache_entry(&dedup_sig) {
                 format!(
-                    "⛔ Cached repeat (call #{} for identical args, limit: {}). \
+                    "Cached repeat skipped (call #{} for identical args, limit: {}). \
                      The result is already in this conversation from an earlier call. \
                      Do NOT call this tool again with the same arguments.\n\n{}",
                     call_count,
@@ -2679,12 +2951,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 )
             } else {
                 format!(
-                    "⛔ Duplicate call #{} (limit: {}). This tool has been called too many times \
-                     with the same arguments. Use the results from earlier calls instead.",
+                    "Duplicate call skipped (#{}; limit: {}). This tool has already been called \
+                     too many times with the same arguments. Use the results from earlier calls instead.",
                     call_count, max_calls,
                 )
             };
-            let status = "error";
+            let status = "skipped";
             if let Some(idx) = tool_idx {
                 self.render.tool_done(idx, tool, args, status, 0, &body);
             }
@@ -2694,7 +2966,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         }
 
         // Cache hit for read-only (cacheable) tools
-        if READ_ONLY_TOOLS.contains(&tool)
+        if edge_tool_is_cacheable_read(tool, args)
             && let Some((cached_output, cached_status)) = self.validated_cache_entry(&dedup_sig)
         {
             if let Some(idx) = tool_idx {
@@ -2713,7 +2985,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let cloud_approved = self.cloud_pre_approved.remove(request_id);
 
         let decision = if cloud_approved {
-            crate::cli::permission_manager::PermissionDecision::Allow
+            crate::cli::permission_manager::GateOutcome::Allow
         } else {
             match self.perm_manager.as_mut() {
                 Some(pm) => crate::tool_safety_guard::ToolSafetyGuard::check_request(
@@ -2726,14 +2998,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         };
         let mut denied_output = None;
         let mut allowed = match decision {
-            crate::cli::permission_manager::PermissionDecision::Allow => true,
-            crate::cli::permission_manager::PermissionDecision::Deny(reason) => {
+            crate::cli::permission_manager::GateOutcome::Allow => true,
+            crate::cli::permission_manager::GateOutcome::Deny(reason) => {
                 denied_output = Some(crate::cli::permission_manager::format_denied_message(
                     &reason,
                 ));
                 false
             }
-            crate::cli::permission_manager::PermissionDecision::NeedApproval {
+            crate::cli::permission_manager::GateOutcome::NeedApproval {
                 tool: t,
                 header,
                 detail,
@@ -2788,8 +3060,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     let always_scope = approval_default_always_scope(&scope_ctx);
                     // Show what Always will remember in product
                     // language. The persisted rule remains an internal
-                    // detail; the UI must not leak `Bash(...:*)` or
-                    // other permissions.json DSL.
+                    // detail; the UI must not leak permissions.json DSL.
                     if always_scope == astra_turn_core::permission::scope::AllowScope::Project {
                         // Include the package root when available so
                         // the user understands the memory boundary.
@@ -3041,8 +3312,17 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             denied_output = Some(error);
             allowed = false;
         }
+        if allowed
+            && let Err(error) = self
+                .preflight_explicit_path_sandbox_expansion(tool, args)
+                .await
+        {
+            denied_output = Some(error);
+            allowed = false;
+        }
         let start = std::time::Instant::now();
         let mut tool_result_fields = None;
+        let mut tool_execution_marked_error = false;
         let mut output = if allowed {
             if tool == astra_runtime::turn::skill_tool::SKILL_TOOL_NAME {
                 // Edge-path skill dedup: if the same skill was already invoked
@@ -3123,188 +3403,194 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 // If the sandbox denied the operation, prompt the user for
                 // authorization. On approval, temporarily expand the sandbox
                 // boundary and retry the tool.
-                if crate::sandbox_retry::is_sandbox_denied(&outcome.output) {
-                    if let Some(pm) = &mut self.perm_manager {
-                        let sandbox_msg =
-                            crate::sandbox_retry::sandbox_denied_message(&outcome.output)
-                                .unwrap_or("");
-                        let sandbox_tool_key = format!("sandbox_expand:{tool}");
-                        let guard_args = serde_json::json!({"reason": sandbox_msg});
-                        let decision = crate::tool_safety_guard::ToolSafetyGuard::check_request(
-                            Some(&mut **pm),
-                            &sandbox_tool_key,
-                            &guard_args,
-                        );
-                        let approved = match decision {
-                            crate::cli::permission_manager::PermissionDecision::Allow => true,
-                            crate::cli::permission_manager::PermissionDecision::Deny(_) => false,
-                            crate::cli::permission_manager::PermissionDecision::NeedApproval {
-                                header,
-                                detail,
-                                reason,
-                                ..
-                            } => {
-                                if let Some(tx) = &self.approval_request_tx {
-                                    use crate::cli::chat_stream::ApprovalResponse;
-                                    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                                    // `🔒 ` prefix visually marks sandbox-escape
-                                    // prompts; header/detail/reason otherwise
-                                    // come straight from the permission manager
-                                    // so we don't echo the same text thrice.
-                                    let _ = tx.send(chat_stream::ApprovalRequest::bare(
-                                        sandbox_tool_key.clone(),
-                                        format!("🔒 {header}"),
-                                        detail,
-                                        reason,
-                                        args.clone(),
-                                        resp_tx,
-                                    ));
-                                    let response = if let Some(token) = self.cancel_token {
-                                        tokio::select! {
-                                            biased;
-                                            _ = token.cancelled() => ApprovalResponse::Deny,
-                                            r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
+                if let Some(sandbox_msg) = normalize_sandbox_denied_outcome(&mut outcome) {
+                    if let Some(expand_dir) =
+                        crate::sandbox_retry::sandbox_expand_dir_from_denial(args, &sandbox_msg)
+                    {
+                        if let Some(pm) = &mut self.perm_manager {
+                            let sandbox_tool_key = format!("sandbox_expand:{tool}");
+                            let guard_args = serde_json::json!({"reason": sandbox_msg.clone()});
+                            let decision = crate::tool_safety_guard::ToolSafetyGuard::check_request(
+                                Some(&mut **pm),
+                                &sandbox_tool_key,
+                                &guard_args,
+                            );
+                            let approved = match decision {
+                                crate::cli::permission_manager::GateOutcome::Allow => true,
+                                crate::cli::permission_manager::GateOutcome::Deny(_) => false,
+                                crate::cli::permission_manager::GateOutcome::NeedApproval {
+                                    header,
+                                    detail,
+                                    reason,
+                                    ..
+                                } => {
+                                    if let Some(tx) = &self.approval_request_tx {
+                                        use crate::cli::chat_stream::ApprovalResponse;
+                                        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                                        // `🔒 ` prefix visually marks sandbox-escape
+                                        // prompts; header/detail/reason otherwise
+                                        // come straight from the permission manager
+                                        // so we don't echo the same text thrice.
+                                        let _ = tx.send(chat_stream::ApprovalRequest::bare(
+                                            sandbox_tool_key.clone(),
+                                            format!("🔒 {header}"),
+                                            detail,
+                                            reason,
+                                            args.clone(),
+                                            resp_tx,
+                                        ));
+                                        let response = if let Some(token) = self.cancel_token {
+                                            tokio::select! {
+                                                biased;
+                                                _ = token.cancelled() => ApprovalResponse::Deny,
+                                                r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
+                                            }
+                                        } else {
+                                            resp_rx.await.unwrap_or(ApprovalResponse::Deny)
+                                        };
+                                        let selected_scope = response.always_scope(
+                                            astra_turn_core::permission::scope::AllowScope::Project,
+                                        );
+                                        match selected_scope {
+                                            Some(astra_turn_core::permission::scope::AllowScope::Project) => {
+                                                // Persistent: writes a tool-level allow
+                                                // rule to settings for future sessions.
+                                                let rule = crate::cli::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
+                                                let remember_preview =
+                                                    astra_turn_core::permission::match_target::remember_preview(
+                                                        &sandbox_tool_key,
+                                                        &guard_args,
+                                                        "in this workspace",
+                                                    );
+                                                pm.add_allow_rule(&rule);
+                                                if let Some(err) = pm.take_last_save_error() {
+                                                    astra_core::agent_warn!(
+                                                        "permission",
+                                                        "Don't ask again for {remember_preview} is session-only; failed to save rule {rule}: {err}"
+                                                    );
+                                                    if let Some(tx) = &self.stream_event_tx {
+                                                        let _ = tx.send(chat_stream::StreamEvent::StatusLine(
+                                                            format!(
+                                                                "Failed to save don't-ask-again rule for {remember_preview}: {err}"
+                                                            ),
+                                                        ));
+                                                    }
+                                                }
+                                                pm.trust_sandbox_root_from_reason(&sandbox_msg);
+                                            }
+                                            Some(
+                                                astra_turn_core::permission::scope::AllowScope::RestOfSession,
+                                            ) => {
+                                                pm.trust_sandbox_root_from_reason(&sandbox_msg);
+                                            }
+                                            Some(
+                                                astra_turn_core::permission::scope::AllowScope::User,
+                                            ) => {
+                                                let rule = crate::cli::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
+                                                let remember_preview =
+                                                    astra_turn_core::permission::match_target::remember_preview(
+                                                        &sandbox_tool_key,
+                                                        &guard_args,
+                                                        "for this user",
+                                                    );
+                                                pm.add_user_allow_rule(&rule);
+                                                if let Some(err) = pm.take_last_save_error() {
+                                                    astra_core::agent_warn!(
+                                                        "permission",
+                                                        "Don't ask again for {remember_preview} is session-only; failed to save user rule {rule}: {err}"
+                                                    );
+                                                    if let Some(tx) = &self.stream_event_tx {
+                                                        let _ = tx.send(chat_stream::StreamEvent::StatusLine(
+                                                            format!(
+                                                                "Failed to save don't-ask-again rule for {remember_preview}: {err}"
+                                                            ),
+                                                        ));
+                                                    }
+                                                }
+                                                pm.trust_sandbox_root_from_reason(&sandbox_msg);
+                                            }
+                                            Some(
+                                                astra_turn_core::permission::scope::AllowScope::OnceThisCall
+                                                | astra_turn_core::permission::scope::AllowScope::RestOfTurn,
+                                            )
+                                            | None => {}
                                         }
+                                        if matches!(
+                                            selected_scope,
+                                            Some(
+                                                astra_turn_core::permission::scope::AllowScope::Project
+                                                    | astra_turn_core::permission::scope::AllowScope::RestOfSession
+                                                    | astra_turn_core::permission::scope::AllowScope::User
+                                            )
+                                        ) {
+                                            pm.record_approval(&sandbox_tool_key, Some(args), true);
+                                        }
+                                        response.is_approved()
+                                    } else if self.render_policy.is_silent() {
+                                        // Sub-run mode: auto-deny sandbox expansion
+                                        astra_core::agent_warn!(
+                                            "permission",
+                                            "Auto-denied sandbox expansion {sandbox_tool_key} in sub-run mode: {reason}"
+                                        );
+                                        pm.record_approval(&sandbox_tool_key, Some(args), false);
+                                        false
                                     } else {
-                                        resp_rx.await.unwrap_or(ApprovalResponse::Deny)
-                                    };
-                                    let selected_scope = response.always_scope(
-                                        astra_turn_core::permission::scope::AllowScope::Project,
-                                    );
-                                    match selected_scope {
-                                        Some(astra_turn_core::permission::scope::AllowScope::Project) => {
-                                            // Persistent: writes a tool-level allow
-                                            // rule to settings for future sessions.
-                                            let rule = crate::cli::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
-                                            let remember_preview =
-                                                astra_turn_core::permission::match_target::remember_preview(
-                                                    &sandbox_tool_key,
-                                                    &guard_args,
-                                                    "in this workspace",
-                                                );
-                                            pm.add_allow_rule(&rule);
-                                            if let Some(err) = pm.take_last_save_error() {
-                                                astra_core::agent_warn!(
-                                                    "permission",
-                                                    "Always allow for {remember_preview} is session-only; failed to save rule {rule}: {err}"
-                                                );
-                                                if let Some(tx) = &self.stream_event_tx {
-                                                    let _ = tx.send(chat_stream::StreamEvent::StatusLine(
-                                                        format!(
-                                                            "Failed to save Always allow for {remember_preview}: {err}"
-                                                        ),
-                                                    ));
-                                                }
-                                            }
-                                            pm.trust_sandbox_root_from_reason(sandbox_msg);
-                                        }
-                                        Some(
-                                            astra_turn_core::permission::scope::AllowScope::RestOfSession,
-                                        ) => {
-                                            pm.trust_sandbox_root_from_reason(sandbox_msg);
-                                        }
-                                        Some(
-                                            astra_turn_core::permission::scope::AllowScope::User,
-                                        ) => {
-                                            let rule = crate::cli::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
-                                            let remember_preview =
-                                                astra_turn_core::permission::match_target::remember_preview(
-                                                    &sandbox_tool_key,
-                                                    &guard_args,
-                                                    "for this user",
-                                                );
-                                            pm.add_user_allow_rule(&rule);
-                                            if let Some(err) = pm.take_last_save_error() {
-                                                astra_core::agent_warn!(
-                                                    "permission",
-                                                    "Always allow for {remember_preview} is session-only; failed to save user rule {rule}: {err}"
-                                                );
-                                                if let Some(tx) = &self.stream_event_tx {
-                                                    let _ = tx.send(chat_stream::StreamEvent::StatusLine(
-                                                        format!(
-                                                            "Failed to save Always allow for {remember_preview}: {err}"
-                                                        ),
-                                                    ));
-                                                }
-                                            }
-                                            pm.trust_sandbox_root_from_reason(sandbox_msg);
-                                        }
-                                        Some(
-                                            astra_turn_core::permission::scope::AllowScope::OnceThisCall
-                                            | astra_turn_core::permission::scope::AllowScope::RestOfTurn,
-                                        )
-                                        | None => {}
+                                        // Issue #326 P0 (tui-only) / #331:
+                                        // legacy interactive stdin path is dead
+                                        // code now that the REPL is gone. With
+                                        // no approval channel and not silent =
+                                        // configuration mismatch, fail closed.
+                                        astra_core::agent_warn!(
+                                            "permission",
+                                            "Auto-denied sandbox expansion {sandbox_tool_key}: \
+                                             no approval sink installed (no TUI, not silent). \
+                                             Pass --mode auto or attach to a TUI session. reason={reason}"
+                                        );
+                                        pm.record_approval(&sandbox_tool_key, Some(args), false);
+                                        false
                                     }
-                                    if matches!(
-                                        selected_scope,
-                                        Some(
-                                            astra_turn_core::permission::scope::AllowScope::Project
-                                                | astra_turn_core::permission::scope::AllowScope::RestOfSession
-                                                | astra_turn_core::permission::scope::AllowScope::User
-                                        )
-                                    ) {
-                                        pm.record_approval(&sandbox_tool_key, Some(args), true);
-                                    }
-                                    response.is_approved()
-                                } else if self.render_policy.is_silent() {
-                                    // Sub-run mode: auto-deny sandbox expansion
-                                    astra_core::agent_warn!(
-                                        "permission",
-                                        "Auto-denied sandbox expansion {sandbox_tool_key} in sub-run mode: {reason}"
-                                    );
-                                    pm.record_approval(&sandbox_tool_key, Some(args), false);
-                                    false
-                                } else {
-                                    // Issue #326 P0 (tui-only) / #331:
-                                    // legacy interactive stdin path is dead
-                                    // code now that the REPL is gone. With
-                                    // no approval channel and not silent =
-                                    // configuration mismatch, fail closed.
-                                    astra_core::agent_warn!(
-                                        "permission",
-                                        "Auto-denied sandbox expansion {sandbox_tool_key}: \
-                                         no approval sink installed (no TUI, not silent). \
-                                         Pass --mode auto or attach to a TUI session. reason={reason}"
-                                    );
-                                    pm.record_approval(&sandbox_tool_key, Some(args), false);
-                                    false
                                 }
+                            };
+                            if approved {
+                                if let Err(e) = self.executor.expand_sandbox_path(expand_dir) {
+                                    astra_core::agent_warn!(
+                                        "sandbox",
+                                        "post-approval expansion rejected: {e}"
+                                    );
+                                }
+                                outcome = execute_with_metadata_responsive(
+                                    std::sync::Arc::clone(&self.executor),
+                                    tool.to_string(),
+                                    args.clone(),
+                                    self.cancel_token.cloned(),
+                                )
+                                .await;
+                                normalize_sandbox_denied_outcome(&mut outcome);
+                                tool_result_fields = outcome.tool_result_fields;
+                                tool_execution_marked_error = outcome.is_error;
+                                outcome.output
+                            } else {
+                                tool_execution_marked_error = true;
+                                format!("Error: {sandbox_msg}")
                             }
-                        };
-                        if approved {
-                            // Single source of truth in `sandbox_retry` — both
-                            // the sequential path here and the parallel batch
-                            // path call the same derivation so their behaviour
-                            // stays byte-identical.
-                            if let Some(dir) =
-                                crate::sandbox_retry::sandbox_expand_dir_from_args(args)
-                            {
-                                self.executor.expand_sandbox_path(dir);
-                            }
-                            outcome = execute_with_metadata_responsive(
-                                std::sync::Arc::clone(&self.executor),
-                                tool.to_string(),
-                                args.clone(),
-                                self.cancel_token.cloned(),
-                            )
-                            .await;
-                            tool_result_fields = outcome.tool_result_fields;
-                            outcome.output
                         } else {
-                            format!("Error: {sandbox_msg}")
+                            tool_execution_marked_error = outcome.is_error;
+                            outcome.output
                         }
                     } else {
-                        outcome.output
+                        tool_execution_marked_error = true;
+                        crate::sandbox_retry::sandbox_retry_no_expand_dir_output(tool, &sandbox_msg)
                     }
                 } else {
                     tool_result_fields = outcome.tool_result_fields;
+                    tool_execution_marked_error = outcome.is_error;
                     outcome.output
                 }
             }
         } else {
             denied_output.unwrap_or_else(|| "Permission denied".to_string())
         };
-        let status = if !allowed {
+        let status = if !allowed || tool_execution_marked_error {
             "error"
         } else {
             cloud_tool_result_status_label(&output)
@@ -3357,7 +3643,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // Read-only tools: populate output cache for cross-turn dedup.
         if allowed
             && !tool_result_status_is_failure(&status)
-            && READ_ONLY_TOOLS.contains(&tool)
+            && edge_tool_is_cacheable_read(tool, args)
             && let Some(validation) = self.cache_validation_for_tool(tool, args)
         {
             self.tool_cache.output_cache.insert(
@@ -3412,21 +3698,23 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             self.render
                 .tool_done(idx, tool, args, &status, duration_ms, &output);
         }
+        let tool_result_fields = self.edge_tool_result_fields_with_runtime(tool_result_fields);
         self.edge_tool_round.push(EdgeToolExecResult {
             request_id: request_id.to_string(),
             tool: tool.to_string(),
             args: args.clone(),
             output: output.clone(),
-            tool_result_fields: tool_result_fields.clone(),
+            tool_result_fields: Some(tool_result_fields.clone()),
             status: status.clone(),
             duration_ms,
         });
-        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+        let body = astra_thin_client::ToolResultRequest::new_with_hash_and_fields(
             request_id.to_string(),
             Some(self.edge_agent_id.clone()),
             status.clone(),
             output,
             duration_ms,
+            Some(tool_result_fields),
         );
         // ── Reconnection dedup: only record when server acked the result ──
         if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
@@ -3693,10 +3981,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     None, &req.tool, &req.args,
                 ),
             };
-            let ok = matches!(
-                decision,
-                crate::cli::permission_manager::PermissionDecision::Allow
-            );
+            let ok = matches!(decision, crate::cli::permission_manager::GateOutcome::Allow);
             if !ok {
                 all_allowed = false;
                 break;
@@ -3809,6 +4094,26 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // speculative output. Journal/observability still fire exactly
         // once from the post-execution pass below.
         let speculative_by_id = self.harvest_speculation_for_batch(&conc_reqs).await;
+        let mut preflight_errors = std::collections::HashMap::new();
+        for (_, req) in &conc_reqs {
+            if reusable_speculative_output(speculative_by_id.get(&req.request_id).cloned())
+                .is_some()
+            {
+                continue;
+            }
+            if let Err(error) = self
+                .preflight_explicit_path_sandbox_expansion(&req.tool, &req.args)
+                .await
+            {
+                astra_core::agent_warn!(
+                    "permission",
+                    "Parallel sandbox preflight for {} failed before execution: {}",
+                    req.tool,
+                    error
+                );
+                preflight_errors.insert(req.request_id.clone(), error);
+            }
+        }
         let outputs: Vec<(crate::edge_tools::ToolExecutionOutcome, u64)> = join_all(
             conc_reqs
                 .iter()
@@ -3820,8 +4125,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     let executor = std::sync::Arc::clone(&executor);
                     let cancel_token_for_tool = self.cancel_token.cloned();
                     let speculative = speculative_by_id.get(&req.request_id).cloned();
+                    let preflight_error = preflight_errors.get(&req.request_id).cloned();
                     let cancel_token = self.cancel_token.cloned();
                     async move {
+                        if let Some(error) = preflight_error {
+                            return (crate::edge_tools::ToolExecutionOutcome::error(error), 0u64);
+                        }
                         if let Some(output) = reusable_speculative_output(speculative) {
                             return (
                                 crate::edge_tools::ToolExecutionOutcome {
@@ -3955,42 +4264,41 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // we no longer assume the parallel batch was pre-approved.
         let mut outputs = outputs;
         for pos in 0..outputs.len() {
-            if !crate::sandbox_retry::is_sandbox_denied(&outputs[pos].0.output) {
+            let Some(sandbox_msg) = normalize_sandbox_denied_outcome(&mut outputs[pos].0) else {
                 continue;
-            }
+            };
             let (_, req) = conc_reqs[pos];
             let tool = req.tool.clone();
             let args = req.args.clone();
             let sandbox_tool_key = format!("sandbox_expand:{tool}");
-            let sandbox_msg = crate::sandbox_retry::sandbox_denied_message(&outputs[pos].0.output)
-                .unwrap_or("")
-                .to_string();
-            let guard_args = serde_json::json!({"reason": sandbox_msg});
+            let Some(expand_dir) =
+                crate::sandbox_retry::sandbox_expand_dir_from_denial(&args, &sandbox_msg)
+            else {
+                outputs[pos].0 = crate::edge_tools::ToolExecutionOutcome::error(
+                    crate::sandbox_retry::sandbox_retry_no_expand_dir_output(&tool, &sandbox_msg),
+                );
+                continue;
+            };
+            let guard_args = serde_json::json!({"reason": sandbox_msg.clone()});
             let decision = crate::tool_safety_guard::ToolSafetyGuard::check_request(
                 self.perm_manager.as_deref_mut(),
                 &sandbox_tool_key,
                 &guard_args,
             );
             let approved = match decision {
-                crate::cli::permission_manager::PermissionDecision::Allow => true,
-                crate::cli::permission_manager::PermissionDecision::Deny(reason) => {
+                crate::cli::permission_manager::GateOutcome::Allow => true,
+                crate::cli::permission_manager::GateOutcome::Deny(reason) => {
                     // Surface the deny reason so the LLM and user can
                     // see why the sandbox refused to widen, instead of
                     // silently continuing with the original
-                    // SANDBOX_DENIED output.
-                    let prefix = "SANDBOX_DENIED: ";
-                    let suffix = format!(" (sandbox_expand:{tool} denied: {reason})");
-                    if !outputs[pos].0.output.contains(&suffix) {
-                        if outputs[pos].0.output.starts_with(prefix) {
-                            outputs[pos].0.output.push_str(&suffix);
-                        } else {
-                            outputs[pos].0.output =
-                                format!("{prefix}{}{suffix}", outputs[pos].0.output);
-                        }
-                    }
+                    // sandbox-denied output.
+                    outputs[pos].0.output = format!(
+                        "Error: {sandbox_msg} (sandbox expansion for {tool} denied: {reason})"
+                    );
+                    outputs[pos].0.is_error = true;
                     false
                 }
-                crate::cli::permission_manager::PermissionDecision::NeedApproval {
+                crate::cli::permission_manager::GateOutcome::NeedApproval {
                     tool: approval_tool,
                     header,
                     detail,
@@ -4047,12 +4355,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         // forcing PermissionMode::Auto for headless
                         // entries; reaching this branch with no sink
                         // means a misconfiguration. Surface a clear
-                        // reason in the SANDBOX_DENIED output.
-                        let suffix = " (approval required for sandbox_expand but no TUI; \
-                                       pass --mode auto or add allow rule)";
-                        if !outputs[pos].0.output.contains(suffix) {
-                            outputs[pos].0.output.push_str(suffix);
-                        }
+                        // reason without exposing the sandbox-denied wire
+                        // prefix.
+                        outputs[pos].0.output = format!(
+                            "Error: {sandbox_msg} (approval required for sandbox_expand but no TUI; pass --mode auto or add allow rule)"
+                        );
+                        outputs[pos].0.is_error = true;
                         false
                     }
                 }
@@ -4060,8 +4368,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             if !approved {
                 continue;
             }
-            if let Some(dir) = crate::sandbox_retry::sandbox_expand_dir_from_args(&args) {
-                self.executor.expand_sandbox_path(dir);
+            if let Err(e) = self.executor.expand_sandbox_path(expand_dir) {
+                astra_core::agent_warn!("sandbox", "post-approval expansion rejected: {e}");
+                continue;
             }
             if let Some(pm) = &mut self.perm_manager {
                 pm.record_approval(&sandbox_tool_key, Some(&args), true);
@@ -4074,14 +4383,16 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     self.cancel_token.cloned(),
                 ))
                 .await;
+            let mut retried = retried;
+            normalize_sandbox_denied_outcome(&mut retried);
             outputs[pos] = (retried, retry_dur);
         }
 
         let mut terminal_post_failure = false;
         for (pos, (outcome, duration_ms)) in outputs.into_iter().enumerate() {
             let (orig_idx, req) = conc_reqs[pos];
+            let status = edge_tool_outcome_status(&outcome);
             let output = outcome.output;
-            let status = cloud_tool_result_status_label(&output);
 
             // Forward tool-completed event.
             if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
@@ -4138,12 +4449,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     .tool_done(idx, &req.tool, &req.args, status, duration_ms, &output);
             }
 
+            let tool_result_fields =
+                self.edge_tool_result_fields_with_runtime(outcome.tool_result_fields);
             let result = EdgeToolExecResult {
                 request_id: req.request_id.clone(),
                 tool: req.tool.clone(),
                 args: req.args.clone(),
                 output: output.clone(),
-                tool_result_fields: outcome.tool_result_fields,
+                tool_result_fields: Some(tool_result_fields.clone()),
                 status: status.to_string(),
                 duration_ms,
             };
@@ -4151,12 +4464,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             results[orig_idx] = Some(result);
 
             // Post tool result to cloud API.
-            let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            let body = astra_thin_client::ToolResultRequest::new_with_hash_and_fields(
                 req.request_id.clone(),
                 Some(self.edge_agent_id.clone()),
                 status.to_string(),
                 output,
                 duration_ms,
+                Some(tool_result_fields),
             );
             // ── Reconnection dedup: only record when server acked the result ──
             if !terminal_post_failure {
@@ -4450,6 +4764,11 @@ fn tool_completion_icon(
 ) -> (String, bool) {
     if tool_result_status_is_failure(status) {
         return (tool_result_status_icon(status), false);
+    }
+
+    // Skipped is protective deduplication, not an error — show warning icon
+    if tool_result_status_is_skipped(status) {
+        return (theme::icon_warn(), true);
     }
 
     let trimmed = output.trim();
@@ -4776,606 +5095,6 @@ impl StreamRenderState {
         )
     }
 
-    /// Shorten a path by keeping the last N chars with leading "..."
-    fn _format_tool_arg_preview_unused(&self, tool: &str, args: &Value) -> Option<String> {
-        match tool {
-            "bash" => args
-                .get("command")
-                .and_then(Value::as_str)
-                .map(|cmd| truncate_line(cmd, 60)),
-            "read_file" => {
-                let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                let start = args.get("start_line").and_then(Value::as_u64);
-                let end = args.get("end_line").and_then(Value::as_u64);
-                match (start, end) {
-                    (Some(s), Some(e)) => Some(format!("{path}:{s}-{e}")),
-                    (Some(s), None) => Some(format!("{path}:{s}-")),
-                    _ => Some(truncate_line(path, 60)),
-                }
-            }
-            "write_file" | "delete_file" => args
-                .get("path")
-                .and_then(Value::as_str)
-                .map(|p| truncate_line(p, 60)),
-            "str_replace" | "multi_edit" => args
-                .get("path")
-                .and_then(Value::as_str)
-                .map(|p| truncate_line(p, 60)),
-            "list_dir" => {
-                let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-                let depth = args.get("depth").and_then(Value::as_u64);
-                match depth {
-                    Some(d) => Some(format!("{} (depth {})", truncate_line(path, 50), d)),
-                    None => Some(truncate_line(path, 60)),
-                }
-            }
-            "grep" => {
-                let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
-                let glob_filter = args.get("glob").and_then(Value::as_str);
-                let path = args.get("path").and_then(Value::as_str);
-                let mut preview = format!("/{}/", truncate_line(pattern, 30));
-                if let Some(g) = glob_filter {
-                    preview.push_str(&format!(" {}", truncate_line(g, 20)));
-                } else if let Some(p) = path {
-                    preview.push_str(&format!(" in {}", truncate_line(p, 20)));
-                }
-                Some(preview)
-            }
-            "glob" => args
-                .get("pattern")
-                .and_then(Value::as_str)
-                .map(|p| truncate_line(p, 60)),
-            "git_log" => {
-                let n = args.get("n").and_then(Value::as_u64);
-                let branch = args.get("branch").and_then(Value::as_str);
-                match (n, branch) {
-                    (Some(n), Some(b)) => Some(format!("-{n} {b}")),
-                    (Some(n), None) => Some(format!("-{n}")),
-                    (None, Some(b)) => Some(truncate_line(b, 20)),
-                    _ => None,
-                }
-            }
-            "git_show" | "git_blame" | "git_file_history" => args
-                .get("commit")
-                .or_else(|| args.get("ref"))
-                .or_else(|| args.get("path"))
-                .or_else(|| args.get("file"))
-                .and_then(Value::as_str)
-                .map(|s| truncate_line(s, 20)),
-            "git_log_search" => args
-                .get("query")
-                .and_then(Value::as_str)
-                .map(|q| format!("\"{}\"", truncate_line(q, 40))),
-            "git_diff" => {
-                let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
-                let path = args.get("path").and_then(Value::as_str);
-                let base_ref = args.get("base_ref").and_then(Value::as_str);
-                let git_ref = args.get("ref").and_then(Value::as_str);
-                if let Some(base) = base_ref {
-                    let tip = git_ref.unwrap_or("HEAD");
-                    match path {
-                        Some(p) => Some(format!("{base}..{tip} -- {}", truncate_line(p, 40))),
-                        None => Some(format!("{base}..{tip}")),
-                    }
-                } else {
-                    match (staged, path) {
-                        (true, Some(p)) => Some(format!("--staged {}", truncate_line(p, 45))),
-                        (true, None) => Some("--staged".to_string()),
-                        (false, Some(p)) => Some(truncate_line(p, 60)),
-                        _ => None,
-                    }
-                }
-            }
-            "git_commit" => args
-                .get("message")
-                .and_then(Value::as_str)
-                .map(|m| format!("-m \"{}\"", truncate_line(m, 50))),
-            "git_revert_commit" => args
-                .get("commit_sha")
-                .and_then(Value::as_str)
-                .map(|sha| truncate_line(sha, 24)),
-            "git_contributors" => {
-                let path = args.get("path").and_then(Value::as_str);
-                let since = args.get("since").and_then(Value::as_str);
-                match (path, since) {
-                    (Some(path), Some(since)) => Some(format!(
-                        "{} since {}",
-                        truncate_line(path, 24),
-                        truncate_line(since, 16)
-                    )),
-                    (Some(path), None) => Some(truncate_line(path, 32)),
-                    (None, Some(since)) => Some(format!("since {}", truncate_line(since, 24))),
-                    (None, None) => None,
-                }
-            }
-            "git_stash" => {
-                let action = args.get("action").and_then(Value::as_str);
-                let stash_ref = args.get("stash_ref").and_then(Value::as_str);
-                let index = args.get("index").and_then(Value::as_i64);
-                match (action, stash_ref, index) {
-                    (Some(action), Some(stash_ref), _) => {
-                        Some(format!("{action} {}", truncate_line(stash_ref, 40)))
-                    }
-                    (Some(action), None, Some(index)) => {
-                        Some(format!("{action} stash@{{{index}}}"))
-                    }
-                    (Some(action), None, None) => Some(action.to_string()),
-                    _ => None,
-                }
-            }
-            "git_checkout_file" => {
-                let path = args.get("path").and_then(Value::as_str);
-                let git_ref = args.get("ref").and_then(Value::as_str);
-                match (path, git_ref) {
-                    (Some(path), Some(git_ref)) => Some(format!(
-                        "{} -- {}",
-                        truncate_line(git_ref, 16),
-                        shorten_path(path, 28)
-                    )),
-                    (Some(path), None) => Some(shorten_path(path, 40)),
-                    _ => None,
-                }
-            }
-            "git_worktree" => {
-                let action = args.get("action").and_then(Value::as_str);
-                let branch = args.get("branch").and_then(Value::as_str);
-                let path = args.get("path").and_then(Value::as_str);
-                match (action, branch, path) {
-                    (Some(action), Some(branch), _) => Some(format!(
-                        "{} {}",
-                        truncate_line(action, 16),
-                        truncate_line(branch, 24)
-                    )),
-                    (Some(action), None, Some(path)) => Some(format!(
-                        "{} {}",
-                        truncate_line(action, 16),
-                        truncate_line(path, 28)
-                    )),
-                    (Some(action), None, None) => Some(action.to_string()),
-                    _ => None,
-                }
-            }
-            "find_definition" | "find_references" => args
-                .get("symbol")
-                .and_then(Value::as_str)
-                .map(|s| truncate_line(s, 40)),
-            "symbol_search" => args
-                .get("query")
-                .and_then(Value::as_str)
-                .map(|query| truncate_line(query, 40)),
-            "hover_info" => {
-                let file = args.get("file").and_then(Value::as_str);
-                let line = args.get("line").and_then(Value::as_u64);
-                let column = args.get("column").and_then(Value::as_u64);
-                match (file, line, column) {
-                    (Some(file), Some(line), Some(column)) => Some(format!(
-                        "{}:{line}:{column}",
-                        shorten_path(
-                            file,
-                            40usize.saturating_sub(format!(":{line}:{column}").chars().count())
-                        )
-                    )),
-                    (Some(file), Some(line), None) => Some(format!(
-                        "{}:{line}",
-                        shorten_path(
-                            file,
-                            40usize.saturating_sub(format!(":{line}").chars().count())
-                        )
-                    )),
-                    (Some(file), None, _) => Some(truncate_line(file, 50)),
-                    _ => None,
-                }
-            }
-            "call_graph" => {
-                let symbol = args.get("symbol").and_then(Value::as_str);
-                let path = args.get("path").and_then(Value::as_str);
-                let start = args.get("start_line").and_then(Value::as_u64);
-                let end = args.get("end_line").and_then(Value::as_u64);
-                match (symbol, path, start, end) {
-                    (Some(symbol), _, _, _) => Some(truncate_line(symbol, 40)),
-                    (None, Some(path), Some(start), Some(end)) => Some(format!(
-                        "{}:{start}-{end}",
-                        shorten_path(
-                            path,
-                            40usize.saturating_sub(format!(":{start}-{end}").chars().count())
-                        )
-                    )),
-                    (None, Some(path), Some(start), None) => Some(format!(
-                        "{}:{start}-",
-                        shorten_path(
-                            path,
-                            40usize.saturating_sub(format!(":{start}-").chars().count())
-                        )
-                    )),
-                    (None, Some(path), None, None) => Some(truncate_line(path, 50)),
-                    _ => None,
-                }
-            }
-            "type_hierarchy" => {
-                let name = args.get("name").and_then(Value::as_str);
-                let direction = args.get("direction").and_then(Value::as_str);
-                match (name, direction) {
-                    (Some(name), Some(direction)) => Some(format!(
-                        "{} ({})",
-                        truncate_line(name, 32),
-                        truncate_line(direction, 16)
-                    )),
-                    (Some(name), None) => Some(truncate_line(name, 40)),
-                    _ => None,
-                }
-            }
-            "rename_symbol" => {
-                let symbol = args.get("symbol").and_then(Value::as_str);
-                let new_name = args.get("new_name").and_then(Value::as_str);
-                match (symbol, new_name) {
-                    (Some(symbol), Some(new_name)) => Some(format!(
-                        "{} -> {}",
-                        truncate_line(symbol, 24),
-                        truncate_line(new_name, 24)
-                    )),
-                    (Some(symbol), None) => Some(truncate_line(symbol, 40)),
-                    _ => None,
-                }
-            }
-            "dead_code" => {
-                let path = args.get("path").and_then(Value::as_str);
-                let kind = args.get("kind").and_then(Value::as_str);
-                match (path, kind) {
-                    (Some(path), Some(kind)) => Some(format!(
-                        "{} ({})",
-                        truncate_line(path, 30),
-                        truncate_line(kind, 16)
-                    )),
-                    (Some(path), None) => Some(truncate_line(path, 40)),
-                    (None, Some(kind)) => Some(truncate_line(kind, 24)),
-                    _ => None,
-                }
-            }
-            "extract_members" => {
-                let file = args.get("file").and_then(Value::as_str);
-                let line = args.get("line").and_then(Value::as_u64);
-                match (file, line) {
-                    (Some(file), Some(line)) => Some(format!(
-                        "{}:{line}",
-                        shorten_path(
-                            file,
-                            40usize.saturating_sub(format!(":{line}").chars().count())
-                        )
-                    )),
-                    (Some(file), None) => Some(truncate_line(file, 40)),
-                    _ => None,
-                }
-            }
-            "lsp" => {
-                let operation = args.get("operation").and_then(Value::as_str);
-                let file = args.get("file").and_then(Value::as_str);
-                let line = args.get("line").and_then(Value::as_u64);
-                let column = args.get("column").and_then(Value::as_u64);
-                let symbol = args.get("symbol").and_then(Value::as_str);
-                let query = args.get("query").and_then(Value::as_str);
-                match (operation, file, line, column, symbol, query) {
-                    (Some(operation), Some(file), Some(line), Some(column), _, _) => Some(format!(
-                        "{operation} {}:{line}:{column}",
-                        shorten_path(
-                            file,
-                            40usize
-                                .saturating_sub(operation.chars().count())
-                                .saturating_sub(1)
-                                .saturating_sub(format!(":{line}:{column}").chars().count())
-                        )
-                    )),
-                    (Some(operation), Some(file), _, _, _, _) => {
-                        Some(format!("{operation} {}", truncate_line(file, 32)))
-                    }
-                    (Some(operation), _, _, _, Some(symbol), _) => {
-                        Some(format!("{operation} {}", truncate_line(symbol, 26)))
-                    }
-                    (Some(operation), _, _, _, _, Some(query)) => {
-                        Some(format!("{operation} {}", truncate_line(query, 26)))
-                    }
-                    (Some(operation), _, _, _, _, _) => Some(truncate_line(operation, 40)),
-                    _ => None,
-                }
-            }
-            "symbols" => args
-                .get("path")
-                .and_then(Value::as_str)
-                .map(|p| truncate_line(p, 60)),
-            "run_build_test" => args
-                .get("command")
-                .and_then(Value::as_str)
-                .map(|c| truncate_line(c, 60)),
-            "web_fetch" => args
-                .get("url")
-                .and_then(Value::as_str)
-                .map(|u| truncate_line(u, 60)),
-            "web_search" => args
-                .get("query")
-                .and_then(Value::as_str)
-                .map(|query| truncate_line(query, 40)),
-            "powershell" => args
-                .get("command")
-                .and_then(Value::as_str)
-                .map(|command| truncate_line(command, 60)),
-            "github_get_pr" | "github_get_issue" => {
-                let owner = args.get("owner").and_then(Value::as_str);
-                let repo = args.get("repo").and_then(Value::as_str);
-                let repo_display = github_repo_display(owner, repo).unwrap_or_default();
-                let number = args
-                    .get("number")
-                    .or_else(|| args.get("pr_number"))
-                    .or_else(|| args.get("issue_number"))
-                    .and_then(Value::as_u64);
-                match number {
-                    Some(n) => Some(format!("{repo_display}#{n}")),
-                    None => Some(repo_display),
-                }
-            }
-            "github_list_prs" | "github_list_issues" | "github_repo_stats" | "github_ci_status" => {
-                let owner = args.get("owner").and_then(Value::as_str);
-                let repo = args.get("repo").and_then(Value::as_str);
-                Some(github_repo_display(owner, repo).unwrap_or_default())
-            }
-            "github_create_issue" => {
-                let owner = args.get("owner").and_then(Value::as_str);
-                let repo = args.get("repo").and_then(Value::as_str);
-                let repo_display = github_repo_display(owner, repo).unwrap_or_default();
-                let title = args.get("title").and_then(Value::as_str);
-                match title {
-                    Some(title) => Some(format!(
-                        "{}: \"{}\"",
-                        repo_display,
-                        truncate_line(title, 28)
-                    )),
-                    None => Some(repo_display),
-                }
-            }
-            "adjust_config" => args
-                .get("path")
-                .and_then(Value::as_str)
-                .map(|path| truncate_line(path, 36)),
-            "prioritize_tool" | "deprioritize_tool" => args
-                .get("tool")
-                .and_then(Value::as_str)
-                .map(|tool| truncate_line(tool, 24)),
-            "set_goal" => args
-                .get("goal")
-                .and_then(Value::as_str)
-                .map(|goal| truncate_line(goal, 40)),
-            "compress_context" => args
-                .get("reason")
-                .and_then(Value::as_str)
-                .map(|reason| truncate_line(reason, 40)),
-            "rollback_session_state" => {
-                let scope = args.get("scope").and_then(Value::as_str);
-                let turn_index = args.get("turn_index").and_then(Value::as_i64);
-                match (scope, turn_index) {
-                    (Some("turn"), Some(turn_index)) => Some(format!("turn {turn_index}")),
-                    (Some(scope), _) => Some(scope.to_string()),
-                    _ => None,
-                }
-            }
-            "get_agent_info" => args
-                .get("dimension")
-                .and_then(Value::as_str)
-                .map(|dimension| truncate_line(dimension, 24)),
-            "reflect" => args
-                .get("question")
-                .or_else(|| args.get("focus"))
-                .and_then(Value::as_str)
-                .map(|value| truncate_line(value, 40)),
-            "context_analysis" => {
-                let mode = args.get("mode").and_then(Value::as_str);
-                let turn = args.get("turn").and_then(Value::as_i64);
-                let turn_a = args.get("turn_a").and_then(Value::as_i64);
-                let turn_b = args.get("turn_b").and_then(Value::as_i64);
-                match (mode, turn, turn_a, turn_b) {
-                    (Some("turn"), Some(turn), _, _) => Some(format!("turn {turn}")),
-                    (Some("compare"), _, Some(turn_a), Some(turn_b)) => {
-                        Some(format!("compare {turn_a} vs {turn_b}"))
-                    }
-                    (Some(mode), _, _, _) => Some(truncate_line(mode, 24)),
-                    _ => None,
-                }
-            }
-            "run_chain" => args
-                .get("name")
-                .or_else(|| args.get("description"))
-                .and_then(Value::as_str)
-                .map(|value| truncate_line(value, 40)),
-            "rollback_file_edits" => {
-                let scope = args.get("scope").and_then(Value::as_str);
-                let turn_index = args.get("turn_index").and_then(Value::as_i64);
-                let path = args.get("path").and_then(Value::as_str);
-                match (scope, turn_index, path) {
-                    (Some("turn"), Some(turn_index), _) => Some(format!("turn {turn_index}")),
-                    (Some("file"), _, Some(path)) => Some(truncate_line(path, 36)),
-                    (Some(scope), _, _) => Some(scope.to_string()),
-                    _ => None,
-                }
-            }
-            "rollback_database_snapshots" => {
-                let scope = args.get("scope").and_then(Value::as_str);
-                let turn_index = args.get("turn_index").and_then(Value::as_i64);
-                let snapshot_id = args.get("snapshot_id").and_then(Value::as_str);
-                match (scope, turn_index, snapshot_id) {
-                    (Some("turn"), Some(turn_index), _) => Some(format!("turn {turn_index}")),
-                    (Some("snapshot"), _, Some(snapshot_id)) => {
-                        Some(truncate_line(snapshot_id, 36))
-                    }
-                    (Some(scope), _, _) => Some(scope.to_string()),
-                    _ => None,
-                }
-            }
-            "rollback_turn_actions" => {
-                let scope = args.get("scope").and_then(Value::as_str);
-                let turn_index = args.get("turn_index").and_then(Value::as_i64);
-                match (scope, turn_index) {
-                    (Some("turn"), Some(turn_index)) => Some(format!("turn {turn_index}")),
-                    (Some(scope), _) => Some(scope.to_string()),
-                    _ => None,
-                }
-            }
-            "send_message" => {
-                let to = args.get("to").and_then(Value::as_str);
-                let summary = args.get("summary").and_then(Value::as_str);
-                let message = args.get("message").and_then(Value::as_str);
-                match (to, summary, message) {
-                    (Some(to), Some(summary), _) => Some(format!(
-                        "{}: {}",
-                        truncate_line(to, 18),
-                        truncate_line(summary, 28)
-                    )),
-                    (Some(to), None, Some(message)) => Some(format!(
-                        "{}: {}",
-                        truncate_line(to, 18),
-                        truncate_line(message, 28)
-                    )),
-                    (Some(to), None, None) => Some(truncate_line(to, 40)),
-                    _ => None,
-                }
-            }
-            "diagnose" => {
-                let category = args.get("category").and_then(Value::as_str);
-                let verbose = args.get("verbose").and_then(Value::as_bool);
-                match (category, verbose) {
-                    (Some(category), Some(true)) => Some(format!("{category} verbose")),
-                    (Some(category), _) => Some(category.to_string()),
-                    (None, Some(true)) => Some("verbose".to_string()),
-                    _ => None,
-                }
-            }
-            "env" => {
-                let operation = args.get("operation").and_then(Value::as_str);
-                let name = args.get("name").and_then(Value::as_str);
-                let pattern = args.get("pattern").and_then(Value::as_str);
-                match (operation, name, pattern) {
-                    (Some(operation), Some(name), _) => {
-                        Some(format!("{operation} {}", truncate_line(name, 30)))
-                    }
-                    (Some("search"), _, Some(pattern)) => {
-                        Some(format!("search {}", truncate_line(pattern, 24)))
-                    }
-                    (Some(operation), _, _) => Some(operation.to_string()),
-                    _ => None,
-                }
-            }
-            "notebook_edit" => {
-                let notebook_path = args.get("notebook_path").and_then(Value::as_str);
-                let edit_mode = args.get("edit_mode").and_then(Value::as_str);
-                match (edit_mode, notebook_path) {
-                    (Some(edit_mode), Some(notebook_path)) => Some(format!(
-                        "{} {}",
-                        truncate_line(edit_mode, 12),
-                        truncate_line(notebook_path, 32)
-                    )),
-                    (_, Some(notebook_path)) => Some(truncate_line(notebook_path, 40)),
-                    _ => None,
-                }
-            }
-            "config" => {
-                let setting = args.get("setting").and_then(Value::as_str);
-                let value = args.get("value").and_then(Value::as_str);
-                match (setting, value) {
-                    (Some(setting), Some(value)) => Some(format!(
-                        "{}={}",
-                        truncate_line(setting, 18),
-                        truncate_line(value, 24)
-                    )),
-                    (Some(setting), None) => Some(truncate_line(setting, 40)),
-                    _ => None,
-                }
-            }
-            "brief" => args
-                .get("focus")
-                .and_then(Value::as_str)
-                .map(|focus| truncate_line(focus, 24)),
-            "share_context" => args
-                .get("key")
-                .and_then(Value::as_str)
-                .map(|key| truncate_line(key, 40)),
-            "query_context" => {
-                let key = args.get("key").and_then(Value::as_str);
-                let prefix = args.get("prefix").and_then(Value::as_str);
-                let list_keys = args.get("list_keys").and_then(Value::as_bool);
-                match (key, prefix, list_keys) {
-                    (Some(key), _, _) => Some(truncate_line(key, 40)),
-                    (None, Some(prefix), _) => Some(truncate_line(prefix, 40)),
-                    (None, None, Some(true)) => Some("keys".to_string()),
-                    _ => None,
-                }
-            }
-            "ask_user" => args
-                .get("question")
-                .and_then(Value::as_str)
-                .map(|question| truncate_line(question, 50)),
-            "sleep" => {
-                let duration_ms = args.get("duration_ms").and_then(Value::as_u64);
-                let reason = args.get("reason").and_then(Value::as_str);
-                match (duration_ms, reason) {
-                    (Some(duration_ms), Some(reason)) => {
-                        Some(format!("{}ms ({})", duration_ms, truncate_line(reason, 28)))
-                    }
-                    (Some(duration_ms), None) => Some(format!("{duration_ms}ms")),
-                    (None, Some(reason)) => Some(truncate_line(reason, 40)),
-                    (None, None) => None,
-                }
-            }
-            "tool_search" => args
-                .get("query")
-                .and_then(Value::as_str)
-                .map(|query| format!("\"{}\"", truncate_line(query, 40))),
-            "task" => task_preview_from_args(args),
-            "mo_query" => args
-                .get("sql")
-                .or_else(|| args.get("query"))
-                .and_then(Value::as_str)
-                .map(|q| truncate_line(q, 60)),
-            "mo_snapshot" | "mo_branch" => {
-                let action = args.get("action").and_then(Value::as_str);
-                let name = args.get("name").and_then(Value::as_str);
-                match (action, name) {
-                    (Some(action), Some(name)) => Some(format!(
-                        "{} {}",
-                        truncate_line(action, 16),
-                        truncate_line(name, 28)
-                    )),
-                    (Some(action), None) => Some(action.to_string()),
-                    _ => None,
-                }
-            }
-            "memory" => {
-                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-                match action {
-                    "recall" => args
-                        .get("query")
-                        .and_then(Value::as_str)
-                        .map(|q| truncate_line(q, 50)),
-                    "remember" => args
-                        .get("content")
-                        .and_then(Value::as_str)
-                        .map(|c| truncate_line(c, 50)),
-                    "forget" => args
-                        .get("memory_id")
-                        .and_then(Value::as_str)
-                        .or_else(|| args.get("topic").and_then(Value::as_str))
-                        .map(|t| truncate_line(t, 40)),
-                    "update" | "expand" | "feedback" => args
-                        .get("memory_id")
-                        .and_then(Value::as_str)
-                        .map(|memory_id| truncate_line(memory_id, 40)),
-                    "focus" => args
-                        .get("focus_value")
-                        .or_else(|| args.get("value"))
-                        .and_then(Value::as_str)
-                        .map(|v| truncate_line(v, 40)),
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
-    }
-
     /// Update a tool line to show completion status with Cursor-style summary.
     fn tool_done(
         &mut self,
@@ -5396,6 +5115,13 @@ impl StreamRenderState {
                 .map(|summary| summary.text.clone())
                 .unwrap_or_else(|| "failed".to_string());
             format!("    {}", err_msg.red())
+        } else if tool_result_status_is_skipped(status) {
+            // Skipped = protective deduplication. Show as dim warning, not red error.
+            let msg = output_summary
+                .as_ref()
+                .map(|summary| summary.text.clone())
+                .unwrap_or_else(|| "skipped (duplicate)".to_string());
+            format!("    {}", msg.dim())
         } else if is_warning {
             output_summary
                 .as_ref()
@@ -5473,6 +5199,13 @@ impl StreamRenderState {
                 .map(|summary| summary.text.clone())
                 .unwrap_or_else(|| "failed".to_string());
             format!("    {}", err_msg.red())
+        } else if tool_result_status_is_skipped(status) {
+            // Skipped = protective deduplication. Show as dim warning, not red error.
+            let msg = output_summary
+                .as_ref()
+                .map(|summary| summary.text.clone())
+                .unwrap_or_else(|| "skipped (duplicate)".to_string());
+            format!("    {}", msg.dim())
         } else if is_warning {
             output_summary
                 .as_ref()
@@ -5580,15 +5313,7 @@ impl StreamRenderState {
                     format_byte_size(byte_size)
                 )))
             }
-            "git_log" => {
-                let total = output.lines().filter(|l| !l.trim().is_empty()).count();
-                if total == 0 {
-                    None
-                } else {
-                    Some(preview(pluralize_with_count(total, "commit", "commits")))
-                }
-            }
-            "git_show" | "git_diff" => {
+            "git" => {
                 // Ignore diff file headers (`+++ b/…`, `--- a/…`) so counts match real hunks.
                 let additions = output
                     .lines()
@@ -5598,7 +5323,6 @@ impl StreamRenderState {
                     .lines()
                     .filter(|l| l.starts_with('-') && !l.starts_with("---"))
                     .count();
-                // Extract changed file names only from +++ b/ lines (not diff --git headers)
                 let files: Vec<&str> = output
                     .lines()
                     .filter_map(|l| l.strip_prefix("+++ b/"))
@@ -5985,69 +5709,7 @@ fn summarize_web_fetch_output(output: &str) -> Option<String> {
 /// Format error message for tool failures with helpful context.
 /// Extracts relevant info from common error patterns.
 fn format_tool_error_summary(tool: &str, output: &str) -> String {
-    let output_trimmed = output.trim();
-    if output_trimmed.is_empty() {
-        return format!("{tool} failed before returning output");
-    }
-    let first_line = output.lines().next().unwrap_or("").trim();
-
-    // Tool-specific error extraction
-    match tool {
-        "bash" | "shell" | "shell_exec" | "run_build_test" => {
-            // For bash errors, try to find the most informative part
-            // Common patterns: "command not found", "No such file", "Permission denied"
-            if let Some(line) = output.lines().find(|l| {
-                let lower = l.to_lowercase();
-                lower.contains("error:")
-                    || lower.contains("failed")
-                    || lower.contains("not found")
-                    || lower.contains("permission denied")
-                    || lower.contains("no such file")
-            }) {
-                return truncate_line(line.trim(), 80);
-            }
-            // Fall back to last non-empty line (often contains the actual error)
-            if let Some(last) = output.lines().rev().find(|l| !l.trim().is_empty()) {
-                return truncate_line(last.trim(), 80);
-            }
-        }
-        "read_file" | "view_file" => {
-            if output_trimmed.contains("No such file") || output_trimmed.contains("ENOENT") {
-                return "File not found".to_string();
-            }
-            if output_trimmed.contains("Permission denied") || output_trimmed.contains("EACCES") {
-                return "Permission denied".to_string();
-            }
-            if output_trimmed.contains("Is a directory") || output_trimmed.contains("EISDIR") {
-                return "Path is a directory, not a file".to_string();
-            }
-        }
-        "edit" | "write_file" | "create_file" => {
-            if output_trimmed.contains("No match found") || output_trimmed.contains("not found") {
-                // Extract what wasn't found if possible
-                if let Some(line) = output
-                    .lines()
-                    .find(|l| l.contains("old_str") || l.contains("pattern"))
-                {
-                    return truncate_line(line.trim(), 80);
-                }
-                return "Pattern not found in file".to_string();
-            }
-            if output_trimmed.contains("Permission denied") {
-                return "Permission denied — cannot write file".to_string();
-            }
-            if output_trimmed.contains("already exists") {
-                return "File already exists".to_string();
-            }
-        }
-        "grep" | "glob" if output_trimmed.contains("No matches") || output_trimmed.is_empty() => {
-            return "No matches found".to_string();
-        }
-        _ => {}
-    }
-
-    // Generic: return first meaningful line, truncated
-    truncate_line(first_line, 80)
+    astra_turn_core::headless_tool_status_display::tool_error_summary(tool, output)
 }
 
 /// Bold+magenta prefix + plain rest (same accent as `Running skill:` / `MCP`).
@@ -6238,38 +5900,8 @@ pub(crate) fn style_tool_description(tool: &str, description: &str) -> String {
                 return s;
             }
         }
-        "github_get_pr" => {
-            if let Some(s) = style_first_matching_prefix(description, &["Getting PR: "]) {
-                return s;
-            }
-        }
-        "github_list_prs" => {
-            if let Some(s) = style_first_matching_prefix(description, &["Listing PRs: "]) {
-                return s;
-            }
-        }
-        "github_get_issue" => {
-            if let Some(s) = style_first_matching_prefix(description, &["Getting issue: "]) {
-                return s;
-            }
-        }
-        "github_list_issues" => {
-            if let Some(s) = style_first_matching_prefix(description, &["Listing issues: "]) {
-                return s;
-            }
-        }
-        "github_repo_stats" => {
-            if let Some(s) = style_first_matching_prefix(description, &["GitHub stats: "]) {
-                return s;
-            }
-        }
-        "github_ci_status" => {
-            if let Some(s) = style_first_matching_prefix(description, &["GitHub CI: "]) {
-                return s;
-            }
-        }
-        "github_create_issue" => {
-            if let Some(s) = style_first_matching_prefix(description, &["Creating issue: "]) {
+        "github" => {
+            if let Some(s) = style_first_matching_prefix(description, &["GitHub: "]) {
                 return s;
             }
         }
@@ -6279,31 +5911,6 @@ pub(crate) fn style_tool_description(tool: &str, description: &str) -> String {
             }
         }
         _ => {}
-    }
-
-    if tool.starts_with("git_") {
-        // Longest first — do not reorder without checking overlaps.
-        const GIT_PREFIXES: &[&str] = &[
-            "Git diff --staged ",
-            "Git diff ",
-            "Git log search \"",
-            "Git contributors since ",
-            "Git contributors ",
-            "Git checkout ",
-            "Git worktree ",
-            "Git stash ",
-            "Git commit \"",
-            "Git commit ",
-            "Git revert ",
-            "Git show ",
-            "Git blame ",
-            "Git history ",
-            "Git log ",
-            "Git ",
-        ];
-        if let Some(s) = style_prefix_longest_first(description, GIT_PREFIXES) {
-            return s;
-        }
     }
 
     description.to_string()
@@ -6317,6 +5924,33 @@ fn panic_payload_summary(payload: &(dyn std::any::Any + Send)) -> String {
     } else {
         "unknown panic payload".to_string()
     }
+}
+
+fn edge_tool_outcome_status(outcome: &crate::edge_tools::ToolExecutionOutcome) -> &'static str {
+    if outcome.is_error {
+        "error"
+    } else {
+        cloud_tool_result_status_label(&outcome.output)
+    }
+}
+
+fn normalize_sandbox_denied_outcome(
+    outcome: &mut crate::edge_tools::ToolExecutionOutcome,
+) -> Option<String> {
+    let message = crate::sandbox_retry::sandbox_denied_message_from_result(
+        &outcome.output,
+        outcome.tool_result_fields.as_ref(),
+    )?
+    .into_owned();
+    outcome.tool_result_fields = Some(
+        crate::sandbox_retry::merge_sandbox_denied_tool_result_fields(
+            outcome.tool_result_fields.take(),
+            &message,
+        ),
+    );
+    outcome.output = format!("Error: {message}");
+    outcome.is_error = true;
+    Some(message)
 }
 
 async fn catch_tool_execution_panic<F>(future: F) -> (crate::edge_tools::ToolExecutionOutcome, u64)
@@ -6507,26 +6141,15 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "grep" => format!("Grep: {preview}"),
         "glob" => format!("Glob: {preview}"),
         "git" => format!("Git {preview}"),
-        // Legacy individual names (kept for old sessions/journal replay)
-        "git_status" => "Git status".to_string(),
-        "git_log" => format!("Git log {preview}"),
-        "git_show" => format!("Git show {preview}"),
-        "git_diff" => format!("Git diff {preview}"),
-        "git_blame" => format!("Git blame {preview}"),
-        "git_file_history" => format!("Git history {preview}"),
-        "git_log_search" => format!("Git log search {preview}"),
-        "git_contributors" => {
+        other_git if other_git.starts_with("git_") => {
+            let action = &other_git[4..]; // strip "git_" prefix
+            let action_display = action.replace('_', " ");
             if preview.is_empty() {
-                "Git contributors".to_string()
+                format!("Git {action_display}")
             } else {
-                format!("Git contributors {preview}")
+                format!("Git {action_display} {preview}")
             }
         }
-        "git_commit" => format!("Git commit {preview}"),
-        "git_revert_commit" => format!("Git revert {preview}"),
-        "git_stash" => format!("Git stash {preview}"),
-        "git_checkout_file" => format!("Git checkout {preview}"),
-        "git_worktree" => format!("Git worktree {preview}"),
         "find_definition" => format!("Find definition of {preview}"),
         "find_references" => format!("Find references to {preview}"),
         "symbol_search" => format!("Search symbol {preview}"),
@@ -6551,14 +6174,6 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
             }
         }
         "introspect" => "Introspecting…".to_string(),
-        // Legacy individual names for journal replay / old sessions.
-        "github_get_pr" => format!("Getting PR: {preview}"),
-        "github_list_prs" => format!("Listing PRs: {preview}"),
-        "github_get_issue" => format!("Getting issue: {preview}"),
-        "github_list_issues" => format!("Listing issues: {preview}"),
-        "github_repo_stats" => format!("GitHub stats: {preview}"),
-        "github_ci_status" => format!("GitHub CI: {preview}"),
-        "github_create_issue" => format!("Creating issue: {preview}"),
         "get_agent_info" => format!("Getting agent info: {preview}"),
         "reflect" => format!("Reflecting: \"{preview}\""),
         "context_analysis" => format!("Context analysis: {preview}"),
@@ -6891,16 +6506,17 @@ mod tests {
         apply_edge_auth_failure_result, approval_batch_group_key, approval_default_always_scope,
         approval_memory_action, approval_memory_preview, approval_scope_context_for_tool,
         approval_stale_revalidation_error, catch_tool_execution_panic, dispatch_turn_event_block,
-        execute_with_metadata_responsive, extract_cli_diff_block, format_tool_display_from_preview,
-        is_edge_auth_failure, merge_edge_tool_rounds, path_mtime_ms, reusable_speculative_output,
-        style_tool_description, sync_incremental_accum_state, sync_incremental_tool_result_state,
-        task_preview_from_args, theme, tool_completion_icon, tool_dedup_signature,
+        edge_tool_is_cacheable_read, edge_tool_outcome_status, execute_with_metadata_responsive,
+        extract_cli_diff_block, format_tool_display_from_preview, is_edge_auth_failure,
+        merge_edge_tool_rounds, normalize_sandbox_denied_outcome, path_mtime_ms,
+        reusable_speculative_output, style_tool_description, sync_incremental_accum_state,
+        sync_incremental_tool_result_state, task_preview_from_args, theme, tool_completion_icon,
+        tool_dedup_signature,
     };
     use crate::cli::chat_stream;
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     use crate::cli::stream::streaming_md;
     use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalEventType};
-    use astra_turn_core::headless_tool_assembly::READ_ONLY_TOOLS;
     use astra_turn_core::sse_stream_host::SseStreamHost;
     use astra_turn_core::turn_event_sink::IncrementalTurnState;
     use serde_json::Value;
@@ -7182,7 +6798,7 @@ mod tests {
 
         let ctx = approval_scope_context_for_tool(
             "bash",
-            &serde_json::json!({"command": r#"cd rust && grep -n "restore_session_into_state\|is_low_information_followup" rust/crates/astra-cli/src/cli/session_input.rs"#}),
+            &serde_json::json!({"command": r#"cd rust && grep -n "restore_session_into_state\|clear_pending_recovery" rust/crates/astra-cli/src/cli/session/session_input.rs"#}),
             false,
             false,
         );
@@ -7452,6 +7068,206 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
+    async fn sandbox_preflight_auto_expands_explicit_external_path() {
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let base = tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("tempdir");
+        let project = base.path().join("project");
+        let external = base.path().join("external");
+        std::fs::create_dir(&project).expect("project");
+        std::fs::create_dir(&external).expect("external");
+        let target = external.join("notes.md");
+        std::fs::write(&target, "outside\n").expect("target");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(&project));
+        let before = executor
+            .resolve_checked(&target.to_string_lossy())
+            .expect_err("external path should start outside the sandbox");
+        assert!(crate::sandbox_retry::is_sandbox_denied(&before), "{before}");
+
+        let mut tool_cache = EdgeToolCache::new(8);
+        let mut pm =
+            crate::cli::permission_manager::PermissionManager::with_project(false, &project);
+        pm.set_mode(crate::cli::permission_manager::PermissionMode::Auto);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: std::sync::Arc::clone(&executor),
+                render_policy: RenderPolicy::Silent,
+                perm_manager: Some(&mut pm),
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: None,
+            },
+            80,
+            false,
+        );
+
+        let expanded = host
+            .preflight_explicit_path_sandbox_expansion(
+                "read_file",
+                &serde_json::json!({"path": target.to_string_lossy()}),
+            )
+            .await
+            .expect("auto should approve sandbox expansion");
+
+        assert!(expanded);
+        executor
+            .resolve_checked(&target.to_string_lossy())
+            .expect("external path should be allowed after preflight");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn sandbox_preflight_deny_mode_returns_clean_error_without_expanding() {
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let base = tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("tempdir");
+        let project = base.path().join("project");
+        let external = base.path().join("external");
+        std::fs::create_dir(&project).expect("project");
+        std::fs::create_dir(&external).expect("external");
+        let target = external.join("notes.md");
+        std::fs::write(&target, "outside\n").expect("target");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(&project));
+
+        let mut tool_cache = EdgeToolCache::new(8);
+        let mut pm =
+            crate::cli::permission_manager::PermissionManager::with_project(false, &project);
+        pm.set_mode(crate::cli::permission_manager::PermissionMode::Deny);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: std::sync::Arc::clone(&executor),
+                render_policy: RenderPolicy::Silent,
+                perm_manager: Some(&mut pm),
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: None,
+            },
+            80,
+            false,
+        );
+
+        let error = host
+            .preflight_explicit_path_sandbox_expansion(
+                "read_file",
+                &serde_json::json!({"path": target.to_string_lossy()}),
+            )
+            .await
+            .expect_err("deny mode should reject sandbox expansion");
+
+        assert!(error.starts_with("Error: "), "{error}");
+        assert!(
+            !error.contains(crate::sandbox_retry::SANDBOX_DENIED_PREFIX),
+            "{error}"
+        );
+        assert!(
+            error.contains("sandbox expansion for read_file denied"),
+            "{error}"
+        );
+        assert!(
+            executor.resolve_checked(&target.to_string_lossy()).is_err(),
+            "denied preflight must not expand the sandbox"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn parallel_batch_preflights_external_paths_in_auto_mode() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let base = tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("tempdir");
+        let project = base.path().join("project");
+        let external = base.path().join("external");
+        std::fs::create_dir(&project).expect("project");
+        std::fs::create_dir(&external).expect("external");
+        let first = external.join("one.txt");
+        let second = external.join("two.txt");
+        std::fs::write(&first, "one\n").expect("first");
+        std::fs::write(&second, "two\n").expect("second");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(&project));
+
+        let mut tool_cache = EdgeToolCache::new(8);
+        let mut pm =
+            crate::cli::permission_manager::PermissionManager::with_project(false, &project);
+        pm.set_mode(crate::cli::permission_manager::PermissionMode::Auto);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: Some(&mut pm),
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: None,
+            },
+            80,
+            false,
+        );
+
+        let results = host
+            .execute_tools_batch(vec![
+                ToolBatchRequest {
+                    request_id: "pf-1".to_string(),
+                    tool: "read_file".to_string(),
+                    args: serde_json::json!({"path": first.to_string_lossy()}),
+                },
+                ToolBatchRequest {
+                    request_id: "pf-2".to_string(),
+                    tool: "read_file".to_string(),
+                    args: serde_json::json!({"path": second.to_string_lossy()}),
+                },
+            ])
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.status == "success"));
+        assert!(results[0].output.contains("one"), "{}", results[0].output);
+        assert!(results[1].output.contains("two"), "{}", results[1].output);
+        assert!(results.iter().all(|result| {
+            !result
+                .output
+                .contains(crate::sandbox_retry::SANDBOX_DENIED_PREFIX)
+        }));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
     async fn cli_sse_host_mirrors_live_state_into_incremental_snapshot() {
         let server = MockServer::start().await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
@@ -7585,7 +7401,7 @@ mod tests {
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         assert!(matches!(
             reloaded.check_nonblocking("write_file", &args),
-            crate::cli::permission_manager::PermissionDecision::Allow
+            crate::cli::permission_manager::GateOutcome::Allow
         ));
     }
 
@@ -7648,13 +7464,13 @@ mod tests {
         let args = serde_json::json!({"path": ".env"});
         assert!(matches!(
             pm.check_nonblocking("write_file", &args),
-            crate::cli::permission_manager::PermissionDecision::Allow
+            crate::cli::permission_manager::GateOutcome::Allow
         ));
         let mut reloaded =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         assert!(matches!(
             reloaded.check_nonblocking("write_file", &args),
-            crate::cli::permission_manager::PermissionDecision::NeedApproval { .. }
+            crate::cli::permission_manager::GateOutcome::NeedApproval { .. }
         ));
     }
 
@@ -7754,6 +7570,7 @@ mod tests {
             output: Some("done".to_string()),
             duration_ms: Some(1),
             result_hash: None,
+            tool_result_fields: None,
         };
 
         let posted = host.post_tool_result_with_auth_retry(&body).await.is_ok();
@@ -7831,6 +7648,7 @@ mod tests {
             output: Some("done".to_string()),
             duration_ms: Some(1),
             result_hash: None,
+            tool_result_fields: None,
         };
 
         let err = host
@@ -8128,6 +7946,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sandbox_denied_outcome_normalizes_internal_wire_prefix() {
+        let mut outcome = crate::edge_tools::ToolExecutionOutcome::error(
+            "SANDBOX_DENIED: Path '/tmp/out.md' is outside the project directory '/tmp/project'; sandbox approval is required for this external path."
+                .to_string(),
+        );
+
+        let message = normalize_sandbox_denied_outcome(&mut outcome).expect("sandbox denial");
+
+        assert_eq!(
+            message,
+            "Path '/tmp/out.md' is outside the project directory '/tmp/project'; sandbox approval is required for this external path."
+        );
+        assert_eq!(outcome.output, format!("Error: {message}"));
+        let fields = outcome.tool_result_fields.expect("metadata fields");
+        assert_eq!(
+            fields.get("error_kind").and_then(Value::as_str),
+            Some(crate::sandbox_retry::SANDBOX_DENIED_ERROR_KIND)
+        );
+        assert!(
+            !outcome
+                .output
+                .contains(crate::sandbox_retry::SANDBOX_DENIED_PREFIX)
+        );
+    }
+
+    #[test]
+    fn sandbox_denied_outcome_normalizes_metadata_only_result() {
+        let mut outcome = crate::edge_tools::ToolExecutionOutcome {
+            output: "Error: operation blocked by local policy".to_string(),
+            tool_result_fields: Some(crate::sandbox_retry::sandbox_denied_tool_result_fields(
+                "Path '/tmp/out.md' is outside the project directory '/tmp/project'; sandbox approval is required for this external path.",
+            )),
+            is_error: true,
+        };
+
+        let message = normalize_sandbox_denied_outcome(&mut outcome).expect("sandbox denial");
+
+        assert_eq!(
+            outcome.output,
+            "Error: Path '/tmp/out.md' is outside the project directory '/tmp/project'; sandbox approval is required for this external path."
+        );
+        assert_eq!(
+            message,
+            "Path '/tmp/out.md' is outside the project directory '/tmp/project'; sandbox approval is required for this external path."
+        );
+    }
+
     // ── Partial tag detection ────────────────────────────────────────
 
     #[test]
@@ -8245,49 +8111,49 @@ mod tests {
     fn format_git_and_github_previews() {
         // git
         assert_eq!(
-            format_tool_display_from_preview("git_revert_commit", Some("abc123")),
+            format_tool_display_from_preview("git", Some("revert abc123")),
             "Git revert abc123"
         );
         assert_eq!(
-            format_tool_display_from_preview("git_stash", Some("push")),
+            format_tool_display_from_preview("git", Some("stash push")),
             "Git stash push"
         );
         assert_eq!(
-            format_tool_display_from_preview("git_file_history", Some("src/main.rs")),
+            format_tool_display_from_preview("git", Some("history src/main.rs")),
             "Git history src/main.rs"
         );
         assert_eq!(
-            format_tool_display_from_preview("git_log_search", Some("\"auth\"")),
+            format_tool_display_from_preview("git", Some("log search \"auth\"")),
             "Git log search \"auth\""
         );
         assert_eq!(
-            format_tool_display_from_preview("git_contributors", Some("src/ since 30 days ago")),
+            format_tool_display_from_preview("git", Some("contributors src/ since 30 days ago")),
             "Git contributors src/ since 30 days ago"
         );
         // additional git tools
         assert_eq!(
-            format_tool_display_from_preview("git_checkout_file", Some("HEAD~1 -- src/lib.rs")),
+            format_tool_display_from_preview("git", Some("checkout HEAD~1 -- src/lib.rs")),
             "Git checkout HEAD~1 -- src/lib.rs"
         );
         assert_eq!(
-            format_tool_display_from_preview("git_worktree", Some("add feature/ui")),
+            format_tool_display_from_preview("git", Some("worktree add feature/ui")),
             "Git worktree add feature/ui"
         );
         // github
         assert_eq!(
-            format_tool_display_from_preview("github_get_issue", Some("matrixorigin/astra#147")),
-            "Getting issue: matrixorigin/astra#147"
+            format_tool_display_from_preview("github", Some("get_issue matrixorigin/astra#147")),
+            "GitHub: get_issue matrixorigin/astra#147"
         );
         assert_eq!(
-            format_tool_display_from_preview("github_list_issues", Some("matrixorigin/astra")),
-            "Listing issues: matrixorigin/astra"
+            format_tool_display_from_preview("github", Some("list_issues matrixorigin/astra")),
+            "GitHub: list_issues matrixorigin/astra"
         );
         assert_eq!(
             format_tool_display_from_preview(
-                "github_create_issue",
-                Some("matrixorigin/astra: \"Fix renderer drift\"")
+                "github",
+                Some("create_issue matrixorigin/astra: \"Fix renderer drift\"")
             ),
-            "Creating issue: matrixorigin/astra: \"Fix renderer drift\""
+            "GitHub: create_issue matrixorigin/astra: \"Fix renderer drift\""
         );
     }
 
@@ -8484,44 +8350,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn format_path_budget_previews() {
-        let r = StreamRenderState::new();
-        let long_path = "/very/long/path/to/deeply/nested/module/with/more/components/src/lib.rs";
-        // call_graph
-        let p = r
-            ._format_tool_arg_preview_unused(
-                "call_graph",
-                &serde_json::json!({"path": long_path, "start_line": 10, "end_line": 24}),
-            )
-            .expect("preview");
-        assert!(p.starts_with(".../"));
-        assert!(p.ends_with(":10-24"));
-        assert!(p.chars().count() <= 40);
-        // hover_info
-        let p = r
-            ._format_tool_arg_preview_unused(
-                "hover_info",
-                &serde_json::json!({"file": long_path, "line": 42, "column": 3}),
-            )
-            .expect("preview");
-        assert!(p.ends_with(":42:3"));
-        assert!(p.chars().count() <= 40);
-        // extract_members
-        let p = r
-            ._format_tool_arg_preview_unused(
-                "extract_members",
-                &serde_json::json!({"file": long_path, "line": 88}),
-            )
-            .expect("preview");
-        assert!(p.ends_with(":88"));
-        assert!(p.chars().count() <= 40);
-        // lsp hover
-        let p = r._format_tool_arg_preview_unused("lsp", &serde_json::json!({"operation": "hover", "file": long_path, "line": 42, "column": 3})).expect("preview");
-        assert!(p.ends_with(":42:3"));
-        assert!(p.chars().count() <= 40);
-    }
-
     #[serial_test::serial]
     #[tokio::test]
     async fn catch_tool_execution_panic_reports_error_output() {
@@ -8533,6 +8361,16 @@ mod tests {
         assert!(duration_ms >= 10);
         assert!(outcome.output.contains("Tool execution panicked: boom"));
         assert!(outcome.tool_result_fields.is_none());
+    }
+
+    #[test]
+    fn edge_tool_outcome_status_prefers_structured_error_flag() {
+        let outcome = crate::edge_tools::ToolExecutionOutcome {
+            output: "plain body from failing transport".to_string(),
+            tool_result_fields: None,
+            is_error: true,
+        };
+        assert_eq!(edge_tool_outcome_status(&outcome), "error");
     }
     // ── Skill/MCP output summary tests ──
 
@@ -8592,6 +8430,15 @@ mod tests {
             .expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Error);
         assert_eq!(s.text, "bash failed before returning output");
+        let s = r
+            .format_output_summary(
+                "str_replace",
+                "STR_REPLACE FAILED — FILE NOT MODIFIED\n\nWHAT: old_str not found in file.\nWHY:  bytes differ\nNEXT: re-read",
+                "failed",
+            )
+            .expect("summary");
+        assert_eq!(s.kind, ToolOutputSummaryKind::Error);
+        assert_eq!(s.text, "old_str not found in file.");
 
         // grep: match counts + no matches
         let s = r
@@ -8616,8 +8463,14 @@ mod tests {
         assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
         assert_eq!(s.text, "no matches");
 
-        // git_diff
-        let s = r.format_output_summary("git_diff", "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n", "ok").expect("summary");
+        // git(action=diff)
+        let s = r
+            .format_output_summary(
+                "git",
+                "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n",
+                "ok",
+            )
+            .expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
         assert!(s.text.contains("+1"));
         assert!(s.text.contains("-1"));
@@ -8856,11 +8709,30 @@ mod tests {
     #[test]
     fn edge_tool_cache_read_only_and_dedup() {
         // read-only tools lookup
-        assert!(READ_ONLY_TOOLS.contains(&"read_file"));
-        assert!(READ_ONLY_TOOLS.contains(&"grep"));
-        assert!(READ_ONLY_TOOLS.contains(&"glob"));
-        assert!(READ_ONLY_TOOLS.contains(&"git_log"));
-        assert!(!READ_ONLY_TOOLS.contains(&"bash"));
+        assert!(edge_tool_is_cacheable_read(
+            "read_file",
+            &serde_json::json!({"path": "/tmp/foo"})
+        ));
+        assert!(edge_tool_is_cacheable_read(
+            "grep",
+            &serde_json::json!({"pattern": "foo"})
+        ));
+        assert!(edge_tool_is_cacheable_read(
+            "glob",
+            &serde_json::json!({"pattern": "*.rs"})
+        ));
+        assert!(edge_tool_is_cacheable_read(
+            "git",
+            &serde_json::json!({"action": "log"})
+        ));
+        assert!(!edge_tool_is_cacheable_read(
+            "git",
+            &serde_json::json!({"action": "commit", "message": "ship"})
+        ));
+        assert!(!edge_tool_is_cacheable_read(
+            "bash",
+            &serde_json::json!({"command": "ls"})
+        ));
 
         // dedup signature deterministic
         let args = serde_json::json!({"path": "/tmp/foo", "pattern": "bar"});
@@ -8869,6 +8741,22 @@ mod tests {
         assert_eq!(sig1, sig2);
         let sig3 = tool_dedup_signature("read_file", &args);
         assert_ne!(sig1, sig3);
+    }
+
+    #[test]
+    fn batch_transaction_boundary_is_git_action_aware() {
+        assert!(CliSseStreamHost::batch_transaction_boundary_supported(
+            "git",
+            &serde_json::json!({"action": "status"})
+        ));
+        assert!(CliSseStreamHost::batch_transaction_boundary_supported(
+            "git",
+            &serde_json::json!({"action": "commit", "message": "ship"})
+        ));
+        assert!(!CliSseStreamHost::batch_transaction_boundary_supported(
+            "git",
+            &serde_json::json!({"action": "push"})
+        ));
     }
 
     #[serial_test::serial]
@@ -9203,9 +9091,10 @@ mod tests {
             .execute_tools_batch(vec![
                 ToolBatchRequest {
                     request_id: "tr-1".to_string(),
-                    tool: "git_stash".to_string(),
+                    tool: "git".to_string(),
                     args: serde_json::json!({
-                        "action": "push",
+                        "action": "stash",
+                        "sub_action": "push",
                         "message": "txn stash",
                         "transaction_id": "tx-stash",
                         "rollback_on_failure": true,
@@ -9292,8 +9181,9 @@ mod tests {
             .execute_tools_batch(vec![
                 ToolBatchRequest {
                     request_id: "tr-1".to_string(),
-                    tool: "git_commit".to_string(),
+                    tool: "git".to_string(),
                     args: serde_json::json!({
+                        "action": "commit",
                         "message": "txn commit",
                         "transaction_id": "tx-commit",
                         "rollback_on_failure": true,
@@ -9877,6 +9767,99 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
+    async fn edge_tool_cache_hit_emits_matching_tool_completed_event() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let file = temp.path().join("cached.txt");
+        std::fs::write(&file, "v1\n").expect("seed");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut tool_cache = EdgeToolCache::new(8);
+        let read_args = serde_json::json!({"path": "cached.txt"});
+        let read_sig = tool_dedup_signature("read_file", &read_args);
+        tool_cache.output_cache.insert(
+            read_sig,
+            EdgeToolCacheEntry {
+                output: "v1\n".to_string(),
+                status: "success".to_string(),
+                validation: EdgeToolCacheValidation::FileMtime {
+                    path: file.clone(),
+                    timestamp_ms: path_mtime_ms(&file),
+                },
+            },
+        );
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: std::sync::Arc::clone(&executor),
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: Some(event_tx),
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: None,
+            },
+            80,
+            false,
+        );
+
+        let result = host
+            .execute_tool("cache-read-hit", "read_file", &read_args)
+            .await;
+        assert_eq!(result.status, "success");
+        assert_eq!(result.output, "v1\n");
+
+        let started = event_rx.try_recv().expect("tool started event");
+        let completed = event_rx.try_recv().expect("tool completed event");
+        match started {
+            chat_stream::StreamEvent::ToolStarted {
+                name, tool_use_id, ..
+            } => {
+                assert_eq!(name, "read_file");
+                assert_eq!(tool_use_id, "cache-read-hit");
+            }
+            other => panic!("expected ToolStarted, got {other:?}"),
+        }
+        match completed {
+            chat_stream::StreamEvent::ToolCompleted {
+                name,
+                status,
+                output,
+                tool_use_id,
+                ..
+            } => {
+                assert_eq!(name, "read_file");
+                assert_eq!(status, "success");
+                assert_eq!(tool_use_id, "cache-read-hit");
+                assert!(output.as_deref().is_some_and(|text| text.contains("v1")));
+            }
+            other => panic!("expected ToolCompleted, got {other:?}"),
+        }
+        assert!(
+            event_rx.try_recv().is_err(),
+            "cache hit should emit exactly start and completion"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
     async fn successful_write_file_clears_cross_turn_read_cache_and_call_counts() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -10073,7 +10056,7 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn edge_tool_cache_reuses_git_show_when_head_is_unchanged() {
+    async fn edge_tool_cache_reuses_git_action_show_when_head_is_unchanged() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tools/result"))
@@ -10113,28 +10096,28 @@ mod tests {
         let first = host
             .execute_tool(
                 "cache-git-1",
-                "git_show",
-                &serde_json::json!({"commit": "HEAD", "stat_only": true}),
+                "git",
+                &serde_json::json!({"action": "show", "revision": "HEAD", "stat_only": true}),
             )
             .await;
         let second = host
             .execute_tool(
                 "cache-git-2",
-                "git_show",
-                &serde_json::json!({"commit": "HEAD", "stat_only": true}),
+                "git",
+                &serde_json::json!({"action": "show", "revision": "HEAD", "stat_only": true}),
             )
             .await;
 
         assert_eq!(first.output, second.output);
         assert_eq!(
             second.duration_ms, 0,
-            "second git_show should be served from cache"
+            "second git(action=show) should be served from cache"
         );
     }
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn edge_tool_cache_invalidates_git_status_after_worktree_change() {
+    async fn edge_tool_cache_invalidates_git_action_status_after_worktree_change() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tools/result"))
@@ -10173,7 +10156,11 @@ mod tests {
         );
 
         let first = host
-            .execute_tool("cache-git-status-1", "git_status", &serde_json::json!({}))
+            .execute_tool(
+                "cache-git-status-1",
+                "git",
+                &serde_json::json!({"action": "status"}),
+            )
             .await;
         assert!(
             !first.output.contains("tracked.txt"),
@@ -10184,7 +10171,11 @@ mod tests {
         std::fs::write(&tracked, "modified\n").expect("modify tracked file");
 
         let second = host
-            .execute_tool("cache-git-status-2", "git_status", &serde_json::json!({}))
+            .execute_tool(
+                "cache-git-status-2",
+                "git",
+                &serde_json::json!({"action": "status"}),
+            )
             .await;
         assert!(
             second.output.contains("tracked.txt"),
@@ -10338,7 +10329,15 @@ mod tests {
             .await;
 
         assert_ne!(result.status, "error");
-        assert!(result.tool_result_fields.is_none());
+        let runtime_environment = result
+            .tool_result_fields
+            .as_ref()
+            .and_then(|fields| fields.get("runtime_environment_advertisement"))
+            .expect("edge tool result should carry runtime environment advertisement");
+        assert_eq!(
+            runtime_environment["binding"]["workspace"]["cwd"],
+            temp.path().to_string_lossy().as_ref()
+        );
         assert!(
             result
                 .output

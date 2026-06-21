@@ -26,6 +26,11 @@ uuid = { workspace = true }
 # Skill types (for TrustTier)
 astra-skills = { workspace = true }
 
+# Session ID validation — single source of truth for journal filename checks.
+# Avoids the drift between `looks_like_session_journal_file` (alphanumeric
+# allowlist) and the canonical `astra_core::session_id::validate`.
+astra-core = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile = "3"

@@ -113,6 +113,8 @@ pub struct StallSnapshotSummary {
     pub forced_completion_soft_stop: bool,
     pub forced_redundant_reads_corrective: bool,
     pub forced_cache_waste_corrective: bool,
+    #[serde(default)]
+    pub forced_search_fanout_corrective: bool,
     pub forced_exploration_family_phase2: bool,
     pub forced_exploration_family_corrective: bool,
 }
@@ -357,6 +359,7 @@ pub fn render_stall_state(s: &IntrospectSnapshot) -> String {
         || st.forced_completion_soft_stop
         || st.forced_redundant_reads_corrective
         || st.forced_cache_waste_corrective
+        || st.forced_search_fanout_corrective
         || st.forced_exploration_family_phase2
         || st.forced_exploration_family_corrective;
     if st.nudge_count == 0 && st.events.is_empty() && !any_forced {
@@ -391,6 +394,9 @@ pub fn render_stall_state(s: &IntrospectSnapshot) -> String {
     }
     if st.forced_cache_waste_corrective {
         forced.push("cache_waste_corrective");
+    }
+    if st.forced_search_fanout_corrective {
+        forced.push("search_fanout_corrective");
     }
     if st.forced_exploration_family_phase2 {
         forced.push("exploration_family_phase2");

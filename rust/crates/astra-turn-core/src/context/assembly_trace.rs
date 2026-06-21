@@ -657,9 +657,12 @@ pub fn build_memory_trace_from_retrieval(
     ranked_results: &[(String, f64)], // (content, score)
     retrieval_latency_ms: u64,
 ) -> MemoryRetrievalTrace {
+    let mut seen = std::collections::HashSet::new();
     let memories_selected: Vec<MemorySelection> = ranked_results
         .iter()
         .filter(|(content, _)| !astra_prompts::memory_proto::is_session_namespace_memory(content))
+        .filter(|(content, _)| !content.trim().is_empty())
+        .filter(|(content, _)| seen.insert(memory_trace_dedup_key(content)))
         .enumerate()
         .map(|(idx, (content, score))| {
             MemorySelection {
@@ -685,6 +688,15 @@ pub fn build_memory_trace_from_retrieval(
     }
 }
 
+fn memory_trace_dedup_key(content: &str) -> String {
+    content
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|c: char| c.is_ascii_punctuation())
+        .to_ascii_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,6 +716,32 @@ mod tests {
         assert_eq!(trace.session_id, "session-abc");
         assert_eq!(trace.token_budget.max_tokens, 100000);
         assert!((trace.token_budget.budget_pressure - 0.45).abs() < 0.001);
+    }
+
+    #[test]
+    fn memory_trace_deduplicates_equivalent_selected_memories() {
+        let trace = build_memory_trace_from_retrieval(
+            "fix task",
+            3,
+            &[
+                ("Use file editing tools directly.".to_string(), 0.9),
+                ("  use   file editing tools directly  ".to_string(), 0.8),
+                ("Keep task board current.".to_string(), 0.7),
+            ],
+            12,
+        );
+
+        assert_eq!(trace.memories_selected.len(), 2);
+        assert_eq!(trace.memories_selected[0].memory_id, "mem-0");
+        assert_eq!(trace.memories_selected[1].memory_id, "mem-1");
+        assert_eq!(
+            trace.total_tokens,
+            trace
+                .memories_selected
+                .iter()
+                .map(|m| m.tokens)
+                .sum::<u32>()
+        );
     }
 
     #[test]

@@ -33,10 +33,10 @@ pub enum EvalSignal {
     NoToolsNeeded,
     /// All tools succeeded with good output.
     AllToolsHealthy,
-    /// A long run of consecutive single-tool rounds was detected — the model
-    /// likely should have batched these into parallel rounds. Carries the
-    /// length of the longest consecutive single-tool-round streak.
-    SequentialReadChurn(usize),
+    /// One or more tool calls returned a cache/no-op/unchanged-result stub
+    /// instead of fresh observational evidence. Carries the count.
+    NoOpToolResults(usize),
+
     /// Multiple read tool calls hit overlapping line ranges of the same file
     /// without any intervening workspace mutation, suggesting the model
     /// re-read content it had already loaded into context. Carries the
@@ -78,14 +78,12 @@ pub enum EvalSignal {
         tool_calls: usize,
         llm_rounds: Option<u32>,
     },
+    /// A tool command completed at the transport/execution layer but its
+    /// classified outcome still represents an unresolved task failure
+    /// (`test_failure`, `env_failure`, `execution_error`). Carries the
+    /// normalized result class and number of unresolved streams.
+    ToolOutcomeFailure { class: String, count: usize },
 }
-
-/// Default threshold for [`EvalSignal::SequentialReadChurn`]: how many
-/// consecutive single-tool rounds we tolerate before flagging the turn.
-/// Calibrated against real session data: healthy turns (mutate→verify chains,
-/// locate→read pairs) observed up to 6; wasted turns (pure exploratory churn)
-/// observed at 10+.
-pub const SEQUENTIAL_READ_CHURN_THRESHOLD: usize = 8;
 
 /// Default threshold for [`EvalSignal::RedundantOverlappingReads`]: minimum
 /// count of redundant read events needed before flagging the turn. Calibrated
@@ -134,7 +132,6 @@ const HIGH_COST_TOOL_CALL_THRESHOLD: usize = 16;
 /// passive eval signals can be tuned without a rebuild.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EvaluationThresholds {
-    pub sequential_read_churn: usize,
     pub redundant_overlapping_reads: usize,
     pub search_fanout: usize,
     pub redundant_validation_retries: usize,
@@ -145,7 +142,6 @@ pub struct EvaluationThresholds {
 impl Default for EvaluationThresholds {
     fn default() -> Self {
         Self {
-            sequential_read_churn: SEQUENTIAL_READ_CHURN_THRESHOLD,
             redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD,
             search_fanout: SEARCH_FANOUT_THRESHOLD,
             redundant_validation_retries: REDUNDANT_VALIDATION_RETRIES_THRESHOLD,
@@ -187,6 +183,7 @@ pub struct ToolCallInfo {
     pub ms: u64,
     pub error: Option<String>,
     pub output_bytes: Option<u32>,
+    pub no_op: bool,
 }
 
 /// Evaluate a completed turn from its observable signals.
@@ -236,13 +233,23 @@ pub fn evaluate_turn(
     // ─── Tool error analysis ────────────────────────────────────────────
     let error_count = tool_calls.iter().filter(|tc| !tc.ok).count();
     let error_rate = error_count as f64 / total_calls as f64;
+    let no_op_count = tool_calls.iter().filter(|tc| tc.no_op).count();
     signals.push(EvalSignal::ToolErrorRate(error_rate));
 
-    if error_rate == 0.0 {
+    if no_op_count > 0 {
+        signals.push(EvalSignal::NoOpToolResults(no_op_count));
+        let penalty = (0.08 * (no_op_count as f64 / total_calls as f64)).clamp(0.03, 0.15);
+        quality -= penalty;
+    }
+
+    if error_rate == 0.0 && no_op_count < total_calls {
         // All tools succeeded
         quality += 0.3;
         confidence += 0.2;
         signals.push(EvalSignal::AllToolsHealthy);
+    } else if error_rate == 0.0 {
+        // All reported ok, but none produced fresh evidence.
+        confidence += 0.05;
     } else if error_rate < 0.5 {
         // Some errors but mostly ok
         quality += 0.1;
@@ -405,6 +412,7 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
             ms: record.ms,
             error: record.error.clone(),
             output_bytes: record.output_bytes,
+            no_op: record.is_noop_or_cached_result(),
         })
         .collect::<Vec<_>>();
     let is_live_query = looks_like_live_query_with_context(input, recent_tools);
@@ -416,21 +424,6 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
         is_live_query,
     );
     eval.thresholds = thresholds;
-
-    // ─── Sequential read-churn detection ────────────────────────────────
-    // Count the longest run of consecutive single-tool rounds across the
-    // real (non-synthetic, non-policy-blocked) records. Excludes records
-    // without a `round` index (e.g., orphaned tail records). When the run
-    // is ≥ the configured threshold, the model almost certainly
-    // could have batched these calls into parallel rounds.
-    let max_streak = longest_single_tool_round_streak(tool_call_records);
-    if max_streak >= thresholds.sequential_read_churn {
-        eval.signals
-            .push(EvalSignal::SequentialReadChurn(max_streak));
-        let penalty = (0.05 + 0.01 * (max_streak - thresholds.sequential_read_churn) as f64)
-            .clamp(0.05, 0.20);
-        eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
-    }
 
     // ─── Redundant overlapping read detection ───────────────────────────
     // Detects the failure mode where the model re-reads the SAME file/line
@@ -533,6 +526,7 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
 
     revoke_all_tools_healthy_when_quality_signals_disagree(&mut eval, &tool_calls);
     align_high_cost_low_yield_verdict(&mut eval, &tool_calls, telemetry);
+    apply_unresolved_tool_outcome_failures(&mut eval, tool_call_records);
 
     eval
 }
@@ -545,7 +539,7 @@ fn is_negative_quality_signal(signal: &EvalSignal) -> bool {
             | EvalSignal::HighBudgetPressure
             | EvalSignal::RepeatToolCall(_)
             | EvalSignal::VerdictWarning
-            | EvalSignal::SequentialReadChurn(_)
+            | EvalSignal::NoOpToolResults(_)
             | EvalSignal::RedundantOverlappingReads(_)
             | EvalSignal::SearchFanout(_)
             | EvalSignal::RedundantValidationRetries(_)
@@ -553,6 +547,7 @@ fn is_negative_quality_signal(signal: &EvalSignal) -> bool {
             | EvalSignal::PromptGrowthChurn { .. }
             | EvalSignal::ExplorationFamilyChurn { .. }
             | EvalSignal::HighCostLowYield { .. }
+            | EvalSignal::ToolOutcomeFailure { .. }
     )
 }
 
@@ -569,7 +564,7 @@ fn is_strong_low_yield_signal(signal: &EvalSignal) -> bool {
     matches!(
         signal,
         EvalSignal::RepeatToolCall(_)
-            | EvalSignal::SequentialReadChurn(_)
+            | EvalSignal::NoOpToolResults(_)
             | EvalSignal::RedundantOverlappingReads(_)
             | EvalSignal::RedundantValidationRetries(_)
             | EvalSignal::ExplorationFamilyChurn { .. }
@@ -581,7 +576,7 @@ fn is_low_yield_signal(signal: &EvalSignal) -> bool {
         signal,
         EvalSignal::EmptyToolOutput
             | EvalSignal::RepeatToolCall(_)
-            | EvalSignal::SequentialReadChurn(_)
+            | EvalSignal::NoOpToolResults(_)
             | EvalSignal::RedundantOverlappingReads(_)
             | EvalSignal::SearchFanout(_)
             | EvalSignal::RedundantValidationRetries(_)
@@ -650,40 +645,93 @@ fn align_high_cost_low_yield_verdict(
     eval.success = error_rate < 0.5 && eval.quality > 0.35;
 }
 
-/// Group real (non-synthetic, non-policy-blocked) tool-call records by their
-/// `round` index and return the longest run of consecutive rounds that each
-/// contained exactly one tool call. Records without a round index are
-/// ignored to avoid false positives from orphaned tail entries.
-fn longest_single_tool_round_streak(records: &[ToolCallRecord]) -> usize {
-    use std::collections::BTreeMap;
-    let mut per_round: BTreeMap<u32, usize> = BTreeMap::new();
+fn result_class_is_outcome_failure(class: &str) -> bool {
+    matches!(class, "test_failure" | "env_failure" | "execution_error")
+}
+
+fn result_class_resolves_outcome_failure(class: &str) -> bool {
+    matches!(class, "success" | "domain_negative")
+}
+
+fn hash_bounded_key(value: &str) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn outcome_resolution_key(record: &ToolCallRecord) -> Option<String> {
+    let class = record.result_class.as_deref()?.trim();
+    if !result_class_is_outcome_failure(class) && !result_class_resolves_outcome_failure(class) {
+        return None;
+    }
+
+    let args = record.args_full.as_deref().unwrap_or("").trim();
+    if let Some(prefix) = normalize_validation_prefix(&record.name, args) {
+        return Some(format!("validation::{prefix}"));
+    }
+
+    let args_key = if !args.is_empty() {
+        args
+    } else {
+        record.args_preview.as_deref().unwrap_or("").trim()
+    };
+    Some(format!(
+        "tool::{}::{}",
+        record.name,
+        hash_bounded_key(args_key)
+    ))
+}
+
+fn unresolved_tool_outcome_failure_counts(
+    records: &[ToolCallRecord],
+) -> std::collections::BTreeMap<String, usize> {
+    let mut unresolved_by_key = std::collections::BTreeMap::<String, String>::new();
+
     for record in records {
         if record.is_synthetic_placeholder() || record.was_blocked_by_policy() {
             continue;
         }
-        if let Some(round) = record.round {
-            *per_round.entry(round).or_insert(0) += 1;
+        let Some(class) = record.result_class.as_deref().map(str::trim) else {
+            continue;
+        };
+        let Some(key) = outcome_resolution_key(record) else {
+            continue;
+        };
+
+        if result_class_is_outcome_failure(class) {
+            unresolved_by_key.insert(key, class.to_string());
+        } else if result_class_resolves_outcome_failure(class) {
+            unresolved_by_key.remove(&key);
         }
     }
-    let mut current = 0_usize;
-    let mut best = 0_usize;
-    let mut prev_round: Option<u32> = None;
-    for (&round, &count) in &per_round {
-        // A gap in round indices breaks the streak — the missing round(s)
-        // may have been filtered out (synthetic/blocked) and we cannot
-        // assume they were single-tool.
-        let adjacent = prev_round.is_none_or(|p| round == p + 1);
-        if count == 1 && adjacent {
-            current += 1;
-            if current > best {
-                best = current;
-            }
-        } else {
-            current = if count == 1 { 1 } else { 0 };
-        }
-        prev_round = Some(round);
+
+    let mut counts = std::collections::BTreeMap::new();
+    for class in unresolved_by_key.values() {
+        *counts.entry(class.clone()).or_insert(0) += 1;
     }
-    best
+    counts
+}
+
+fn apply_unresolved_tool_outcome_failures(eval: &mut TurnEvaluation, records: &[ToolCallRecord]) {
+    let counts = unresolved_tool_outcome_failure_counts(records);
+    let total: usize = counts.values().sum();
+    if total == 0 {
+        return;
+    }
+
+    eval.signals
+        .retain(|signal| !matches!(signal, EvalSignal::AllToolsHealthy));
+    for (class, count) in counts {
+        eval.signals
+            .push(EvalSignal::ToolOutcomeFailure { class, count });
+    }
+
+    let penalty = (0.25 + 0.08 * total.saturating_sub(1) as f64).clamp(0.25, 0.50);
+    eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
+    eval.confidence = (eval.confidence + 0.15).clamp(0.0, 1.0);
+    eval.success = false;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1150,14 +1198,14 @@ pub fn eval_signal_to_json_with_thresholds(
             "kind": "all_tools_healthy",
             "message": "All tool calls completed successfully with non-empty output",
         }),
-        EvalSignal::SequentialReadChurn(streak) => json!({
-            "kind": "sequential_read_churn",
-            "streak": streak,
-            "threshold": thresholds.sequential_read_churn,
+        EvalSignal::NoOpToolResults(count) => json!({
+            "kind": "noop_tool_results",
+            "count": count,
             "message": format!(
-                "Detected {streak} consecutive single-tool rounds — these calls likely should have been batched into parallel rounds"
+                "Detected {count} tool result(s) that reused cached or already-known observations instead of fresh evidence"
             ),
         }),
+
         EvalSignal::RedundantOverlappingReads(count) => json!({
             "kind": "redundant_overlapping_reads",
             "count": count,
@@ -1234,6 +1282,14 @@ pub fn eval_signal_to_json_with_thresholds(
                 ),
             },
         }),
+        EvalSignal::ToolOutcomeFailure { class, count } => json!({
+            "kind": "tool_outcome_failure",
+            "class": class,
+            "count": count,
+            "message": format!(
+                "Detected {count} unresolved tool outcome failure(s) classified as `{class}`"
+            ),
+        }),
     }
 }
 pub fn eval_signals_to_json_with_thresholds(
@@ -1295,6 +1351,7 @@ mod tests {
             ms: 100,
             error: None,
             output_bytes: Some(500),
+            no_op: false,
         }
     }
 
@@ -1306,6 +1363,7 @@ mod tests {
             ms: 50,
             error: Some("tool error".to_string()),
             output_bytes: None,
+            no_op: false,
         }
     }
 
@@ -1317,6 +1375,19 @@ mod tests {
             ms: 100,
             error: None,
             output_bytes: Some(0),
+            no_op: false,
+        }
+    }
+
+    fn noop_call(name: &str) -> ToolCallInfo {
+        ToolCallInfo {
+            name: name.to_string(),
+            repeat_key: name.to_string(),
+            ok: true,
+            ms: 10,
+            error: None,
+            output_bytes: Some(120),
+            no_op: true,
         }
     }
 
@@ -1463,6 +1534,23 @@ mod tests {
     }
 
     #[test]
+    fn noop_tool_results_are_low_yield_not_all_tools_healthy() {
+        let eval = evaluate_turn(&[noop_call("read_file")], 0, false, 0.3, false);
+
+        assert!(eval.signals.contains(&EvalSignal::NoOpToolResults(1)));
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::AllToolsHealthy)),
+            "{:?}",
+            eval.signals
+        );
+        assert!(eval.success);
+        assert!(eval.quality < 0.5, "{eval:?}");
+    }
+
+    #[test]
     fn evaluate_tool_call_records_reuses_live_query_heuristic() {
         let eval = evaluate_tool_call_records(
             "Check the latest git status",
@@ -1474,6 +1562,92 @@ mod tests {
         );
         assert!(!eval.success);
         assert!(eval.signals.contains(&EvalSignal::NoToolsNeeded));
+    }
+
+    #[test]
+    fn evaluate_tool_call_records_counts_cached_read_as_noop() {
+        let mut record = journal_ok_call("read_file");
+        record.error = Some("cached_cross_turn".to_string());
+        record.result_preview = Some("[cached_cross_turn: reused 200 bytes]".to_string());
+
+        let eval = evaluate_tool_call_records("Summarize file", &[], &[record], 0, false, 0.2);
+
+        assert!(eval.signals.contains(&EvalSignal::NoOpToolResults(1)));
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::AllToolsHealthy)),
+            "{:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn evaluate_tool_call_records_marks_unresolved_outcome_failure_unsuccessful() {
+        let mut record = journal_ok_call("bash");
+        record.args_full = Some(
+            serde_json::json!({"command": "cargo test -p astra-runtime 2>&1 | tail -20"})
+                .to_string(),
+        );
+        record.result_class = Some("test_failure".to_string());
+        record.exit_semantics = Some("domain_negative".to_string());
+
+        let eval = evaluate_tool_call_records("run the tests", &[], &[record], 0, false, 0.2);
+
+        assert!(!eval.success, "{eval:?}");
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::AllToolsHealthy)),
+            "{:?}",
+            eval.signals
+        );
+        assert!(eval.signals.iter().any(|signal| matches!(
+            signal,
+            EvalSignal::ToolOutcomeFailure { class, count }
+                if class == "test_failure" && *count == 1
+        )));
+        let json = eval_signals_to_json_with_thresholds(&eval.signals, eval.thresholds);
+        assert!(
+            json.iter()
+                .any(|signal| signal["kind"] == "tool_outcome_failure"
+                    && signal["class"] == "test_failure")
+        );
+    }
+
+    #[test]
+    fn later_matching_success_resolves_tool_outcome_failure() {
+        let mut failed = journal_ok_call("bash");
+        failed.args_full = Some(
+            serde_json::json!({"command": "cargo test -p astra-runtime | tail -20"}).to_string(),
+        );
+        failed.result_class = Some("test_failure".to_string());
+        failed.exit_semantics = Some("domain_negative".to_string());
+
+        let mut passed = journal_ok_call("bash");
+        passed.args_full =
+            Some(serde_json::json!({"command": "cargo test -p astra-runtime"}).to_string());
+        passed.result_class = Some("success".to_string());
+        passed.exit_semantics = Some("success".to_string());
+
+        let eval = evaluate_tool_call_records(
+            "fix and rerun the tests",
+            &[],
+            &[failed, passed],
+            0,
+            false,
+            0.2,
+        );
+
+        assert!(eval.success, "{eval:?}");
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::ToolOutcomeFailure { .. }))
+        );
     }
 
     #[test]
@@ -2288,153 +2462,6 @@ mod tests {
             ..Default::default()
         }
     }
-
-    #[test]
-    fn sequential_read_churn_flags_long_single_tool_streak() {
-        // Mirrors session 6566d6a8 turn 1: 10 consecutive read_file rounds,
-        // each with exactly one tool call. The model should have batched.
-        let mut records = Vec::new();
-        for r in 0..10 {
-            records.push(record_in_round("read_file", r, None));
-        }
-        let eval =
-            evaluate_tool_call_records("explain the auth flow", &[], &records, 0, false, 0.3);
-        let streak = eval.signals.iter().find_map(|s| match s {
-            EvalSignal::SequentialReadChurn(n) => Some(*n),
-            _ => None,
-        });
-        assert_eq!(
-            streak,
-            Some(10),
-            "expected SequentialReadChurn(10), got signals={:?}",
-            eval.signals
-        );
-        assert!(
-            !eval
-                .signals
-                .iter()
-                .any(|s| matches!(s, EvalSignal::AllToolsHealthy)),
-            "wasteful single-tool churn must not still look healthy: {:?}",
-            eval.signals
-        );
-        // Quality should be docked by the churn penalty.
-        let baseline =
-            evaluate_tool_call_records("explain the auth flow", &[], &records[..1], 0, false, 0.3);
-        assert!(
-            eval.quality < baseline.quality,
-            "churn turn quality={} should be below baseline={}",
-            eval.quality,
-            baseline.quality
-        );
-    }
-
-    #[test]
-    fn sequential_read_churn_does_not_flag_well_batched_turn() {
-        // Mirrors session 03945541 turn 2: 6 rounds, mostly batched in
-        // parallel pairs, with a few legitimately-sequential rounds for
-        // mutate→verify chains. max_consec_single_tool_rounds = 4.
-        let records = vec![
-            // round 0: 4-tool parallel batch
-            record_in_round("git_show", 0, Some("b-0-0")),
-            record_in_round("git_show", 0, Some("b-0-0")),
-            record_in_round("git_show", 0, Some("b-0-0")),
-            record_in_round("git_show", 0, Some("b-0-0")),
-            // round 1: 2-tool parallel
-            record_in_round("bash", 1, Some("b-1-0")),
-            record_in_round("bash", 1, Some("b-1-0")),
-            // rounds 2-5: 4 consecutive single-tool rounds (mutate→verify)
-            record_in_round("str_replace", 2, None),
-            record_in_round("read_file", 3, None),
-            record_in_round("str_replace", 4, None),
-            record_in_round("bash", 5, None),
-            // round 6: 2-tool parallel batch (cargo test pair)
-            record_in_round("bash", 6, Some("b-6-0")),
-            record_in_round("bash", 6, Some("b-6-0")),
-        ];
-        let eval = evaluate_tool_call_records("ship the fix", &[], &records, 0, false, 0.3);
-        assert!(
-            !eval
-                .signals
-                .iter()
-                .any(|s| matches!(s, EvalSignal::SequentialReadChurn(_))),
-            "well-batched turn should NOT emit SequentialReadChurn; got {:?}",
-            eval.signals
-        );
-    }
-
-    #[test]
-    fn sequential_read_churn_does_not_flag_parallel_only_turn() {
-        // 12 rounds, every one with 3 parallel tools. Zero single-tool rounds.
-        let mut records = Vec::new();
-        for r in 0..12 {
-            let batch = format!("b-{r}-0");
-            for _ in 0..3 {
-                records.push(record_in_round("read_file", r, Some(batch.as_str())));
-            }
-        }
-        let eval = evaluate_tool_call_records("survey the codebase", &[], &records, 0, false, 0.3);
-        assert!(
-            !eval
-                .signals
-                .iter()
-                .any(|s| matches!(s, EvalSignal::SequentialReadChurn(_))),
-            "all-parallel turn should NOT emit SequentialReadChurn; got {:?}",
-            eval.signals
-        );
-    }
-
-    #[test]
-    fn sequential_read_churn_below_threshold_is_silent() {
-        // Mirrors 03945541 turn 1: 6 single-tool rounds, just under the
-        // threshold of 8. Should NOT trigger.
-        let records: Vec<_> = (0..6)
-            .map(|r| record_in_round("git_show", r, None))
-            .collect();
-        let eval = evaluate_tool_call_records("review", &[], &records, 0, false, 0.3);
-        assert!(
-            !eval
-                .signals
-                .iter()
-                .any(|s| matches!(s, EvalSignal::SequentialReadChurn(_))),
-            "6 single-tool rounds is below threshold; got {:?}",
-            eval.signals
-        );
-    }
-
-    #[test]
-    fn sequential_read_churn_signal_serializes_to_json() {
-        let value = eval_signal_to_json(&EvalSignal::SequentialReadChurn(11));
-        assert_eq!(value["kind"], "sequential_read_churn");
-        assert_eq!(value["streak"], 11);
-        assert_eq!(value["threshold"], SEQUENTIAL_READ_CHURN_THRESHOLD as i64);
-        assert!(value["message"].as_str().unwrap().contains("11"));
-    }
-
-    #[test]
-    fn sequential_read_churn_custom_threshold_is_respected() {
-        let records: Vec<_> = (0..6)
-            .map(|r| record_in_round("git_show", r, None))
-            .collect();
-        let eval = evaluate_tool_call_records_with_thresholds(
-            "review",
-            &[],
-            &records,
-            0,
-            false,
-            0.3,
-            EvaluationThresholds {
-                sequential_read_churn: 6,
-                ..Default::default()
-            },
-        );
-        let streak = eval.signals.iter().find_map(|s| match s {
-            EvalSignal::SequentialReadChurn(n) => Some(*n),
-            _ => None,
-        });
-        assert_eq!(streak, Some(6));
-        assert_eq!(eval.thresholds.sequential_read_churn, 6);
-    }
-
     #[test]
     fn exploration_family_churn_flags_repeated_git_diff_rounds() {
         let mut records = vec![record_in_round("git_diff", 0, None)];
@@ -2551,100 +2578,6 @@ mod tests {
         assert_eq!(value["tool_calls"], 12);
         assert_eq!(value["llm_rounds"], 9);
     }
-
-    #[test]
-    fn sequential_read_churn_streak_broken_by_round_gap() {
-        // Rounds 0,1,2 (single-tool) then gap (round 3 missing) then
-        // rounds 4,5,6,7,8,9,10,11,12 (single-tool). Without gap-awareness
-        // the streak would be 12; with it, the two segments are 3 and 9.
-        let mut records = Vec::new();
-        for r in [0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12] {
-            records.push(record_in_round("read_file", r, None));
-        }
-        let eval = evaluate_tool_call_records("explore", &[], &records, 0, false, 0.3);
-        let streak = eval.signals.iter().find_map(|s| match s {
-            EvalSignal::SequentialReadChurn(n) => Some(*n),
-            _ => None,
-        });
-        // Longest contiguous segment is 9 (rounds 4-12), which exceeds
-        // the threshold of 8.
-        assert_eq!(
-            streak,
-            Some(9),
-            "gap must break streak; expected 9, got {:?}",
-            eval.signals
-        );
-    }
-
-    #[test]
-    fn sequential_read_churn_gap_splits_below_threshold() {
-        // Two segments of 4 separated by a gap — neither reaches threshold.
-        let mut records = Vec::new();
-        for r in [0, 1, 2, 3, 8, 9, 10, 11] {
-            records.push(record_in_round("read_file", r, None));
-        }
-        let eval = evaluate_tool_call_records("explore", &[], &records, 0, false, 0.3);
-        assert!(
-            !eval
-                .signals
-                .iter()
-                .any(|s| matches!(s, EvalSignal::SequentialReadChurn(_))),
-            "two segments of 4 with gap should not trigger; got {:?}",
-            eval.signals
-        );
-    }
-
-    // ─── Graduated penalty calibration ─────────────────────────────────
-    //
-    // Formula: penalty = (0.05 + 0.01 * (streak - THRESHOLD)).clamp(0.05, 0.20)
-    // We verify three points: at threshold, mid-range, and cap.
-    // To isolate the churn penalty from other quality factors, we compare
-    // two evaluations with the SAME number of records — one with all
-    // single-tool rounds (triggers churn), one with all records in a
-    // single round (no churn). The quality delta is purely the penalty.
-
-    fn churn_penalty_for_streak(streak: usize) -> f64 {
-        // All-single-tool-rounds: triggers SequentialReadChurn.
-        let churn_records: Vec<_> = (0..streak as u32)
-            .map(|r| record_in_round("read_file", r, None))
-            .collect();
-        // Same records but all in round 0: one round with `streak` tools,
-        // so longest single-tool streak = 0 → no churn penalty.
-        let batched_records: Vec<_> = (0..streak)
-            .map(|_| record_in_round("read_file", 0, None))
-            .collect();
-        let eval_churn = evaluate_tool_call_records("q", &[], &churn_records, 0, false, 0.3);
-        let eval_batched = evaluate_tool_call_records("q", &[], &batched_records, 0, false, 0.3);
-        eval_batched.quality - eval_churn.quality
-    }
-
-    #[test]
-    fn graduated_penalty_at_threshold_is_minimum() {
-        let penalty = churn_penalty_for_streak(SEQUENTIAL_READ_CHURN_THRESHOLD); // 8
-        assert!(
-            (penalty - 0.05).abs() < 1e-9,
-            "streak=8 should penalize 0.05, got {penalty}"
-        );
-    }
-
-    #[test]
-    fn graduated_penalty_scales_with_streak() {
-        let penalty = churn_penalty_for_streak(18);
-        assert!(
-            (penalty - 0.15).abs() < 1e-9,
-            "streak=18 should penalize 0.15, got {penalty}"
-        );
-    }
-
-    #[test]
-    fn graduated_penalty_caps_at_maximum() {
-        let penalty = churn_penalty_for_streak(30);
-        assert!(
-            (penalty - 0.20).abs() < 1e-9,
-            "streak=30 should cap at 0.20, got {penalty}"
-        );
-    }
-
     // ─── Search fan-out detection ────────────────────────────────────────
 
     #[test]

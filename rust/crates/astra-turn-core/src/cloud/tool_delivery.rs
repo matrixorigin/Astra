@@ -33,6 +33,8 @@ use crate::tool::result::sanitize::tool_result_content_for_model;
 
 pub const MSG_APPROVAL_LEDGER_TIMEOUT: &str =
     "timed out waiting for edge POST /approval/respond (§5.5 ledger)";
+const MSG_TOOL_LEDGER_MISSING: &str =
+    "missing edge tool-result ledger entry after tool wait completed";
 const JOURNAL_REPLAY_POLL_INTERVAL_MS: u64 = 250;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,11 +216,25 @@ fn structured_tool_result(
         };
     }
 
-    let body = ledger_entry
+    let Some(body) = ledger_entry
         .and_then(|entry| entry.get("body"))
-        .unwrap_or_else(|| {
-            ledger_entry.expect("structured_tool_result requires ledger entry when not timed out")
-        });
+        .or(ledger_entry)
+    else {
+        return EdgeDeliveredToolResult {
+            tool_call_id: tool_call_id.to_string(),
+            status: "missing_ledger".to_string(),
+            tool_result_fields: Some(Map::from_iter([
+                (
+                    "status".to_string(),
+                    Value::String("missing_ledger".to_string()),
+                ),
+                (
+                    "output".to_string(),
+                    Value::String(MSG_TOOL_LEDGER_MISSING.to_string()),
+                ),
+            ])),
+        };
+    };
     EdgeDeliveredToolResult {
         tool_call_id: tool_call_id.to_string(),
         status: body
@@ -226,7 +242,11 @@ fn structured_tool_result(
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string(),
-        tool_result_fields: body.as_object().cloned(),
+        tool_result_fields: body
+            .get("tool_result_fields")
+            .and_then(Value::as_object)
+            .cloned()
+            .or_else(|| body.as_object().cloned()),
     }
 }
 
@@ -1130,6 +1150,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_tool_result_prefers_nested_tool_result_fields() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let uid = "u1_nested";
+        let tc = read_tool("c_nested");
+        ledger.lock().await.insert(
+            tool_callback_key(uid, "c_nested"),
+            json!({
+                "body": {
+                    "request_id": "c_nested",
+                    "status": "ok",
+                    "output": "done",
+                    "duration_ms": 5,
+                    "tool_result_fields": {
+                        "runtime_environment_advertisement": {"schema_version": 1}
+                    }
+                }
+            }),
+        );
+
+        let delivery =
+            wait_tool_result_ledger_for_tool(&ledger, uid, &tc, Duration::from_millis(60)).await;
+        let fields = delivery.tool_results[0]
+            .tool_result_fields
+            .as_ref()
+            .expect("nested structured fields");
+        assert!(fields.get("request_id").is_none());
+        assert_eq!(
+            fields
+                .get("runtime_environment_advertisement")
+                .and_then(|value| value.get("schema_version"))
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
     async fn tool_result_wait_is_user_scoped_and_does_not_consume_wrong_user_entry() {
         let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let tc = read_tool("shared-call");
@@ -1174,6 +1230,23 @@ mod tests {
             Some("wrong-user")
         );
         assert!(ledger.lock().await.is_empty());
+    }
+
+    #[test]
+    fn structured_tool_result_missing_ledger_fails_closed_instead_of_panicking() {
+        let result = structured_tool_result("missing-call", None, false);
+
+        assert_eq!(result.tool_call_id, "missing-call");
+        assert_eq!(result.status, "missing_ledger");
+        assert!(
+            result
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("output"))
+                .and_then(Value::as_str)
+                .is_some_and(|output| output.contains("missing edge tool-result ledger entry")),
+            "missing ledger entries must be surfaced as structured output"
+        );
     }
 
     #[tokio::test]

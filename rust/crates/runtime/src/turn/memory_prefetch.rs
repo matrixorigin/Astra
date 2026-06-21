@@ -594,7 +594,8 @@ pub(crate) fn build_memory_entries(merged_lines: &[String]) -> Vec<ContextMemory
 /// Tagged entries (`[@namespace/type] body`) always pass even if short —
 /// the namespace already asserts the entry carries structured meaning.
 fn is_memory_worthy(trimmed: &str) -> bool {
-    if astra_prompts::memory_proto::is_session_namespace_memory(trimmed) {
+    let semantic_payload = memory_payload_without_source_label(trimmed);
+    if astra_prompts::memory_proto::is_session_namespace_memory(semantic_payload) {
         return false;
     }
 
@@ -650,9 +651,9 @@ fn is_memory_worthy(trimmed: &str) -> bool {
     // turn 4: 78 such `**Context:**` entries filled a 6,397c block.
     //
     // Routed through the single source of truth in
-    // `astra_turn_types::SCAFFOLDING_BODY_PREFIXES` so new runtime
+    // `astra_turn_types::scaffolding_body_prefixes_for_filtering` so new runtime
     // injections added there are automatically filtered here.
-    for prefix in astra_turn_types::SCAFFOLDING_BODY_PREFIXES {
+    for prefix in astra_turn_types::scaffolding_body_prefixes_for_filtering() {
         if trimmed.starts_with(prefix) {
             return false;
         }
@@ -683,6 +684,19 @@ fn is_memory_worthy(trimmed: &str) -> bool {
     }
 
     true
+}
+
+fn memory_payload_without_source_label(trimmed: &str) -> &str {
+    let content = trimmed.trim_start();
+    if let Some(rest) = content.strip_prefix(CROSS_SESSION_SOURCE_LABEL) {
+        return rest.trim_start();
+    }
+    if let Some(rest) = content.strip_prefix(LEARNINGS_SOURCE_LABEL_PREFIX)
+        && let Some((_, payload)) = rest.split_once(LEARNINGS_SOURCE_LABEL_SUFFIX)
+    {
+        return payload.trim_start();
+    }
+    content
 }
 
 /// Normalize a memory line for dedup: case-fold + strip trailing
@@ -1286,11 +1300,17 @@ mod tests {
         let lines = vec![
             "[@session/active] session_id=other\nrecent work".to_string(),
             "[@session/memory] session_id=legacy\nlegacy body".to_string(),
+            "[cross-session memory] [@session/active] stale active task from another session"
+                .to_string(),
             "[@pref/active] prefer Rust".to_string(),
         ];
         let section = build_memory_section(&lines).expect("pref entry survives");
         assert!(!section.contains("[@session/active]"), "got: {section}");
         assert!(!section.contains("[@session/memory]"), "got: {section}");
+        assert!(
+            !section.contains("[cross-session memory]"),
+            "source labels must not let session namespace entries bypass filtering: {section}"
+        );
         assert!(section.contains("prefer Rust"), "got: {section}");
     }
 
@@ -1315,6 +1335,7 @@ mod tests {
     fn build_memory_entries_drop_structured_session_namespace_entries() {
         let lines = vec![
             "[@session/active] current session memory".to_string(),
+            "[cross-session memory] [@session/active] stale active session memory".to_string(),
             "[@pref/active] prefer Rust".to_string(),
         ];
         let entries = build_memory_entries(&lines);
@@ -1451,7 +1472,7 @@ mod tests {
     }
 
     #[test]
-    fn build_memory_entries_drops_attention_manifest_echo() {
+    fn build_memory_entries_drops_legacy_scaffolding_echo() {
         let lines = vec![
             "[Active task attachment] Resume the active task/thread below unless the user explicitly changes topic.".to_string(),
             "[Self-check — round 12] You have been reading/exploring for 12 consecutive rounds".to_string(),

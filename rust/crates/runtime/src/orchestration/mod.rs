@@ -19,6 +19,7 @@ pub use agent_result_status::{
 pub use agent_tool::{
     AgentToolContext, handle_agent_fanout_tool, handle_agent_get_result_action,
     handle_agent_spawn_action, handle_agent_tool, normalize_agent_spawn_args,
+    render_agent_runtime_binding_error,
 };
 pub use agent_trace_status::{
     AGENT_TRACE_EVENT_CANCELLED, AGENT_TRACE_EVENT_COMPLETED, AGENT_TRACE_EVENT_FAILED,
@@ -45,7 +46,8 @@ pub use fork_cache_probe::{ForkCacheProbeState, maybe_emit_fork_cache_probe};
 pub use permission_sync::{
     InheritedPermissions, PermissionAction, PermissionCallback, PermissionDecision, PermissionMode,
     PermissionRequest, PermissionRequestHandler, PermissionRequestMessaging, PermissionResponse,
-    PermissionResponseMessaging, PermissionRule, PermissionSyncContext, PermissionUpdate,
+    PermissionResponseMessaging, PermissionRule, PermissionSyncContext, PermissionSyncHandle,
+    PermissionUpdate,
 };
 pub use spawner::{
     AgentHistoryRecord, AgentStatus, DynamicAgentSpawner, InheritedChildPrefix, PermissionSummary,

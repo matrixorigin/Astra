@@ -109,7 +109,10 @@ impl SweeperLease {
     }
 }
 
-pub(crate) fn spawn_runtime_sweepers(shared_pool: SharedPool) {
+pub(crate) fn spawn_runtime_sweepers(
+    shared_pool: SharedPool,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Vec<tokio::task::JoinHandle<()>> {
     let pod_id = std::env::var("ASTRA_POD_ID")
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -124,22 +127,29 @@ pub(crate) fn spawn_runtime_sweepers(shared_pool: SharedPool) {
 
     // Each sweeper independently checks the lease before every work cycle.
     // No master loop — no risk of duplicate spawn.
-    crate::server::device_lease_sweeper::spawn_device_lease_expiry_sweeper(
-        shared_pool.clone(),
-        std::sync::Arc::clone(&lease),
-    );
-    crate::server::artifact_retention_sweeper::spawn_artifact_retention_sweeper(
-        shared_pool.clone(),
-        std::sync::Arc::clone(&lease),
-    );
-    crate::server::session::session_todo_sweeper::spawn_session_todo_stale_sweeper(
-        shared_pool.clone(),
-        std::sync::Arc::clone(&lease),
-    );
-    crate::server::session::session_todo_sweeper::spawn_session_todo_archive_sweeper(
-        shared_pool,
-        lease,
-    );
+    let handles = vec![
+        crate::server::device_lease_sweeper::spawn_device_lease_expiry_sweeper(
+            shared_pool.clone(),
+            std::sync::Arc::clone(&lease),
+            cancel.clone(),
+        ),
+        crate::server::artifact_retention_sweeper::spawn_artifact_retention_sweeper(
+            shared_pool.clone(),
+            std::sync::Arc::clone(&lease),
+            cancel.clone(),
+        ),
+        crate::server::session::session_todo_sweeper::spawn_session_todo_stale_sweeper(
+            shared_pool.clone(),
+            std::sync::Arc::clone(&lease),
+            cancel.clone(),
+        ),
+        crate::server::session::session_todo_sweeper::spawn_session_todo_archive_sweeper(
+            shared_pool,
+            lease,
+            cancel,
+        ),
+    ];
+    handles
 }
 
 #[cfg(test)]

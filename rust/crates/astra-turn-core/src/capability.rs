@@ -30,6 +30,18 @@ pub enum Capability {
     LocalBackgroundTasks,
 }
 
+impl Capability {
+    /// Whether this capability requires a runtime executor binding.
+    ///
+    /// An executor-gated capability cannot be satisfied by a service or static
+    /// feature flag; the runtime must have an active executor handle (e.g., a
+    /// spawn-context for AgentSpawner) for tools requiring this capability to
+    /// pass admission.
+    pub fn is_executor_gated(self) -> bool {
+        matches!(self, Capability::AgentSpawner)
+    }
+}
+
 /// Session-invariant set of runtime capabilities.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CapabilitySet {
@@ -50,6 +62,10 @@ impl CapabilitySet {
             .with(Capability::GitHubAuth)
             .with(Capability::LSPServer)
             .with(Capability::PlanLifecycle)
+        // NOTE: LocalBackgroundTasks is intentionally excluded — it is an
+        // edge-only capability (typed background tasks like bg-shell).
+        // Server-side ToolEngine has no handlers for task_output / task_stop
+        // / task_list; those tools only execute on edge agents.
     }
 
     pub fn with(mut self, capability: Capability) -> Self {
@@ -103,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn all_contains_every_declared_capability() {
+    fn all_contains_every_server_side_capability() {
         let caps = CapabilitySet::all();
         for capability in [
             Capability::AgentSpawner,

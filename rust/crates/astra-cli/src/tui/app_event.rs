@@ -58,8 +58,8 @@ pub(crate) enum TuiAppEvent {
     // ── Turn lifecycle ──────────────────────────────────────────────────
     TurnComplete,
     TurnError(String),
-    TurnWarning(String),
-    TurnInfo(String),
+    SystemWarning(String),
+    SystemInfo(String),
     ExplainReport(Vec<serde_json::Value>),
     VerdictReport(Vec<crate::VerdictEvent>),
 

@@ -3,8 +3,12 @@
 use super::{BottomPane, BottomPaneAction};
 use crate::cli::chat_stream::ApprovalResponse;
 use crate::cli::permission_manager::PermissionMode;
+use crate::tui::bottom_pane::in_flight_agents_view::{
+    AgentRow, AgentRowStatus, InFlightAgentsView,
+};
 use crate::tui::slash_dispatch::next_permission_mode_for_cycle;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 #[test]
@@ -64,21 +68,18 @@ fn backtab_cycles_mode_when_composer_has_text() {
 
 #[test]
 fn next_mode_cycle_full_loop_skips_deny() {
-    // Prompt → Auto → AcceptEdits → Plan → Prompt (wrap).
-    // Deny → Auto (same as Prompt — both return to Auto).
-    // Deny is intentionally excluded from the Shift+Tab cycle;
-    // cycling past it lands on Auto.
+    // Prompt → AcceptEdits → Plan → Auto → Prompt (wrap).
+    // `Deny` is sticky under the cycle: a bare `/allow` (or Shift+Tab) must
+    // never silently move a session out of the most restrictive mode — it
+    // is only exited by an explicit `/allow <mode>`. Likewise `Deny` is
+    // never a cycle *target*.
     assert_eq!(
         next_permission_mode_for_cycle(PermissionMode::Prompt),
-        PermissionMode::Auto
+        PermissionMode::AcceptEdits
     );
     assert_eq!(
         next_permission_mode_for_cycle(PermissionMode::Deny),
-        PermissionMode::Auto
-    );
-    assert_eq!(
-        next_permission_mode_for_cycle(PermissionMode::Auto),
-        PermissionMode::AcceptEdits
+        PermissionMode::Deny
     );
     assert_eq!(
         next_permission_mode_for_cycle(PermissionMode::AcceptEdits),
@@ -86,6 +87,10 @@ fn next_mode_cycle_full_loop_skips_deny() {
     );
     assert_eq!(
         next_permission_mode_for_cycle(PermissionMode::Plan),
+        PermissionMode::Auto
+    );
+    assert_eq!(
+        next_permission_mode_for_cycle(PermissionMode::Auto),
         PermissionMode::Prompt
     );
 }
@@ -93,10 +98,31 @@ fn next_mode_cycle_full_loop_skips_deny() {
 #[test]
 fn next_mode_cycle_starting_from_default() {
     // Starting from Prompt (the default), verify the first Shift+Tab
-    // goes to Auto.
+    // goes to Accept.
     assert_eq!(
         next_permission_mode_for_cycle(PermissionMode::Prompt),
-        PermissionMode::Auto
+        PermissionMode::AcceptEdits
+    );
+}
+
+#[test]
+fn pre_draw_tick_pops_terminal_agent_view_after_grace_period() {
+    let mut pane = BottomPane::new();
+    pane.push_view(Box::new(InFlightAgentsView::new(vec![AgentRow {
+        agent_id: "reviewer@done".into(),
+        name: "reviewer".into(),
+        child_count: 0,
+        elapsed_ms: 1200,
+        status: AgentRowStatus::Completed,
+        fanout: None,
+    }])));
+    assert!(pane.has_active_view());
+
+    pane.pre_draw_tick(Instant::now() + Duration::from_secs(4));
+
+    assert!(
+        !pane.has_active_view(),
+        "terminal agent board should auto-dismiss instead of staying pinned"
     );
 }
 

@@ -104,7 +104,7 @@ schemas` 1800 / `system_static` 1200 / `recent_tail` 420。总 ≈
 **用户原话**：「先跑 pg_dump，schema only，整库。」
 
 **state 变化**：agent 发起 `pg_dump_schema` 工具调用，执行 ~240
-秒，原始输出 `3,221,225,472 B`（3GB 纯文本 SQL）。工具 runner 流
+秒，原始输出 `3,221,225,472 B`（3GB 纯文本 SQL）。工具执行器流
 式写 OSS：`artifact_ref='artifact:pgdump-prod-20260601-schema'`，
 `session_artifacts` 新增 1 行（artifact_type='tool_output_raw'，
 `byte_size=3221225472`，`content_hash=sha256(normalized)` — 规范化
@@ -116,8 +116,8 @@ schema'`, `status='ok'`, `byte_size=3221225472`, `token_estimate=
 SCHEMA` 头部 + 末尾自动追加 "...truncated at 800 chars / 3221225472
 bytes, stats: tables=482, views=37, sequences=12, routines=156, FK=
 1204, indexes=3890; full in artifact:pgdump-prod-20260601-schema"。
-**原始 3GB 数据从未进过 API server 内存**（走 tool runner 流式上
-传 OSS，runner 返回给 runtime 的仅是 metadata + preview）。
+**原始 3GB 数据从未进过 API server 内存**（走 tool executor 流式上
+传 OSS，executor 返回给 runtime 的仅是 metadata + preview）。
 
 **manifest zone**：本轮 agent 只需 ACK 工具结果，不需要 reasoning
 over 全部 schema。`tool_previews` 240（1 条 pg_dump preview）/
@@ -133,7 +133,7 @@ TABLE` / `CREATE INDEX` 原文、全部 FK 定义原文、全部 view 定义原
 续报告使用。
 
 **state 变化**：agent 发起 `pg_schema_structurize` 工具，该工具**在
-tool runner 侧**直接消费 artifact OSS（不经 API server），扫描 3GB
+tool executor 侧**直接消费 artifact OSS（不经 API server），扫描 3GB
 dump 后输出一份 8MB 的结构化 JSON（每个 table / 索引 / FK 一条
 记录）。JSON 落第二个 artifact：`artifact:pgdump-prod-20260601-
 struct-json`，`byte_size=8388608`，`content_hash=sha256(json)`，
@@ -158,7 +158,7 @@ builder 的渲染器 SELECT 明确带 `WHERE byte_size < 16384` 兜底保
 言、用 MatrixOne 语法。」
 
 **state 变化**：agent 发起一次**批量 tool 调用** `sql_compat_scan`
-（input=glob，tool runner 内部 fan-out）。runner 返回 1 条聚合
+（input=glob，tool executor 内部 fan-out）。executor 返回 1 条聚合
 result + 1000 条 per-file record。写入策略：（a）`session_tool_
 outputs` 批量 insert **1001 行**（1 聚合 + 1000 per-file），走单事
 务 + 多值 `INSERT INTO ... VALUES (...), (...), ...` 拆成 10 批 × 100
@@ -213,8 +213,8 @@ artifact JSON 原文。
 
 **用户原话**：「近 7 天 slowlog 拉下来，TOP 50 慢查询。」
 
-**state 变化**：agent 调 `slow_query_analyzer`（tool runner 消费上
-游 OSS 的 slowlog，`byte_size=838,860,800`），在 runner 侧完成解
+**state 变化**：agent 调 `slow_query_analyzer`（tool executor 消费上
+游 OSS 的 slowlog，`byte_size=838,860,800`），在 executor 侧完成解
 析 + fingerprint 聚合 + TOP50 digest。两个 artifact：（a）raw log
 `artifact:slowlog-raw-20260525-20260601`，`byte_size=838860800`，
 `content_hash=sha256(raw)` — 此处**有意不规范化**（日志本来就是
@@ -250,7 +250,7 @@ T7 聚合行，拿 `artifact_ref='artifact:slowlog-top50-20260601'`；
 EXPLAIN plan、涉及表/索引列表；（3）若仍需原始事件，按 chunk
 索引对 raw slowlog artifact 做 **byte-range GET**（只读该 digest
 指向的 offset 区间，约 1.8MB），绝**不**加载 800MB 全量。加载的
-1.8MB 切片在 tool runner 侧解析为结构化 JSON（~22KB）后才
+1.8MB 切片在 tool executor 侧解析为结构化 JSON（~22KB）后才
 send 给 runtime，runtime 再渲染成 preview_text（800 字符）+ 落
 `session_tool_outputs` 一行 `tool_name='slow_query_explain_for_
 rank3'`, `parent_output_id`=T7 聚合行 output_id（延续链）。
@@ -292,7 +292,7 @@ SQL 兼容性 + slowlog TOP 风险，分级。」
 **state 变化**：agent 发起 `render_migration_risk_report` 工具，
 input=多个 `artifact_ref`（pgdump-struct-json、sql-scan-detail、
 slowlog-top50-20260601）+ 本会话 `decision` 全部 active 行。
-runner 在 cloud 侧读取 artifact 并合成 markdown（~180KB）。落
+executor 在 cloud 侧读取 artifact 并合成 markdown（~180KB）。落
 `session_artifacts`：`artifact:migration-risk-report-20260601-v1`，
 `byte_size=184320`，`content_hash=sha256(normalized markdown)`，
 `provenance_refs=['artifact:pgdump-prod-20260601-struct-json',
@@ -309,7 +309,7 @@ decision） / `plan_todo` 280（只剩 "decision_log 汇总" 一条）。总
 ≈ 5000。
 
 **LLM 看不到**：报告 markdown 全文 180KB；任何 artifact raw 内
-容（报告生成完全在 tool runner 侧完成，runtime 只拿 metadata）。
+容（报告生成完全在 tool executor 侧完成，runtime 只拿 metadata）。
 
 ### T11 · 11:55 老陈下载报告
 
@@ -358,7 +358,7 @@ opened_for_display`。
 
 | 压力来源 | 对应设计机制 |
 | --- | --- |
-| 单次 3GB tool 输出如果误进 prompt 即爆预算 | A9：`session_tool_outputs` 强制分 `preview_text` + `artifact_ref`，`byte_size > 16KB` 的输出 prompt 渲染器硬路由到 preview 分支；原始数据仅在 tool runner 与 OSS 之间流动，API server / runtime 内存从不承载 raw |
+| 单次 3GB tool 输出如果误进 prompt 即爆预算 | A9：`session_tool_outputs` 强制分 `preview_text` + `artifact_ref`，`byte_size > 16KB` 的输出 prompt 渲染器硬路由到 preview 分支；原始数据仅在 tool executor 与 OSS 之间流动，API server / runtime 内存从不承载 raw |
 | 1000 文件 fan-out 扫描，per-file 详细结果若都进 prompt 约 20k tokens，爆 `tool_previews` 上限 | A9：聚合行 + per-file 行双写，prompt 侧只引用聚合行 preview；per-file 行只供 **A10 structured filter / FTS** 后按需出场，不做默认渲染 |
 | 老陈"第 3 条为啥慢"需要精确定位到 artifact 内部切片 | A10 三级检索：structured → FTS → vector；本场景 T8 精确 digest rank 走 structured filter + artifact 内部 chunk index，vector tier 不触发（不浪费） |
 | "FK 报错在哪个文件" 的关键词回查 | A10 tier 2：`preview_text` 上的 FTS index，append-only 写入不造成 bloat |
@@ -475,12 +475,12 @@ line 1" 但 artifact 校验正常。缓解：preview 截断算法按**语法感�
 尾固定追加 `truncated at X bytes` 文案让 agent 知道是截断不是错误。
 
 **F2 · 1000 条 per-file `session_tool_outputs` 写入走 N+1**：如果
-tool runner 每处理一个文件就 `INSERT ... VALUES (...)` 单行一次，
+tool executor 每处理一个文件就 `INSERT ... VALUES (...)` 单行一次，
 1000 次 insert 在 MatrixOne 上 ~2–4 秒网络往返，直接把 T5 延迟
 拖到 "UI 卡顿阈值" 之上；更糟会触发 connection pool 打满。**可
 观测信号**：T5 回合 `latency_ms > 5000`；DB 监控看到 `INSERT
 count` 突发 1000+；tool 执行时间里 "DB write" 占比 > 50%。缓
-解：runner 必须 batch insert（10 批 × 100 行），并为 `session_
+解：executor 必须 batch insert（10 批 × 100 行），并为 `session_
 tool_outputs` 增加覆盖 `(session_id, output_id)` 的主键 hash 分片
 以避免热点。
 
@@ -511,14 +511,14 @@ session_artifacts WHERE tool_name='pg_dump_schema' AND user_id=?`
 供未来算法升级。
 
 **F5 · T6 structured filter 漏网：status 枚举不规范**：如果 tool
-runner 偶尔写入 `status='FAIL'`（大写）、`status='failed'`（过去
+executor 偶尔写入 `status='FAIL'`（大写）、`status='failed'`（过去
 式）或 `status='incompat'`，T6 的 `WHERE status='fail'` 就会漏掉
 部分行，137 变 129，用户直接少看到 8 个不兼容文件。**可观测信
 号**：`SELECT DISTINCT status FROM session_tool_outputs WHERE
 tool_name='sql_compat_scan'` 返回 > 3 个不同值；用户追问"上次扫
 出来不是 137 条吗？" 缓解：schema 层面给 `status` 加 CHECK 约
 束 `status IN ('ok','warn','fail','error','timeout','skipped')`，
-tool runner 统一经由 enum 转字符串，禁止自由文本。
+tool executor 统一经由 enum 转字符串，禁止自由文本。
 
 **F6 · 3GB artifact 下载走 API server 流式代理**：如果 `GET /api/
 artifacts/:id/download` 的实现是 `pipe(S3.getObject(), res)`，单用
@@ -558,7 +558,7 @@ artifacts/:id/download` p99 latency > 10 分钟。缓解：必须返回
    (128)`，没说"hash 之前是否规范化"。不同工具的规范化策略差
    别极大（见 §7 F4），不统一会导致 dedup/审计/复用全线失效。
    建议在设计文档里加一段「Content Hash Normalization Contract」，
-   要求每个 tool runner 声明 `normalize_version` 并文档化规则，同
+   要求每个 tool executor 声明 `normalize_version` 并文档化规则，同
    schema 的 tool 变更规范化规则时 `normalize_version` 必须 bump。
 
 **三条具体建议**：

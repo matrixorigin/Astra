@@ -79,6 +79,12 @@ fn is_explicit_parallel_skill_request(message: &str) -> bool {
         "多agent",
         "多个agent",
         "并行review",
+        // Chinese review phrasings — normalized form keeps CJK as-is
+        // (whitespace/dash/underscore are stripped before matching).
+        "并行审查",
+        "多角度审查",
+        "多视角审查",
+        "同时审查",
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
@@ -820,8 +826,6 @@ struct StallDiagnosis {
 }
 
 fn compute_stall_diagnosis(state: &AgenticLoopState) -> StallDiagnosis {
-    let single_tool_streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
-
     // 1. Exploration family streak (read/search/diff dominance)
     if let Some((family, streak)) =
         astra_turn_core::evaluation::exploration_family_round_streak(&state.stall.tool_call_records)
@@ -867,12 +871,14 @@ fn compute_stall_diagnosis(state: &AgenticLoopState) -> StallDiagnosis {
         };
     }
 
-    // 3. Single-tool streak
-    if single_tool_streak >= 3 {
+    let single_tool_streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
+    // Stall signal must fire AFTER nudge (nudge at 6, stall at 8+) to give the model
+    // a chance to self-correct before declaring a stall.
+    if single_tool_streak >= 8 {
         return StallDiagnosis {
             signal: Some(format!("single_tool_streak={single_tool_streak}")),
             summary: Some(format!(
-                "a single-tool streak of {single_tool_streak} consecutive rounds"
+                "{single_tool_streak} consecutive single-tool rounds without batching"
             )),
             restricted_tools: Vec::new(),
         };
@@ -967,9 +973,6 @@ pub(crate) fn build_circuit_breaker_abort_message(state: &AgenticLoopState) -> S
         }
         Some(s) if s.contains("exploration_family=search") => {
             "Next: stop fanning out new greps; pick the single most-promising hit and read it directly."
-        }
-        Some(s) if s.starts_with("single_tool_streak=") => {
-            "Next: batch independent tool calls into one parallel round, or commit a partial answer with what you have."
         }
         _ => {
             "Next: produce a textual answer from existing evidence; only call a tool if it adds genuinely new information."
@@ -1475,7 +1478,21 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         };
         crate::observability::on_turn_start(hub, session_id, &user_id, &state.message);
     }
-    let turn_intent = host.judge_turn_intent(state).await;
+    let turn_intent = host.judge_turn_intent(state).await.or_else(|| {
+        // Structural fallback when the LLM judge is unavailable or failed.
+        // Keeps scenario routing, continuation mode, and adaptive profiles
+        // functional under judge outages instead of collapsing to defaults.
+        let has_prior_assistant_turn = state
+            .messages
+            .iter()
+            .rev()
+            .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
+        Some(crate::turn::agentic::turn_intent::fallback_turn_intent(
+            &state.message,
+            &state.recent_tools,
+            has_prior_assistant_turn,
+        ))
+    });
     apply_adaptive_execution_profile_with_intent(state, turn_intent.as_ref());
 
     if (state.telemetry.observability_session.is_some() || state.skills.resolver.is_some())
@@ -2184,12 +2201,24 @@ mod tests {
             json!({"role": "tool", "content": ""}),
             json!({"role": "assistant", "content": ""}),
             json!({"role": "tool", "content": ""}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": ""}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": ""}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": ""}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": ""}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": ""}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": ""}),
         ];
 
         let summary = interruption_state_summary(&state, None);
         assert_eq!(
             summary.stall_signal.as_deref(),
-            Some("single_tool_streak=3")
+            Some("single_tool_streak=9")
         );
         assert_eq!(
             summary.resume_restricted_tools,
@@ -2740,7 +2769,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_turn_iteration_infers_default_code_review_intent() {
+    async fn prepare_turn_iteration_does_not_infer_code_review_without_judge_intent() {
         let mut host = MockHost::new(Vec::new());
         let hub = make_hub();
         let session = make_session();
@@ -2758,11 +2787,11 @@ mod tests {
 
         assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
         let guard = astra_core::sync_poison::recover_rwlock_read(&session);
-        assert_eq!(guard.profile.current_scenario, Some(Scenario::CodeReview));
+        assert_ne!(guard.profile.current_scenario, Some(Scenario::CodeReview));
     }
 
     #[tokio::test]
-    async fn prepare_turn_iteration_infers_default_quick_answer_intent() {
+    async fn prepare_turn_iteration_does_not_infer_quick_answer_without_judge_intent() {
         let mut host = MockHost::new(Vec::new());
         let hub = make_hub();
         let session = make_session();
@@ -2780,7 +2809,7 @@ mod tests {
 
         assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
         let guard = astra_core::sync_poison::recover_rwlock_read(&session);
-        assert_eq!(guard.profile.current_scenario, Some(Scenario::QuickAnswer));
+        assert_ne!(guard.profile.current_scenario, Some(Scenario::QuickAnswer));
     }
 
     #[test]
@@ -3313,6 +3342,7 @@ mod tests {
             state
                 .turn_guard
                 .record_tool_result("bash", "Error: command timed out");
+            state.turn_guard.health.record_failure("bash");
         }
         assert!(state.turn_guard.health.is_deprioritized("bash"));
         assert!(!state.turn_guard.tool_sigs.is_empty());
@@ -3390,15 +3420,13 @@ mod tests {
             state.messages.len()
         );
 
-        // Verify a compaction boundary marker was inserted.
-        let has_boundary = state
-            .messages
-            .iter()
-            .any(|m| m.get("_compact_boundary").is_some());
-        assert!(
-            has_boundary,
-            "compaction must insert a boundary marker in the message list"
-        );
+        // Compaction is already proven by message-count reduction above.
+        // The `_compact_boundary` marker lives in `Message.extra` and is
+        // intentionally stripped by `From<Message> for Value` to keep
+        // prompt-cache prefixes stable on the provider wire — it does NOT
+        // survive into `state.messages` (Vec<Value>). Asserting on it here
+        // would test the wrong layer. See compaction_engine_tests.rs for
+        // typed-level boundary marker assertions.
 
         // Emissions are suppressed when quiet=true, but the pipeline
         // itself must execute without panicking — that's the contract.

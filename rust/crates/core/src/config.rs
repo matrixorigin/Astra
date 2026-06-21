@@ -71,6 +71,38 @@ pub struct ServerConfig {
     pub api: ApiConfig,
     /// Runtime limits and tuning parameters.
     pub runtime: ServerRuntimeConfig,
+    /// Deployment profile and tool capability controls.
+    pub deployment: DeploymentConfig,
+}
+
+/// Deployment-level tool capability controls.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DeploymentConfig {
+    /// Tools disabled at deployment time (checked before dispatch).
+    pub disabled_tools: Vec<String>,
+}
+
+impl DeploymentConfig {
+    fn merge_from(&mut self, other: &Self) {
+        if !other.disabled_tools.is_empty() {
+            self.disabled_tools = other.disabled_tools.clone();
+        }
+    }
+
+    /// Apply environment variable overrides for deployment-level settings.
+    pub(crate) fn apply_env_overrides(&mut self) {
+        if let Ok(val) = std::env::var("ASTRA_DISABLED_TOOLS") {
+            let tools: Vec<String> = val
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !tools.is_empty() {
+                self.disabled_tools = tools;
+            }
+        }
+    }
 }
 
 /// Database connection pool configuration.
@@ -424,7 +456,7 @@ impl ServerConfig {
     /// `~/.astra/server.toml` (user-level, for dev/self-hosted).
     /// User overrides system. Environment variables take highest precedence.
     /// Returns defaults if no file exists.
-    pub(crate) fn load() -> Result<Self, ConfigError> {
+    pub fn load() -> Result<Self, ConfigError> {
         let mut config = Self::default();
 
         // System-level: /etc/astra/server.toml
@@ -499,6 +531,7 @@ impl ServerConfig {
         self.auth.merge_from(&other.auth);
         self.api.merge_from(&other.api);
         self.runtime.merge_from(&other.runtime);
+        self.deployment.merge_from(&other.deployment);
     }
 
     /// Apply environment variable overrides on top of loaded config.
@@ -507,6 +540,7 @@ impl ServerConfig {
         self.auth.apply_env_overrides();
         self.api.apply_env_overrides();
         self.runtime.apply_env_overrides();
+        self.deployment.apply_env_overrides();
     }
 }
 
@@ -556,6 +590,8 @@ pub struct AppSettings {
     pub bridge_secret: String,
     pub token_encryption_key: Option<String>,
     pub database_bootstrap_catalog: String,
+    /// Tools disabled at deployment time (deployment.toml → server.toml → env).
+    pub disabled_tools: Vec<String>,
 }
 
 impl fmt::Debug for AppSettings {
@@ -618,11 +654,26 @@ impl AppSettings {
                 _ => env::var(key).ok(),
             }
         };
-        Self::from_lookup(lookup)
+        let mut settings = Self::from_lookup(lookup)?;
+        settings.disabled_tools = sc.deployment.disabled_tools.clone();
+        Ok(settings)
     }
 
     pub fn from_map(values: &HashMap<String, String>) -> Result<Self, ConfigError> {
         Self::from_lookup(|key| values.get(key).cloned())
+    }
+    fn disabled_tools_from_lookup<F>(lookup: &F) -> Vec<String>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        lookup("ASTRA_DISABLED_TOOLS")
+            .map(|s| {
+                s.split(',')
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn from_lookup<F>(lookup: F) -> Result<Self, ConfigError>
@@ -686,6 +737,7 @@ impl AppSettings {
                 "dev-bridge-secret-change-me",
             )?,
             token_encryption_key: lookup("ASTRA_TOKEN_ENCRYPTION_KEY"),
+            disabled_tools: Self::disabled_tools_from_lookup(&lookup),
         })
     }
 }
@@ -697,7 +749,7 @@ pub struct MatrixOneSettings {
     pub user: String,
     pub password: String,
     pub database: String,
-    /// Max connections in the shared pool (env `ASTRA_DB_POOL_MAX_CONNECTIONS`, default 40).
+    /// Max connections in the shared pool (env `ASTRA_DB_POOL_MAX_CONNECTIONS`, default 80).
     pub db_pool_max_connections: u32,
     /// Min idle connections in the shared pool (env `ASTRA_DB_POOL_MIN_CONNECTIONS`, default 1).
     pub db_pool_min_connections: u32,
@@ -1794,6 +1846,65 @@ cors_origins = ["http://localhost:3000", "https://example.com"]
             assert_eq!(settings.matrixone.db_pool_max_lifetime_secs, 400);
             assert_eq!(settings.api.host, "127.0.0.1");
             assert_eq!(settings.api.port, 9000);
+        });
+    }
+
+    #[test]
+    fn deployment_disabled_tools_from_toml() {
+        let toml_str = r#"
+            [deployment]
+            disabled_tools = ["tool_a", "tool_b"]
+            "#;
+        let config = ServerConfig::parse(toml_str).unwrap();
+        assert_eq!(
+            config.deployment.disabled_tools,
+            vec!["tool_a".to_string(), "tool_b".to_string()]
+        );
+    }
+
+    #[test]
+    fn deployment_disabled_tools_from_env() {
+        temp_env::with_var(
+            "ASTRA_DISABLED_TOOLS",
+            Some("tool_x, tool_y, tool_z"),
+            || {
+                let mut config = ServerConfig::default();
+                config.apply_env_overrides();
+                assert_eq!(
+                    config.deployment.disabled_tools,
+                    vec![
+                        "tool_x".to_string(),
+                        "tool_y".to_string(),
+                        "tool_z".to_string()
+                    ]
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn deployment_disabled_tools_empty_env_noop() {
+        temp_env::with_var("ASTRA_DISABLED_TOOLS", Some(""), || {
+            let mut config = ServerConfig::default();
+            config.deployment.disabled_tools = vec!["from_toml".to_string()];
+            config.apply_env_overrides();
+            // Empty env value should not overwrite TOML value
+            assert_eq!(
+                config.deployment.disabled_tools,
+                vec!["from_toml".to_string()]
+            );
+        });
+    }
+
+    #[test]
+    fn deployment_disabled_tools_env_trims_whitespace() {
+        temp_env::with_var("ASTRA_DISABLED_TOOLS", Some("  a , b ,  c  "), || {
+            let mut config = ServerConfig::default();
+            config.apply_env_overrides();
+            assert_eq!(
+                config.deployment.disabled_tools,
+                vec!["a".to_string(), "b".to_string(), "c".to_string()]
+            );
         });
     }
 }

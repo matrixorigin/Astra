@@ -4,11 +4,7 @@
 
 use serde_json::Value;
 
-/// Determine whether a tool result string indicates an error.
-///
-/// For structured JSON results (our tools), checks `"ok": false` or a non-null
-/// `"error"` field. For plain-text results, falls back to `starts_with("error")`.
-pub fn is_tool_error(result_str: &str) -> bool {
+fn json_tool_result_is_error(result_str: &str) -> bool {
     if let Ok(v) = serde_json::from_str::<Value>(result_str) {
         if let Some(ok_val) = v.get("ok").and_then(|o| o.as_bool()) {
             return !ok_val;
@@ -19,20 +15,87 @@ pub fn is_tool_error(result_str: &str) -> bool {
         if v.get("error_code").is_some() {
             return true;
         }
-        if v.get("status").and_then(|s| s.as_str()) == Some("error") {
-            return true;
+        if let Some(status) = v.get("status").and_then(|s| s.as_str()) {
+            let normalized = status.trim().to_ascii_lowercase();
+            if matches!(
+                normalized.as_str(),
+                "error"
+                    | "failed"
+                    | "failure"
+                    | "partial_failure"
+                    | "denied"
+                    | "cancelled"
+                    | "canceled"
+                    | "timeout"
+                    | "timed_out"
+            ) {
+                return true;
+            }
         }
+    }
+    false
+}
+
+fn first_non_empty_line(output: &str) -> Option<&str> {
+    output.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+fn first_line_is_tool_failure_banner(output: &str) -> bool {
+    let Some(line) = first_non_empty_line(output) else {
+        return false;
+    };
+    let Some(rest) = line.strip_prefix("❌ ") else {
+        return false;
+    };
+    let head = rest.split('—').next().unwrap_or(rest).trim();
+    let mut parts = head.split_whitespace();
+    let Some(tool_name) = parts.next() else {
+        return false;
+    };
+    let Some(status) = parts.next() else {
+        return false;
+    };
+    status == "FAILED"
+        && tool_name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// True when the visible tool body carries an explicit failure marker.
+///
+/// This intentionally accepts only machine-owned contracts:
+/// structured JSON error fields/statuses and the tool failure banner
+/// `❌ <TOOL_NAME> FAILED ...` on the first non-empty line. It does not scan
+/// arbitrary prose for words like "failed", which would misclassify normal
+/// file contents, logs, or quoted code.
+#[must_use]
+pub fn tool_output_has_explicit_failure_signal(output: &str) -> bool {
+    json_tool_result_is_error(output)
+        || first_line_is_tool_failure_banner(output)
+        || output.trim_start().starts_with("SANDBOX_DENIED:")
+}
+
+/// Determine whether a tool result string indicates an error.
+///
+/// For structured JSON results (our tools), checks `"ok": false` or a non-null
+/// `"error"` field. For plain-text results, accepts only stable tool failure
+/// contracts plus the legacy `Error:` prefix.
+pub fn is_tool_error(result_str: &str) -> bool {
+    if tool_output_has_explicit_failure_signal(result_str) {
+        return true;
     }
     result_str.to_lowercase().starts_with("error")
 }
 
-/// `status` string for cloud `POST /tools/result` from edge executor output prefixes.
+/// `status` string for cloud `POST /tools/result` from edge executor output.
 ///
-/// Matches the CLI convention: `Error:`, `Unknown tool:`, and `Sandbox:` imply `"error"`;
-/// everything else is reported as `"success"` (the body may still describe failure in JSON).
+/// Structured JSON failures, stable tool failure banners, sandbox denials, and
+/// legacy error prefixes imply `"error"`. Everything else is reported as
+/// `"success"`.
 #[must_use]
 pub fn cloud_tool_result_status_label(output: &str) -> &'static str {
-    if output.starts_with("Error:")
+    if is_tool_error(output)
+        || output.starts_with("Error:")
         || output.starts_with("Unknown tool:")
         || output.starts_with("Sandbox:")
     {
@@ -40,6 +103,81 @@ pub fn cloud_tool_result_status_label(output: &str) -> &'static str {
     } else {
         "success"
     }
+}
+
+/// Stable success sentinel emitted by prose-style mutation tools.
+///
+/// Contract: file-mutation emitters that return human-readable prose
+/// (`str_replace`, `multi_edit`, `delete_file`) MUST append this token to a
+/// successful result body. Emitters that return structured JSON (e.g.
+/// `write_file` returns `{"success":true,...}`) are detected separately via
+/// the JSON branch of [`tool_output_has_explicit_success_signal`] and do not
+/// need the sentinel (appending it would break JSON parsing).
+///
+/// The body-wins reconciliation in
+/// [`execution_result_is_error`](crate::turn::headless_tool_pipeline::execute::execution_result_is_error)
+/// keys on this signal, so coupling matcher behavior to human-readable prose
+/// would silently regress when copy is tweaked. Read-only tools do not need to
+/// emit it: they are never reconciled against a failed edge-metadata status
+/// (transport failures on read-only tools are surfaced as errors, which is
+/// the desired behavior).
+pub const TOOL_SUCCESS_SENTINEL: &str = "<<<ASTRA_TOOL_OK>>>";
+
+/// True when the visible tool body carries an explicit success marker.
+///
+/// Priority order (stable first):
+/// 1. [`TOOL_SUCCESS_SENTINEL`] substring — the canonical contract.
+/// 2. Structured JSON success (`ok:true` / `success:true` /
+///    `status: ok|success|...`).
+/// 3. Legacy prose prefixes (kept for backward compatibility with emitters
+///    not yet migrated to the sentinel; new mutation emitters MUST use the
+///    sentinel).
+///
+/// This is deliberately narrower than "not an error". It exists for transport
+/// reconciliation: if edge metadata says failure but the body says a mutation
+/// succeeded, the body must win so the journal does not turn a real edit into a
+/// false failed tool call.
+#[must_use]
+pub fn tool_output_has_explicit_success_signal(output: &str) -> bool {
+    let trimmed = output.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // 1. Stable sentinel — highest priority contract.
+    if output.contains(TOOL_SUCCESS_SENTINEL) {
+        return true;
+    }
+
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+        if v.get("ok").and_then(Value::as_bool) == Some(true) {
+            return true;
+        }
+        if v.get("success").and_then(Value::as_bool) == Some(true) {
+            return true;
+        }
+        if let Some(status) = v.get("status").and_then(Value::as_str) {
+            let status = status.trim().to_ascii_lowercase();
+            if matches!(
+                status.as_str(),
+                "ok" | "success" | "succeeded" | "completed" | "complete" | "passed"
+            ) {
+                return true;
+            }
+        }
+    }
+
+    // 3. Legacy prose prefixes. DO NOT extend this list; emit the sentinel
+    //    instead. These are kept only so emitters not yet migrated keep
+    //    working.
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("replaced successfully")
+        || (lower.starts_with("applied ") && lower.contains(" edit(s) successfully"))
+        || lower.starts_with("created successfully")
+        || lower.starts_with("updated successfully")
+        || lower.starts_with("deleted successfully")
+        || lower.starts_with("saved successfully")
+        || lower.starts_with("completed successfully")
 }
 
 /// Classification of tool errors for rollback policy decisions.
@@ -58,6 +196,11 @@ pub enum ToolErrorSeverity {
     Success,
     /// Soft error: recoverable, no side effects, agent can decide next step.
     SoftError,
+    /// Execution failure before the tool implementation ran.
+    ///
+    /// This is a real failed tool call for UX / tool-health purposes, but it
+    /// must not trigger rollback because no tool side effect happened.
+    InfrastructureError,
     /// Hard error: may have inconsistent state, should trigger rollback.
     HardError,
 }
@@ -97,6 +240,17 @@ const SOFT_ERROR_PATTERNS: &[&str] = &[
     "no changes detected",
     // create_file on existing file — specific pattern
     "file already exists",
+];
+
+/// Tool execution infrastructure failures. These are failed tool calls but
+/// not rollback triggers because the requested tool implementation did not run.
+const INFRASTRUCTURE_ERROR_PATTERNS: &[&str] = &[
+    "headless edge protocol",
+    "no matching edge execution",
+    "runtime binding unavailable",
+    "runtime binding is unavailable",
+    "no executor attached",
+    "no multi-agent executor attached",
 ];
 
 /// Timeout/transient error patterns — soft for read-only tools, hard for mutation tools.
@@ -178,6 +332,15 @@ pub fn classify_tool_error(tool: &str, output: &str) -> ToolErrorSeverity {
                 // Read-only tool timeout is recoverable
                 ToolErrorSeverity::SoftError
             };
+        }
+    }
+
+    // Check execution-infrastructure errors before soft errors. These failures
+    // are not recoverable by tweaking args, and counting them as soft makes the
+    // journal report a failed executor binding as `ok=true`.
+    for pattern in INFRASTRUCTURE_ERROR_PATTERNS {
+        if lower.contains(pattern) {
+            return ToolErrorSeverity::InfrastructureError;
         }
     }
 
@@ -411,6 +574,54 @@ mod tests {
         assert_eq!(cloud_tool_result_status_label("Error: x"), "error");
         assert_eq!(cloud_tool_result_status_label("Unknown tool: y"), "error");
         assert_eq!(cloud_tool_result_status_label("Sandbox: z"), "error");
+        assert_eq!(
+            cloud_tool_result_status_label(r#"{"status":"failed","error":"bad args"}"#),
+            "error"
+        );
+    }
+
+    #[test]
+    fn explicit_failure_signal_detects_structured_tool_banners_only_at_top_level() {
+        let output = "❌ STR_REPLACE FAILED — FILE NOT MODIFIED\n\nWHAT: old_str not found.";
+        assert!(is_tool_error(output));
+        assert_eq!(cloud_tool_result_status_label(output), "error");
+        assert_eq!(
+            classify_tool_error("str_replace", output),
+            ToolErrorSeverity::SoftError
+        );
+
+        let quoted_file_content = "log line from a file\n❌ STR_REPLACE FAILED — FILE NOT MODIFIED";
+        assert!(!is_tool_error(quoted_file_content));
+        assert_eq!(
+            cloud_tool_result_status_label(quoted_file_content),
+            "success"
+        );
+    }
+
+    #[test]
+    fn explicit_failure_signal_detects_sandbox_denied_prefix() {
+        let output = "SANDBOX_DENIED: Path '/tmp/x' is outside workspace";
+        assert!(is_tool_error(output));
+        assert_eq!(cloud_tool_result_status_label(output), "error");
+    }
+
+    #[test]
+    fn explicit_success_signal_detects_str_replace_bodies() {
+        assert!(tool_output_has_explicit_success_signal(
+            "Replaced successfully\n<<<ASTRA_UNIFIED_DIFF>>>"
+        ));
+        assert!(tool_output_has_explicit_success_signal(
+            "Applied 3 edit(s) successfully\n\n<<<ASTRA_UNIFIED_DIFF>>>"
+        ));
+        assert!(tool_output_has_explicit_success_signal(
+            r#"{"ok":true,"status":"completed"}"#
+        ));
+        assert!(!tool_output_has_explicit_success_signal(
+            "permission denied"
+        ));
+        assert!(!tool_output_has_explicit_success_signal(
+            "Error: str_replace failed: old_str not found"
+        ));
     }
 
     #[test]
@@ -429,6 +640,20 @@ mod tests {
     fn tool_error_nested_error_key_is_not_error() {
         let result = r#"{"ok":true,"data":{"error":"some inner issue"}}"#;
         assert!(!is_tool_error(result));
+    }
+
+    #[test]
+    fn sentinel_wins_over_failed_metadata() {
+        // Contract: mutation emitters append TOOL_SUCCESS_SENTINEL to successful
+        // bodies. The body-wins reconciliation must key on the sentinel, so a
+        // human-readable body coupled with a stale failed edge status still
+        // classifies as success.
+        let body = format!("Replaced successfully\n{TOOL_SUCCESS_SENTINEL}");
+        assert!(tool_output_has_explicit_success_signal(&body));
+
+        // Sentinel must win even when the prose prefix is missing/unrecognized.
+        let body_minimal = format!("done\n{TOOL_SUCCESS_SENTINEL}");
+        assert!(tool_output_has_explicit_success_signal(&body_minimal));
     }
 
     #[test]
@@ -518,6 +743,11 @@ mod tests {
     #[test]
     fn is_tool_error_json_status_error() {
         assert!(is_tool_error(r#"{"status": "error", "detail": "oops"}"#));
+    }
+
+    #[test]
+    fn is_tool_error_json_status_failed() {
+        assert!(is_tool_error(r#"{"status": "failed", "detail": "oops"}"#));
     }
 
     #[test]
@@ -722,6 +952,17 @@ if let Err(e) = writeln!(file, "{line}") {
     }
 
     #[test]
+    fn classify_headless_edge_protocol_as_infrastructure_error() {
+        let output =
+            "Error: headless edge protocol — tool `agent_fanout` has no matching edge execution";
+        assert_eq!(
+            classify_tool_error("agent_fanout", output),
+            ToolErrorSeverity::InfrastructureError
+        );
+        assert!(!tool_error_triggers_rollback("agent_fanout", output));
+    }
+
+    #[test]
     fn classify_timeout_soft_for_read_only_tool() {
         // Read-only tool timeout → SoftError
         let output = "Error: command timed out after 30s";
@@ -754,15 +995,9 @@ if let Err(e) = writeln!(file, "{line}") {
             ToolErrorSeverity::HardError
         );
 
-        // git_commit timeout
+        // git action timeout
         assert_eq!(
-            classify_tool_error("git_commit", output),
-            ToolErrorSeverity::HardError
-        );
-
-        // git_revert_commit timeout
-        assert_eq!(
-            classify_tool_error("git_revert_commit", output),
+            classify_tool_error("git", output),
             ToolErrorSeverity::HardError
         );
 
@@ -772,15 +1007,9 @@ if let Err(e) = writeln!(file, "{line}") {
             ToolErrorSeverity::HardError
         );
 
-        // git_stash timeout
+        // github mutating action timeout
         assert_eq!(
-            classify_tool_error("git_stash", output),
-            ToolErrorSeverity::HardError
-        );
-
-        // github_create_issue timeout
-        assert_eq!(
-            classify_tool_error("github_create_issue", output),
+            classify_tool_error("github", output),
             ToolErrorSeverity::HardError
         );
     }

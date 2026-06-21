@@ -4,7 +4,7 @@
 //! (`edge_executor_id`, `capabilities`).
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 /// `POST /chat/stream` body — superset of server `ChatRequest` plus optional edge fields.
@@ -145,6 +145,9 @@ pub struct ToolResultRequest {
     /// and return 200 OK — the edge treats this as success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_hash: Option<String>,
+    /// Structured tool-result metadata forwarded through the cloud ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result_fields: Option<Map<String, Value>>,
 }
 
 impl ToolResultRequest {
@@ -169,6 +172,17 @@ impl ToolResultRequest {
         output: String,
         duration_ms: u64,
     ) -> Self {
+        Self::new_with_hash_and_fields(request_id, edge_agent_id, status, output, duration_ms, None)
+    }
+
+    pub fn new_with_hash_and_fields(
+        request_id: String,
+        edge_agent_id: Option<String>,
+        status: String,
+        output: String,
+        duration_ms: u64,
+        tool_result_fields: Option<Map<String, Value>>,
+    ) -> Self {
         let result_hash = Self::compute_result_hash(&request_id, &output);
         Self {
             request_id,
@@ -177,6 +191,7 @@ impl ToolResultRequest {
             output: Some(output),
             duration_ms: Some(duration_ms),
             result_hash: Some(result_hash),
+            tool_result_fields,
         }
     }
 
@@ -1260,6 +1275,30 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_new_with_hash_and_fields_preserves_metadata() {
+        let fields = Map::from_iter([(
+            "runtime_environment_advertisement".to_string(),
+            serde_json::json!({"schema_version": 1}),
+        )]);
+        let req = ToolResultRequest::new_with_hash_and_fields(
+            "req-1".into(),
+            Some("agent-1".into()),
+            "success".into(),
+            "done".into(),
+            100,
+            Some(fields),
+        );
+        assert_eq!(
+            req.tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("runtime_environment_advertisement"))
+                .and_then(|value| value.get("schema_version"))
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn tool_result_serde_roundtrip_preserves_edge_agent_id() {
         let req = ToolResultRequest {
             request_id: "r1".into(),
@@ -1268,6 +1307,7 @@ mod tests {
             output: Some("ok".into()),
             duration_ms: Some(10),
             result_hash: Some("abc123".into()),
+            tool_result_fields: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: ToolResultRequest = serde_json::from_str(&json).unwrap();

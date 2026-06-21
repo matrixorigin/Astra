@@ -31,6 +31,15 @@ use uuid::Uuid;
 
 const HTTP_TOKEN: &str = "Bearer phase1-http-token";
 
+fn unsupported_phase1_http_method<T>(method: &str) -> Result<T, (StatusCode, Json<ErrorResponse>)> {
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(ErrorResponse::new(format!(
+            "phase1_run_durability test mock does not implement {method}"
+        ))),
+    ))
+}
+
 fn require_db_it_env() -> astra_core::MatrixOneSettings {
     assert_eq!(
         std::env::var("ASTRA_TEST_DB_IT").as_deref(),
@@ -153,28 +162,28 @@ impl AuthService for Phase1HttpAuth {
         &self,
         _request: AuthRegisterRequestData,
     ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("auth.register")
     }
 
     async fn login(
         &self,
         _request: AuthLoginRequestData,
     ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("auth.login")
     }
 
     async fn refresh(
         &self,
         _request: AuthRefreshRequestData,
     ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("auth.refresh")
     }
 
     async fn logout(
         &self,
         _request: AuthRefreshRequestData,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("auth.logout")
     }
 }
 
@@ -190,7 +199,7 @@ impl SessionService for Phase1HttpSession {
         _user_id: String,
         _request: SessionCreateRequestData,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("sessions.create_session")
     }
 
     async fn get_session(
@@ -218,14 +227,14 @@ impl SessionService for Phase1HttpSession {
         _user_id: String,
         _request: SessionUpdateRequestData,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("sessions.update_session")
     }
 
     async fn list_sessions(
         &self,
         _filter: SessionListFilter,
     ) -> Result<SessionListRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("sessions.list_sessions")
     }
 
     async fn delete_session(
@@ -233,7 +242,7 @@ impl SessionService for Phase1HttpSession {
         _session_id: String,
         _user_id: String,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("sessions.delete_session")
     }
 
     async fn get_session_activity(
@@ -243,7 +252,7 @@ impl SessionService for Phase1HttpSession {
         _limit: u32,
         _offset: u32,
     ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("sessions.get_session_activity")
     }
 }
 
@@ -265,7 +274,7 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
         _user_id: String,
         _request: ChatRequestData,
     ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("runs.create_run")
     }
 
     async fn stream_chat(
@@ -273,7 +282,7 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
         _user_id: String,
         _request: ChatRequestData,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        unsupported_phase1_http_method("runs.stream_chat")
     }
 
     async fn get_run_status(
@@ -544,6 +553,39 @@ async fn l2_lease_race_has_single_owner() {
         .filter(|won| *won)
         .count();
     assert_eq!(wins, 1, "exactly one pod may own a live lease");
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+async fn l2_recovery_ignores_live_runs_owned_by_other_pods() {
+    let pool = setup_pool().await;
+    let (run_id, session_id, user_id) = test_ids();
+    let owner_a = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("owner-a");
+    owner_a
+        .insert_run(durable_record(&run_id, &session_id, &user_id))
+        .await
+        .unwrap();
+
+    let owner_b = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("owner-b");
+    assert!(
+        owner_b
+            .find_recoverable_running_runs()
+            .await
+            .unwrap()
+            .iter()
+            .all(|run| run.run_id != run_id),
+        "startup recovery must not mark another live owner as crashed"
+    );
+
+    assert!(
+        owner_a
+            .find_recoverable_running_runs()
+            .await
+            .unwrap()
+            .iter()
+            .any(|run| run.run_id == run_id),
+        "the current owner may recover its own running run"
+    );
 }
 
 #[tokio::test]

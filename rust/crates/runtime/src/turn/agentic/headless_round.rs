@@ -26,9 +26,7 @@ pub use astra_turn_core::headless_tool_body_preview::{
     HeadlessRoundTerminal, HeadlessStderrStyle, NoopHeadlessTerminal,
 };
 
-pub(crate) type PermissionSyncHandle = std::sync::Arc<
-    tokio::sync::RwLock<crate::orchestration::permission_sync::PermissionSyncContext>,
->;
+use crate::orchestration::PermissionSyncHandle;
 
 /// Typed execution context for one headless tool round.
 pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
@@ -45,6 +43,11 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     pub messages: &'a mut Vec<Value>,
     pub tool_results: &'a mut Vec<Value>,
     pub valid_tool_names: &'a HashSet<String>,
+    /// Names listed in this turn's `<deferred_tools>` manifest. Empty when
+    /// the surface produced no deferred listing for this turn. Threaded into
+    /// [`HeadlessToolExecutionCtx::deferred_tool_names`] so the validator can
+    /// emit the activation hint instead of "Unknown tool" for these names.
+    pub deferred_tool_names: &'a HashSet<String>,
     pub restricted_tools: &'a mut HashSet<String>,
     pub turn_guard: &'a mut TurnGuard,
     pub step_recorder: &'a mut StepRecorder,
@@ -182,6 +185,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         messages,
         tool_results,
         valid_tool_names,
+        deferred_tool_names,
         restricted_tools,
         turn_guard,
         step_recorder,
@@ -239,6 +243,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             messages,
             tool_results,
             valid_tool_names,
+            deferred_tool_names,
             restricted_tools,
             turn_guard,
             step_recorder,

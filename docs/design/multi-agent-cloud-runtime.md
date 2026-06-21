@@ -674,7 +674,7 @@ The **edge** tier is intentionally **thin**: it is not a second copy of the cogn
 | Optional: `POST /approval/respond` if the UX is on the same machine | Cross-session learning merge |
 | Optional: `POST /agents/edge` (+ heartbeat) with [`EdgeRegisterRequest`](../../rust/crates/astra-thin-client/src/protocol.rs); task lease mutations with [`TaskLeaseMutationRequest`](../../rust/crates/astra-thin-client/src/protocol.rs) for multi-agent coordination | `SyncOrchestrator` / MatrixOne pool (server-side) |
 
-**Dependency budget**: `astra-thin-client` (+ serde / async runtime) and a **local tool runner** crate or embedded module. **Must not** depend on `astra` (CLI), `runtime` pipeline, or `services` — otherwise the edge stops being deployable as a small sidecar (CI runner, IDE helper, headless worker).
+**Dependency budget**: `astra-thin-client` (+ serde / async runtime) and a **local tool executor** crate or embedded module. **Must not** depend on `astra` (CLI), `runtime` pipeline, or `services` — otherwise the edge stops being deployable as a small sidecar (CI runner, IDE helper, headless worker).
 
 **Advertise capabilities** on every chat turn so the cloud router knows which `tool_request` events to emit:
 

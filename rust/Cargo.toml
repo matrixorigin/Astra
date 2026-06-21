@@ -21,6 +21,7 @@ members = [
     "crates/astra-text-utils",
     "crates/astra-config",
     "crates/astra-learning",
+    "crates/astra-runtime-env",
     "crates/astra-test-harness",
     "crates/astra-harness",
     "crates/astra-credentials",
@@ -44,6 +45,7 @@ astra-text-utils = { path = "crates/astra-text-utils" }
 astra-pipeline = { path = "crates/astra-pipeline" }
 astra-plan = { path = "crates/astra-plan" }
 astra-prompts = { path = "crates/astra-prompts" }
+astra-runtime-env = { path = "crates/astra-runtime-env" }
 astra-sandbox = { path = "crates/astra-sandbox" }
 astra-server-types = { path = "crates/astra-server-types", default-features = false }
 astra-turn-core = { path = "crates/astra-turn-core" }
@@ -92,6 +94,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "std",
     "time",
 ] }
+unicode-normalization = "0.1"
 # Must match `tracing-opentelemetry` (0.27.x pulls opentelemetry 0.26 — keep a single OTel line).
 opentelemetry = { version = "0.26.0", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.26.0", default-features = false, features = [

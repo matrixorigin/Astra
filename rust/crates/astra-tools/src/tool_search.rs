@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 
 use crate::relevance_score::Scoreable;
 
+const KEYWORD_DESCRIPTION_MAX_CHARS: usize = 180;
+
 struct ToolSchemaAdapter<'a>(&'a Value);
 
 impl Scoreable for ToolSchemaAdapter<'_> {
@@ -59,23 +61,29 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
     // caller can invoke the tool immediately. This is the "deferred tool
     // activation" pattern — the LLM saw the tool name elsewhere, asked for
     // its schema, now has everything needed to call it.
-    if let Some(tool_names) = query.strip_prefix("select:") {
-        let requested: Vec<&str> = tool_names
+    if let Some(tool_names) = select_payload(query) {
+        let mut requested = Vec::new();
+        for name in tool_names
             .split(',')
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .collect();
+        {
+            if !requested
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(name))
+            {
+                requested.push(name.to_string());
+            }
+        }
         let mut found = Vec::new();
         let mut missing = Vec::new();
 
-        for name in requested {
-            let name_lower = name.to_lowercase();
+        for name in &requested {
             if let Some(tool) = schemas.iter().find(|t| {
                 t.get("function")
                     .and_then(|f| f.get("name"))
                     .and_then(Value::as_str)
-                    .map(|n| n.to_lowercase() == name_lower)
-                    .unwrap_or(false)
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
             }) {
                 if let Some(func) = tool.get("function") {
                     let tool_name = func.get("name").and_then(Value::as_str).unwrap_or("");
@@ -97,12 +105,14 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
                     found.push(entry);
                 }
             } else {
-                missing.push(name.to_string());
+                missing.push(name.clone());
             }
         }
 
         return json!({
+            "mode": "select",
             "query": query,
+            "requested": requested,
             "matches": found,
             "missing": missing,
             "total_tools": schemas.len()
@@ -124,21 +134,31 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
                 .get("description")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let short_desc: String = desc.chars().take(100).collect();
+            let short_desc: String = desc.chars().take(KEYWORD_DESCRIPTION_MAX_CHARS).collect();
+            let was_truncated = desc.chars().count() > KEYWORD_DESCRIPTION_MAX_CHARS;
             json!({
                 "name": name,
-                "description": if desc.len() > 100 { format!("{}...", short_desc) } else { desc.to_string() },
+                "description": if was_truncated { format!("{}...", short_desc) } else { desc.to_string() },
                 "score": score
             })
         })
         .collect();
 
     json!({
+        "mode": "keyword",
         "query": query,
         "matches": matches,
         "total_tools": schemas.len()
     })
     .to_string()
+}
+
+fn select_payload(query: &str) -> Option<&str> {
+    const SELECT_PREFIX: &str = "select:";
+    query
+        .get(..SELECT_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(SELECT_PREFIX))
+        .then(|| &query[SELECT_PREFIX.len()..])
 }
 
 #[cfg(test)]
@@ -191,6 +211,8 @@ mod tests {
         let result = tool_search(&schemas, &json!({"query": "select:bash"}));
         assert!(result.contains("bash"));
         let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["mode"].as_str(), Some("select"));
+        assert_eq!(parsed["requested"][0].as_str(), Some("bash"));
         assert!(parsed["missing"].as_array().unwrap().is_empty());
 
         // Missing tool
@@ -215,6 +237,37 @@ mod tests {
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert!(parsed["matches"].as_array().unwrap().is_empty());
         assert_eq!(parsed["missing"][0].as_str(), Some("spawn_agent"));
+    }
+
+    #[test]
+    fn select_mode_prefix_is_case_insensitive() {
+        let schemas = sample_schemas();
+        let result = tool_search(&schemas, &json!({"query": "Select:BASH"}));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["query"].as_str(), Some("Select:BASH"));
+        assert_eq!(parsed["mode"].as_str(), Some("select"));
+        assert_eq!(parsed["requested"][0].as_str(), Some("BASH"));
+        assert_eq!(parsed["matches"][0]["name"].as_str(), Some("bash"));
+        assert!(parsed["matches"][0].get("score").is_none());
+        assert!(parsed["missing"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn select_mode_deduplicates_requested_names() {
+        let schemas = sample_schemas();
+        let result = tool_search(&schemas, &json!({"query": "select:BASH,bash,grep"}));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let requested = parsed["requested"].as_array().unwrap();
+        assert_eq!(requested.len(), 2);
+        assert_eq!(requested[0].as_str(), Some("BASH"));
+        assert_eq!(requested[1].as_str(), Some("grep"));
+
+        let matches = parsed["matches"].as_array().unwrap();
+        let bash_count = matches
+            .iter()
+            .filter(|m| m["name"].as_str() == Some("bash"))
+            .count();
+        assert_eq!(bash_count, 1);
     }
 
     #[test]
@@ -297,5 +350,44 @@ mod tests {
         let parsed: Value = serde_json::from_str(&result).unwrap();
         let desc = parsed["matches"][0]["description"].as_str().unwrap();
         assert!(desc.len() <= 200);
+    }
+
+    #[test]
+    fn keyword_search_preserves_deferred_agent_constraints() {
+        let schemas = crate::schemas::all_tool_schemas();
+
+        let result = tool_search(
+            &schemas,
+            &json!({"query": "agent_fanout", "max_results": 20}),
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let matches = parsed["matches"].as_array().unwrap();
+        let fanout = matches
+            .iter()
+            .find(|m| m["name"].as_str() == Some("agent_fanout"))
+            .expect("agent_fanout should be discoverable by keyword");
+        let desc = fanout["description"].as_str().unwrap_or_default();
+        assert!(
+            desc.contains("exactly target_count slots")
+                && desc.contains("description+prompt")
+                && desc.contains("no brief/agents/background"),
+            "keyword summary must keep fanout shape constraints: {desc}"
+        );
+
+        let result = tool_search(&schemas, &json!({"query": "agent", "max_results": 20}));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let matches = parsed["matches"].as_array().unwrap();
+        let agent = matches
+            .iter()
+            .find(|m| m["name"].as_str() == Some("agent"))
+            .expect("agent should be discoverable by keyword");
+        let desc = agent["description"].as_str().unwrap_or_default();
+        assert!(
+            desc.contains("description+prompt")
+                && desc.contains("agent_id")
+                && desc.contains("foreground")
+                && desc.contains("run_chain"),
+            "keyword summary must keep agent action constraints: {desc}"
+        );
     }
 }

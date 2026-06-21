@@ -73,7 +73,7 @@ The v1 web-agent implementation was driven from the original scenario set rather
 | G24 | resolved | `§Cold-Start Hydration @v0.3` | `/sessions/{id}/state`, active run replay contract |
 | G25 | resolved | `§Device Lease End Event Parity @v0.3` | revoke/auto-expire symmetric SSE events |
 | G26 | resolved | `§Manifest Reason Enumeration @v0.3` | extended reason enum and `turn_intent` |
-| G27 | resolved | `§Tool Baseline, Raw Ref, and Runner Registration @v0.3` | tool runner registry, raw ref registry, FTS weights |
+| G27 | resolved | `§Tool Baseline, Raw Ref, and Executor Registration @v0.3` | tool executor registry, raw ref registry, FTS weights |
 | G28 | open | deferred | add `cancel` mutation enum in v1.0.1 |
 | G29 | open | deferred | formalize `checkpoint_v1.extra` recommendation in v1.0.1 |
 
@@ -102,7 +102,7 @@ The web-agent v1 implementation owns or extends **29 schema surfaces**:
 | Tool output durability | `session_tool_output_batches`, `session_tool_outputs` |
 | Transcript and device state | `session_transcript_items`, `session_state_revisions`, `session_device_leases`, `session_device_lease_events` |
 | Context manifest | `context_manifest_reason_types`, `context_manifests`, `context_manifest_items` |
-| Preview/raw-ref registry | `preview_template_registry`, `tool_runner_registry`, `raw_ref_scheme_registry` |
+| Preview/raw-ref registry | `preview_template_registry`, `tool_executor_registry`, `raw_ref_scheme_registry` |
 | State projection | `session_state_items`, `session_state_item_events`, `session_delegations`, `session_todos`, `session_history_chunks` |
 | Artifacts and ACL | `session_artifacts` extended, `session_artifacts_grants` |
 | Personal skills | `user_skill_sources`, `user_skill_versions`, `user_skill_evaluations`, `skill_installations` extended |

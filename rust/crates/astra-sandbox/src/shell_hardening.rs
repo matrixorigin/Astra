@@ -59,6 +59,8 @@ pub const SENSITIVE_ENV_VARS: &[&str] = &[
 /// Configuration for shell hardening features.
 #[derive(Debug, Clone)]
 pub struct ShellHardeningConfig {
+    /// Preserve failure from any segment of a shell pipeline.
+    pub pipefail: bool,
     /// Disable extended glob patterns (bash extglob / zsh EXTENDED_GLOB).
     pub disable_extglob: bool,
     /// Reset IFS to default (space, tab, newline).
@@ -72,6 +74,7 @@ pub struct ShellHardeningConfig {
 impl Default for ShellHardeningConfig {
     fn default() -> Self {
         Self {
+            pipefail: true,
             disable_extglob: true,
             reset_ifs: true,
             redirect_stdin: true,
@@ -83,13 +86,22 @@ impl Default for ShellHardeningConfig {
 /// Build a hardened command string with security preamble.
 ///
 /// Wraps the user command with:
-/// 1. Extglob disable (prevents malicious filename expansion post-validation)
-/// 2. IFS reset (prevents word-splitting attacks)
-/// 3. Stdin redirect to /dev/null (prevents stdin pipe hijacking)
+/// 1. Pipefail (preserves upstream pipeline failures)
+/// 2. Extglob disable (prevents malicious filename expansion post-validation)
+/// 3. IFS reset (prevents word-splitting attacks)
+/// 4. Stdin redirect to /dev/null (prevents stdin pipe hijacking)
 ///
 /// The preamble is compatible with both bash and zsh.
 pub fn build_hardened_command(config: &ShellHardeningConfig, user_command: &str) -> String {
     let mut parts = Vec::new();
+
+    if config.pipefail {
+        // bash: `set -o pipefail`; zsh: `setopt PIPE_FAIL`. Ignore the
+        // unsupported form so the same preamble works across supported shells.
+        parts.push(
+            "{ set -o pipefail 2>/dev/null || setopt PIPE_FAIL 2>/dev/null; } || true".to_string(),
+        );
+    }
 
     if config.disable_extglob {
         // Compatible with both bash and zsh:
@@ -105,7 +117,9 @@ pub fn build_hardened_command(config: &ShellHardeningConfig, user_command: &str)
     if config.reset_ifs {
         // Reset IFS to default (space, tab, newline) to prevent word-splitting attacks.
         // An attacker could set IFS to '/' to break path parsing.
-        parts.push("IFS=$' \\t\\n'".to_string());
+        // Keep this POSIX-sh compatible and free of single quotes: isolated execution
+        // paths may wrap the full command in a single-quoted shell argument.
+        parts.push("IFS=$(printf \" \\011\\012\")".to_string());
     }
 
     if parts.is_empty() {
@@ -289,8 +303,14 @@ pub fn is_dangerous_file_path(path: &str) -> bool {
     // "my.profile.rs" against ".profile".
     for &dangerous in DANGEROUS_FILE_PATHS {
         if dangerous.ends_with('/') {
-            // Directory pattern: substring match is correct (e.g. ".git/" in any position).
-            if normalized.contains(dangerous) {
+            // Directory pattern: match the directory component itself or any child path.
+            // This catches `.git` as well as `.git/config` without matching `foo.git`.
+            let dir = dangerous.trim_end_matches('/');
+            if normalized == dir
+                || normalized.ends_with(&format!("/{dir}"))
+                || normalized.contains(&format!("/{dir}/"))
+                || normalized.starts_with(&format!("{dir}/"))
+            {
                 return true;
             }
         } else {
@@ -319,8 +339,9 @@ pub fn is_dangerous_file_path(path: &str) -> bool {
 /// # Examples
 ///
 /// ```ignore
-/// // Safe internal artifact → allow.
+/// // Safe internal artifacts → allow.
 /// assert!(!is_dangerous_read_path("~/.astra/sessions/s1/tool-results/call_abc.txt"));
+/// assert!(!is_dangerous_read_path("~/.astra/sessions/s1.jsonl"));
 /// // Dangerous but not a safe internal path → block.
 /// assert!(is_dangerous_read_path("~/.astra/config.toml"));
 /// assert!(is_dangerous_read_path(".bashrc"));
@@ -347,10 +368,14 @@ pub fn is_dangerous_read_path(path: &str) -> bool {
 /// # Examples
 ///
 /// ```ignore
-/// // Session tool-results are safe to read back for summarization.
+/// // Session artifacts are safe to read back for summarization/diagnostics.
 /// assert_eq!(
 ///     is_internal_safe_path("~/.astra/sessions/s1/tool-results/call_abc.txt"),
 ///     Some(InternalPathKind::SessionToolResult)
+/// );
+/// assert_eq!(
+///     is_internal_safe_path("~/.astra/sessions/s1.jsonl"),
+///     Some(InternalPathKind::SessionJournal)
 /// );
 /// // But arbitrary .astra/ paths are not safe.
 /// assert_eq!(is_internal_safe_path("~/.astra/config.toml"), None);
@@ -402,6 +427,23 @@ pub fn is_internal_safe_path(path: &str) -> Option<InternalPathKind> {
 fn match_internal_safe_pattern(p: &std::path::Path) -> Option<InternalPathKind> {
     let components: Vec<_> = p.components().collect();
 
+    // Look for pattern: .astra/sessions/<session_id>.jsonl.
+    // This is the top-level session journal file, not arbitrary files under a
+    // per-session directory.
+    for i in 0..components.len().saturating_sub(2) {
+        let c0 = components[i].as_os_str().to_string_lossy();
+        let c1 = components.get(i + 1)?.as_os_str().to_string_lossy();
+        let c2 = components.get(i + 2)?.as_os_str().to_string_lossy();
+
+        if c0 == ".astra"
+            && c1 == "sessions"
+            && components.len() == i + 3
+            && looks_like_session_journal_file(&c2)
+        {
+            return Some(InternalPathKind::SessionJournal);
+        }
+    }
+
     // Look for pattern: .astra/sessions/<session_id>/tool-results/<file>.
     // Must match exactly these 4 components in sequence, with at least one more after.
     for i in 0..components.len().saturating_sub(4) {
@@ -421,9 +463,25 @@ fn match_internal_safe_pattern(p: &std::path::Path) -> Option<InternalPathKind> 
     None
 }
 
+fn looks_like_session_journal_file(name: &str) -> bool {
+    let Some(session_id) = name.strip_suffix(".jsonl") else {
+        return false;
+    };
+    // Delegate to the single source of truth. This previously reimplemented
+    // an alphanumeric/length/`-`/`_`/`.` allowlist that drifted from the
+    // canonical `astra_core::session_id::validate` used by the permission
+    // layer (`path_sensitivity.rs`) and the services layer
+    // (`services::session_journal::validate_session_id`). Any divergence
+    // would let the sandbox accept journal filenames the permission layer
+    // rejects (or vice-versa), so both must consult the same validator.
+    astra_core::session_id::validate(session_id).is_ok()
+}
+
 /// Kind of internal path that the agent is allowed to access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InternalPathKind {
+    /// Top-level session journal (e.g. `.astra/sessions/<session_id>.jsonl`).
+    SessionJournal,
     /// Session tool-result artifact (e.g. `.astra/sessions/*/tool-results/call_*.txt`).
     SessionToolResult,
 }
@@ -463,6 +521,10 @@ mod tests {
     fn default_config_adds_all_hardening() {
         let config = ShellHardeningConfig::default();
         let cmd = build_hardened_command(&config, "echo hello");
+        assert!(
+            cmd.contains("pipefail"),
+            "should preserve pipeline failures"
+        );
         assert!(cmd.contains("extglob"), "should disable extglob");
         assert!(cmd.contains("IFS="), "should reset IFS");
         assert!(cmd.contains("< /dev/null"), "should redirect stdin");
@@ -470,8 +532,28 @@ mod tests {
     }
 
     #[test]
+    fn ifs_reset_is_shell_portable_and_quote_safe() {
+        let config = ShellHardeningConfig::default();
+        let cmd = build_hardened_command(&config, "echo hello");
+
+        assert!(
+            cmd.contains("IFS=$(printf \" \\011\\012\")"),
+            "IFS reset must use portable printf form; got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("$'"),
+            "ANSI-C quoting is bash-specific and breaks sh wrappers; got: {cmd}"
+        );
+        assert!(
+            !cmd.contains('\''),
+            "hardening preamble must not introduce single quotes; got: {cmd}"
+        );
+    }
+
+    #[test]
     fn no_hardening_returns_raw_command() {
         let config = ShellHardeningConfig {
+            pipefail: false,
             disable_extglob: false,
             reset_ifs: false,
             redirect_stdin: false,
@@ -479,6 +561,42 @@ mod tests {
         };
         let cmd = build_hardened_command(&config, "echo hello");
         assert_eq!(cmd, "echo hello");
+    }
+
+    #[test]
+    fn journal_filename_validation_matches_session_id_rules() {
+        // Contract: `looks_like_session_journal_file` and the canonical
+        // `astra_core::session_id::validate` must agree. Previously these
+        // reimplemented overlapping-but-divergent allowlists; any drift would
+        // let the sandbox accept journal filenames the permission/services
+        // layer rejects (or vice-versa).
+        let good = [
+            "abc-123.jsonl",
+            "550e8400-e29b-41d4-a716-446655440000.jsonl",
+            "session_2024.jsonl",
+        ];
+        let bad = [
+            ".jsonl",                              // empty id
+            "..jsonl",                             // traversal
+            "a/b.jsonl",                           // separator
+            "café.jsonl",                          // non-ASCII
+            "has\nnewline.jsonl",                  // control char
+            &format!("{}.jsonl", "a".repeat(201)), // too long
+        ];
+        for g in good {
+            assert!(
+                looks_like_session_journal_file(g),
+                "{g:?} should be accepted"
+            );
+        }
+        for b in bad {
+            assert!(
+                !looks_like_session_journal_file(b),
+                "{b:?} should be rejected"
+            );
+        }
+        // Non-.jsonl suffix never matches regardless of id validity.
+        assert!(!looks_like_session_journal_file("abc-123.txt"));
     }
 
     #[test]
@@ -583,6 +701,8 @@ mod tests {
 
     #[test]
     fn detects_git_internal_paths() {
+        assert!(is_dangerous_file_path(".git"));
+        assert!(is_dangerous_file_path("/home/user/.git"));
         assert!(is_dangerous_file_path(".git/config"));
         assert!(is_dangerous_file_path("/home/user/.git/hooks/pre-commit"));
         assert!(is_dangerous_file_path(".gitconfig"));
@@ -597,6 +717,8 @@ mod tests {
 
     #[test]
     fn detects_ssh_paths() {
+        assert!(is_dangerous_file_path(".ssh"));
+        assert!(is_dangerous_file_path("/home/user/.ssh"));
         assert!(is_dangerous_file_path(".ssh/id_rsa"));
         assert!(is_dangerous_file_path("~/.ssh/id_rsa"));
         assert!(is_dangerous_file_path("/home/user/.ssh/authorized_keys"));
@@ -631,6 +753,13 @@ mod tests {
 
         // session tool-results are write-dangerous but NOT read-dangerous
         assert!(!is_dangerous_read_path(&artifact_path.to_string_lossy()));
+        let journal_path = temp.path().join(".astra/sessions/s1.jsonl");
+        std::fs::write(&journal_path, "{}\n").unwrap();
+        assert_eq!(
+            is_internal_safe_path(&journal_path.to_string_lossy()),
+            Some(InternalPathKind::SessionJournal)
+        );
+        assert!(!is_dangerous_read_path(&journal_path.to_string_lossy()));
         // But other .astra/ paths remain read-dangerous
         assert!(is_dangerous_read_path("/Users/test/.astra/config.toml"));
         assert!(is_dangerous_read_path(
@@ -647,6 +776,9 @@ mod tests {
         // write-dangerous: tool-results are still flagged
         assert!(is_dangerous_file_path(
             "/Users/test/.astra/sessions/s1/tool-results/call_abc.txt"
+        ));
+        assert!(is_dangerous_file_path(
+            "/Users/test/.astra/sessions/s1.jsonl"
         ));
         assert!(is_dangerous_file_path("/Users/test/.astra/config.toml"));
     }
@@ -714,6 +846,7 @@ mod tests {
     fn dangerous_path_git_internal_nested() {
         assert!(is_dangerous_file_path("repo/.git/config"));
         assert!(is_dangerous_file_path(".git/HEAD"));
+        assert!(!is_dangerous_file_path("repo/foo.git/config"));
     }
 
     // --- build_hardened_command edge cases ---
@@ -721,12 +854,14 @@ mod tests {
     #[test]
     fn hardened_command_only_extglob() {
         let config = ShellHardeningConfig {
+            pipefail: false,
             disable_extglob: true,
             reset_ifs: false,
             redirect_stdin: false,
             scrub_secrets: false,
         };
         let cmd = build_hardened_command(&config, "echo hello");
+        assert!(!cmd.contains("pipefail"));
         assert!(cmd.contains("extglob"));
         assert!(!cmd.contains("IFS="));
         assert!(!cmd.contains("< /dev/null"));
@@ -735,12 +870,14 @@ mod tests {
     #[test]
     fn hardened_command_only_ifs() {
         let config = ShellHardeningConfig {
+            pipefail: false,
             disable_extglob: false,
             reset_ifs: true,
             redirect_stdin: false,
             scrub_secrets: false,
         };
         let cmd = build_hardened_command(&config, "ls");
+        assert!(!cmd.contains("pipefail"));
         assert!(cmd.contains("IFS="));
         assert!(!cmd.contains("extglob"));
     }
@@ -766,6 +903,7 @@ mod tests {
     #[test]
     fn stdin_redirect_wraps_pipe_with_disabled_extras() {
         let config = ShellHardeningConfig {
+            pipefail: false,
             disable_extglob: false,
             reset_ifs: false,
             redirect_stdin: true,
@@ -776,6 +914,21 @@ mod tests {
         assert!(
             cmd.contains("< /dev/null"),
             "pipe commands must have stdin redirect; got: '{cmd}'"
+        );
+    }
+
+    #[test]
+    fn default_config_preserves_pipeline_failures_and_stdin_guard() {
+        let config = ShellHardeningConfig::default();
+        let cmd = build_hardened_command(&config, "cargo test 2>&1 | tail -20");
+
+        assert!(
+            cmd.contains("pipefail") || cmd.contains("PIPE_FAIL"),
+            "pipeline hardening must enable pipefail; got: '{cmd}'"
+        );
+        assert!(
+            cmd.contains("( cargo test 2>&1 | tail -20 ) < /dev/null"),
+            "pipeline hardening must wrap the whole pipeline for stdin guard; got: '{cmd}'"
         );
     }
 
@@ -803,7 +956,25 @@ mod tests {
             is_internal_safe_path(&format!("cat {artifact_path}")),
             Some(InternalPathKind::SessionToolResult)
         );
+        let journal = root.join(".astra/sessions/s1.jsonl");
+        std::fs::write(&journal, "journal").expect("write test journal");
+        assert_eq!(
+            is_internal_safe_path(&journal.to_string_lossy()),
+            Some(InternalPathKind::SessionJournal)
+        );
+        assert_eq!(
+            is_internal_safe_path(&format!("grep pattern {}", journal.to_string_lossy())),
+            Some(InternalPathKind::SessionJournal)
+        );
         assert_eq!(is_internal_safe_path(&artifact_dir.to_string_lossy()), None);
+        assert_eq!(
+            is_internal_safe_path(
+                &root
+                    .join(".astra/sessions/s1/messages.jsonl")
+                    .to_string_lossy()
+            ),
+            None
+        );
         assert_eq!(
             is_internal_safe_path(&root.join(".astra/config.toml").to_string_lossy()),
             None

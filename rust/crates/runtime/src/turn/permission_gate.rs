@@ -4,12 +4,10 @@
 //! When a tool is blocked by permissions, it returns an error result
 //! instead of executing, or requests permission from the parent agent.
 
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
 
 use crate::orchestration::permission_sync::{
-    PermissionRequest, PermissionResponse, PermissionSyncContext, PermissionUpdate,
+    PermissionRequest, PermissionResponse, PermissionSyncHandle, PermissionUpdate,
 };
 use astra_messaging::router::AgentMailbox;
 use astra_turn_core::permission::engine::{DecisionSource, HardDecision, evaluate_permission};
@@ -35,7 +33,7 @@ pub enum PermissionCheckResult {
 /// Check permission for a tool call.
 ///
 /// Flow:
-/// 1. If no permission_context, always allow (legacy mode)
+/// 1. If no permission_context, fail closed
 /// 2. Check PermissionSyncContext.is_allowed()
 /// 3. If denied and have mailbox, request permission from the parent
 /// 4. Return result
@@ -44,21 +42,23 @@ pub enum PermissionCheckResult {
 ///
 /// * `tool_name` — Name of the tool being invoked (e.g. `"bash"`, `"edit_file"`).
 /// * `args` — Optional JSON string of tool arguments, used for rule matching.
-/// * `permission_context` — Shared permission rules for this agent. `None` means
-///   legacy/unrestricted mode (all tools allowed).
+/// * `permission_context` — Shared permission rules for this agent. `None`
+///   means the caller failed to provide an authorization context, so the gate
+///   denies the tool call.
 /// * `mailbox` — Agent's mailbox for requesting permission from the parent.
 ///   `None` when no parent is available (root agent or standalone mode).
 /// * `timeout` — Maximum time to wait for a parent permission response.
 pub async fn check_tool_permission(
     tool_name: &str,
     args: Option<&str>,
-    permission_context: Option<&Arc<RwLock<PermissionSyncContext>>>,
+    permission_context: Option<&PermissionSyncHandle>,
     mailbox: Option<&mut AgentMailbox>,
     timeout: Duration,
 ) -> PermissionCheckResult {
-    // No permission context = legacy mode, always allow
     let Some(ctx) = permission_context else {
-        return PermissionCheckResult::Allowed;
+        return PermissionCheckResult::Denied {
+            reason: "no permission context configured".to_string(),
+        };
     };
 
     let normalized_args = args
@@ -171,54 +171,6 @@ pub fn permission_denied_error_result(tool_name: &str, reason: &str) -> String {
     )
 }
 
-/// Tools that are unconditionally read-only — safe to call in plan mode.
-///
-/// This list mirrors the tools that claudecode's plan-mode workflow
-/// instructions explicitly allow ("Thoroughly explore the codebase
-/// using Glob, Grep, and Read tools"). The `enter_plan_mode` /
-/// `exit_plan_mode` tools themselves must also pass — otherwise plan
-/// mode is a trap (model enters but can't exit).
-///
-/// Tools NOT on this list are treated as potentially-mutating in plan
-/// mode and denied. The list is conservative: it's safer to deny a
-/// surprising read-only tool than to allow a surprising write tool.
-fn is_read_only_in_plan_mode(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "read_file"
-            | "grep"
-            | "glob"
-            | "list_dir"
-            | "git_status"
-            | "git_diff"
-            | "git_log"
-            | "git_file_history"
-            | "git_contributors"
-            | "git_log_search"
-            | "git_show"
-            | "git_blame"
-            | "symbols"
-            | "introspect"
-            | "lsp"
-            | "web_fetch"
-            | "web_search"
-            | "memory"
-            | "session"
-            | "task"
-            | "tool_search"
-            | "ask_user"
-            | "notify"
-            | "view_image"
-            | "exit_plan_mode" // Read-only sub-actions of `git` tool. The full git tool also
-                               // has stash/commit/revert which mutate, but the model picks
-                               // those by `action` — we'd need argument-aware filtering to
-                               // be safe, so deny the whole git tool in plan mode for now
-                               // and let the model use individual git read tools through
-                               // bash if it really must (which is itself denied — the
-                               // intent is "read the code, don't mutate state").
-    )
-}
-
 /// Plan-mode-aware wrapper around [`check_tool_permission`]. When
 /// `plan_mode_active` is true, mutating tools are denied at the gate
 /// with a redirect to `exit_plan_mode`; read-only tools fall through
@@ -231,12 +183,19 @@ fn is_read_only_in_plan_mode(tool_name: &str) -> bool {
 pub async fn check_tool_permission_in_plan_mode(
     tool_name: &str,
     args: Option<&str>,
-    permission_context: Option<&Arc<RwLock<PermissionSyncContext>>>,
+    permission_context: Option<&PermissionSyncHandle>,
     mailbox: Option<&mut AgentMailbox>,
     timeout: Duration,
     plan_mode_active: bool,
 ) -> PermissionCheckResult {
-    if plan_mode_active && !is_read_only_in_plan_mode(tool_name) {
+    let normalized_args = args
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .map(|parsed| normalize_llm_function_arguments(&parsed))
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    if plan_mode_active
+        && crate::turn::plan_mode_guard::is_plan_mode_blocked_tool(tool_name, &normalized_args)
+    {
         return PermissionCheckResult::Denied {
             reason: format!(
                 "tool '{tool_name}' is blocked while plan mode is active. \
@@ -247,7 +206,15 @@ pub async fn check_tool_permission_in_plan_mode(
             ),
         };
     }
-    check_tool_permission(tool_name, args, permission_context, mailbox, timeout).await
+    let normalized_args_str = serde_json::to_string(&normalized_args).ok();
+    check_tool_permission(
+        tool_name,
+        normalized_args_str.as_deref(),
+        permission_context,
+        mailbox,
+        timeout,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -255,9 +222,11 @@ mod tests {
     use super::*;
     use crate::orchestration::permission_sync::{
         InheritedPermissions, PermissionMode, PermissionResponseMessaging, PermissionRule,
+        PermissionSyncContext,
     };
     use astra_turn_core::permission::types::RuleMatchContext;
     use std::collections::HashSet;
+    use std::sync::Arc;
 
     fn is_allowed(result: &PermissionCheckResult) -> bool {
         matches!(
@@ -267,7 +236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_context_always_allowed() {
+    async fn no_context_fails_closed() {
         let result = check_tool_permission(
             "edit",
             Some("src/main.rs"),
@@ -276,7 +245,12 @@ mod tests {
             Duration::from_secs(5),
         )
         .await;
-        assert!(is_allowed(&result));
+        match result {
+            PermissionCheckResult::Denied { reason } => {
+                assert!(reason.contains("no permission context"));
+            }
+            other => panic!("missing permission context must deny, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -290,7 +264,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let result =
             check_tool_permission("edit", None, Some(&ctx), None, Duration::from_secs(5)).await;
@@ -308,7 +282,7 @@ mod tests {
             is_background: true,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let result =
             check_tool_permission("edit", None, Some(&ctx), None, Duration::from_secs(5)).await;
@@ -326,7 +300,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let result =
             check_tool_permission("edit", None, Some(&ctx), None, Duration::from_secs(5)).await;
@@ -353,7 +327,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         // Should approve without needing a mailbox
         let result = check_tool_permission(
@@ -388,7 +362,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         // "view" is in the allowlist — should approve
         let result =
@@ -411,27 +385,12 @@ mod tests {
         assert_eq!(telemetry.tools_blocked, 1);
     }
 
-    /// REGRESSION: a sub-agent in `Prompt` mode whose tool IS in the
-    /// agent_type's `allowed_tools` allowlist must be auto-approved
-    /// without trying to ask the parent. The user already authorized
-    /// the spawn action that created this sub-agent, knowing its
-    /// agent_type's tool surface (e.g. `code-review` ⇒ bash, grep,
-    /// glob, view). Asking them again per-tool-call is friction
-    /// without consent value.
-    ///
-    /// The pre-fix bug (session 2a98814b): sub-agents inherited
-    /// Prompt mode, fell through to the "request parent" branch, but
-    /// the orchestrator mailbox was never registered in
-    /// `initialize_multi_agent_runtime` — so `request_permission`
-    /// returned `MailboxError::AgentNotFound("orchestrator@run-...")`
-    /// and the tool call was denied. 4 review agents spawned, all
-    /// returned 0 tool calls, useless output.
-    ///
-    /// Fix: extend the local-approve fast path so it also fires when
-    /// `allowed_tools.is_some()` AND the tool is in the list,
-    /// regardless of mode. The allowlist IS the consent.
+    /// `allowed_tools` is a tool-surface boundary, not consent to run
+    /// mutating or executing tools. In Prompt mode, allowlisted bash
+    /// still needs a parent approval sink; without one, the gate denies
+    /// instead of silently executing.
     #[tokio::test]
-    async fn allowlisted_tool_auto_approves_in_prompt_mode_without_mailbox() {
+    async fn allowlisted_execute_tool_denies_in_prompt_mode_without_mailbox() {
         let inherited = InheritedPermissions {
             mode: PermissionMode::Prompt,
             allow_rules: vec![],
@@ -449,33 +408,31 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         // No mailbox — orchestrator is not registered (the actual
         // production state on a fresh REPL).
         let result = check_tool_permission(
             "bash",
-            Some(r#"{"command":"git show HEAD"}"#),
+            Some(r#"{"command":"touch prompt-mode-allowlist-denied.txt"}"#),
             Some(&ctx),
             None,
             Duration::from_secs(1),
         )
         .await;
         assert!(
-            is_allowed(&result),
-            "tool in agent_type allowlist must auto-approve in Prompt mode; \
-             got {result:?}. Pre-fix this would have hit the 'mailbox = None' \
-             branch and denied the call."
+            matches!(result, PermissionCheckResult::Denied { .. }),
+            "allowlisted execute tools must still require approval in Prompt mode; got {result:?}"
         );
 
         let telemetry = ctx.read().await.telemetry();
         assert_eq!(
             telemetry.permission_requests, 0,
-            "must NOT send a mailbox request — the allowlist is the consent"
+            "without a mailbox the gate should fail before sending a request"
         );
         assert_eq!(
-            telemetry.tools_blocked, 0,
-            "must NOT block the call — allowlisted tools bypass the prompt path"
+            telemetry.tools_blocked, 1,
+            "missing approval sink should be recorded as a blocked tool"
         );
     }
 
@@ -501,7 +458,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let result = check_tool_permission(
             "read_file",
@@ -535,7 +492,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         // `edit` is NOT in the code-review-style allowlist.
         let result = check_tool_permission(
@@ -563,7 +520,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let result = check_tool_permission(
             "bash",
@@ -583,18 +540,18 @@ mod tests {
     async fn explicit_actions_follow_auto_mode_without_parent() {
         let inherited = InheritedPermissions {
             mode: PermissionMode::Auto,
-            allow_rules: vec![PermissionRule::parse("git_commit")],
+            allow_rules: vec![PermissionRule::parse("git")],
             deny_rules: vec![],
             ask_rules: vec![],
             allowed_tools: None,
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let result = check_tool_permission(
-            "git_commit",
-            Some(r#"{"message":"ship it"}"#),
+            "git",
+            Some(r#"{"action":"commit","message":"ship it"}"#),
             Some(&ctx),
             None,
             Duration::from_secs(1),
@@ -637,14 +594,14 @@ mod tests {
 
         let inherited = InheritedPermissions {
             mode: PermissionMode::Prompt,
-            allow_rules: vec![PermissionRule::parse("git_commit")],
+            allow_rules: vec![PermissionRule::parse("git")],
             deny_rules: vec![],
             ask_rules: vec![],
             allowed_tools: None,
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let router_clone = router.clone();
         let parent_addr_clone = parent_addr.clone();
@@ -670,8 +627,8 @@ mod tests {
         });
 
         let result = check_tool_permission(
-            "git_commit",
-            Some(r#"{"message":"ship it"}"#),
+            "git",
+            Some(r#"{"action":"commit","message":"ship it"}"#),
             Some(&ctx),
             Some(&mut child_mailbox),
             Duration::from_secs(1),
@@ -718,8 +675,8 @@ mod tests {
 
         // No allowlist set — Prompt mode falls through to the
         // request-parent flow that this test is exercising. (When an
-        // allowlist IS set, allowlisted tools auto-approve locally;
-        // see `allowlisted_tool_auto_approves_in_prompt_mode_without_mailbox`.)
+        // allowlist IS set, mutating/execute tools still need approval;
+        // see `allowlisted_execute_tool_denies_in_prompt_mode_without_mailbox`.)
         let inherited = InheritedPermissions {
             mode: PermissionMode::Prompt,
             allow_rules: vec![],
@@ -729,7 +686,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let router_clone = router.clone();
         let parent_addr_clone = parent_addr.clone();
@@ -741,7 +698,7 @@ mod tests {
                     let response =
                         crate::orchestration::permission_sync::PermissionResponse::approve()
                             .with_update(PermissionUpdate::allow(PermissionRule::parse(
-                                "Bash(touch:*)",
+                                r#"Bash(argv_prefix="touch")"#,
                             )));
                     router_clone
                         .send(response.to_message(
@@ -812,12 +769,12 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         // Pretend the session is mid-plan with active plan id present.
         let result = check_tool_permission_in_plan_mode(
             "bash",
-            Some(r#"{"command":"echo hi"}"#),
+            Some(r#"{"command":"touch plan.txt"}"#),
             Some(&ctx),
             None,
             Duration::from_secs(1),
@@ -841,17 +798,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_mode_blocks_str_replace_and_write_file() {
+    async fn plan_mode_blocks_mutating_and_execute_tools_by_args() {
         let inherited = InheritedPermissions {
             mode: PermissionMode::Auto,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
-        for tool in &["str_replace", "write_file", "multi_edit"] {
+        for (tool, args) in [
+            ("str_replace", None),
+            ("write_file", None),
+            ("multi_edit", None),
+            ("delete_file", Some(r#"{"path":"stale.txt"}"#)),
+            ("run_script", Some(r#"{"script":"touch plan.txt"}"#)),
+            ("rollback_file_edits", Some(r#"{"scope":"current_turn"}"#)),
+            ("rollback_session_state", Some(r#"{"scope":"last_turn"}"#)),
+            ("adjust_config", Some(r#"{"key":"model","value":"fast"}"#)),
+            ("prioritize_tool", Some(r#"{"tool":"bash"}"#)),
+            ("deprioritize_tool", Some(r#"{"tool":"grep"}"#)),
+            ("compress_context", Some(r#"{"target_tokens":1000}"#)),
+            ("task", Some(r#"{"action":"stop","task_id":"bg-shell-1"}"#)),
+        ] {
             let result = check_tool_permission_in_plan_mode(
                 tool,
-                None,
+                args,
                 Some(&ctx),
                 None,
                 Duration::from_secs(1),
@@ -866,12 +836,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plan_mode_blocks_shell_even_when_args_look_read_only() {
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Auto,
+            ..Default::default()
+        };
+        let ctx = PermissionSyncContext::shared(inherited);
+
+        for command in ["git status --short", "ls src", "grep -R needle src"] {
+            let args = serde_json::json!({ "command": command }).to_string();
+            let result = check_tool_permission_in_plan_mode(
+                "bash",
+                Some(&args),
+                Some(&ctx),
+                None,
+                Duration::from_secs(1),
+                true,
+            )
+            .await;
+            assert!(
+                matches!(result, PermissionCheckResult::Denied { .. }),
+                "shell command `{command}` must be blocked during plan authoring because bash is an unstructured execute surface. Got: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn plan_mode_allows_read_only_tools() {
         let inherited = InheritedPermissions {
             mode: PermissionMode::Auto,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         for tool in &[
             "read_file",
@@ -914,11 +910,11 @@ mod tests {
             mode: PermissionMode::Auto,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let result = check_tool_permission_in_plan_mode(
             "bash",
-            Some(r#"{"command":"echo hi"}"#),
+            Some(r#"{"command":"touch plan.txt"}"#),
             Some(&ctx),
             None,
             Duration::from_secs(1),
@@ -940,7 +936,7 @@ mod tests {
             mode: PermissionMode::Auto,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let result = check_tool_permission_in_plan_mode(
             "exit_plan_mode",
@@ -995,7 +991,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let result = check_tool_permission(
             "bash",

@@ -1,8 +1,78 @@
 //! Shared plan state persisted and mirrored across runtime and CLI flows.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use astra_services::task_orchestrator::TaskPlan;
+
+/// Plan lifecycle phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlanPhase {
+    /// Authoring the plan, no subtasks yet.
+    Planning,
+    /// Plan has subtasks but none started.
+    Refining,
+    /// At least one subtask in progress or done.
+    Executing,
+    /// All subtasks completed.
+    Completed,
+}
+
+impl PlanPhase {
+    /// Serialize as the lowercase kebab-compatible static string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlanPhase::Planning => "planning",
+            PlanPhase::Refining => "refining",
+            PlanPhase::Executing => "executing",
+            PlanPhase::Completed => "completed",
+        }
+    }
+}
+
+impl fmt::Display for PlanPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for PlanPhase {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for PlanPhase {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        match s.as_str() {
+            "planning" => Ok(PlanPhase::Planning),
+            "refining" => Ok(PlanPhase::Refining),
+            "executing" => Ok(PlanPhase::Executing),
+            "completed" => Ok(PlanPhase::Completed),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["planning", "refining", "executing", "completed"],
+            )),
+        }
+    }
+}
+
+impl PlanModeState {
+    /// Infer the current phase from plan progress.
+    pub fn infer_phase(&self) -> PlanPhase {
+        if self.plan.progress_pct() == 100 {
+            PlanPhase::Completed
+        } else if self.plan.subtasks.is_empty() {
+            PlanPhase::Planning
+        } else if self.plan.items_done() > 0 {
+            PlanPhase::Executing
+        } else {
+            PlanPhase::Refining
+        }
+    }
+}
 
 fn default_version() -> u64 {
     1

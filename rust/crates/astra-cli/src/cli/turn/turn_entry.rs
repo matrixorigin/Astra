@@ -7,8 +7,7 @@ use super::turn_settlement::TurnDispatch;
 use super::turn_stream_runner::{TurnAttempt, execute_stream_turn};
 use crate::cli::session::session_adaptation::{finalize_turn_adaptation, prepare_turn_adaptation};
 use crate::cli::session::session_input::{
-    active_task_attachment, build_effective_line_with_attachment,
-    clear_pending_recovery_for_ordinary_chat_input, finalize_effective_line,
+    build_effective_line, clear_pending_recovery_for_ordinary_chat_input, finalize_effective_line,
 };
 use crate::cli::session::session_state::SessionState;
 
@@ -248,8 +247,6 @@ pub(crate) async fn handle_chat_input_with_ui(
         clear_pending_recovery_for_ordinary_chat_input(state);
     }
 
-    state.perm_manager.trust_explicit_user_paths(&line);
-
     ui.blank_line();
 
     if crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(state)
@@ -267,18 +264,14 @@ pub(crate) async fn handle_chat_input_with_ui(
     }
 
     let resume_guidance = state.resume_guidance.take();
-    let active_attachment = active_task_attachment(&line, state);
     let effective_line = finalize_effective_line(
-        build_effective_line_with_attachment(&line, state, ui, active_attachment.as_ref()),
+        build_effective_line(&line, state, ui),
         resume_guidance,
         state,
     )
     .await;
     let turn_start = Instant::now();
     let session_id = state.session_id.clone();
-    let semantic_query_override = active_attachment
-        .as_ref()
-        .map(|attachment| attachment.semantic_query());
     let attempt = run_chat_turn(
         state,
         ctx.api,
@@ -286,7 +279,7 @@ pub(crate) async fn handle_chat_input_with_ui(
         token,
         &effective_line,
         session_id.as_deref(),
-        semantic_query_override.as_deref(),
+        None,
     )
     .await;
     let mut dispatch = TurnDispatch {
@@ -295,7 +288,7 @@ pub(crate) async fn handle_chat_input_with_ui(
         effective_line: &effective_line,
         token,
         session_id: session_id.as_deref(),
-        semantic_query_override: semantic_query_override.as_deref(),
+        semantic_query_override: None,
         turn_start,
         ui,
     };
@@ -476,7 +469,6 @@ mod tests {
         let pre_turn_gate = &body[..gate_end];
         assert!(
             !pre_turn_gate.contains("restore_session_into_state(")
-                && !pre_turn_gate.contains("is_low_information_followup(&line)")
                 && pre_turn_gate.contains("clear_pending_recovery_for_ordinary_chat_input(state);"),
             "ordinary chat input must not auto-restore pending recovery; resume is explicit only"
         );

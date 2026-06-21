@@ -107,7 +107,7 @@ fn right_moves_focus_to_always_and_enter_remembers_workspace_default() {
     let mut bp = BottomPane::new();
     let rx = enqueue(&mut bp, "bash");
 
-    // Allow once -> Always
+    // Yes -> don't ask again
     let _ = bp.handle_key(special(KeyCode::Right));
     let _ = bp.handle_key(special(KeyCode::Enter));
     assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::AlwaysAllow);
@@ -390,7 +390,7 @@ fn activation_single_vs_batch_reports_correct_variant() {
 fn down_moves_focus_like_right() {
     let mut bp = BottomPane::new();
     let rx = enqueue(&mut bp, "bash");
-    // Down from Allow once -> Always.
+    // Down from Yes -> don't ask again.
     let _ = bp.handle_key(special(KeyCode::Down));
     let _ = bp.handle_key(special(KeyCode::Enter));
     assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::AlwaysAllow);
@@ -400,7 +400,7 @@ fn down_moves_focus_like_right() {
 fn up_moves_focus_like_left_wrapping_to_reject() {
     let mut bp = BottomPane::new();
     let rx = enqueue(&mut bp, "bash");
-    // Up from Allow once wraps to the last button (Reject).
+    // Up from Yes wraps to the last button (No).
     let _ = bp.handle_key(special(KeyCode::Up));
     let _ = bp.handle_key(special(KeyCode::Enter));
     assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::Deny);
@@ -410,7 +410,7 @@ fn up_moves_focus_like_left_wrapping_to_reject() {
 fn primary_always_resolves_without_second_match_target_step() {
     let mut bp = BottomPane::new();
     let rx = enqueue(&mut bp, "bash");
-    // From Allow once (index 0), Down once lands on Always.
+    // From Yes (index 0), Down once lands on don't ask again.
     let _ = bp.handle_key(special(KeyCode::Down));
     let _ = bp.handle_key(special(KeyCode::Enter));
     assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::AlwaysAllow);

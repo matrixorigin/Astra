@@ -203,7 +203,9 @@ impl ToolCell {
         {
             return;
         }
-        self.output_summary = Some(failure_detail_fallback(&self.name, &self.description));
+        let fallback = failure_detail_fallback(&self.name, &self.description);
+        self.output_summary = Some(fallback.clone());
+        self.output = Some(fallback);
     }
 
     fn bullet(&self) -> Span<'static> {
@@ -557,13 +559,21 @@ impl HistoryCell for ToolCell {
         // Output summary — diff renderer for +/- content,
         // plain truncated preview otherwise.
         if missing_failure_details {
-            lines.push(Line::from(vec![
-                Span::styled("  └ ", dim),
-                Span::styled(
-                    failure_detail_fallback(&self.name, &self.description),
-                    Style::default().fg(Color::Red),
-                ),
-            ]));
+            let fallback = failure_detail_fallback(&self.name, &self.description);
+            let detail = sanitize_terminal_text(&fallback);
+            let detail_lines: Vec<&str> = detail.lines().collect();
+            for (i, detail_line) in detail_lines.iter().enumerate() {
+                let is_last = i + 1 == detail_lines.len();
+                let gutter = if is_last { "  └ " } else { "  ├ " };
+                lines.extend(wrap_prefixed_line(
+                    Line::from(vec![
+                        Span::styled(gutter.to_string(), dim),
+                        Span::styled((*detail_line).to_string(), Style::default().fg(Color::Red)),
+                    ]),
+                    width,
+                    Line::from(vec![Span::styled("  │ ".to_string(), dim)]),
+                ));
+            }
         }
 
         if let Some(edited) = edited_diff {
@@ -860,9 +870,15 @@ fn failure_detail_fallback(name: &str, description: &str) -> String {
     let label = friendly_tool_display_name_for_context(name, description);
     let description = description.trim();
     if description.is_empty() {
-        format!("{label} failed before returning output")
+        format!(
+            "{label} failed before returning output.\n\
+             Origin: agent_tool_reporting_error; no error body returned."
+        )
     } else {
-        format!("{label} failed before returning output: {description}")
+        format!(
+            "{label} failed before returning output: {description}.\n\
+             Origin: agent_tool_reporting_error; no error body returned."
+        )
     }
 }
 
@@ -1079,8 +1095,11 @@ mod tests {
         assert!(t.duration_ms.is_some(), "duration snapshotted on finalize");
         assert_eq!(
             t.output_summary.as_deref(),
-            Some("Bash failed before returning output: slow op")
+            Some(
+                "Bash failed before returning output: slow op.\nOrigin: agent_tool_reporting_error; no error body returned."
+            )
         );
+        assert_eq!(t.output.as_deref(), t.output_summary.as_deref());
         assert!(!t.is_live());
     }
 
@@ -1174,12 +1193,16 @@ mod tests {
     fn complete_failed_tool_synthesizes_missing_details() {
         let mut t = ToolCell::new_running("bash", "$ make check 2>&1");
         t.complete("failed", 1200, String::new(), None, None);
-        assert_eq!(
-            t.output_summary.as_deref(),
-            Some("Bash failed before returning output: $ make check 2>&1")
+        let summary = t.output_summary.as_deref().unwrap();
+        assert!(
+            summary.contains("Bash failed before returning output: $ make check 2>&1"),
+            "{summary}"
         );
+        assert!(summary.contains("agent_tool_reporting_error"), "{summary}");
+        assert_eq!(t.output.as_deref(), t.output_summary.as_deref());
         let out = render(&t, 100, 4);
         assert!(out.contains("Bash failed before returning output"), "{out}");
+        assert!(out.contains("agent_tool_reporting_error"), "{out}");
         assert!(!out.contains("No details returned"), "{out}");
     }
 
@@ -1297,10 +1320,13 @@ mod tests {
             Some(" \n ".into()),
             Some("\t".into()),
         );
-        assert_eq!(
-            t.output_summary.as_deref(),
-            Some("Read failed before returning output: Reading: src/main.rs")
+        let summary = t.output_summary.as_deref().unwrap();
+        assert!(
+            summary.contains("Read failed before returning output: Reading: src/main.rs"),
+            "{summary}"
         );
+        assert!(summary.contains("agent_tool_reporting_error"), "{summary}");
+        assert_eq!(t.output.as_deref(), t.output_summary.as_deref());
     }
 
     #[test]

@@ -6,10 +6,9 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use astra_pipeline::journal_crypto::{JournalCrypto, hex_decode, hex_encode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -47,33 +46,6 @@ fn backoff_delay(retry_count: u32) -> Duration {
     Duration::from_millis(ms)
 }
 
-fn ledger_crypto() -> io::Result<&'static JournalCrypto> {
-    static CRYPTO: OnceLock<Result<JournalCrypto, String>> = OnceLock::new();
-    match CRYPTO
-        .get_or_init(|| JournalCrypto::from_env_or_local_key().map_err(|error| error.to_string()))
-    {
-        Ok(crypto) => Ok(crypto),
-        Err(error) => Err(io::Error::other(error.clone())),
-    }
-}
-
-fn encrypt_persisted_ledger_line(line: &str) -> io::Result<String> {
-    let encrypted = ledger_crypto()?.encrypt(line.as_bytes())?;
-    Ok(hex_encode(&encrypted))
-}
-
-fn decrypt_persisted_ledger_line(line: &str) -> io::Result<Option<String>> {
-    let Some(bytes) = hex_decode(line.trim()) else {
-        return Ok(None);
-    };
-    let Some(decrypted) = ledger_crypto()?.decrypt(&bytes) else {
-        return Ok(None);
-    };
-    String::from_utf8(decrypted)
-        .map(Some)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-}
-
 fn sync_parent_dir(dir: &Path) -> io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
@@ -93,7 +65,7 @@ impl LedgerEntryMeta {
     fn now() -> Self {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .unwrap_or(std::time::Duration::MAX)
             .as_millis() as u64;
         Self {
             created_at_ms: now_ms,
@@ -106,7 +78,7 @@ impl LedgerEntryMeta {
         self.retry_count += 1;
         self.last_poll_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .unwrap_or(std::time::Duration::MAX)
             .as_millis() as u64;
     }
 
@@ -114,7 +86,7 @@ impl LedgerEntryMeta {
     fn age_ms(&self) -> u64 {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .unwrap_or(std::time::Duration::MAX)
             .as_millis() as u64;
         now_ms.saturating_sub(self.created_at_ms)
     }
@@ -286,7 +258,6 @@ impl LedgerPersistence {
                 .unwrap_or_default()
                 .as_millis() as u64,
         });
-        let encrypted = encrypt_persisted_ledger_line(&line.to_string())?;
         #[cfg(unix)]
         let mut file = {
             use std::os::unix::fs::OpenOptionsExt;
@@ -301,7 +272,7 @@ impl LedgerPersistence {
             .create(true)
             .append(true)
             .open(&path)?;
-        writeln!(file, "{encrypted}")?;
+        writeln!(file, "{line}")?;
         file.sync_data()?;
         drop(file);
         if !existed {
@@ -339,8 +310,16 @@ impl LedgerPersistence {
             if line.trim().is_empty() {
                 continue;
             }
-            let json = decrypt_persisted_ledger_line(&line)?.unwrap_or(line);
-            let entry: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+            let entry: serde_json::Value = match serde_json::from_str(&line) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "skipping malformed edge ledger JSONL line during recovery"
+                    );
+                    continue;
+                }
+            };
             let Some(op) = entry.get("op").and_then(|v| v.as_str()) else {
                 continue;
             };
@@ -399,8 +378,7 @@ impl LedgerPersistence {
                     .unwrap_or_default()
                     .as_millis() as u64,
             });
-            let encrypted = encrypt_persisted_ledger_line(&line.to_string())?;
-            writeln!(file, "{encrypted}")?;
+            writeln!(file, "{line}")?;
         }
         file.sync_all()?;
         drop(file);
@@ -2098,14 +2076,14 @@ mod tests {
         let lines: Vec<_> = persisted.lines().collect();
         assert_eq!(lines.len(), 1, "compact must rewrite a single active entry");
         assert!(
-            !lines[0].contains("\"key\":\"keep\""),
-            "persisted ledger lines should be encrypted at rest"
+            lines[0].contains("\"key\":\"keep\""),
+            "persisted ledger lines should be plaintext JSONL"
         );
         assert_eq!(persistence.recover().unwrap(), vec!["keep".to_string()]);
     }
 
     #[test]
-    fn ledger_persistence_encrypts_raw_journal_lines() {
+    fn ledger_persistence_writes_plaintext_journal_lines() {
         let tmp = tempdir().unwrap();
         let persistence = LedgerPersistence::new(tmp.path().to_path_buf());
 
@@ -2113,13 +2091,26 @@ mod tests {
 
         let raw = std::fs::read_to_string(tmp.path().join("edge_ledger.jsonl")).unwrap();
         assert!(
-            !raw.contains("secret-key"),
-            "raw persisted ledger should not expose callback keys"
+            raw.contains("\"key\":\"secret-key\""),
+            "raw persisted ledger should expose plaintext callback keys"
         );
         assert_eq!(
             persistence.recover().unwrap(),
             vec!["secret-key".to_string()]
         );
+    }
+
+    #[test]
+    fn ledger_persistence_skips_malformed_jsonl_lines() {
+        let tmp = tempdir().unwrap();
+        let persistence = LedgerPersistence::new(tmp.path().to_path_buf());
+        std::fs::write(
+            tmp.path().join("edge_ledger.jsonl"),
+            "{\"op\":\"insert\",\"key\":\"keep\",\"ts_ms\":1}\nnot-json\n{\"op\":\"remove\",\"key\":\"missing\",\"ts_ms\":2}\n",
+        )
+        .unwrap();
+
+        assert_eq!(persistence.recover().unwrap(), vec!["keep".to_string()]);
     }
 
     #[test]

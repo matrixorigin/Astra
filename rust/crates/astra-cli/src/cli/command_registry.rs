@@ -322,18 +322,18 @@ const DIFF_SUBCOMMANDS: &[(&str, &str)] = &[
 // EXPERIMENT_SUBCOMMANDS removed — /experiment is dead code
 
 const ALLOW_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("all", "Auto-approve all (alias for auto)"),
     ("auto", "Auto-approve all tool use"),
     ("plan", "Read-only investigation mode; mutations are denied"),
     (
-        "accept-edits",
+        "accept_edits",
         "Auto-approve workspace-local file edits while still prompting for shell and external writes",
     ),
     ("deny", "Deny all tool use"),
     ("prompt", "Prompt before tool use"),
-    ("default", "Alias for ask/prompt mode"),
-    ("ask", "Ask before tool use"),
     ("rules", "Show current permission rules"),
+    ("trust", "Trust this workspace"),
+    ("untrust", "Mark this workspace untrusted"),
+    ("trace", "Show recent permission audit events"),
 ];
 
 const INSTRUCTIONS_SUBCOMMANDS: &[(&str, &str)] = &[
@@ -687,13 +687,9 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::Observability,
     )
     .with_tui_handler(TuiHandler::Panel),
-    CommandMeta::new(
-        "/whoami",
-        "Alias for /info",
-        CommandGroup::Observability,
-    )
-    .alias()
-    .with_tui_handler(TuiHandler::Panel),
+    CommandMeta::new("/whoami", "Alias for /info", CommandGroup::Observability)
+        .alias()
+        .with_tui_handler(TuiHandler::Panel),
     CommandMeta::new(
         "/health",
         "Alias for /stats health",
@@ -793,11 +789,11 @@ pub static COMMANDS: &[CommandMeta] = &[
     // ── System ────────────────────────────────────────────────────────────
     CommandMeta::new(
         "/allow",
-        "Permission mode: /allow [auto|plan|accept-edits|prompt|default|ask|deny|all|rules|trust|untrust|trace]",
+        "Permission mode: /allow [auto|plan|accept_edits|prompt|deny|rules|trust|untrust|trace]",
         CommandGroup::System,
     )
     .with_subcommands(ALLOW_SUBCOMMANDS)
-    .with_arg_hint("[auto|accept-edits|plan|prompt|default|ask|deny|all|rules]")
+    .with_arg_hint("[auto|accept_edits|plan|prompt|deny|rules|trust|untrust|trace]")
     .with_tui_handler(TuiHandler::Inline),
     CommandMeta::new(
         "/instructions",
@@ -1106,18 +1102,24 @@ mod tests {
             .iter()
             .find(|meta| meta.name == "/allow")
             .expect("/allow command");
-        assert!(allow.description.contains("accept-edits"));
+        assert!(allow.description.contains("accept_edits"));
         assert!(allow.description.contains("plan"));
         assert_eq!(
             allow.arg_hint,
-            Some("[auto|accept-edits|plan|prompt|default|ask|deny|all|rules]")
+            Some("[auto|accept_edits|plan|prompt|deny|rules|trust|untrust|trace]")
         );
 
         let subs = subcommand_completions("/allow").expect("/allow subcommands");
-        assert!(subs.iter().any(|(tok, _)| *tok == "accept-edits"));
-        assert!(subs.iter().any(|(tok, _)| *tok == "default"));
-        assert!(subs.iter().any(|(tok, _)| *tok == "ask"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "accept_edits"));
+        assert!(!subs.iter().any(|(tok, _)| *tok == "accept-edits"));
+        assert!(!subs.iter().any(|(tok, _)| *tok == "default"));
+        assert!(!subs.iter().any(|(tok, _)| *tok == "ask"));
+        assert!(!subs.iter().any(|(tok, _)| *tok == "all"));
+        assert!(!subs.iter().any(|(tok, _)| *tok == "status"));
         assert!(subs.iter().any(|(tok, _)| *tok == "plan"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "trust"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "untrust"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "trace"));
     }
 
     #[test]

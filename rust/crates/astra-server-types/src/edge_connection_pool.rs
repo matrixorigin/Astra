@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use serde::Serialize;
+use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -30,8 +31,12 @@ const MAX_PENDING_REQUESTS_PER_USER: usize = 100;
 /// success/timeout paths).
 const PENDING_REQUEST_TTL_SECS: u64 = EDGE_TOOL_TIMEOUT_SECS * 3;
 
+/// Maximum capacity for the channel between the tool router and an edge agent's
+/// WebSocket write loop. When full, senders apply backpressure to prevent OOM.
+pub const EDGE_WS_CHANNEL_CAPACITY: usize = 256;
+
 /// Sender half that pushes frames into an edge agent's WebSocket write loop.
-pub type EdgeWsSender = mpsc::UnboundedSender<EdgeServerMessage>;
+pub type EdgeWsSender = mpsc::Sender<EdgeServerMessage>;
 
 /// Information about a tool request dispatched to an edge, stored for
 /// reconnection deduplication. When an edge reconnects, cloud can check
@@ -54,6 +59,7 @@ pub struct EdgeConnection {
     pub edge_agent_id: String,
     pub hostname: Option<String>,
     pub workspace_dir: Option<String>,
+    pub capabilities: Option<Value>,
     pub sender: EdgeWsSender,
     pub connected_at: std::time::Instant,
     /// Pending tool call responses: request_id → oneshot sender.
@@ -121,6 +127,27 @@ impl EdgeConnectionPool {
         workspace_dir: Option<String>,
         sender: EdgeWsSender,
     ) {
+        self.register_with_capabilities(
+            user_id,
+            edge_agent_id,
+            hostname,
+            workspace_dir,
+            None,
+            sender,
+        )
+    }
+
+    /// Register a new edge connection with its structured runtime capability advertisement.
+    /// Replaces any existing connection for the same key.
+    pub fn register_with_capabilities(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        hostname: Option<String>,
+        workspace_dir: Option<String>,
+        capabilities: Option<Value>,
+        sender: EdgeWsSender,
+    ) {
         let key = pool_key(user_id, edge_agent_id);
         self.connections.insert(
             key,
@@ -129,6 +156,7 @@ impl EdgeConnectionPool {
                 edge_agent_id: edge_agent_id.to_string(),
                 hostname,
                 workspace_dir,
+                capabilities,
                 sender,
                 connected_at: std::time::Instant::now(),
                 pending_results: Arc::new(DashMap::new()),
@@ -163,6 +191,7 @@ impl EdgeConnectionPool {
                     edge_agent_id: conn.edge_agent_id.clone(),
                     hostname: conn.hostname.clone(),
                     workspace_dir: conn.workspace_dir.clone(),
+                    capabilities: conn.capabilities.clone(),
                     connected_at: conn.connected_at,
                 }
             })
@@ -232,16 +261,26 @@ impl EdgeConnectionPool {
         };
         self.insert_pending_request(user_id, &request_id, dispatched);
 
-        if sender.send(msg).is_err() {
+        if sender.send(msg).await.is_err() {
             pending_results.remove(&request_id);
             self.remove_pending_request(&request_id);
             return None;
         }
 
+        // Helper: notify the edge that it should abort the in-flight request
+        // and drop any partial result. Best-effort: if the send fails (edge
+        // already gone), we still proceed with local cleanup.
+        let cancel_edge = || {
+            let _ = sender.try_send(EdgeServerMessage::ToolCancel {
+                request_id: request_id.clone(),
+            });
+        };
+
         let timeout_dur = Duration::from_secs(EDGE_TOOL_TIMEOUT_SECS);
         let result = if let Some(token) = cancel_token {
             tokio::select! {
                 _ = token.cancelled() => {
+                    cancel_edge();
                     pending_results.remove(&request_id);
                     self.remove_pending_request(&request_id);
                     return None;
@@ -257,6 +296,10 @@ impl EdgeConnectionPool {
                 Some(result)
             }
             _ => {
+                // Timed out waiting for the edge. Tell it to abort so the
+                // (possibly still running) tool does not write to a file or
+                // run a destructive command after the caller has given up.
+                cancel_edge();
                 pending_results.remove(&request_id);
                 self.remove_pending_request(&request_id);
                 None
@@ -309,6 +352,17 @@ impl EdgeConnectionPool {
         {
             return tx.send(result).is_ok();
         }
+        // No pending entry: the request was already cancelled, timed out, or the
+        // connection was reset. Log so operators can correlate late edge results
+        // (e.g. a bash command completing after the caller already gave up and
+        // issued a conflicting write) instead of silently dropping them.
+        tracing::warn!(
+            user_id = %user_id,
+            edge_agent_id = %edge_agent_id,
+            request_id = %request_id,
+            is_error = result.is_error,
+            "edge tool result delivered with no pending receiver; dropping"
+        );
         false
     }
 
@@ -330,30 +384,44 @@ impl EdgeConnectionPool {
 
     /// Insert a dispatched request into the pending set, enforcing the capacity
     /// limit by evicting the oldest entry if necessary.
+    ///
+    /// Holds `pending_request_order` across the global capacity check AND all
+    /// three structural inserts so that concurrent inserters are serialized:
+    /// they cannot both observe `len < max_pending` and then both push, which
+    /// would overshoot the cap. It also keeps the order deque consistent with
+    /// `pending_requests` under panic (the push_back happens last, under the
+    /// same critical section that decided capacity).
     fn insert_pending_request(&self, user_id: &str, request_id: &str, req: DispatchedToolRequest) {
+        // Per-user cap: evict first, OUTSIDE the order lock —
+        // `evict_oldest_pending_for_user` itself locks `pending_request_order`,
+        // so holding it here would re-enter and deadlock.
         while self.pending_count_for_user(user_id) >= self.max_pending_per_user.max(1) {
             if !self.evict_oldest_pending_for_user(user_id) {
                 break;
             }
         }
 
-        let mut eviction_attempts = 0usize;
-        while self.pending_requests.len() >= self.max_pending
-            && eviction_attempts < self.max_pending.max(1)
-        {
-            eviction_attempts += 1;
-            let oldest_request_id = self
-                .pending_request_order
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .pop_front();
-            let Some(oldest_request_id) = oldest_request_id else {
+        // Critical section: serialize all concurrent inserters w.r.t. the
+        // global capacity invariant and the three-structure consistency.
+        let mut order = self
+            .pending_request_order
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Global capacity eviction under the lock. `pending_request_order` may
+        // contain stale ids (entries already removed via remove_pending_request,
+        // which does not pop the order deque); pop_front until we evict a live
+        // entry or the deque empties.
+        while self.pending_requests.len() >= self.max_pending {
+            let Some(oldest_request_id) = order.pop_front() else {
                 break;
             };
             if self.remove_pending_request(&oldest_request_id).is_some() {
                 break;
             }
+            // Stale id already gone from pending_requests; keep evicting.
         }
+
         self.pending_requests.insert(
             request_id.to_string(),
             PendingRequestEntry {
@@ -365,10 +433,9 @@ impl EdgeConnectionPool {
             .entry(user_id.to_string())
             .or_default()
             .push_back(request_id.to_string());
-        self.pending_request_order
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_back(request_id.to_string());
+        // Order deque push is last, while still holding the lock that
+        // authorized the insert — no window for another inserter to sneak in.
+        order.push_back(request_id.to_string());
     }
 
     fn pending_count_for_user(&self, user_id: &str) -> usize {
@@ -452,12 +519,9 @@ impl EdgeConnectionPool {
 
         for key in &keys {
             if let Some(entry) = self.connections.get(key) {
-                let _ = entry.sender.send(closing.clone());
+                let _ = entry.sender.try_send(closing.clone());
             }
         }
-
-        // Brief grace for edges to process the Closing frame.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         // Parse user_id:edge_agent_id back; unregister cleans up pending results.
         for key in &keys {
@@ -515,6 +579,7 @@ pub struct EdgeConnectionInfo {
     pub edge_agent_id: String,
     pub hostname: Option<String>,
     pub workspace_dir: Option<String>,
+    pub capabilities: Option<Value>,
     pub connected_at: std::time::Instant,
 }
 
@@ -528,7 +593,7 @@ mod tests {
         let pool = EdgeConnectionPool::new();
         assert!(!pool.has_connected_edge("user-1"));
 
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(1);
         pool.register("user-1", "edge-a", Some("laptop".into()), None, tx);
 
         assert!(pool.has_connected_edge("user-1"));
@@ -539,7 +604,7 @@ mod tests {
     #[test]
     fn unregister_removes_connection() {
         let pool = EdgeConnectionPool::new();
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(1);
         pool.register("user-1", "edge-a", None, None, tx);
         assert!(pool.has_connected_edge("user-1"));
 
@@ -551,8 +616,8 @@ mod tests {
     #[test]
     fn get_user_edges_returns_info() {
         let pool = EdgeConnectionPool::new();
-        let (tx1, _rx1) = mpsc::unbounded_channel();
-        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
         pool.register("user-1", "edge-a", Some("laptop".into()), None, tx1);
         pool.register("user-1", "edge-b", Some("desktop".into()), None, tx2);
 
@@ -564,9 +629,41 @@ mod tests {
     }
 
     #[test]
+    fn get_user_edges_returns_structured_capabilities() {
+        let pool = EdgeConnectionPool::new();
+        let (tx, _rx) = mpsc::channel(1);
+        pool.register_with_capabilities(
+            "user-1",
+            "edge-a",
+            Some("laptop".into()),
+            Some("/workspace".into()),
+            Some(json!({
+                "schema_version": 1,
+                "binding": {
+                    "runtime": {"provider": "host_process"},
+                    "capabilities": {"runtime": {"shell": true, "git": true}}
+                }
+            })),
+            tx,
+        );
+
+        let edges = pool.get_user_edges("user-1");
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0].capabilities.as_ref().unwrap()["binding"]["runtime"]["provider"],
+            "host_process"
+        );
+        assert_eq!(
+            edges[0].capabilities.as_ref().unwrap()["binding"]["capabilities"]["runtime"]["git"],
+            true
+        );
+    }
+
+    #[test]
     fn closed_sender_detected_as_disconnected() {
         let pool = EdgeConnectionPool::new();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(1);
         pool.register("user-1", "edge-a", None, None, tx);
         drop(rx); // close the receiver, which closes the sender
         assert!(!pool.has_connected_edge("user-1"));
@@ -575,7 +672,7 @@ mod tests {
     #[test]
     fn cleanup_stale_removes_closed() {
         let pool = EdgeConnectionPool::new();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(1);
         pool.register("user-1", "edge-stale", None, None, tx);
         drop(rx);
         assert_eq!(pool.connection_count(), 1);
@@ -586,7 +683,7 @@ mod tests {
     #[tokio::test]
     async fn deliver_tool_result_completes_pending() {
         let pool = EdgeConnectionPool::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(1);
         pool.register("user-1", "edge-a", None, None, tx);
 
         // Spawn a task that will call execute_tool
@@ -765,7 +862,7 @@ mod tests {
     #[tokio::test]
     async fn drain_closes_live_connections_and_clears_pool() {
         let pool = EdgeConnectionPool::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(1);
         pool.register("user-1", "edge-a", None, None, tx);
         assert_eq!(pool.connection_count(), 1);
 
@@ -783,11 +880,11 @@ mod tests {
         let pool = EdgeConnectionPool::new();
 
         // Live connection
-        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let (tx1, _rx1) = mpsc::channel(1);
         pool.register("user-1", "edge-a", None, None, tx1);
 
         // Already-closed connection
-        let (tx2, rx2) = mpsc::unbounded_channel();
+        let (tx2, rx2) = mpsc::channel(1);
         pool.register("user-1", "edge-b", None, None, tx2);
         drop(rx2); // close
 
@@ -807,7 +904,7 @@ mod tests {
     #[tokio::test]
     async fn drain_clears_in_flight_results_for_live_connections() {
         let pool = EdgeConnectionPool::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(1);
         pool.register("user-1", "edge-a", None, None, tx);
 
         // Dispatch a tool call so there's an in-flight oneshot.
@@ -834,7 +931,7 @@ mod tests {
     #[tokio::test]
     async fn drain_tolerates_concurrent_drain_calls() {
         let pool = EdgeConnectionPool::new();
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(1);
         pool.register("user-1", "edge-a", None, None, tx);
 
         let p1 = pool.clone();

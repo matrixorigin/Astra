@@ -35,6 +35,12 @@ pub(super) async fn build_runtime_wiring(
         .with_encryptor(Arc::clone(run_encryptor)),
     );
     let memory_extraction_service = matrix_rt.clone_memory_extraction_service();
+    let workspace_record_store = Arc::new(astra_services::DatabaseWorkspaceRecordStore::new(
+        shared_pool.clone(),
+    ));
+    workspace_record_store.ensure_tables().await?;
+    let workspace_record_store: Arc<dyn astra_services::WorkspaceStateStore> =
+        workspace_record_store;
 
     let sub_run_executor: Arc<dyn crate::server::delegation::engine::SubRunExecutor> = {
         let mut exec = ServerSubRunExecutor::new(
@@ -76,6 +82,7 @@ pub(super) async fn build_runtime_wiring(
     .with_edge_connection_pool(state.edge_connection_pool.clone())
     .with_edge_dispatch_service(state.execution.edge_dispatch_service.clone())
     .with_edge_registry_service(state.execution.edge_registry_service.clone())
+    .with_workspace_record_store(workspace_record_store)
     .with_resource_governor(resource_governor.clone())
     .with_skill_service(state.skill_service.clone())
     .with_model_service(state.model_service.clone())
@@ -89,7 +96,8 @@ pub(super) async fn build_runtime_wiring(
     .with_observer_worker(state.turn_persistence.observer_worker.clone())
     .with_tool_event_writer(state.turn_persistence.tool_event_writer.clone())
     .with_auxiliary_event_writer(state.turn_persistence.auxiliary_event_writer.clone())
-    .with_run_concurrency_limit(run_concurrency_limit);
+    .with_run_concurrency_limit(run_concurrency_limit)
+    .with_tool_execution_service(state.tool_execution_service.clone());
     if let Some(svc) = memory_extraction_service.as_ref() {
         run_lifecycle = run_lifecycle.with_memory_extraction_service(Arc::clone(svc));
     }
@@ -191,7 +199,7 @@ pub(super) fn default_agent_profile_registry() -> astra_services::AgentProfileRe
         "read_file".into(),
         "write_file".into(),
         "str_replace".into(),
-        "git_commit".into(),
+        "git".into(),
     ];
     let _ = profile_registry.register(coder);
 

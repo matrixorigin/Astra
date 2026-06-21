@@ -1,4 +1,4 @@
-use super::{ToolExecutor, test_executor};
+use super::{ToolExecutor, fanout_test_context, test_executor, test_spawner};
 use serde_json::json;
 
 // ── run_chain (end-to-end with real tool execution) ──────────────────────
@@ -266,7 +266,8 @@ async fn chain_skip_condition_end_to_end() {
 #[tokio::test]
 async fn chain_via_agent_run_chain_tool() {
     let dir = tempfile::tempdir().unwrap();
-    let executor = ToolExecutor::new(dir.path());
+    let executor =
+        ToolExecutor::new(dir.path()).with_spawn_context(fanout_test_context(test_spawner()));
 
     // Invoke run_chain through the consolidated agent tool (like LLM would)
     let chain_args = json!({
@@ -315,9 +316,10 @@ async fn run_chain_invalid_format_returns_error() {
         )
         .await;
     assert!(
-        result.contains("Error"),
+        result.contains("Error: Invalid chain format"),
         "should return error for invalid chain: {result}"
     );
+    assert!(!result.contains(astra_core::error_kind::TOOL_BINDING_SENTINEL));
 }
 
 #[tokio::test]
@@ -344,14 +346,15 @@ async fn run_chain_blocks_recursive_child_chain() {
         .await;
     // Chain validation rejects unknown tool names (run_chain is not in TOOL_CATALOG)
     assert!(
-        result.contains("Error"),
+        result.contains("Error: Invalid chain"),
         "should return error for recursive/unknown tool chain: {result}"
     );
+    assert!(!result.contains(astra_core::error_kind::TOOL_BINDING_SENTINEL));
 }
 
 #[tokio::test]
 async fn run_chain_blocks_repeated_identical_steps() {
-    let executor = test_executor();
+    let executor = test_executor().with_spawn_context(fanout_test_context(test_spawner()));
     let result = executor
         .execute(
             "agent",

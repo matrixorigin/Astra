@@ -1135,7 +1135,7 @@ fn is_memory_context_worthy(rendered: &str) -> bool {
     if ["None", "(none)", "Tools used: none", "🔄 In progress"].contains(&trimmed) {
         return false;
     }
-    for prefix in astra_turn_types::SCAFFOLDING_BODY_PREFIXES {
+    for prefix in astra_turn_types::scaffolding_body_prefixes_for_filtering() {
         if trimmed.starts_with(prefix) {
             return false;
         }

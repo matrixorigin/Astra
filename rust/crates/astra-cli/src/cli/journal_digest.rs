@@ -1630,7 +1630,7 @@ mod tests {
 ⚠ agent returned an error. Check the error details and either fix the arguments or try an alternative tool."#
         ));
         assert!(result_body_signals_failure(
-            r#"{"status":"failed","error":"Agent spawning not available in this context."}"#
+            r#"{"status":"failed","error":"runtime binding is unavailable in this session mode"}"#
         ));
         assert!(result_body_signals_failure(
             r#"{"error":"Failed to serialize output"}"#
@@ -1731,6 +1731,29 @@ mod tests {
         assert!(
             d.failed_tool_calls.is_empty(),
             "cross-turn cache hits must not appear in failed_tool_calls"
+        );
+    }
+
+    #[test]
+    fn digest_does_not_flag_deferred_not_admitted_placeholders_as_failures() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = JournalDirGuard::new(tmp.path());
+
+        let sid = "test-deferred-tool-00000000-0000-0000-0000-000000000013";
+        fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"agent_fanout","ok":true,"ms":0,"error":"tool_not_admitted","result_preview":"Deferred: Error: Tool 'agent_fanout' is not available in this turn yet. First call tool_search with query=\"select:agent_fanout\"."},{"name":"bash","ok":true,"ms":5,"result_preview":"ok"}]}"#,
+        )
+        .expect("write journal");
+
+        let d = build_digest(sid, DigestFocus::All).expect("digest");
+        assert_eq!(
+            d.aggregates.tool_calls_failed, 0,
+            "deferred activation placeholders must not count as failures"
+        );
+        assert!(
+            d.failed_tool_calls.is_empty(),
+            "deferred activation placeholders must not appear in failed_tool_calls"
         );
     }
 

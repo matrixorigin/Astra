@@ -228,10 +228,15 @@ fn build_skill_listing_section_with_budget_and_caps(
             "EXCEPTION: when the user explicitly asks for parallel / \
              multi-agent / multiple-agent fan-out (e.g. \"多agents\", \"N \
              agents\", \"parallel review\", \"different angles in parallel\"), \
-             route through `agent_fanout(action='start', target_count=N, \
-             slots=[...])` instead of skill execution or an `agents:[...]` \
-             payload. Put each child's full brief in that slot's `prompt`, \
-             then collect with `agent_fanout(action='get_results', \
+             route through `agent_fanout` instead of skill execution or an \
+             `agents:[...]` payload. If `agent_fanout` is not present in \
+             `tools[]`, first call `tool_search(query=\"select:agent_fanout\")` \
+             to fetch its full schema. Then call \
+             `agent_fanout(action='start', target_count=N, \
+             slots=[{id:'api', description:'Short UI label', prompt:'Full child task prompt'}], \
+             defaults={agent_type:'code-review'})`. \
+             Put each child's full brief in that slot's `prompt`, then collect \
+             with `agent_fanout(action='get_results', \
              group_id=...)`. Skills usually run sequentially inside the \
              parent turn, which contradicts the user's explicit fan-out intent.",
         );
@@ -409,14 +414,17 @@ pub fn build_deferred_tools_section_with_budget(
     }
 
     body.push_str(
-        "Tools in `<deferred_tools>` are CALLABLE directly — invoke them \
-         by name even though they are not in `tools[]`. The runtime accepts \
-         calls to any deferred tool listed above. Use `tool_search(query=\"select:NAME\")` \
-         only when you need the full parameter schema first (e.g. for an unfamiliar tool). \
-         For dotted legacy names like `agent.spawn`, use the consolidated tool name \
-         (`agent`) and pass the action via its `action` field. \
-         Never call a tool whose name does NOT appear in `tools[]` or `<deferred_tools>` — \
-         use `tool_search` with a keyword query to discover what exists.",
+        "Tools in `<deferred_tools>` are discovery metadata, not complete call \
+         contracts. Do not invoke a tool listed only in `<deferred_tools>`. \
+         Before first use, call `tool_search(query=\"select:NAME\")` to fetch \
+         the full schema; after that schema has appeared in a `tool_search` \
+         result, invoke the tool by name with the schema's exact fields even if \
+         it is still absent from `tools[]`. If a tool is already present in \
+         `tools[]`, call it directly. For dotted legacy names like `agent.spawn`, \
+         use the consolidated tool name (`agent`) and pass the action via its \
+         `action` field. Never call a tool whose name does NOT appear in \
+         `tools[]` or `<deferred_tools>` — use `tool_search` with a keyword \
+         query to discover what exists.",
     );
 
     Some(PromptSection::stable(body, CacheScope::Session))
@@ -626,10 +634,10 @@ fn planning_section() -> &'static str {
 /// Failure handling + resilience. Inspired by Claude Code's prompt contract.
 fn resilience_section() -> &'static str {
     "\n## Failure Handling & Resilience\n\
-     - **Context window is not your concern**: the system automatically compresses prior messages as context approaches limits. Your conversation is not limited by the context window — keep working.\n\
+     - **Context window is not your concern**: the system automatically compresses prior messages as context approaches limits. Do not stop solely because of context-window pressure; follow the latest real user request and current state.\n\
      - **Diagnose before switching**: read the error, check assumptions, try a focused fix. Don't blindly retry the same action.\n\
-     - **If the user said continue, don't give up**: execute, or use ask_user with a concrete blocker.\n\
-     - **Escalate only when genuinely stuck**: investigate first; use ask_user only for the missing decision.\n\
+     - **If the user said continue, don't give up**: execute, or ask the user with a concrete blocker. Use `ask_user` only when that tool is visible or has been activated.\n\
+     - **Escalate only when genuinely stuck**: investigate first; ask only for the missing decision.\n\
      - **Batch large refactors**: for 50+ sites, work in 10-15 file batches. Verify each batch before proceeding.\n\
      - **On repeated str_replace failures**: if the same str_replace fails 2x, the file content has changed or your old_str is wrong. Re-read the file (targeted range), don't guess.\n"
 }
@@ -661,7 +669,7 @@ fn plan_execution_section() -> &'static str {
     "\n## Plan Execution\n\
       - **Don't skip ahead**: when the session already has a current subtask or active plan step, implement ONLY that unit of work. If no executable subtask exists yet, stay in planning/decomposition instead of inventing progress.\n\
       - **Respect files list**: if the subtask specifies files to modify, start by reading those.\n\
-      - **Keep rollback boundaries honest**: in rollback-on-failure boundaries such as plan subtasks, `run_chain`, or explicit batch transactions, non-read-only `bash` is a manual boundary. Prefer structured mutation tools and use `run_build_test` for build/test loops when available.\n\
+      - **Keep rollback boundaries honest**: in rollback-on-failure boundaries such as plan subtasks, `run_chain`, or explicit batch transactions, non-read-only `bash` is a manual boundary. Prefer structured mutation tools; use project-native build/test commands through available tools after edits.\n\
       - **Meet acceptance criteria**: the subtask may include criteria — verify them before marking done.\n\
      - **Build/test after changes**: run the project's build and test commands to confirm.\n\
      - **Report clearly**: summarize what changed and whether criteria passed.\n"
@@ -677,39 +685,35 @@ fn output_format_section() -> &'static str {
      - **Explanations**: lead with the answer, then supporting detail.\n\
      - **Multiple findings**: use a list or table.\n\
      - **NEVER repeat a summary/report.** Stop cleanly when done.\n\
-     - **Use ask_user only for real decisions.** If malformed, fix it and retry immediately.\n\
-     \n\
-     ## Tool Precedence\n\
-     - Understand code: symbols(calls=true) → call_graph → read_file\n\
-     - Navigate code: find_definition / find_references(kind=...) → grep\n\
-     - Impact: call_graph(callers=true, scope='project') → find_references\n\
-     - Rename/refactor: rename_symbol(dry_run=true) → review → apply\n\
-     - File search: glob → grep → log search\n\
-     - Code edit: read context → str_replace → run_build_test\n\
-     - Git: status → diff → log → show → blame\n\
-     - Build/test: run_build_test → fix errors → repeat\n\
-     - GitHub: list → detail → CI status\n"
+     - **Ask the user only for real decisions.** Use `ask_user` only when visible or activated; otherwise ask in your normal response.\n"
 }
 
 /// Tool error recovery. Scenario-based: diagnose → fix → anti-pattern.
 fn tool_error_recovery_section() -> &'static str {
     "\n## Tool Error Recovery\n\
+     ### Current Turn Boundary\n\
+     The current turn is the runtime cycle for the latest user request. Visible tools, attached executors, and per-turn tool budgets are fixed for that cycle; another tool call in the same turn does not change them.\n\
      ### Retry Budget\n\
      Fix args and retry ONCE. If it fails twice, switch tool or ask the user. Never loop on the same failing call.\n\
      ### Scenario: File not found (read_file / str_replace / write_file)\n\
      - Fix: `glob` with a partial pattern → confirm the real path → retry with the confirmed path.\n\
      - Anti-pattern: retrying variations like `src/foo.rs` → `./src/foo.rs` → `crates/x/src/foo.rs` hoping one sticks.\n\
+     ### Scenario: Tool schema or argument error (`unknown field`, invalid range, missing required field)\n\
+     - Fix: trust the error's valid-field list, remove unsupported fields, and retry the same structured tool once with the exact schema.\n\
+     - `read_file`: valid fields are `path`, `start_line`, `end_line`, `outline`; it does not support `offset`, `limit`, `length`, or count-style ranges. Use `start_line=1,end_line=N` for the first N lines.\n\
+     - Invalid `read_file` line range means `start_line` is after `end_line`; recompute the intended inclusive line range before retrying.\n\
+     - Anti-pattern: switching to bash/python to compensate for a malformed structured-tool call.\n\
      ### Scenario: str_replace old_str did not match\n\
      - Fix: re-read the exact target lines → copy verbatim (including leading whitespace) → retry. For multiple matches, add surrounding context lines to disambiguate.\n\
      - Anti-pattern: shortening old_str hoping for a loose match; replace_all without verifying uniqueness.\n\
      ### Scenario: bash command timeout or hang (>30s no output)\n\
-     - Fix: add non-interactive flags (`--yes`, `-y`, `CI=1`); narrow scope (single file vs recursive); for builds use `run_build_test` with package scope, not `cargo build` on the workspace.\n\
+     - Fix: add non-interactive flags (`--yes`, `-y`, `CI=1`); narrow scope (single file vs recursive); for builds, prefer the narrow package/test command over a full workspace build.\n\
      - Anti-pattern: re-running the same command with a longer timeout.\n\
      ### Scenario: Truncated output (\"... truncated\")\n\
      - Fix: narrow the query (file glob, line range, `head_limit`, specific package) and retry.\n\
      - Anti-pattern: re-running the identical call hoping for more.\n\
      ### Scenario: ask_user shape error\n\
-     - Fix: retry ask_user with top-level `questions[]`. Do NOT continue with guessed defaults.\n\
+     - Fix: if `ask_user` is available, retry with top-level `questions[]`; otherwise ask the user in your normal response. Do NOT continue with guessed defaults.\n\
      - Anti-pattern: reusing top-level `question`/`choices`, or skipping clarification after failure.\n\
      ### Scenario: Auth / credential / permission error\n\
      - Stop. Do NOT retry with the same credentials or path. Ask for re-auth or a permitted path.\n\
@@ -726,15 +730,42 @@ pub(crate) fn self_model_section(_tool_names: &[&str]) -> String {
     String::new()
 }
 
-/// Tool-conditional guidance. Removed — tool descriptions in the schema already
-/// contain usage guidance. This section was duplicating schema content and
-/// wasting ~1000 tokens per turn. Returns empty string.
+fn tool_visible(tool_names: &[&str], name: &str) -> bool {
+    tool_names.contains(&name)
+}
+
+/// Tool-conditional guidance.
+///
+/// Keep this section about the cross-tool admission protocol, not individual
+/// schemas. Schema docs explain arguments; this text prevents the model from
+/// calling structured tools that are known only through examples, memory, or
+/// `<deferred_tools>`.
 pub(crate) fn tool_conditional_section(
-    _tool_names: &[&str],
+    tool_names: &[&str],
     _profile_desc: &str,
     _selection_confidence: f64,
 ) -> String {
-    String::new()
+    if tool_names.is_empty() {
+        return String::new();
+    }
+
+    let mut body = String::from(
+        "\n## Tool Availability Protocol\n\
+         - Call a structured tool only if it is visible in this turn's `tools[]`.\n\
+         - Do not infer tool availability from examples, prior turns, pinned defaults, or local executor capability; the current `tools[]` is authoritative.\n",
+    );
+    if tool_visible(tool_names, "tool_search") {
+        body.push_str(
+            "         - A tool listed only in `<deferred_tools>` is not callable yet. Before first use, call `tool_search(query=\"select:NAME\")` and then follow the returned schema exactly.\n",
+        );
+    } else {
+        body.push_str(
+            "         - If a needed structured tool is not visible, use a visible alternative or ask in your normal response.\n",
+        );
+    }
+    body.push_str(&tool_precedence_section(tool_names));
+    body.push_str(&search_strategy_section(tool_names));
+    body
 }
 
 /// Per-turn advisory for tool-selector uncertainty.
@@ -750,142 +781,442 @@ pub(crate) fn low_confidence_tool_selection_section(selection_confidence: f64) -
     })
 }
 
-/// Task-type specific strategy. Session-scoped — depends on detected task type.
-fn task_type_section(task_type: Option<&str>) -> &'static str {
+fn symbols_guidance(tool_names: &[&str]) -> String {
+    if tool_visible(tool_names, "symbols") {
+        " Use `symbols` for symbol-aware navigation when appropriate.".to_string()
+    } else if tool_visible(tool_names, "tool_search") {
+        " Use `symbols` only if it appears in `<deferred_tools>` and after `tool_search(query=\"select:symbols\")`.".to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn deferred_search_guidance(tool_names: &[&str]) -> &'static str {
+    if tool_visible(tool_names, "tool_search") {
+        "activate a deferred content-search tool with `tool_search(query=\"select:NAME\")` before use"
+    } else if tool_visible(tool_names, "bash") {
+        "use visible shell search through `bash` when appropriate"
+    } else {
+        "use only visible discovery/read tools"
+    }
+}
+
+fn tool_precedence_section(tool_names: &[&str]) -> String {
+    let has_glob = tool_visible(tool_names, "glob");
+    let has_list_dir = tool_visible(tool_names, "list_dir");
+    let has_grep = tool_visible(tool_names, "grep");
+    let has_read_file = tool_visible(tool_names, "read_file");
+    let has_log_search = tool_visible(tool_names, "log_search");
+    let has_str_replace = tool_visible(tool_names, "str_replace");
+    let has_write_file = tool_visible(tool_names, "write_file");
+    let has_bash = tool_visible(tool_names, "bash");
+    let has_git = tool_visible(tool_names, "git");
+    let has_github = tool_visible(tool_names, "github");
+
+    if !(has_glob
+        || has_list_dir
+        || has_grep
+        || has_read_file
+        || has_log_search
+        || has_str_replace
+        || has_write_file
+        || has_bash
+        || has_git
+        || has_github)
+    {
+        return String::new();
+    }
+
+    let mut body = String::from("\n## Tool Precedence\n");
+    if has_grep {
+        let layout = match (has_glob, has_list_dir) {
+            (true, true) => "glob/list_dir",
+            (true, false) => "glob",
+            (false, true) => "list_dir",
+            (false, false) => "known paths",
+        };
+        let read_suffix = if has_read_file {
+            " → targeted read_file"
+        } else {
+            ""
+        };
+        let navigate_suffix = if has_read_file {
+            ", then read_file around exact matches"
+        } else {
+            ""
+        };
+        let file_search_chain = if has_glob && has_log_search {
+            "glob → grep → log_search"
+        } else if has_glob {
+            "glob → grep"
+        } else if has_log_search {
+            "grep → log_search"
+        } else {
+            "grep"
+        };
+        body.push_str(&format!(
+            "     - Understand code: {layout} → grep{read_suffix}.{}\n\
+             - Navigate code: grep for names/usages{navigate_suffix}.\n\
+             - Impact: grep callers/imports and read the call sites that matter.\n\
+             - File search: {file_search_chain}\n",
+            symbols_guidance(tool_names)
+        ));
+    } else if has_glob || has_list_dir || has_read_file || tool_visible(tool_names, "tool_search") {
+        let layout = match (has_glob, has_list_dir) {
+            (true, true) => "glob/list_dir for layout",
+            (true, false) => "glob for filenames",
+            (false, true) => "list_dir for layout",
+            (false, false) => "available context",
+        };
+        body.push_str(&format!(
+            "     - Understand code: {layout}, then targeted read_file when visible.{}\n\
+             - Navigate code: {}; never call hidden structured tools directly.\n",
+            symbols_guidance(tool_names),
+            deferred_search_guidance(tool_names)
+        ));
+        if tool_visible(tool_names, "tool_search") {
+            body.push_str(
+                "     - Deferred search: if `grep` appears only in `<deferred_tools>`, select it before calling it; the name alone is not executable.\n",
+            );
+        }
+    }
+
+    if has_str_replace || has_write_file {
+        body.push_str(
+            "     - Code edit: read current context with visible tools → apply the smallest edit → run a visible build/test path.\n",
+        );
+    } else if has_read_file {
+        body.push_str(
+            "     - Code read: use targeted ranges or outlines; avoid whole large files unless necessary.\n",
+        );
+    }
+    if has_git {
+        body.push_str("     - Git: status → diff → log → show → blame\n");
+    } else if has_bash {
+        body.push_str(
+            "     - Git: use shell git commands through `bash` only when repository state is needed; do not call the structured `git` tool when it is absent.\n",
+        );
+    }
+    if has_bash {
+        body.push_str(
+            "     - Build/test: run the repository's normal command → fix errors → repeat\n",
+        );
+    }
+    if has_github {
+        body.push_str("     - GitHub: list → detail → CI status\n");
+    }
+    body
+}
+
+fn read_file_review_guidance(tool_names: &[&str]) -> &'static str {
+    if tool_visible(tool_names, "read_file") {
+        "call read_file with start_line/end_line for ~30 lines around the change, or outline=true for large files"
+    } else {
+        "use visible read/context tools for small, targeted slices around the change"
+    }
+}
+
+/// Task-type specific strategy. Session-scoped — depends on detected task type
+/// and the currently visible tool set.
+fn task_type_section(task_type: Option<&str>, tool_names: &[&str]) -> String {
     match task_type {
         Some("code_review") => {
-            "\n## Code Review Strategy\n\
-              ### CRITICAL: Evidence BEFORE conclusions\n\
-              You MUST gather evidence first, then form conclusions. NEVER write a summary or verdict \
-              before you have examined the diff. Do NOT output review text in the same turn as your \
-              first tool call — wait for tool results.\n\
-              \n\
-              ### Process\n\
-              1. **Get the diff**:\n\
-                 - **Working-tree / staged changes**: call git_status + git_diff in ONE parallel turn.\n\
-                 - **Specific commit review**: call git_log + git_show (or git_diff with ref) in ONE parallel turn.\n\
+            let diff_guidance = if tool_visible(tool_names, "git") {
+                "- **Working-tree / staged changes**: call git(action=\"status\") + git(action=\"diff\") in ONE parallel turn.\n\
+                 - **Specific commit review**: call git(action=\"log\") + git(action=\"show\") (or git(action=\"diff\") with ref) in ONE parallel turn.\n\
                  - **Efficient alternative**: use bash with `git log -1 --format='%H %s' && git diff HEAD~1` for a single-tool compound fetch.\n\
-              ONLY use git_diff with `path` if the output shows \"[truncated]\". \
-              The first git_diff returns the COMPLETE diff — do NOT re-fetch the same content with path filters.\n\
-               2. **Identify scope**: list changed files and classify them (logic, test, config, formatting).\n\
-               Treat the diff as primary evidence — avoid whole-repo or file-by-file crawls unless a specific risk remains.\n\
-               3. **Read targeted context**: for files with non-trivial logic changes, call read_file with \
-               start_line/end_line for ~30 lines around the change, or outline=true for large files. \
-               Default budget: no more than 3 read_file calls for the review; only exceed that when an unresolved risk remains. \
-               NEVER read_file on a whole large file — if it fails with 'too large', retry with line ranges or outline=true.\n\
-               4. **Evaluate**: correctness → security → edge cases → performance → test coverage. Skip pure style nits.\n\
-               5. **If a read_file fails**: degrade your conclusion for that file. Say \"could not verify\" — do NOT claim it is fine.\n\
-              \n\
-              ### Output\n\
-              - Summary: 1–3 bullets on the change and risk.\n\
-              - Findings: 0–5 material issues only; label must-fix/should-fix/suggestion, cite file:line, and give the fix. If none, say \"None\".\n\
-              - Verification: say what you checked and what you could not verify\n\
-              - Verdict: LGTM or Needs changes. NEVER say LGTM if you had read_file errors on logic-changed files.\n\
-              \n\
-              ### Anti-patterns (NEVER do these)\n\
-               - Do NOT write a review summary in the same response where you call git_diff.\n\
-               - Do NOT say \"tests look good\" without reading at least one test file.\n\
-               - Do NOT call git_log in one turn, wait, then call git_show — call BOTH in the first turn.\n\
-               - Do NOT keep calling read_file without a new, explicit risk question to resolve.\n\
-               - Do NOT output XML-like tags or claim full confidence when evidence is incomplete.\n"
+              ONLY use git(action=\"diff\") with `path` if the output shows \"[truncated]\". \
+              The first git(action=\"diff\") returns the COMPLETE diff — do NOT re-fetch the same content with path filters."
+                    .to_string()
+            } else if tool_visible(tool_names, "bash") {
+                "- **Diff/source evidence**: use visible `bash` shell commands to inspect repository state when needed; do not call absent structured git tools.\n\
+                 - **Specific commit review**: fetch commit evidence through visible tools or ask for the commit/diff if the environment cannot expose it."
+                    .to_string()
+            } else {
+                "- **Diff/source evidence**: use the diff or files already provided by the user, visible tools, or ask for the missing diff before reviewing."
+                    .to_string()
+            };
+            let git_antipattern = if tool_visible(tool_names, "git") {
+                "- Do NOT write a review summary in the same response where you call git(action=\"diff\").\n\
+                 - Do NOT call git(action=\"log\") in one turn, wait, then call git(action=\"show\") — call BOTH in the first turn."
+                    .to_string()
+            } else {
+                "- Do NOT call structured git actions when `git` is not visible.\n\
+                 - Do NOT write review conclusions before gathering the available evidence."
+                    .to_string()
+            };
+            let read_budget = if tool_visible(tool_names, "read_file") {
+                "Default budget: no more than 3 read_file calls for the review; only exceed that when an unresolved risk remains. NEVER read_file on a whole large file — if it fails with 'too large', retry with line ranges or outline=true."
+            } else {
+                "Default budget: no more than 3 targeted reads for the review; only exceed that when an unresolved risk remains. Avoid whole large files; use visible ranges or outlines when supported."
+            };
+            format!(
+                "\n## Code Review Strategy\n\
+                  ### CRITICAL: Evidence BEFORE conclusions\n\
+                  You MUST gather evidence first, then form conclusions. NEVER write a summary or verdict \
+                  before you have examined the diff. Do NOT output review text in the same turn as your \
+                  first tool call — wait for tool results.\n\
+                  \n\
+                  ### Process\n\
+                  1. **Get the diff**:\n\
+                     {diff_guidance}\n\
+                   2. **Identify scope**: list changed files and classify them (logic, test, config, formatting).\n\
+                   Treat the diff as primary evidence — avoid whole-repo or file-by-file crawls unless a specific risk remains.\n\
+                   3. **Read targeted context**: {read_guidance}. \
+                   {read_budget}\n\
+                   4. **Evaluate**: correctness → security → edge cases → performance → test coverage. Skip pure style nits.\n\
+                   5. **If a read fails**: degrade your conclusion for that file. Say \"could not verify\" — do NOT claim it is fine.\n\
+                  \n\
+                  ### Output\n\
+                  - Summary: 1–3 bullets on the change and risk.\n\
+                  - Findings: 0–5 material issues only; label must-fix/should-fix/suggestion, cite file:line, and give the fix. If none, say \"None\".\n\
+                  - Verification: say what you checked and what you could not verify\n\
+                  - Verdict: LGTM or Needs changes. NEVER say LGTM if you had read errors on logic-changed files.\n\
+                  \n\
+                  ### Anti-patterns (NEVER do these)\n\
+                   {git_antipattern}\n\
+                   - Do NOT say \"tests look good\" without reading at least one test file.\n\
+                   - Do NOT keep calling read tools without a new, explicit risk question to resolve.\n\
+                   - Do NOT output XML-like tags or claim full confidence when evidence is incomplete.\n",
+                read_guidance = read_file_review_guidance(tool_names),
+            )
         }
         Some("debugging") => {
-            "\n## Debugging Strategy\n\
-             1. Start with the error message / stack trace — read it carefully before exploring.\n\
-             2. Form a hypothesis about the root cause.\n\
-             3. Verify with ONE targeted tool call (read the suspected file/function).\n\
-             4. If hypothesis is wrong, form a new one — don't shotgun search.\n\
-             5. Check recent git changes near the error site (git_log, git_blame).\n\
-             6. If a command fails, do NOT retry the exact same command — vary the approach.\n\
-             7. Once found: explain the root cause, show the fix, verify it compiles/passes.\n"
+            let history = if tool_visible(tool_names, "git") {
+                "Check recent git changes near the error site with git(action=\"log\") and git(action=\"blame\")."
+            } else if tool_visible(tool_names, "bash") {
+                "If recent history matters, use visible shell git commands through `bash`; do not call absent structured git tools."
+            } else {
+                "If recent history matters, use visible history/context tools or ask for the missing evidence."
+            };
+            format!(
+                "\n## Debugging Strategy\n\
+                 1. Start with the error message / stack trace — read it carefully before exploring.\n\
+                 2. Form a hypothesis about the root cause.\n\
+                 3. Verify with ONE targeted tool call using a visible tool.\n\
+                 4. If hypothesis is wrong, form a new one — don't shotgun search.\n\
+                 5. {history}\n\
+                 6. If a command fails, do NOT retry the exact same command — vary the approach.\n\
+                 7. Once found: explain the root cause, show the fix, verify it compiles/passes.\n"
+            )
         }
-        Some("exploration") => {
+        Some("exploration") => format!(
             "\n## Exploration Strategy\n\
-             1. Start broad: list_dir for project structure, then identify entry points.\n\
-             2. Narrow: grep for key terms, glob for file patterns.\n\
+             1. Start broad: use visible layout/file tools for project structure, then identify entry points.\n\
+             2. Narrow: {}.\n\
              3. Build a mental map: entry points → core modules → dependencies → patterns.\n\
              4. Read files with targeted ranges, not full files — scan structure first.\n\
-             5. Summarize architecture with concrete file paths and relationships.\n\
-             6. Note patterns: error handling style, naming conventions, test structure.\n"
-        }
+            5. Summarize architecture with concrete file paths and relationships.\n\
+             6. Note patterns: error handling style, naming conventions, test structure.\n",
+            if tool_visible(tool_names, "grep") {
+                if tool_visible(tool_names, "glob") {
+                    "grep for key terms, glob for file patterns"
+                } else {
+                    "grep for key terms"
+                }
+            } else {
+                deferred_search_guidance(tool_names)
+            }
+        ),
         Some("implementation") => {
-            "\n## Implementation Strategy\n\
-              1. **Understand structure**: symbols(calls=true) for file overview + call flow in one shot.\n\
-              2. **Find location**: find_definition → glob → grep → read sections.\n\
-              3. **Check impact**: find_references(kind='call') to see callers. call_graph(callers=true, scope='project') for thorough impact.\n\
-              4. **Implement surgically**: minimal changes, follow style. str_replace auto-formats.\n\
-              5. **Wire it up**: add imports, register modules, update exports.\n\
-              6. **Verify**: run_build_test, fix from structured output, repeat.\n\
-              7. **Commit**: git_commit with a clear message.\n"
+            let symbols = symbols_guidance(tool_names);
+            let edit_guidance = if tool_visible(tool_names, "str_replace") {
+                "minimal changes, follow style. str_replace auto-formats"
+            } else {
+                "minimal changes, follow style. use visible edit tools only"
+            };
+            let verify_guidance = if tool_visible(tool_names, "bash") {
+                "run the repository's normal build/test command, fix errors, repeat"
+            } else {
+                "run a visible build/test path when available, fix errors, repeat"
+            };
+            if tool_visible(tool_names, "grep") {
+                let layout = match (
+                    tool_visible(tool_names, "glob"),
+                    tool_visible(tool_names, "list_dir"),
+                ) {
+                    (true, true) => "glob/list_dir for layout",
+                    (true, false) => "glob for filenames",
+                    (false, true) => "list_dir for layout",
+                    (false, false) => "available context",
+                };
+                let read_suffix = if tool_visible(tool_names, "read_file") {
+                    ", read_file targeted sections"
+                } else {
+                    ""
+                };
+                let find_location = match (
+                    tool_visible(tool_names, "glob"),
+                    tool_visible(tool_names, "read_file"),
+                ) {
+                    (true, true) => "glob → grep → read sections",
+                    (true, false) => "glob → grep",
+                    (false, true) => "grep → read sections",
+                    (false, false) => "grep exact names/usages",
+                };
+                format!(
+                    "\n## Implementation Strategy\n\
+                      1. **Understand structure**: {layout}, grep for names{read_suffix}.{symbols}\n\
+                      2. **Find location**: {find_location}.\n\
+                      3. **Check impact**: grep callers/imports and read the relevant call sites.\n\
+                      4. **Implement surgically**: {edit_guidance}.\n\
+                      5. **Wire it up**: add imports, register modules, update exports.\n\
+                      6. **Verify**: {verify_guidance}.\n\
+                      7. **Commit**: {commit_guidance}.\n",
+                    commit_guidance = if tool_visible(tool_names, "git") {
+                        "git(action=\"commit\") with a clear message"
+                    } else if tool_visible(tool_names, "bash") {
+                        "use visible shell git commands only if the user asked for a commit"
+                    } else {
+                        "only if a visible git-capable tool exists and the user asked for it"
+                    }
+                )
+            } else {
+                format!(
+                    "\n## Implementation Strategy\n\
+                      1. **Understand structure**: use visible layout/file tools and targeted reads.{symbols}\n\
+                      2. **Find location**: {} before using any deferred search tool.\n\
+                      3. **Check impact**: find callers/imports with visible search/read tools; do not call hidden structured tools.\n\
+                      4. **Implement surgically**: {edit_guidance}.\n\
+                      5. **Wire it up**: add imports, register modules, update exports.\n\
+                      6. **Verify**: {verify_guidance}.\n\
+                      7. **Commit**: {}.\n",
+                    deferred_search_guidance(tool_names),
+                    if tool_visible(tool_names, "git") {
+                        "git(action=\"commit\") with a clear message"
+                    } else if tool_visible(tool_names, "bash") {
+                        "use visible shell git commands only if the user asked for a commit"
+                    } else {
+                        "only if a visible git-capable tool exists and the user asked for it"
+                    }
+                )
+            }
         }
-        Some("refactoring") => {
+        Some("refactoring") => format!(
             "\n## Refactoring Strategy\n\
              1. Run tests BEFORE refactoring to establish a passing baseline.\n\
-             2. Use call_graph(callers=true, scope='project') to find all callers before changing a signature.\n\
-             3. For renames: rename_symbol(dry_run=true) to preview, then dry_run=false to apply.\n\
+             2. Use {} to find callers before changing a signature.{}\n\
+             3. For renames: preview with visible search/read tools, then apply a targeted edit.\n\
              4. Make one logical change at a time — verify after each.\n\
              5. Preserve external behavior; focus on clarity and maintainability.\n\
-             6. Run tests AFTER to confirm nothing regressed.\n"
-        }
-        Some("testing") => {
-            "\n## Testing Strategy\n\
+             6. Run tests AFTER to confirm nothing regressed.\n",
+            if tool_visible(tool_names, "grep") && tool_visible(tool_names, "read_file") {
+                "grep/read_file"
+            } else if tool_visible(tool_names, "grep") {
+                "grep"
+            } else if tool_visible(tool_names, "read_file") {
+                "read_file"
+            } else {
+                "visible search/read tools"
+            },
+            symbols_guidance(tool_names)
+        ),
+        Some("testing") => "\n## Testing Strategy\n\
              1. Read the module under test to understand its behavior and edge cases.\n\
              2. Follow existing test patterns: naming, setup/teardown, assertion style.\n\
              3. Cover: happy path → edge cases → error conditions → boundary values.\n\
              4. Each test verifies ONE behavior with a clear, descriptive name.\n\
              5. Run the new tests to confirm they pass — fix failures before reporting.\n"
-        }
-        Some("documentation") => {
-            "\n## Documentation Strategy\n\
+            .to_string(),
+        Some("documentation") => "\n## Documentation Strategy\n\
              - Read the code first — document actual behavior, not assumptions.\n\
              - Include: purpose, usage examples, parameters, return values, error conditions.\n\
              - Keep docs close to the code they describe.\n\
              - Use the project's existing documentation style and format.\n"
-        }
-        Some("performance") => {
-            "\n## Performance Strategy\n\
+            .to_string(),
+        Some("performance") => "\n## Performance Strategy\n\
              1. Measure first — don't guess. Profile to locate the actual bottleneck.\n\
              2. Optimize the hottest path only; avoid premature optimization elsewhere.\n\
              3. Check: algorithm complexity, allocation patterns, I/O blocking, cache misses.\n\
              4. Verify improvement with before/after measurements.\n\
              5. Ensure optimization doesn't break correctness — run tests after.\n"
-        }
+            .to_string(),
         Some("analysis") => {
-            "\n## Analysis Strategy\n\
-             1. Gather data from multiple sources: code, git history, logs, docs.\n\
-             2. Form hypotheses, then verify — don't jump to conclusions from a single signal.\n\
-             3. Use git_blame + git_file_history for ownership/evolution questions.\n\
-             4. Summarize findings with concrete evidence (file paths, line numbers, commit SHAs).\n\
-             5. Present: root cause → impact → recommendation.\n"
+            let ownership = if tool_visible(tool_names, "git") {
+                "Use git(action=\"blame\") + git(action=\"file_history\") for ownership/evolution questions."
+            } else if tool_visible(tool_names, "bash") {
+                "Use visible shell git commands for ownership/evolution questions when repository history is needed."
+            } else {
+                "Use visible docs/history/context tools for ownership/evolution questions, or ask for the missing evidence."
+            };
+            format!(
+                "\n## Analysis Strategy\n\
+                 1. Gather data from multiple sources: code, history, logs, docs.\n\
+                 2. Form hypotheses, then verify — don't jump to conclusions from a single signal.\n\
+                 3. {ownership}\n\
+                 4. Summarize findings with concrete evidence (file paths, line numbers, commit SHAs).\n\
+                 5. Present: root cause → impact → recommendation.\n"
+            )
         }
         Some("deployment") => {
-            "\n## Deployment Strategy\n\
-             1. Check CI status FIRST — don't deploy if builds are failing.\n\
-             2. Review pending changes: git_status → git_diff → CI status.\n\
-             3. Verify config files (env vars, secrets) are correct for target environment.\n\
-             4. Prefer incremental rollout over big-bang deployments.\n"
+            let review = if tool_visible(tool_names, "git") {
+                "Review pending changes: git(action=\"status\") → git(action=\"diff\") → CI status."
+            } else if tool_visible(tool_names, "bash") {
+                "Review pending changes with visible shell git commands and CI status when available."
+            } else {
+                "Review pending changes and CI status using visible tools; ask if deployment evidence is unavailable."
+            };
+            format!(
+                "\n## Deployment Strategy\n\
+                 1. Check CI status FIRST — don't deploy if builds are failing.\n\
+                 2. {review}\n\
+                 3. Verify config files (env vars, secrets) are correct for target environment.\n\
+                 4. Prefer incremental rollout over big-bang deployments.\n"
+            )
         }
-        _ => "",
+        _ => String::new(),
     }
 }
 
-/// Search strategy. Session-scoped — only when search tools are available.
-fn search_strategy_section(tool_names: &[&str]) -> &'static str {
-    let has_glob = tool_names.contains(&"glob");
-    let has_grep = tool_names.contains(&"grep");
-    let has_read_file = tool_names.contains(&"read_file");
-    if has_glob || has_grep || has_read_file {
-        "\n## Search Strategy\n\
-         - Use glob first for filenames/dirs, then grep only that subset for content.\n\
-         - For broad exploration that clearly needs >3 searches, consider an explore agent if available.\n\
-         - Start narrow. Prefer likely roots first: src, crates, app, lib, packages, cmd, internal, tests.\n\
-         - For code review, search changed files or adjacent modules before the whole repo.\n\
-         - Skip generated or bulky trees unless the task explicitly targets them: build, dist, target, coverage, htmlcov, node_modules, vendor.\n\
-         - After grep finds candidates, switch to targeted reads instead of repeating more broad searches.\n\
-         - If a grep is slow or noisy, tighten path, extension, or literal term — do NOT repeat the same broad search.\n\
-         - Use find_definition/find_references for code symbols when available; keep grep for content searches.\n"
+/// Search strategy. Session-scoped — only when search/read tools are available.
+fn search_strategy_section(tool_names: &[&str]) -> String {
+    let has_glob = tool_visible(tool_names, "glob");
+    let has_grep = tool_visible(tool_names, "grep");
+    let has_read_file = tool_visible(tool_names, "read_file");
+    let has_list_dir = tool_visible(tool_names, "list_dir");
+    if !(has_glob || has_grep || has_read_file || has_list_dir) {
+        return String::new();
+    }
+
+    if has_grep {
+        let first_step = match (has_glob, has_list_dir) {
+            (true, true) => "Use glob/list_dir first",
+            (true, false) => "Use glob first",
+            (false, true) => "Use list_dir first",
+            (false, false) => "Start from known paths",
+        };
+        format!(
+            "\n## Search Strategy\n\
+             - {first_step} for filenames/dirs, then grep only that subset for content.\n\
+             - For broad exploration that clearly needs >3 searches, consider an explore agent if available.\n\
+             - Start narrow. Prefer likely roots first: src, crates, app, lib, packages, cmd, internal, tests.\n\
+             - For code review, search changed files or adjacent modules before the whole repo.\n\
+             - Skip generated or bulky trees unless the task explicitly targets them: build, dist, target, coverage, htmlcov, node_modules, vendor.\n\
+             - After grep finds candidates, switch to targeted reads instead of repeating more broad searches.\n\
+             - If grep is slow or noisy, tighten path, extension, or literal term — do NOT repeat the same broad search.\n\
+             - Use `symbols` for code symbols only when visible or activated; keep grep for content searches.\n"
+        )
     } else {
-        ""
+        let mut body = String::from(
+            "\n## Search Strategy\n\
+             - Use visible layout/file tools first for filenames/dirs, then targeted reads for exact context.\n\
+             - For broad exploration that clearly needs >3 searches, consider an explore agent if available.\n\
+             - Start narrow. Prefer likely roots first: src, crates, app, lib, packages, cmd, internal, tests.\n\
+             - For code review, inspect changed files or adjacent modules before the whole repo.\n\
+             - Skip generated or bulky trees unless the task explicitly targets them: build, dist, target, coverage, htmlcov, node_modules, vendor.\n\
+             - After locating candidates, switch to targeted reads instead of repeating broad searches.\n",
+        );
+        if tool_visible(tool_names, "tool_search") {
+            body.push_str(
+                "             - If content search is needed and appears in `<deferred_tools>`, activate it with `tool_search(query=\"select:NAME\")` before calling it.\n",
+            );
+        }
+        if tool_visible(tool_names, "bash") {
+            body.push_str(
+                "             - Shell commands inside `bash` are separate from structured tools; a hidden structured `grep` tool still requires visibility or activation.\n",
+            );
+        }
+        body
     }
 }
 
@@ -1034,24 +1365,13 @@ pub fn build_system_prompt_sections_with_style(
         ));
     }
 
-    let tt = task_type_section(task_type);
+    let tt = task_type_section(task_type, tool_names);
     if !tt.is_empty() {
         // The detected task type is recomputed each turn from the user
         // request — it's environmental signal, not part of the agent
         // persona. Bill to `Environment` so token accounting reflects
         // reality.
-        sections.push(PromptSection::dynamic(
-            tt.to_string(),
-            PromptTokenBucket::Environment,
-        ));
-    }
-
-    let ss = search_strategy_section(tool_names);
-    if !ss.is_empty() {
-        sections.push(PromptSection::dynamic(
-            ss.to_string(),
-            PromptTokenBucket::Environment,
-        ));
+        sections.push(PromptSection::dynamic(tt, PromptTokenBucket::Environment));
     }
 
     // ── Dynamic sections (change every turn) ──
@@ -1475,10 +1795,10 @@ pub const ROUND_BUDGET_HARD_LIMIT: u32 = 15;
 
 /// Threshold for the parallel-batching nudge: how many consecutive trailing
 /// single-tool rounds we tolerate before injecting a corrective directive.
-/// Set lower than [`crate::evaluation::SEQUENTIAL_READ_CHURN_THRESHOLD`] (=8,
-/// post-mortem) so we intervene EARLY — by round 4 of the same pattern, the
-/// turn is already wasting tokens and we want to break the streak.
-pub const PARALLEL_BATCHING_NUDGE_THRESHOLD: usize = 4;
+/// Set lower than the force threshold (=8) so we intervene EARLY — by round 6
+/// of the same pattern, the turn is already wasting tokens and we want to
+/// break the streak.
+pub const PARALLEL_BATCHING_NUDGE_THRESHOLD: usize = 6;
 
 /// Walk the conversation tail backwards and count how many consecutive
 /// most-recent rounds each ran exactly one tool. A "round" here is a contiguous
@@ -1530,19 +1850,13 @@ pub fn parallel_batching_nudge_directive(messages: &[serde_json::Value]) -> Stri
     if streak < PARALLEL_BATCHING_NUDGE_THRESHOLD {
         return String::new();
     }
-    // Compacted from a 3-bullet form (~450c) to one line (~165c). The
-    // long form explained *why* parallel is cheaper and enumerated
-    // examples — both derivable from the header and the model's
-    // existing tool-use training. What the directive has to assert is
-    // just: "you did N single-tool rounds in a row; batch the next
-    // independent calls". Rides the volatile lane once the streak
-    // threshold trips, so bytes here are per-turn waste until the
-    // model batches (which resets the streak).
+    // Informational only — the model can see the pattern and decide whether
+    // to batch or continue sequentially. No prescriptive language.
     format!(
-        "\n\n## ⚠ Sequential Tool Calls Detected\n\
-         Last {streak} rounds each ran one tool. Batch independent calls \
-         (different files, greps, reads) into a single parallel round; \
-         keep sequential rounds only when a call depends on the previous result.\n"
+        "\n\n## Sequential Tool Calls Detected\n\
+         Last {streak} rounds each ran one tool. Consider batching independent \
+         calls (different files, greps, reads) into a single parallel round \
+         when they don't depend on each other's output.\n"
     )
 }
 
@@ -1710,27 +2024,30 @@ mod tests {
 
     #[test]
     fn code_review_prompt_includes_commit_review_guidance() {
-        let p = build_main_system_prompt(
-            &["git_diff", "git_log", "git_show", "bash"],
-            "",
-            1.0,
-            Some("code_review"),
-        );
+        let p =
+            build_main_system_prompt(&["git", "bash", "read_file"], "", 1.0, Some("code_review"));
         assert!(
             p.contains("Specific commit review"),
             "should include commit review variant"
         );
         assert!(
-            p.contains("git_log + git_show"),
-            "should guide git_log + git_show in parallel"
+            p.contains("git(action=\"log\") + git(action=\"show\")"),
+            "should guide git log + show in parallel"
         );
         assert!(
             p.contains("call BOTH in the first turn"),
-            "should warn against sequential git_log then git_show"
+            "should warn against sequential git log then git show"
         );
         assert!(
             p.contains("Default budget: no more than 3 read_file calls"),
             "should bound read_file fanout for review turns"
+        );
+
+        let p_no_read_file =
+            build_main_system_prompt(&["git", "bash"], "", 1.0, Some("code_review"));
+        assert!(
+            !p_no_read_file.contains("read_file calls"),
+            "review prompt must not mention structured read_file calls when read_file is hidden"
         );
     }
 
@@ -2043,6 +2360,11 @@ mod tests {
         assert!(p.contains("Retry Budget"));
         assert!(p.contains("retry ONCE"));
         assert!(p.contains("File not found"));
+        assert!(p.contains("Tool schema or argument error"));
+        assert!(p.contains("read_file"));
+        assert!(p.contains("offset"));
+        assert!(p.contains("limit"));
+        assert!(p.contains("switching to bash/python"));
         assert!(p.contains("str_replace old_str did not match"));
         assert!(p.contains("bash command timeout"));
         assert!(p.contains("Truncated output"));
@@ -2074,7 +2396,7 @@ mod tests {
         assert!(!p_no.contains("Memory Rules"));
 
         // With memory tools → memory rules appear (implied by tool selector)
-        let p_mem = build_main_system_prompt(&["bash", "git_diff"], "", 0.5, None);
+        let p_mem = build_main_system_prompt(&["bash", "git"], "", 0.5, None);
         assert!(
             !p_mem.contains("Memory Rules"),
             "without memory tools, no rules"
@@ -2119,10 +2441,73 @@ mod tests {
             "read_file alone should trigger search strategy"
         );
 
-        // call_graph tool → code nav guidance
-        let p_cg = build_main_system_prompt(&["call_graph", "find_definition"], "", 0.5, None);
-        assert!(p_cg.contains("call_graph"));
-        assert!(p_cg.contains("callers=true"));
+        // Legacy code-nav tools with no schema must not leak into the prompt.
+        let p_nav = build_main_system_prompt(&["glob", "grep", "read_file"], "", 0.5, None);
+        for legacy in [
+            "find_definition",
+            "find_references",
+            "call_graph",
+            "rename_symbol",
+            "run_build_test",
+        ] {
+            assert!(
+                !p_nav.contains(legacy),
+                "prompt must not instruct direct use of non-surfaced tool {legacy}"
+            );
+        }
+        assert!(
+            !p_nav.contains("tool_search(query=\"select:symbols\")"),
+            "symbols activation guidance must not mention tool_search when tool_search is hidden"
+        );
+        let p_nav_with_search =
+            build_main_system_prompt(&["glob", "grep", "read_file", "tool_search"], "", 0.5, None);
+        assert!(
+            p_nav_with_search.contains("tool_search(query=\"select:symbols\")"),
+            "symbols guidance must require deferred activation when tool_search is visible"
+        );
+
+        let p_no_grep = build_main_system_prompt(
+            &["bash", "read_file", "tool_search"],
+            "",
+            0.5,
+            Some("implementation"),
+        );
+        for direct_grep_phrase in [
+            "→ grep",
+            "grep for names/usages",
+            "grep for names",
+            "grep callers/imports",
+            "After grep finds",
+            "str_replace auto-formats",
+        ] {
+            assert!(
+                !p_no_grep.contains(direct_grep_phrase),
+                "prompt must not instruct direct structured grep when grep is not visible: {direct_grep_phrase}"
+            );
+        }
+        assert!(
+            p_no_grep.contains("Call a structured tool only if it is visible"),
+            "prompt should state the current tools[] admission boundary"
+        );
+        assert!(
+            p_no_grep.contains("tool_search(query=\"select:NAME\")"),
+            "prompt should route deferred tools through tool_search activation"
+        );
+
+        let p_no_git =
+            build_main_system_prompt(&["bash", "read_file"], "", 0.5, Some("code_review"));
+        for direct_git_phrase in [
+            "git(action=\"status\")",
+            "git(action=\"diff\")",
+            "git(action=\"log\")",
+            "git(action=\"show\")",
+            "git(action=\"blame\")",
+        ] {
+            assert!(
+                !p_no_git.contains(direct_git_phrase),
+                "prompt must not instruct direct structured git when git is not visible: {direct_git_phrase}"
+            );
+        }
 
         // Profile desc in prompt
         let p_prof = build_main_system_prompt(&["bash"], "\n## Project: TestProj\n", 0.5, None);
@@ -2291,26 +2676,26 @@ mod tests {
         let p = build_main_system_prompt(&["bash"], "", 0.5, Some("implementation"));
         assert!(!p.contains("Build & Test Loop"));
 
-        // Plan execution warns about mutating bash in rollback boundaries
-        let p =
-            build_main_system_prompt(&["bash", "run_build_test"], "", 0.5, Some("implementation"));
+        // Plan execution warns about mutating bash in rollback boundaries.
+        let p = build_main_system_prompt(&["bash"], "", 0.5, Some("implementation"));
         assert!(p.contains("non-read-only `bash` is a manual boundary"));
-        assert!(p.contains("run_build_test"));
+        assert!(!p.contains("run_build_test"));
 
         // Git mutations absent without commit tool
-        let p = build_main_system_prompt(&["git_diff", "git_log"], "", 0.5, None);
+        let p = build_main_system_prompt(&["git"], "", 0.5, None);
         assert!(!p.contains("Git Workflow"));
 
-        // Implementation strategy references new tools
+        // Implementation strategy stays grounded in surfaced tools.
         let p = build_main_system_prompt(
-            &["find_definition", "run_build_test", "git_commit"],
+            &["glob", "grep", "read_file", "str_replace", "git"],
             "",
             0.5,
             Some("implementation"),
         );
-        assert!(p.contains("find_definition"));
-        assert!(p.contains("run_build_test"));
-        assert!(p.contains("git_commit"));
+        assert!(!p.contains("find_definition"));
+        assert!(!p.contains("run_build_test"));
+        assert!(!p.contains("call_graph"));
+        assert!(p.contains("git(action=\"commit\")"));
         assert!(p.contains("str_replace auto-formats"));
 
         // Default persona budget stays bounded
@@ -2387,7 +2772,7 @@ mod tests {
 
         // Task-type strategy lands in None-scoped segment
         let task_sections = build_system_prompt_sections(
-            &vec!["bash", "find_definition", "find_references"],
+            &vec!["bash", "grep", "read_file"],
             "",
             0.8,
             Some("debugging"),
@@ -2757,15 +3142,15 @@ mod tests {
 
     #[test]
     fn parallel_batching_nudge_fires_after_threshold_streak() {
-        // 4 single-tool rounds in a row — at threshold.
-        let msgs = rounds_pattern(&[1, 1, 1, 1]);
+        // 6 single-tool rounds in a row — at threshold.
+        let msgs = rounds_pattern(&[1, 1, 1, 1, 1, 1]);
         let directive = parallel_batching_nudge_directive(&msgs);
         assert!(
             directive.contains("Sequential Tool Calls Detected"),
             "expected nudge at threshold; got {:?}",
             directive
         );
-        assert!(directive.contains("4 rounds"));
+        assert!(directive.contains("6 rounds"));
     }
 
     #[test]
@@ -2789,12 +3174,12 @@ mod tests {
     fn parallel_batching_nudge_skips_runtime_system_messages() {
         // Trailing nudges/feedback injected by the runtime should not break
         // the streak detection.
-        let mut msgs = rounds_pattern(&[1, 1, 1, 1]);
+        let mut msgs = rounds_pattern(&[1, 1, 1, 1, 1, 1]);
         msgs.push(serde_json::json!({
             "role": "system",
             "content": "## Already Fetched (do NOT re-read these)\nFiles: foo.rs"
         }));
-        assert_eq!(trailing_single_tool_round_streak(&msgs), 4);
+        assert_eq!(trailing_single_tool_round_streak(&msgs), 6);
         assert!(
             parallel_batching_nudge_directive(&msgs).contains("Sequential Tool Calls Detected")
         );
@@ -2815,7 +3200,7 @@ mod tests {
     /// server_loop_host / wire_assembly).
     #[test]
     fn trailing_single_tool_streak_skips_system_reminder_wrapper() {
-        let mut msgs = rounds_pattern(&[1, 1, 1, 1]);
+        let mut msgs = rounds_pattern(&[1, 1, 1, 1, 1, 1]);
         // The real shape seen in session 8d9e5903 captures:
         msgs.push(serde_json::json!({
             "role": "user",
@@ -2823,7 +3208,7 @@ mod tests {
         }));
         assert_eq!(
             trailing_single_tool_round_streak(&msgs),
-            4,
+            6,
             "runtime-injected <system-reminder> at tail must be treated as scaffolding \
              so the single-tool streak detector can see the real round cadence; \
              otherwise parallel-batching force never fires on live Astra sessions"
@@ -2838,19 +3223,17 @@ mod tests {
     fn trailing_single_tool_streak_skips_multiple_scaffolding_tails() {
         // Realistic Astra tail: attention manifest + system-reminder +
         // potentially a volatile-wrapper system message stacked up.
-        let mut msgs = rounds_pattern(&[1, 1, 1, 1, 1]);
-        msgs.push(serde_json::json!({
-            "role": "system",
-            "content": "(runtime-injected nudge)"
-        }));
+        let mut msgs = rounds_pattern(&[1, 1, 1, 1, 1, 1]);
         msgs.push(serde_json::json!({
             "role": "user",
-            "content": "<system-reminder>\nTurn: 5 | Tokens: 12000\n</system-reminder>"
+            "content": "<system-reminder>\n\n\n## Git State\n- Git branch: improve_promts\n</system-reminder>"
         }));
         assert_eq!(
             trailing_single_tool_round_streak(&msgs),
-            5,
-            "multiple stacked scaffolding tails must all be peeled off"
+            6,
+            "runtime-injected <system-reminder> at tail must be treated as scaffolding \
+             so the single-tool streak detector can see the real round cadence; \
+             otherwise parallel-batching force never fires on live Astra sessions"
         );
     }
 
@@ -3046,14 +3429,13 @@ mod tests {
 
         // Tool search activation always mentioned
         if let Some(sec) = deferred {
-            // Section exists and is valid
-            assert!(!sec.text.is_empty());
+            assert!(sec.text.contains("tool_search(query=\"select:NAME\")"));
         }
 
-        // Advertises direct invocation
+        // Deferred entries are not callable until activated.
         if let Some(sec) = deferred {
-            // Section provides actionable guidance
-            assert!(!sec.text.is_empty());
+            assert!(sec.text.contains("Do not invoke a tool listed only"));
+            assert!(!sec.text.contains("CALLABLE directly"));
         }
     }
 

@@ -384,7 +384,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     if let Some(ref text) = tool_conditional {
         volatile.push(prompts::PromptSection::dynamic(
             text.clone(),
-            prompts::PromptTokenBucket::BasePersona,
+            prompts::PromptTokenBucket::Environment,
         ));
     }
     let all_sections_for_trace = {

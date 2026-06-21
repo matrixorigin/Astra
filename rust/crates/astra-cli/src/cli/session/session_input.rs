@@ -1,51 +1,8 @@
 use crate::cli::project_instructions::format_project_instructions;
-use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
+use crate::cli::session::session_state::SessionState;
 use astra_runtime::prompts;
 use astra_tools::task_mgmt::SessionTask;
 use astra_turn_core::input_classifier;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ActiveTaskAttachment {
-    pub anchor: ContinuationAnchor,
-    pub followup: String,
-}
-
-impl ActiveTaskAttachment {
-    pub(crate) fn render(&self, effective_line: &str) -> String {
-        let task_board_reanchor = if self.anchor.has_active_task_board() {
-            "If the active thread already has a task board, reconcile it before proceeding: create any missing tasks implied by the approved plan, call task(action='update', task_id='...', new_status='in_progress') before doing the work, and update with new_status='completed' as tasks complete.\n"
-        } else {
-            ""
-        };
-        format!(
-            "[Active task attachment]\n\
-Resume the active task/thread below unless the user explicitly changes topic.\n\
-Treat brief follow-ups as actions on this active thread, not as brand-new unrelated tasks.\n\
-If the follow-up asks to fix / patch / test / continue, apply that action to this active thread.\n\
-{task_board_reanchor}\
-{}\n\n[User follow-up]\n{effective_line}",
-            self.anchor.text
-        )
-    }
-
-    pub(crate) fn semantic_query(&self) -> String {
-        let mut parts = Vec::new();
-        if let Some(task) = self.anchor.latest_user_task.as_deref() {
-            parts.push(format!("Task: {task}"));
-        }
-        if !self.anchor.active_task_board.is_empty() {
-            parts.push(format!(
-                "Open tasks: {}",
-                self.anchor.active_task_board.join(" | ")
-            ));
-        }
-        if let Some(direction) = self.anchor.assistant_direction.as_deref() {
-            parts.push(format!("Assistant summary: {direction}"));
-        }
-        parts.push(format!("Follow-up: {}", self.followup.trim()));
-        parts.join("\n")
-    }
-}
 
 /// Detect if a user message appears to be a correction/redirection.
 pub(crate) fn detect_correction_signal(message: &str) -> bool {
@@ -155,25 +112,10 @@ fn format_open_task_reminder_list(tasks: &[SessionTask]) -> Option<String> {
     }
 }
 
-pub(crate) fn active_task_attachment(
-    line: &str,
-    state: &SessionState,
-) -> Option<ActiveTaskAttachment> {
-    let anchor = state
-        .continuation_anchor
-        .clone()
-        .filter(|_| is_low_information_followup(line))?;
-    Some(ActiveTaskAttachment {
-        anchor,
-        followup: line.to_string(),
-    })
-}
-
-pub(crate) fn build_effective_line_with_attachment(
+pub(crate) fn build_effective_line(
     line: &str,
     state: &SessionState,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
-    attachment: Option<&ActiveTaskAttachment>,
 ) -> String {
     let mut effective_line = if let Some(skill_dev) = state.skill_dev.as_ref() {
         let skill_md = skill_dev.dir.join("SKILL.md");
@@ -219,31 +161,14 @@ pub(crate) fn build_effective_line_with_attachment(
         effective_line = format!("{block}\n\n{effective_line}");
     }
 
-    if let Some(attachment) = attachment {
-        effective_line = attachment.render(&effective_line);
-    }
-
     effective_line
-}
-
-pub(crate) fn build_effective_line(
-    line: &str,
-    state: &SessionState,
-    ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
-) -> String {
-    let attachment = active_task_attachment(line, state);
-    build_effective_line_with_attachment(line, state, ui, attachment.as_ref())
-}
-
-pub(crate) fn is_low_information_followup(line: &str) -> bool {
-    input_classifier::is_low_information_followup(line)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         apply_resume_context, build_effective_line, clear_pending_recovery_for_ordinary_chat_input,
-        detect_correction_signal, finalize_effective_line, is_low_information_followup,
+        detect_correction_signal, finalize_effective_line,
     };
     use crate::cli::session::session_state::SessionState;
     use crate::cli::session::session_state::SkillDevState;
@@ -287,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn build_effective_line_injects_anchor_for_short_continue() {
+    fn build_effective_line_does_not_phrase_match_short_continue() {
         let state = SessionState {
             continuation_anchor: Some(
                 "Latest user task: debug Chinese input drops\nLatest assistant direction: inspect prompt redraw path"
@@ -299,25 +224,13 @@ mod tests {
 
         let effective =
             build_effective_line("继续", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
-        assert!(effective.contains("[Active task attachment]"));
-        assert!(effective.contains("debug Chinese input drops"));
-        assert!(effective.contains("[User follow-up]\n继续"));
+        assert!(!effective.contains("[Active task attachment]"));
+        assert!(!effective.contains("debug Chinese input drops"));
+        assert_eq!(effective, "继续");
     }
 
     #[test]
-    fn low_information_followup_detects_repair_prompts() {
-        assert!(is_low_information_followup("修复?"));
-        assert!(is_low_information_followup("fix this"));
-        assert!(is_low_information_followup("test it"));
-        assert!(is_low_information_followup("还有什么？"));
-        assert!(!is_low_information_followup("修一下输入法问题"));
-        assert!(!is_low_information_followup(
-            "implement request batching in runtime selector"
-        ));
-    }
-
-    #[test]
-    fn build_effective_line_injects_attachment_for_low_information_repair_followup() {
+    fn build_effective_line_does_not_reanchor_repair_followup_by_phrase() {
         let state = SessionState {
             continuation_anchor: Some(
                 "Latest user task: review commit aa1f419b\nLatest assistant summary:\n## Review\nP5 still blocks large merges"
@@ -328,14 +241,11 @@ mod tests {
 
         let effective =
             build_effective_line("修复?", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
-        assert!(effective.contains("[Active task attachment]"));
-        assert!(effective.contains("review commit aa1f419b"));
-        assert!(effective.contains("fix / patch / test / continue"));
-        assert!(effective.contains("[User follow-up]\n修复?"));
+        assert_eq!(effective, "修复?");
     }
 
     #[test]
-    fn build_effective_line_reanchors_generic_followup_to_task_board() {
+    fn build_effective_line_does_not_reanchor_generic_followup_to_task_board() {
         let state = SessionState {
             continuation_anchor: Some(
                 "Latest user task: improve session memory flow\nActive task board:\n- [in_progress] task-1: Phase 1: /memory show — TDD".into(),
@@ -348,12 +258,7 @@ mod tests {
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
         );
-        assert!(effective.contains("[Active task attachment]"));
-        assert!(effective.contains("reconcile it before proceeding"));
-        assert!(effective.contains("new_status='in_progress'"));
-        assert!(effective.contains("new_status='completed'"));
-        assert!(effective.contains("Active task board:"));
-        assert!(effective.contains("[User follow-up]\n还有什么？"));
+        assert_eq!(effective, "还有什么？");
     }
 
     #[test]
@@ -545,8 +450,8 @@ mod tests {
         );
         assert!(effective.contains("[SKILL DEV: combo]"), "skill dev prefix");
         assert!(effective.contains("Concise"), "system skill");
-        assert!(effective.contains("[Active task attachment]"), "anchor");
-        assert!(effective.contains("fix auth"), "anchor content");
+        assert!(!effective.contains("[Active task attachment]"), "anchor");
+        assert!(!effective.contains("fix auth"), "anchor content");
     }
 
     #[test]

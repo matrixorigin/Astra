@@ -205,13 +205,14 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
             state.current_run_id.as_deref().unwrap_or("unknown"),
             state.current_session_id.as_deref().unwrap_or("unknown"),
             state.recursion_depth,
-            "orchestrator",
+            &state.self_agent_id,
             state.hooks.workspace_root_hint.as_deref(),
             &state.hooks.forward_headers,
             state.hooks.llm_token_service.as_ref(),
             &state.skills.request_constraints,
             &state.skills.search,
             adaptive_delegation_context.as_ref(),
+            &state.delegation_chain,
         )
         .await
     } else {
@@ -406,6 +407,7 @@ pub(crate) fn parse_delegation_request(
         pattern,
         user_id: "system".to_string(),
         depth: u32::from(recursion_depth),
+        delegation_chain: Vec::new(),
         context,
         execution_metadata: None,
     })
@@ -772,14 +774,16 @@ pub(crate) async fn partition_and_execute_delegations(
     parent_run_id: &str,
     session_id: &str,
     recursion_depth: u8,
-    source_agent_id: &str,
+    self_agent_id: &str,
     workspace_hint: Option<&str>,
     forward_headers: &std::collections::HashMap<String, String>,
     llm_token_service: Option<&astra_services::LlmTokenServiceConfig>,
     request_constraints: &RequestConstraints,
     skill_search: &astra_core::SkillSearchSettings,
     adaptive_context: Option<&DelegationAdaptiveContext>,
+    parent_delegation_chain: &[String],
 ) -> (Vec<DelegationExecutionResult>, Vec<Value>) {
+    let source_agent_id = self_agent_id;
     let mut delegation_results = Vec::new();
     let mut remaining = Vec::new();
 
@@ -800,6 +804,10 @@ pub(crate) async fn partition_and_execute_delegations(
                 adaptive_context,
             ) {
                 Ok(mut request) => {
+                    // Inherit parent's delegation chain and append source agent_id
+                    // to enable circular delegation detection across hops.
+                    request.delegation_chain = parent_delegation_chain.to_vec();
+                    request.delegation_chain.push(source_agent_id.to_string());
                     merge_workspace_hint_into_delegation_request(&mut request, workspace_hint);
                     merge_request_allowlist_into_delegation_request(
                         &mut request,
@@ -1746,6 +1754,7 @@ mod tests {
             &RequestConstraints::default(),
             &astra_core::SkillSearchSettings::default(),
             None,
+            &[],
         )
         .await;
 
@@ -1783,6 +1792,7 @@ mod tests {
             &RequestConstraints::default(),
             &astra_core::SkillSearchSettings::default(),
             None,
+            &[],
         )
         .await;
 
@@ -1811,6 +1821,7 @@ mod tests {
             &RequestConstraints::default(),
             &astra_core::SkillSearchSettings::default(),
             None,
+            &[],
         )
         .await;
 
@@ -1844,6 +1855,7 @@ mod tests {
             &RequestConstraints::default(),
             &astra_core::SkillSearchSettings::default(),
             None,
+            &[],
         )
         .await;
 

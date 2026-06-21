@@ -129,13 +129,17 @@ mod turn_guard_integration {
     fn stall_and_health_compose() {
         let mut guard = TurnGuard::new();
 
-        // 3 consecutive failures → deprioritized
-        guard.record_tool_result("bash", "Error: permission denied");
-        guard.record_tool_result("bash", "Error: permission denied");
-        guard.record_tool_result("bash", "Error: permission denied");
+        // 3 consecutive failures on a dedicated tool → deprioritized.
+        // Shell command failures do not poison the generic shell surface.
+        guard.record_tool_result("write_file", "Error: permission denied");
+        guard.record_tool_result("write_file", "Error: permission denied");
+        guard.record_tool_result("write_file", "Error: permission denied");
 
         // Same tool call three times → stall (window=3)
-        let calls = [tool_call("bash", r#"{"command":"ls"}"#)];
+        let calls = [tool_call(
+            "write_file",
+            r#"{"path":"x.rs","content":"same"}"#,
+        )];
         guard.record_tool_calls(&calls);
         guard.record_tool_calls(&calls);
         guard.record_tool_calls(&calls);
@@ -148,7 +152,7 @@ mod turn_guard_integration {
             "Should have both stall nudge and health warning, got: {:?}",
             verdict.injections
         );
-        assert!(verdict.avoid_tools.contains(&"bash".to_string()));
+        assert!(verdict.avoid_tools.contains(&"write_file".to_string()));
     }
 
     /// Proves: escalation reaches critical after multiple nudges
@@ -194,28 +198,28 @@ mod turn_guard_integration {
 
         // First failure cycle
         for _ in 0..3 {
-            guard.record_tool_result("bash", "Error: fail");
+            guard.record_tool_result("write_file", "Error: fail");
         }
-        assert!(guard.health.is_deprioritized("bash"));
+        assert!(guard.health.is_deprioritized("write_file"));
 
         // Rehabilitate
-        guard.record_tool_result("bash", r#"{"ok": true}"#);
-        assert!(!guard.health.is_deprioritized("bash"));
+        guard.record_tool_result("write_file", r#"{"ok": true}"#);
+        assert!(!guard.health.is_deprioritized("write_file"));
 
         // Second failure cycle
         for _ in 0..3 {
-            guard.record_tool_result("bash", "Error: fail");
+            guard.record_tool_result("write_file", "Error: fail");
         }
-        assert!(guard.health.is_deprioritized("bash"));
+        assert!(guard.health.is_deprioritized("write_file"));
 
         // Rehabilitate again
-        guard.record_tool_result("bash", r#"{"ok": true}"#);
+        guard.record_tool_result("write_file", r#"{"ok": true}"#);
 
         // Third failure cycle: only 2 needed (stricter threshold)
-        guard.record_tool_result("bash", "Error: fail");
-        guard.record_tool_result("bash", "Error: fail");
+        guard.record_tool_result("write_file", "Error: fail");
+        guard.record_tool_result("write_file", "Error: fail");
         assert!(
-            guard.health.is_deprioritized("bash"),
+            guard.health.is_deprioritized("write_file"),
             "Flaky tool should be deprioritized after only 2 failures"
         );
     }
@@ -646,7 +650,7 @@ mod error_recovery_integration {
         assert!(delay.is_some());
 
         // After retry fails, build recovery message
-        let msg = build_recovery_message("github_list_prs", error, category, &[]);
+        let msg = build_recovery_message("read_file", error, category, &[]);
         assert!(msg.contains("Alternatives"));
 
         // Escalation after multiple issues (new thresholds: 3 nudges → Warning,
@@ -704,8 +708,8 @@ mod chat_stream_turnguard_e2e {
         json!({"function": {"name": name, "arguments": args}})
     }
 
-    /// Simulates the exact verdict-application logic from chat_stream.rs.
-    /// Returns (remaining_turns_after, restricted_tools, stall_events, force_stop).
+    /// Simulates verdict-side budget/event handling from chat_stream.rs.
+    /// Advisory avoid_tools are not hard schema restrictions.
     fn apply_verdict(
         verdict: &TurnVerdict,
         remaining: usize,
@@ -714,9 +718,7 @@ mod chat_stream_turnguard_e2e {
         let mut remaining_turns = remaining;
         let mut stall_events = Vec::new();
 
-        for tool in &verdict.avoid_tools {
-            restricted.insert(tool.clone());
-        }
+        let _ = restricted;
 
         match verdict.severity {
             VerdictSeverity::Critical => {
@@ -932,9 +934,9 @@ mod chat_stream_turnguard_e2e {
 
     // ── Tool health scenarios ──
 
-    /// Mutating tool deprioritized after 3 errors → shows up in avoid_tools AND restricted_tools.
+    /// Mutating tool deprioritized after 3 errors → shows up in advisory avoid_tools only.
     #[test]
-    fn tool_deprioritization_propagates_to_restricted() {
+    fn tool_deprioritization_is_advisory_only() {
         let mut guard = TurnGuard::new();
         let mut restricted = HashSet::new();
 
@@ -950,8 +952,8 @@ mod chat_stream_turnguard_e2e {
         // Apply verdict
         apply_verdict(&v, 25, &mut restricted);
         assert!(
-            restricted.contains("mo_snapshot"),
-            "deprioritized tool must land in restricted_tools"
+            !restricted.contains("mo_snapshot"),
+            "deprioritized tool must not become a hard schema restriction"
         );
     }
 
@@ -1011,20 +1013,20 @@ mod chat_stream_turnguard_e2e {
 
         // Deprioritize
         for _ in 0..3 {
-            guard.record_tool_result("bash", "Error: fail");
+            guard.record_tool_result("write_file", "Error: fail");
         }
         let v1 = guard.evaluate();
-        assert!(v1.avoid_tools.contains(&"bash".to_string()));
+        assert!(v1.avoid_tools.contains(&"write_file".to_string()));
 
         // Rehabilitate
-        guard.record_tool_result("bash", r#"{"output":"ok"}"#);
-        assert!(!guard.health.is_deprioritized("bash"));
+        guard.record_tool_result("write_file", r#"{"output":"ok"}"#);
+        assert!(!guard.health.is_deprioritized("write_file"));
 
-        // Next evaluation should not list bash in avoid (from health)
+        // Next evaluation should not list write_file in avoid (from health)
         // Note: it might still appear from escalation/stall — we test health specifically
         let deprioritized = guard.health.deprioritized_tools();
         assert!(
-            !deprioritized.contains(&"bash"),
+            !deprioritized.contains(&"write_file"),
             "rehabilitated tool not in deprioritized list"
         );
     }
@@ -1034,13 +1036,13 @@ mod chat_stream_turnguard_e2e {
     fn independent_tool_health_tracking() {
         let mut guard = TurnGuard::new();
 
-        // bash fails, grep succeeds
-        guard.record_tool_result("bash", "Error: permission denied");
-        guard.record_tool_result("bash", "Error: permission denied");
-        guard.record_tool_result("bash", "Error: permission denied");
+        // write_file fails, grep succeeds
+        guard.record_tool_result("write_file", "Error: permission denied");
+        guard.record_tool_result("write_file", "Error: permission denied");
+        guard.record_tool_result("write_file", "Error: permission denied");
         guard.record_tool_result("grep", r#"{"matches":["a.rs"]}"#);
 
-        assert!(guard.health.is_deprioritized("bash"));
+        assert!(guard.health.is_deprioritized("write_file"));
         assert!(!guard.health.is_deprioritized("grep"));
     }
 
@@ -1369,33 +1371,32 @@ mod chat_stream_turnguard_e2e {
         }
     }
 
-    /// Restricted tools accumulate across turns (never cleared implicitly).
+    /// Advisory avoid tools can recur across turns without becoming hard restrictions.
     #[test]
-    fn restricted_tools_accumulate_across_turns() {
+    fn advisory_avoid_tools_do_not_accumulate_into_restricted_tools() {
         let mut guard = TurnGuard::new();
         let mut restricted = HashSet::new();
 
-        // Turn 1: deprioritize bash
+        // Turn 1: deprioritize one tool
         for _ in 0..3 {
-            guard.record_tool_result("bash", "Error: fail");
+            guard.record_tool_result("mo_snapshot", "Error: fail");
         }
         let v = guard.evaluate();
+        assert!(v.avoid_tools.contains(&"mo_snapshot".to_string()));
         apply_verdict(&v, 25, &mut restricted);
-        assert!(restricted.contains("bash"));
+        assert!(!restricted.contains("mo_snapshot"));
 
-        // Turn 2: deprioritize another restrictable tool
+        // Turn 2: deprioritize another tool
         for _ in 0..3 {
             guard.record_tool_result("write_file", "Error: fail");
         }
         let v = guard.evaluate();
+        assert!(v.avoid_tools.contains(&"write_file".to_string()));
         apply_verdict(&v, 25, &mut restricted);
-        assert!(restricted.contains("write_file"));
 
-        // Both should be in restricted
-        assert!(restricted.contains("bash"), "bash still restricted");
         assert!(
-            restricted.contains("write_file"),
-            "write_file also restricted"
+            restricted.is_empty(),
+            "soft health avoid guidance must not accumulate into restricted_tools"
         );
     }
 
@@ -1499,14 +1500,14 @@ mod chat_stream_turnguard_e2e {
 
         for i in 0..10 {
             if i % 2 == 0 {
-                guard.record_tool_result("bash", "Error: intermittent");
+                guard.record_tool_result("write_file", "Error: intermittent");
             } else {
-                guard.record_tool_result("bash", r#"{"output":"ok"}"#);
+                guard.record_tool_result("write_file", r#"{"output":"ok"}"#);
             }
         }
 
         assert!(
-            !guard.health.is_deprioritized("bash"),
+            !guard.health.is_deprioritized("write_file"),
             "alternating results should reset consecutive counter"
         );
     }
@@ -1605,10 +1606,10 @@ mod chat_stream_turnguard_e2e {
 
         // Simulate mixed tool usage
         for _ in 0..5 {
-            guard.record_tool_result("bash", r#"{"output":"ok"}"#);
+            guard.record_tool_result("write_file", r#"{"output":"ok"}"#);
         }
         for _ in 0..3 {
-            guard.record_tool_result("bash", "Error: command not found");
+            guard.record_tool_result("write_file", "Error: operation failed");
         }
         for _ in 0..7 {
             guard.record_tool_result("git_log", r#"[{"sha":"abc"}]"#);
@@ -1618,17 +1619,17 @@ mod chat_stream_turnguard_e2e {
         let restored = ToolHealthTracker::from_entries(&exported);
 
         // Verify round-trip accuracy
-        let bash_entry = exported.iter().find(|e| e.name == "bash").unwrap();
-        assert_eq!(bash_entry.total_calls, 8);
-        assert_eq!(bash_entry.total_failures, 3);
-        assert!((bash_entry.failure_rate - 3.0 / 8.0).abs() < 0.01);
+        let write_file_entry = exported.iter().find(|e| e.name == "write_file").unwrap();
+        assert_eq!(write_file_entry.total_calls, 8);
+        assert_eq!(write_file_entry.total_failures, 3);
+        assert!((write_file_entry.failure_rate - 3.0 / 8.0).abs() < 0.01);
 
         let git_entry = exported.iter().find(|e| e.name == "git_log").unwrap();
         assert_eq!(git_entry.total_calls, 7);
         assert_eq!(git_entry.total_failures, 0);
 
-        // bash: 37.5% failure < 50% threshold → not deprioritized
-        assert!(!restored.is_deprioritized("bash"));
+        // write_file: 37.5% failure < 50% threshold → not deprioritized
+        assert!(!restored.is_deprioritized("write_file"));
         // git_log: 0% → definitely not deprioritized
         assert!(!restored.is_deprioritized("git_log"));
     }
@@ -1673,11 +1674,11 @@ mod chat_stream_turnguard_e2e {
             v.avoid_tools
         );
 
-        // Apply verdict (simulating chat_stream.rs schema exclusion)
+        // Apply verdict: health-only avoid guidance must not hide schemas.
         let mut restricted = HashSet::new();
         let (_, _, force_stop) = apply_verdict(&v, 20, &mut restricted);
         assert!(!force_stop, "health-only issues should not force stop");
         assert!(!restricted.contains("mo_query"));
-        assert!(restricted.contains("mo_snapshot"));
+        assert!(!restricted.contains("mo_snapshot"));
     }
 }

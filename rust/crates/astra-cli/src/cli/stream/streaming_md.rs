@@ -185,6 +185,8 @@ const BUFFERED_TAGS: &[SuppressedTag] = &[
 /// - Matched pairs: `<tag>…</tag>` or `<tag attr="…">…</tag>` → removed
 /// - Unclosed opening tags: `<tag>trailing` → truncated at tag start
 /// - Lone closing tags: `</tag>` without matching open → removed
+/// - Residual fragments: `<parameter=…>` and `<function=…>` (degraded tool-call
+///   syntax emitted as text) → removed
 pub(crate) fn strip_xml_tags_inplace(text: &mut String) {
     let mut changed = false;
 
@@ -235,6 +237,13 @@ pub(crate) fn strip_xml_tags_inplace(text: &mut String) {
         }
     }
 
+    // Strip residual `<parameter=…>` and `<function=…>` fragments (degraded
+    // tool-call syntax that models sometimes emit as raw text without an
+    // enclosing `<invoke>` wrapper). These are never intended for the user.
+    if text.contains("<parameter") || text.contains("<function=") {
+        changed |= strip_residual_fragments_inplace(text);
+    }
+
     if changed {
         // Strip orphan opening code fences left behind when a model emits
         // ```<think>…</think>``` style leakage (MiniMax pattern). After the
@@ -247,6 +256,40 @@ pub(crate) fn strip_xml_tags_inplace(text: &mut String) {
             *text = text.replace("\n\n\n", "\n\n");
         }
     }
+}
+
+/// Strip `<parameter=KEY>`, `<parameter name="KEY">`, and `<function=NAME>`
+/// fragments in-place. Returns `true` if any fragments were removed.
+fn strip_residual_fragments_inplace(text: &mut String) -> bool {
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    // Match both `<parameter=KEY>` and `<parameter name="KEY">` (and the
+    // spaceless `<parameter name=KEY>` variant). MiniMax sometimes emits
+    // the `name="…"` form as degraded text; only the `=` form was matched
+    // before, leaking the `name="…"` variant into user output.
+    static RE_PARAM: OnceLock<Regex> = OnceLock::new();
+    let re_param = RE_PARAM.get_or_init(|| {
+        Regex::new(r#"<parameter(?:\s+name\s*=\s*"[^"]*"|\s*=\s*[^>\s]+)[^>]*>\s*\S*"#).unwrap()
+    });
+    static RE_FUNC: OnceLock<Regex> = OnceLock::new();
+    let re_func = RE_FUNC.get_or_init(|| Regex::new(r"<function=[^>]+>").unwrap());
+
+    let before = text.clone();
+    *text = re_param.replace_all(text, "").to_string();
+    *text = re_func.replace_all(text, "").to_string();
+
+    // Collapse multiple spaces.
+    static RE_SPACES: OnceLock<Regex> = OnceLock::new();
+    let re_spaces = RE_SPACES.get_or_init(|| Regex::new(r" {2,}").unwrap());
+    *text = re_spaces.replace_all(text, " ").to_string();
+
+    // Collapse excessive blank lines.
+    static RE_BLANK: OnceLock<Regex> = OnceLock::new();
+    let re_blank = RE_BLANK.get_or_init(|| Regex::new(r"\n{3,}").unwrap());
+    *text = re_blank.replace_all(text, "\n\n").to_string();
+
+    *text != before
 }
 
 /// Remove orphan opening code fences (``` or ```lang on its own line) that

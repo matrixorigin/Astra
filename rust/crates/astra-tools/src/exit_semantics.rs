@@ -81,6 +81,11 @@ pub fn classify_exit(command: &str, exit_code: i32) -> ExitSemantics {
     if matches!(exit_code, 126 | 127) || !(0..128).contains(&exit_code) {
         return ExitSemantics::ExecutionError;
     }
+    if exit_code == 1
+        && let Some(semantics) = pipeline_domain_negative_semantics(command)
+    {
+        return semantics;
+    }
 
     let family = command_family(command);
     match (family.as_deref(), exit_code) {
@@ -88,6 +93,7 @@ pub fn classify_exit(command: &str, exit_code: i32) -> ExitSemantics {
         (Some("git"), 1) if command_contains_word(command, "grep") => {
             ExitSemantics::InformationalFailure
         }
+        (Some("pgrep" | "pkill" | "killall"), 1) => ExitSemantics::InformationalFailure,
         (Some("diff" | "cmp"), 1) => ExitSemantics::DomainNegative,
         (Some("false"), 1) => ExitSemantics::DomainNegative,
         (Some("test" | "["), 1) => ExitSemantics::DomainNegative,
@@ -165,8 +171,16 @@ pub fn classify_command_result(
 /// `python -c "print('a|b')" | head`) without treating regex alternation as a
 /// pipeline.
 pub fn last_pipeline_segment(command: &str) -> &str {
+    split_pipeline_segments(command)
+        .last()
+        .copied()
+        .unwrap_or(command)
+}
+
+fn split_pipeline_segments(command: &str) -> Vec<&str> {
     let bytes = command.as_bytes();
-    let mut last_start = 0;
+    let mut segments = Vec::new();
+    let mut start = 0;
     let mut i = 0;
     let mut in_single = false;
     let mut in_double = false;
@@ -179,20 +193,31 @@ pub fn last_pipeline_segment(command: &str) -> &str {
             b'\'' if !in_double => in_single = !in_single,
             b'"' if !in_single => in_double = !in_double,
             b'|' if !in_single && !in_double => {
-                last_start = i + 1;
+                let prev_pipe = i > 0 && bytes[i - 1] == b'|';
+                let next_pipe = i + 1 < bytes.len() && bytes[i + 1] == b'|';
+                if !prev_pipe && !next_pipe {
+                    segments.push(command[start..i].trim());
+                    start = i + 1;
+                }
             }
             _ => {}
         }
         i += 1;
     }
-    &command[last_start..]
+    segments.push(command[start..].trim());
+    segments
 }
 
-fn command_family(command: &str) -> Option<String> {
+#[must_use]
+pub fn command_family(command: &str) -> Option<String> {
     // Extract the *last* command in a pipeline — the last segment determines
     // the exit code, not the first (e.g. `ls | grep foo` → `grep`).
     // Skip escaped `\|` used in regex patterns like `grep 'foo\|bar'`.
-    let mut tokens = last_shell_list_segment(last_pipeline_segment(command))
+    segment_family(last_pipeline_segment(command))
+}
+
+fn segment_family(segment: &str) -> Option<String> {
+    let mut tokens = last_shell_list_segment(segment)
         .split_whitespace()
         .skip_while(|t| is_env_assignment(t));
     let family = tokens
@@ -209,10 +234,94 @@ fn command_family(command: &str) -> Option<String> {
             }
         }
     }
-    if is_test_runner_family(&family) && command_contains_word(command, "test") {
+    if is_test_runner_family(&family) && command_contains_word(segment, "test") {
         return Some("test".to_string());
     }
     Some(family)
+}
+
+fn pipeline_domain_negative_semantics(command: &str) -> Option<ExitSemantics> {
+    let segments = split_pipeline_segments(command);
+    if segments.len() < 2 {
+        return None;
+    }
+    // With pipefail, the exit code can come from any segment. Classify based
+    // on the last segment first (it always determines the exit code without
+    // pipefail). For earlier segments, only attribute the exit code to them
+    // if the last segment is a passive sink (head, tail, tee, sort, wc, etc.)
+    // that doesn't independently produce exit 1.
+    let last = segments.last().unwrap();
+    match segment_family(last).as_deref() {
+        Some("grep" | "rg" | "ripgrep" | "ag") => {
+            return Some(ExitSemantics::InformationalFailure);
+        }
+        Some("git") if command_contains_word(last, "grep") => {
+            return Some(ExitSemantics::InformationalFailure);
+        }
+        Some("diff" | "cmp" | "false" | "test" | "[") => {
+            return Some(ExitSemantics::DomainNegative);
+        }
+        Some("pytest" | "nose2" | "tox" | "unittest" | "jest" | "vitest" | "mocha") => {
+            return Some(ExitSemantics::DomainNegative);
+        }
+        Some("git") if command_contains_word(last, "diff") => {
+            return Some(ExitSemantics::DomainNegative);
+        }
+        _ => {}
+    }
+
+    // Last segment is not a known domain-negative tool. With pipefail, exit 1
+    // could come from an earlier search/test segment IF the last segment is a
+    // passive data sink that doesn't independently fail with exit 1.
+    if is_passive_pipe_sink(last) {
+        for segment in &segments[..segments.len() - 1] {
+            match segment_family(segment).as_deref() {
+                Some("grep" | "rg" | "ripgrep" | "ag") => {
+                    return Some(ExitSemantics::InformationalFailure);
+                }
+                Some("git") if command_contains_word(segment, "grep") => {
+                    return Some(ExitSemantics::InformationalFailure);
+                }
+                Some("diff" | "cmp" | "false" | "test" | "[") => {
+                    return Some(ExitSemantics::DomainNegative);
+                }
+                Some("git") if command_contains_word(segment, "diff") => {
+                    return Some(ExitSemantics::DomainNegative);
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn is_passive_pipe_sink(segment: &str) -> bool {
+    matches!(
+        segment_family(segment).as_deref(),
+        Some(
+            "head"
+                | "tail"
+                | "tee"
+                | "sort"
+                | "uniq"
+                | "wc"
+                | "cat"
+                | "less"
+                | "more"
+                | "cut"
+                | "tr"
+                | "sed"
+                | "awk"
+                | "column"
+                | "fmt"
+                | "fold"
+                | "nl"
+                | "paste"
+                | "rev"
+                | "expand"
+                | "unexpand"
+        )
+    )
 }
 
 fn last_shell_list_segment(command: &str) -> &str {
@@ -359,10 +468,38 @@ mod tests {
     }
 
     #[test]
+    fn grep_pipeline_no_match_remains_informational_under_pipefail() {
+        let semantics = classify_exit("grep needle haystack.txt | head -20", 1);
+        assert_eq!(semantics, ExitSemantics::InformationalFailure);
+        assert!(!semantics.is_tool_error());
+    }
+
+    #[test]
+    fn non_domain_pipeline_failure_is_execution_error() {
+        let semantics = classify_exit("sh -c 'exit 7' | head -20", 7);
+        assert_eq!(semantics, ExitSemantics::ExecutionError);
+        assert!(semantics.is_tool_error());
+    }
+
+    #[test]
     fn git_grep_no_match_is_informational() {
         let semantics = classify_exit("git grep missing -- src", 1);
         assert_eq!(semantics, ExitSemantics::InformationalFailure);
         assert!(!semantics.is_tool_error());
+    }
+
+    #[test]
+    fn process_match_commands_no_match_are_informational() {
+        for command in [
+            "pgrep missing-process-name",
+            "cd /work/repo && pgrep missing-process-name",
+            "pkill -0 missing-process-name",
+            "killall -0 missing-process-name",
+        ] {
+            let semantics = classify_exit(command, 1);
+            assert_eq!(semantics, ExitSemantics::InformationalFailure, "{command}");
+            assert!(!semantics.is_tool_error(), "{command}");
+        }
     }
 
     #[test]

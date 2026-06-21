@@ -20,13 +20,13 @@ impl ToolSafetyGuard {
         perm_manager: Option<&mut crate::cli::permission_manager::PermissionManager>,
         name: &str,
         args: &Value,
-    ) -> crate::cli::permission_manager::PermissionDecision {
+    ) -> crate::cli::permission_manager::GateOutcome {
         if let Err(error) = Self::check_dispatch(name, args) {
-            return crate::cli::permission_manager::PermissionDecision::Deny(error);
+            return crate::cli::permission_manager::GateOutcome::Deny(error);
         }
         match perm_manager {
             Some(pm) => pm.check_nonblocking(name, args),
-            None => crate::cli::permission_manager::PermissionDecision::Allow,
+            None => crate::cli::permission_manager::GateOutcome::Allow,
         }
     }
 
@@ -74,7 +74,7 @@ impl ToolSafetyGuard {
             })
         {
             return Err(format!(
-                "Error: run_chain rollback_on_failure only supports read-only bash steps. `{command}` is mutating. Use structured mutation tools (write_file, git_*, rollback-aware editors), use run_build_test for build/test loops when available, or keep bash read-only inside the chain."
+                "Error: run_chain rollback_on_failure only supports read-only bash steps. `{command}` is mutating. Use structured mutation tools (write_file, git_*, rollback-aware editors), run project-native build/test commands through visible tools after the transaction, or keep bash read-only inside the chain."
             ));
         }
 
@@ -110,7 +110,7 @@ fn is_mutating_tool(name: &str, args: Option<&Value>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{MAX_RUN_CHAIN_MUTATING_STEPS, ToolSafetyGuard};
-    use crate::cli::permission_manager::{PermissionDecision, PermissionManager};
+    use crate::cli::permission_manager::{GateOutcome, PermissionManager};
     use astra_runtime::tool_registry::ToolChain;
     use serde_json::json;
 
@@ -184,7 +184,7 @@ mod tests {
         );
 
         match decision {
-            PermissionDecision::Deny(reason) => {
+            GateOutcome::Deny(reason) => {
                 assert!(reason.contains("blocked by default"));
             }
             other => panic!("expected deny, got: {other:?}"),
@@ -200,7 +200,7 @@ mod tests {
             &json!({"path": "file.txt", "content": "x"}),
         );
 
-        assert!(matches!(decision, PermissionDecision::NeedApproval { .. }));
+        assert!(matches!(decision, GateOutcome::NeedApproval { .. }));
     }
 
     #[test]
@@ -213,7 +213,7 @@ mod tests {
         );
 
         match decision {
-            PermissionDecision::Deny(reason) => {
+            GateOutcome::Deny(reason) => {
                 assert!(reason.contains("shell_obfuscation"));
                 assert!(reason.contains("eval"));
             }

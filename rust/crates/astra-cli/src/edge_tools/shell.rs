@@ -6,7 +6,7 @@ use super::{
     SANDBOX_DENIED_PREFIX, ToolExecutor, apply_env_overlay, build_test, code_intel,
     sandbox_command, validate_path, wrap_command_with_limits,
 };
-use astra_runtime::tool_sandbox::{SandboxMode, SandboxPolicy, filter_environment};
+use astra_runtime::tool_sandbox::{IsolationLevel, SandboxPolicy, filter_environment};
 use astra_tools::detach::{
     AdoptionAckOutcome, await_adoption_ack, detach_signal_observed, render_bash_detached_marker,
     restore_detach_signal_receiver, sigkill_process_group, terminate_detached_payload,
@@ -36,85 +36,33 @@ struct CommandResult {
 /// Interpret exit code based on the command that produced it.
 /// Extracts the *last* command in a pipeline (that's what determines the exit code).
 fn interpret_exit_code(command: &str, code: i32) -> CommandResult {
-    let base = last_pipeline_command(command);
-    match base {
-        // grep/rg: 0=matches, 1=no matches, 2+=error
-        "grep" | "rg" | "ag" | "ack" => match code {
-            0 => CommandResult {
-                is_error: false,
-                note: None,
-            },
-            1 => CommandResult {
-                is_error: false,
-                note: Some("No matches found"),
-            },
-            _ => CommandResult {
-                is_error: true,
-                note: None,
-            },
+    match astra_tools::exit_semantics::classify_exit(command, code) {
+        astra_tools::exit_semantics::ExitSemantics::Success
+        | astra_tools::exit_semantics::ExitSemantics::DomainNegative => CommandResult {
+            is_error: false,
+            note: None,
         },
-        // diff: 0=identical, 1=differences, 2+=error
-        "diff" => match code {
-            0 | 1 => CommandResult {
-                is_error: false,
-                note: None,
-            },
-            _ => CommandResult {
-                is_error: true,
-                note: None,
-            },
+        astra_tools::exit_semantics::ExitSemantics::InformationalFailure => CommandResult {
+            is_error: false,
+            note: Some(informational_failure_note(command)),
         },
-        // test/[: 0=true, 1=false, 2+=error
-        "test" | "[" => match code {
-            0 | 1 => CommandResult {
-                is_error: false,
-                note: None,
-            },
-            _ => CommandResult {
-                is_error: true,
-                note: None,
-            },
-        },
-        // find: 0=ok, 1=partial (some dirs inaccessible), 2+=error
-        "find" | "fd" => match code {
-            0 | 1 => CommandResult {
-                is_error: false,
-                note: None,
-            },
-            _ => CommandResult {
-                is_error: true,
-                note: None,
-            },
-        },
-        // pkill/pgrep/killall: 0=matched, 1=no match, 2=syntax error, 3=fatal
-        "pkill" | "pgrep" | "killall" => match code {
-            0 => CommandResult {
-                is_error: false,
-                note: None,
-            },
-            1 => CommandResult {
-                is_error: false,
-                note: Some("No processes matched"),
-            },
-            _ => CommandResult {
-                is_error: true,
-                note: None,
-            },
-        },
-        // Default: only 0 is success
-        _ => CommandResult {
-            is_error: code != 0,
+        astra_tools::exit_semantics::ExitSemantics::TimedOut
+        | astra_tools::exit_semantics::ExitSemantics::Cancelled
+        | astra_tools::exit_semantics::ExitSemantics::Signaled
+        | astra_tools::exit_semantics::ExitSemantics::ExecutionError => CommandResult {
+            is_error: true,
             note: None,
         },
     }
 }
 
-/// Extract the base command name from the last segment of a pipeline.
-fn last_pipeline_command(command: &str) -> &str {
-    astra_tools::exit_semantics::last_pipeline_segment(command)
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
+fn informational_failure_note(command: &str) -> &'static str {
+    let family = astra_tools::exit_semantics::command_family(command);
+    if matches!(family.as_deref(), Some("pgrep" | "pkill" | "killall")) {
+        "No processes matched"
+    } else {
+        "No matches found"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -500,6 +448,10 @@ fn check_bash_path_boundary_with_oldpwd(
     command: &str,
     oldpwd: Option<&std::path::Path>,
 ) -> Option<String> {
+    if matches!(policy.isolation, IsolationLevel::Permissive) {
+        return check_bash_sensitive_path_boundary(policy, command, oldpwd);
+    }
+
     if let Some(msg) = check_shell_compound_body_path_boundary(policy, command, oldpwd) {
         return Some(msg);
     }
@@ -594,18 +546,47 @@ fn check_powershell_path_boundary(
                 policy.project_root.join(trimmed)
             };
             let path_str = resolved.to_string_lossy();
-            if let Err(e) = validate_path(policy, &path_str)
-                && e.is_boundary_violation()
-            {
-                return Some(format!(
-                    "{}The command references '{}' which is outside the project directory '{}'. \
-                     Ask the user for permission before accessing files outside the project.",
-                    SANDBOX_DENIED_PREFIX,
-                    trimmed,
-                    policy.project_root.display(),
-                ));
+            if let Err(error) = validate_path(policy, &path_str) {
+                if error.is_boundary_violation() {
+                    return Some(format!(
+                        "{}The command references '{}' which is outside the project directory '{}'. \
+                         Ask the user for permission before accessing files outside the project.",
+                        SANDBOX_DENIED_PREFIX,
+                        trimmed,
+                        policy.project_root.display(),
+                    ));
+                }
+                return Some(format!("{SANDBOX_DENIED_PREFIX}Sandbox: {error}"));
             }
         }
+    }
+    None
+}
+
+fn check_bash_sensitive_path_boundary(
+    _policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    command: &str,
+    _oldpwd: Option<&std::path::Path>,
+) -> Option<String> {
+    use astra_turn_core::permission::path_sensitivity::{
+        PathSensitivity, sensitive_path_match_for_shell_command,
+    };
+
+    let hit = sensitive_path_match_for_shell_command(command)?;
+    match hit.sensitivity {
+        PathSensitivity::Sensitive => {
+            return Some(format!(
+                "Sandbox: Path '{}' is blocked as a sensitive credential path",
+                hit.token
+            ));
+        }
+        PathSensitivity::InternalArtifactReadOnly(_) => {
+            return Some(format!(
+                "Sandbox: Path '{}' is blocked as an internal runtime artifact path",
+                hit.token
+            ));
+        }
+        PathSensitivity::Normal => { /* not sensitive */ }
     }
     None
 }
@@ -928,16 +909,17 @@ fn validate_plain_command_path_arg(
         policy.project_root.join(&literal_arg)
     };
     let path_str = resolved.to_string_lossy();
-    if let Err(e) = validate_path(policy, &path_str)
-        && e.is_boundary_violation()
-    {
-        return Some(format!(
-            "{}The command references '{}' which is outside the project directory '{}'. \
-             Ask the user for permission before accessing files outside the project.",
-            SANDBOX_DENIED_PREFIX,
-            literal_arg,
-            policy.project_root.display(),
-        ));
+    if let Err(error) = validate_path(policy, &path_str) {
+        if error.is_boundary_violation() {
+            return Some(format!(
+                "{}The command references '{}' which is outside the project directory '{}'. \
+                 Ask the user for permission before accessing files outside the project.",
+                SANDBOX_DENIED_PREFIX,
+                literal_arg,
+                policy.project_root.display(),
+            ));
+        }
+        return Some(format!("{SANDBOX_DENIED_PREFIX}Sandbox: {error}"));
     }
     None
 }
@@ -1462,7 +1444,7 @@ fn check_redirection_path_boundary(
                 if !target_in_single_quote
                     && !target_in_double_quote
                     && (target_ch.is_whitespace()
-                        || matches!(target_ch, '|' | ';' | '&' | '\n' | '\r' | '<' | '>'))
+                        || matches!(target_ch, '|' | ';' | '&' | '\n' | '\r' | '<' | '>' | ')'))
                 {
                     let raw_target = command[target_start..byte_idx].trim();
                     if let Some(target) = shell_tokenize_like_bash(raw_target).first()
@@ -1990,9 +1972,6 @@ fn check_shell_loop_path_boundary(
             }
             return Some(msg);
         }
-        if let Some((kind, subcommand)) = fanout_subcommand {
-            return Some(shell_loop_fanout_review_message(policy, kind, &subcommand));
-        }
         idx = done_idx + 1;
     }
     None
@@ -2033,11 +2012,21 @@ fn shell_loop_body_subcommand_requires_boundary_review(body: &str) -> Option<Str
         let Some(base) = first_segment_subcommand(&parts) else {
             continue;
         };
-        if subcommand_requires_boundary_review(base) {
+        if shell_loop_segment_requires_boundary_review(base, &parts) {
             return Some(base.to_string());
         }
     }
     None
+}
+
+fn shell_loop_segment_requires_boundary_review(base: &str, parts: &[String]) -> bool {
+    if is_shell_interpreter_command(base) {
+        return true;
+    }
+    if !is_boundary_sensitive_file_access_command(base) {
+        return false;
+    }
+    parts.iter().skip(1).any(|part| !part.starts_with('-'))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2958,11 +2947,7 @@ enum DetachableShellOutput {
 fn effective_shell_command(config: &ShellRunConfig) -> String {
     if config.harden_command {
         if let Some(ref policy) = config.sandbox_policy {
-            if !matches!(policy.mode, SandboxMode::Permissive) {
-                wrap_command_with_limits(policy, &config.command)
-            } else {
-                config.command.clone()
-            }
+            wrap_command_with_limits(policy, &config.command)
         } else {
             config.command.clone()
         }
@@ -2993,9 +2978,8 @@ fn run_shell_output_with_config(config: ShellRunConfig) -> Result<std::process::
         child_cmd.process_group(0); // child becomes its own process group leader
     }
 
-    // Apply sandbox environment filtering.
+    // Apply sandbox environment filtering (all isolation levels).
     if let Some(ref policy) = config.sandbox_policy
-        && !matches!(policy.mode, SandboxMode::Permissive)
         && let Err(e) = sandbox_command(policy, &mut child_cmd)
     {
         eprintln!("[sandbox] failed to apply policy: {e}");
@@ -3107,9 +3091,7 @@ fn configure_detachable_tokio_command(config: &ShellRunConfig) -> TokioCommand {
     #[cfg(unix)]
     child_cmd.process_group(0);
 
-    if let Some(ref policy) = config.sandbox_policy
-        && !matches!(policy.mode, SandboxMode::Permissive)
-    {
+    if let Some(ref policy) = config.sandbox_policy {
         child_cmd.current_dir(&policy.project_root);
         child_cmd.env_clear();
         for (key, value) in filter_environment(policy) {
@@ -4123,8 +4105,13 @@ impl ToolExecutor {
 
     fn prepare_bash_invocation(&self, args: &Value) -> Result<(String, f64), String> {
         let command = match args.get("command").and_then(Value::as_str) {
-            Some(c) => c,
-            None => return Err("Error: missing 'command'".to_string()),
+            Some(c) if !c.trim().is_empty() => c,
+            _ => {
+                return Err("Error: missing required field `command` for bash. \
+                     Origin: model_argument_error; no command was run. \
+                     Next: retry with a JSON object like {\"command\":\"pwd\"}."
+                    .to_string());
+            }
         };
         astra_tools::shell_ops::validate_bash_background_task_contract(command)?;
 
@@ -4157,7 +4144,7 @@ impl ToolExecutor {
                 .unwrap_or_else(|e| e.into_inner());
             let is_restrictive = sp_guard
                 .as_ref()
-                .is_some_and(|p| !matches!(p.mode, SandboxMode::Permissive));
+                .is_some_and(|p| !matches!(p.isolation, IsolationLevel::Permissive));
             drop(sp_guard);
             if is_restrictive {
                 return Err(warning);
@@ -4204,9 +4191,7 @@ impl ToolExecutor {
                 .sandbox_policy
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(ref policy) = *sp_guard
-                && !matches!(policy.mode, SandboxMode::Permissive)
-            {
+            if let Some(ref policy) = *sp_guard {
                 if let Some(msg) = check_bash_path_boundary(policy, &command) {
                     return Err(msg);
                 }
@@ -4367,7 +4352,7 @@ impl ToolExecutor {
             Ok(invocation) => invocation,
             Err(message) => {
                 self.restore_bash_detach_handle(slot, handle).await;
-                return Some(super::ToolExecutionOutcome::error(message));
+                return Some(super::tool_execution_outcome_from_output(message));
             }
         };
         let config =
@@ -4381,11 +4366,7 @@ impl ToolExecutor {
                 let output =
                     self.finalize_tool_output(self.render_bash_output(&command, out), "bash");
                 self.record_output_size(output.len());
-                Some(if output.starts_with("Error") {
-                    super::ToolExecutionOutcome::error(output)
-                } else {
-                    super::ToolExecutionOutcome::ok(output)
-                })
+                Some(super::tool_execution_outcome_from_output(output))
             }
             Ok(DetachableShellOutput::Detached {
                 payload,
@@ -4474,8 +4455,13 @@ impl ToolExecutor {
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> String {
         let command = match args.get("command").and_then(Value::as_str) {
-            Some(c) => c,
-            None => return "Error: missing 'command'".to_string(),
+            Some(c) if !c.trim().is_empty() => c,
+            _ => {
+                return "Error: missing required field `command` for powershell. \
+                        Origin: model_argument_error; no command was run. \
+                        Next: retry with a JSON object like {\"command\":\"Get-Location\"}."
+                    .to_string();
+            }
         };
         let timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0);
 
@@ -4484,9 +4470,7 @@ impl ToolExecutor {
                 .sandbox_policy
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(ref policy) = *sp_guard
-                && !matches!(policy.mode, SandboxMode::Permissive)
-            {
+            if let Some(ref policy) = *sp_guard {
                 if let Some(msg) = check_powershell_path_boundary(policy, command) {
                     return msg;
                 }
@@ -4754,26 +4738,38 @@ impl ToolExecutor {
             );
         }
 
-        // Use fd if available (faster, respects .gitignore), fall back to find
+        // Use fd if available (faster, respects .gitignore), fall back to
+        // find. The fallback lists candidate files only; Rust-side glob
+        // filtering below is authoritative so a bad shell expression cannot
+        // explode a narrow/no-match pattern into the entire repository.
         let shell_cmd = format!(
-            "cd {} && {{ fd --type f --glob {} 2>/dev/null || find . {} -o -name {} -print | sed 's|^./||'; }} | head -100",
+            "cd {} && {{ fd --type f --glob {} 2>/dev/null || find . {} -o -type f -print | sed 's|^./||'; }} | head -1000",
             shell_escape(base.to_string_lossy().as_ref()),
             shell_escape(&pattern),
-            default_find_prune_clause(),
-            shell_escape(pattern.split('/').next_back().unwrap_or(&pattern))
+            default_find_prune_clause()
         );
         let mut cmd = Command::new("bash");
         cmd.arg("-c").arg(&shell_cmd);
         // Use 15s timeout for glob/find (directory traversal)
         match run_command_with_cleanup(&mut cmd, 15.0) {
             Ok(o) => {
-                let text = String::from_utf8_lossy(&o.stdout).into_owned();
-                if text.trim().is_empty() {
+                let raw_text = String::from_utf8_lossy(&o.stdout);
+                let mut files = raw_text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .filter(|line| astra_tools::shell_ops::glob_matches_path(&pattern, line))
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                files.sort();
+                files.dedup();
+                if files.is_empty() {
                     "No files found".to_string()
                 } else {
                     // Apply per-tool output limit (centralised in per_tool_output_limit)
+                    let text = files.join("\n");
                     let limit = self.scaled_output_limit_for("glob");
-                    let line_count = text.lines().count();
+                    let line_count = files.len();
                     if text.len() > limit {
                         let end = text.floor_char_boundary(limit);
                         let cut = text[..end].rfind('\n').map(|pos| pos + 1).unwrap_or(end);
@@ -5068,6 +5064,20 @@ mod tests {
         ToolExecutor::new(std::env::temp_dir())
     }
 
+    fn create_current_session_artifact() -> (
+        tempfile::TempDir,
+        astra_services::session_journal::JournalDirGuard,
+        std::path::PathBuf,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_root = temp.path().join("sessions");
+        let guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
+        let artifact_path = sessions_root.join("session-1/tool-results/call_abc.txt");
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, "child output").unwrap();
+        (temp, guard, artifact_path)
+    }
+
     // ── P4: Bash security layer tests (data-driven) ─────────────────────
 
     #[test]
@@ -5154,6 +5164,23 @@ mod tests {
         let executor = test_executor();
         let result = executor.bash(&serde_json::json!({}));
         assert!(result.contains("Error"), "got: {result}");
+        assert!(
+            result.contains("Origin: model_argument_error"),
+            "got: {result}"
+        );
+        assert!(result.contains("no command was run"), "got: {result}");
+    }
+
+    #[test]
+    fn bash_blank_command_returns_model_argument_error() {
+        let executor = test_executor();
+        let result = executor.bash(&serde_json::json!({"command": " \n\t "}));
+        assert!(result.contains("Error"), "got: {result}");
+        assert!(
+            result.contains("Origin: model_argument_error"),
+            "got: {result}"
+        );
+        assert!(result.contains("no command was run"), "got: {result}");
     }
 
     #[test]
@@ -5499,6 +5526,11 @@ mod tests {
         let executor = test_executor();
         let result = executor.powershell(&serde_json::json!({}));
         assert!(result.contains("Error"), "got: {result}");
+        assert!(
+            result.contains("Origin: model_argument_error"),
+            "got: {result}"
+        );
+        assert!(result.contains("no command was run"), "got: {result}");
     }
 
     #[test]
@@ -5665,6 +5697,28 @@ mod tests {
     }
 
     #[test]
+    fn glob_nonexistent_pattern_prefix_does_not_return_entire_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("rust/crates/astra-thin-client/src")).unwrap();
+        std::fs::write(
+            dir.path()
+                .join("rust/crates/astra-thin-client/src/client.rs"),
+            "",
+        )
+        .unwrap();
+        let executor = ToolExecutor::new(dir.path());
+
+        let result = executor.glob(&serde_json::json!({
+            "pattern": "rust/crates/astra-orch/**/*.rs"
+        }));
+
+        assert_eq!(
+            result, "No files found",
+            "no-match glob must not fall back to unrelated workspace files: {result}"
+        );
+    }
+
+    #[test]
     fn glob_outside_project_sandbox_blocked() {
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
@@ -5770,13 +5824,35 @@ mod tests {
     // ── resolve_checked sandbox ──────────────────────────────────────────────
 
     #[test]
-    fn resolve_checked_with_permissive_sandbox_allows_all() {
+    fn resolve_checked_with_permissive_sandbox_allows_ordinary_external_paths() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
         *executor.sandbox_policy.write().unwrap() = Some(SandboxPolicy::permissive(dir.path()));
-        let result = executor.resolve_checked("/etc/passwd");
-        assert!(result.is_ok(), "should allow with permissive: {result:?}");
+        let result = executor.resolve_checked("/usr/bin/cat");
+        assert!(
+            result.is_ok(),
+            "should allow ordinary external path with permissive: {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_checked_with_permissive_sandbox_blocks_sensitive_paths() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let dir = tempfile::tempdir().unwrap();
+        let sensitive_path = dir.path().join(".ssh/id_rsa");
+        let executor = ToolExecutor::new(dir.path());
+        *executor.sandbox_policy.write().unwrap() = Some(SandboxPolicy::permissive(dir.path()));
+
+        let err = executor
+            .resolve_checked(&sensitive_path.to_string_lossy())
+            .unwrap_err();
+
+        assert!(err.contains("sensitive credential path"), "{err}");
+        assert!(
+            !err.starts_with(super::SANDBOX_DENIED_PREFIX),
+            "sensitive paths are bypass-immune, not expandable sandbox boundaries: {err}"
+        );
     }
 
     #[test]
@@ -5788,7 +5864,9 @@ mod tests {
             result.is_ok(),
             "relative path inside project should succeed: {result:?}"
         );
-        assert!(result.unwrap().starts_with(dir.path()));
+        let resolved = astra_sandbox::canonicalize_parent_and_append(&result.unwrap()).unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        assert!(resolved.starts_with(root));
     }
 
     #[test]
@@ -5797,7 +5875,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
         *executor.sandbox_policy.write().unwrap() = Some(SandboxPolicy::for_project(dir.path()));
-        let err = executor.resolve_checked("/etc/passwd").unwrap_err();
+        let err = executor.resolve_checked("/usr/bin/cat").unwrap_err();
         assert!(
             err.starts_with(super::SANDBOX_DENIED_PREFIX),
             "boundary violation should have SANDBOX_DENIED prefix: {err}"
@@ -5821,7 +5899,11 @@ mod tests {
         ] {
             let result = check_bash_path_boundary(&policy, cmd);
             assert!(result.is_some(), "{label}: should block: {cmd}");
-            assert!(result.unwrap().starts_with(super::SANDBOX_DENIED_PREFIX));
+            let msg = result.unwrap();
+            assert!(
+                msg.starts_with(super::SANDBOX_DENIED_PREFIX),
+                "{label}: expected SANDBOX_DENIED prefix, got: {msg}"
+            );
         }
     }
 
@@ -5860,11 +5942,93 @@ mod tests {
     }
 
     #[test]
-    fn bash_path_boundary_permissive_skips_check() {
+    fn bash_path_boundary_permissive_allows_ordinary_external_paths() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::permissive("/home/user/project");
         let result = check_bash_path_boundary(&policy, "cat /etc/passwd");
         assert!(result.is_none(), "permissive mode should allow everything");
+    }
+
+    #[test]
+    fn bash_path_boundary_permissive_blocks_sensitive_paths() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+
+        let result = check_bash_path_boundary(&policy, "cat /home/user/.ssh/id_rsa")
+            .expect("permissive should still block sensitive credential paths");
+
+        assert!(result.contains("sensitive credential path"), "{result}");
+        assert!(
+            !result.starts_with(super::SANDBOX_DENIED_PREFIX),
+            "sensitive paths are not expandable sandbox boundaries: {result}"
+        );
+    }
+
+    #[test]
+    fn bash_path_boundary_permissive_allows_grep_pattern_mentioning_sensitive_name() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+        let result = check_bash_path_boundary(
+            &policy,
+            r#"grep -n "fn resolve_checked\|sensitive credential\|SANDBOX_DENIED_PREFIX\|\.ssh\|credentials.json" rust/crates/astra-cli/src/edge_tools/shell.rs"#,
+        );
+
+        assert!(
+            result.is_none(),
+            "grep search text is data, not a filesystem access: {result:?}"
+        );
+    }
+
+    #[test]
+    fn bash_path_boundary_permissive_blocks_grep_sensitive_file_operand() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "grep -n needle ~/.ssh/id_rsa")
+            .expect("permissive should still block sensitive grep operands");
+
+        assert!(result.contains("sensitive credential path"), "{result}");
+        assert!(
+            !result.starts_with(super::SANDBOX_DENIED_PREFIX),
+            "sensitive paths are not expandable sandbox boundaries: {result}"
+        );
+    }
+
+    #[test]
+    fn bash_path_boundary_permissive_allows_current_session_artifact_reads() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+        let (_temp, _guard, artifact_path) = create_current_session_artifact();
+        let command = format!(
+            "cat {} | python3 -c 'import sys; print(sys.stdin.read())'",
+            artifact_path.display()
+        );
+
+        let result = check_bash_path_boundary(&policy, &command);
+
+        assert!(
+            result.is_none(),
+            "read-only shell processing of current-session artifacts must not be blocked: {result:?}"
+        );
+    }
+
+    #[test]
+    fn bash_path_boundary_permissive_blocks_current_session_artifact_writes() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+        let (_temp, _guard, artifact_path) = create_current_session_artifact();
+        let command = format!("rm -f {}", artifact_path.display());
+
+        let result = check_bash_path_boundary(&policy, &command)
+            .expect("writes to current-session artifacts must be blocked");
+
+        assert!(
+            result.contains("internal runtime artifact path"),
+            "{result}"
+        );
+        assert!(
+            !result.starts_with(super::SANDBOX_DENIED_PREFIX),
+            "internal artifact writes are not expandable sandbox boundaries: {result}"
+        );
     }
 
     #[test]
@@ -5905,6 +6069,27 @@ mod tests {
         assert!(check_bash_path_boundary(&policy, "echo $(cat /etc/passwd)").is_none());
         // >&2 is fd duplication, not path
         assert!(check_bash_path_boundary(&policy, "echo hi >&2").is_none());
+    }
+
+    #[test]
+    fn redirection_to_dev_null_inside_command_substitution_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(
+            &policy,
+            r#"hits=$(grep -cE "ask_user|approval" "$f" 2>/dev/null)"#,
+        );
+        assert!(
+            result.is_none(),
+            "device redirection inside command substitution should not be treated as a project file escape: {result:?}"
+        );
+    }
+
+    #[test]
+    fn redirection_to_dev_null_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        assert!(check_bash_path_boundary(&policy, "echo hi >/dev/null").is_none());
     }
 
     #[test]
@@ -6694,6 +6879,20 @@ mod tests {
         assert!(
             result.is_none(),
             "for-loops should stay allowed for non-file-access subcommands"
+        );
+    }
+
+    #[test]
+    fn for_loop_pipeline_head_without_path_operand_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(
+            &policy,
+            r#"for f in *.rs; do echo "=== $f ==="; grep -nE "ask_user|approval" "$f" 2>/dev/null | head -8; done"#,
+        );
+        assert!(
+            result.is_none(),
+            "loop fan-out review should require an unsafe path operand, not just a stdin consumer like head: {result:?}"
         );
     }
 
@@ -7896,6 +8095,24 @@ mod tests {
                 1,
                 false,
                 Some("No matches found"),
+            ),
+            (
+                "cd /work/repo && grep -n missing src/main.rs",
+                1,
+                false,
+                Some("No matches found"),
+            ),
+            (
+                "pgrep missing-process-name",
+                1,
+                false,
+                Some("No processes matched"),
+            ),
+            (
+                "cd /work/repo && pgrep missing-process-name",
+                1,
+                false,
+                Some("No processes matched"),
             ),
             ("cargo build", 1, true, None),
         ];

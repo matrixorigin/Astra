@@ -153,6 +153,32 @@ fn extend_restricted_with_blocked_tools(
     // callers don't need signature changes; add future block sources here.
 }
 
+type RootPermissionContextHandle = astra_runtime::orchestration::PermissionSyncHandle;
+
+fn root_permission_context_handle(
+    perm_manager: &crate::cli::permission_manager::PermissionManager,
+) -> RootPermissionContextHandle {
+    perm_manager.runtime_permission_handle()
+}
+
+async fn refresh_root_permission_context(
+    handle: &mut Option<RootPermissionContextHandle>,
+    perm_manager: &crate::cli::permission_manager::PermissionManager,
+) {
+    let latest = perm_manager.runtime_permission_context();
+    if let Some(existing) = handle.as_ref() {
+        // Merge — NOT replace. Overwriting the whole context would wipe
+        // runtime telemetry (tools_blocked, recent_denials, ...) and the
+        // in-session allow/deny decisions the user already made this turn,
+        // breaking the self-model feedback loop. Only the policy half
+        // (`inherited`) is refreshed from the manager's latest snapshot.
+        let mut guard = existing.write().await;
+        guard.merge_policy_from(&latest);
+    } else {
+        *handle = Some(latest.into_shared());
+    }
+}
+
 pub(crate) async fn stream_chat_sse(
     mut p: ChatTurnParams<'_>,
 ) -> Result<StreamResult, crate::TurnFailure> {
@@ -293,6 +319,7 @@ pub(crate) async fn stream_chat_sse(
             let spawn_ctx = edge_tools::agent_spawning::AgentActionContext {
                 run_id: parent_turn_run_id.clone(),
                 agent_id: root_agent_id.to_string(),
+                delegation_chain: Vec::new(),
                 current_model: p.model.map(str::to_string),
                 recursion_depth: 0,
                 is_fork_child: false,
@@ -341,11 +368,20 @@ pub(crate) async fn stream_chat_sse(
     // --add-dir: expand sandbox to include additional directories
     if let Some(cli_context) = p.cli_context {
         for dir in &cli_context.add_dirs {
-            executor.expand_sandbox_path(dir.clone());
+            if let Err(e) = executor.expand_sandbox_path(dir.clone()) {
+                astra_core::agent_warn!("sandbox", "--add-dir {} rejected: {e}", dir.display());
+            }
         }
     } else if let Ok(dirs) = std::env::var("ASTRA_CLI_ADD_DIRS") {
         for dir in dirs.split(':').filter(|s| !s.is_empty()) {
-            executor.expand_sandbox_path(PathBuf::from(dir));
+            let dir = PathBuf::from(dir);
+            if let Err(e) = executor.expand_sandbox_path(dir.clone()) {
+                astra_core::agent_warn!(
+                    "sandbox",
+                    "ASTRA_CLI_ADD_DIRS {} rejected: {e}",
+                    dir.display()
+                );
+            }
         }
     }
     let messages = load_turn_messages(p.pre_loaded_messages.take(), p.history, p.message);
@@ -390,9 +426,10 @@ pub(crate) async fn stream_chat_sse(
     executor.set_plugin_schemas(mcp_plugin_schemas);
     let registry = ToolRegistry::new_runtime_surface(all_schemas.clone());
     let pinned_schema_tokens = registry.total_pinned_token_cost() as u64;
-    // Build valid_tool_names from the registry's runtime surface rather than
-    // reusing the pre-filtered schema vec directly.
-    let valid_tool_names: HashSet<String> = registry.all_schema_names().into_iter().collect();
+    // Full runtime inventory is used only for static allow/deny policy
+    // calculations. The headless validator's admitted tool set is populated
+    // per round from the final `edge_tools` payload actually sent to the model.
+    let runtime_tool_names: HashSet<String> = registry.all_schema_names().into_iter().collect();
 
     // --allowed-tools: if set, restrict to only the specified tools
     let mut initial_restricted: HashSet<String> = if let Some(cli_context) = p.cli_context {
@@ -402,7 +439,7 @@ pub(crate) async fn stream_chat_sse(
             .map(String::as_str)
             .collect();
         if !allowed.is_empty() {
-            valid_tool_names
+            runtime_tool_names
                 .iter()
                 .filter(|name| !allowed.contains(name.as_str()))
                 .cloned()
@@ -417,7 +454,7 @@ pub(crate) async fn stream_chat_sse(
             .filter(|s| !s.is_empty())
             .collect();
         if !allowed.is_empty() {
-            valid_tool_names
+            runtime_tool_names
                 .iter()
                 .filter(|name| !allowed.contains(name.as_str()))
                 .cloned()
@@ -503,9 +540,10 @@ pub(crate) async fn stream_chat_sse(
         None => std::mem::take(&mut local_discovered_skills),
     };
 
-    // Capture full permission mode before perm_manager is moved into the host.
-    let parent_perm_mode = p.perm_manager.mode();
+    // Capture the child permission envelope before perm_manager is moved into the host.
+    let child_permissions = p.perm_manager.inherited_permissions_for_child(true);
     let parent_cancel_token = p.cancel_token.clone();
+    let root_permission_context = root_permission_context_handle(p.perm_manager);
 
     // Snapshot approval overrides for checkpoint persistence.
     let initial_approval_overrides = p.perm_manager.export_session_overrides();
@@ -540,7 +578,7 @@ pub(crate) async fn stream_chat_sse(
         all_schemas,
         file_context,
         perm_manager: p.perm_manager,
-        valid_tool_names,
+        valid_tool_names: HashSet::new(),
         capabilities: cli_capabilities,
         pending_clear_lines: 0,
         is_plan_subtask: p.is_plan_subtask,
@@ -584,7 +622,7 @@ pub(crate) async fn stream_chat_sse(
             p.token.to_string(),
             p.model.map(|m| m.to_string()),
             project_root.clone(),
-            parent_perm_mode,
+            child_permissions,
             parent_cancel_token,
         )
         .with_skill_resolver(skill_resolver.clone())
@@ -692,12 +730,12 @@ pub(crate) async fn stream_chat_sse(
             forced_execution_retry: false,
             forced_execution_escalation: false,
             forced_parallel_batching: false,
-            forced_parallel_batching_escalated: false,
             forced_round_budget_phase1: false,
             forced_round_budget_phase2: false,
             introspection_count: 0,
             forced_redundant_reads_corrective: false,
             forced_cache_waste_corrective: false,
+            forced_search_fanout_corrective: false,
             forced_exploration_family_corrective: false,
             forced_exploration_family_phase2: false,
             exploration_family_corrective_family: None,
@@ -793,6 +831,8 @@ pub(crate) async fn stream_chat_sse(
         api_token: p.token.to_string(),
         delegation_engine: p.delegation_engine,
         delegations_this_turn: 0,
+        delegation_chain: Vec::new(),
+        self_agent_id: "tui_session".to_string(),
         project_context,
         checkpoint_gate: None,
         last_llm_context_manifest_trace: None,
@@ -812,7 +852,7 @@ pub(crate) async fn stream_chat_sse(
         max_cumulative_tokens: 0,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         recent_file_reads: Vec::new(),
-        permission_context: None,
+        permission_context: Some(root_permission_context),
         permission_handler: None,
         tactical_adapter: None,
         step_signal_collector: None,
@@ -1070,9 +1110,12 @@ mod tests {
     use super::{
         circuit_breaker_config_from_tool_selection, detect_turn_hook_sets,
         extend_restricted_with_blocked_tools, normalize_turn_model,
-        restored_compaction_effectiveness,
+        refresh_root_permission_context, restored_compaction_effectiveness,
+        root_permission_context_handle,
     };
+    use crate::cli::permission_manager::{PermissionManager, PermissionMode};
     use astra_runtime::observability::ObservabilityHub;
+    use astra_runtime::turn::permission_gate::{PermissionCheckResult, check_tool_permission};
     use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
     use serde_json::json;
     use std::collections::HashSet;
@@ -1093,6 +1136,195 @@ mod tests {
         assert_eq!(cfg.max_introspect_emissions, 3);
         assert_eq!(cfg.half_open_patience, 2);
         assert_eq!(cfg.absolute_max_rounds, 200);
+    }
+
+    #[tokio::test]
+    async fn root_permission_context_auto_mode_allows_visible_tools() {
+        let mut manager = PermissionManager::new(false);
+        manager.set_mode(PermissionMode::Auto);
+        let ctx = root_permission_context_handle(&manager);
+
+        let result = check_tool_permission(
+            "git",
+            Some(r#"{"action":"status"}"#),
+            Some(&ctx),
+            None,
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                PermissionCheckResult::Allowed | PermissionCheckResult::AllowedImplicit { .. }
+            ),
+            "auto mode must install a root permission context that allows visible tools, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_root_permission_context_updates_existing_handle() {
+        let mut manager = PermissionManager::new(false);
+        let mut handle = Some(root_permission_context_handle(&manager));
+        let original = handle.as_ref().unwrap().clone();
+
+        manager.set_mode(PermissionMode::Auto);
+        refresh_root_permission_context(&mut handle, &manager).await;
+
+        let refreshed = handle.as_ref().unwrap();
+        assert!(
+            Arc::ptr_eq(&original, refreshed),
+            "refresh must update the existing context so any permission handler keeps seeing the current policy"
+        );
+
+        let result = check_tool_permission(
+            "bash",
+            Some(r#"{"command":"git status"}"#),
+            Some(refreshed),
+            None,
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                PermissionCheckResult::Allowed | PermissionCheckResult::AllowedImplicit { .. }
+            ),
+            "refreshed auto context should allow bash, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_root_permission_context_preserves_runtime_telemetry() {
+        // Regression: `refresh_root_permission_context` used to wholesale
+        // replace the context (`*existing.write().await = latest`), which
+        // wiped runtime telemetry (tools_blocked, recent_denials, ...) and
+        // broke the self-model feedback loop. It must now merge policy only.
+        let mut manager = PermissionManager::new(false);
+        manager.set_mode(PermissionMode::Auto);
+        let mut handle = Some(root_permission_context_handle(&manager));
+
+        // Seed runtime telemetry + a session deny rule into the existing handle.
+        {
+            let mut guard = handle.as_ref().unwrap().write().await;
+            guard.record_blocked_tool_with_reason("bash", Some("seeded denial"));
+            guard.apply_update(&astra_turn_core::permission::types::PermissionUpdate::deny(
+                astra_turn_core::permission::types::PermissionRule::tool("dangerous_tool"),
+            ));
+        }
+
+        // Mutate policy (mode flip) and refresh — the bug used to wipe the
+        // telemetry + session deny above.
+        manager.set_mode(PermissionMode::Prompt);
+        refresh_root_permission_context(&mut handle, &manager).await;
+
+        let guard = handle.as_ref().unwrap().read().await;
+        assert_eq!(
+            guard.telemetry().tools_blocked,
+            1,
+            "refresh must preserve runtime tools_blocked telemetry, not wipe it"
+        );
+        assert!(
+            guard
+                .telemetry()
+                .recent_denials
+                .iter()
+                .any(|name| name == "bash"),
+            "refresh must preserve recent_denials, not wipe it"
+        );
+        assert!(
+            guard.is_denied("dangerous_tool", None),
+            "refresh must preserve in-session deny rules, not wipe them"
+        );
+        assert_eq!(
+            guard.mode(),
+            PermissionMode::Prompt,
+            "refresh must still apply the fresh policy (mode flip)"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_mode_approval_refresh_allows_same_tool_call() {
+        let mut manager = PermissionManager::new(false);
+        manager.set_mode(PermissionMode::Prompt);
+        let mut handle = Some(root_permission_context_handle(&manager));
+        let args = json!({"command": "cargo test"});
+        let args_str = serde_json::to_string(&args).unwrap();
+
+        let before = check_tool_permission(
+            "bash",
+            Some(&args_str),
+            handle.as_ref(),
+            None,
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert!(
+            matches!(before, PermissionCheckResult::Denied { .. }),
+            "prompt mode should require approval before a bash execution, got {before:?}"
+        );
+
+        manager.record_approval("bash", Some(&args), true);
+        refresh_root_permission_context(&mut handle, &manager).await;
+
+        let after = check_tool_permission(
+            "bash",
+            Some(&args_str),
+            handle.as_ref(),
+            None,
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert!(
+            matches!(
+                after,
+                PermissionCheckResult::Allowed | PermissionCheckResult::AllowedImplicit { .. }
+            ),
+            "prompt approval must refresh into the runtime permission context, got {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_edits_root_context_allows_edits_but_not_bash() {
+        let mut manager = PermissionManager::new(false);
+        manager.set_mode(PermissionMode::AcceptEdits);
+        let handle = root_permission_context_handle(&manager);
+
+        let write_args = serde_json::to_string(&json!({
+            "path": "src/lib.rs",
+            "content": "pub fn demo() {}\n",
+        }))
+        .unwrap();
+        let write_result = check_tool_permission(
+            "write_file",
+            Some(&write_args),
+            Some(&handle),
+            None,
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert!(
+            matches!(
+                write_result,
+                PermissionCheckResult::Allowed | PermissionCheckResult::AllowedImplicit { .. }
+            ),
+            "accept_edits should allow workspace file edits, got {write_result:?}"
+        );
+
+        let bash_args = serde_json::to_string(&json!({"command": "cargo test"})).unwrap();
+        let bash_result = check_tool_permission(
+            "bash",
+            Some(&bash_args),
+            Some(&handle),
+            None,
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert!(
+            matches!(bash_result, PermissionCheckResult::Denied { .. }),
+            "accept_edits should still require approval for bash, got {bash_result:?}"
+        );
     }
 
     #[test]

@@ -26,6 +26,7 @@ mod audit_handlers;
 mod auth_handlers;
 mod bridge_prep;
 mod chat_handlers;
+mod cleanup_retry;
 pub mod conflict_resolver;
 pub mod delegation;
 pub mod device_lease_sweeper;
@@ -49,6 +50,7 @@ mod resource_handlers;
 mod router_builder;
 pub mod run;
 pub(crate) mod runtime_mcp;
+pub(crate) mod server_bash_execution;
 pub mod server_loop_host;
 pub mod server_skill_subrun;
 pub mod server_tool_executor;
@@ -58,7 +60,38 @@ mod state_builder;
 pub mod sweeper_lease;
 mod task_handlers;
 pub mod team;
+pub(crate) mod tool_agent_info;
+pub(crate) mod tool_agent_runtime;
+pub(crate) mod tool_approval_preflight;
+pub(crate) mod tool_ask_user;
+pub(crate) mod tool_binding_projection;
+pub(crate) mod tool_database_snapshots;
+pub(crate) mod tool_edge_selection;
+pub(crate) mod tool_edge_transport;
+pub(crate) mod tool_exactly_once;
+pub(crate) mod tool_execution_binding;
+pub(crate) mod tool_execution_result;
+pub(crate) mod tool_execution_service;
+pub(crate) mod tool_external_transport;
+pub(crate) mod tool_file_runtime;
+pub(crate) mod tool_introspect;
+pub(crate) mod tool_local_execution;
+pub(crate) mod tool_local_transport;
+pub(crate) mod tool_plan_gate;
+pub(crate) mod tool_route_boundary;
+pub(crate) mod tool_route_runtime;
+pub(crate) mod tool_route_selection;
+pub(crate) mod tool_session_config;
+pub(crate) mod tool_session_history;
+pub(crate) mod tool_session_runtime;
+pub(crate) mod tool_session_state_rollback;
+pub(crate) mod tool_task_runtime;
 pub mod tool_transport;
+pub(crate) mod tool_transport_errors;
+pub(crate) mod tool_transport_metadata;
+pub(crate) mod tool_transport_plan;
+pub(crate) mod tool_work_surface_events;
+pub(crate) mod tool_workspace_path_guard;
 mod user_skill_handlers;
 mod ws_handler;
 
@@ -193,6 +226,21 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref pool) = state.shared_pool {
         bg_handles.push(spawn_data_cleanup(pool.clone(), bg_cancel.clone()));
         bg_handles.push(astra_services::session_reaper::spawn_session_reaper(
+            pool.clone(),
+            bg_cancel.clone(),
+        ));
+        // Spawn background cleanup-debt retry task
+        {
+            let cleanup_store: std::sync::Arc<dyn astra_services::WorkspaceCleanupDebtStore> =
+                std::sync::Arc::new(astra_services::DatabaseWorkspaceRecordStore::new(
+                    pool.clone(),
+                ));
+            bg_handles.push(crate::server::cleanup_retry::spawn_cleanup_retry(
+                cleanup_store,
+                bg_cancel.clone(),
+            ));
+        }
+        bg_handles.extend(crate::server::sweeper_lease::spawn_runtime_sweepers(
             pool.clone(),
             bg_cancel.clone(),
         ));

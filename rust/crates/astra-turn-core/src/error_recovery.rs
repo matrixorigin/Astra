@@ -86,25 +86,9 @@ pub fn should_retry_with_hint(
 /// categories.
 const TOOL_GROUPS: &[&[&str]] = &[
     // Git information tools
-    &[
-        "git_log",
-        "git_diff",
-        "git_status",
-        "git_blame",
-        "git_file_history",
-        "git_contributors",
-        "git_log_search",
-    ],
+    &["git"],
     // GitHub API tools
-    &[
-        "github_list_prs",
-        "github_get_pr",
-        "github_list_issues",
-        "github_get_issue",
-        "github_create_issue",
-        "github_ci_status",
-        "github_repo_stats",
-    ],
+    &["github"],
     // File reading tools
     &["read_file", "grep", "glob", "list_dir"],
     // File writing tools
@@ -188,6 +172,12 @@ pub fn build_recovery_message(
         ErrorCategory::ToolUnavailable => format!(
             "⚠ {} is not available in this environment. \
              Do NOT retry — use an alternative tool.",
+            tool_name
+        ),
+        ErrorCategory::ToolBinding => format!(
+            "⚠ {} was advertised but no executor/transport was bound for this turn. \
+             Do NOT retry the same call. Do NOT assume bash or a different tool is equivalent; \
+             continue with degraded coverage only after stating what capability was lost.",
             tool_name
         ),
         ErrorCategory::ResourceLimit => format!(
@@ -622,25 +612,12 @@ mod tests {
 
     #[test]
     fn suggestions_data_driven() {
-        // git_log alternatives
-        let alts = suggest_alternatives("git_log", &[]);
-        assert!(alts.contains(&"git_diff".to_string()));
-        assert!(alts.contains(&"git_blame".to_string()));
-        assert!(!alts.contains(&"git_log".to_string()));
-
-        // excludes deprioritized
-        let alts = suggest_alternatives("git_log", &["git_diff", "git_blame"]);
-        assert!(!alts.contains(&"git_diff".to_string()));
-        assert!(!alts.contains(&"git_blame".to_string()));
-        assert!(alts.contains(&"git_status".to_string()));
+        // consolidated action tools do not suggest retired helper names
+        assert!(suggest_alternatives("git", &[]).is_empty());
+        assert!(suggest_alternatives("github", &[]).is_empty());
 
         // no alternatives for unique tools
         assert!(suggest_alternatives("bash", &[]).is_empty());
-
-        // github alternatives
-        assert!(
-            suggest_alternatives("github_list_prs", &[]).contains(&"github_get_pr".to_string())
-        );
 
         // multi-edit alternatives
         let alts = suggest_alternatives("multi_edit", &[]);
@@ -652,8 +629,8 @@ mod tests {
 
     #[test]
     fn recovery_message_includes_alternatives() {
-        let msg = build_recovery_message("git_log", "timeout", ErrorCategory::Network, &[]);
-        assert!(msg.contains("git_diff"));
+        let msg = build_recovery_message("multi_edit", "timeout", ErrorCategory::Network, &[]);
+        assert!(msg.contains("write_file"));
         assert!(msg.contains("Alternatives"));
     }
 
@@ -668,7 +645,7 @@ mod tests {
         assert!(msg.contains("workspace safety"));
 
         // auth no retry
-        let msg = build_recovery_message("github_list_prs", "401", ErrorCategory::Auth, &[]);
+        let msg = build_recovery_message("github", "401", ErrorCategory::Auth, &[]);
         assert!(msg.contains("authentication"));
         assert!(msg.contains("Do NOT retry"));
 

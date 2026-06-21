@@ -63,6 +63,10 @@ pub struct DefaultToolExecutor {
     bash_cache: Arc<Mutex<HashMap<BashCacheKey, BashCacheEntry>>>,
     workspace_generation: Arc<AtomicU64>,
     bash_cache_ttl: std::time::Duration,
+    /// Tracks whether the HTTP client was successfully built.
+    /// When `false`, GitHub tools and other HTTP-dependent tools will report
+    /// a diagnostic error explaining why HTTP is unavailable.
+    http_client_available: bool,
 }
 
 /// Key for the per-session bash dedup cache. Bumping ANY of these
@@ -107,6 +111,43 @@ struct BashCacheEntry {
 /// visible on the next read-only probe.
 pub const DEFAULT_BASH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Recover a poisoned `Mutex` while logging the recovery. A panic that
+/// poisoned the lock is a real bug — callers should not silently swallow it.
+/// We keep the recovery (continuing is better than propagating panic across
+/// an await boundary in a tool executor), but emit an `error!` so operators
+/// can correlate the root cause.
+///
+/// Also increments a global counter so monitoring systems can alert on
+/// mutex poisoning events without scraping logs.
+static POISONED_LOCK_RECOVERY_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn recover_poisoned_lock<'a, T>(
+    result: std::sync::LockResult<std::sync::MutexGuard<'a, T>>,
+    lock_name: &'static str,
+) -> std::sync::MutexGuard<'a, T> {
+    match result {
+        Ok(guard) => guard,
+        Err(poison) => {
+            let count =
+                POISONED_LOCK_RECOVERY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            tracing::error!(
+                lock = lock_name,
+                recovery_count = count,
+                "mutex poisoned by a panicking thread; recovering to keep tool executor available"
+            );
+            poison.into_inner()
+        }
+    }
+}
+
+/// Returns the number of times a poisoned mutex was recovered.
+/// Useful for monitoring and alerting.
+#[allow(dead_code)]
+pub fn poisoned_lock_recovery_count() -> u64 {
+    POISONED_LOCK_RECOVERY_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl DefaultToolExecutor {
     pub fn new(ctx: ToolContext) -> Self {
         let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
@@ -120,6 +161,7 @@ impl DefaultToolExecutor {
             bash_cache: Arc::new(Mutex::new(HashMap::new())),
             workspace_generation: Arc::new(AtomicU64::new(0)),
             bash_cache_ttl: DEFAULT_BASH_CACHE_TTL,
+            http_client_available: true,
         }
     }
 
@@ -143,6 +185,10 @@ impl DefaultToolExecutor {
     ///
     /// Handles the full setup recipe shared by edge and cloud:
     /// HTTP client, `ToolContext`, sandbox, and optional GitHub integration.
+    ///
+    /// If the HTTP client cannot be built, a warning is logged and the
+    /// executor is created without HTTP support (GitHub tools etc. will
+    /// report errors rather than crashing the runtime).
     pub fn for_workspace(
         workspace: &Path,
         user_id: impl Into<String>,
@@ -150,12 +196,21 @@ impl DefaultToolExecutor {
         user_agent: &str,
         timeout: std::time::Duration,
     ) -> Self {
-        let http_client = reqwest::Client::builder()
+        let (http_client, http_client_available) = match reqwest::Client::builder()
             .timeout(timeout)
             .user_agent(user_agent.to_string())
             .no_proxy()
             .build()
-            .expect("failed to build HTTP client for tool executor");
+        {
+            Ok(client) => (client, true),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "failed to build HTTP client for tool executor — HTTP-dependent tools will be unavailable"
+                );
+                (reqwest::Client::new(), false)
+            }
+        };
 
         let ctx = crate::ToolContext {
             project_root: workspace.to_path_buf(),
@@ -170,6 +225,7 @@ impl DefaultToolExecutor {
         };
 
         let mut executor = Self::new(ctx);
+        executor.http_client_available = http_client_available;
         let tokens = crate::github::resolve_github_tokens();
         if !tokens.is_empty() {
             let github = GitHubClient::from_tokens(http_client, tokens, Vec::new());
@@ -221,7 +277,7 @@ impl ToolExecutor for DefaultToolExecutor {
     async fn execute(&self, name: &str, args: &Value) -> ToolResult {
         // ── Approval gate ────────────────────────────────────────────
         if let Some(gate) = &self.approval_gate
-            && gate.requires_approval(name)
+            && gate.requires_approval_for(name, args)
         {
             let request_id = uuid::Uuid::new_v4().to_string();
             let decision = gate.request_approval(&request_id, name, args).await;
@@ -271,7 +327,7 @@ impl ToolExecutor for DefaultToolExecutor {
                 let mut map = self
                     .bash_cache
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .unwrap_or_else(|e| recover_poisoned_lock(Err(e), "bash_cache"));
                 let now = std::time::Instant::now();
                 let ttl = self.bash_cache_ttl;
                 match map.get(&key) {
@@ -342,7 +398,7 @@ impl ToolExecutor for DefaultToolExecutor {
         {
             self.bash_cache
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(|e| recover_poisoned_lock(Err(e), "bash_cache"))
                 .insert(
                     key,
                     BashCacheEntry {
@@ -471,37 +527,29 @@ impl DefaultToolExecutor {
             // ── GitHub API ───────────────────────────────────────────
             "github" => {
                 let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                let resolved_name = match action {
-                    "list_prs" => "github_list_prs",
-                    "get_pr" => "github_get_pr",
-                    "ci_status" => "github_ci_status",
-                    "list_issues" => "github_list_issues",
-                    "get_issue" => "github_get_issue",
-                    "repo_stats" => "github_repo_stats",
-                    "create_issue" => "github_create_issue",
-                    "" => {
-                        return ToolResult::error(
-                            "Missing required parameter: action. Use one of: \
+                match action {
+                    "list_prs" | "get_pr" | "ci_status" | "list_issues" | "get_issue"
+                    | "repo_stats" | "create_issue" => {
+                        self.dispatch_github_action(action, args).await
+                    }
+                    "" => ToolResult::error(
+                        "Missing required parameter: action. Use one of: \
                          list_prs, get_pr, ci_status, list_issues, get_issue, \
                          repo_stats, create_issue"
-                                .to_string(),
-                        );
-                    }
-                    other => {
-                        return ToolResult::error(format!(
-                            "Unknown github action: '{other}'. Valid: list_prs, get_pr, \
+                            .to_string(),
+                    ),
+                    other => ToolResult::error(format!(
+                        "Unknown github action: '{other}'. Valid: list_prs, get_pr, \
                          ci_status, list_issues, get_issue, repo_stats, create_issue"
-                        ));
-                    }
-                };
-                self.dispatch_github(resolved_name, args).await
+                    )),
+                }
             }
 
             // ── Code intelligence (tree-sitter) ──────────────────────
             "symbols" => self.dispatch_symbols(args),
 
             // ── Web search ───────────────────────────────────────────
-            "web_search" => string_to_result(crate::web_search::web_search(args)),
+            "web_search" => crate::web_search::web_search_result(args),
 
             // ── Utility tools ────────────────────────────────────────
             "tool_search" => {
@@ -572,11 +620,6 @@ impl DefaultToolExecutor {
                 }
             }
 
-            // ── Delegation placeholder ───────────────────────────────
-            "delegate" => ToolResult::text(
-                "Delegation request acknowledged. Sub-agent will be spawned.".into(),
-            ),
-
             // ── Unknown tool ─────────────────────────────────────────
             _ => ToolResult::error(format!(
                 "Error: Tool '{name}' not available in DefaultToolExecutor"
@@ -584,31 +627,39 @@ impl DefaultToolExecutor {
         }
     }
 
-    /// Dispatch GitHub API tools via the optional GitHubClient.
-    async fn dispatch_github(&self, name: &str, args: &Value) -> ToolResult {
+    /// Dispatch the consolidated GitHub tool via the optional GitHubClient.
+    async fn dispatch_github_action(&self, action: &str, args: &Value) -> ToolResult {
         let client = match &self.github_client {
             Some(c) => c,
             None => {
+                if !self.http_client_available {
+                    return ToolResult::error(format!(
+                        "Error: github(action='{action}') failed — HTTP client could not be built.\n\n\
+                         This is a system configuration issue (proxy, TLS, network). \
+                         Check server logs for 'failed to build HTTP client' errors.\n\n\
+                         GitHub integration requires a working HTTP client. \
+                         Once the infrastructure issue is resolved, this tool will function normally."
+                    ));
+                }
                 return ToolResult::error(format!(
-                    "Error: GitHub tool '{name}' failed — no GitHub token is configured.\n\n\
+                    "Error: github(action='{action}') failed — no GitHub token is configured.\n\n\
                      To fix, do ONE of:\n\
                      1. Run `gh auth login` in a terminal (gh CLI stores the token)\n\
                      2. Set the GITHUB_TOKEN environment variable before starting this session\n\n\
-                     After authenticating, restart the session and retry.\n\
-                     Workaround: use `bash` with `gh issue create ...` or `gh pr create ...` directly \
-                     (the gh CLI may already be authenticated separately)."
+                     If you are running in CI, ensure the token is injected into the runtime.\n\
+                     After authentication, restart the session to enable GitHub integration."
                 ));
             }
         };
-        let output = match name {
-            "github_list_prs" => client.github_list_prs(args).await,
-            "github_get_pr" => client.github_get_pr(args).await,
-            "github_ci_status" => client.github_ci_status(args).await,
-            "github_list_issues" => client.github_list_issues(args).await,
-            "github_get_issue" => client.github_get_issue(args).await,
-            "github_repo_stats" => client.github_repo_stats(args).await,
-            "github_create_issue" => client.github_create_issue(args).await,
-            _ => return ToolResult::error(format!("Error: Unknown GitHub tool '{name}'")),
+        let output = match action {
+            "list_prs" => client.github_list_prs(args).await,
+            "get_pr" => client.github_get_pr(args).await,
+            "ci_status" => client.github_ci_status(args).await,
+            "list_issues" => client.github_list_issues(args).await,
+            "get_issue" => client.github_get_issue(args).await,
+            "repo_stats" => client.github_repo_stats(args).await,
+            "create_issue" => client.create_issue(args).await,
+            _ => return ToolResult::error(format!("Error: Unknown github action '{action}'")),
         };
         string_to_result(output)
     }
@@ -656,19 +707,15 @@ fn mark_result_cached(result: &mut ToolResult) {
 
 fn is_workspace_mutation_tool(name: &str, args: &Value) -> bool {
     match name {
-        "write_file" | "str_replace" | "multi_edit" | "delete_file" | "git_commit"
-        | "git_revert_commit" => true,
-        "git_stash" => args
-            .get("action")
-            .and_then(Value::as_str)
-            .is_some_and(git_stash_action_mutates_workspace),
+        "write_file" | "str_replace" | "multi_edit" | "delete_file" => true,
         "git" => args
             .get("action")
             .and_then(Value::as_str)
             .is_some_and(|action| match action {
-                "commit" | "revert_commit" => true,
+                "commit" | "revert_commit" | "push" => true,
                 "stash" => args
                     .get("stash_action")
+                    .or_else(|| args.get("sub_action"))
                     .and_then(Value::as_str)
                     .is_some_and(git_stash_action_mutates_workspace),
                 _ => false,
@@ -687,6 +734,7 @@ fn git_stash_action_mutates_workspace(action: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::Arc;
 
     use super::*;
     use serde_json::Value;
@@ -715,6 +763,63 @@ mod tests {
             .current_dir(dir)
             .output()
             .unwrap();
+    }
+
+    struct DenyInvocationApprovalGate;
+
+    #[async_trait::async_trait]
+    impl ToolApprovalGate for DenyInvocationApprovalGate {
+        async fn request_approval(
+            &self,
+            _request_id: &str,
+            _tool_name: &str,
+            _args: &Value,
+        ) -> crate::ApprovalDecision {
+            crate::ApprovalDecision::Denied {
+                reason: Some("test denied".to_string()),
+            }
+        }
+
+        fn requires_approval(&self, _tool_name: &str) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_invocation_approval_blocks_git_mutating_action() {
+        let (_tmp, mut exec) = test_executor();
+        exec.approval_gate = Some(Arc::new(DenyInvocationApprovalGate));
+
+        let result = exec
+            .execute(
+                "git",
+                &serde_json::json!({"action": "commit", "message": "ship"}),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("The user REJECTED this tool call"),
+            "mutating git actions must ask approval before execution: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_invocation_approval_skips_git_read_only_action() {
+        let (tmp, mut exec) = test_executor();
+        init_git_repo(tmp.path());
+        exec.approval_gate = Some(Arc::new(DenyInvocationApprovalGate));
+
+        let result = exec
+            .execute("git", &serde_json::json!({"action": "diff"}))
+            .await;
+
+        assert!(
+            !result.output.contains("The user REJECTED this tool call"),
+            "read-only git actions must not request approval: {}",
+            result.output
+        );
     }
 
     #[tokio::test]
@@ -879,6 +984,22 @@ mod tests {
         let result = exec.execute("nonexistent", &serde_json::json!({})).await;
         assert!(result.is_error);
         assert!(result.output.contains("not available"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_delegate_is_not_a_default_executor_tool() {
+        let (_tmp, exec) = test_executor();
+        let result = exec
+            .execute("delegate", &serde_json::json!({"task": "review"}))
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .contains("Tool 'delegate' not available in DefaultToolExecutor"),
+            "{}",
+            result.output
+        );
     }
 
     #[tokio::test]
@@ -1475,6 +1596,16 @@ mod tests {
             .await;
         assert!(result.is_error);
         assert!(
+            result.output.contains("github(action='list_prs')"),
+            "error should describe the consolidated action surface: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("github_list_prs"),
+            "error must not leak legacy helper tool names: {}",
+            result.output
+        );
+        assert!(
             result.output.contains("no GitHub token is configured"),
             "error must describe the problem, not the internal API: {}",
             result.output
@@ -1485,8 +1616,13 @@ mod tests {
             result.output
         );
         assert!(
-            result.output.contains("Workaround"),
-            "error must offer a fallback path: {}",
+            result.output.contains("restart the session"),
+            "error must explain how to enable the feature: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("Workaround"),
+            "error must not suggest bypassing the system architecture: {}",
             result.output
         );
     }
@@ -1515,6 +1651,58 @@ mod tests {
             !result.output.contains("ServerToolExecutor"),
             "error must not leak internal type names: {}",
             result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_github_helper_names_are_unknown_tools() {
+        let (_tmp, exec) = test_executor();
+        for name in [
+            "github_list_prs",
+            "github_get_pr",
+            "github_ci_status",
+            "github_list_issues",
+            "github_get_issue",
+            "github_repo_stats",
+        ] {
+            let result = exec.execute(name, &serde_json::json!({})).await;
+            assert!(result.is_error, "{name}: {}", result.output);
+            assert!(
+                result
+                    .output
+                    .contains(&format!("Tool '{name}' not available")),
+                "{name}: {}",
+                result.output
+            );
+        }
+    }
+
+    #[test]
+    fn recover_poisoned_lock_increments_counter() {
+        use std::sync::Mutex;
+
+        let before = super::poisoned_lock_recovery_count();
+
+        // Create a mutex and poison it by panicking while holding the lock
+        let mutex = Mutex::new(42);
+        let mutex_arc = Arc::new(mutex);
+        let mutex_clone = mutex_arc.clone();
+
+        let handle = std::thread::spawn(move || {
+            let _guard = mutex_clone.lock().unwrap();
+            panic!("poison the lock");
+        });
+        let _ = handle.join();
+
+        // Now try to lock it - it should be poisoned
+        let result = mutex_arc.lock();
+        let _guard = super::recover_poisoned_lock(result, "test_lock");
+
+        let after = super::poisoned_lock_recovery_count();
+        assert_eq!(
+            after,
+            before + 1,
+            "poisoned lock recovery should increment the counter"
         );
     }
 

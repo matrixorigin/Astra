@@ -9,12 +9,17 @@
 //! astra-edge --server-url wss://astra.example.com --token <jwt> --workspace-dir ~/projects/my-app
 //! ```
 
+use astra_runtime_env::{
+    ExecutorBinding, PolicyIntent, RunBinding, RuntimeBinding, RuntimeEnvironmentAdvertisement,
+    ToolRegistry, WorkspaceAuthority, WorkspaceBinding,
+};
 use astra_server_types::edge_ws_protocol::{
     EDGE_AUTH_TIMEOUT_SECS, EDGE_HEARTBEAT_INTERVAL_SECS, EdgeClientMessage, EdgeServerMessage,
 };
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
-use std::path::PathBuf;
+use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::Instrument;
@@ -52,6 +57,29 @@ fn default_edge_id() -> String {
     format!("edge-{hostname}-{}", &uuid::Uuid::new_v4().to_string()[..8])
 }
 
+fn canonical_workspace_dir(workspace_dir: &Path) -> PathBuf {
+    workspace_dir
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_dir.to_path_buf())
+}
+
+fn edge_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Value {
+    let registry = ToolRegistry::builtins();
+    let workspace = canonical_workspace_dir(workspace)
+        .to_string_lossy()
+        .to_string();
+    let binding = RunBinding::resolve(
+        WorkspaceBinding::edge_workspace(workspace, WorkspaceAuthority::ReadWrite),
+        ExecutorBinding::edge_agent(edge_id.to_string()),
+        RuntimeBinding::host_process(format!("edge-host:{edge_id}")),
+        PolicyIntent::local_developer(),
+        &registry,
+    );
+
+    serde_json::to_value(RuntimeEnvironmentAdvertisement::new(binding))
+        .expect("runtime environment advertisement serializes")
+}
+
 // ─── Connection loop ─────────────────────────────────────────────────────────
 
 async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -79,18 +107,16 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
 
     // Send auth
     let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
+    let workspace = canonical_workspace_dir(&args.workspace_dir);
     let auth_msg = EdgeClientMessage::Auth {
         token: args.token.clone(),
         edge_agent_id: args.edge_id.clone(),
         hostname,
-        workspace_dir: Some(
-            args.workspace_dir
-                .canonicalize()
-                .unwrap_or_else(|_| args.workspace_dir.clone())
-                .to_string_lossy()
-                .to_string(),
-        ),
-        capabilities: None,
+        workspace_dir: Some(workspace.to_string_lossy().to_string()),
+        capabilities: Some(edge_runtime_environment_capabilities(
+            &args.edge_id,
+            &workspace,
+        )),
     };
     write
         .send(Message::Text(serde_json::to_string(&auth_msg)?.into()))
@@ -133,11 +159,6 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
             return Err("Auth timeout or connection closed".into());
         }
     }
-
-    let workspace = args
-        .workspace_dir
-        .canonicalize()
-        .unwrap_or_else(|_| args.workspace_dir.clone());
 
     let session_id = format!("edge-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let executor = astra_tools::executor::DefaultToolExecutor::for_workspace(
@@ -193,6 +214,12 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
                             }
                             Ok(EdgeServerMessage::Pong) => {
                                 // heartbeat ack
+                            }
+                            Ok(EdgeServerMessage::ToolCancel { request_id }) => {
+                                tracing::warn!(
+                                    request_id = %request_id,
+                                    "Server cancelled tool request; edge has no in-flight cancel hook yet — ignoring"
+                                );
                             }
                             Ok(EdgeServerMessage::Closing { reason }) => {
                                 tracing::info!(reason = %reason, "Server closing connection");
@@ -287,5 +314,43 @@ async fn main() {
     astra_logging::shutdown_otel();
     if exit_with_error {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edge_runtime_environment_capabilities_describe_local_edge_runtime() {
+        let value = edge_runtime_environment_capabilities("edge-test", Path::new("/workspace/app"));
+
+        assert_eq!(
+            value["schema_version"],
+            RuntimeEnvironmentAdvertisement::SCHEMA_VERSION
+        );
+        assert_eq!(value["binding"]["workspace"]["kind"], "edge_workspace");
+        assert_eq!(value["binding"]["workspace"]["authority"], "read_write");
+        assert_eq!(value["binding"]["executor"]["kind"], "edge_agent");
+        assert_eq!(value["binding"]["executor"]["executor_id"], "edge-test");
+        assert_eq!(
+            value["binding"]["runtime"]["session_manager"],
+            "host_process"
+        );
+        assert_eq!(
+            value["binding"]["capabilities"]["runtime"]["runtime_has_shell"],
+            true
+        );
+        assert_eq!(
+            value["binding"]["capabilities"]["runtime"]["runtime_has_git"],
+            true
+        );
+        assert!(
+            value["binding"]["tool_surface"]["tool_names"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|name| name.as_str() == Some("bash"))
+        );
     }
 }

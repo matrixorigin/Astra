@@ -372,6 +372,10 @@ pub struct DelegationRequest {
     pub user_id: String,
     /// Current delegation depth (for loop prevention).
     pub depth: u32,
+    /// Chain of agent_ids that led to this delegation (for circular detection).
+    /// Format: ["orchestrator", "coder", "reviewer"] means orchestrator→coder→reviewer.
+    #[serde(default)]
+    pub delegation_chain: Vec<String>,
     /// Context to pass to delegated agents.
     pub context: HashMap<String, serde_json::Value>,
     /// UI/runtime execution binding metadata inherited from the parent run.
@@ -565,6 +569,26 @@ impl AgentProfileRegistry {
             CoordinationPattern::Sequential { agent_ids, .. } => agent_ids.clone(),
             CoordinationPattern::Fork { agent_id, .. } => vec![agent_id.clone()],
         };
+
+        // Circular delegation detection: reject if any target agent already
+        // appears in the delegation chain. This prevents A→B→C→A cycles
+        // that the depth limit alone cannot catch.
+        for target_id in &agent_ids {
+            if request.delegation_chain.contains(target_id) {
+                let chain_display = request
+                    .delegation_chain
+                    .iter()
+                    .chain(std::iter::once(target_id))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" → ");
+                return Err(format!(
+                    "circular delegation detected: {chain_display}. \
+                     Agent '{}' already exists in the delegation chain",
+                    target_id
+                ));
+            }
+        }
 
         if agent_ids.is_empty() {
             return Err("delegation pattern has no agents".to_string());
@@ -936,6 +960,7 @@ mod tests {
             },
             user_id: "u1".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -960,6 +985,7 @@ mod tests {
             },
             user_id: "u1".into(),
             depth: 5, // exceeds max_delegation_depth=3
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -985,6 +1011,7 @@ mod tests {
             },
             user_id: "u1".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -1010,6 +1037,7 @@ mod tests {
             },
             user_id: "u1".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -1032,6 +1060,7 @@ mod tests {
             },
             user_id: "u1".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -1056,6 +1085,7 @@ mod tests {
             },
             user_id: "u1".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -1092,6 +1122,7 @@ mod tests {
             },
             user_id: "u1".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -1119,6 +1150,7 @@ mod tests {
             },
             user_id: "u1".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };
@@ -1437,6 +1469,7 @@ mod tests {
             },
             user_id: "u1".into(),
             depth: 1,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };

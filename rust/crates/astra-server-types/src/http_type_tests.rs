@@ -483,10 +483,18 @@ fn run_status_response_serializes() {
         status: "waiting".into(),
         waiting_for: Some("tool_call".into()),
         events_count: 3,
+        workspace: Some(json!({"kind": "server_sandbox"})),
+        executor: Some(json!({"kind": "server_local"})),
+        transport: Some("server_local".into()),
+        fallback_policy: Some("disabled".into()),
     };
     let v = serde_json::to_value(&resp).unwrap();
     assert_eq!(v["waiting_for"], "tool_call");
     assert_eq!(v["events_count"], 3);
+    assert_eq!(v["workspace"]["kind"], "server_sandbox");
+    assert_eq!(v["executor"]["kind"], "server_local");
+    assert_eq!(v["transport"], "server_local");
+    assert_eq!(v["fallback_policy"], "disabled");
 }
 
 #[test]

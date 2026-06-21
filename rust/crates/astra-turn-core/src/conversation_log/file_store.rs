@@ -84,6 +84,11 @@ impl FileCslStore {
         let tmp = path.with_extension("jsonl.tmp");
         {
             let mut file = std::fs::File::create(&tmp)?;
+            // Copy permissions from the original BEFORE writing payload so the
+            // healed file never exposes sensitive content with looser permissions.
+            if let Ok(meta) = std::fs::metadata(path) {
+                let _ = std::fs::set_permissions(&tmp, meta.permissions());
+            }
             for entry in entries {
                 let mut line = serde_json::to_string(entry)?;
                 line.push('\n');

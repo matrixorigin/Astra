@@ -188,10 +188,7 @@ async fn submit_deferred_tui_input(
 ) -> Result<(), String> {
     let provider = astra_core::sync_poison::recover_mutex_lock(run_control)
         .clone()
-        .ok_or_else(|| {
-            "Current turn is not ready to accept deferred input yet. Press Ctrl+C to cancel this run if you need to stop it now."
-                .to_string()
-        })?;
+        .ok_or_else(|| "Run is changing state. Try again, or press Ctrl+C to stop.".to_string())?;
     provider.enqueue_text(text)
 }
 
@@ -241,7 +238,21 @@ fn render_transcript_view_lines(
     lines
 }
 
-fn surface_status_line_system_cell(event: &TuiAppEvent, chat_widget: &mut chat_widget::ChatWidget) {
+/// Handles status-line events that the bottom pane / chat widget must
+/// react to locally. Two cases:
+///
+/// - `PermissionAutoApproved`: commits an info cell to chat history.
+/// - `StatusLine` carrying `__deferred_input_applied__:<preview>`: the
+///   server dequeued a deferred input. We return the `<preview>` segment
+///   so the caller can pass it to `pop_applied_deferred_followup`, which
+///   recomputes the fingerprint from the local head and compares — a
+///   mismatch means the local and server queues have desynced (missed/
+///   extra/reordered event), and the queue is dropped with a visible
+///   warning rather than committing the *wrong* text as the user's input.
+fn surface_status_line_system_cell(
+    event: &TuiAppEvent,
+    chat_widget: &mut chat_widget::ChatWidget,
+) -> Option<String> {
     match event {
         TuiAppEvent::PermissionAutoApproved { tool, reason } => {
             chat_widget.commit_system(history_cell::system::SystemCell::info(
@@ -249,14 +260,53 @@ fn surface_status_line_system_cell(event: &TuiAppEvent, chat_widget: &mut chat_w
                     .trim()
                     .to_string(),
             ));
+            None
         }
-        TuiAppEvent::StatusLine(text) => {
-            if let Some(message) = text.strip_prefix(DEFERRED_INPUT_APPLIED_PREFIX) {
-                chat_widget.commit_deferred_user(message.trim().to_string());
-            }
+        TuiAppEvent::StatusLine(text) => text
+            .strip_prefix(DEFERRED_INPUT_APPLIED_PREFIX)
+            .map(|p| p.to_string()),
+        _ => None,
+    }
+}
+
+/// React to a `__deferred_input_applied__` status line by popping the
+/// matching head of the local deferred queue and committing it to chat
+/// history as the user's own input. On desync (server preview ≠ local
+/// head fingerprint) the entire local queue is dropped and surfaced as a
+/// warning cell so the failure is *visible* — never silently commit the
+/// wrong text as the user's words.
+fn apply_deferred_followup_status(
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+    expected_preview: &str,
+) {
+    match bottom_pane.pop_applied_deferred_followup(expected_preview) {
+        super::bottom_pane::DeferredFollowupPop::Applied(full_text) => {
+            chat_widget.commit_deferred_user(full_text);
         }
-        _ => {}
-    };
+        super::bottom_pane::DeferredFollowupPop::Empty => {
+            // Stray/late applied signal with an empty queue — nothing to
+            // commit, but log so an unexpected repeat is diagnosable.
+            tracing::debug!(
+                target: "astra_cli::tui",
+                preview = %expected_preview,
+                "deferred-input applied signal arrived with an empty local queue"
+            );
+        }
+        super::bottom_pane::DeferredFollowupPop::Desync { dropped } => {
+            let previews = dropped
+                .iter()
+                .map(|t| deferred_input_preview(t))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            chat_widget.commit_system(history_cell::system::SystemCell::warning(format!(
+                "Deferred-input queue desynced with the server; {n} queued item(s) \
+                     dropped to avoid committing the wrong input as yours. \
+                     Dropped text visible above; re-send if you still need it: {previews}",
+                n = dropped.len(),
+            )));
+        }
+    }
 }
 
 fn context_trace_count(state: &crate::cli::session::session_state::SessionState) -> usize {
@@ -761,6 +811,15 @@ pub(crate) async fn run_tui_session(
     }
     let mut status_indicator = status_indicator::StatusIndicator::new();
     let mut pending_deferred_slash_flush = false;
+    // Set on Ctrl+C/Esc interrupt: the run is winding down and any remaining
+    // queued input should be submitted as a fresh turn once the run genuinely
+    // ends, rather than restored as a draft. We do NOT drain the queue in the
+    // cancel handler — keeping it populated until turn-end means any
+    // `__deferred_input_applied__` signals that arrive during the cancel→stop
+    // window still pop+commit to chat history correctly. Resolved at the single
+    // turn-end drain point so there is exactly one place that decides what
+    // happens to leftover queue items.
+    let mut interrupt_pending = false;
 
     // Task board observer + toggle state. Observer is tick-driven
     // (see task_board_observer.rs rationale); no background loop
@@ -1699,6 +1758,11 @@ pub(crate) async fn run_tui_session(
                                         let agent_spawner_for_cancel = state.agent_spawner.clone();
                                         let active_turn_local_run_control =
                                             state.active_turn_local_run_control.clone();
+                                        let preinstalled_run_control =
+                                            crate::cli::turn::local_run_control::LocalDeferredInputRunControl::shared();
+                                        *astra_core::sync_poison::recover_mutex_lock(
+                                            &active_turn_local_run_control,
+                                        ) = Some(preinstalled_run_control);
                                         let bash_detach_slot_for_ctrl_b =
                                             state.bash_detach_slot.clone();
                                         let background_registry_turn_session_id =
@@ -1720,6 +1784,7 @@ pub(crate) async fn run_tui_session(
                                             let itick = tokio::time::sleep(Duration::from_millis(80));
                                             tokio::pin!(itick);
                                             tokio::select! {
+                                                biased;
                                                 result = &mut fut, if turn_result_ready.is_none() => {
                                                     if bash_detach_request_pending {
                                                         turn_result_ready = Some(result);
@@ -1727,7 +1792,7 @@ pub(crate) async fn run_tui_session(
                                                     }
                                                     break result;
                                                 }
-                                                Some(tev) = event_stream.next() => {
+                                                Some(tev) = event_stream.next(), if turn_result_ready.is_none() => {
                                                     match tev {
                                                         TuiEvent::Key(k) => {
                                                             // Shift+Tab cycles permission mode mid-turn.
@@ -1965,6 +2030,7 @@ pub(crate) async fn run_tui_session(
                                                             // During turn: composer stays usable.
                                                             // Enter queues a deferred input against the active run.
                                                             // Ctrl+C interrupts.
+                                                            bottom_pane.pre_draw_tick(std::time::Instant::now());
                                                             match bottom_pane.handle_key(k) {
                                                                     BottomPaneAction::SubmitInput(queued_text) => {
                                                                         // Agent drill-in sentinel: user pressed Enter
@@ -2003,16 +2069,20 @@ pub(crate) async fn run_tui_session(
                                                                         )
                                                                         .await
                                                                         {
-                                                                            Ok(()) => {
-                                                                                chat_widget.commit_system(
-                                                                                    history_cell::system::SystemCell::info(
-                                                                                        format!(
-                                                                                            "Queued for next tool call: {}",
-                                                                                            deferred_input_preview(&queued_text)
-                                                                                        ),
-                                                                                    ),
-                                                                                );
-                                                                            }
+                                                                                Ok(()) => {
+                                                                                    if !bottom_pane.queue_deferred_followup(queued_text) {
+                                                                                        // User pressed Enter with nothing typed during an
+                                                                                        // active turn. The server received the empty input
+                                                                                        // (it was submitted as a deferred send), but the
+                                                                                        // local queue panel has nothing to show. Commit an
+                                                                                        // info cell so the action is visible.
+                                                                                        chat_widget.commit_system(
+                                                                                            history_cell::system::SystemCell::info(
+                                                                                                "Empty follow-up queued.",
+                                                                                            ),
+                                                                                        );
+                                                                                    }
+                                                                                }
                                                                             Err(error) => {
                                                                                 bottom_pane.composer.set_text(&queued_text);
                                                                                 chat_widget.commit_system(
@@ -2187,6 +2257,18 @@ pub(crate) async fn run_tui_session(
                                                                         // Ctrl+C so routine interrupts stay
                                                                         // noise-free.
                                                                         chat_widget.commit_cancel_banner(cancelled_count);
+                                                                        // Don't drain the queue here. The run is
+                                                                        // being cancelled but may still emit
+                                                                        // `__deferred_input_applied__` signals
+                                                                        // before it fully stops — those must
+                                                                        // keep popping the head and committing
+                                                                        // to chat history. We record intent and
+                                                                        // resolve leftover items once at turn
+                                                                        // end (single decision point), so the
+                                                                        // unhappy path "cancel failed / slow to
+                                                                        // stop" can never drop user input.
+                                                                        interrupt_pending = true;
+                                                                        bottom_pane.interrupt_pending = true;
                                                                         tui_cancel_token.cancel();
                                                                     }
                                                                     _ => {}
@@ -2223,7 +2305,24 @@ pub(crate) async fn run_tui_session(
                                     let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
                                 }
                                                         }
-                                                        _ => {}
+                                                        TuiEvent::Paste(text) => {
+                                                            bottom_pane.handle_paste(&text);
+                                                            frame_requester.schedule_frame();
+                                                            {
+                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                    let frame = active_viewport(
+                                        &chat_widget,
+                                        &status_indicator,
+                                        Some(&*task_board),
+                                        board_expanded,
+                                        board_user_pin,
+                                        w,
+                                        guard.terminal.size().map(|s| s.height).unwrap_or(24),
+                                    );
+                                    board_expanded = frame.resolved_board_expanded;
+                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                }
+                                                        }
                                                     }
                                                 }
                                                 handoff = bash_detach_handoff_rx.recv() => {
@@ -2422,10 +2521,18 @@ pub(crate) async fn run_tui_session(
                                                         chat_widget.handle_event(new_ev);
                                                         refresh_open_agent_views_for_event(&ae, &chat_widget, &mut bottom_pane);
                                                     }
-                                                    surface_status_line_system_cell(
-                                                        &ae,
-                                                        &mut chat_widget,
-                                                    );
+                                                    if let Some(preview) =
+                                                        surface_status_line_system_cell(
+                                                            &ae,
+                                                            &mut chat_widget,
+                                                        )
+                                                    {
+                                                        apply_deferred_followup_status(
+                                                            &mut bottom_pane,
+                                                            &mut chat_widget,
+                                                            &preview,
+                                                        );
+                                                    }
                                                     handle_app_event(&ae, &mut bottom_pane, &mut status_indicator, &frame_requester);
                                                     let should_rearm_bash_detach =
                                                         !bash_detach_request_pending
@@ -2610,6 +2717,9 @@ pub(crate) async fn run_tui_session(
                                         r
                                     };
 
+                                    *astra_core::sync_poison::recover_mutex_lock(
+                                        &state.active_turn_local_run_control,
+                                    ) = None;
                                     state.tui_stream_event_tx = None;
                                     state.tui_agent_live_event_sink = None;
 
@@ -2639,14 +2749,65 @@ pub(crate) async fn run_tui_session(
                                                     chat_widget.handle_event(new_ev);
                                                         refresh_open_agent_views_for_event(&ae, &chat_widget, &mut bottom_pane);
                                                 }
-                                                surface_status_line_system_cell(
-                                                    &ae,
-                                                    &mut chat_widget,
-                                                );
+                                                if let Some(preview) =
+                                                    surface_status_line_system_cell(
+                                                        &ae,
+                                                        &mut chat_widget,
+                                                    )
+                                                {
+                                                    apply_deferred_followup_status(
+                                                        &mut bottom_pane,
+                                                        &mut chat_widget,
+                                                        &preview,
+                                                    );
+                                                }
                                                 handle_app_event(&ae, &mut bottom_pane, &mut status_indicator, &frame_requester);
                                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
                                             }
                                         }
+                                    }
+
+                                    // Single turn-end drain for leftover queue items.
+                                    // Before this point the queue is preserved so that
+                                    // `__deferred_input_applied__` signals arriving during
+                                    // the cancel→stop window still pop+commit correctly.
+                                    // Here we decide once what happens to the remainder:
+                                    //   - Interrupt pending (Esc/Ctrl+C): the user explicitly
+                                    //     asked to send NOW. Stage the text in the composer
+                                    //     and replay a synthetic Enter so the next turn
+                                    //     begins immediately. Input is never dropped even if
+                                    //     the cancel RPC failed — the queue survived.
+                                    //   - Otherwise: restore as a draft beneath any in-progress
+                                    //     edit, with a visible info banner so the user knows
+                                    //     why their typed text reappeared and can decide to
+                                    //     send or edit it.
+                                    let unapplied_deferred_inputs =
+                                        bottom_pane.take_deferred_followups();
+                                    if interrupt_pending {
+                                        interrupt_pending = false;
+                                        bottom_pane.interrupt_pending = false;
+                                        if !unapplied_deferred_inputs.is_empty() {
+                                            let text = unapplied_deferred_inputs.join("\n\n");
+                                            bottom_pane.replace_composer_text(&text);
+                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                            event_stream.push_front(TuiEvent::Key(
+                                                crossterm::event::KeyEvent::new(
+                                                    crossterm::event::KeyCode::Enter,
+                                                    crossterm::event::KeyModifiers::NONE,
+                                                ),
+                                            ));
+                                            frame_requester.schedule_frame();
+                                        }
+                                    } else if !unapplied_deferred_inputs.is_empty() {
+                                        let restored = unapplied_deferred_inputs.join("\n\n");
+                                        let preview = deferred_input_preview(&restored);
+                                        bottom_pane.restore_into_composer(&restored);
+                                        chat_widget.commit_system(
+                                            history_cell::system::SystemCell::info(format!(
+                                                "Queued input was not applied before the run finished; draft restored into composer: {preview}",
+                                            )),
+                                        );
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
                                     }
 
                                     if turn_result.is_ok()
@@ -3386,13 +3547,22 @@ pub(crate) async fn run_tui_session(
                     chat_widget.handle_event(new_ev);
                     refresh_open_agent_views_for_event(&ae, &chat_widget, &mut bottom_pane);
                 }
-                surface_status_line_system_cell(&ae, &mut chat_widget);
+                if let Some(preview) = surface_status_line_system_cell(&ae, &mut chat_widget) {
+                    apply_deferred_followup_status(
+                        &mut bottom_pane,
+                        &mut chat_widget,
+                        &preview,
+                    );
+                }
                 handle_app_event(&ae, &mut bottom_pane, &mut status_indicator, &frame_requester);
                 if should_flush_ambient_commits(pending_deferred_slash_flush) {
                     flush_chat_widget(&mut guard, &mut chat_widget, w);
                 }
             }
             _ = &mut tick => {
+                if bottom_pane.pre_draw_tick(std::time::Instant::now()) {
+                    frame_requester.schedule_frame();
+                }
                 // Re-derive permission-mode chip from live state so
                 // mode pivots driven by the agentic loop (e.g. the
                 // `exit_plan_mode` overlay handing the next turn back
@@ -3696,8 +3866,8 @@ fn handle_app_event(
         | TuiAppEvent::Compaction(_)
         | TuiAppEvent::ExplainReport(_)
         | TuiAppEvent::VerdictReport(_)
-        | TuiAppEvent::TurnWarning(_)
-        | TuiAppEvent::TurnInfo(_)
+        | TuiAppEvent::SystemWarning(_)
+        | TuiAppEvent::SystemInfo(_)
         | TuiAppEvent::PermissionAutoApproved { .. } => {}
         TuiAppEvent::TurnComplete | TuiAppEvent::TurnError(_) => {
             bottom_pane.set_task_status(TaskStatus::Idle);
@@ -3773,12 +3943,14 @@ mod tests {
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
-            inherited_permissions: None,
+            inherited_permissions: astra_runtime::orchestration::InheritedPermissions::auto_approve(
+            ),
             inherited_skills: Vec::new(),
             live_event_sink: None,
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
+            delegation_chain: Vec::new(),
         }
     }
 
@@ -3936,7 +4108,7 @@ mod tests {
         );
         agent.fanout_slot = Some(
             astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity::new(
-                "review-1", 3, 0,
+                "review-1", 3, 0, None,
             )
             .unwrap(),
         );
@@ -3975,7 +4147,12 @@ mod tests {
                 3,
             );
         group
-            .set_slot_request(1, "api reviewer", "review API surface")
+            .set_slot_request(
+                1,
+                Some("api-reviewer".to_string()),
+                "api reviewer",
+                "review API surface",
+            )
             .unwrap();
         group
             .record_spawn_rejected(1, "concurrency cap reached")
@@ -4090,7 +4267,7 @@ mod tests {
 
     #[tokio::test]
     async fn restored_local_agent_projects_as_unavailable_stale_task() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
         let restored = vec![restored_local_agent_projection("running")];
@@ -4125,7 +4302,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_task_list_xml_includes_restored_local_agent_without_spawner() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
         let restored = vec![restored_local_agent_projection("running")];
@@ -4146,7 +4323,7 @@ mod tests {
 
     #[tokio::test]
     async fn restored_local_agent_keeps_fanout_group_metadata_for_resume_footer() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
         let restored = vec![restored_fanout_local_agent_projection("running")];
@@ -4179,7 +4356,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_output_command_reads_restored_local_agent_projection() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
         let restored = vec![restored_local_agent_projection("running")];
@@ -4204,7 +4381,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_stop_command_reports_stale_handle_for_restored_local_agent() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
         let restored = vec![restored_local_agent_projection("running")];
@@ -4230,7 +4407,7 @@ mod tests {
         let spawned = spawner.spawn(input, &test_spawn_context()).await.unwrap();
         assert!(matches!(spawned, SpawnAgentOutput::Launched { .. }));
 
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
 
@@ -4264,7 +4441,7 @@ mod tests {
             other => panic!("expected launched background agent, got {other:?}"),
         };
 
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
 
@@ -4298,7 +4475,7 @@ mod tests {
             other => panic!("expected launched background agent, got {other:?}"),
         };
 
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
 
@@ -4338,7 +4515,7 @@ mod tests {
             other => panic!("expected launched background agent, got {other:?}"),
         };
 
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
         let mut chat_widget = chat_widget::ChatWidget::new("");
@@ -4403,7 +4580,7 @@ mod tests {
             other => panic!("expected launched background agent, got {other:?}"),
         };
 
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
         let mut chat_widget = chat_widget::ChatWidget::new("");
@@ -4451,7 +4628,7 @@ mod tests {
         let spawned = spawner.spawn(input, &test_spawn_context()).await.unwrap();
         assert!(matches!(spawned, SpawnAgentOutput::Launched { .. }));
 
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
         let mut bottom_pane = BottomPane::new();
@@ -4538,7 +4715,7 @@ mod tests {
 
     #[tokio::test]
     async fn force_open_background_task_view_opens_panel_on_empty_registry() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("empty"));
         let mut bottom_pane = BottomPane::new();
@@ -4562,7 +4739,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_task_switcher_opens_for_pending_bash_handoff() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("pending"));
         let mut bottom_pane = BottomPane::new();
@@ -4607,7 +4784,7 @@ mod tests {
 
     #[tokio::test]
     async fn force_open_background_task_view_preempts_existing_bottom_pane() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("overlay"));
         let mut bottom_pane = BottomPane::new();
@@ -4644,7 +4821,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_task_rows_include_typed_status_and_combined_tail() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("bg-task-row-projection"),
         );
@@ -4679,7 +4856,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_task_rows_surface_missing_output_artifact() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("bg-task-missing-output"),
         );
@@ -4710,7 +4887,7 @@ mod tests {
 
     #[test]
     fn background_task_rows_project_restored_running_as_unavailable_stale() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let stdout = temp.path().join("restored.stdout");
         let stderr = temp.path().join("restored.stderr");
         std::fs::write(&stdout, "line from previous session\n").unwrap();
@@ -4756,7 +4933,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn background_task_projection_persistence_round_trips_workspace() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "bg-projection-session";
         let mut workspace = astra_services::session_workspace::WorkspaceMetadata::with_context(
@@ -4810,7 +4987,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn background_local_agent_projection_persistence_round_trips_workspace() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "bg-local-agent-projection-session";
         let workspace = astra_services::session_workspace::WorkspaceMetadata::with_context(
@@ -4862,7 +5039,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_task_output_snapshot_drains_completion_before_status() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("bg-task-output-snapshot"),
         );
@@ -4881,7 +5058,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_task_output_snapshot_includes_stderr_only_shell_output() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("bg-task-output-stderr"),
         );
@@ -4901,7 +5078,7 @@ mod tests {
 
     #[test]
     fn background_task_output_snapshot_projects_restored_running_as_unavailable() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let stdout = temp.path().join("restored.stdout");
         let stderr = temp.path().join("restored.stderr");
         std::fs::write(&stdout, "old output\n").unwrap();
@@ -4935,7 +5112,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_task_switcher_opens_for_failed_but_not_completed_only() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = crate::tests::test_temp_dir();
         let mut completed_registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("completed-only"),
         );
@@ -5020,8 +5197,8 @@ mod tests {
             .await
             .expect_err("missing run control must be rejected locally");
         assert!(
-            error.contains("not ready to accept deferred input"),
-            "missing run control should surface a local readiness error"
+            error.contains("changing state"),
+            "missing run control should surface a user-facing transient-state error"
         );
     }
 
@@ -5055,6 +5232,43 @@ mod tests {
     }
 
     #[test]
+    fn active_turn_preinstalls_local_run_control_before_stream_future_starts() {
+        let source = include_str!("event_loop.rs");
+        let install_pos = source
+            .find("LocalDeferredInputRunControl::shared()")
+            .expect("TUI turn loop must preinstall local run control");
+        let future_pos = source
+            .find("handle_chat_input_with_ui(submit_text")
+            .expect("TUI turn loop must start chat input future");
+
+        assert!(
+            install_pos < future_pos,
+            "deferred input provider must exist before the active-turn future starts"
+        );
+    }
+
+    #[test]
+    fn active_turn_select_prioritizes_completed_turn_before_keyboard_input() {
+        let source = include_str!("event_loop.rs");
+        let select_pos = source
+            .find("tokio::select! {\n                                                biased;")
+            .expect("active-turn select must be biased");
+        let result_pos = source[select_pos..]
+            .find("result = &mut fut, if turn_result_ready.is_none()")
+            .map(|p| select_pos + p)
+            .expect("active-turn select must poll the turn future");
+        let event_pos = source[select_pos..]
+            .find("Some(tev) = event_stream.next(), if turn_result_ready.is_none()")
+            .map(|p| select_pos + p)
+            .expect("active-turn select must gate keyboard events after turn completion");
+
+        assert!(
+            result_pos < event_pos,
+            "completed turn futures must win over queued keyboard input so Enter at turn end is not misrouted as deferred input"
+        );
+    }
+
+    #[test]
     fn deferred_input_status_lines_are_committed_to_chat_history() {
         let source = include_str!("event_loop.rs");
         assert!(
@@ -5068,6 +5282,47 @@ mod tests {
         assert!(
             source.contains("chat_widget.commit_deferred_user"),
             "applied deferred input should be rendered as a user transcript row"
+        );
+    }
+
+    #[test]
+    fn active_turn_handles_paste_events_before_falling_through() {
+        let source = include_str!("event_loop.rs");
+        let active_start = source
+            .find("bottom_pane.queue_deferred_followup(queued_text)")
+            .expect("active turn block should track queued deferred inputs in bottom pane");
+        let active_end = source[active_start..]
+            .find("*astra_core::sync_poison::recover_mutex_lock(\n                                        &state.active_turn_local_run_control,")
+            .map(|offset| active_start + offset)
+            .expect("active turn block must clear local run control after select loop");
+        let active_block = &source[active_start..active_end];
+
+        assert!(
+            active_block.contains("TuiEvent::Paste(text)"),
+            "active-turn event loop must route bracketed paste into the composer"
+        );
+        assert!(
+            active_block.contains("bottom_pane.handle_paste(&text)"),
+            "active-turn paste should use the same bottom-pane paste path as idle mode"
+        );
+    }
+
+    #[test]
+    fn deferred_interrupt_replays_queued_input_as_next_submit() {
+        let source = include_str!("event_loop.rs");
+        // The cancel handler records intent without draining the queue, so
+        // any `__deferred_input_applied__` signals arriving during the
+        // cancel→stop window still pop+commit correctly.
+        assert!(
+            source.contains("interrupt_pending = true;"),
+            "interrupt path should record intent to replay leftover queue at turn end"
+        );
+        // The replay is resolved once at the single turn-end drain point —
+        // interrupt branch stages the text and pushes a synthetic Enter.
+        assert!(
+            source.contains("event_stream.push_front(TuiEvent::Key(")
+                && source.contains("crossterm::event::KeyCode::Enter"),
+            "turn-end drain should replay leftover queued follow-up as an immediate next Enter submit"
         );
     }
 

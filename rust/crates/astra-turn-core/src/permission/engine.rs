@@ -170,7 +170,7 @@ pub enum TraceOutcome {
     Matched(HardDecision),
 }
 
-/// The 11 fixed evaluation slots. Plan v3 §P2 freezes the order:
+/// The fixed evaluation slots. Plan v3 §P2 freezes the order:
 /// any future change must update both this enum and the
 /// `evaluation_order_is_stable` pinning test, so the rule-precedence
 /// contract can't drift silently.
@@ -187,6 +187,7 @@ pub enum EvaluationStep {
     SensitivePath,
     ExecuteHardDeny,
     SandboxExpand,
+    ToolAllowlist,
     AskRules,
     ReadShortCircuit,
     SessionOverride,
@@ -197,7 +198,7 @@ pub enum EvaluationStep {
 
 /// Canonical ordering. Any reorder must change this constant AND
 /// flip the pinning test in `tests::evaluation_order_is_stable`.
-pub const EVALUATION_ORDER: [EvaluationStep; 13] = [
+pub const EVALUATION_ORDER: [EvaluationStep; 14] = [
     EvaluationStep::SchemaIdentity,
     EvaluationStep::DenyRules,
     EvaluationStep::SafetyMiddleware,
@@ -205,6 +206,7 @@ pub const EVALUATION_ORDER: [EvaluationStep; 13] = [
     EvaluationStep::SensitivePath,
     EvaluationStep::ExecuteHardDeny,
     EvaluationStep::SandboxExpand,
+    EvaluationStep::ToolAllowlist,
     EvaluationStep::AskRules,
     EvaluationStep::ReadShortCircuit,
     EvaluationStep::SessionOverride,
@@ -366,29 +368,7 @@ pub struct DecisionEnvelope {
     pub risk_tags: Vec<RiskTag>,
 }
 
-fn legacy_plan_mode_tool_alias(tool_name: &str, args: &Value) -> Option<&'static str> {
-    let action = args.get("action").and_then(Value::as_str).map(str::trim);
-    match tool_name {
-        "session" => match action {
-            Some("enter_plan_mode") => Some("enter_plan_mode"),
-            Some("exit_plan_mode") => Some("exit_plan_mode"),
-            _ => None,
-        },
-        "agent" if action == Some("run_chain") => match args.get("chain").and_then(Value::as_str) {
-            Some("enter_plan_mode") => Some("enter_plan_mode"),
-            Some("exit_plan_mode") => Some("exit_plan_mode"),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-pub(crate) fn plan_mode_denial_reason(tool_name: &str, args: &Value) -> String {
-    if let Some(canonical_tool) = legacy_plan_mode_tool_alias(tool_name, args) {
-        return format!(
-            "Tool '{tool_name}' denied by permission mode. Use `{canonical_tool}` directly — plan mode no longer routes through `{tool_name}`."
-        );
-    }
+pub(crate) fn plan_mode_denial_reason(tool_name: &str) -> String {
     format!(
         "Tool '{tool_name}' denied by permission mode. Plan mode allows read-only tools plus `enter_plan_mode` / `exit_plan_mode`; author the plan, then call `exit_plan_mode(plan=...)`."
     )
@@ -703,10 +683,11 @@ pub fn evaluate_permission(
                     .and_then(Value::as_str)
                     .unwrap_or("Access to path outside project boundary")
                     .to_string();
+                let action = sandbox_expand_action_label(inner_tool);
                 let decision = HardDecision::NeedExternal {
                     prompt: ApprovalPrompt {
                         tool: tool_name.to_string(),
-                        header: format!("{inner_tool} wants to read outside the project"),
+                        header: format!("{inner_tool} wants to {action} outside the project"),
                         detail: None,
                         reason,
                         risk_tags: risk_tags.clone(),
@@ -752,6 +733,40 @@ pub fn evaluate_permission(
         "not a sandbox expansion",
     );
 
+    if ctx.inherited.allowed_tools.is_some() {
+        if !ctx.inherited.is_tool_allowed_by_allowlist(tool_name) {
+            let decision = HardDecision::Deny {
+                reason: format!("Tool '{tool_name}' not in allowed tools list"),
+            };
+            push_matched(
+                &mut trace,
+                EvaluationStep::ToolAllowlist,
+                &decision,
+                "tool not in allowed_tools",
+            );
+            return envelope(
+                decision,
+                DecisionSource::Mode {
+                    mode: "agent policy allowlist".to_string(),
+                },
+                trace,
+                will_save,
+                risk_tags,
+            );
+        }
+        push_skipped(
+            &mut trace,
+            EvaluationStep::ToolAllowlist,
+            "tool in allowed_tools; continuing to permission mode",
+        );
+    } else {
+        push_skipped(
+            &mut trace,
+            EvaluationStep::ToolAllowlist,
+            "no tool allowlist",
+        );
+    }
+
     if let Some(rule) = ctx
         .inherited
         .ask_rule_with_context(tool_name, &rule_match_context)
@@ -777,7 +792,8 @@ pub fn evaluate_permission(
     if explicit_approval_reason(tool_name, args).is_none()
         && is_read_only_tool_with_args(tool_name, Some(args))
         && ctx.mode() != PermissionMode::Deny
-        && ctx.inherited.is_tool_allowed_by_allowlist(tool_name)
+        && !(ctx.mode() == PermissionMode::Plan
+            && is_plan_mode_unstructured_execute_tool(tool_name))
     {
         let decision = HardDecision::Allow;
         push_matched(
@@ -843,7 +859,7 @@ pub fn evaluate_permission(
             );
         }
         let decision = HardDecision::Deny {
-            reason: plan_mode_denial_reason(tool_name, args),
+            reason: plan_mode_denial_reason(tool_name),
         };
         push_matched(&mut trace, EvaluationStep::Mode, &decision, &mode_label);
         return envelope(
@@ -954,15 +970,11 @@ pub fn evaluate_permission(
                 )
             }
             PermissionMode::Auto => {
-                let decision = if ctx.inherited.allowed_tools.is_some()
-                    && !ctx.inherited.is_tool_allowed_by_allowlist(tool_name)
-                {
-                    HardDecision::Deny {
-                        reason: format!("Tool '{tool_name}' not in allowed tools list"),
-                    }
-                } else {
-                    HardDecision::Allow
-                };
+                // ToolAllowlist step already denied unlisted tools, so
+                // anything reaching ExplicitApproval in Auto mode is
+                // allowed (it's an explicit-approval-gated tool that
+                // the mode auto-approves).
+                let decision = HardDecision::Allow;
                 push_matched(
                     &mut trace,
                     EvaluationStep::ExplicitApproval,
@@ -980,16 +992,9 @@ pub fn evaluate_permission(
                 )
             }
             PermissionMode::AcceptEdits => {
-                let decision = if ctx.inherited.allowed_tools.is_some()
-                    && !ctx.inherited.is_tool_allowed_by_allowlist(tool_name)
-                {
-                    HardDecision::Deny {
-                        reason: format!("Tool '{tool_name}' not in allowed tools list"),
-                    }
-                } else {
-                    HardDecision::NeedExternal {
-                        prompt: approval_prompt(tool_name, args, prompt_reason, risk_tags.clone()),
-                    }
+                // ToolAllowlist step already denied unlisted tools.
+                let decision = HardDecision::NeedExternal {
+                    prompt: approval_prompt(tool_name, args, prompt_reason, risk_tags.clone()),
                 };
                 push_matched(
                     &mut trace,
@@ -1062,18 +1067,6 @@ pub fn evaluate_permission(
 
     let mode = ctx.mode();
     let (decision, mode_label) = match mode {
-        PermissionMode::Auto if ctx.inherited.allowed_tools.is_some() => {
-            if ctx.inherited.is_tool_allowed_by_allowlist(tool_name) {
-                (HardDecision::Allow, "agent policy allowlist".to_string())
-            } else {
-                (
-                    HardDecision::Deny {
-                        reason: format!("Tool '{tool_name}' not in allowed tools list"),
-                    },
-                    "agent policy allowlist".to_string(),
-                )
-            }
-        }
         PermissionMode::Auto => (HardDecision::Allow, mode.to_string()),
         PermissionMode::Plan => (
             HardDecision::Deny {
@@ -1081,30 +1074,6 @@ pub fn evaluate_permission(
             },
             mode.to_string(),
         ),
-        PermissionMode::AcceptEdits if ctx.inherited.allowed_tools.is_some() => {
-            if !ctx.inherited.is_tool_allowed_by_allowlist(tool_name) {
-                (
-                    HardDecision::Deny {
-                        reason: format!("Tool '{tool_name}' not in allowed tools list"),
-                    },
-                    "agent policy allowlist".to_string(),
-                )
-            } else if accept_edits_auto_allows(tool_name, args) {
-                (HardDecision::Allow, mode.to_string())
-            } else {
-                (
-                    HardDecision::NeedExternal {
-                        prompt: approval_prompt(
-                            tool_name,
-                            args,
-                            "Write/execute tool requires approval".to_string(),
-                            risk_tags.clone(),
-                        ),
-                    },
-                    mode.to_string(),
-                )
-            }
-        }
         PermissionMode::AcceptEdits => {
             if accept_edits_auto_allows(tool_name, args) {
                 (HardDecision::Allow, mode.to_string())
@@ -1128,18 +1097,6 @@ pub fn evaluate_permission(
             },
             mode.to_string(),
         ),
-        PermissionMode::Prompt if ctx.inherited.allowed_tools.is_some() => {
-            if ctx.inherited.is_tool_allowed_by_allowlist(tool_name) {
-                (HardDecision::Allow, "agent policy allowlist".to_string())
-            } else {
-                (
-                    HardDecision::Deny {
-                        reason: format!("Tool '{tool_name}' not in allowed tools list"),
-                    },
-                    "agent policy allowlist".to_string(),
-                )
-            }
-        }
         PermissionMode::Prompt => (
             HardDecision::NeedExternal {
                 prompt: approval_prompt(
@@ -1160,6 +1117,10 @@ pub fn evaluate_permission(
         will_save,
         risk_tags,
     )
+}
+
+fn is_plan_mode_unstructured_execute_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "bash" | "background_shell" | "powershell")
 }
 
 /// Preview the rule that an "Always allow" action would persist for this call.
@@ -1217,6 +1178,30 @@ fn push_matched(
         outcome: TraceOutcome::Matched(decision.clone()),
         note: note.to_string(),
     });
+}
+
+fn sandbox_expand_action_label(inner_tool: &str) -> &'static str {
+    match cloud_gated_tool_kind(inner_tool) {
+        Some(CloudGatedToolKind::Write) => "write",
+        Some(CloudGatedToolKind::Execute) => "execute",
+        None if matches!(
+            inner_tool,
+            "read_file"
+                | "list_dir"
+                | "grep"
+                | "glob"
+                | "symbols"
+                | "find_definition"
+                | "find_references"
+                | "symbol_search"
+                | "hover_info"
+                | "extract_members"
+        ) =>
+        {
+            "read"
+        }
+        None => "access",
+    }
 }
 
 fn approval_prompt(
@@ -1347,7 +1332,22 @@ fn fingerprinted_override(
     ctx: &PermissionSyncContext,
 ) -> Option<bool> {
     let json = ctx.inherited.fingerprinted_overrides.as_ref()?;
-    let overrides = serde_json::from_value::<FingerprintedOverrides>(json.clone()).ok()?;
+    // Fail-closed: a corrupt overrides blob must NOT silently fall through
+    // to broader (potentially permissive) rules. Distinguish "no overrides
+    // present" (None → caller falls through normally) from "overrides present
+    // but undecodable" (Some(false) → deny). The latter is a security signal,
+    // not a recoverable state.
+    let overrides = match serde_json::from_value::<FingerprintedOverrides>(json.clone()) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "fingerprinted_overrides blob is present but undecodable; denying tool {} as fail-closed",
+                tool_name,
+            );
+            return Some(false);
+        }
+    };
     content_aware_fingerprint_candidates(tool_name, args)
         .into_iter()
         .find_map(|fp| overrides.check(&fp))
@@ -1379,10 +1379,23 @@ fn content_aware_fingerprint(tool_name: &str, args: &Value) -> ApprovalFingerpri
             let path = path_hint_from_args(args);
             path.map_or_else(
                 || ApprovalFingerprint::bare(tool_name),
-                |path| ApprovalFingerprint::file_op_exact(tool_name, Some(&path)),
+                |path| {
+                    ApprovalFingerprint::file_op_exact(
+                        file_write_fingerprint_tool(tool_name),
+                        Some(&path),
+                    )
+                },
             )
         }
         None => ApprovalFingerprint::bare(tool_name),
+    }
+}
+
+fn file_write_fingerprint_tool(tool_name: &str) -> &str {
+    if crate::tool::categories::registry().is_file_op(tool_name) {
+        "file_write"
+    } else {
+        tool_name
     }
 }
 
@@ -1397,7 +1410,7 @@ fn content_aware_fingerprint_candidates(tool_name: &str, args: &Value) -> Vec<Ap
         if crate::tool::categories::registry().is_file_op(tool_name) {
             push_unique_fingerprint(
                 &mut candidates,
-                ApprovalFingerprint::file_op_exact("edit", Some(&path)),
+                ApprovalFingerprint::file_op_exact("file_write", Some(&path)),
             );
         }
         if let Some(resolved) = resolved_write_path(&path) {
@@ -1408,7 +1421,7 @@ fn content_aware_fingerprint_candidates(tool_name: &str, args: &Value) -> Vec<Ap
             if crate::tool::categories::registry().is_file_op(tool_name) {
                 push_unique_fingerprint(
                     &mut candidates,
-                    ApprovalFingerprint::file_op_exact("edit", Some(&resolved)),
+                    ApprovalFingerprint::file_op_exact("file_write", Some(&resolved)),
                 );
             }
         }
@@ -1483,6 +1496,20 @@ mod tests {
         (temp, guard, artifact_path)
     }
 
+    fn create_current_session_journal() -> (
+        tempfile::TempDir,
+        astra_services::session_journal::JournalDirGuard,
+        std::path::PathBuf,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_root = temp.path().join("sessions");
+        let guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
+        std::fs::create_dir_all(&sessions_root).unwrap();
+        let journal_path = sessions_root.join("550e8400-e29b-41d4-a716-446655440000.jsonl");
+        std::fs::write(&journal_path, "{}\n").unwrap();
+        (temp, guard, journal_path)
+    }
+
     /// **Pinning test** — Plan v3 §P2 requires a fixed evaluation
     /// order to make rule precedence auditable. Any reorder must
     /// be deliberate and update this test.
@@ -1498,6 +1525,7 @@ mod tests {
                 EvaluationStep::SensitivePath,
                 EvaluationStep::ExecuteHardDeny,
                 EvaluationStep::SandboxExpand,
+                EvaluationStep::ToolAllowlist,
                 EvaluationStep::AskRules,
                 EvaluationStep::ReadShortCircuit,
                 EvaluationStep::SessionOverride,
@@ -1529,6 +1557,101 @@ mod tests {
             deny_idx < sandbox_idx,
             "DenyRules ({deny_idx}) must run before SandboxExpand ({sandbox_idx})"
         );
+    }
+
+    /// Fail-closed pinning: a corrupt `fingerprinted_overrides` blob must
+    /// resolve to an explicit deny (`Some(false)`), NOT fall through to
+    /// broader rules via `None`. The old `.ok()?` path silently downgraded
+    /// to whatever the caller did next — the exact bug class this module
+    /// is supposed to prevent.
+    #[test]
+    fn fingerprinted_override_corrupt_json_denies() {
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::AcceptEdits,
+                fingerprinted_overrides: Some(serde_json::json!({"not": "a valid shape"})),
+                ..Default::default()
+            },
+        );
+        // Call the private fn directly — we're inside the module.
+        let result =
+            fingerprinted_override("bash", &serde_json::json!({"command": "echo hi"}), &ctx);
+        assert_eq!(
+            result,
+            Some(false),
+            "corrupt fingerprinted_overrides blob must fail-closed to Some(false), not fall through as None"
+        );
+    }
+
+    /// Positive pinning: a well-formed empty overrides blob must still
+    /// return `None` (no override matched) so the caller falls through
+    /// normally. This guards against the fail-closed change accidentally
+    /// treating "no overrides" the same as "corrupt overrides".
+    #[test]
+    fn fingerprinted_override_empty_blob_falls_through() {
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::AcceptEdits,
+                fingerprinted_overrides: None,
+                ..Default::default()
+            },
+        );
+        let result =
+            fingerprinted_override("bash", &serde_json::json!({"command": "echo hi"}), &ctx);
+        assert_eq!(
+            result, None,
+            "missing fingerprinted_overrides blob must fall through as None"
+        );
+    }
+
+    #[test]
+    fn sandbox_expand_prompt_headers_describe_inner_tool_action() {
+        for mode in [
+            crate::permission::types::PermissionMode::Prompt,
+            crate::permission::types::PermissionMode::AcceptEdits,
+        ] {
+            let ctx = crate::permission::types::PermissionSyncContext::new(
+                crate::permission::types::InheritedPermissions {
+                    mode,
+                    ..Default::default()
+                },
+            );
+
+            for (tool, expected_header) in [
+                (
+                    "sandbox_expand:read_file",
+                    "read_file wants to read outside the project",
+                ),
+                (
+                    "sandbox_expand:write_file",
+                    "write_file wants to write outside the project",
+                ),
+                (
+                    "sandbox_expand:bash",
+                    "bash wants to execute outside the project",
+                ),
+            ] {
+                let envelope = evaluate_permission(
+                    tool,
+                    &serde_json::json!({
+                        "reason": "Path '/tmp/outside' is outside the project directory '/tmp/project'; sandbox approval is required for this external path."
+                    }),
+                    &ctx,
+                );
+
+                match envelope.decision {
+                    HardDecision::NeedExternal { prompt } => {
+                        assert_eq!(prompt.tool, tool);
+                        assert_eq!(prompt.header, expected_header);
+                        assert!(prompt.detail.is_none());
+                    }
+                    other => {
+                        panic!("{mode:?} sandbox expansion should prompt for {tool}; got {other:?}")
+                    }
+                }
+                assert_eq!(envelope.source, DecisionSource::SandboxExpansion);
+            }
+        }
     }
 
     /// Catastrophic-command checks (the `rm -rf /` circuit breaker)
@@ -1596,7 +1719,7 @@ mod tests {
             .into_owned();
         assert_eq!(
             rule,
-            format!(r#"Edit(path_prefix="{cwd}", op="write", cwd_root="{cwd}")"#)
+            format!(r#"file_write(path_prefix="{cwd}", op="write", cwd_root="{cwd}")"#)
         );
     }
 
@@ -1607,7 +1730,7 @@ mod tests {
             &serde_json::json!({"path": "/tmp/zzzz3.md", "content": "# zzzz3"}),
         );
 
-        assert_eq!(rule, r#"Edit(path_glob="/tmp/zzzz3.md", op="write")"#);
+        assert_eq!(rule, r#"file_write(path_glob="/tmp/zzzz3.md", op="write")"#);
     }
 
     #[test]
@@ -1638,7 +1761,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_mode_allowlist_locally_allows_listed_non_explicit_tool() {
+    fn prompt_mode_allowlist_does_not_locally_allow_listed_write_tool() {
         let ctx = crate::permission::types::PermissionSyncContext::new(
             crate::permission::types::InheritedPermissions {
                 mode: crate::permission::types::PermissionMode::Prompt,
@@ -1652,17 +1775,21 @@ mod tests {
             &ctx,
         );
 
-        assert!(matches!(envelope.decision, HardDecision::Allow));
+        assert!(
+            matches!(envelope.decision, HardDecision::NeedExternal { .. }),
+            "allowed_tools restricts the child tool surface but must not approve writes in Prompt mode; got {:?}",
+            envelope.decision
+        );
         assert_eq!(
             envelope.source,
             DecisionSource::Mode {
-                mode: "agent policy allowlist".to_string()
+                mode: "prompt".to_string()
             }
         );
     }
 
     #[test]
-    fn prompt_mode_allowlist_blocks_unlisted_tool() {
+    fn prompt_mode_allowlist_blocks_unlisted_explicit_tool_before_prompting() {
         let ctx = crate::permission::types::PermissionSyncContext::new(
             crate::permission::types::InheritedPermissions {
                 mode: crate::permission::types::PermissionMode::Prompt,
@@ -1680,6 +1807,25 @@ mod tests {
                 mode: "agent policy allowlist".to_string()
             }
         );
+    }
+
+    #[test]
+    fn prompt_mode_allowlist_still_allows_listed_read_only_tool() {
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::Prompt,
+                allowed_tools: Some(std::collections::HashSet::from(["read_file".to_string()])),
+                ..Default::default()
+            },
+        );
+        let envelope = evaluate_permission(
+            "read_file",
+            &serde_json::json!({"path": "src/lib.rs"}),
+            &ctx,
+        );
+
+        assert!(matches!(envelope.decision, HardDecision::Allow));
+        assert_eq!(envelope.source, DecisionSource::ReadShortCircuit);
     }
 
     #[test]
@@ -1713,6 +1859,22 @@ mod tests {
             &ctx,
         );
         assert!(matches!(mutating_bash.decision, HardDecision::Deny { .. }));
+
+        let read_only_bash = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": "git status --short"}),
+            &ctx,
+        );
+        assert!(
+            matches!(read_only_bash.decision, HardDecision::Deny { .. }),
+            "plan mode must deny shell execution even when args look read-only: {read_only_bash:?}"
+        );
+        assert_eq!(
+            read_only_bash.source,
+            DecisionSource::Mode {
+                mode: "plan".to_string()
+            }
+        );
     }
 
     #[test]
@@ -1742,24 +1904,19 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_denial_reason_guides_legacy_plan_tool_aliases() {
-        let session_reason =
-            plan_mode_denial_reason("session", &serde_json::json!({"action": "exit_plan_mode"}));
-        assert!(session_reason.contains("Use `exit_plan_mode` directly"));
-        assert!(session_reason.contains("no longer routes through `session`"));
-
-        let agent_reason = plan_mode_denial_reason(
-            "agent",
-            &serde_json::json!({"action": "run_chain", "chain": "exit_plan_mode"}),
-        );
-        assert!(agent_reason.contains("Use `exit_plan_mode` directly"));
-        assert!(agent_reason.contains("no longer routes through `agent`"));
+    fn plan_mode_denial_reason_does_not_special_case_unsupported_plan_tool_shapes() {
+        for tool_name in ["session", "agent"] {
+            let reason = plan_mode_denial_reason(tool_name);
+            assert!(reason.contains("Plan mode allows read-only tools"));
+            assert!(reason.contains("exit_plan_mode(plan=...)"));
+            assert!(!reason.contains("no longer routes through"));
+            assert!(!reason.contains("Use `exit_plan_mode` directly"));
+        }
     }
 
     #[test]
     fn generic_plan_mode_denial_reason_points_to_exit_tool() {
-        let reason =
-            plan_mode_denial_reason("bash", &serde_json::json!({"command": "touch plan.txt"}));
+        let reason = plan_mode_denial_reason("bash");
         assert!(reason.contains("Plan mode allows read-only tools"));
         assert!(reason.contains("exit_plan_mode(plan=...)"));
     }
@@ -1790,7 +1947,7 @@ mod tests {
         let ctx = crate::permission::types::PermissionSyncContext::new(
             crate::permission::types::InheritedPermissions {
                 mode: crate::permission::types::PermissionMode::Prompt,
-                ask_rules: vec![crate::permission::types::PermissionRule::parse("bash(*)")],
+                ask_rules: vec![crate::permission::types::PermissionRule::parse("bash()")],
                 ..Default::default()
             },
         );
@@ -1825,15 +1982,13 @@ mod tests {
         let ctx = crate::permission::types::PermissionSyncContext::new(
             crate::permission::types::InheritedPermissions {
                 mode: crate::permission::types::PermissionMode::Prompt,
-                allow_rules: vec![crate::permission::types::PermissionRule::parse(
-                    "git_commit",
-                )],
+                allow_rules: vec![crate::permission::types::PermissionRule::parse("git")],
                 ..Default::default()
             },
         );
         let envelope = evaluate_permission(
-            "git_commit",
-            &serde_json::json!({"message": "ship it"}),
+            "git",
+            &serde_json::json!({"action": "commit", "message": "ship it"}),
             &ctx,
         );
         assert!(matches!(
@@ -1892,6 +2047,38 @@ mod tests {
         assert!(
             matches!(bash_read.decision, HardDecision::Allow),
             "read-only processing of tool result artifacts must not require manual approval: {bash_read:?}"
+        );
+    }
+
+    #[test]
+    fn evaluate_reading_session_journal_is_allowed_in_auto_mode() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let (_temp, _guard, journal_path) = create_current_session_journal();
+        let journal_path = journal_path.to_string_lossy().to_string();
+
+        let grep = evaluate_permission(
+            "grep",
+            &serde_json::json!({
+                "pattern": "str_replace|str replace",
+                "path": journal_path.clone()
+            }),
+            &ctx,
+        );
+        assert!(
+            matches!(grep.decision, HardDecision::Allow),
+            "session journals are first-party diagnostic artifacts and must be searchable in Auto mode: {grep:?}"
+        );
+
+        let bash_read = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": format!("grep 'str_replace' {journal_path}")}),
+            &ctx,
+        );
+        assert!(
+            matches!(bash_read.decision, HardDecision::Allow),
+            "read-only shell searches of session journals must not require manual approval: {bash_read:?}"
         );
     }
 
@@ -1959,6 +2146,46 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_grep_pattern_mentioning_sensitive_name_is_not_sensitive_in_any_mode() {
+        let args = serde_json::json!({
+            "command": r#"grep -n "fn resolve_checked\|sensitive credential\|SANDBOX_DENIED_PREFIX\|\.ssh\|credentials.json" rust/crates/astra-cli/src/edge_tools/shell.rs"#
+        });
+
+        for mode in [
+            crate::permission::types::PermissionMode::Prompt,
+            crate::permission::types::PermissionMode::AcceptEdits,
+            crate::permission::types::PermissionMode::Auto,
+        ] {
+            let ctx = crate::permission::types::PermissionSyncContext::root(mode);
+            let envelope = evaluate_permission("bash", &args, &ctx);
+            assert!(
+                !matches!(envelope.source, DecisionSource::SensitivePath { .. }),
+                "{mode:?} must not treat grep search text as a sensitive path: {envelope:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_grep_sensitive_file_operand_is_sensitive_in_any_mode() {
+        let args = serde_json::json!({
+            "command": "grep -n needle ~/.ssh/id_rsa"
+        });
+
+        for mode in [
+            crate::permission::types::PermissionMode::Prompt,
+            crate::permission::types::PermissionMode::AcceptEdits,
+            crate::permission::types::PermissionMode::Auto,
+        ] {
+            let ctx = crate::permission::types::PermissionSyncContext::root(mode);
+            let envelope = evaluate_permission("bash", &args, &ctx);
+            assert!(
+                matches!(envelope.source, DecisionSource::SensitivePath { .. }),
+                "{mode:?} must gate a real sensitive file operand: {envelope:?}"
+            );
+        }
+    }
+
+    #[test]
     fn evaluate_writing_session_tool_result_artifact_still_requires_approval() {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,
@@ -1983,6 +2210,35 @@ mod tests {
         assert!(
             !matches!(bash_rm.decision, HardDecision::Allow),
             "destructive shell operations on tool result artifacts must remain gated"
+        );
+    }
+
+    #[test]
+    fn evaluate_writing_session_journal_still_requires_approval() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let (_temp, _guard, journal_path) = create_current_session_journal();
+        let journal_path = journal_path.to_string_lossy().to_string();
+
+        let write_file = evaluate_permission(
+            "write_file",
+            &serde_json::json!({"path": journal_path.clone(), "content": "tamper"}),
+            &ctx,
+        );
+        assert!(
+            !matches!(write_file.decision, HardDecision::Allow),
+            "session journals are read-only diagnostic state"
+        );
+
+        let bash_rm = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": format!("rm -f {journal_path}")}),
+            &ctx,
+        );
+        assert!(
+            !matches!(bash_rm.decision, HardDecision::Allow),
+            "destructive shell operations on session journals must remain gated"
         );
     }
 
@@ -2049,6 +2305,31 @@ mod tests {
     }
 
     #[test]
+    fn git_worktree_destructive_bash_requires_approval_in_auto_mode() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let envelope = evaluate_permission(
+            "bash",
+            &serde_json::json!({
+                "command": "git restore --staged --worktree rust/crates/foo/src/lib.rs"
+            }),
+            &ctx,
+        );
+
+        assert!(matches!(
+            envelope.decision,
+            HardDecision::NeedExternal { .. }
+        ));
+        assert!(
+            matches!(envelope.source, DecisionSource::GitSafety { ref violation } if violation.contains("git restore")),
+            "{:?}",
+            envelope.source
+        );
+        assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
+    }
+
+    #[test]
     fn structured_git_force_push_respects_auto_allowlist() {
         let ctx = crate::permission::types::PermissionSyncContext::new(
             crate::permission::types::InheritedPermissions {
@@ -2069,10 +2350,12 @@ mod tests {
         );
 
         assert!(matches!(envelope.decision, HardDecision::Deny { .. }));
-        assert!(matches!(
+        assert_eq!(
             envelope.source,
-            DecisionSource::ExplicitApprovalGate { .. }
-        ));
+            DecisionSource::Mode {
+                mode: "agent policy allowlist".to_string()
+            }
+        );
     }
 
     #[test]
@@ -2154,10 +2437,12 @@ mod tests {
             evaluate_permission("bash", &serde_json::json!({"command": "cargo test"}), &ctx);
 
         assert!(matches!(envelope.decision, HardDecision::Deny { .. }));
-        assert!(matches!(
+        assert_eq!(
             envelope.source,
-            DecisionSource::ExplicitApprovalGate { .. }
-        ));
+            DecisionSource::Mode {
+                mode: "agent policy allowlist".to_string()
+            }
+        );
     }
 
     // ── Issue #326 P5 / R2 Major 5: MCP capability metadata ──

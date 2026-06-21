@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 
+use crate::tool::categories::is_file_mutation_tool;
 use crate::tool::result::semantics::tool_dedup_signature;
 
 /// One tool slot to execute in a headless round: either a server `tool_calls[i]` or synthetic edge row `i`.
@@ -357,25 +358,44 @@ fn no_matching_edge_execution_message(name: &str) -> String {
     if matches!(name, "enter_plan_mode" | "exit_plan_mode") {
         return format!(
             "Error: headless edge protocol — tool `{name}` has no matching \
-             edge execution in this turn.\n\n\
+             edge execution in this turn.\n\
              This plan lifecycle tool requires a trusted plan executor/review \
-             overlay, but the current session mode did not attach one. \
-             Do NOT retry `{name}` in this session mode and do NOT replace plan \
-             approval with bash. Continue normal execution if the user already \
-             asked to implement, or ask the user to switch to an interactive \
-             plan-capable surface."
+             overlay, but no matching executor was bound for this turn. \
+             Continue normal execution if the user already asked to implement, \
+             or ask the user to switch to an interactive plan-capable surface."
+        );
+    }
+
+    if matches!(name, "agent" | "agent_fanout") {
+        return format!(
+            "Error: headless edge protocol — tool `{name}` has no matching \
+             edge execution in this turn.\n\n\
+             This tool requires the multi-agent runtime, but no agent executor \
+             path was bound for this turn. This call cannot run in the current \
+             turn regardless of retries. Continue only with tools that are \
+             visible and executable in this turn."
+        );
+    }
+
+    if is_file_mutation_tool(name) {
+        return format!(
+            "Error: headless edge protocol — tool `{name}` has no matching \
+             edge execution in this turn.\n\n\
+             This dedicated file mutation tool requires a server-side execution \
+             path that is not available in this turn. Use a visible dedicated \
+             file-edit tool only when that tool is actually executable in this \
+             turn."
         );
     }
 
     format!(
         "Error: headless edge protocol — tool `{name}` has no matching \
-         edge execution in this turn.\n\n\
+         edge execution in this turn. \
          This means `{name}` requires a server-side execution path that is \
-         not available in the current session mode.\n\
-         Workaround: use `bash` to accomplish the same task directly. For \
-         example, use `gh issue create ...` instead of `github(action=create_issue)`, \
-         or shell commands instead of `run_script`.\n\
-         If you believe this tool should work here, ask the user to file a bug."
+         not bound for this turn. \
+         Use only tools that have a bound executor this turn. If the user \
+         actually needs `{name}`, tell them which executor capability is \
+         missing in the current turn."
     )
 }
 
@@ -514,6 +534,8 @@ pub fn openai_tool_roundtrip_values_with_result_fields(
     content: &str,
     tool_result_fields: Option<&serde_json::Map<String, Value>>,
 ) -> (Value, Value) {
+    let content = astra_core::error_kind::strip_tool_binding_sentinel(content);
+    let content = content.as_ref();
     let msg = json!({
         "role": "tool",
         "tool_call_id": tool_call_id,
@@ -680,6 +702,44 @@ mod tests {
         );
         assert_eq!(out.output, "from-map");
         assert_eq!(out.duration_ms, 0);
+    }
+
+    #[test]
+    fn no_edge_execution_for_file_mutation_does_not_suggest_shell_fallback() {
+        let rows: Vec<Row> = vec![];
+        let mut consumed = vec![];
+        let by_sig = HashMap::new();
+        let out = take_edge_output_for_tool_call_with_duration(
+            "write_file",
+            &json!({"path": "index.html", "content": "<main></main>"}),
+            &rows,
+            &mut consumed,
+            &by_sig,
+        );
+
+        let lower = out.output.to_ascii_lowercase();
+        assert!(
+            lower.contains("dedicated file mutation tool"),
+            "{}",
+            out.output
+        );
+        assert!(
+            lower.contains("server-side execution path"),
+            "{}",
+            out.output
+        );
+        assert!(!lower.contains("workaround: use `bash`"), "{}", out.output);
+        assert!(
+            !out.output
+                .contains(astra_core::error_kind::TOOL_BINDING_SENTINEL),
+            "{}",
+            out.output
+        );
+        assert!(
+            !out.output.contains("Workaround: use `bash`"),
+            "{}",
+            out.output
+        );
     }
 
     #[test]
@@ -972,10 +1032,9 @@ mod tests {
             "str_replace",
             "delete_file",
             "multi_edit",
-            "git_commit",
-            "git_stash",
+            "git",
             "git_checkout_file",
-            "github_create_issue",
+            "github",
             "mo_query",
             "mo_snapshot",
             "mo_branch",
@@ -991,18 +1050,7 @@ mod tests {
 
     #[test]
     fn read_only_tools_covers_git_and_github_reads() {
-        for expected in &[
-            "git_status",
-            "git_diff",
-            "git_log",
-            "git_blame",
-            "read_file",
-            "grep",
-            "glob",
-            "list_dir",
-            "github_list_prs",
-            "github_get_pr",
-        ] {
+        for expected in &["read_file", "grep", "glob", "list_dir"] {
             assert!(
                 READ_ONLY_TOOLS.contains(expected),
                 "missing cacheable tool: {expected}"
@@ -1117,6 +1165,28 @@ mod tests {
     }
 
     #[test]
+    fn openai_tool_roundtrip_values_strips_tool_binding_sentinel() {
+        let content = format!(
+            "Error: tool binding unavailable {}",
+            astra_core::error_kind::TOOL_BINDING_SENTINEL
+        );
+        let (m, tr) = openai_tool_roundtrip_values("call-1", "agent", &content);
+        assert!(
+            !m["content"]
+                .as_str()
+                .unwrap()
+                .contains(astra_core::error_kind::TOOL_BINDING_SENTINEL)
+        );
+        assert!(
+            !tr["result"]
+                .as_str()
+                .unwrap()
+                .contains(astra_core::error_kind::TOOL_BINDING_SENTINEL)
+        );
+        assert!(m["content"].as_str().unwrap().contains("tool binding"));
+    }
+
+    #[test]
     fn openai_tool_roundtrip_values_with_result_fields_merges_metadata() {
         let extra_fields = serde_json::Map::from_iter([(
             "pre_state_snapshot_id".to_string(),
@@ -1132,14 +1202,6 @@ mod tests {
         assert_eq!(tr["name"], "mo_query");
         assert_eq!(tr["result"], "OK (no results)");
         assert_eq!(tr["pre_state_snapshot_id"], "moq_snap_2");
-    }
-
-    #[test]
-    fn read_only_tools_includes_git_show() {
-        assert!(
-            READ_ONLY_TOOLS.contains(&"git_show"),
-            "git_show should be cacheable (idempotent read of committed content)"
-        );
     }
 
     #[test]
@@ -1330,7 +1392,6 @@ mod tests {
         let message = no_matching_edge_execution_message("exit_plan_mode");
 
         assert!(message.contains("trusted plan executor"));
-        assert!(message.contains("Do NOT retry"));
         assert!(
             !message.contains("Workaround: use `bash`"),
             "plan approval must not be replaced with bash: {message}"
@@ -1338,9 +1399,44 @@ mod tests {
     }
 
     #[test]
-    fn non_plan_no_matching_edge_error_keeps_direct_workaround() {
-        let message = no_matching_edge_execution_message("github_create_issue");
+    fn agent_fanout_no_matching_edge_error_does_not_suggest_bash_or_serial_agent() {
+        let message = no_matching_edge_execution_message("agent_fanout");
 
-        assert!(message.contains("Workaround: use `bash`"), "{message}");
+        assert!(message.contains("multi-agent runtime"), "{message}");
+        // The message must NOT offer a degraded serial/bash fallback — those
+        // silently reduce coverage and are never equivalent to fan-out.
+        assert!(
+            !message.contains("explicitly accepts degraded"),
+            "fanout message must not smuggle in a degraded-coverage escape hatch: {message}"
+        );
+        assert!(
+            !message.contains("Workaround: use `bash`"),
+            "multi-agent execution must not be replaced with bash: {message}"
+        );
+        assert!(
+            message.contains("visible and executable in this turn"),
+            "fanout binding message must explain the executable-tool boundary: {message}"
+        );
+        assert!(
+            !message.contains(astra_core::error_kind::TOOL_BINDING_SENTINEL),
+            "binding classification is structural; messages must not carry sentinels: {message}"
+        );
+    }
+
+    #[test]
+    fn non_plan_no_matching_edge_error_forbids_substitution() {
+        let message = no_matching_edge_execution_message("github");
+
+        // The generic binding message used to suggest `bash` as a workaround,
+        // which let the model route around the binding gate. It must now tell
+        // the model NOT to substitute and to ask the user for a bound mode.
+        assert!(
+            !message.contains("Workaround: use `bash`"),
+            "generic binding message must not suggest bash substitution: {message}"
+        );
+        assert!(
+            message.contains("Use only tools that have a bound executor"),
+            "generic binding message must state the bound-executor constraint: {message}"
+        );
     }
 }

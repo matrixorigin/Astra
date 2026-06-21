@@ -22,6 +22,7 @@
 
 use super::*;
 use crate::plan::{PlanLoadError, PlanModeState};
+use astra_plan::PlanPhase;
 use astra_plan::{PlanListFilter, PlanStepRun};
 use astra_services::task_orchestrator::{TaskPlan, TaskStatus};
 use astra_tools::task_mgmt::{
@@ -108,6 +109,7 @@ pub(super) enum ApprovalPolicy {
 }
 const MAX_ERROR_LENGTH: usize = 10_000;
 const MAX_ARTIFACT_REF_LENGTH: usize = 1_000;
+const PLAN_EDIT_NOT_IMPLEMENTED_DETAIL: &str = "Natural-language plan editing is not implemented; use explicit plan create, execute, rewind, or redo-step endpoints instead.";
 
 fn validate_attempt(attempt: i32) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     if !(1..=MAX_ATTEMPT).contains(&attempt) {
@@ -270,7 +272,7 @@ pub(super) struct StartStepRunResponse {
 #[derive(Serialize)]
 pub(super) struct PlanResponse {
     pub plan_id: String,
-    pub phase: String,
+    pub phase: PlanPhase,
     pub goal: String,
     pub version: u64,
     pub plan: Option<TaskPlan>,
@@ -280,7 +282,7 @@ pub(super) struct PlanResponse {
 #[derive(Serialize)]
 pub(super) struct PlanStatusResponse {
     pub plan_id: String,
-    pub phase: String,
+    pub phase: PlanPhase,
     pub goal: String,
     pub version: u64,
     pub progress_pct: u32,
@@ -375,7 +377,7 @@ fn plan_summary_from_state(plan_id: String, plan_state: &PlanModeState) -> PlanS
         goal: plan_state.goal.clone(),
         progress_pct: plan_state.plan.progress_pct(),
         subtask_count: plan_state.plan.subtasks.len(),
-        status: infer_phase_name(plan_state).to_string(),
+        status: plan_state.infer_phase().to_string(),
     }
 }
 
@@ -435,23 +437,10 @@ fn rewind_plan_from_subtask(plan: &mut TaskPlan, start_idx: usize) -> usize {
     reset_count
 }
 
-/// Infer the phase name from a persisted `PlanModeState`.
-fn infer_phase_name(plan_state: &PlanModeState) -> &'static str {
-    if plan_state.plan.progress_pct() == 100 {
-        "completed"
-    } else if plan_state.plan.subtasks.is_empty() {
-        "planning"
-    } else if plan_state.plan.items_done() > 0 {
-        "executing"
-    } else {
-        "refining"
-    }
-}
-
-fn capabilities_for_phase_name(name: &str) -> PlanCapabilities {
-    match name {
-        "executing" => PlanCapabilities::auto_execute(),
-        "completed" => PlanCapabilities::default(),
+fn capabilities_for_phase(phase: PlanPhase) -> PlanCapabilities {
+    match phase {
+        PlanPhase::Executing => PlanCapabilities::auto_execute(),
+        PlanPhase::Completed => PlanCapabilities::default(),
         _ => PlanCapabilities::planning(),
     }
 }
@@ -763,7 +752,7 @@ pub(super) async fn create_plan_handler(
         StatusCode::CREATED,
         Json(PlanResponse {
             plan_id,
-            phase: "planning".to_string(),
+            phase: PlanPhase::Planning,
             goal,
             version: plan_state.version,
             plan: None,
@@ -873,12 +862,12 @@ pub(super) async fn get_plan_handler(
         .load_owned(&plan_id, &user.user_id)
         .await
         .map_err(map_plan_load_err)?;
-    let phase = infer_phase_name(&plan_state);
-    let capabilities = capabilities_for_phase_name(phase);
+    let phase = plan_state.infer_phase();
+    let capabilities = capabilities_for_phase(phase);
 
     Ok(Json(PlanResponse {
         plan_id,
-        phase: phase.to_string(),
+        phase,
         goal: plan_state.goal,
         version: plan_state.version,
         plan: Some(plan_state.plan),
@@ -903,7 +892,7 @@ pub(super) async fn update_plan_handler(
         ));
     }
 
-    let mut plan_state = state
+    let plan_state = state
         .plan_repo
         .load_owned(&plan_id, &user.user_id)
         .await
@@ -911,42 +900,17 @@ pub(super) async fn update_plan_handler(
 
     check_version(&plan_state, req.expected_version)?;
 
-    if infer_phase_name(&plan_state) == "completed" {
+    if plan_state.infer_phase() == PlanPhase::Completed {
         return Err(error_response(
             StatusCode::CONFLICT,
             "Cannot edit a completed plan",
         ));
     }
 
-    let session_hint = plan_state.session_hint.clone();
-    let expected = resolve_expected_version(&plan_state, req.expected_version);
-    state
-        .plan_repo
-        .save(&plan_id, &mut plan_state, expected)
-        .await
-        .map_err(map_plan_load_err)?;
-
-    emit_plan_journal(
-        session_hint.as_deref(),
-        astra_services::session_journal::JournalEvent::plan_edit(
-            session_hint.as_deref(),
-            "edit",
-            Some(serde_json::json!({
-                "plan_id": plan_id,
-                "instruction": instruction,
-                "version": plan_state.version,
-            })),
-        ),
-    );
-
-    Ok(Json(PlanResponse {
-        plan_id,
-        phase: "refining".to_string(),
-        goal: plan_state.goal,
-        version: plan_state.version,
-        plan: Some(plan_state.plan),
-        capabilities: PlanCapabilities::planning(),
-    }))
+    Err(error_response(
+        StatusCode::NOT_IMPLEMENTED,
+        PLAN_EDIT_NOT_IMPLEMENTED_DETAIL,
+    ))
 }
 
 /// `POST /plans/{plan_id}/execute` — start plan execution.
@@ -1124,7 +1088,7 @@ pub(super) async fn execute_plan_handler(
 
     Ok(Json(PlanStatusResponse {
         plan_id,
-        phase: "executing".to_string(),
+        phase: PlanPhase::Executing,
         goal: plan_state.goal,
         version: plan_state.version,
         progress_pct: plan_state.plan.progress_pct(),
@@ -1231,16 +1195,16 @@ pub(super) async fn exit_plan_mode_handler(
         ),
     );
 
-    let phase_name = if req.approved {
-        infer_phase_name(&plan_state)
+    let phase = if req.approved {
+        plan_state.infer_phase()
     } else {
-        "planning"
+        PlanPhase::Planning
     };
-    let capabilities = capabilities_for_phase_name(phase_name);
+    let capabilities = capabilities_for_phase(phase);
 
     Ok(Json(PlanResponse {
         plan_id,
-        phase: phase_name.to_string(),
+        phase,
         goal: plan_state.goal,
         version: plan_state.version,
         plan: Some(plan_state.plan),
@@ -1985,14 +1949,14 @@ pub(super) async fn plan_status_handler(
         .load_owned(&plan_id, &user.user_id)
         .await
         .map_err(map_plan_load_err)?;
-    let phase_name = infer_phase_name(&plan_state);
-    let capabilities = capabilities_for_phase_name(phase_name);
+    let phase = plan_state.infer_phase();
+    let capabilities = capabilities_for_phase(phase);
 
     let (completed, failed) = status_counts(&plan_state.plan);
 
     Ok(Json(PlanStatusResponse {
         plan_id,
-        phase: phase_name.to_string(),
+        phase,
         goal: plan_state.goal,
         version: plan_state.version,
         progress_pct: plan_state.plan.progress_pct(),
@@ -2173,16 +2137,16 @@ mod tests {
             .await;
     }
 
-    // ── infer_phase_name tests ─────────────────────────────────────────────
+    // ── infer_phase tests ─────────────────────────────────────────────
 
     #[test]
-    fn infer_phase_name_empty_plan_is_planning() {
+    fn infer_phase_empty_plan_is_planning() {
         let state = PlanModeState::new("build auth".into());
-        assert_eq!(infer_phase_name(&state), "planning");
+        assert_eq!(state.infer_phase(), PlanPhase::Planning);
     }
 
     #[test]
-    fn infer_phase_name_with_pending_subtasks_is_refining() {
+    fn infer_phase_with_pending_subtasks_is_refining() {
         let mut state = PlanModeState::new("add tests".into());
         state
             .plan
@@ -2193,11 +2157,11 @@ mod tests {
                 status: TaskStatus::Pending,
                 ..Default::default()
             });
-        assert_eq!(infer_phase_name(&state), "refining");
+        assert_eq!(state.infer_phase(), PlanPhase::Refining);
     }
 
     #[test]
-    fn infer_phase_name_with_in_progress_subtasks_is_executing() {
+    fn infer_phase_with_in_progress_subtasks_is_executing() {
         let mut state = PlanModeState::new("add tests".into());
         state
             .plan
@@ -2217,11 +2181,11 @@ mod tests {
                 status: TaskStatus::Pending,
                 ..Default::default()
             });
-        assert_eq!(infer_phase_name(&state), "executing");
+        assert_eq!(state.infer_phase(), PlanPhase::Executing);
     }
 
     #[test]
-    fn infer_phase_name_all_completed() {
+    fn infer_phase_all_completed() {
         let mut state = PlanModeState::new("deploy service".into());
         state
             .plan
@@ -2232,7 +2196,7 @@ mod tests {
                 status: TaskStatus::Completed,
                 ..Default::default()
             });
-        assert_eq!(infer_phase_name(&state), "completed");
+        assert_eq!(state.infer_phase(), PlanPhase::Completed);
     }
 
     #[test]

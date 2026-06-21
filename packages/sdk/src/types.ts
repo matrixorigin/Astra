@@ -158,21 +158,20 @@ export type ExecutorBinding = {
   kind:
     | "server_local"
     | "edge_agent"
+    | "orchestrator_managed"
     | "thin_client"
     | "mcp"
-    | "hosted_runner"
-    | "unknown"
-    | string;
+    | "unknown";
   executor_id?: string;
   display_name?: string;
   transport?:
     | "server_local"
     | "edge_ws"
     | "edge_ledger"
+    | "gateway_relay"
+    | "sandbox_resident_agent"
     | "mcp_http"
-    | "runner_rpc"
-    | "unknown"
-    | string;
+    | "unknown";
   status?: "online" | "offline" | "degraded" | "unknown" | string;
 };
 

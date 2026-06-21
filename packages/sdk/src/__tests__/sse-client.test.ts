@@ -395,7 +395,7 @@ describe("parseSseDataEvents", () => {
     const raw =
       'data: {"type":"run_waiting","run_id":"r1","reason":"executor offline","waiting_for":"edge","workspace":{"kind":"edge_workspace"},"executor":{"kind":"edge_agent","status":"offline"},"transport":"edge_ws","fallback_policy":"disabled"}\n\n' +
       'data: {"type":"run_blocked","call_id":"c1","tool":"shell","reason":"transport_disconnected","message":"edge disconnected","executor":{"kind":"edge_agent"},"transport":"edge_ws"}\n\n' +
-      'data: {"type":"run_blocked","call_id":"c2","tool":"bash","reason":"workspace_executor_unavailable","message":"workspace is not routed","workspace":{"kind":"git_checkout"},"executor":{"kind":"hosted_runner","status":"degraded"},"transport":"runner_rpc"}\n\n' +
+      'data: {"type":"run_blocked","call_id":"c2","tool":"bash","reason":"workspace_executor_unavailable","message":"workspace is not routed","workspace":{"kind":"git_checkout"},"executor":{"kind":"orchestrator_managed","status":"degraded"},"transport":"sandbox_resident_agent"}\n\n' +
       'data: {"type":"agent_waiting","agent_id":"a1","run_id":"r2","status":"waiting","reason":"child executor offline"}\n\n';
 
     const events = parseSseDataEvents(raw);

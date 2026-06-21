@@ -3,7 +3,6 @@ pub enum FollowupSuggestionKind {
     Validate,
     Commit,
     Push,
-    Continue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,10 +11,25 @@ pub struct FollowupSuggestion {
     pub kind: FollowupSuggestionKind,
 }
 
+pub fn tool_marker(tool_name: &str, args_json: Option<&str>) -> String {
+    let action = args_json
+        .and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok())
+        .and_then(|args| {
+            args.get("action")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+    match (tool_name, action.as_deref()) {
+        ("git", Some(action)) => format!("git:{action}"),
+        ("github", Some(action)) => format!("github:{action}"),
+        _ => tool_name.to_string(),
+    }
+}
+
 pub fn suggest_followup(
     user_message: &str,
     assistant_text: &str,
-    tool_names: &[String],
+    tool_markers: &[String],
 ) -> Option<FollowupSuggestion> {
     let trimmed = user_message.trim();
     if trimmed.is_empty()
@@ -27,9 +41,9 @@ pub fn suggest_followup(
     }
 
     let lexicon = suggestion_lexicon(trimmed, assistant_text);
-    let edited = tool_names.iter().any(|tool| is_edit_tool(tool));
-    let validated = tool_names.iter().any(|tool| is_validation_tool(tool));
-    let committed = tool_names.iter().any(|tool| tool == "git_commit");
+    let edited = tool_markers.iter().any(|tool| is_edit_tool(tool));
+    let validated = tool_markers.iter().any(|tool| is_validation_tool(tool));
+    let committed = tool_markers.iter().any(|tool| is_commit_tool(tool));
 
     if let Some(question_reply) =
         suggest_reply_to_assistant_question(assistant_text, edited, validated, committed, &lexicon)
@@ -69,7 +83,6 @@ struct SuggestionLexicon {
     validate: &'static str,
     commit: &'static str,
     push: &'static str,
-    continue_prompt: &'static str,
 }
 
 fn suggestion_lexicon(line: &str, assistant_text: &str) -> SuggestionLexicon {
@@ -78,14 +91,12 @@ fn suggestion_lexicon(line: &str, assistant_text: &str) -> SuggestionLexicon {
             validate: "跑一下测试",
             commit: "提交一下",
             push: "推上去",
-            continue_prompt: "继续",
         }
     } else {
         SuggestionLexicon {
             validate: "run the tests",
             commit: "commit this",
             push: "push it",
-            continue_prompt: "go ahead",
         }
     }
 }
@@ -98,14 +109,12 @@ fn prefers_chinese(text: &str) -> bool {
 fn is_edit_tool(tool: &str) -> bool {
     matches!(
         tool,
-        "write_file"
-            | "str_replace"
-            | "multi_edit"
-            | "create_file"
-            | "delete_file"
-            | "move_file"
-            | "git_commit"
+        "write_file" | "str_replace" | "multi_edit" | "create_file" | "delete_file" | "move_file"
     )
+}
+
+fn is_commit_tool(tool: &str) -> bool {
+    tool == "git:commit"
 }
 
 fn is_validation_tool(tool: &str) -> bool {
@@ -169,24 +178,7 @@ fn suggest_reply_to_assistant_question(
         });
     }
 
-    if mentions_continue_question(&lower, full_text) {
-        return Some(FollowupSuggestion {
-            text: lexicon.continue_prompt.to_string(),
-            kind: FollowupSuggestionKind::Continue,
-        });
-    }
-
     None
-}
-
-fn mentions_continue_question(lower: &str, full_text: &str) -> bool {
-    lower.contains("continue")
-        || lower.contains("keep going")
-        || lower.contains("keep working")
-        || lower.contains("go ahead")
-        || full_text.contains("继续")
-        || full_text.contains("接着")
-        || full_text.contains("往下")
 }
 
 fn mentions_test_question(lower: &str, full_text: &str) -> bool {
@@ -245,6 +237,43 @@ mod tests {
         )
         .expect("suggestion");
         assert_eq!(suggestion.text, "跑一下测试");
+    }
+
+    #[test]
+    fn marker_extracts_consolidated_git_action() {
+        assert_eq!(
+            tool_marker("git", Some(r#"{"action":"commit","message":"ship"}"#)),
+            "git:commit"
+        );
+        assert_eq!(tool_marker("git", Some(r#"{"action":"diff"}"#)), "git:diff");
+        assert_eq!(
+            tool_marker("read_file", Some(r#"{"path":"a.rs"}"#)),
+            "read_file"
+        );
+    }
+
+    #[test]
+    fn suggests_push_after_consolidated_git_action_commit_marker() {
+        let suggestion = suggest_followup(
+            "commit it",
+            "Committed the changes.",
+            &["git:commit".to_string()],
+        )
+        .expect("suggestion");
+        assert_eq!(suggestion.text, "push it");
+        assert_eq!(suggestion.kind, FollowupSuggestionKind::Push);
+    }
+
+    #[test]
+    fn read_only_git_marker_does_not_suggest_push() {
+        assert_eq!(
+            suggest_followup(
+                "show the diff",
+                "Here is the diff.",
+                &["git:diff".to_string()]
+            ),
+            None
+        );
     }
 
     #[test]

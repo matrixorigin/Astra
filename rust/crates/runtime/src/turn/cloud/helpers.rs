@@ -82,8 +82,6 @@ pub struct CompactPlan {
     pub turns_removed: usize,
     /// Estimated token count freed by the removal.
     pub freed_tokens: u64,
-    /// User queries from the drop range (first N chars each, for summary).
-    pub user_queries: Vec<String>,
 }
 
 /// Fixup: extend `tail_start` backward to prevent splitting assistant↔tool pairs.
@@ -190,25 +188,11 @@ pub fn compute_compact_plan(
     let turns_removed = affected_turns.len();
 
     let drop_range = head_end..tail_start;
-    // Single traversal over the drop range: compute freed_tokens AND collect
-    // short user-query previews for the boundary summary.
-    let mut user_queries: Vec<String> = Vec::new();
     let freed_tokens: u64 = messages[drop_range.clone()]
         .iter()
         .enumerate()
         .filter(|(i, _)| pivot_idx.map_or(true, |p| *i + head_end != p))
-        .map(|(_idx, m)| {
-            // Collect user queries trimmed to 100 chars for the summarised boundary.
-            if m.role == "user" {
-                if let Some(ref content) = m.content {
-                    let snippet = if content.len() > 100 {
-                        format!("{}…", &content[..content.floor_char_boundary(100)])
-                    } else {
-                        content.clone()
-                    };
-                    user_queries.push(snippet);
-                }
-            }
+        .map(|(_, m)| {
             let content_tokens = m
                 .content
                 .as_deref()
@@ -236,7 +220,6 @@ pub fn compute_compact_plan(
         affected_turns,
         turns_removed,
         freed_tokens,
-        user_queries,
     })
 }
 

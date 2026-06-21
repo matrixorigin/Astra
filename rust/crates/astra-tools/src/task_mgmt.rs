@@ -389,6 +389,11 @@ pub struct SessionSubtask {
     /// "my work" miss subtasks of tasks they own (U-7 unhappy path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// Optional status-change note for this subtask. This is intentionally
+    /// stored on the subtask, not parent metadata, so subtask updates can
+    /// accept explanatory reasons without pretending they are parent failures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -1390,16 +1395,88 @@ fn is_reversible_auto_completed_parent(task: &SessionTask) -> bool {
             .unwrap_or(false)
 }
 
+fn task_actions_allowing_field(field: &str, current_action: &str) -> Vec<&'static str> {
+    const TASK_ACTION_FIELDS: &[(&str, &[&str])] = &[
+        (
+            "create",
+            &[
+                "action",
+                "title",
+                "description",
+                "subtasks",
+                "active_form",
+                "owner",
+                "metadata",
+                "add_blocks",
+                "add_blocked_by",
+            ],
+        ),
+        ("list", &["action", "status_filter"]),
+        ("get", &["action", "task_id"]),
+        (
+            "update",
+            &[
+                "action",
+                "task_id",
+                "new_status",
+                "status",
+                "title",
+                "description",
+                "subtask_id",
+                "active_form",
+                "owner",
+                "metadata",
+                "add_blocks",
+                "add_blocked_by",
+                "remove_blocks",
+                "remove_blocked_by",
+                "reason",
+                "error_message",
+            ],
+        ),
+        ("stop", &["action", "task_id", "reason"]),
+        (
+            "archive",
+            &["action", "task_id", "older_than_days", "reason"],
+        ),
+    ];
+
+    TASK_ACTION_FIELDS
+        .iter()
+        .filter_map(|(action, fields)| {
+            (*action != current_action && fields.contains(&field)).then_some(*action)
+        })
+        .collect()
+}
+
+fn unknown_task_field_message(action: &str, key: &str, allowed: &[&str]) -> String {
+    let other_actions = task_actions_allowing_field(key, action);
+    let action_hint = if other_actions.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; field is valid for: {}",
+            other_actions
+                .iter()
+                .map(|action| format!("task.{action}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    format!(
+        "unknown field '{key}' for task.{action} (valid: {}{})",
+        allowed.join(", "),
+        action_hint
+    )
+}
+
 fn validate_allowed_fields(args: &Value, action: &str, allowed: &[&str]) -> Result<(), String> {
     let Some(obj) = args.as_object() else {
         return Err(format!("task.{action} arguments must be an object"));
     };
     for key in obj.keys() {
         if !allowed.contains(&key.as_str()) {
-            return Err(format!(
-                "unknown field '{key}' for task.{action} (valid: {})",
-                allowed.join(", ")
-            ));
+            return Err(unknown_task_field_message(action, key, allowed));
         }
     }
     if let Some(action_value) = obj.get("action")
@@ -1591,6 +1668,7 @@ fn parse_create_subtasks(
             status: SessionTaskStatusKind::Pending,
             depends_on,
             owner: explicit_owner.or_else(|| parent_owner.map(str::to_string)),
+            reason: None,
         });
     }
 
@@ -1959,6 +2037,12 @@ impl TaskManager {
     /// `restore_snapshot` uses the sealed version as its compare-and-restore
     /// guard. This lets rollback undo the caller's own mutation while refusing
     /// to clobber any later concurrent task-board write.
+    ///
+    /// **TOCTOU guard**: verifies that at most one version increment
+    /// (the caller's own mutation) occurred between snapshot capture and
+    /// seal. Returns an error if a concurrent mutation advanced the
+    /// version further, because the snapshot no longer represents the
+    /// pre-state of ONLY this caller's mutation.
     pub async fn seal_snapshot_for_restore(
         &self,
         snapshot: &mut TaskManagerSnapshot,
@@ -1969,6 +2053,16 @@ impl TaskManager {
             .get_session_version(&sid)
             .await
             .map_err(|e| format!("seal_snapshot_for_restore: failed to read version: {e}"))?;
+        // TOCTOU guard: if more than one version increment happened
+        // (i.e. a concurrent mutation intervened between capture and
+        // seal), the snapshot is stale.
+        if version > snapshot.version + 1 {
+            return Err(format!(
+                "seal_snapshot_for_restore: concurrent mutation detected \
+                 (captured version={}, current version={}) — snapshot is stale",
+                snapshot.version, version
+            ));
+        }
         snapshot.restore_version = Some(version);
         Ok(())
     }
@@ -2446,7 +2540,10 @@ impl TaskManager {
         {
             return format!("Error: {error}");
         }
-        if error_message.is_none() && new_status == Some(SessionTaskStatusKind::Failed) {
+        if subtask_id.is_none()
+            && error_message.is_none()
+            && new_status == Some(SessionTaskStatusKind::Failed)
+        {
             error_message = reason.clone();
         }
         if error_message.is_some() {
@@ -2536,7 +2633,6 @@ impl TaskManager {
                 ("add_blocked_by", !proposed_blocked_by.is_empty()),
                 ("remove_blocks", !remove_blocks.is_empty()),
                 ("remove_blocked_by", !remove_blocked_by.is_empty()),
-                ("reason", reason.is_some()),
             ]
             .into_iter()
             .filter_map(|(field, present)| present.then_some(field))
@@ -2639,6 +2735,9 @@ impl TaskManager {
                             validate_subtask_status_transition(previous_status, *status)?;
                             subtask.status = *status;
                         }
+                        if let Some(note) = reason.clone() {
+                            subtask.reason = Some(note);
+                        }
                         // Copy the reconciled parent state from projected_task instead of
                         // re-running reconcile on the real task. This avoids a race where
                         // concurrent subtask updates could apply reconcile twice and
@@ -2659,6 +2758,7 @@ impl TaskManager {
                                 "subtask_id": st_id,
                                 "previous_status": previous_status,
                                 "status": final_subtask_status,
+                                "reason": reason,
                                 "message": format!("Subtask '{}' updated to '{}'", st_id, final_subtask_status)
                             })
                             .to_string(),
@@ -2771,17 +2871,25 @@ impl TaskManager {
                         }
                     }
                     if projected_status.is_in_progress() {
-                        if new_status == Some(SessionTaskStatusKind::InProgress) {
+                        let starting_now = new_status == Some(SessionTaskStatusKind::InProgress)
+                            && previous_status != SessionTaskStatusKind::InProgress;
+                        let dependency_edges_changed = !proposed_blocked_by.is_empty()
+                            || !proposed_blocks.is_empty()
+                            || !remove_blocked_by.is_empty()
+                            || !remove_blocks.is_empty();
+                        if starting_now {
                             validate_single_in_progress_slot(&tasks, &task_id)?;
                         }
-                        validate_task_can_start_after_projected_edges(
-                            &tasks,
-                            &task_id,
-                            &proposed_blocked_by,
-                            &proposed_blocks,
-                            &remove_blocked_by,
-                            &remove_blocks,
-                        )?;
+                        if starting_now || dependency_edges_changed {
+                            validate_task_can_start_after_projected_edges(
+                                &tasks,
+                                &task_id,
+                                &proposed_blocked_by,
+                                &proposed_blocks,
+                                &remove_blocked_by,
+                                &remove_blocks,
+                            )?;
+                        }
                     }
 
                     // Cycle detection on the projected graph.
@@ -3474,6 +3582,18 @@ mod tests {
             );
         }
 
+        let create_only_field_on_update = m
+            .update(&json!({"task_id": "task-1", "subtasks": []}))
+            .await;
+        assert!(
+            create_only_field_on_update.contains("unknown field 'subtasks' for task.update"),
+            "{create_only_field_on_update}"
+        );
+        assert!(
+            create_only_field_on_update.contains("field is valid for: task.create"),
+            "{create_only_field_on_update}"
+        );
+
         let action_wrong_type = m
             .create(&json!({"action": true, "title": "bad action"}))
             .await;
@@ -3972,6 +4092,77 @@ mod tests {
         assert!(
             task.metadata.is_none(),
             "rejected subtask update must not write hidden parent metadata: {task:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subtask_update_accepts_reason_without_parent_metadata() {
+        let m = mgr();
+        m.create(&json!({
+            "title": "parent",
+            "subtasks": [{ "id": "verify", "title": "verify changes" }]
+        }))
+        .await;
+
+        let update = m
+            .update(&json!({
+                "task_id": "task-1",
+                "subtask_id": "verify",
+                "new_status": "completed",
+                "reason": "cargo check and focused tests passed"
+            }))
+            .await;
+
+        assert!(!update.starts_with("Error:"), "{update}");
+        assert!(
+            update.contains("cargo check and focused tests passed"),
+            "response should surface the recorded reason: {update}"
+        );
+        let task: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await).unwrap();
+        assert_eq!(
+            task.subtasks[0].reason.as_deref(),
+            Some("cargo check and focused tests passed")
+        );
+        assert!(
+            task.metadata
+                .as_ref()
+                .is_none_or(|metadata| !metadata.contains_key("reason")),
+            "subtask reason must stay on the subtask, not parent metadata: {task:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_subtask_update_accepts_reason_without_error_message_rewrite() {
+        let m = mgr();
+        m.create(&json!({
+            "title": "parent",
+            "subtasks": [{ "id": "compile", "title": "compile" }]
+        }))
+        .await;
+
+        let update = m
+            .update(&json!({
+                "task_id": "task-1",
+                "subtask_id": "compile",
+                "new_status": "failed",
+                "reason": "compiler unavailable"
+            }))
+            .await;
+
+        assert!(!update.starts_with("Error:"), "{update}");
+        let task: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await).unwrap();
+        assert_eq!(task.subtasks[0].status, SessionTaskStatusKind::Failed);
+        assert_eq!(
+            task.subtasks[0].reason.as_deref(),
+            Some("compiler unavailable")
+        );
+        assert!(
+            task.metadata
+                .as_ref()
+                .is_none_or(|metadata| !metadata.contains_key("error_message")),
+            "subtask reason must not be rewritten as parent error_message: {task:?}"
         );
     }
 
@@ -4519,6 +4710,24 @@ mod tests {
         assert!(
             second.contains("\"success\":true") && second.contains("\"status\":\"in_progress\""),
             "{second}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_in_progress_is_idempotent_for_the_same_task() {
+        let m = mgr();
+        m.create(&json!({"title": "already running"})).await;
+        let first = m
+            .update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        assert!(!first.starts_with("Error:"), "{first}");
+
+        let repeat = m
+            .update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        assert!(
+            repeat.contains("\"success\":true") && repeat.contains("\"status\":\"in_progress\""),
+            "same-task in_progress repeat should be treated as idempotent success: {repeat}"
         );
     }
 
@@ -5487,6 +5696,7 @@ mod tests {
                         status: SessionTaskStatusKind::InProgress,
                         depends_on: vec![],
                         owner: None,
+                        reason: None,
                     }],
                     created_at: "".into(),
                     updated_at: "".into(),

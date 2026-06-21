@@ -38,6 +38,7 @@ crc32fast = "1.4"
 dirs = "6.0.0"
 fastrand = "2"
 percent-encoding = "2.3"
+unicode-normalization.workspace = true
 astra-logging.workspace = true
 astra-config.workspace = true
 astra-core.workspace = true
@@ -47,6 +48,7 @@ astra-text-utils.workspace = true
 astra-pipeline.workspace = true
 astra-plan.workspace = true
 astra-prompts.workspace = true
+astra-runtime-env.workspace = true
 astra-sandbox.workspace = true
 astra-server-types = { workspace = true, features = ["server"] }
 astra-mcp.workspace = true

@@ -73,17 +73,17 @@ mod tests {
 
     #[test]
     fn catalog_has_expected_tools() {
-        assert_eq!(TOOL_CATALOG.len(), 27);
+        assert_eq!(TOOL_CATALOG.len(), 34);
     }
 
     #[test]
     fn all_tools_are_pinned() {
-        assert_eq!(ToolRegistry::pinned_count(), 22);
+        assert_eq!(ToolRegistry::pinned_count(), 23);
     }
 
     #[test]
     fn catalog_dynamic_count_matches_unpinned_tools() {
-        assert_eq!(ToolRegistry::dynamic_count(), 5);
+        assert_eq!(ToolRegistry::dynamic_count(), 11);
     }
 
     #[test]

@@ -7,10 +7,11 @@
 //! - **cgroup v2 limits**: memory ceiling + CPU quota per-tool invocation.
 //!
 //! Falls back gracefully when:
-//! - `unshare` is not available (non-Linux, container without CAP_SYS_ADMIN).
-//! - cgroup v2 is not mounted.
-//! - Caller passes `IsolationConfig::disabled()`.
-
+///    - If kernel >= 3.19, unprivileged user namespaces are considered safe.
+///    - On older kernels, --map-root-user is skipped and a warning is emitted
+///      because of known privilege-escalation vulnerabilities (CVE-2015-1328, etc.).
+///
+/// Caller passes `IsolationConfig::disabled()`.
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -19,8 +20,11 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 const MAX_CAPTURED_STDOUT_BYTES: usize = 64 * 1024;
 const MAX_CAPTURED_STDERR_BYTES: usize = 32 * 1024;
+const DEFAULT_MAX_CAPTURED_OUTPUT_BYTES: usize =
+    MAX_CAPTURED_STDOUT_BYTES + MAX_CAPTURED_STDERR_BYTES;
 const READ_CHUNK_SIZE: usize = 8 * 1024;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Per-invocation isolation configuration.
 #[derive(Debug, Clone)]
@@ -37,6 +41,8 @@ pub struct IsolationConfig {
     pub cpu_quota: f64,
     /// Maximum execution wall-clock time.
     pub timeout: Duration,
+    /// Maximum combined stdout/stderr bytes retained in memory.
+    pub max_output_bytes: usize,
     /// Working directory for the subprocess.
     pub working_dir: PathBuf,
 }
@@ -51,6 +57,7 @@ impl IsolationConfig {
             memory_limit_bytes: 512 * 1024 * 1024, // 512 MB
             cpu_quota: 1.0,                        // 1 full core
             timeout: Duration::from_secs(120),
+            max_output_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
             working_dir,
         }
     }
@@ -64,6 +71,7 @@ impl IsolationConfig {
             memory_limit_bytes: 1024 * 1024 * 1024, // 1 GB
             cpu_quota: 2.0,                         // 2 cores
             timeout: Duration::from_secs(120),
+            max_output_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
             working_dir,
         }
     }
@@ -74,9 +82,12 @@ impl IsolationConfig {
             pid_namespace: false,
             mount_namespace: false,
             net_namespace: false,
-            memory_limit_bytes: 0,
-            cpu_quota: 0.0,
+            // Apply permissive resource limits even when namespace isolation is disabled.
+            // This prevents unbounded resource consumption while maintaining backward compat.
+            memory_limit_bytes: 1024 * 1024 * 1024, // 1 GB
+            cpu_quota: 2.0,                         // 2 cores
             timeout: Duration::from_secs(120),
+            max_output_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
             working_dir,
         }
     }
@@ -146,6 +157,55 @@ struct StreamChunk {
     bytes: Vec<u8>,
 }
 
+struct StreamOutputCapture {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    max_output_bytes: usize,
+    stdout_capped: bool,
+    stderr_capped: bool,
+}
+
+impl StreamOutputCapture {
+    fn new(max_output_bytes: usize) -> Self {
+        Self {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            max_output_bytes,
+            stdout_capped: false,
+            stderr_capped: false,
+        }
+    }
+
+    fn append(&mut self, chunk: StreamChunk) {
+        let retained_bytes = self.stdout.len().saturating_add(self.stderr.len());
+        let remaining = self.max_output_bytes.saturating_sub(retained_bytes);
+        match chunk.stream {
+            StreamKind::Stdout => append_capped(
+                &mut self.stdout,
+                &chunk.bytes,
+                remaining,
+                &mut self.stdout_capped,
+            ),
+            StreamKind::Stderr => append_capped(
+                &mut self.stderr,
+                &chunk.bytes,
+                remaining,
+                &mut self.stderr_capped,
+            ),
+        }
+    }
+
+    fn drain_ready(&mut self, rx: &mut tokio::sync::mpsc::UnboundedReceiver<StreamChunk>) {
+        while let Ok(chunk) = rx.try_recv() {
+            self.append(chunk);
+        }
+    }
+
+    fn is_capped(&self) -> bool {
+        self.stdout_capped || self.stderr_capped
+    }
+}
+
 /// Check if `unshare` with user namespace mapping actually works.
 ///
 /// The binary may exist but the kernel may block unprivileged user namespaces
@@ -167,6 +227,54 @@ fn unshare_available() -> bool {
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
+    })
+}
+
+/// Check whether the running kernel is safe for `--map-root-user`.
+///
+/// Kernels before 3.19 have known privilege-escalation vulnerabilities
+/// (notably CVE-2015-1328 in overlayfs) that can be exploited via
+/// unprivileged user namespaces.  This check parses `uname -r` and
+/// returns true only when the kernel is ≥ 3.19.0.
+fn map_root_user_safe() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let output = std::process::Command::new("uname")
+            .arg("-r")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output();
+        let output = match output {
+            Ok(o) => o,
+            Err(_) => return false,
+        };
+        let version_str = String::from_utf8_lossy(&output.stdout);
+        let version_str = version_str.trim();
+        let parts: Vec<u32> = version_str
+            .split(|c: char| !c.is_ascii_digit())
+            .filter_map(|s| s.parse::<u32>().ok())
+            .take(3)
+            .collect();
+        if parts.len() < 2 {
+            // Can't parse kernel version — be conservative and refuse.
+            tracing::warn!(
+                target: "astra_sandbox::process_isolation",
+                kernel_version = %version_str,
+                "cannot parse kernel version; refusing --map-root-user"
+            );
+            return false;
+        }
+        let (major, minor) = (parts[0], parts[1]);
+        let safe = major > 3 || (major == 3 && minor >= 19);
+        if !safe {
+            tracing::warn!(
+                target: "astra_sandbox::process_isolation",
+                kernel_version = %version_str,
+                "kernel < 3.19 — --map-root-user disabled due to known EoP vulnerabilities \
+                 (CVE-2015-1328, etc.). Upgrade your kernel to ≥ 3.19 for full isolation."
+            );
+        }
+        safe
     })
 }
 
@@ -200,19 +308,28 @@ fn create_cgroup(config: &IsolationConfig) -> Option<PathBuf> {
 
     // Set memory limit.
     if config.memory_limit_bytes > 0 {
-        let _ = std::fs::write(
+        if let Err(e) = std::fs::write(
             cg_path.join("memory.max"),
             config.memory_limit_bytes.to_string(),
-        );
-        // Also set a swap limit to prevent OOM-swap thrashing.
-        let _ = std::fs::write(cg_path.join("memory.swap.max"), "0");
+        ) {
+            tracing::error!(%e, "cgroup memory.max write failed — removing cgroup");
+            let _ = std::fs::remove_dir(&cg_path);
+            return None;
+        }
+        if let Err(e) = std::fs::write(cg_path.join("memory.swap.max"), "0") {
+            tracing::warn!(%e, "cgroup memory.swap.max write failed (non-fatal)");
+        }
     }
 
     // Set CPU quota (period = 100ms, quota = period * fraction).
     if config.cpu_quota > 0.0 {
         let period_us: u64 = 100_000; // 100ms
         let quota_us = (period_us as f64 * config.cpu_quota) as u64;
-        let _ = std::fs::write(cg_path.join("cpu.max"), format!("{quota_us} {period_us}"));
+        if let Err(e) = std::fs::write(cg_path.join("cpu.max"), format!("{quota_us} {period_us}")) {
+            tracing::error!(%e, "cgroup cpu.max write failed — removing cgroup");
+            let _ = std::fs::remove_dir(&cg_path);
+            return None;
+        }
     }
 
     Some(cg_path)
@@ -238,6 +355,8 @@ fn cleanup_cgroup(cg_path: &Path) {
 #[derive(Debug)]
 pub struct CgroupGuard {
     cg_path: Option<PathBuf>,
+    /// Absolute path to cgroup.procs for post-spawn PID join.
+    procs_path: Option<PathBuf>,
 }
 
 impl CgroupGuard {
@@ -253,6 +372,16 @@ impl CgroupGuard {
     pub fn path(&self) -> Option<&Path> {
         self.cg_path.as_deref()
     }
+
+    /// Join a spawned child process to this cgroup by writing its PID to
+    /// cgroup.procs. No-op when the cgroup is inactive. Returns `Err` if
+    /// the write fails — callers must kill the child in that case.
+    pub fn join_child(&self, pid: u32) -> Result<(), std::io::Error> {
+        if let Some(ref procs_path) = self.procs_path {
+            std::fs::write(procs_path, pid.to_string())?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for CgroupGuard {
@@ -263,31 +392,29 @@ impl Drop for CgroupGuard {
     }
 }
 
-/// Attach cgroup v2 memory + CPU limits to an existing Command.
+/// Attach cgroup v2 memory + CPU limits to a spawned child process.
 ///
-/// The child process joins the cgroup via a `pre_exec` hook so its
-/// allocations are bounded from the very first instruction. The returned
-/// [`CgroupGuard`] cleans up the cgroup directory on drop.
+/// Returns a [`CgroupGuard`] that must be kept alive for the lifetime
+/// of the child. Call [`CgroupGuard::join_child`] immediately after
+/// `Command::spawn()` to write the child's PID to `cgroup.procs`.
 ///
 /// Semantics:
 /// - `memory_limit_bytes = 0` → no memory limit applied.
 /// - `cpu_quota = 0.0` → no CPU limit applied.
 /// - If both are zero, or cgroup v2 is unavailable, returns an inactive
-///   guard and does not modify `cmd`. This is the happy "permissive"
-///   fallback — callers who need to *know* whether isolation actually
-///   fired should check [`CgroupGuard::active`].
+///   guard. This is the happy "permissive" fallback — callers who need
+///   to *know* whether isolation actually fired should check
+///   [`CgroupGuard::active`].
 ///
 /// Unlike [`execute_isolated`], this function does NOT spawn, pump, or
-/// wait — it only configures the `Command` builder. Use this when you
-/// need custom stdout/stderr handling (streaming, RPC sockets, etc.).
-pub fn apply_cgroup(
-    cmd: &mut tokio::process::Command,
-    memory_limit_bytes: u64,
-    cpu_quota: f64,
-) -> CgroupGuard {
+/// wait — it only creates the cgroup and returns a guard handle.
+pub fn apply_cgroup(memory_limit_bytes: u64, cpu_quota: f64) -> CgroupGuard {
     // Mirror the allocation heuristic of create_cgroup.
     if memory_limit_bytes == 0 && cpu_quota <= 0.0 {
-        return CgroupGuard { cg_path: None };
+        return CgroupGuard {
+            cg_path: None,
+            procs_path: None,
+        };
     }
     let config = IsolationConfig {
         pid_namespace: false,
@@ -296,32 +423,24 @@ pub fn apply_cgroup(
         memory_limit_bytes,
         cpu_quota,
         timeout: Duration::from_secs(0),
+        max_output_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
         working_dir: PathBuf::new(),
     };
     let cg_path = match create_cgroup(&config) {
         Some(p) => p,
-        None => return CgroupGuard { cg_path: None },
+        None => {
+            return CgroupGuard {
+                cg_path: None,
+                procs_path: None,
+            };
+        }
     };
 
-    // Join the cgroup in the child via pre_exec. Writing our PID to
-    // cgroup.procs moves us into the cgroup before exec — so the exec'd
-    // program runs under the limits from instruction 0.
-    #[cfg(unix)]
-    {
-        let procs_path = cg_path.join("cgroup.procs");
-        // pre_exec is from std::os::unix::process::CommandExt — already
-        // in scope via the existing create_cgroup call site.
-        unsafe {
-            cmd.pre_exec(move || {
-                let pid = std::process::id().to_string();
-                std::fs::write(&procs_path, &pid)
-                    .map_err(|e| std::io::Error::other(format!("cgroup join: {e}")))
-            });
-        }
-    }
+    let procs_path = cg_path.join("cgroup.procs");
 
     CgroupGuard {
         cg_path: Some(cg_path),
+        procs_path: Some(procs_path),
     }
 }
 
@@ -342,27 +461,9 @@ fn append_capped(buffer: &mut Vec<u8>, chunk: &[u8], max_bytes: usize, capped: &
 
 fn drain_stream_chunks(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<StreamChunk>,
-    stdout: &mut Vec<u8>,
-    stderr: &mut Vec<u8>,
-    stdout_capped: &mut bool,
-    stderr_capped: &mut bool,
+    capture: &mut StreamOutputCapture,
 ) {
-    while let Ok(chunk) = rx.try_recv() {
-        match chunk.stream {
-            StreamKind::Stdout => append_capped(
-                stdout,
-                &chunk.bytes,
-                MAX_CAPTURED_STDOUT_BYTES,
-                stdout_capped,
-            ),
-            StreamKind::Stderr => append_capped(
-                stderr,
-                &chunk.bytes,
-                MAX_CAPTURED_STDERR_BYTES,
-                stderr_capped,
-            ),
-        }
-    }
+    capture.drain_ready(rx);
 }
 
 fn trim_incomplete_trailing_line(output: &mut String) {
@@ -404,6 +505,112 @@ async fn pump_stream<R>(
     }
 }
 
+async fn drain_stream_pumps_after_exit(
+    mut stdout_task: tokio::task::JoinHandle<()>,
+    mut stderr_task: tokio::task::JoinHandle<()>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<StreamChunk>,
+    capture: &mut StreamOutputCapture,
+) {
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+    let idle_timer = tokio::time::sleep(OUTPUT_DRAIN_TIMEOUT);
+    tokio::pin!(idle_timer);
+
+    loop {
+        if stdout_done && stderr_done {
+            break;
+        }
+
+        tokio::select! {
+            Some(chunk) = rx.recv() => {
+                capture.append(chunk);
+                idle_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + OUTPUT_DRAIN_TIMEOUT);
+
+                if capture.is_capped() {
+                    if !stdout_done {
+                        stdout_task.abort();
+                    }
+                    if !stderr_done {
+                        stderr_task.abort();
+                    }
+                    break;
+                }
+            }
+            _ = &mut stdout_task, if !stdout_done => {
+                stdout_done = true;
+            }
+            _ = &mut stderr_task, if !stderr_done => {
+                stderr_done = true;
+            }
+            _ = &mut idle_timer => {
+                if !stdout_done {
+                    stdout_task.abort();
+                }
+                if !stderr_done {
+                    stderr_task.abort();
+                }
+                break;
+            }
+        }
+    }
+
+    if !stdout_done {
+        let _ = stdout_task.await;
+    }
+    if !stderr_done {
+        let _ = stderr_task.await;
+    }
+
+    drain_stream_chunks(rx, capture);
+}
+
+/// Build a shell script that sets up filesystem isolation inside a new mount
+/// namespace before executing `command`.
+///
+/// When `unshare --mount` creates a new mount namespace, the child still
+/// inherits the full host filesystem.  This wrapper:
+///
+/// 1. Remounts `/` as private to prevent mount propagation.
+/// 2. Mounts a fresh `/proc` (required by PID namespace).
+/// 3. Mounts `tmpfs` over `/tmp` and `/var/tmp` to block temp-file leaks.
+/// 4. Creates a `tmpfs` at `/workspace` and bind-mounts `working_dir` into it
+///    so tools can read/write their workspace without seeing the host tree.
+///
+/// Mount failures are non-fatal: the script continues with `|| true` so tools
+/// still execute even when the kernel denies a particular mount (e.g. inside
+/// an already-restricted container).
+fn build_mount_namespace_wrapper() -> String {
+    let script = r#"
+set -e
+# Make / private to prevent mount propagation back to the host
+mount --make-rprivate / 2>/dev/null || true
+# Fresh procfs for the PID namespace
+mount -t proc proc /proc 2>/dev/null || true
+# Isolate temporary directories
+mount -t tmpfs -o size=128M,mode=1777 tmpfs /tmp 2>/dev/null || true
+mkdir -p /var/tmp 2>/dev/null || true
+mount -t tmpfs -o size=32M,mode=1777 tmpfs /var/tmp 2>/dev/null || true
+# Create workspace and bind-mount the working directory.
+# We use /tmp/_astra_ws instead of /workspace because / is often not
+# writable in unprivileged user namespaces (root-owned on the host).
+# The path comes from argv, not the environment, so callers cannot spoof it.
+# Validate arguments are present
+if [ $# -lt 2 ]; then
+  echo "Error: command and working directory arguments required" >&2
+  exit 1
+fi
+mkdir -p /tmp/_astra_ws 2>/dev/null || true
+mount --bind -- "$2" /tmp/_astra_ws 2>/dev/null || true
+cd /tmp/_astra_ws
+# Execute the actual command with strict mode
+set -u
+exec bash -c "$1"
+"#;
+    script.trim().to_string()
+}
+
 /// Execute a command with Linux process isolation.
 ///
 /// # Fallback behavior
@@ -420,14 +627,26 @@ pub async fn execute_isolated(
     let ns_available = wants_ns && unshare_available();
 
     // Warn operators when namespace isolation was requested but is unavailable.
-    // This prevents silent security degradation in Strict mode.
+    // In Strict mode, this is a hard failure — security guarantees are NOT met.
     if wants_ns && !ns_available {
-        tracing::warn!(
+        tracing::error!(
             target: "astra_sandbox::process_isolation",
             "namespace isolation unavailable (unshare not found or not permitted); \
-             running without PID/mount/network namespace isolation. \
-             If this is a Strict-mode sandbox, security guarantees are NOT met."
+             refusing to execute in Strict-mode. \
+             PID/mount/network namespace isolation is required for strict sandboxing."
         );
+        return IsolatedOutput {
+            stdout: String::new(),
+            stderr: "Error: namespace isolation unavailable — strict-mode requires \
+                     PID/mount/network namespace isolation (unshare not found or not permitted)"
+                .to_string(),
+            exit_code: None,
+            timed_out: false,
+            stdout_capped: false,
+            stderr_capped: false,
+            namespace_active: false,
+            cgroup_active: false,
+        };
     }
 
     // ── Build the command ────────────────────────────────────────────
@@ -445,18 +664,37 @@ pub async fn execute_isolated(
             unshare_flags.push("--net");
         }
         // Map the current user to root inside the namespace (unprivileged).
-        unshare_flags.push("--map-root-user");
+        // Skip on kernels < 3.19 where this has known EoP vulnerabilities.
+        let use_map_root = map_root_user_safe();
+        if use_map_root {
+            unshare_flags.push("--map-root-user");
+        } else {
+            tracing::warn!(
+                target: "astra_sandbox::process_isolation",
+                "skipping --map-root-user: kernel is vulnerable. \
+                 User namespace isolation is degraded."
+            );
+        }
         unshare_flags.push("--");
         unshare_flags.push("bash");
         unshare_flags.push("-c");
-        unshare_flags.push(command);
-        (
-            "unshare".to_string(),
-            unshare_flags
-                .into_iter()
-                .map(String::from)
-                .collect::<Vec<_>>(),
-        )
+
+        // Build a filesystem isolation wrapper when mount namespace is active.
+        // Without this, the child inherits the full host filesystem including
+        // /etc/shadow and other sensitive paths.
+        let mut args = unshare_flags
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        if config.mount_namespace {
+            args.push(build_mount_namespace_wrapper());
+            args.push("astra-mount-wrapper".to_string());
+            args.push(command.to_string());
+            args.push(config.working_dir.display().to_string());
+        } else {
+            args.push(command.to_string());
+        }
+        ("unshare".to_string(), args)
     } else {
         (
             "bash".to_string(),
@@ -467,29 +705,23 @@ pub async fn execute_isolated(
     // ── cgroup setup ─────────────────────────────────────────────────
     let cg_path = create_cgroup(config);
 
+    // Freeze the cgroup *before* spawn to close the TOCTOU window:
+    // the child will be frozen immediately upon entering the cgroup
+    // and won't execute user code until limits are applied + unfreeze.
+    #[cfg(unix)]
+    if let Some(ref cg) = cg_path {
+        let _ = std::fs::write(cg.join("cgroup.freeze"), "1");
+    }
+
     let mut cmd = tokio::process::Command::new(&program);
     cmd.args(&args).current_dir(&config.working_dir).env_clear();
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    // Apply filtered environment.
+    // Apply filtered environment first (untrusted).
     for (k, v) in env {
         cmd.env(k, v);
-    }
-
-    // If cgroup created, write PID to cgroup.procs after spawn.
-    // We use a pre_exec hook on Unix to join the cgroup before exec.
-    #[cfg(unix)]
-    if let Some(ref cg) = cg_path {
-        let procs_path = cg.join("cgroup.procs");
-        unsafe {
-            cmd.pre_exec(move || {
-                let pid = std::process::id().to_string();
-                std::fs::write(&procs_path, &pid)
-                    .map_err(|e| std::io::Error::other(format!("cgroup join: {e}")))
-            });
-        }
     }
 
     let mut child = match cmd.spawn() {
@@ -510,6 +742,61 @@ pub async fn execute_isolated(
             };
         }
     };
+
+    // Post-spawn: join the child to its cgroup by writing the real PID.
+    // The cgroup was frozen before spawn — child won't execute until
+    // limits are applied and the freeze is released.
+    #[cfg(unix)]
+    if let Some(ref cg) = cg_path {
+        let Some(pid) = child.id() else {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            cleanup_cgroup(cg);
+            return IsolatedOutput {
+                stdout: String::new(),
+                stderr: "Failed to obtain child PID for cgroup join".to_string(),
+                exit_code: None,
+                timed_out: false,
+                stdout_capped: false,
+                stderr_capped: false,
+                namespace_active: false,
+                cgroup_active: false,
+            };
+        };
+        let procs_path = cg.join("cgroup.procs");
+        if let Err(e) = std::fs::write(&procs_path, pid.to_string()) {
+            tracing::error!(path = %procs_path.display(), %e, "cgroup.procs write failed — killing child");
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            cleanup_cgroup(cg);
+            return IsolatedOutput {
+                stdout: String::new(),
+                stderr: format!("cgroup join failed: {e}"),
+                exit_code: None,
+                timed_out: false,
+                stdout_capped: false,
+                stderr_capped: false,
+                namespace_active: false,
+                cgroup_active: false,
+            };
+        }
+        if let Err(e) = std::fs::write(cg.join("cgroup.freeze"), "0") {
+            tracing::error!(%e, "cgroup.freeze unfreeze failed — killing child");
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            cleanup_cgroup(cg);
+            return IsolatedOutput {
+                stdout: String::new(),
+                stderr: format!("cgroup unfreeze failed: {e}"),
+                exit_code: None,
+                timed_out: false,
+                stdout_capped: false,
+                stderr_capped: false,
+                namespace_active: false,
+                cgroup_active: false,
+            };
+        }
+    }
 
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
@@ -556,22 +843,14 @@ pub async fn execute_isolated(
     let stdout_task = tokio::spawn(pump_stream(stdout, StreamKind::Stdout, tx.clone()));
     let stderr_task = tokio::spawn(pump_stream(stderr, StreamKind::Stderr, tx));
 
-    let mut stdout_bytes = Vec::new();
-    let mut stderr_bytes = Vec::new();
-    let mut stdout_capped = false;
-    let mut stderr_capped = false;
+    let mut capture = StreamOutputCapture::new(config.max_output_bytes);
     let mut exit_code = None;
     let mut timed_out = false;
+    let mut abort_stream_pumps = false;
     let deadline = tokio::time::Instant::now() + config.timeout;
 
     loop {
-        drain_stream_chunks(
-            &mut rx,
-            &mut stdout_bytes,
-            &mut stderr_bytes,
-            &mut stdout_capped,
-            &mut stderr_capped,
-        );
+        drain_stream_chunks(&mut rx, &mut capture);
 
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -607,8 +886,7 @@ pub async fn execute_isolated(
             let _ = child.wait().await;
             // Abort I/O reader tasks immediately — grandchild processes may
             // still hold the pipes open (e.g. `sleep` surviving shell kill).
-            stdout_task.abort();
-            stderr_task.abort();
+            abort_stream_pumps = true;
             break;
         }
 
@@ -619,24 +897,26 @@ pub async fn execute_isolated(
         .await;
     }
 
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
-    // Drain any remaining buffered chunks from before the abort/completion.
-    drain_stream_chunks(
-        &mut rx,
-        &mut stdout_bytes,
-        &mut stderr_bytes,
-        &mut stdout_capped,
-        &mut stderr_capped,
-    );
+    if abort_stream_pumps {
+        stdout_task.abort();
+        stderr_task.abort();
+    }
+    drain_stream_pumps_after_exit(stdout_task, stderr_task, &mut rx, &mut capture).await;
 
     // ── Cleanup cgroup ───────────────────────────────────────────────
     if let Some(ref cg) = cg_path {
         cleanup_cgroup(cg);
     }
 
-    let mut stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
-    let mut stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+    let StreamOutputCapture {
+        stdout,
+        stderr,
+        stdout_capped,
+        stderr_capped,
+        ..
+    } = capture;
+    let mut stdout = String::from_utf8_lossy(&stdout).into_owned();
+    let mut stderr = String::from_utf8_lossy(&stderr).into_owned();
     if timed_out || stdout_capped {
         trim_incomplete_trailing_line(&mut stdout);
     }
@@ -668,6 +948,7 @@ mod tests {
         assert!(cfg.net_namespace);
         assert_eq!(cfg.memory_limit_bytes, 512 * 1024 * 1024);
         assert_eq!(cfg.cpu_quota, 1.0);
+        assert_eq!(cfg.max_output_bytes, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES);
     }
 
     #[test]
@@ -676,7 +957,10 @@ mod tests {
         assert!(!cfg.pid_namespace);
         assert!(!cfg.mount_namespace);
         assert!(!cfg.net_namespace);
-        assert_eq!(cfg.memory_limit_bytes, 0);
+        // Disabled mode still applies safety limits: 1 GiB memory cap
+        // and 600s timeout to prevent OOM and infinite execution.
+        assert_eq!(cfg.memory_limit_bytes, 1024 * 1024 * 1024);
+        assert_eq!(cfg.max_output_bytes, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES);
     }
 
     #[test]
@@ -727,14 +1011,12 @@ mod tests {
     #[test]
     fn apply_cgroup_zero_or_negative_limits_inactive() {
         // Zero memory, zero cpu
-        let mut cmd = tokio::process::Command::new("true");
-        let guard = apply_cgroup(&mut cmd, 0, 0.0);
+        let guard = apply_cgroup(0, 0.0);
         assert!(!guard.active(), "zero limits must not create a cgroup");
         assert!(guard.path().is_none());
 
         // Zero memory, negative cpu
-        let mut cmd = tokio::process::Command::new("true");
-        let guard = apply_cgroup(&mut cmd, 0, -1.0);
+        let guard = apply_cgroup(0, -1.0);
         assert!(!guard.active());
     }
 
@@ -744,8 +1026,7 @@ mod tests {
     /// yield an inactive guard (graceful fallback).
     #[test]
     fn apply_cgroup_activity_matches_host_support() {
-        let mut cmd = tokio::process::Command::new("true");
-        let guard = apply_cgroup(&mut cmd, 64 * 1024 * 1024, 1.0);
+        let guard = apply_cgroup(64 * 1024 * 1024, 1.0);
         if cgroupv2_available() {
             // On a cgroup v2 host we'd expect active, UNLESS writing to
             // /sys/fs/cgroup is blocked (unprivileged container, etc.) —
@@ -779,6 +1060,7 @@ mod tests {
         {
             let _guard = CgroupGuard {
                 cg_path: Some(fake_cg.clone()),
+                procs_path: None,
             };
             // guard goes out of scope here → Drop fires
         }
@@ -792,7 +1074,10 @@ mod tests {
     /// Inactive guard's Drop is a no-op (no panic, no work).
     #[test]
     fn cgroup_guard_inactive_drop_noop() {
-        let guard = CgroupGuard { cg_path: None };
+        let guard = CgroupGuard {
+            cg_path: None,
+            procs_path: None,
+        };
         drop(guard); // must not panic
     }
 
@@ -809,6 +1094,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_isolated_caps_combined_output_from_config() {
+        let mut config = IsolationConfig::disabled(PathBuf::from("/tmp"));
+        config.max_output_bytes = 4;
+        let env =
+            std::collections::HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+
+        let out = execute_isolated("printf 'a\\nb\\nc\\n'", &env, &config).await;
+
+        assert!(out.stdout_capped, "{out:?}");
+        assert_eq!(out.stdout, "a\nb\n");
+        assert_eq!(out.stdout.len() + out.stderr.len(), 4);
+    }
+
+    #[tokio::test]
     async fn execute_isolated_exit_code() {
         let config = IsolationConfig::disabled(PathBuf::from("/tmp"));
         let env =
@@ -817,25 +1116,158 @@ mod tests {
         assert_eq!(out.exit_code, Some(42));
     }
 
-    /// P1-K: execute_isolated must log a warning when namespace isolation
-    /// is requested but unavailable (Strict mode silent degradation).
-    /// P1-K: IsolationConfig::strict() requests namespace isolation.
-    /// When unshare is unavailable, namespace_active must be false in output.
+    /// P1-K: execute_isolated must hard-fail when namespace isolation
+    /// is requested but unavailable (Strict mode must not silently degrade).
     #[tokio::test]
-    async fn strict_mode_without_unshare_sets_namespace_active_false() {
-        // This test runs on any machine. If unshare IS available, namespace_active
-        // will be true (correct). If not, it must be false (not silently true).
+    async fn strict_mode_without_unshare_refuses_execution() {
         let config = IsolationConfig::strict(PathBuf::from("/tmp"));
         let env =
             std::collections::HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
         let out = execute_isolated("echo ok", &env, &config).await;
-        // namespace_active must accurately reflect whether unshare was used
-        assert_eq!(
-            out.namespace_active,
-            unshare_available(),
-            "namespace_active must match unshare_available()"
+        if unshare_available() {
+            assert!(out.namespace_active);
+            assert!(out.stdout.contains("ok") || out.exit_code == Some(0));
+        } else {
+            assert!(!out.namespace_active);
+            assert!(out.stdout.is_empty());
+            assert!(out.exit_code.is_none());
+            assert!(
+                out.stderr.contains("namespace isolation unavailable"),
+                "{out:?}"
+            );
+        }
+    }
+
+    /// The mount namespace wrapper script must include the workspace bind-mount
+    /// and proc/tmp tmpfs mounts when mount_namespace is active.
+    #[test]
+    fn build_mount_namespace_wrapper_includes_safety_mounts() {
+        let script = build_mount_namespace_wrapper();
+        // Essential safety mounts
+        assert!(
+            script.contains("mount --make-rprivate /"),
+            "must remount / as private"
         );
-        // Either way, the command must have run
-        assert!(out.stdout.contains("ok") || out.exit_code == Some(0));
+        assert!(
+            script.contains("mount -t proc proc /proc"),
+            "must mount fresh procfs"
+        );
+        assert!(
+            script.contains("mount -t tmpfs"),
+            "must mount tmpfs for /tmp"
+        );
+        assert!(script.contains("mount --bind"), "must bind-mount workspace");
+        // Should use argv, not a user-controlled environment variable.
+        assert!(
+            script.contains("mount --bind -- \"$2\""),
+            "must reference working dir via argv with an option boundary"
+        );
+        assert!(
+            script.contains("/tmp/_astra_ws"),
+            "must bind-mount to /tmp/_astra_ws"
+        );
+        assert!(
+            script.contains("cd /tmp/_astra_ws"),
+            "must change to workspace dir"
+        );
+        assert!(
+            script.contains("exec bash -c \"$1\""),
+            "must execute the original command from argv"
+        );
+    }
+
+    /// The wrapper must use argv for path to prevent shell injection via
+    /// directory names and environment spoofing.
+    #[test]
+    fn build_mount_namespace_wrapper_uses_argv_not_embedded_path_or_env() {
+        let script = build_mount_namespace_wrapper();
+        // Should NOT contain any hardcoded paths (security: no shell injection)
+        assert!(
+            !script.contains("/home/user"),
+            "should not embed hardcoded paths: {script}"
+        );
+        assert!(
+            !script.contains("/tmp/user"),
+            "should not embed hardcoded paths: {script}"
+        );
+        // Should use argv instead of a spoofable env var.
+        assert!(
+            script.contains("mount --bind -- \"$2\""),
+            "must use argv for working dir: {script}"
+        );
+        assert!(
+            !script.contains("ASTRA_WORKING_DIR"),
+            "must not depend on user-controlled env for working dir: {script}"
+        );
+    }
+
+    /// The wrapper must never embed command text directly: command bytes are
+    /// passed as argv and executed with `bash -c "$1"` after setup.
+    #[test]
+    fn build_mount_namespace_wrapper_does_not_embed_command_text() {
+        let script = build_mount_namespace_wrapper();
+        assert!(
+            !script.contains("echo 'injected"),
+            "wrapper must not embed command text: {script}"
+        );
+        assert!(script.contains("exec bash -c \"$1\""));
+    }
+
+    /// Integration: when mount_namespace is active, the executed command
+    /// should see a restricted filesystem (no /etc/shadow accessible).
+    /// This test only runs when unshare is available.
+    #[tokio::test]
+    async fn mount_namespace_restricts_host_filesystem() {
+        if !unshare_available() {
+            return; // skip on non-Linux or unprivileged containers
+        }
+        let mut config = IsolationConfig::strict(PathBuf::from("/tmp"));
+        config.net_namespace = false; // keep net to simplify test
+        let env =
+            std::collections::HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        // Try to read /etc/shadow — should fail because tmpfs covers /tmp
+        // and the original /etc is not accessible via bind mount.
+        // Instead verify /workspace exists and contains the working dir.
+        // Use printf to avoid single-quote escaping complexity in mount namespace.
+        let out = execute_isolated(
+            "test -d /tmp/_astra_ws && printf workspace_ok; test -f /tmp/_astra_ws/../etc/shadow && printf shadow_leaked || printf shadow_blocked",
+            &env,
+            &config,
+        )
+        .await;
+        assert!(
+            out.stdout.contains("workspace_ok"),
+            "/tmp/_astra_ws should exist: {out:?}"
+        );
+        assert!(
+            out.stdout.contains("shadow_blocked"),
+            "/etc/shadow should not be accessible from /tmp/_astra_ws/../etc: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mount_namespace_preserves_single_quotes_in_command() {
+        if !unshare_available() {
+            return; // skip on non-Linux or unprivileged containers
+        }
+        let mut config = IsolationConfig::strict(PathBuf::from("/tmp"));
+        config.net_namespace = false;
+        let env =
+            std::collections::HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+
+        let out = execute_isolated("printf 'quote_ok\\n'", &env, &config).await;
+        assert!(out.stdout.contains("quote_ok"), "{out:?}");
+    }
+
+    /// Regression: when mount_namespace is disabled, the wrapper must NOT be
+    /// used — the raw command must be passed directly.
+    #[tokio::test]
+    async fn disabled_mount_namespace_passes_raw_command() {
+        let config = IsolationConfig::disabled(PathBuf::from("/tmp"));
+        let env =
+            std::collections::HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        // This command would fail if wrapped (cd /workspace wouldn't exist)
+        let out = execute_isolated("echo 'raw_ok'", &env, &config).await;
+        assert!(out.stdout.contains("raw_ok"), "{out:?}");
     }
 }

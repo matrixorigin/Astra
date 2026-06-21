@@ -70,6 +70,7 @@ async fn cache_breakpoint_persists_turn_over_turn() {
         "u".to_string(),
         "s".to_string(),
     )
+    .with_server_sandbox_workspace("/tmp/astra-phase-r7-context")
     .with_edge_tools(vec![tool_schema()])
     .with_test_llm_rounds(vec![scripted("a"), scripted("b"), scripted("c")])
     .with_mock_provider("anthropic", "claude-sonnet-4")
@@ -345,6 +346,7 @@ async fn subrun_does_not_leak_parent_results_into_child() {
         "u".to_string(),
         "parent-session".to_string(),
     )
+    .with_server_sandbox_workspace("/tmp/astra-phase-r7-context")
     .with_edge_tools(vec![tool_schema()])
     .with_test_llm_rounds(vec![scripted("parent reply")])
     .with_mock_provider("anthropic", "claude-sonnet-4")
@@ -383,6 +385,7 @@ async fn subrun_does_not_leak_parent_results_into_child() {
         String::new(),
         "subrun-test-session".to_string(),
     )
+    .with_server_sandbox_workspace("/tmp/astra-phase-r7-context")
     .with_edge_tools(vec![tool_schema()])
     .with_test_llm_rounds(vec![scripted("child reply")])
     .with_mock_provider("anthropic", "claude-sonnet-4")

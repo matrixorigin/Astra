@@ -4,6 +4,10 @@ use serde_json::Value;
 
 use crate::prompts;
 
+const ABSOLUTE_TRIM_SCHEMA_TOKENS: usize = 128_000;
+const ABSOLUTE_COMPACT_HISTORY_TOKENS: usize = 200_000;
+const ABSOLUTE_AGGRESSIVE_PRUNE_TOKENS: usize = 320_000;
+
 /// Same pressure value used when building `SelectionContext` for tool selection.
 #[must_use]
 pub fn budget_pressure_for_chat_turn(
@@ -15,6 +19,19 @@ pub fn budget_pressure_for_chat_turn(
     let budget = prompts::budget_for_model(model);
     let tier = budget.compaction_tier(estimated);
     tier.budget_pressure()
+        .max(absolute_latency_pressure(estimated))
+}
+
+fn absolute_latency_pressure(estimated_tokens: usize) -> f64 {
+    if estimated_tokens >= ABSOLUTE_AGGRESSIVE_PRUNE_TOKENS {
+        0.9
+    } else if estimated_tokens >= ABSOLUTE_COMPACT_HISTORY_TOKENS {
+        0.6
+    } else if estimated_tokens >= ABSOLUTE_TRIM_SCHEMA_TOKENS {
+        0.3
+    } else {
+        0.0
+    }
 }
 
 #[cfg(test)]
@@ -150,6 +167,17 @@ mod tests {
     fn empty_messages_zero_schema_is_normal() {
         let p = budget_pressure_for_chat_turn(&[], None, 0);
         assert_eq!(p, 0.0);
+    }
+
+    #[test]
+    fn large_absolute_prompt_escalates_pressure_even_on_large_context_model() {
+        assert_eq!(
+            budget_pressure_for_chat_turn(&[], Some("gemini-2.5-pro"), 100_000),
+            0.0
+        );
+        assert!(budget_pressure_for_chat_turn(&[], Some("gemini-2.5-pro"), 128_000) >= 0.3);
+        assert!(budget_pressure_for_chat_turn(&[], Some("gemini-2.5-pro"), 200_000) >= 0.6);
+        assert!(budget_pressure_for_chat_turn(&[], Some("gemini-2.5-pro"), 320_000) >= 0.9);
     }
 
     /// Even with many messages, if they're all short and no schema tokens,

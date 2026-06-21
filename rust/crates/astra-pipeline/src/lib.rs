@@ -14,7 +14,6 @@ pub mod event;
 pub mod exactly_once;
 pub mod feedback_extraction;
 pub mod feedback_store;
-pub mod journal_crypto;
 pub mod output_stream;
 pub mod reflection_feedback;
 pub mod routing;

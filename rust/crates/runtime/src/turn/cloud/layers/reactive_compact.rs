@@ -58,12 +58,11 @@ impl CompressionLayer for ReactiveCompact {
 
         let boundary = Message {
             role: "system".to_string(),
-            content: Some(format!(
-                "[EMERGENCY COMPACTION: {} messages ({} turns) removed due to context overflow. \
-                 Only the most recent {} messages are preserved. \
-                 If you need earlier context, ask the user to provide it again.]",
-                plan.removed_count, plan.turns_removed, KEEP_TAIL
-            )),
+            content: Some(
+                "[Context compacted: older messages were removed due to context overflow. \
+                 The conversation continues below.]"
+                    .to_string(),
+            ),
             content_is_tool_result: false,
             content_was_array: false,
             content_modified: false,

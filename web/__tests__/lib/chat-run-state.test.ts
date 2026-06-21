@@ -30,12 +30,12 @@ function waitingRun(
 
 describe('deriveChatRunUiState', () => {
   it('allows queued follow-up input for active queueable statuses', () => {
-    for (const status of ['running', 'input-queued', 'waiting']) {
+    for (const status of ['running', 'input-queued', 'waiting', 'blocked']) {
       const ui = deriveChatRunUiState({ ...base, activeRun: run(status) });
 
       expect(ui.canQueueDeferredInput).toBe(true);
       expect(ui.composerDisabled).toBe(false);
-      expect(ui.composerPlaceholder).toBe('Queue a follow-up for the next tool call...');
+      expect(ui.composerPlaceholder).toBe('Queue a follow-up for the next execution boundary...');
     }
   });
 

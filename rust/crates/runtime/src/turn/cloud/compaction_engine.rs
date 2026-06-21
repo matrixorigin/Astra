@@ -92,6 +92,41 @@ impl CompactionEngine {
         // Message::from or in the layer loop below.
         let mut typed: Vec<Message> = messages.iter().map(|v| Message::from(v.clone())).collect();
 
+        let outcome = self.compress_typed(&mut typed, budget);
+
+        // Only now — after every layer succeeded — overwrite the caller's
+        // messages. If any layer panicked, the original Vec<Value> is intact.
+        *messages = typed.into_iter().map(Value::from).collect();
+
+        // Re-sanitize after every typed round-trip: Message::from may filter
+        // malformed tool_calls even when no layer ultimately frees tokens, and
+        // that can still leave an empty tool_calls array on the way back out.
+        astra_turn_core::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
+
+        outcome
+    }
+
+    /// Run the layer pipeline on typed `Vec<Message>` without the Value
+    /// round-trip. Tests use this to inspect `_`-prefixed boundary markers
+    /// (`_compact_boundary`, `_messages_removed`, ...) that the wire
+    /// serializer (`From<Message> for Value`) intentionally strips to keep
+    /// prompt-cache prefixes stable. Production callers use
+    /// `compress_if_needed`, which delegates here after the Value→Message
+    /// conversion.
+    pub(crate) fn compress_typed(
+        &self,
+        typed: &mut Vec<Message>,
+        budget: &TokenBudget,
+    ) -> PipelineOutcome {
+        let pressure = budget.pressure();
+        if pressure <= self.min_trigger_pressure() {
+            return PipelineOutcome {
+                layer_results: Vec::new(),
+                total_tokens_freed: 0,
+                budget_satisfied: !budget.is_over_budget(),
+            };
+        }
+
         let mut running_budget = budget.clone();
         let mut layer_results = Vec::new();
         let mut total_freed: u64 = 0;
@@ -101,7 +136,7 @@ impl CompactionEngine {
                 continue;
             }
 
-            let result = layer.compress(&mut typed, &running_budget);
+            let result = layer.compress(typed, &running_budget);
             if result.estimated_tokens_freed == 0 {
                 continue;
             }
@@ -117,15 +152,6 @@ impl CompactionEngine {
                 break;
             }
         }
-
-        // Only now — after every layer succeeded — overwrite the caller's
-        // messages. If any layer panicked, the original Vec<Value> is intact.
-        *messages = typed.into_iter().map(Value::from).collect();
-
-        // Re-sanitize after every typed round-trip: Message::from may filter
-        // malformed tool_calls even when no layer ultimately frees tokens, and
-        // that can still leave an empty tool_calls array on the way back out.
-        astra_turn_core::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
 
         PipelineOutcome {
             layer_results,

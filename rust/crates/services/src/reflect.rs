@@ -479,6 +479,11 @@ fn summary_for(kind: astra_core::ErrorKind, tool: &str, count: i64) -> String {
         K::ToolUnavailable => {
             format!("Tool not available in this environment ({tool}) — {count} occurrences")
         }
+        K::ToolBinding => {
+            format!(
+                "Tool binding mismatch ({tool}): advertised without executor/transport — {count} occurrences"
+            )
+        }
         K::ContextWindow => format!(
             "Prompt exceeded context window ({tool}): compact history or switch model — {count} occurrences"
         ),

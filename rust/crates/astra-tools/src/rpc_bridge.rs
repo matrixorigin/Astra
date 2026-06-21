@@ -627,7 +627,7 @@ mod tests {
         let token = AuthToken::from_str_for_test("tok");
         let exec = MockExecutor::new();
         let counter = AtomicUsize::new(0);
-        let req = r#"{"tool":"git_commit","args":{},"auth_token":"tok"}"#;
+        let req = r#"{"tool":"unknown_tool","args":{},"auth_token":"tok"}"#;
         let (resp, _) = rpc_roundtrip(req, &policy, &token, &exec, &counter).await;
         assert!(resp.contains("not allowed"), "resp: {resp}");
         assert_eq!(exec.call_count(), 0);

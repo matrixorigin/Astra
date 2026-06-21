@@ -432,7 +432,47 @@ pub fn parse_degraded_tool_calls(text: &str) -> Option<Vec<Value>> {
 /// `parse_degraded_tool_calls` matched first.
 pub fn strip_degraded_tool_calls(text: &str) -> String {
     let after_invoke = strip_parsed_invocations(text);
-    strip_parsed_tool_call_tags(&after_invoke)
+    let after_tool_call = strip_parsed_tool_call_tags(&after_invoke);
+    strip_residual_xml_fragments(&after_tool_call)
+}
+
+/// Strip bare `<parameter=…>` and `<function=…>` fragments that aren't
+/// wrapped in proper `<invoke>` blocks. These appear when models emit
+/// degraded tool call syntax directly in text output (no `<invoke>` wrapper,
+/// no valid XML quoting — just `<parameter=action> value`-style raw text).
+///
+/// Without this cleanup, the user sees raw tool-call markup leaking into the
+/// transcript alongside the assistant's natural-language response.
+fn strip_residual_xml_fragments(text: &str) -> String {
+    use regex::Regex;
+
+    if !text.contains("<parameter=") && !text.contains("<function=") {
+        return text.to_string();
+    }
+
+    // `<parameter=KEY>` or `<parameter=KEY>VALUE` — strip tag and the
+    // immediately-following word (the "value") when present on the same line.
+    static RE_PARAM: OnceLock<Regex> = OnceLock::new();
+    let re_param = RE_PARAM.get_or_init(|| Regex::new(r"<parameter=[^>]+>\s*\S*").unwrap());
+
+    // `<function=NAME>` — self-closing fragment, no value.
+    static RE_FUNC: OnceLock<Regex> = OnceLock::new();
+    let re_func = RE_FUNC.get_or_init(|| Regex::new(r"<function=[^>]+>").unwrap());
+
+    let mut result = re_param.replace_all(text, "").to_string();
+    result = re_func.replace_all(&result, "").to_string();
+
+    // Collapse multiple spaces left by removal, trim per-line.
+    static RE_SPACES: OnceLock<Regex> = OnceLock::new();
+    let re_spaces = RE_SPACES.get_or_init(|| Regex::new(r" {2,}").unwrap());
+    result = re_spaces.replace_all(&result, " ").to_string();
+
+    // Remove blank lines created by fragment removal.
+    static RE_BLANK: OnceLock<Regex> = OnceLock::new();
+    let re_blank = RE_BLANK.get_or_init(|| Regex::new(r"\n{3,}").unwrap());
+    result = re_blank.replace_all(&result, "\n\n").to_string();
+
+    result.trim().to_string()
 }
 
 // ─── <invoke> Parsing Helpers ───────────────────────────────────────────────
@@ -890,5 +930,47 @@ Done."#;
             calls.is_some(),
             "invoke with surrounding prose should be parsed"
         );
+    }
+
+    #[test]
+    fn strip_residual_fragments_removes_parameter_tags() {
+        let input = "所有任务已完成。更新一下 task board 状态：  <parameter=action> update  <parameter=new_status> completed";
+        let result = strip_residual_xml_fragments(input);
+        assert!(!result.contains("<parameter="));
+        assert!(!result.contains("<function="));
+        assert!(result.contains("所有任务已完成"));
+        assert!(!result.contains("update"));
+        assert!(!result.contains("completed"));
+    }
+
+    #[test]
+    fn strip_residual_fragments_removes_function_tags() {
+        let input = "text\n<function=task> <parameter=action> update  <parameter=new_status> completed  <parameter=task_id> task-5\nmore";
+        let result = strip_residual_xml_fragments(input);
+        assert!(!result.contains("<parameter="));
+        assert!(!result.contains("<function="));
+        assert!(result.contains("text"));
+        assert!(result.contains("more"));
+        assert!(!result.contains("update"));
+        assert!(!result.contains("task-5"));
+    }
+
+    #[test]
+    fn strip_residual_fragments_preserves_normal_text() {
+        let input = "normal text without any fragments at all";
+        let result = strip_residual_xml_fragments(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn strip_residual_fragments_handles_user_transcript() {
+        let input = "所有任务已完成。更新一下 stale 的 task board 状态：  <parameter=action> update  <parameter=new_status> completed\n<parameter=task_id> task-3\n\n<function=task> <parameter=action> update  <parameter=new_status> completed  <parameter=task_id> task-4\n\n<function=task> <parameter=action> update  <parameter=new_status> completed  <parameter=task_id> task-5";
+        let result = strip_residual_xml_fragments(input);
+        assert!(!result.contains("<parameter="));
+        assert!(!result.contains("<function="));
+        assert!(result.contains("所有任务已完成"));
+        assert!(!result.contains("task-3"));
+        assert!(!result.contains("task-4"));
+        assert!(!result.contains("task-5"));
     }
 }

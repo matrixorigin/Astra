@@ -188,3 +188,51 @@ pub(super) async fn admin_cleanup_handler(
         "tables": details,
     })))
 }
+
+// ── Runtime tool enable/disable ───────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub(super) struct DisableToolRequest {
+    tool_name: String,
+}
+
+/// GET /admin/tools/disabled — list all runtime-disabled tools.
+pub(super) async fn admin_list_disabled_tools_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<String>>, (StatusCode, Json<ErrorResponse>)> {
+    state.admin.authorizer.require_admin(&headers).await?;
+    let tools = state.tool_execution_service.disabled_tools().await;
+    Ok(Json(tools))
+}
+
+/// PUT /admin/tools/disabled — disable a tool at runtime.
+pub(super) async fn admin_disable_tool_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DisableToolRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state.admin.authorizer.require_admin(&headers).await?;
+    let added = state
+        .tool_execution_service
+        .disable_tool(&body.tool_name)
+        .await;
+    Ok(Json(serde_json::json!({
+        "tool_name": body.tool_name,
+        "was_added": added,
+    })))
+}
+
+/// DELETE /admin/tools/disabled/{tool_name} — re-enable a tool at runtime.
+pub(super) async fn admin_enable_tool_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(tool_name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state.admin.authorizer.require_admin(&headers).await?;
+    let removed = state.tool_execution_service.enable_tool(&tool_name).await;
+    Ok(Json(serde_json::json!({
+        "tool_name": tool_name,
+        "was_removed": removed,
+    })))
+}

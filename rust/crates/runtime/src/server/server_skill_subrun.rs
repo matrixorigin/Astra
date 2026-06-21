@@ -28,10 +28,13 @@ use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
 use astra_text_utils::semantic_dedup::SemanticDedup;
+
+use crate::server::tool_execution_service::ToolExecutionService;
 use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
 use astra_turn_core::turn_guard::TurnGuard;
 
 use super::server_loop_host::ServerAgenticLoopHostBuilder;
+use super::tool_transport::ExecutionBindingSnapshot;
 
 /// Maximum turns for a skill sub-run (matches CLI's SUBRUN_MAX_TURNS).
 pub const SUBRUN_MAX_TURNS: usize = 30;
@@ -55,6 +58,8 @@ pub struct ServerSkillSubRunExecutor {
     edge_tools: Vec<Value>,
     /// Edge profile (cwd, git_branch, etc.) inherited from parent.
     edge_profile: Map<String, Value>,
+    /// Workspace/executor/runtime binding inherited from the parent run.
+    execution_binding_snapshot: Option<ExecutionBindingSnapshot>,
     /// Skill resolver inherited from parent — enables nested inline skills.
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
     /// Parent cancellation token — propagated so stop/cancel interrupts sub-runs.
@@ -83,6 +88,8 @@ pub struct ServerSkillSubRunExecutor {
     /// from the parent lifecycle service. `None` → no extraction in
     /// skill sub-runs (rarely surfaces user-relevant memory).
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
+    /// Request-level permissions inherited from the parent server run.
+    inherited_permissions: crate::orchestration::InheritedPermissions,
 }
 
 impl ServerSkillSubRunExecutor {
@@ -99,6 +106,7 @@ impl ServerSkillSubRunExecutor {
             llm_token_service: None,
             edge_tools: Vec::new(),
             edge_profile: Map::new(),
+            execution_binding_snapshot: None,
             skill_resolver: None,
             cancel_token: None,
             forward_headers: HashMap::new(),
@@ -110,6 +118,7 @@ impl ServerSkillSubRunExecutor {
             #[cfg(feature = "harness")]
             harness_sink: None,
             memory_extraction_service: None,
+            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
         }
     }
 
@@ -158,6 +167,11 @@ impl ServerSkillSubRunExecutor {
         self
     }
 
+    pub fn with_execution_binding_snapshot(mut self, snapshot: ExecutionBindingSnapshot) -> Self {
+        self.execution_binding_snapshot = Some(snapshot);
+        self
+    }
+
     pub fn with_skill_resolver(
         mut self,
         resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
@@ -181,6 +195,14 @@ impl ServerSkillSubRunExecutor {
 
     pub fn with_request_constraints(mut self, constraints: RequestConstraints) -> Self {
         self.request_constraints = constraints;
+        self
+    }
+
+    pub fn with_inherited_permissions(
+        mut self,
+        inherited_permissions: crate::orchestration::InheritedPermissions,
+    ) -> Self {
+        self.inherited_permissions = inherited_permissions;
         self
     }
 
@@ -254,6 +276,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         let compact_strategy = astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
             effective_model.as_deref().unwrap_or(""),
         );
+        let permission_context =
+            crate::orchestration::PermissionSyncContext::shared(self.inherited_permissions.clone());
 
         // Build a sub-run session ID for isolation.
         let safe_name = crate::skills::loader::sanitize_for_path(skill_name);
@@ -287,6 +311,10 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         ))
         .with_edge_profile(self.edge_profile.clone())
         .with_edge_callback_ledger(Arc::new(TokioMutex::new(HashMap::new())));
+
+        if let Some(snapshot) = &self.execution_binding_snapshot {
+            builder = builder.with_execution_binding_snapshot(snapshot.clone());
+        }
 
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
@@ -445,6 +473,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             api_token: String::new(),
             delegation_engine: None,
             delegations_this_turn: 0,
+            delegation_chain: Vec::new(),
+            self_agent_id: "orchestrator".to_string(),
             project_context: None,
             checkpoint_gate: None,
             last_llm_context_manifest_trace: None,
@@ -464,7 +494,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             max_cumulative_tokens: SUBRUN_MAX_CUMULATIVE_TOKENS,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
             recent_file_reads: Vec::new(),
-            permission_context: None,
+            permission_context: Some(permission_context),
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
@@ -505,6 +535,12 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         {
             let workspace = self.provision_skill_workspace(skill_name, &subrun_session_id);
             let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
+
+            let mut builder = ToolExecutionService::builder();
+            if let Some(pool) = &self.edge_connection_pool {
+                builder = builder.edge_connection_pool(pool.clone());
+            }
+
             let mut executor = super::server_tool_executor::ServerToolExecutor::new(
                 workspace,
                 String::new(), // skill sub-runs don't track user_id
@@ -515,10 +551,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
                 self.shared_pool.is_some(),
             ))
-            .with_cancel_token(self.cancel_token.clone());
-            if let Some(pool) = &self.edge_connection_pool {
-                executor.set_edge_connection_pool(pool.clone());
-            }
+            .with_cancel_token(self.cancel_token.clone())
+            .with_tool_execution_service(builder.build());
             if let Some(pool) = &self.shared_pool {
                 executor.set_context_manifest_pool(pool.clone());
             }
@@ -549,6 +583,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::tool_transport::{
+        ExecutorBinding, ExecutorStatus, ToolTransportKind, WorkspaceAuthority, WorkspaceBinding,
+    };
 
     fn mock_matrixone() -> MatrixOneSettings {
         MatrixOneSettings::mock()
@@ -556,6 +593,23 @@ mod tests {
 
     fn mock_encryptor() -> Arc<FernetTokenEncryptor> {
         Arc::new(FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=").unwrap())
+    }
+
+    fn edge_runtime_snapshot() -> ExecutionBindingSnapshot {
+        ExecutionBindingSnapshot::new(
+            WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-1",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+            astra_runtime_env::RuntimeBinding::host_process("edge-host"),
+        )
     }
 
     #[test]
@@ -568,6 +622,10 @@ mod tests {
         assert!(executor.cancel_token.is_none());
         assert!(executor.skill_resolver.is_none());
         assert!(executor.llm_token_service.is_none());
+        assert_eq!(
+            executor.inherited_permissions.mode,
+            crate::orchestration::PermissionMode::Auto
+        );
     }
 
     #[test]
@@ -591,6 +649,40 @@ mod tests {
         assert!(executor.llm_token_service.is_some());
         assert_eq!(executor.edge_tools.len(), 1);
         assert!(executor.cancel_token.is_some());
+    }
+
+    #[test]
+    fn server_skill_subrun_executor_keeps_inherited_permissions() {
+        let inherited_permissions = crate::orchestration::InheritedPermissions::new(
+            crate::orchestration::PermissionMode::Deny,
+        );
+        let executor = ServerSkillSubRunExecutor::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "test-session".to_string(),
+        )
+        .with_inherited_permissions(inherited_permissions);
+
+        assert_eq!(
+            executor.inherited_permissions.mode,
+            crate::orchestration::PermissionMode::Deny
+        );
+    }
+
+    #[test]
+    fn server_skill_subrun_executor_keeps_execution_binding_snapshot() {
+        let snapshot = edge_runtime_snapshot();
+        let executor = ServerSkillSubRunExecutor::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "test-session".to_string(),
+        )
+        .with_execution_binding_snapshot(snapshot.clone());
+
+        assert_eq!(
+            executor.execution_binding_snapshot.as_ref(),
+            Some(&snapshot)
+        );
     }
 
     /// Server-side symmetric to `cli_skill_subrun_rejects_when_recursion_depth_limit_reached`:

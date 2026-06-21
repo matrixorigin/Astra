@@ -24,6 +24,7 @@ use crate::cli::mcp_config::execute_mcp_command;
 use crate::cli::one_shot_session_routing::{
     OneShotSessionRouting, resolve_one_shot_session_routing,
 };
+use crate::cli::permission_command::handle_permission_command;
 use crate::cli::permission_manager::{PermissionManager, PermissionMode};
 use crate::cli::project_instructions::discover_project_instructions;
 use crate::cli::session::session_runtime;
@@ -102,7 +103,7 @@ fn maybe_wire_delegation_engine(
         token.to_string(),
         state.model.clone(),
         project_root.clone(),
-        state.perm_manager.mode(),
+        state.perm_manager.inherited_permissions_for_child(true),
         None,
     );
     let mut registry = astra_services::AgentProfileRegistry::new();
@@ -486,7 +487,6 @@ async fn execute_headless_task_body(
         api,
         token.clone(),
         pipeline_modules.unified_skill_registry.clone(),
-        pm.mode(),
         skill_search.clone(),
         session_id.clone(),
         effective_model.clone(),
@@ -1033,131 +1033,12 @@ async fn execute_repl_bridge_command(
     Ok(ExitCode::Success)
 }
 
-fn handle_permission_command(arg: &str, state: &mut SessionState) {
-    match arg {
-        "" => {
-            let next = match state.perm_manager.mode() {
-                PermissionMode::Prompt => PermissionMode::Plan,
-                PermissionMode::Plan => PermissionMode::AcceptEdits,
-                PermissionMode::AcceptEdits => PermissionMode::Auto,
-                PermissionMode::Auto => PermissionMode::Deny,
-                PermissionMode::Deny => PermissionMode::Prompt,
-            };
-            state.perm_manager.set_mode(next);
-            eprintln!(
-                "  {} Permission mode → {}",
-                theme::icon_info(),
-                permission_mode_display_label(next).magenta()
-            );
-        }
-        "all" => {
-            state.perm_manager.set_mode(PermissionMode::Auto);
-            eprintln!(
-                "  {} Permission mode → {} (all tools auto-approved)",
-                "⚡".yellow(),
-                permission_mode_display_label(PermissionMode::Auto).magenta()
-            );
-        }
-        "plan" => {
-            state.perm_manager.set_mode(PermissionMode::Plan);
-            eprintln!(
-                "  {} Permission mode → {} (read-only investigation mode)",
-                theme::icon_info(),
-                permission_mode_display_label(PermissionMode::Plan).magenta()
-            );
-        }
-        "accept_edits" | "accept-edits" => {
-            state.perm_manager.set_mode(PermissionMode::AcceptEdits);
-            eprintln!(
-                "  {} Permission mode → {} (workspace-local edits auto-approved)",
-                theme::icon_info(),
-                permission_mode_display_label(PermissionMode::AcceptEdits).magenta()
-            );
-        }
-        "rules" | "status" => {
-            let summary = state.perm_manager.rules_summary();
-            eprint!("{summary}");
-        }
-        "trust" => match state.perm_manager.trust_workspace() {
-            Ok(message) => eprintln!("  {} {message}", theme::icon_info()),
-            Err(err) => eprintln!("  {} Failed to trust workspace: {err}", theme::icon_warn()),
-        },
-        "untrust" => match state.perm_manager.untrust_workspace() {
-            Ok(message) => eprintln!("  {} {message}", theme::icon_info()),
-            Err(err) => eprintln!(
-                "  {} Failed to mark workspace untrusted: {err}",
-                theme::icon_warn()
-            ),
-        },
-        "trace" => {
-            for line in astra_turn_core::permission::audit::format_snapshot_lines(50) {
-                eprintln!("{line}");
-            }
-        }
-        arg if arg.starts_with("trace --export ") => {
-            let path = arg.trim_start_matches("trace --export ").trim();
-            if path.is_empty() {
-                eprintln!("  {} Missing export path", theme::icon_warn());
-                return;
-            }
-            let lines = astra_turn_core::permission::audit::snapshot_redacted_jsonl_lines();
-            let body = if lines.is_empty() {
-                String::new()
-            } else {
-                format!("{}\n", lines.join("\n"))
-            };
-            match std::fs::write(path, body) {
-                Ok(()) => eprintln!(
-                    "  {} Permission trace exported to {path}",
-                    theme::icon_info()
-                ),
-                Err(err) => eprintln!(
-                    "  {} Failed to export permission trace to {path}: {err}",
-                    theme::icon_warn()
-                ),
-            }
-        }
-        "prompt" | "default" | "ask" => {
-            state.perm_manager.set_mode(PermissionMode::Prompt);
-            eprintln!(
-                "  {} Permission mode → {}",
-                theme::icon_info(),
-                permission_mode_display_label(PermissionMode::Prompt).magenta()
-            );
-        }
-        _ => match arg.parse::<PermissionMode>() {
-            Ok(mode) => {
-                state.perm_manager.set_mode(mode);
-                eprintln!(
-                    "  {} Permission mode → {}",
-                    theme::icon_info(),
-                    permission_mode_display_label(mode).magenta()
-                );
-            }
-            Err(_) => {
-                eprintln!(
-                    "  {} Unknown mode '{}'. Use: auto, plan, accept-edits, prompt, deny, all, rules, trust, untrust, trace",
-                    theme::icon_warn(),
-                    arg
-                );
-            }
-        },
-    }
-}
-
-pub(crate) fn permission_mode_display_label(mode: PermissionMode) -> &'static str {
-    match mode {
-        PermissionMode::Prompt => "Ask",
-        PermissionMode::Auto => "Auto",
-        PermissionMode::AcceptEdits => "Edits",
-        PermissionMode::Plan => "Plan",
-        PermissionMode::Deny => "Deny",
-    }
-}
-
 #[cfg(test)]
 mod permission_mode_display_tests {
-    use super::{PermissionMode, handle_permission_command, permission_mode_display_label};
+    use super::PermissionMode;
+    use crate::cli::permission_command::{
+        handle_permission_command, permission_mode_display_label,
+    };
     use crate::cli::session::session_state::SessionState;
 
     #[test]
@@ -1173,13 +1054,19 @@ mod permission_mode_display_tests {
     }
 
     #[test]
-    fn default_alias_restores_ask_mode() {
-        let mut state = SessionState::default();
-        state.perm_manager.set_mode(PermissionMode::Auto);
+    fn removed_permission_aliases_do_not_change_mode() {
+        for alias in ["all", "default", "ask", "accept-edits"] {
+            let mut state = SessionState::default();
+            state.perm_manager.set_mode(PermissionMode::Deny);
 
-        handle_permission_command("default", &mut state);
+            handle_permission_command(alias, &mut state);
 
-        assert_eq!(state.perm_manager.mode(), PermissionMode::Prompt);
+            assert_eq!(
+                state.perm_manager.mode(),
+                PermissionMode::Deny,
+                "removed alias must be rejected: {alias}"
+            );
+        }
     }
 }
 
@@ -1811,7 +1698,6 @@ async fn execute_cli_command_impl(
                 api,
                 token.clone(),
                 astra_runtime::skills::default_unified_registry().clone(),
-                pm.mode(),
                 skill_search.clone(),
                 session_id.clone(),
                 effective_model.clone(),

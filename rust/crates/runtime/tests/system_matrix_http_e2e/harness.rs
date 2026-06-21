@@ -576,6 +576,37 @@ pub async fn wait_for_agent_event_types(
     }
 }
 
+/// Poll until a run reaches the specified status, or timeout.
+/// Returns the final status observed.
+pub async fn wait_for_run_status(
+    app: &Router,
+    run_id: &str,
+    auth: &str,
+    target_status: &str,
+    timeout: std::time::Duration,
+) -> String {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let (st, body) = get_json(app, &format!("/chat/runs/{run_id}"), Some(auth), &[]).await;
+        if st == StatusCode::OK {
+            let status = body["status"].as_str().unwrap_or("unknown");
+            if status == target_status {
+                return status.to_string();
+            }
+            // If we hit a terminal state that's not our target, bail early
+            if matches!(status, "completed" | "failed" | "cancelled") && status != target_status {
+                return status.to_string();
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "timeout ({timeout:?}) waiting for run {run_id} to reach status '{target_status}'"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// Shared Matrix E2E context after app build + user registration + session creation.
 pub struct MatrixE2eCtx {
     pub app: Router,

@@ -11,6 +11,7 @@ pub(crate) struct EdgeInfo {
     pub(crate) edge_agent_id: String,
     pub(crate) hostname: Option<String>,
     pub(crate) workspace_dir: Option<String>,
+    pub(crate) capabilities: Option<serde_json::Value>,
     pub(crate) connected_secs: u64,
 }
 
@@ -27,6 +28,7 @@ pub(crate) async fn edge_status_handler(
             edge_agent_id: info.edge_agent_id,
             hostname: info.hostname,
             workspace_dir: info.workspace_dir,
+            capabilities: info.capabilities,
             connected_secs: info.connected_at.elapsed().as_secs(),
         })
         .collect();

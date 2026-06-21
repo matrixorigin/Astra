@@ -342,9 +342,9 @@ struct ToolStubDef {
 const TOOL_STUB_DEFS: &[ToolStubDef] = &[
     ToolStubDef {
         name: "read_file",
-        signature: "path, offset=None, limit=None",
-        docstring: "Read a file's contents. Returns the file text.",
-        args_expr: r#"{"path": path, "offset": offset, "limit": limit}"#,
+        signature: "path, start_line=None, end_line=None, outline=None",
+        docstring: "Read a file's contents. Use start_line/end_line for line ranges or outline=True for signatures.",
+        args_expr: r#"{"path": path, "start_line": start_line, "end_line": end_line, "outline": outline}"#,
     },
     ToolStubDef {
         name: "write_file",
@@ -398,7 +398,7 @@ struct ToolDocLine {
 const TOOL_DOC_LINES: &[ToolDocLine] = &[
     ToolDocLine {
         name: "read_file",
-        doc: "  read_file(path, offset=None, limit=None) — read file contents",
+        doc: "  read_file(path, start_line=None, end_line=None, outline=None) — read file contents",
     },
     ToolDocLine {
         name: "write_file",
@@ -925,12 +925,20 @@ pub async fn run_script(
     // until the child has exited and been waited on — otherwise Drop
     // tries to remove a non-empty cgroup directory. Silent fallback when
     // cgroup v2 is unavailable: the guard is inactive and does nothing.
-    let _cgroup_guard =
-        astra_sandbox::apply_cgroup(&mut cmd, config.memory_limit_bytes, config.cpu_quota);
+    let cgroup_guard = astra_sandbox::apply_cgroup(config.memory_limit_bytes, config.cpu_quota);
 
     let mut child = cmd
         .spawn()
         .map_err(|e| io_context("run_script spawn python", e))?;
+
+    // Post-spawn: join child to cgroup by writing its real PID.
+    if let Some(pid) = child.id()
+        && let Err(e) = cgroup_guard.join_child(pid)
+    {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(io_context("cgroup join_child", e).into());
+    }
 
     let stdout = child.stdout.take().expect("stdout piped");
     let max_stdout = config.max_stdout_bytes;
@@ -1825,6 +1833,23 @@ mod tests {
     }
 
     #[test]
+    fn read_file_stub_uses_current_line_range_args() {
+        let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
+        let stub = generate_python_stub(&enabled);
+        assert!(
+            stub.contains("def read_file(path, start_line=None, end_line=None, outline=None):"),
+            "stub must expose the current read_file API; got:\n{stub}"
+        );
+        assert!(stub.contains(r#""start_line": start_line"#));
+        assert!(stub.contains(r#""end_line": end_line"#));
+        assert!(stub.contains(r#""outline": outline"#));
+        assert!(
+            !stub.contains("offset"),
+            "read_file stub must not advertise or pass legacy offset"
+        );
+    }
+
+    #[test]
     fn stub_contains_builtin_helpers() {
         let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
         let stub = generate_python_stub(&enabled);
@@ -1884,6 +1909,22 @@ mod tests {
         assert!(!desc.contains("Each call returns a dict"), "{desc}");
         assert!(script_desc.contains("synchronous"), "{script_desc}");
         assert!(script_desc.contains("no `await`"), "{script_desc}");
+    }
+
+    #[test]
+    fn schema_describes_current_read_file_args() {
+        let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
+        let schema =
+            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
+        let desc = schema["function"]["description"].as_str().unwrap();
+        assert!(
+            desc.contains("read_file(path, start_line=None, end_line=None, outline=None)"),
+            "schema must advertise current read_file args: {desc}"
+        );
+        assert!(
+            !desc.contains("read_file(path, offset=None, limit=None)"),
+            "schema must not advertise legacy read_file offset/limit: {desc}"
+        );
     }
 
     // R4.8: tool name in `_call("name", ...)` is JSON-encoded (double-quoted)

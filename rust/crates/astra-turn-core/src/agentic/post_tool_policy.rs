@@ -152,14 +152,11 @@ pub fn apply_agentic_post_tool_policy(
             append_openai_user_content_messages(messages, &verdict.injections);
         }
 
-        // Inject TurnGuard avoid_tools into same-turn restricted_tools
-        // so the model cannot re-use flagged tools within the current turn
-        // (cross-turn restriction is handled separately via resume_restricted_tools).
-        for tool in &verdict.avoid_tools {
-            if !crate::guardrails::turn_guard::is_read_only_never_restrict(tool) {
-                restricted_tools.insert(tool.clone());
-            }
-        }
+        // `avoid_tools` is advisory stall-recovery guidance. Removing those
+        // tools from the visible schema changes the model contract mid-turn and
+        // can force it onto a worse surface. Hard restrictions are owned by
+        // permission, interaction-mode, runtime allowlist, and resource-limit
+        // enforcement, not by soft health diagnostics.
 
         match verdict.severity {
             VerdictSeverity::Critical => {
@@ -296,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn reward_hacking_warning_retries_and_restricts_tools() {
+    fn reward_hacking_warning_retries_without_schema_restriction() {
         let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();
         let mut stall_events = Vec::new();
@@ -336,8 +333,7 @@ mod tests {
 
         assert_eq!(out, AgenticPostToolPolicyOutcome::RetryLlmClearToolResults);
         assert_eq!(remaining_turns, 8);
-        // read_file is read-only — it should NOT be restricted (model needs it
-        // for observation), but it should still appear in the verdict audit.
+        // Reward-hacking guidance is advisory and must not hide the schema.
         assert!(
             !restricted_tools.contains("read_file"),
             "read-only tools must not be added to restricted_tools"
@@ -400,6 +396,104 @@ mod tests {
         assert_eq!(remaining_turns, 10);
         assert_eq!(verdict_events.len(), 1);
         assert_eq!(verdict_events[0].severity, "info");
+    }
+
+    #[test]
+    fn advisory_avoid_tools_do_not_remove_visible_tool_schema() {
+        let mut intent_tool_turns = Vec::new();
+        let mut messages = Vec::new();
+        let mut stall_events = Vec::new();
+        let mut verdict_events = Vec::new();
+        let mut restricted_tools = HashSet::new();
+        let mut remaining_turns = 10usize;
+        let mut step_recorder = StepRecorder::with_persistence("sid", "tid");
+        let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
+        let mut turn_guard = TurnGuard::new();
+        let tool_calls = vec![
+            json!({"name": "agent_fanout", "arguments": {"action": "get_results", "group_id": "review"}}),
+            json!({"name": "agent_fanout", "arguments": {"action": "get_results", "group_id": "review"}}),
+            json!({"name": "agent_fanout", "arguments": {"action": "get_results", "group_id": "review"}}),
+        ];
+        turn_guard.record_tool_calls(&tool_calls);
+
+        let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
+            turn_index: 0,
+            message: "collect review results",
+            tool_calls_for_guard: &tool_calls,
+            intent_tool_turns: &mut intent_tool_turns,
+            messages: &mut messages,
+            stall_events: &mut stall_events,
+            turn_guard: &mut turn_guard,
+            verdict_events: &mut verdict_events,
+            restricted_tools: &mut restricted_tools,
+            remaining_turns: &mut remaining_turns,
+            step_recorder: &mut step_recorder,
+            current_session_id: None,
+            max_turns: 8,
+            loop_turn: 0,
+            recent_tools: &[],
+            last_heavy_checkpoint: &mut last_heavy_checkpoint,
+            interaction_mode: TurnInteractionMode::Prompt,
+        });
+
+        assert_eq!(out, AgenticPostToolPolicyOutcome::RetryLlmClearToolResults);
+        assert_eq!(verdict_events.len(), 1);
+        assert!(
+            verdict_events[0]
+                .avoid_tools
+                .contains(&"agent_fanout".to_string())
+        );
+        assert!(
+            !turn_guard.health.is_deprioritized("agent_fanout"),
+            "stall advice alone must not mark the tool unhealthy"
+        );
+        assert!(
+            !restricted_tools.contains("agent_fanout"),
+            "advisory avoid_tools must not remove the tool schema"
+        );
+    }
+
+    #[test]
+    fn health_deprioritized_tools_remain_same_turn_advisory() {
+        let mut intent_tool_turns = Vec::new();
+        let mut messages = Vec::new();
+        let mut stall_events = Vec::new();
+        let mut verdict_events = Vec::new();
+        let mut restricted_tools = HashSet::new();
+        let mut remaining_turns = 10usize;
+        let mut step_recorder = StepRecorder::with_persistence("sid", "tid");
+        let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
+        let mut turn_guard = TurnGuard::new();
+        for _ in 0..3 {
+            turn_guard.health.record_failure("write_file");
+        }
+
+        let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
+            turn_index: 0,
+            message: "run command",
+            tool_calls_for_guard: &[],
+            intent_tool_turns: &mut intent_tool_turns,
+            messages: &mut messages,
+            stall_events: &mut stall_events,
+            turn_guard: &mut turn_guard,
+            verdict_events: &mut verdict_events,
+            restricted_tools: &mut restricted_tools,
+            remaining_turns: &mut remaining_turns,
+            step_recorder: &mut step_recorder,
+            current_session_id: None,
+            max_turns: 8,
+            loop_turn: 0,
+            recent_tools: &[],
+            last_heavy_checkpoint: &mut last_heavy_checkpoint,
+            interaction_mode: TurnInteractionMode::Prompt,
+        });
+
+        assert_eq!(out, AgenticPostToolPolicyOutcome::RetryLlmClearToolResults);
+        assert!(turn_guard.health.is_deprioritized("write_file"));
+        assert!(
+            !restricted_tools.contains("write_file"),
+            "soft health-deprioritized tools must not be hidden"
+        );
     }
 
     #[test]

@@ -78,7 +78,13 @@ fn unknown_model_falls_back_to_configured_default() {
     assert_eq!(budget, limits.max_turn_input_tokens);
 }
 
-// ─── 2. Factual volatile messages ────────────────────────────────────────
+// Pure-fact contract (first principle): a runtime event notification
+// states what happened and the authoritative user request. It must NOT
+// introduce a behavioral fork ("Continue only if X, otherwise Y") because
+// weak models under budget pressure read the fork as license to stop early,
+// and must NOT issue imperatives ("Avoid ...", "Do NOT ..."). The model's
+// action space stays unconstrained; the latest user request remains
+// authoritative.
 
 #[test]
 fn budget_reached_advisory_does_not_disable_tools() {
@@ -104,28 +110,67 @@ fn budget_reached_advisory_does_not_disable_tools() {
 }
 
 #[test]
-fn compact_resume_directive_stays_factual_not_adversarial() {
-    // This one fires right after a successful compact+spill. Its purpose
-    // is to tell the model "history was compressed, continue" without
-    // forbidding anything. The current version contains an absolute
-    // directive ("Do NOT summarize progress") which is fine tactically
-    // but becomes adversarial when combined with BUDGET_REACHED_ADVISORY
-    // on the same turn. Keep ONE behavioural nudge ("continue"); facts
-    // should dominate.
-    let msg = COMPACT_RESUME_DIRECTIVE;
+fn budget_reached_advisory_has_no_behavioral_fork() {
+    // "Continue only if X; otherwise answer concisely" is a fork that weak
+    // models resolve toward early termination under budget pressure. A
+    // runtime fact notification must not branch the agent's behavior.
+    let msg = BUDGET_REACHED_ADVISORY.to_lowercase();
     assert!(
-        msg.to_lowercase().contains("continue") || msg.to_lowercase().contains("keep working"),
-        "compact-resume directive should tell the model to continue, \
-         got: {msg:?}"
+        !msg.contains("otherwise"),
+        "budget advisory must not introduce a behavioral fork, got: {BUDGET_REACHED_ADVISORY:?}"
     );
-    // Sanity: still mentions the compaction event itself so the model
-    // knows why the history looks shorter.
     assert!(
-        msg.to_lowercase().contains("compact")
-            || msg.to_lowercase().contains("compress")
-            || msg.to_lowercase().contains("freed"),
-        "compact-resume directive should reference the compaction event, \
-         got: {msg:?}"
+        !msg.contains("concisely") && !msg.contains("concise"),
+        "budget advisory must not suggest early termination via brevity, got: {BUDGET_REACHED_ADVISORY:?}"
+    );
+    assert!(
+        !msg.contains("continue only"),
+        "budget advisory must not gate continuation, got: {BUDGET_REACHED_ADVISORY:?}"
+    );
+}
+
+#[test]
+fn budget_reached_advisory_has_no_imperatives() {
+    // Imperatives ("Avoid re-reading ...", "Do NOT ...") are directives,
+    // not facts. The runtime reports state; the latest user request
+    // decides behavior.
+    let msg = BUDGET_REACHED_ADVISORY.to_lowercase();
+    assert!(
+        !msg.contains("avoid "),
+        "budget advisory must not contain imperatives, got: {BUDGET_REACHED_ADVISORY:?}"
+    );
+    assert!(
+        !msg.contains("do not") && !msg.contains("don't"),
+        "budget advisory must not contain imperatives, got: {BUDGET_REACHED_ADVISORY:?}"
+    );
+}
+
+#[test]
+fn compact_resume_directive_is_pure_fact() {
+    // The compact-resume directive fires right after a successful
+    // compact+spill. Per the design docstring it must state what happened
+    // and NOT prescribe whether to continue or summarize. No behavioral
+    // fork, no imperatives, no gating of continuation.
+    let msg = COMPACT_RESUME_DIRECTIVE.to_lowercase();
+    // Must reference the compaction event so the model knows why the
+    // history looks shorter.
+    assert!(
+        msg.contains("compact") || msg.contains("compress") || msg.contains("freed"),
+        "compact-resume directive should reference the compaction event, got: {COMPACT_RESUME_DIRECTIVE:?}"
+    );
+    // No behavioral fork.
+    assert!(
+        !msg.contains("otherwise"),
+        "compact-resume directive must not introduce a behavioral fork, got: {COMPACT_RESUME_DIRECTIVE:?}"
+    );
+    assert!(
+        !msg.contains("continue only"),
+        "compact-resume directive must not gate continuation, got: {COMPACT_RESUME_DIRECTIVE:?}"
+    );
+    // No imperatives.
+    assert!(
+        !msg.contains("do not") && !msg.contains("don't") && !msg.contains("avoid "),
+        "compact-resume directive must not contain imperatives, got: {COMPACT_RESUME_DIRECTIVE:?}"
     );
 }
 

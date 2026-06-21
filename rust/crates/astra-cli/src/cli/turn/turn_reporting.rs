@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::streaming_types::StreamResult;
+use astra_runtime::pipeline::evaluation::{EvalSignal, TurnEvaluation};
 use astra_services::session_journal;
 use crossterm::style::Stylize;
 
@@ -82,6 +83,7 @@ pub(crate) fn build_history_text(
 pub(crate) fn print_turn_status_line(
     state: &SessionState,
     result: &StreamResult,
+    evaluation: Option<&TurnEvaluation>,
     turn_start: Instant,
 ) {
     if state.tui_render_policy.is_some() {
@@ -173,12 +175,62 @@ pub(crate) fn print_turn_status_line(
     if let Some(notice) = interruption_status_notice(result) {
         eprintln!("{}", format!("  ⚠ {notice}").yellow());
     }
+    if let Some(notice) = evaluation.and_then(turn_evaluation_status_notice) {
+        eprintln!("{}", format!("  ⚠ {notice}").yellow());
+    }
     print_context_window_warning(result.budget_pressure);
 
     let width = crossterm::terminal::size()
         .map(|(columns, _)| columns as usize)
         .unwrap_or(80);
     eprintln!("{}", "─".repeat(width.min(72)).dim());
+}
+
+pub(crate) fn turn_evaluation_status_notice(eval: &TurnEvaluation) -> Option<String> {
+    let outcome_failures = eval
+        .signals
+        .iter()
+        .filter_map(|signal| match signal {
+            EvalSignal::ToolOutcomeFailure { class, count } => Some(format!("{class} x{count}")),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !outcome_failures.is_empty() {
+        return Some(format!(
+            "Turn finished with unresolved tool outcome failure(s): {}. Treat the final answer as incomplete until validation passes.",
+            outcome_failures.join(", ")
+        ));
+    }
+
+    if eval.success {
+        return None;
+    }
+
+    let reason = eval
+        .signals
+        .iter()
+        .find_map(turn_evaluation_signal_reason)
+        .unwrap_or("turn evaluation failed");
+    Some(format!(
+        "Turn evaluation marked this turn incomplete (quality {:.2}): {reason}.",
+        eval.quality
+    ))
+}
+
+fn turn_evaluation_signal_reason(signal: &EvalSignal) -> Option<&'static str> {
+    match signal {
+        EvalSignal::ToolErrorRate(rate) if *rate >= 0.5 => Some("tool error rate is high"),
+        EvalSignal::StallDetected => Some("stall/divergence was detected"),
+        EvalSignal::VerdictWarning => Some("TurnGuard emitted a warning"),
+        EvalSignal::NoToolsNeeded => Some("needed tools were not used"),
+        EvalSignal::HighCostLowYield { .. } => Some("high-cost exploration produced low yield"),
+        EvalSignal::LlmRoundChurn { .. } => Some("too many LLM rounds were used"),
+        EvalSignal::PromptGrowthChurn { .. } => Some("prompt size ballooned across rounds"),
+        EvalSignal::RedundantValidationRetries(_) => Some("validation was retried redundantly"),
+        EvalSignal::RedundantOverlappingReads(_) => Some("content was re-read redundantly"),
+        EvalSignal::ExplorationFamilyChurn { .. } => Some("exploration stayed in one tool family"),
+        _ => None,
+    }
 }
 
 pub(crate) fn interruption_status_notice(result: &StreamResult) -> Option<String> {
@@ -242,8 +294,9 @@ pub(crate) fn print_context_window_warning(budget_pressure: f64) {
 mod tests {
     use super::{
         build_history_text, build_turn_tool_summary, cache_hit_percentage, compact_token_count,
-        interruption_status_notice,
+        interruption_status_notice, turn_evaluation_status_notice,
     };
+    use astra_runtime::pipeline::evaluation::{EvalSignal, EvaluationThresholds, TurnEvaluation};
     use astra_services::session_journal;
 
     fn make_record(
@@ -257,6 +310,37 @@ mod tests {
             file_path: file_path.map(|path| path.into()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn turn_evaluation_notice_reports_unresolved_outcome_failure() {
+        let eval = TurnEvaluation {
+            success: false,
+            quality: 0.2,
+            confidence: 0.9,
+            signals: vec![EvalSignal::ToolOutcomeFailure {
+                class: "test_failure".to_string(),
+                count: 1,
+            }],
+            thresholds: EvaluationThresholds::default(),
+        };
+
+        let notice = turn_evaluation_status_notice(&eval).expect("notice");
+        assert!(notice.contains("test_failure x1"));
+        assert!(notice.contains("incomplete"));
+    }
+
+    #[test]
+    fn turn_evaluation_notice_ignores_successful_turn() {
+        let eval = TurnEvaluation {
+            success: true,
+            quality: 0.8,
+            confidence: 0.7,
+            signals: vec![EvalSignal::AllToolsHealthy],
+            thresholds: EvaluationThresholds::default(),
+        };
+
+        assert!(turn_evaluation_status_notice(&eval).is_none());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Path validation and boundary enforcement.
 
-use super::policy::{SandboxMode, SandboxPolicy};
+use super::policy::{IsolationLevel, SandboxPolicy, is_never_readable_path};
 use std::path::{Path, PathBuf};
 
 /// Error type for path validation failures.
@@ -16,6 +16,8 @@ pub enum SandboxPathError {
     SymlinkEscape { requested: String, target: String },
     /// Path could not be resolved (doesn't exist, permission denied, etc.).
     ResolutionFailed { requested: String, reason: String },
+    /// Path matches a credential-bearing location that is blocked at every isolation level.
+    SensitivePath { requested: String },
 }
 
 impl std::fmt::Display for SandboxPathError {
@@ -40,6 +42,12 @@ impl std::fmt::Display for SandboxPathError {
             Self::ResolutionFailed { requested, reason } => {
                 write!(f, "Cannot resolve path '{requested}': {reason}")
             }
+            Self::SensitivePath { requested } => {
+                write!(
+                    f,
+                    "Path '{requested}' is blocked as a sensitive credential path"
+                )
+            }
         }
     }
 }
@@ -47,8 +55,10 @@ impl std::fmt::Display for SandboxPathError {
 impl std::error::Error for SandboxPathError {}
 
 impl SandboxPathError {
-    /// Returns `true` when the error is a boundary violation (not a resolution failure).
-    /// Callers can use this to distinguish "needs user authorization" from "path is broken".
+    /// Returns `true` when the error is an expandable sandbox boundary
+    /// violation (not a resolution failure or bypass-immune sensitive path).
+    /// Callers can use this to distinguish "needs user authorization" from
+    /// "path is broken" and "path is never readable".
     pub fn is_boundary_violation(&self) -> bool {
         matches!(
             self,
@@ -59,8 +69,9 @@ impl SandboxPathError {
 
 /// Validate and resolve a path against the sandbox policy.
 ///
-/// For Permissive mode, returns the path as-is (backward compatible).
-/// For Standard/Strict modes:
+/// For Permissive isolation, returns the path as-is except for bypass-immune
+/// credential paths that are blocked at every isolation level.
+/// For Standard/Strict isolation:
 /// 1. Resolves the path (relative to project_root or absolute)
 /// 2. Canonicalizes to resolve symlinks and `..` components
 /// 3. Checks the canonical path is within allowed boundaries
@@ -69,16 +80,6 @@ impl SandboxPathError {
 ///
 /// Returns `SandboxPathError` if the path escapes the boundary or can't be resolved.
 pub fn validate_path(policy: &SandboxPolicy, path: &str) -> Result<PathBuf, SandboxPathError> {
-    // Permissive mode: no validation, backward compatible
-    if policy.mode == SandboxMode::Permissive {
-        let p = Path::new(path);
-        return Ok(if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            policy.project_root.join(p)
-        });
-    }
-
     // Resolve the raw path
     let raw = Path::new(path);
     let resolved = if raw.is_absolute() {
@@ -87,7 +88,21 @@ pub fn validate_path(policy: &SandboxPolicy, path: &str) -> Result<PathBuf, Sand
         policy.project_root.join(raw)
     };
 
-    // For existing paths: canonicalize to follow symlinks and resolve ..
+    if policy.isolation == IsolationLevel::Permissive {
+        let sensitive_candidate = sensitive_check_path(&resolved);
+        if is_never_readable_path(&resolved) || is_never_readable_path(&sensitive_candidate) {
+            return Err(SandboxPathError::SensitivePath {
+                requested: path.to_string(),
+            });
+        }
+        return Ok(resolved);
+    }
+
+    // Resolve symlinks safely: canonicalize what exists, normalize the rest.
+    // This mitigates TOCTOU attacks where a symlink is created between exists() and
+    // canonicalize(), and prevents new-file paths from silently escaping via
+    // symlinked parent directories. Note: a small race window remains between
+    // exists() and canonicalize(); true prevention requires openat2(RESOLVE_BENEATH).
     let canonical = if resolved.exists() {
         resolved
             .canonicalize()
@@ -96,9 +111,16 @@ pub fn validate_path(policy: &SandboxPolicy, path: &str) -> Result<PathBuf, Sand
                 reason: e.to_string(),
             })?
     } else {
-        // For new files: normalize the path components manually
-        normalize_path(&resolved)
+        // For new files: canonicalize the nearest existing ancestor to resolve
+        // symlinks in parent components, then append the remaining path segments.
+        canonicalize_parent_and_append(&resolved)?
     };
+
+    if is_never_readable_path(&canonical) {
+        return Err(SandboxPathError::SensitivePath {
+            requested: path.to_string(),
+        });
+    }
 
     // Check boundary
     if policy.is_path_allowed(&canonical) {
@@ -112,11 +134,20 @@ pub fn validate_path(policy: &SandboxPolicy, path: &str) -> Result<PathBuf, Sand
     }
 }
 
+fn sensitive_check_path(path: &Path) -> PathBuf {
+    if path.exists()
+        && let Ok(canonical) = path.canonicalize()
+    {
+        return canonical;
+    }
+    canonicalize_parent_and_append(path).unwrap_or_else(|_| normalize_path(path))
+}
+
 /// Normalize path without filesystem access (for non-existent files).
 ///
 /// Resolves `.` and `..` components lexically. This doesn't follow symlinks
 /// but prevents obvious directory traversal attacks.
-pub(crate) fn normalize_path(path: &Path) -> PathBuf {
+pub fn normalize_path(path: &Path) -> PathBuf {
     let mut components = Vec::new();
 
     for component in path.components() {
@@ -144,6 +175,49 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     components.iter().collect()
 }
 
+/// Canonicalize the nearest existing ancestor directory, then append the remaining
+/// path segments. This safely resolves symlinks in parent components for new-file paths.
+///
+/// Example: if `/home/user/proj/subdir` exists but `newfile.txt` doesn't, canonicalize
+/// `/home/user/proj/subdir` then append `newfile.txt`.
+pub fn canonicalize_parent_and_append(path: &Path) -> Result<PathBuf, SandboxPathError> {
+    let mut current = path.to_path_buf();
+    let mut suffix = Vec::new();
+
+    // Walk up until we find an existing ancestor
+    while !current.exists() {
+        if let Some(name) = current.file_name() {
+            suffix.push(name.to_os_string());
+        } else {
+            break;
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+
+    // Canonicalize the existing ancestor
+    let canonical_base = if current.exists() {
+        current
+            .canonicalize()
+            .map_err(|e| SandboxPathError::ResolutionFailed {
+                requested: path.display().to_string(),
+                reason: e.to_string(),
+            })?
+    } else {
+        // Fallback: couldn't find any existing ancestor, normalize the whole path
+        return Ok(normalize_path(path));
+    };
+
+    // Append the suffix in reverse order (we collected bottom-up)
+    let mut result = canonical_base;
+    for segment in suffix.into_iter().rev() {
+        result.push(segment);
+    }
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,15 +230,15 @@ mod tests {
         SandboxPolicy::strict(root)
     }
 
-    // ── Permissive mode ────────────────────────────────────────────────��
+    // ── Permissive isolation ─────────────────────────────────────────────
 
     #[test]
-    fn permissive_mode_path_validation() {
+    fn permissive_isolation_path_validation() {
         let p = SandboxPolicy::permissive("/home/user/project");
-        // Allows absolute paths
-        let result = validate_path(&p, "/etc/passwd");
+        // Allows arbitrary absolute paths (non-sensitive).
+        let result = validate_path(&p, "/var/data/file");
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), PathBuf::from("/etc/passwd"));
+        assert_eq!(result.unwrap(), PathBuf::from("/var/data/file"));
         // Resolves relative
         let result = validate_path(&p, "src/main.rs");
         assert!(result.is_ok());
@@ -172,15 +246,43 @@ mod tests {
             result.unwrap(),
             PathBuf::from("/home/user/project/src/main.rs")
         );
-        // Allows dotdot escape
-        let result = validate_path(&p, "../../etc/passwd");
+        // Allows dotdot escape to non-sensitive paths
+        let result = validate_path(&p, "../../var/data");
         assert!(result.is_ok());
+        // System account files are blocked at every isolation level —
+        // /etc/passwd is no longer a valid permissive-mode target.
+        let result = validate_path(&p, "/etc/passwd");
+        assert!(
+            result.is_err(),
+            "/etc/passwd must be blocked in permissive mode"
+        );
     }
 
-    // ── Standard mode ────────────────────────────────────────────────────
+    #[test]
+    fn permissive_isolation_blocks_sensitive_credential_paths() {
+        let p = SandboxPolicy::permissive("/home/user/project");
+
+        for path in [
+            "/home/user/.ssh/id_rsa",
+            "/home/user/.aws/credentials",
+            "/etc/shadow",
+        ] {
+            let result = validate_path(&p, path);
+            assert!(result.is_err(), "permissive must block {path}");
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("sensitive credential path"),
+                "denial should name sensitive path policy"
+            );
+        }
+    }
+
+    // ── Standard isolation ───────────────────────────────────────────────
 
     #[test]
-    fn standard_mode_path_validation() {
+    fn standard_isolation_path_validation() {
         let p = standard_policy("/home/user/proj");
         // Allows relative within project
         assert!(validate_path(&p, "subdir/file.txt").is_ok());
@@ -199,10 +301,10 @@ mod tests {
         assert!(validate_path(&p, "/etc/shadow").is_err());
     }
 
-    // ── Strict mode ──────────────────────────────────────────────────────
+    // ── Strict isolation ─────────────────────────────────────────────────
 
     #[test]
-    fn strict_mode_path_validation() {
+    fn strict_isolation_path_validation() {
         let p = strict_policy("/home/user/project");
         // Blocks /var/tmp
         assert!(validate_path(&p, "/var/tmp/secret").is_err());
@@ -305,6 +407,10 @@ mod tests {
         // Classification
         assert!(boundary.is_boundary_violation());
         assert!(symlink.is_boundary_violation());
+        let sensitive = SandboxPathError::SensitivePath {
+            requested: "~/.ssh/id_rsa".into(),
+        };
+        assert!(!sensitive.is_boundary_violation());
         assert!(!resolution.is_boundary_violation());
     }
 }

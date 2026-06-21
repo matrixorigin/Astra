@@ -166,8 +166,10 @@ pub fn build_stop_hook_prompt(hooks: &[StopHook]) -> Option<serde_json::Value> {
                 }
             }
             format!(
-                "⚠️ VERIFICATION REQUIRED: Before you finish, run these checks using the bash tool:\n\
+                "⚠️ VERIFICATION REQUIRED: Before you finish, run any missing checks using the bash tool:\n\
                  {}\n\n\
+                 If you already ran the exact relevant check(s) after the latest file edit and they passed, \
+                 do not rerun them; summarize that evidence and finish. \
                  If any check fails, fix the issues and re-run the failing check. \
                  Repeat until all checks pass. Only then may you complete.",
                 parts.join("\n")
@@ -193,8 +195,10 @@ pub fn build_stop_hook_prompt(hooks: &[StopHook]) -> Option<serde_json::Value> {
                 })
                 .collect();
             format!(
-                "⚠️ VERIFICATION REQUIRED: Before you finish, run these checks using the bash tool:\n\
+                "⚠️ VERIFICATION REQUIRED: Before you finish, run any missing checks using the bash tool:\n\
                  {}\n\n\
+                 If you already ran the exact relevant check(s) after the latest file edit and they passed, \
+                 do not rerun them; summarize that evidence and finish. \
                  If any check fails, fix the issues and re-run the failing check. \
                  Repeat until all checks pass. Only then may you complete.",
                 commands.join("\n")
@@ -271,6 +275,8 @@ mod tests {
         assert!(content.contains("/project"));
         assert!(content.contains("type-check"));
         assert!(content.contains("bash tool"));
+        assert!(content.contains("already ran the exact relevant check"));
+        assert!(content.contains("after the latest file edit"));
     }
 
     #[test]
@@ -447,5 +453,6 @@ mod tests {
         assert!(content.contains("Phase 1"));
         assert!(content.contains("Phase 2"));
         assert!(content.contains("[timeout: 60s]"));
+        assert!(content.contains("do not rerun them"));
     }
 }

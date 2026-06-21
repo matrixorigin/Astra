@@ -222,9 +222,39 @@ pub enum RequestedTurnInteractionMode {
 pub enum WorkspaceBindingRequestKind {
     ServerSandbox,
     EdgeWorkspace,
-    UploadedSnapshot,
-    GitCheckout,
+    CloudWorkspace,
     None,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum WorkspaceSourceRequest {
+    EdgePath {
+        path: String,
+    },
+    UploadedSnapshot {
+        artifact_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        root: Option<String>,
+    },
+    GitCheckout {
+        repository: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reference: Option<String>,
+    },
+    Template {
+        template_id: String,
+    },
+    DatasetBundle {
+        dataset_id: String,
+    },
+    ArtifactBundle {
+        artifact_id: String,
+    },
+    Scratch,
+    PersistentVolume {
+        volume_id: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,8 +277,10 @@ pub struct WorkspaceBindingRequest {
     pub kind: WorkspaceBindingRequestKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(default, alias = "cwd", skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
+    pub source: Option<WorkspaceSourceRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority: Option<WorkspaceAuthorityRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -260,9 +292,9 @@ pub struct WorkspaceBindingRequest {
 pub enum ExecutorBindingRequestKind {
     ServerLocal,
     EdgeAgent,
+    OrchestratorManaged,
     ThinClient,
     Mcp,
-    HostedRunner,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,8 +303,9 @@ pub enum ToolTransportKindRequest {
     ServerLocal,
     EdgeWs,
     EdgeLedger,
+    GatewayRelay,
+    SandboxResidentAgent,
     McpHttp,
-    RunnerRpc,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -791,8 +824,17 @@ pub trait RunStateStore: Send + Sync {
     /// Find runs in WAITING status (for resume engine).
     async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String>;
 
-    /// Find runs in RUNNING status (for crash recovery — mark them failed on restart).
+    /// Find runs in RUNNING status.
     async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String>;
+
+    /// Find active runs this store owner may recover after startup.
+    ///
+    /// Implementations backed by shared durable storage must not return rows
+    /// owned by a different live pod with an unexpired lease. Otherwise one
+    /// app instance can falsely mark another instance's live run as crashed.
+    async fn find_recoverable_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+        self.find_running_runs().await
+    }
 
     /// Find the newest run that blocks starting another run in the same session.
     async fn find_blocking_session_run(
@@ -1020,10 +1062,11 @@ impl RunStateStore for InMemoryRunStateStore {
             return Err("session already has an active run".to_string());
         }
         runs.insert(run_id.clone(), record);
-        let inserted = runs
-            .get(run_id.as_str())
-            .cloned()
-            .expect("inserted run must be readable");
+        let Some(inserted) = runs.get(run_id.as_str()).cloned() else {
+            return Err(format!(
+                "inserted run disappeared before projection sync: {run_id}"
+            ));
+        };
 
         // Evict oldest completed/failed runs when over capacity
         let mut evicted_ids = Vec::new();
@@ -1235,7 +1278,7 @@ impl RunStateStore for InMemoryRunStateStore {
         let updated = {
             let mut runs = self.runs.write().await;
             let Some(run) = runs.get_mut(run_id) else {
-                return Ok(());
+                return Err(format!("run not found while appending events: {run_id}"));
             };
             let start_idx = run.events.len() as i64;
             run.events.extend(events.iter().cloned());
@@ -2564,6 +2607,32 @@ impl RunStateStore for DatabaseRunStateStore {
                 .fetch_all(self.pool.get())
                 .await
                 .map_err(|source| db_error("find_running_runs", "active", source).to_string())?;
+        rows.into_iter()
+            .map(run_record_from_row)
+            .collect::<DbStoreResult<Vec<_>>>()
+            .map_err(|e| e.to_string())
+    }
+
+    async fn find_recoverable_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+        let rows = sqlx::query(
+            "SELECT * FROM agent_runs
+             WHERE status IN (?, ?)
+               AND (
+                   owner_pod_id IS NULL
+                   OR owner_pod_id = ?
+                   OR owner_lease_expires_at IS NULL
+                   OR owner_lease_expires_at < NOW(6)
+               )
+             ORDER BY updated_at ASC",
+        )
+        .bind(STATUS_RUNNING)
+        .bind(STATUS_INPUT_QUEUED)
+        .bind(&self.owner_pod_id)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(|source| {
+            db_error("find_recoverable_running_runs", "active", source).to_string()
+        })?;
         rows.into_iter()
             .map(run_record_from_row)
             .collect::<DbStoreResult<Vec<_>>>()
@@ -3991,8 +4060,8 @@ mod tests {
                 "call_id": "c1",
                 "tool": "bash",
                 "reason": "workspace_executor_unavailable",
-                "workspace": {"kind": "git_checkout"},
-                "executor": {"kind": "hosted_runner", "status": "degraded"},
+                "workspace": {"kind": "cloud_workspace"},
+                "executor": {"kind": "orchestrator_managed", "status": "degraded"},
             }),
         ] {
             assert_eq!(transform_run_event_for_client(event.clone()), event);
@@ -4008,9 +4077,9 @@ mod tests {
                 "tool": "bash",
                 "reason": "workspace_executor_unavailable",
                 "message": "Workspace is not routed to an available executor.",
-                "workspace": {"kind": "git_checkout"},
-                "executor": {"kind": "hosted_runner", "status": "degraded"},
-                "transport": "runner_rpc",
+                "workspace": {"kind": "cloud_workspace"},
+                "executor": {"kind": "orchestrator_managed", "status": "degraded"},
+                "transport": "sandbox_resident_agent",
                 "fallback_policy": "disabled"
             },
             "index": 4
@@ -4024,9 +4093,9 @@ mod tests {
                 "tool": "bash",
                 "reason": "workspace_executor_unavailable",
                 "message": "Workspace is not routed to an available executor.",
-                "workspace": {"kind": "git_checkout"},
-                "executor": {"kind": "hosted_runner", "status": "degraded"},
-                "transport": "runner_rpc",
+                "workspace": {"kind": "cloud_workspace"},
+                "executor": {"kind": "orchestrator_managed", "status": "degraded"},
+                "transport": "sandbox_resident_agent",
                 "fallback_policy": "disabled"
             })
         );
@@ -4319,6 +4388,24 @@ mod tests {
         let loaded = store.load_run("batch-empty").await.unwrap().unwrap();
         assert_eq!(loaded.events.len(), 0);
         assert_eq!(loaded.last_event_idx, -1); // unchanged
+    }
+
+    #[tokio::test]
+    async fn append_events_batch_unknown_run_returns_error() {
+        let store = InMemoryRunStateStore::new();
+        let event = make_event("tool_result", json!({"output": "orphan"}));
+
+        let batch_error = store
+            .append_events_batch("missing-run", std::slice::from_ref(&event))
+            .await
+            .expect_err("non-empty batch append to unknown run must fail");
+        assert!(batch_error.contains("run not found"));
+
+        let single_error = store
+            .append_event("missing-run", event)
+            .await
+            .expect_err("single append delegates to batch and must also fail");
+        assert!(single_error.contains("run not found"));
     }
 
     #[tokio::test]

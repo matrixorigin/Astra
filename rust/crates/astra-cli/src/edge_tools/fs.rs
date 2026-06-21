@@ -2,19 +2,51 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::{
-    AGGREGATE_OUTPUT_BUDGET, AGGREGATE_SOFT_LIMIT, ReadDedupKey, SANDBOX_DENIED_PREFIX,
-    ToolExecutor, code_intel, fuzzy_replacer, tool_output_limit, truncate_output,
+    AGGREGATE_OUTPUT_BUDGET, AGGREGATE_SOFT_LIMIT, ReadCoverage, ReadDedupKey,
+    SANDBOX_DENIED_PREFIX, ToolExecutor, code_intel, fuzzy_replacer, tool_output_limit,
+    truncate_output,
 };
-use astra_runtime::tool_sandbox::{SandboxMode, validate_path};
+use astra_runtime::tool_sandbox::validate_path;
 use astra_sandbox::is_internal_safe_path;
 use astra_tools::fs_ops::{
     check_anchor_vs_replacement_size, read_to_string_lossy, str_replace_fail,
+    validate_read_file_args,
 };
+use astra_turn_core::tool_result_sanitize::READ_FILE_MODEL_RESULT_CHARS;
+use astra_turn_core::tool_result_semantics::TOOL_SUCCESS_SENTINEL;
 use serde_json::{Value, json};
 
 /// Check if a path is a UNC path (Windows network path that could leak NTLM credentials).
 fn is_unc_path(path: &str) -> bool {
     path.starts_with("\\\\") || path.starts_with("//")
+}
+
+fn expand_home_path_arg(path: &str) -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    if matches!(path, "~" | "$HOME" | "${HOME}") {
+        return Some(home);
+    }
+    path.strip_prefix("~/")
+        .or_else(|| path.strip_prefix("$HOME/"))
+        .or_else(|| path.strip_prefix("${HOME}/"))
+        .map(|suffix| home.join(suffix))
+}
+
+/// Append the stable [`TOOL_SUCCESS_SENTINEL`] to a human-readable success body.
+///
+/// Contract (see `tool::result::semantics`): file-mutation emitters MUST emit
+/// the sentinel on success so the body-wins reconciliation can override a stale
+/// failed edge-metadata status. Callers should pass the human-readable message
+/// they were already returning; this preserves display while making the signal
+/// machine-parseable.
+fn success_body(human: &str) -> String {
+    format!("{human}\n{TOOL_SUCCESS_SENTINEL}")
+}
+
+/// In-place variant for emitters that build up `result` incrementally.
+fn append_success_sentinel(result: &mut String) {
+    result.push('\n');
+    result.push_str(TOOL_SUCCESS_SENTINEL);
 }
 
 fn edit_type_label(edit_type: astra_turn_core::file_edit_journal::EditType) -> &'static str {
@@ -62,6 +94,17 @@ fn edit_type_label(edit_type: astra_turn_core::file_edit_journal::EditType) -> &
 // shared/synced.
 
 impl ToolExecutor {
+    fn read_file_model_output_limit(&self) -> usize {
+        self.scaled_output_limit().min(READ_FILE_MODEL_RESULT_CHARS)
+    }
+
+    fn read_file_body_output_limit(&self) -> usize {
+        let hard_limit = self.read_file_model_output_limit();
+        hard_limit
+            .saturating_sub(READ_FILE_DELIVERY_MARGIN_CHARS)
+            .max(hard_limit.min(1024))
+    }
+
     fn record_fuzzy_match_event(
         &self,
         path: &Path,
@@ -83,7 +126,14 @@ impl ToolExecutor {
         if is_unc_path(path) {
             return Err("Error: UNC/network paths are not supported (security risk)".to_string());
         }
-        let p = Path::new(path);
+        let expanded_home_path = expand_home_path_arg(path);
+        let path_for_validation = expanded_home_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        let validation_path = path_for_validation.as_deref().unwrap_or(path);
+        let p = expanded_home_path
+            .as_deref()
+            .unwrap_or_else(|| Path::new(path));
         let resolved = if p.is_absolute() {
             p.to_path_buf()
         } else {
@@ -110,19 +160,17 @@ impl ToolExecutor {
                 .sandbox_policy
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(ref policy) = *sp_guard
-                && !matches!(policy.mode, SandboxMode::Permissive)
-            {
-                return validate_path(policy, path).map_err(|e| {
+            if let Some(ref policy) = *sp_guard {
+                return validate_path(policy, validation_path).map_err(|e| {
                     if e.is_boundary_violation() {
                         // Use structured prefix so the agentic loop can detect sandbox
                         // denials and prompt the user for authorization instead of
                         // letting the model silently fall back to bash.
                         format!(
-                            "{}Path '{}' is outside the project directory '{}'. \
-                             Ask the user for permission before accessing files outside the project.",
+                            "{}Path '{}' is outside the project directory '{}'; \
+                             sandbox approval is required for this external path.",
                             SANDBOX_DENIED_PREFIX,
-                            path,
+                            validation_path,
                             policy.project_root.display(),
                         )
                     } else {
@@ -135,9 +183,15 @@ impl ToolExecutor {
     }
 
     pub(crate) fn read_file(&self, args: &Value) -> String {
+        if let Err(error) = validate_read_file_args(args) {
+            return error;
+        }
         let path_str = match args.get("path").and_then(Value::as_str) {
             Some(p) => p,
-            None => return "Error: missing 'path'".to_string(),
+            None => {
+                return "Error: missing required field `path` for read_file. Valid fields: path, start_line, end_line, outline."
+                    .to_string();
+            }
         };
         let path = match self.resolve_checked(path_str) {
             Ok(safe) => safe,
@@ -221,7 +275,6 @@ impl ToolExecutor {
             }
         }
 
-        // Raw range keys for consecutive dedup.
         let start_raw = args.get("start_line").and_then(Value::as_u64);
         let end_raw = args.get("end_line").and_then(Value::as_u64);
         let has_range = start_raw.is_some() || end_raw.is_some();
@@ -398,15 +451,22 @@ impl ToolExecutor {
                         }
 
                         // No outline available — return truncated content with hint
-                        let limit = self.scaled_output_limit();
-                        let truncated =
-                            &content_for_outline[..content_for_outline.floor_char_boundary(limit)];
-                        let numbered = add_line_numbers(truncated, 1);
-                        return format!(
-                            "{numbered}\n[Auto-truncated — aggregate output budget is high \
+                        let marker = format!(
+                            "\n[Auto-truncated — aggregate output budget is high \
                              ({agg} bytes used, file has {total_lines} lines). \
                              Use start_line/end_line to read specific sections.]"
                         );
+                        let budget = self
+                            .read_file_body_output_limit()
+                            .saturating_sub(marker.chars().count());
+                        let lines: Vec<&str> = content_for_outline.split('\n').collect();
+                        let mut delivered = add_line_numbers_budgeted(&lines, 1, budget).output;
+                        push_suffix_if_fits(
+                            &mut delivered,
+                            &marker,
+                            self.read_file_model_output_limit(),
+                        );
+                        return delivered;
                     }
                 }
             }
@@ -446,7 +506,7 @@ impl ToolExecutor {
             }
         };
 
-        // Outline mode: return only definition signatures with line numbers
+        // Outline isolation: return only definition signatures with line numbers
         if has_outline {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let total_lines = content.lines().count();
@@ -512,29 +572,33 @@ impl ToolExecutor {
         // waste tool calls (e.g., 6 read_file calls for different hunks of
         // a 200-line file). Works on FIRST read too, not just subsequent reads.
         // Hard cap at 16 KB (~4000 tokens) to prevent large files from
-        // exploding context even if they fit the dynamic output budget.
+        // exploding context even if they fit the dynamic output budget. The
+        // rendered tool result must also fit the model-side read_file budget;
+        // otherwise it would be compressed after we had incorrectly recorded
+        // the file as fully delivered.
         const AUTO_EXPAND_MAX_BYTES: usize = 16_384;
         if is_ranged {
-            let max_chars = self.scaled_output_limit().min(AUTO_EXPAND_MAX_BYTES);
             if let Ok(meta) = fs::metadata(&path)
-                && (meta.len() as usize) <= max_chars
-                && content.len() <= max_chars
+                && (meta.len() as usize) <= AUTO_EXPAND_MAX_BYTES
+                && content.len() <= AUTO_EXPAND_MAX_BYTES
             {
-                // Upgrade to full read — future reads will hit can_dedup_read
-                self.record_read_cached(&path, false, ReadDedupKey::Full, content.clone());
                 let total_lines = content.lines().count();
                 let numbered = add_line_numbers(&content, 1);
-                return format!(
+                let expanded = format!(
                     "[Auto-expanded to full file ({total_lines} lines) — \
                      small enough to read entirely. Use this content for all \
                      references to {path_str}; do not re-read.]\n\
                      {numbered}"
                 );
+                if expanded.chars().count() <= self.read_file_model_output_limit() {
+                    // Upgrade to full read — future reads will hit can_dedup_read.
+                    self.record_read_cached(&path, false, ReadDedupKey::Full, content.clone());
+                    return expanded;
+                }
             }
         }
 
-        // Record the read state
-        let record_key = if is_ranged {
+        let request_key = if is_ranged {
             ReadDedupKey::Range {
                 start_line: start_raw,
                 end_line: end_raw,
@@ -542,55 +606,73 @@ impl ToolExecutor {
         } else {
             ReadDedupKey::Full
         };
-        self.record_read_cached(&path, is_ranged, record_key, content.clone());
-
-        // Escalating warning when the same file is read too many times.
-        // Trains the model to stop re-reading by making the cost of repetition visible.
-        let read_count = self.file_read_count(&path);
-        let ranged_count = self.file_ranged_read_count(&path);
-        let read_warning = if read_count >= 4 {
-            "\n\n⚠ WARNING: This file has been read 4+ times this session. You already \
-             have this content — stop re-reading and use the information from earlier reads."
-                .to_string()
-        } else if read_count >= 3 {
-            "\n\n⚠ Note: This file has been read 3 times. Consider using content from \
-             earlier reads instead of requesting more ranges."
-                .to_string()
-        } else if is_ranged && ranged_count >= 3 {
-            // Large file read in 3+ different ranges — nudge toward grep
-            "\n\n⚠ This file has been read in 3+ different ranges. Use grep to find \
-             specific content instead of reading more sections — it uses far fewer tokens."
-                .to_string()
-        } else {
-            String::new()
-        };
 
         if !is_ranged {
-            let total_lines = content.lines().count();
-            let max_chars = self.scaled_output_limit();
-            if content.len() > max_chars {
-                let truncated = &content[..content.floor_char_boundary(max_chars)];
-                let numbered = add_line_numbers(truncated, 1);
-                let mut out = numbered;
-                out.push_str(&format!(
-                    "\n[truncated — file has {total_lines} lines, use start_line/end_line or outline=true]"
-                ));
-                if !read_warning.is_empty() {
-                    out.push_str(&read_warning);
-                }
-                return out;
-            }
+            let lines: Vec<&str> = content.split('\n').collect();
+            let total_lines = lines.len();
             let numbered = add_line_numbers(&content, 1);
-            if read_warning.is_empty() {
-                return numbered;
+            let mut output;
+            let coverage;
+            let dedup_eligible;
+            let is_partial_delivery;
+
+            if numbered.chars().count() <= self.read_file_model_output_limit() {
+                output = numbered;
+                coverage = ReadCoverage::Full;
+                dedup_eligible = true;
+                is_partial_delivery = false;
+            } else {
+                let delivery =
+                    add_line_numbers_budgeted(&lines, 1, self.read_file_body_output_limit());
+                let delivered_end = delivery.complete_lines as u64;
+                output = delivery.output;
+                let marker = if delivered_end > 0 {
+                    format!(
+                        "\n[truncated — file has {total_lines} lines; delivered through line \
+                         {delivered_end}. Use read_file(path=\"{path_str}\", start_line={}, \
+                         end_line=...) or outline=true to read specific sections.]",
+                        delivered_end + 1
+                    )
+                } else {
+                    format!(
+                        "\n[truncated — first line exceeds the read_file result budget for \
+                         {path_str}. Use grep or a narrower start_line/end_line range.]"
+                    )
+                };
+                push_suffix_if_fits(&mut output, &marker, self.read_file_model_output_limit());
+                coverage = if delivered_end > 0 {
+                    ReadCoverage::Range {
+                        start_line: 1,
+                        end_line: delivered_end,
+                    }
+                } else {
+                    ReadCoverage::None
+                };
+                dedup_eligible = false;
+                is_partial_delivery = true;
             }
-            return format!("{numbered}{read_warning}");
+
+            self.record_read_cached_with_coverage(
+                &path,
+                is_partial_delivery,
+                request_key,
+                dedup_eligible,
+                coverage,
+                content.clone(),
+            );
+
+            let read_warning = self.read_warning_for(&path, false);
+            push_suffix_if_fits(
+                &mut output,
+                &read_warning,
+                self.read_file_model_output_limit(),
+            );
+            return output;
         }
+
         let lines: Vec<&str> = content.lines().collect();
         let s = start.unwrap_or(1).saturating_sub(1).min(lines.len());
         let e = end.unwrap_or(lines.len()).min(lines.len());
-        // Auto-swap if the LLM accidentally reversed start/end.
-        let (s, e) = if s > e { (e, s) } else { (s, e) };
         if s >= e {
             return format!(
                 "(empty range: start_line {} >= end_line {} or file has only {} lines)",
@@ -600,15 +682,91 @@ impl ToolExecutor {
             );
         }
         let actual_start_line = s + 1; // 1-indexed
-        let slice = lines[s..e].join("\n");
-        let mut result = truncate_output(
-            add_line_numbers(&slice, actual_start_line),
-            self.scaled_output_limit(),
-        );
-        if !read_warning.is_empty() {
-            result.push_str(&read_warning);
+        let requested_lines = &lines[s..e];
+        let numbered = add_line_numbers(&requested_lines.join("\n"), actual_start_line);
+        let mut result;
+        let coverage;
+        let dedup_eligible;
+
+        if numbered.chars().count() <= self.read_file_model_output_limit() {
+            result = numbered;
+            coverage = ReadCoverage::Range {
+                start_line: actual_start_line as u64,
+                end_line: e as u64,
+            };
+            dedup_eligible = true;
+        } else {
+            let delivery = add_line_numbers_budgeted(
+                requested_lines,
+                actual_start_line,
+                self.read_file_body_output_limit(),
+            );
+            let delivered_end = if delivery.complete_lines > 0 {
+                Some(actual_start_line as u64 + delivery.complete_lines as u64 - 1)
+            } else {
+                None
+            };
+            result = delivery.output;
+            let marker = if let Some(end_line) = delivered_end {
+                format!(
+                    "\n[truncated — requested lines {actual_start_line}–{e}; delivered through \
+                     line {end_line}. Continue with read_file(path=\"{path_str}\", \
+                     start_line={}, end_line=...).]",
+                    end_line + 1
+                )
+            } else {
+                format!(
+                    "\n[truncated — line {actual_start_line} exceeds the read_file result \
+                     budget for {path_str}. Use grep or a narrower range.]"
+                )
+            };
+            push_suffix_if_fits(&mut result, &marker, self.read_file_model_output_limit());
+            coverage = if let Some(end_line) = delivered_end {
+                ReadCoverage::Range {
+                    start_line: actual_start_line as u64,
+                    end_line,
+                }
+            } else {
+                ReadCoverage::None
+            };
+            dedup_eligible = false;
         }
+        self.record_read_cached_with_coverage(
+            &path,
+            true,
+            request_key,
+            dedup_eligible,
+            coverage,
+            content.clone(),
+        );
+
+        let read_warning = self.read_warning_for(&path, true);
+        push_suffix_if_fits(
+            &mut result,
+            &read_warning,
+            self.read_file_model_output_limit(),
+        );
         result
+    }
+
+    fn read_warning_for(&self, path: &Path, is_ranged: bool) -> String {
+        let read_count = self.file_read_count(path);
+        let ranged_count = self.file_ranged_read_count(path);
+        if read_count >= 4 {
+            "\n\n⚠ WARNING: This file has been read 4+ times this session. You already \
+             have this content — stop re-reading and use the information from earlier reads."
+                .to_string()
+        } else if read_count >= 3 {
+            "\n\n⚠ Note: This file has been read 3 times. Consider using content from \
+             earlier reads instead of requesting more ranges."
+                .to_string()
+        } else if is_ranged && ranged_count >= 3 {
+            "\n\n⚠ This file has been read in 3+ different ranges. Use grep to find \
+             specific content instead of reading more sections — it uses far fewer tokens."
+                .to_string()
+        } else {
+            String::new()
+        }
     }
 
     /// Returns JSON with structured result for reliable parsing
@@ -686,11 +844,11 @@ impl ToolExecutor {
         // symlink swaps (TOCTOU) between the initial resolve_checked and now.
         if path.exists() {
             if let Ok(canonical) = path.canonicalize() {
-                if !self.is_within_project_root(&canonical) {
+                if !self.is_within_sandbox_boundary(&canonical) {
                     return json!({
                         "success": false,
                         "error": format!(
-                            "Security: path '{}' was replaced with a symlink pointing outside the project",
+                            "Security: path '{}' was replaced with a symlink pointing outside the approved sandbox boundary",
                             path.display()
                         )
                     }).to_string();
@@ -884,6 +1042,7 @@ impl ToolExecutor {
                             fuzzy_match.strategy,
                             astra_runtime::observability::FuzzyMatchOutcome::Matched,
                         );
+                        append_success_sentinel(&mut result);
                         return result;
                     }
                     Err(e) => return format!("Error writing file: {e}"),
@@ -1013,6 +1172,7 @@ impl ToolExecutor {
                     "exact",
                     astra_runtime::observability::FuzzyMatchOutcome::Matched,
                 );
+                append_success_sentinel(&mut result);
                 result
             }
             Err(e) => format!("Error writing file: {e}"),
@@ -1066,7 +1226,7 @@ impl ToolExecutor {
                         before_content,
                     ),
                 }
-                format!("Deleted: {}", rel_str)
+                success_body(&format!("Deleted: {}", rel_str))
             }
             Err(e) => format!("Error deleting file: {e}"),
         }
@@ -1101,6 +1261,34 @@ impl ToolExecutor {
         match self.file_journal.lock() {
             Ok(journal) => journal.checkpoint(),
             Err(poisoned) => poisoned.into_inner().checkpoint(),
+        }
+    }
+
+    /// Rollback all file edits recorded since `checkpoint` within the
+    /// given turn, transactionally (if any undo fails, already-undone
+    /// entries are re-applied so disk state stays consistent).
+    ///
+    /// Used by `str_replace_batch` to recover from partial multi-file
+    /// write failures.
+    pub(crate) fn rollback_files_since_checkpoint(&self, turn_index: u32, checkpoint: u64) {
+        let result = match self.file_journal.lock() {
+            Ok(journal) => journal.undo_turn_since_transactional(turn_index, checkpoint),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .undo_turn_since_transactional(turn_index, checkpoint),
+        };
+        // Refresh file-state tracking for every reverted path so
+        // subsequent reads don't hit stale-timestamp guards.
+        if let Ok(paths) = &result {
+            for path in paths {
+                self.refresh_rolled_back_file_state(path);
+            }
+        }
+        if let Err(error) = result {
+            astra_core::agent_warn!(
+                "file_edit",
+                "str_replace_batch rollback failed for turn {turn_index} checkpoint {checkpoint}: {error}"
+            );
         }
     }
 
@@ -1712,6 +1900,69 @@ impl ToolExecutor {
         }
     }
 
+    pub(crate) fn str_replace_batch(&self, args: &Value) -> String {
+        let top_path = args.get("path").and_then(Value::as_str);
+        let edits = match args.get("edits").and_then(Value::as_array) {
+            Some(e) => e,
+            None => return "Error: missing 'edits' array".to_string(),
+        };
+        if edits.is_empty() {
+            return "Error: 'edits' array is empty".to_string();
+        }
+
+        // Fast-path: same-file batch with top-level path and no per-edit paths
+        if top_path.filter(|path| !path.trim().is_empty()).is_some()
+            && edits
+                .iter()
+                .all(|edit| edit.get("path").and_then(Value::as_str).is_none())
+        {
+            return self.multi_edit(args);
+        }
+
+        let groups = match astra_tools::fs_ops::partition_edits_by_path(edits, top_path) {
+            Ok(g) => g,
+            Err(e) => return e,
+        };
+
+        // Sandbox-validate every path BEFORE touching disk.
+        // The core two-phase commit in multi_path_edit guarantees atomicity:
+        // all files are staged first, then rename() commits them atomically.
+        // No journal checkpoint, no preimage capture, no dual rollback.
+        for (path, _) in &groups {
+            if let Err(error) = self.resolve_checked(path) {
+                return error;
+            }
+        }
+
+        // Build the delegated args: top-level dry_run + per-edit paths.
+        // The core's str_replace routes to multi_path_edit for multi-file batches.
+        let dry_run = args
+            .get("dry_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let mut delegated = serde_json::Map::new();
+        delegated.insert(
+            "edits".to_string(),
+            args.get("edits").cloned().unwrap_or(Value::Null),
+        );
+        if dry_run {
+            delegated.insert("dry_run".to_string(), Value::Bool(true));
+        }
+        if let Some(allow) = args.get("allow_structural_change") {
+            delegated.insert("allow_structural_change".to_string(), allow.clone());
+        }
+
+        let result =
+            astra_tools::fs_ops::str_replace(&self.project_root, &Value::Object(delegated));
+        if result.is_error {
+            result.output
+        } else {
+            // Append success sentinel — the core doesn't emit it.
+            success_body(&result.output)
+        }
+    }
+
     pub(crate) fn multi_edit(&self, args: &Value) -> String {
         let path = match args.get("path").and_then(Value::as_str) {
             Some(p) => match self.resolve_checked(p) {
@@ -1819,8 +2070,12 @@ impl ToolExecutor {
                             })
                         {
                             let (orig_idx, _) = fuzzy_applications[prev_i];
-                            return format!(
-                                "Error: edit[{i}] fuzzy-matched the same region as edit[{orig_idx}] (both resolved to overlapping spans via whitespace-normalized match). Aborting all edits — provide distinct exact old_str values or merge the two edits."
+                            return str_replace_fail(
+                                &format!(
+                                    "edit[{i}] fuzzy-matched the same region as edit[{orig_idx}]. Aborting all edits."
+                                ),
+                                "Both edits resolved to overlapping spans via whitespace-normalized matching, so applying them separately would clobber the same file region.",
+                                "Merge those edits into one replacement for that region, or provide distinct exact old_str values copied from a fresh read_file result.",
                             );
                         }
                         if i == 0 {
@@ -1920,6 +2175,7 @@ impl ToolExecutor {
                 }
 
                 append_str_replace_cli_unified_diff(&mut result, &content, &working, &path);
+                append_success_sentinel(&mut result);
                 result
             }
             Err(e) => format!("Error writing file: {e}"),
@@ -2739,6 +2995,13 @@ fn read_capped_to_string_lossy(path: &Path, max_bytes: usize) -> std::io::Result
 
 // ─── Line numbers ───────────────────────────────────────────────────────────
 
+const READ_FILE_DELIVERY_MARGIN_CHARS: usize = 1024;
+
+struct NumberedReadDelivery {
+    output: String,
+    complete_lines: usize,
+}
+
 /// Add line numbers to content in compact tab-separated format.
 /// Example output: `  1\tline content\n  2\tnext line`
 fn add_line_numbers(content: &str, start_line: usize) -> String {
@@ -2753,6 +3016,68 @@ fn add_line_numbers(content: &str, start_line: usize) -> String {
         .join("\n")
 }
 
+fn add_line_numbers_budgeted(
+    lines: &[&str],
+    start_line: usize,
+    max_chars: usize,
+) -> NumberedReadDelivery {
+    if lines.is_empty() {
+        return NumberedReadDelivery {
+            output: String::new(),
+            complete_lines: 0,
+        };
+    }
+
+    let max_num = start_line + lines.len().saturating_sub(1);
+    let width = max_num.to_string().len().max(1);
+    let mut output = String::new();
+    let mut output_chars = 0usize;
+    let mut complete_lines = 0usize;
+
+    for (i, line) in lines.iter().enumerate() {
+        let rendered = format!("{:>width$}\t{line}", start_line + i);
+        let separator_chars = usize::from(!output.is_empty());
+        let rendered_chars = rendered.chars().count();
+        if output_chars + separator_chars + rendered_chars > max_chars {
+            if complete_lines == 0 && max_chars > 0 {
+                output.push_str(char_prefix(&rendered, max_chars));
+            }
+            return NumberedReadDelivery {
+                output,
+                complete_lines,
+            };
+        }
+        if !output.is_empty() {
+            output.push('\n');
+            output_chars += 1;
+        }
+        output.push_str(&rendered);
+        output_chars += rendered_chars;
+        complete_lines += 1;
+    }
+
+    NumberedReadDelivery {
+        output,
+        complete_lines,
+    }
+}
+
+fn char_prefix(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
+fn push_suffix_if_fits(output: &mut String, suffix: &str, max_chars: usize) {
+    if suffix.is_empty() {
+        return;
+    }
+    if output.chars().count() + suffix.chars().count() <= max_chars {
+        output.push_str(suffix);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::ToolExecutor;
@@ -2762,6 +3087,8 @@ mod tests {
         str_replace_not_found_hint,
     };
     use astra_text_utils::str_preview::truncate_str;
+    use astra_turn_core::tool_result_sanitize::READ_FILE_MODEL_RESULT_CHARS;
+    use astra_turn_core::tool_result_semantics::TOOL_SUCCESS_SENTINEL;
     use serde_json::{Value, json};
     use std::io::Write;
 
@@ -3255,6 +3582,61 @@ type Handler interface {
         let executor = test_executor_in(dir.path());
         let result = executor.read_file(&serde_json::json!({"path": "numbered.txt"}));
         assert_eq!(result, "1\thello\n2\tworld\n3\tfoo");
+    }
+
+    #[test]
+    fn read_file_rejects_unknown_fields_before_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
+
+        let result = executor.read_file(&serde_json::json!({
+            "file": "numbered.txt",
+            "offset": 1,
+            "limit": 300
+        }));
+
+        assert!(result.contains("unknown field `file`"), "{result}");
+        assert!(result.contains("Valid fields: path"), "{result}");
+        assert!(result.contains("Use `path` for the file path"), "{result}");
+        assert!(
+            !result.contains("missing 'path'"),
+            "unknown-field contract should fire before legacy missing-path text: {result}"
+        );
+    }
+
+    #[test]
+    fn read_file_rejects_invalid_optional_arg_types() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.txt"), "a\nb\nc").unwrap();
+        let executor = test_executor_in(dir.path());
+
+        let result = executor.read_file(&serde_json::json!({
+            "path": "test.txt",
+            "start_line": "1"
+        }));
+        assert!(result.contains("`start_line`"), "{result}");
+        assert!(result.contains("positive integer"), "{result}");
+
+        let result = executor.read_file(&serde_json::json!({
+            "path": "test.txt",
+            "outline": 1
+        }));
+        assert!(result.contains("`outline`"), "{result}");
+        assert!(result.contains("boolean"), "{result}");
+
+        let result = executor.read_file(&serde_json::json!({
+            "path": "test.txt",
+            "start_line": 3,
+            "end_line": 1
+        }));
+        assert!(
+            result.contains("start_line must be <= end_line"),
+            "{result}"
+        );
+        assert!(result.contains("No file was read"), "{result}");
+        assert!(result.contains("start_line=1"), "{result}");
+        assert!(result.contains("end_line=3"), "{result}");
+        assert!(!result.contains("1\ta"), "{result}");
     }
 
     #[test]
@@ -3964,6 +4346,96 @@ type Handler interface {
         );
     }
 
+    #[test]
+    fn truncated_full_read_does_not_cover_unseen_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        write_large_file(dir.path(), "budgeted.txt", 260);
+
+        let executor = test_executor_in(dir.path());
+        let first = executor.read_file(&serde_json::json!({ "path": "budgeted.txt" }));
+        assert!(
+            first.contains("truncated"),
+            "full read should truncate: {first}"
+        );
+        assert!(
+            first.chars().count() <= READ_FILE_MODEL_RESULT_CHARS,
+            "read_file output must fit model read budget"
+        );
+
+        let later = executor.read_file(&serde_json::json!({
+            "path": "budgeted.txt",
+            "start_line": 200,
+            "end_line": 205
+        }));
+        assert!(
+            later.contains("line 200") && !later.contains("already read"),
+            "unseen tail range must still be readable: {later}"
+        );
+
+        let covered = executor.read_file(&serde_json::json!({
+            "path": "budgeted.txt",
+            "start_line": 1,
+            "end_line": 5
+        }));
+        assert!(
+            covered.contains("already read"),
+            "delivered prefix can still dedup: {covered}"
+        );
+    }
+
+    #[test]
+    fn truncated_ranged_read_records_only_delivered_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        write_large_file(dir.path(), "range-budgeted.txt", 260);
+
+        let executor = test_executor_in(dir.path());
+        let first = executor.read_file(&serde_json::json!({
+            "path": "range-budgeted.txt",
+            "start_line": 1,
+            "end_line": 220
+        }));
+        assert!(
+            first.contains("truncated"),
+            "range should truncate: {first}"
+        );
+        assert!(
+            first.chars().count() <= READ_FILE_MODEL_RESULT_CHARS,
+            "ranged read_file output must fit model read budget"
+        );
+
+        let later = executor.read_file(&serde_json::json!({
+            "path": "range-budgeted.txt",
+            "start_line": 200,
+            "end_line": 205
+        }));
+        assert!(
+            later.contains("line 200") && !later.contains("already read"),
+            "undelivered part of truncated range must not be considered read: {later}"
+        );
+    }
+
+    #[test]
+    fn truncated_full_read_does_not_satisfy_overwrite_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        write_large_file(dir.path(), "overwrite.txt", 260);
+
+        let executor = test_executor_in(dir.path());
+        let read = executor.read_file(&serde_json::json!({ "path": "overwrite.txt" }));
+        assert!(
+            read.contains("truncated"),
+            "setup should be a partial delivery: {read}"
+        );
+
+        let write = executor.write_file(&serde_json::json!({
+            "path": "overwrite.txt",
+            "content": "replacement\n"
+        }));
+        assert!(
+            write.contains("only partially read"),
+            "truncated full read must not permit overwrite: {write}"
+        );
+    }
+
     // ── read_file not-found hints ────────────────────────────────────────────
 
     #[test]
@@ -4357,6 +4829,116 @@ type Handler interface {
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
         let result = exe.multi_edit(&json!({"path": "f.txt", "edits": []}));
         assert!(result.contains("empty"), "result: {result}");
+    }
+
+    #[test]
+    fn str_replace_batch_accepts_per_edit_paths_for_multi_file_batch() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let a = tmpdir.path().join("a.txt");
+        let b = tmpdir.path().join("b.txt");
+        std::fs::write(&a, "alpha beta").unwrap();
+        std::fs::write(&b, "gamma delta").unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&json!({"path": "a.txt"}));
+        exe.read_file(&json!({"path": "b.txt"}));
+
+        let result = exe.str_replace_batch(&json!({
+            "edits": [
+                {"path": "a.txt", "old_str": "alpha", "new_str": "ALPHA"},
+                {"path": "b.txt", "old_str": "delta", "new_str": "DELTA"}
+            ]
+        }));
+
+        assert!(
+            result.contains("Successfully applied edits to 2 file(s)"),
+            "result: {result}"
+        );
+        assert!(result.contains(TOOL_SUCCESS_SENTINEL), "result: {result}");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "ALPHA beta\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "gamma DELTA\n");
+    }
+
+    #[test]
+    fn str_replace_batch_prevalidates_all_files_before_writing() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let a = tmpdir.path().join("a.txt");
+        let b = tmpdir.path().join("b.txt");
+        std::fs::write(&a, "alpha beta").unwrap();
+        std::fs::write(&b, "gamma delta").unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&json!({"path": "a.txt"}));
+        exe.read_file(&json!({"path": "b.txt"}));
+
+        let result = exe.str_replace_batch(&json!({
+            "edits": [
+                {"path": "a.txt", "old_str": "alpha", "new_str": "ALPHA"},
+                {"path": "b.txt", "old_str": "missing", "new_str": "MISSING"}
+            ]
+        }));
+
+        assert!(
+            result.contains("old_str not found"),
+            "missing old_str should be surfaced: {result}"
+        );
+        assert!(
+            !result.contains(TOOL_SUCCESS_SENTINEL),
+            "should not succeed: {result}"
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha beta");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "gamma delta");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn str_replace_batch_atomic_rename_handles_readonly_dest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let a = tmpdir.path().join("a.txt");
+        let b = tmpdir.path().join("b.txt");
+        std::fs::write(&a, "alpha beta").unwrap();
+        std::fs::write(&b, "gamma delta").unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&json!({"path": "a.txt"}));
+        exe.read_file(&json!({"path": "b.txt"}));
+
+        let mut readonly = std::fs::metadata(&b).unwrap().permissions();
+        readonly.set_mode(0o444);
+        std::fs::set_permissions(&b, readonly).unwrap();
+
+        let result = exe.str_replace_batch(&json!({
+            "edits": [
+                {"path": "a.txt", "old_str": "alpha", "new_str": "ALPHA"},
+                {"path": "b.txt", "old_str": "gamma", "new_str": "GAMMA"}
+            ]
+        }));
+
+        let mut writable = std::fs::metadata(&b).unwrap().permissions();
+        writable.set_mode(0o644);
+        std::fs::set_permissions(&b, writable).unwrap();
+
+        // staging + rename() replaces the directory entry atomically,
+        // so read-only destination files do not block the operation.
+        assert!(result.contains(TOOL_SUCCESS_SENTINEL), "result: {result}");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "ALPHA beta\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "GAMMA delta\n");
+    }
+
+    #[test]
+    fn str_replace_batch_requires_some_path_source() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+
+        let result = exe.str_replace_batch(&json!({
+            "edits": [
+                {"old_str": "alpha", "new_str": "ALPHA"}
+            ]
+        }));
+
+        assert!(
+            result.contains("top-level path") && result.contains("path inside every edit"),
+            "result: {result}"
+        );
     }
 
     #[test]

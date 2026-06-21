@@ -6,7 +6,6 @@ pub mod agents;
 pub mod artifact_policy;
 pub mod auth;
 pub mod branches;
-pub mod checkpoint_crypto;
 pub mod config_version_cloud;
 pub mod context;
 pub mod context_manifest;
@@ -65,6 +64,7 @@ pub mod triggers;
 pub mod turn_intent_judge;
 pub mod verification;
 pub mod workflows;
+pub mod workspace_records;
 
 fn missing_shared_pool_error(
     service_name: &'static str,
@@ -328,4 +328,9 @@ pub use turn_intent_judge::{
 pub use workflows::{
     UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem, WorkflowRunRecord,
     WorkflowService,
+};
+pub use workspace_records::{
+    DatabaseWorkspaceRecordStore, InMemoryWorkspaceRecordStore, WorkspaceCleanupDebtEntry,
+    WorkspaceCleanupDebtStore, WorkspaceCleanupDebtStoreError, WorkspaceRecordEntry,
+    WorkspaceRecordStore, WorkspaceRecordStoreError, WorkspaceStateStore,
 };

@@ -41,6 +41,7 @@ pub mod run_script;
 pub mod shell_ops;
 pub mod task_mgmt;
 pub mod task_mgmt_matrixone;
+pub mod tool_engine;
 pub mod tool_result_status;
 pub mod tool_search;
 
@@ -152,20 +153,9 @@ pub trait ToolExecutor: Send + Sync {
     }
 }
 
-// ─── Sandbox configuration ──────────────────────────────────────────────────
+pub use astra_sandbox::IsolationLevel;
 
-/// Sandbox enforcement level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum SandboxMode {
-    /// No restrictions — backward compatible.
-    Permissive,
-    /// Path boundary enforcement + env filtering.
-    Standard,
-    /// Full isolation: Standard + restricted shell + optional namespace.
-    Strict,
-    /// Read-only access: no writes, no shell mutations.
-    ReadOnly,
-}
+// ─── Sandbox configuration ──────────────────────────────────────────────────
 
 /// Sandbox configuration for tool execution.
 #[derive(Debug, Clone)]
@@ -175,7 +165,7 @@ pub struct SandboxConfig {
     /// Additional allowed path prefixes.
     pub allowed_paths: Vec<PathBuf>,
     /// Sandbox enforcement level.
-    pub mode: SandboxMode,
+    pub mode: IsolationLevel,
     /// Maximum output size in bytes before truncation.
     pub max_output_bytes: usize,
     /// Maximum command execution time.
@@ -210,7 +200,7 @@ impl SandboxConfig {
         Self {
             project_root: root,
             allowed_paths,
-            mode: SandboxMode::Standard,
+            mode: IsolationLevel::Standard,
             max_output_bytes: 200_000,
             command_timeout: Duration::from_secs(120),
             network_allowed: true,
@@ -223,7 +213,7 @@ impl SandboxConfig {
         Self {
             project_root: root,
             allowed_paths: default_temp_allowed_paths(),
-            mode: SandboxMode::Strict,
+            mode: IsolationLevel::Strict,
             max_output_bytes: 200_000,
             command_timeout: Duration::from_secs(120),
             network_allowed: false,
@@ -406,6 +396,24 @@ pub trait ToolApprovalGate: Send + Sync {
 
     /// Returns `true` if this tool requires approval before execution.
     fn requires_approval(&self, tool_name: &str) -> bool;
+
+    /// Returns `true` if this invocation requires approval before execution.
+    ///
+    /// # Contract for implementers
+    ///
+    /// The default implementation ORs [`Self::requires_approval`] with
+    /// [`tool_requires_approval`] — the latter handles argument-sensitive
+    /// checks (e.g. `git(action=commit)` vs `git(action=diff)`).
+    ///
+    /// If you override this method you **must** either:
+    /// 1. call `tool_requires_approval(tool_name, args)` yourself, or
+    /// 2. replicate its argument-sensitive logic.
+    ///
+    /// Failing to do so will silently bypass approval checks for mutating
+    /// git/github actions.
+    fn requires_approval_for(&self, tool_name: &str, args: &Value) -> bool {
+        self.requires_approval(tool_name) || tool_requires_approval(tool_name, args)
+    }
 }
 
 // ─── ask_user gate ────────────────────────────────────────────────────────────
@@ -472,11 +480,33 @@ pub const APPROVAL_REQUIRED_TOOLS: &[&str] = &[
     "delete_file",
     "rollback_file_edits",
     "rollback_database_snapshots",
-    "git_commit",
-    "git_revert_commit",
-    "git_stash",
-    "github_create_issue",
 ];
+
+fn git_stash_action_requires_approval(args: &Value) -> bool {
+    args.get("stash_action")
+        .or_else(|| args.get("sub_action"))
+        .and_then(Value::as_str)
+        .is_some_and(|action| matches!(action, "push" | "save" | "apply" | "pop" | "drop"))
+}
+
+/// Returns `true` if this exact tool invocation requires user approval.
+pub fn tool_requires_approval(tool_name: &str, args: &Value) -> bool {
+    match tool_name {
+        "git" => args
+            .get("action")
+            .and_then(Value::as_str)
+            .is_some_and(|action| match action {
+                "commit" | "revert_commit" | "push" => true,
+                "stash" => git_stash_action_requires_approval(args),
+                _ => false,
+            }),
+        "github" => args
+            .get("action")
+            .and_then(Value::as_str)
+            .is_some_and(|action| action == "create_issue"),
+        _ => APPROVAL_REQUIRED_TOOLS.contains(&tool_name),
+    }
+}
 
 // ─── Output management utilities ────────────────────────────────────────────
 
@@ -741,7 +771,7 @@ mod tests {
     fn sandbox_standard_defaults() {
         let cfg = SandboxConfig::standard("/projects/foo");
         assert_eq!(cfg.project_root, PathBuf::from("/projects/foo"));
-        assert_eq!(cfg.mode, SandboxMode::Standard);
+        assert_eq!(cfg.mode, IsolationLevel::Standard);
         assert!(cfg.network_allowed);
         assert_eq!(cfg.max_output_bytes, 200_000);
         assert_eq!(cfg.command_timeout, Duration::from_secs(120));
@@ -752,17 +782,16 @@ mod tests {
     #[test]
     fn sandbox_strict_defaults() {
         let cfg = SandboxConfig::strict("/srv/workspace");
-        assert_eq!(cfg.mode, SandboxMode::Strict);
+        assert_eq!(cfg.mode, IsolationLevel::Strict);
         assert!(!cfg.network_allowed);
         assert!(cfg.allowed_paths.contains(&PathBuf::from("/tmp")));
         assert!(cfg.allowed_paths.contains(&std::env::temp_dir()));
     }
 
     #[test]
-    fn sandbox_mode_ordering() {
-        assert!(SandboxMode::Permissive < SandboxMode::Standard);
-        assert!(SandboxMode::Standard < SandboxMode::Strict);
-        assert!(SandboxMode::Strict < SandboxMode::ReadOnly);
+    fn sandbox_config_uses_shared_isolation_level_ordering() {
+        assert!(IsolationLevel::Permissive < IsolationLevel::Standard);
+        assert!(IsolationLevel::Standard < IsolationLevel::Strict);
     }
 
     // ── Output utilities ───────────────────────────────────────────────
@@ -946,7 +975,7 @@ mod tests {
         );
     }
 
-    // ── APPROVAL_REQUIRED_TOOLS ────────────────────────────────────────
+    // ── Approval policy ────────────────────────────────────────────────
 
     #[test]
     fn approval_required_tools_includes_dangerous_ops() {
@@ -956,12 +985,83 @@ mod tests {
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"delete_file"));
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"rollback_file_edits"));
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"rollback_database_snapshots"));
-        assert!(APPROVAL_REQUIRED_TOOLS.contains(&"git_commit"));
-        assert!(APPROVAL_REQUIRED_TOOLS.contains(&"git_revert_commit"));
-        assert!(APPROVAL_REQUIRED_TOOLS.contains(&"git_stash"));
-        assert!(APPROVAL_REQUIRED_TOOLS.contains(&"github_create_issue"));
         assert!(!APPROVAL_REQUIRED_TOOLS.contains(&"read_file"));
         assert!(!APPROVAL_REQUIRED_TOOLS.contains(&"grep"));
+    }
+
+    #[test]
+    fn approval_required_tools_does_not_keep_retired_action_aliases() {
+        for retired in [
+            "git_commit",
+            "git_revert_commit",
+            "git_stash",
+            "github_create_issue",
+        ] {
+            assert!(!APPROVAL_REQUIRED_TOOLS.contains(&retired));
+        }
+    }
+
+    #[test]
+    fn tool_requires_approval_for_git_mutating_actions() {
+        assert!(tool_requires_approval(
+            "git",
+            &serde_json::json!({"action": "commit", "message": "ship"})
+        ));
+        assert!(tool_requires_approval(
+            "git",
+            &serde_json::json!({"action": "revert_commit", "commit_sha": "abc123"})
+        ));
+        assert!(tool_requires_approval(
+            "git",
+            &serde_json::json!({"action": "push", "remote": "origin", "branch": "main"})
+        ));
+        assert!(tool_requires_approval(
+            "git",
+            &serde_json::json!({"action": "stash", "sub_action": "push"})
+        ));
+        assert!(tool_requires_approval(
+            "git",
+            &serde_json::json!({"action": "stash", "stash_action": "drop"})
+        ));
+    }
+
+    #[test]
+    fn tool_requires_approval_skips_git_read_only_actions() {
+        for action in [
+            "status",
+            "diff",
+            "log",
+            "show",
+            "blame",
+            "file_history",
+            "log_search",
+            "contributors",
+        ] {
+            assert!(!tool_requires_approval(
+                "git",
+                &serde_json::json!({"action": action})
+            ));
+        }
+        assert!(!tool_requires_approval(
+            "git",
+            &serde_json::json!({"action": "stash", "sub_action": "list"})
+        ));
+    }
+
+    #[test]
+    fn tool_requires_approval_for_github_mutating_actions() {
+        assert!(tool_requires_approval(
+            "github",
+            &serde_json::json!({"action": "create_issue", "title": "bug"})
+        ));
+        assert!(!tool_requires_approval(
+            "github",
+            &serde_json::json!({"action": "list_prs"})
+        ));
+        assert!(!tool_requires_approval(
+            "github",
+            &serde_json::json!({"action": "get_issue"})
+        ));
     }
 
     // ── ApprovalDecision ───────────────────────────────────────────────

@@ -4,6 +4,11 @@
 //! `astra` / `runtime` / cognitive pipelines.
 
 use crate::protocol::{ChatStreamRequest, EdgeRegisterRequest};
+use astra_runtime_env::{
+    ExecutorBinding, PolicyIntent, RunBinding, RuntimeBinding, RuntimeEnvironmentAdvertisement,
+    ToolRegistry, WorkspaceAuthority, WorkspaceBinding,
+};
+use serde_json::Value;
 
 /// HTTP header matching design doc §5.5 (`POST /tools/result`).
 pub const ASTRA_EDGE_ID_HEADER: &str = "X-Astra-Edge-Id";
@@ -29,10 +34,41 @@ pub fn advertise_executor(req: &mut ChatStreamRequest, executor_id: impl Into<St
     }
 }
 
-/// [`EdgeRegisterRequest`] with `capabilities` set to [`builtin_capability_preset`] as JSON (for `POST /agents/edge`).
-pub fn edge_register_with_capabilities(executor_id: impl Into<String>) -> EdgeRegisterRequest {
-    let mut r = EdgeRegisterRequest::new(executor_id);
-    r.capabilities = Some(serde_json::json!(builtin_capability_preset()));
+/// Structured runtime-env advertisement for `POST /agents/edge`.
+pub fn edge_runtime_environment_capabilities(
+    executor_id: impl AsRef<str>,
+    worktree_path: impl AsRef<str>,
+) -> Value {
+    let registry = ToolRegistry::builtins();
+    let edge_agent_id = executor_id.as_ref();
+    let binding = RunBinding::resolve(
+        WorkspaceBinding::edge_workspace(
+            worktree_path.as_ref().to_string(),
+            WorkspaceAuthority::ReadWrite,
+        ),
+        ExecutorBinding::edge_agent(edge_agent_id.to_string()),
+        RuntimeBinding::host_process(format!("edge-host:{edge_agent_id}")),
+        PolicyIntent::local_developer(),
+        &registry,
+    );
+
+    serde_json::to_value(RuntimeEnvironmentAdvertisement::new(binding))
+        .expect("runtime environment advertisement serializes")
+}
+
+/// [`EdgeRegisterRequest`] with a structured runtime-env capability advertisement.
+pub fn edge_register_with_capabilities(
+    executor_id: impl Into<String>,
+    worktree_path: impl Into<String>,
+) -> EdgeRegisterRequest {
+    let executor_id = executor_id.into();
+    let worktree_path = worktree_path.into();
+    let mut r = EdgeRegisterRequest::new(executor_id.clone());
+    r.worktree_path = Some(worktree_path.clone());
+    r.capabilities = Some(edge_runtime_environment_capabilities(
+        &executor_id,
+        &worktree_path,
+    ));
     r
 }
 
@@ -58,8 +94,29 @@ mod tests {
 
     #[test]
     fn edge_register_with_capabilities_json() {
-        let r = edge_register_with_capabilities("my-edge");
+        let r = edge_register_with_capabilities("my-edge", "/workspace/app");
         assert_eq!(r.edge_agent_id, "my-edge");
-        assert!(r.capabilities.as_ref().unwrap().is_array());
+        assert_eq!(r.worktree_path.as_deref(), Some("/workspace/app"));
+        let capabilities = r.capabilities.as_ref().unwrap();
+        assert_eq!(
+            capabilities["schema_version"],
+            RuntimeEnvironmentAdvertisement::SCHEMA_VERSION
+        );
+        assert_eq!(
+            capabilities["binding"]["workspace"]["kind"],
+            "edge_workspace"
+        );
+        assert_eq!(
+            capabilities["binding"]["workspace"]["cwd"],
+            "/workspace/app"
+        );
+        assert_eq!(
+            capabilities["binding"]["executor"]["executor_id"],
+            "my-edge"
+        );
+        assert_eq!(
+            capabilities["binding"]["capabilities"]["runtime"]["runtime_has_git"],
+            true
+        );
     }
 }

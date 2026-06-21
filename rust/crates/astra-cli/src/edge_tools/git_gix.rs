@@ -2038,9 +2038,23 @@ mod tests {
         let tracked = repo.path().join("tracked.txt");
         std::fs::write(&tracked, "two\n").expect("modify tracked file");
         let executor = ToolExecutor::new(repo.path());
+        let git_schema = crate::edge_tools::all_tool_schemas()
+            .into_iter()
+            .find(|schema| {
+                schema
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    == Some("git")
+            })
+            .expect("git schema");
+        executor.set_current_visible_tool_schemas(&[git_schema]);
 
         let outcome = executor
-            .execute_with_metadata("git_stash", &json!({"action": "push", "message": "demo"}))
+            .execute_with_metadata(
+                "git",
+                &json!({"action": "stash", "sub_action": "push", "message": "demo"}),
+            )
             .await;
         assert!(
             !outcome.output.starts_with("Error:"),

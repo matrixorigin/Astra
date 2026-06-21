@@ -265,8 +265,15 @@ impl From<Message> for Value {
         if m.is_synthetic {
             map.insert("_synthetic".to_string(), Value::Bool(true));
         }
+        // Internal telemetry/metadata fields use a `_` prefix and must NOT
+        // cross the provider wire — they're not part of the model-visible
+        // message and would destabilize prompt-cache prefixes (dynamic
+        // counters like `_messages_removed` change across re-compactions,
+        // busting the cache at the boundary even when `content` is stable).
         for (k, v) in m.extra {
-            map.insert(k, v);
+            if !k.starts_with('_') {
+                map.insert(k, v);
+            }
         }
         Value::Object(map)
     }
@@ -588,24 +595,57 @@ mod tests {
 
     #[test]
     fn round_trip_extra_fields_preserved() {
+        // Non-`_`-prefixed extra keys must survive round-trip (these are
+        // provider-visible fields the model expects to see).
         let v = json!({
             "role": "user",
             "content": "hi",
-            "_compact_boundary": true,
-            "_reactive": false,
-            "_messages_removed": 5,
             "custom_provider_field": {"nested": true}
         });
         let msg = Message::from(v.clone());
         let back = Value::from(msg);
-        // All extra keys must survive round-trip.
-        assert_eq!(back["_compact_boundary"], Value::Bool(true));
-        assert_eq!(back["_reactive"], Value::Bool(false));
-        assert_eq!(back["_messages_removed"], json!(5));
         assert_eq!(back["custom_provider_field"], json!({"nested": true}));
-        // Also verify known fields survived.
         assert_eq!(back["role"], Value::String("user".into()));
         assert_eq!(back["content"], Value::String("hi".into()));
+    }
+
+    #[test]
+    fn wire_serialization_strips_underscore_prefixed_extras() {
+        // Dynamic telemetry counters (`_messages_removed`, `_turns_removed`,
+        // `_reactive`, `_compact_boundary`) live in `extra` but must NOT
+        // cross the provider wire: they change across re-compactions and
+        // would bust the prompt-cache prefix at the boundary even when
+        // `content` is stable. See `From<Message> for Value`.
+        let v = json!({
+            "role": "system",
+            "content": "[compacted]",
+            "_compact_boundary": true,
+            "_reactive": false,
+            "_messages_removed": 5,
+            "_turns_removed": 2,
+            "custom_provider_field": {"ok": true}
+        });
+        let msg = Message::from(v);
+        let back = Value::from(msg);
+        assert!(
+            back.get("_compact_boundary").is_none(),
+            "_compact_boundary must not cross provider wire"
+        );
+        assert!(
+            back.get("_reactive").is_none(),
+            "_reactive must not cross provider wire"
+        );
+        assert!(
+            back.get("_messages_removed").is_none(),
+            "_messages_removed must not cross provider wire"
+        );
+        assert!(
+            back.get("_turns_removed").is_none(),
+            "_turns_removed must not cross provider wire"
+        );
+        // Non-`_`-prefixed extras still pass through.
+        assert_eq!(back["custom_provider_field"], json!({"ok": true}));
+        assert_eq!(back["content"], Value::String("[compacted]".into()));
     }
 
     #[test]

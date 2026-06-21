@@ -129,7 +129,7 @@ pub enum ForkReason {
 fn journal_event_content_hash(event: &JournalEvent) -> String {
     let payload = serde_json::to_vec(event).unwrap_or_else(|_| format!("{event:?}").into_bytes());
     let digest = Sha256::digest(&payload);
-    format!("sha256:{}", crate::checkpoint_crypto::hex_encode(&digest))
+    format!("sha256:{digest:x}")
 }
 
 /// Error during DB ingestion.

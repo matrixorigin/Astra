@@ -17,6 +17,7 @@ server = [
     "dep:serde_yaml_ng",
     "dep:tokio",
     "dep:tokio-util",
+    "dep:tracing",
     "dep:uuid",
 ]
 
@@ -34,6 +35,7 @@ regex = { workspace = true, optional = true }
 serde_yaml_ng = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 
 [dev-dependencies]

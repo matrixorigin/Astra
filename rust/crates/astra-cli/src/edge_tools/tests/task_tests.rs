@@ -282,9 +282,9 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
         .await;
     assert!(
         create_dependency_removal_field.starts_with("Error:")
-            && create_dependency_removal_field.contains("update-only")
-            && create_dependency_removal_field.contains("task(action='update'")
-            && create_dependency_removal_field.contains("<created task_id>"),
+            && create_dependency_removal_field.contains("task.create")
+            && create_dependency_removal_field.contains("task.update")
+            && create_dependency_removal_field.contains("unknown field 'remove_blocked_by'"),
         "create dependency-removal misuse should explain the two-step repair: {create_dependency_removal_field}"
     );
 

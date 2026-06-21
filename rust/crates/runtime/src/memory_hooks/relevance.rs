@@ -5,12 +5,25 @@
 //! Uses the cheapest `selector`-tagged model from the registry
 //! (resolved via `resolve_memory_model` from the model DB).
 
+use std::collections::HashSet;
+
+use astra_text_utils::text_tokenize::tokenize;
+
 /// Prompt for the selector model to judge memory relevance.
 pub const RELEVANCE_FILTER_PROMPT: &str = "\
 You are filtering retrieved memories for relevance to a user's task.
 Return ONLY a JSON array of indices for memories that are CLEARLY useful.
 If unsure whether a memory is relevant, EXCLUDE it — false negatives
 are better than noise. Return [] if nothing is relevant.";
+
+/// Prompt for judging whether the latest user message is feedback about
+/// previously injected memory/lesson/rule candidates.
+pub const MEMORY_FEEDBACK_FILTER_PROMPT: &str = "\
+You are reviewing a user's latest message against memory candidates that were
+shown to the assistant earlier. Return ONLY a JSON array of candidate indices
+that the user is explicitly rejecting as irrelevant, stale, wrong, conflicting,
+or no longer applicable. Do not mark a candidate just because the new task is
+about something else. If uncertain, return [].";
 
 /// Build the user-turn content for relevance filtering.
 #[must_use]
@@ -20,6 +33,20 @@ pub fn build_relevance_query(user_message: &str, memories: &[String]) -> String 
         prompt.push_str(&format!("[{}] {}\n", i, truncate(m, 150)));
     }
     prompt.push_str("\nRelevant indices (JSON array):");
+    prompt
+}
+
+/// Build the user-turn content for memory feedback filtering.
+#[must_use]
+pub fn build_memory_feedback_query(user_message: &str, memories: &[String]) -> String {
+    let mut prompt = format!(
+        "Latest user message: {}\n\nInjected candidates:\n",
+        truncate(user_message, 300)
+    );
+    for (i, m) in memories.iter().enumerate() {
+        prompt.push_str(&format!("[{}] {}\n", i, truncate(m, 180)));
+    }
+    prompt.push_str("\nRejected candidate indices (JSON array):");
     prompt
 }
 
@@ -60,6 +87,131 @@ pub fn filter_by_indices<T: Clone>(items: &[T], indices: &[usize]) -> Vec<T> {
         .collect()
 }
 
+/// Local relevance gate used when the selector model is unavailable and as a
+/// deterministic fallback in tests. It only keeps items that share meaningful
+/// task terms with the current user message.
+#[must_use]
+pub fn lexical_filter_memories(user_message: &str, items: &[String]) -> Vec<String> {
+    let indices = lexical_relevant_indices(user_message, items);
+    filter_by_indices(items, &indices)
+}
+
+#[must_use]
+pub fn lexical_relevant_indices(user_message: &str, items: &[String]) -> Vec<usize> {
+    let query_terms = meaningful_terms(user_message);
+    if query_terms.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scored = Vec::new();
+    for (idx, item) in items.iter().enumerate() {
+        let item_terms = meaningful_terms(item);
+        let score = overlap_score(&query_terms, &item_terms);
+        if score > 0 {
+            scored.push((idx, score));
+        }
+    }
+    scored.sort_by(|(left_idx, left_score), (right_idx, right_score)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left_idx.cmp(right_idx))
+    });
+    scored.into_iter().map(|(idx, _)| idx).collect()
+}
+
+fn meaningful_terms(text: &str) -> HashSet<String> {
+    tokenize(text)
+        .into_iter()
+        .filter(|term| is_meaningful_term(term))
+        .collect()
+}
+
+fn overlap_score(query_terms: &HashSet<String>, item_terms: &HashSet<String>) -> usize {
+    query_terms
+        .intersection(item_terms)
+        .filter(|term| is_strong_overlap_term(term))
+        .map(|term| if term.is_ascii() { 2 } else { 1 })
+        .sum()
+}
+
+fn is_strong_overlap_term(term: &str) -> bool {
+    if term.is_ascii() {
+        return term.chars().count() >= 3;
+    }
+    term.chars().count() >= 2
+}
+
+fn is_meaningful_term(term: &str) -> bool {
+    if term.trim().is_empty() {
+        return false;
+    }
+    if matches!(
+        term,
+        "the"
+            | "and"
+            | "for"
+            | "with"
+            | "that"
+            | "this"
+            | "from"
+            | "into"
+            | "when"
+            | "rule"
+            | "rules"
+            | "general"
+            | "always"
+            | "never"
+            | "should"
+            | "would"
+            | "could"
+            | "don't"
+            | "dont"
+            | "doesn't"
+            | "doesnt"
+            | "do"
+            | "not"
+            | "use"
+            | "using"
+            | "used"
+            | "user"
+            | "task"
+            | "please"
+            | "help"
+            | "need"
+            | "want"
+            | "about"
+            | "because"
+            | "instead"
+            | "prefer"
+            | "run"
+    ) {
+        return false;
+    }
+    if matches!(
+        term,
+        "的" | "了"
+            | "是"
+            | "在"
+            | "和"
+            | "与"
+            | "或"
+            | "这"
+            | "那"
+            | "用"
+            | "要"
+            | "不"
+            | "做"
+            | "说"
+            | "把"
+            | "给"
+            | "对"
+            | "错"
+    ) {
+        return false;
+    }
+    true
+}
+
 /// Connection parameters for an OpenAI-compatible LLM endpoint.
 /// Resolved from the model registry via `resolve_memory_model`.
 #[derive(Debug, Clone)]
@@ -76,8 +228,9 @@ pub struct LlmConnParams {
 /// Filter a list of text items through the selector model.
 /// Returns only items deemed relevant to `user_message`.
 ///
-/// On any error (network, timeout, parse failure) returns the original
-/// list unchanged — graceful degradation over silent filtering.
+/// On transport/model errors, falls back to the deterministic lexical gate.
+/// If the selector explicitly returns no relevant indices, returns an empty
+/// list. Prompt noise is more harmful than a missed memory.
 pub async fn filter_memories(
     params: &LlmConnParams,
     user_message: &str,
@@ -94,7 +247,7 @@ pub async fn filter_memories(
         .build()
     {
         Ok(c) => c,
-        Err(_) => return items.to_vec(),
+        Err(_) => return lexical_filter_memories(user_message, items),
     };
 
     let mut req_body = serde_json::json!({
@@ -122,7 +275,7 @@ pub async fn filter_memories(
         .await
     {
         Ok(r) => r,
-        Err(_) => return items.to_vec(),
+        Err(_) => return lexical_filter_memories(user_message, items),
     };
 
     let body = resp.text().await.unwrap_or_default();
@@ -139,7 +292,7 @@ pub async fn filter_memories(
         .unwrap_or_default();
 
     if text.is_empty() {
-        return items.to_vec();
+        return lexical_filter_memories(user_message, items);
     }
 
     // Safety net: strip <think> tags that native thinkers may emit despite suppression.
@@ -153,10 +306,86 @@ pub async fn filter_memories(
 
     let indices = parse_relevance_response(&text, items.len());
     if indices.is_empty() {
-        return items.to_vec();
+        return Vec::new();
     }
 
     filter_by_indices(items, &indices)
+}
+
+/// Use the selector model to identify which previously injected candidates the
+/// user is explicitly rejecting. On any failure, returns an empty set rather
+/// than guessing from surface words.
+pub async fn select_dismissed_memory_indices(
+    params: &LlmConnParams,
+    user_message: &str,
+    items: &[String],
+) -> Vec<usize> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let query = build_memory_feedback_query(user_message, items);
+    let text = match run_selector_prompt(params, MEMORY_FEEDBACK_FILTER_PROMPT, query).await {
+        Some(text) => text,
+        None => return Vec::new(),
+    };
+    parse_relevance_response(&text, items.len())
+}
+
+async fn run_selector_prompt(
+    params: &LlmConnParams,
+    system_prompt: &str,
+    user_content: String,
+) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .no_proxy()
+        .build()
+        .ok()?;
+
+    let mut req_body = serde_json::json!({
+        "model": params.wire_model_name.as_deref().unwrap_or(&params.model_name),
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "max_tokens": 50,
+        "temperature": 0.0,
+    });
+    astra_turn_core::thinking_config::ThinkingConfig::Off.apply_openai_suppression(
+        &mut req_body,
+        &params.provider,
+        &params.base_url,
+    );
+
+    let resp = client
+        .post(format!("{}/chat/completions", params.base_url))
+        .header("Authorization", format!("Bearer {}", params.api_key))
+        .json(&req_body)
+        .send()
+        .await
+        .ok()?;
+
+    let body = resp.text().await.unwrap_or_default();
+    let text = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| {
+            v.get("choices")?
+                .get(0)?
+                .get("message")?
+                .get("content")?
+                .as_str()
+                .map(String::from)
+        })?;
+    if text.trim().is_empty() {
+        return None;
+    }
+
+    let stripped = astra_turn_core::thinking_config::strip_think_tags(&text);
+    Some(if stripped.trim().is_empty() {
+        text
+    } else {
+        stripped
+    })
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -205,6 +434,26 @@ mod tests {
     }
 
     #[test]
+    fn lexical_filter_keeps_only_evidenced_items() {
+        let items = vec![
+            "Do not treat curl checks as browser verification".into(),
+            "Prefer cargo test for Rust executor changes".into(),
+        ];
+        let result = lexical_filter_memories("review Rust executor code", &items);
+        assert_eq!(
+            result,
+            vec!["Prefer cargo test for Rust executor changes".to_string()]
+        );
+    }
+
+    #[test]
+    fn lexical_filter_handles_chinese_ascii_mixed_terms() {
+        let items = vec!["不要用bash执行git命令".into(), "always run clippy".into()];
+        let result = lexical_filter_memories("用bash运行测试", &items);
+        assert_eq!(result, vec!["不要用bash执行git命令".to_string()]);
+    }
+
+    #[test]
     fn build_query_includes_all_memories() {
         let query = build_relevance_query(
             "fix auth bug",
@@ -214,6 +463,18 @@ mod tests {
         assert!(query.contains("[0] use rg not grep"));
         assert!(query.contains("[1] RS256 for JWT"));
         assert!(query.contains("Relevant indices"));
+    }
+
+    #[test]
+    fn build_feedback_query_includes_candidates() {
+        let query = build_memory_feedback_query(
+            "the first candidate should not apply here",
+            &["candidate one".into(), "candidate two".into()],
+        );
+        assert!(query.contains("Latest user message"));
+        assert!(query.contains("[0] candidate one"));
+        assert!(query.contains("[1] candidate two"));
+        assert!(query.contains("Rejected candidate indices"));
     }
 
     #[test]
@@ -281,7 +542,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filter_memories_unreachable_server_returns_all() {
+    async fn filter_memories_unreachable_server_uses_lexical_fallback() {
         let params = LlmConnParams {
             base_url: "http://127.0.0.1:1".into(),
             api_key: "key".into(),
@@ -291,9 +552,16 @@ mod tests {
             request_body_overrides: None,
             thinking_capability: None,
         };
-        let items = vec!["a".into(), "b".into(), "c".into()];
-        let result = filter_memories(&params, "query", &items).await;
-        assert_eq!(result, items, "unreachable server should return all items");
+        let items = vec![
+            "browser verification for html pages".into(),
+            "cargo test for rust executor changes".into(),
+        ];
+        let result = filter_memories(&params, "rust executor review", &items).await;
+        assert_eq!(
+            result,
+            vec!["cargo test for rust executor changes".to_string()],
+            "unreachable server should fall back to local relevance"
+        );
     }
 
     // ── Mock server integration tests ────────────────────────────────────
@@ -428,5 +696,58 @@ mod tests {
         let items = vec!["irrelevant".into(), "relevant".into(), "noise".into()];
         let result = filter_memories(&params, "query", &items).await;
         assert_eq!(result, vec!["relevant"]);
+    }
+
+    #[tokio::test]
+    async fn filter_memories_selector_empty_means_no_injection() {
+        let captured = Arc::new(Mutex::new(None));
+        let base = spawn_mock_completions(captured.clone(), "[]").await;
+        let params = LlmConnParams {
+            base_url: base,
+            api_key: "k".into(),
+            model_name: "m".into(),
+            wire_model_name: None,
+            provider: "openai".into(),
+            request_body_overrides: None,
+            thinking_capability: None,
+        };
+        let items = vec!["cargo test for rust executor changes".into()];
+        let result = filter_memories(&params, "rust executor review", &items).await;
+        assert!(
+            result.is_empty(),
+            "selector's explicit empty relevance result should be respected"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_dismissed_memory_indices_uses_selector_output() {
+        let captured = Arc::new(Mutex::new(None));
+        let base = spawn_mock_completions(captured.clone(), "[0]").await;
+        let params = LlmConnParams {
+            base_url: base,
+            api_key: "k".into(),
+            model_name: "m".into(),
+            wire_model_name: None,
+            provider: "openai".into(),
+            request_body_overrides: None,
+            thinking_capability: None,
+        };
+        let items = vec![
+            "candidate about browser verification".into(),
+            "candidate about rust tests".into(),
+        ];
+        let dismissed = select_dismissed_memory_indices(
+            &params,
+            "the first candidate should not apply",
+            &items,
+        )
+        .await;
+        assert_eq!(dismissed, vec![0]);
+
+        let body = captured.lock().unwrap().take().expect("request captured");
+        assert_eq!(
+            body["messages"][0]["content"],
+            MEMORY_FEEDBACK_FILTER_PROMPT
+        );
     }
 }

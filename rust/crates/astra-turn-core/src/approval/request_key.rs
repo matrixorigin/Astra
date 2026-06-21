@@ -6,7 +6,7 @@
 //! questions need OPPOSITE accuracy:
 //!
 //! - **Rule matching** (the existing fingerprint) wants to be GENEROUS.
-//!   A user-saved rule like `Bash(npm test:*)` should match any future
+//!   A user-saved rule like `Bash(argv_prefix="npm test")` should match any future
 //!   `npm test` call regardless of arguments. The fingerprint normalizes
 //!   path patterns (`approval_fingerprint.rs:185-197`) and tolerates wide
 //!   command matches (`approval_fingerprint.rs:99-130`). Generous = good.

@@ -534,7 +534,7 @@ impl RunEngine {
     ///   `failed` with reason "recovered from crash".
     pub async fn recover_active_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
         let waiting = self.store.find_waiting_runs().await?;
-        let running = self.store.find_running_runs().await?;
+        let running = self.store.find_recoverable_running_runs().await?;
 
         let mut recovered_running = Vec::with_capacity(running.len());
         for mut run in running {
@@ -635,10 +635,11 @@ impl RunInputProvider for RunEngine {
         let run = match self.store.load_run(run_id).await {
             Ok(Some(run)) => run,
             Ok(None) => {
+                let error = format!("run not found while polling deferred input: {run_id}");
                 return RunQueuedInputPoll {
                     next_cursor: after_event_index,
                     inputs: Vec::new(),
-                    error: None,
+                    error: Some(error),
                 };
             }
             Err(error) => {
@@ -1405,6 +1406,20 @@ mod tests {
         assert_eq!(poll.next_cursor, 7);
         assert!(poll.inputs.is_empty());
         assert_eq!(poll.error.as_deref(), Some("load failed"));
+    }
+
+    #[tokio::test]
+    async fn poll_user_inputs_reports_missing_run_as_error() {
+        let engine = test_engine();
+
+        let poll = engine.poll_user_inputs("missing-run", 3).await;
+
+        assert_eq!(poll.next_cursor, 3);
+        assert!(poll.inputs.is_empty());
+        assert_eq!(
+            poll.error.as_deref(),
+            Some("run not found while polling deferred input: missing-run")
+        );
     }
 
     #[tokio::test]

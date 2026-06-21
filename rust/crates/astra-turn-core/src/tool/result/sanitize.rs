@@ -23,15 +23,22 @@ fn str_replace_diff_block_re() -> &'static Regex {
 /// ~50K chars ≈ 12.5K tokens — generous for individual tool results while
 /// preventing unbounded context growth from large file reads or verbose bash output.
 pub const MAX_TOOL_RESULT_CHARS: usize = 50_000;
-const HIGH_CHURN_READ_RESULT_CHARS: usize = 12_000;
+/// Maximum `read_file`/`view` payload size that is delivered to the model.
+///
+/// File read state must use this as an upper bound for "content seen by the
+/// model"; larger internal caches are not evidence that the model saw the
+/// omitted lines.
+pub const READ_FILE_MODEL_RESULT_CHARS: usize = 12_000;
 const HIGH_CHURN_DIFF_RESULT_CHARS: usize = 14_000;
 const HIGH_CHURN_SHELL_RESULT_CHARS: usize = 18_000;
 
 /// Remove `_cli_*` keys from JSON tool results and diff sentinels from `str_replace` text.
-/// Also truncates oversized results to `MAX_TOOL_RESULT_CHARS`, keeping head + tail with
-/// a truncation notice in the middle.
+///
+/// This keeps the full sanitized content. Use this for durable artifacts that a
+/// later tool may parse or read back. Budget truncation belongs only at the
+/// model-message boundary.
 #[must_use]
-pub fn tool_result_content_for_model(tool_name: &str, content: &str) -> String {
+pub fn tool_result_content_for_model_unbounded(tool_name: &str, content: &str) -> String {
     let content = match tool_name {
         "write_file" => strip_cli_json_keys(content),
         "str_replace" | "multi_edit" => str_replace_diff_block_re()
@@ -39,6 +46,7 @@ pub fn tool_result_content_for_model(tool_name: &str, content: &str) -> String {
             .to_string(),
         _ => content.to_string(),
     };
+    let content = astra_core::error_kind::strip_tool_binding_sentinel(&content).into_owned();
     let sanitized = sanitize_tool_output_for_llm(&content);
     if sanitized.stripped_lines > 0 {
         agent_warn!(
@@ -56,16 +64,31 @@ pub fn tool_result_content_for_model(tool_name: &str, content: &str) -> String {
             tool_name
         );
     }
+    sanitized.content
+}
+
+/// Remove `_cli_*` keys from JSON tool results and diff sentinels from
+/// `str_replace` text. Also truncates oversized results to
+/// `MAX_TOOL_RESULT_CHARS`, keeping head + tail with a truncation notice in the
+/// middle.
+#[must_use]
+pub fn tool_result_content_for_model(tool_name: &str, content: &str) -> String {
+    let sanitized = tool_result_content_for_model_unbounded(tool_name, content);
+    truncate_tool_result_for_model(tool_name, &sanitized)
+}
+
+#[must_use]
+pub fn truncate_tool_result_for_model(tool_name: &str, sanitized_content: &str) -> String {
     truncate_tool_result(
         tool_name,
-        &sanitized.content,
-        model_result_char_budget(tool_name, &sanitized.content),
+        sanitized_content,
+        model_result_char_budget(tool_name, sanitized_content),
     )
 }
 
 fn model_result_char_budget(tool_name: &str, content: &str) -> usize {
     match tool_name {
-        "read_file" | "view" => HIGH_CHURN_READ_RESULT_CHARS,
+        "read_file" | "view" => READ_FILE_MODEL_RESULT_CHARS,
         "git_diff" | "git_show" | "str_replace" | "multi_edit" => HIGH_CHURN_DIFF_RESULT_CHARS,
         // Shell output is too varied to cap as aggressively as structured read
         // tools, but huge diffs/build logs should not dominate the next round.
@@ -235,6 +258,17 @@ mod tests {
     }
 
     #[test]
+    fn strips_tool_binding_sentinel_for_model_context() {
+        let raw = format!(
+            "Error: tool `agent_fanout` runtime binding is unavailable. {}",
+            astra_core::error_kind::TOOL_BINDING_SENTINEL
+        );
+        let out = tool_result_content_for_model("agent_fanout", &raw);
+        assert!(!out.contains(astra_core::error_kind::TOOL_BINDING_SENTINEL));
+        assert!(out.contains("runtime binding is unavailable"));
+    }
+
+    #[test]
     fn write_file_multiple_cli_keys() {
         let raw = json!({
             "success": true,
@@ -298,13 +332,34 @@ mod tests {
         let big = "fn example() {}\n".repeat(6_000);
         let out = tool_result_content_for_model("read_file", &big);
         assert!(
-            out.chars().count() <= HIGH_CHURN_READ_RESULT_CHARS,
+            out.chars().count() <= READ_FILE_MODEL_RESULT_CHARS,
             "read_file output should be bounded for context churn: {} chars",
             out.chars().count()
         );
         assert!(
             out.contains("truncated") || out.contains("elided"),
             "folded output should explain truncation"
+        );
+    }
+
+    #[test]
+    fn unbounded_model_content_preserves_long_json_shape() {
+        let raw = json!({
+            "status": "completed",
+            "result": "x".repeat(MAX_TOOL_RESULT_CHARS + 10_000)
+        })
+        .to_string();
+
+        let unbounded = tool_result_content_for_model_unbounded("agent_fanout", &raw);
+        serde_json::from_str::<Value>(&unbounded)
+            .expect("durable model artifact content must remain parseable JSON");
+
+        let inline = tool_result_content_for_model("agent_fanout", &raw);
+        assert!(
+            inline.contains("truncated")
+                || inline.contains("elided")
+                || inline.len() <= MAX_TOOL_RESULT_CHARS,
+            "inline model content should remain budgeted"
         );
     }
 

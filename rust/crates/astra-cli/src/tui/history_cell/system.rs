@@ -65,7 +65,6 @@ impl SystemCell {
         }
     }
 
-    #[allow(dead_code)]
     pub fn warning(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -81,7 +80,6 @@ impl SystemCell {
     /// displayed length. The persisted copy is the humanised
     /// version, not the raw text, so resume renders the same as
     /// the live turn did.
-    #[allow(dead_code)]
     pub fn error(raw: impl AsRef<str>) -> Self {
         Self {
             message: humanize_error(raw.as_ref()),
@@ -91,14 +89,12 @@ impl SystemCell {
         }
     }
 
-    #[allow(dead_code)]
     pub fn with_ts(mut self, ts: impl Into<String>) -> Self {
         self.ts = Some(ts.into());
         self
     }
 
     /// Resume constructor.
-    #[allow(dead_code)]
     pub fn from_persist(ev: TurnEvent) -> Option<Self> {
         match ev {
             TurnEvent::System { ts, level, text } => Some(Self {

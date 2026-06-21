@@ -293,8 +293,8 @@ impl ToolExecutor {
                     .unwrap_or_else(|e| e.into_inner());
                 if let Some(ref policy) = *sp_guard {
                     session_info.insert(
-                        "sandbox_mode".to_string(),
-                        json!(format!("{:?}", policy.mode)),
+                        "sandbox_isolation".to_string(),
+                        json!(format!("{:?}", policy.isolation)),
                     );
                     if verbose {
                         let paths: Vec<String> = policy
@@ -305,7 +305,7 @@ impl ToolExecutor {
                         session_info.insert("allowed_paths".to_string(), json!(paths));
                     }
                 } else {
-                    session_info.insert("sandbox_mode".to_string(), json!("disabled"));
+                    session_info.insert("sandbox_isolation".to_string(), json!("disabled"));
                 }
             }
 

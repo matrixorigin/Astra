@@ -965,7 +965,7 @@ pub(crate) async fn handle_team_command(
                 token,
                 state.model.clone(),
                 project_root.clone(),
-                state.perm_manager.mode(),
+                state.perm_manager.inherited_permissions_for_child(true),
                 Some(cancel_token.clone()),
             )
             .with_progress_tx(progress_tx);

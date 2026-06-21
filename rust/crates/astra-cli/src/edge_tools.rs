@@ -2,12 +2,11 @@
 //!
 //! Tools: bash, read_file (with outline mode), write_file, str_replace (with fuzzy matching),
 //!        list_dir, grep (with context_lines/max_matches), glob,
-//!        git_status, git_diff, git_log, git_show, git_blame, git_file_history,
-//!        git_contributors, git_log_search, web_fetch,
+//!        git(action=...), github(action=...), web_fetch,
 //!        mo_query, mo_snapshot, mo_branch
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     path::{Path, PathBuf},
     sync::atomic::AtomicBool,
@@ -17,11 +16,48 @@ use std::{
 use astra_runtime::tool_sandbox::{
     SandboxPolicy, sandbox_command, validate_path, wrap_command_with_limits,
 };
+use astra_turn_core::sync_utils::{
+    rwlock_check_contains_or_default, rwlock_read_clone_or_default, rwlock_write_reset_on_poison,
+};
 
 /// Prefix returned by tool execution when the sandbox blocks a path.
 /// The agentic loop / permission manager can detect this to prompt the user
 /// for authorization instead of letting the model silently fall back to bash.
 pub const SANDBOX_DENIED_PREFIX: &str = "SANDBOX_DENIED: ";
+
+/// Error returned by [`ToolExecutor::expand_sandbox_path`] when a path is
+/// rejected by the validation gate.
+///
+/// Every variant maps to a concrete, auditable rejection reason so callers
+/// (CLI flag parsing, TUI approval flow) can surface a precise message
+/// instead of a generic "denied".
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SandboxExpansionError {
+    /// The path was not absolute. Only absolute, concrete paths are expandable.
+    #[error("sandbox expansion requires an absolute path")]
+    NotAbsolute,
+    /// The path is the filesystem root `/`, which would open the entire
+    /// filesystem to the sandbox — always rejected.
+    #[error("sandbox expansion cannot open the filesystem root")]
+    RootPath,
+    /// The path contains a `..` component that escapes the supplied directory.
+    #[error("sandbox expansion rejects parent-dir traversal escapes")]
+    TraversalEscape,
+    /// The path is a system-sensitive directory or credential store whose
+    /// children include secrets (e.g. `/etc`, `~/.ssh`, `/var/run/secrets`).
+    #[error("sandbox expansion rejects system-sensitive path")]
+    SystemSensitivePath,
+    /// The sandbox policy lock is poisoned. The sandbox cannot be mutated
+    /// safely — the request must be rejected rather than silently dropped.
+    #[error("sandbox policy lock is poisoned; cannot expand safely")]
+    PolicyLockPoisoned,
+    /// No sandbox policy is installed. The caller asked to expand a path
+    /// into a sandbox that doesn't exist (e.g. headless path before init).
+    /// Returning `Ok` here would be a silent no-op: the user believes
+    /// `--add-dir` took effect, but the sandbox was never updated.
+    #[error("no sandbox policy installed; cannot expand path")]
+    NoSandboxPolicy,
+}
 use crossterm::style::Stylize;
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -58,6 +94,7 @@ use astra_tools::passive_tsc_check;
 mod shell;
 use astra_tools::env_tools;
 use astra_tools::schemas::all_tool_schemas as full_tool_schemas;
+use astra_turn_core::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind_with_args};
 pub use env_tools::apply_overlay as apply_env_overlay;
 #[path = "edge_tools/code_analysis.rs"]
 mod code_analysis;
@@ -68,6 +105,16 @@ mod context_tools;
 
 pub fn all_tool_schemas() -> Vec<Value> {
     full_tool_schemas()
+}
+
+fn local_runtime_tool_schemas(raw_schemas: Vec<Value>) -> Vec<Value> {
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let binding = astra_runtime_env::RunBinding::local_developer(".", &registry);
+    astra_runtime_env::CapabilityResolver.filter_tool_schemas(
+        &registry,
+        raw_schemas,
+        &binding.capabilities,
+    )
 }
 
 /// Construct the CLI's session-wide `CapabilitySet`.
@@ -97,7 +144,84 @@ struct CliCapabilityView {
 }
 
 pub fn local_tool_schemas() -> Vec<Value> {
-    full_tool_schemas()
+    local_runtime_tool_schemas(full_tool_schemas())
+}
+
+#[cfg(test)]
+fn test_visible_tool_schemas() -> Vec<Value> {
+    const EXECUTOR_LOCAL_TOOL_NAMES: &[&str] = &[
+        "adjust_config",
+        "agent",
+        "agent_fanout",
+        "ask_user",
+        "bash",
+        "brief",
+        "call_graph",
+        "compress_context",
+        "config",
+        "context_analysis",
+        "dead_code",
+        "delegate",
+        "deprioritize_tool",
+        "diagnose",
+        "enter_plan_mode",
+        "env",
+        "exit_plan_mode",
+        "extract_members",
+        "find_definition",
+        "find_references",
+        "get_agent_info",
+        "git",
+        "github",
+        "glob",
+        "grep",
+        "hover_info",
+        "introspect",
+        "list_dir",
+        "lsp",
+        "memory",
+        "mo",
+        "mo_branch",
+        "mo_query",
+        "mo_snapshot",
+        "notebook_edit",
+        "notify",
+        "prioritize_tool",
+        "query_context",
+        "read_file",
+        "reflect",
+        "rename_symbol",
+        "rollback_database_snapshots",
+        "rollback_session_state",
+        "rollback_turn_actions",
+        "run_build_test",
+        "session",
+        "share_context",
+        "str_replace",
+        "symbol_search",
+        "symbols",
+        "task",
+        "task_list",
+        "task_output",
+        "task_stop",
+        "tool_search",
+        "type_hierarchy",
+        "web_fetch",
+        "web_search",
+        "write_file",
+    ];
+
+    let mut schemas = all_tool_schemas();
+    let mut names = astra_turn_core::tool::deferred_activation::tool_names_from_schemas(&schemas);
+    for name in EXECUTOR_LOCAL_TOOL_NAMES {
+        if names.insert((*name).to_string()) {
+            schemas.push(json!({
+                "type": "function",
+                "function": { "name": name },
+            }));
+        }
+    }
+    schemas
 }
 
 /// Plan-mode write guard tool list (CLI parity with
@@ -105,7 +229,7 @@ pub fn local_tool_schemas() -> Vec<Value> {
 /// in `phase=planning` these tools must be short-circuited: they all
 /// mutate the world (filesystem, DB, git, GitHub), so allowing them
 /// would let the model execute a plan it has not yet had approved.
-/// Read-only tools (read_file, grep, glob, git_status/diff/log) and
+/// Read-only tools (read_file, grep, glob, git(action=status/diff/log)) and
 /// session-scoped authoring tools (`task`, memory_*) stay available so the
 /// agent can keep authoring without mutating the external world.
 pub(crate) fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
@@ -120,19 +244,36 @@ pub(crate) fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
         return action == "stop";
     }
 
+    if matches!(
+        cloud_gated_tool_kind_with_args(tool, Some(args)),
+        Some(CloudGatedToolKind::Write | CloudGatedToolKind::Execute)
+    ) {
+        return true;
+    }
+
     matches!(
         tool,
-        "bash"
-            | "write_file"
-            | "str_replace"
-            | "mo"
-            | "rollback_database_snapshots"
-            | "git_commit"
-            | "git_stash"
-            | "git_revert_commit"
-            | "github_create_issue"
+        "bash" | "write_file" | "str_replace" | "mo" | "rollback_database_snapshots"
     )
 }
+
+fn git_stash_action_args(args: &Value) -> Value {
+    let stash_action = args
+        .get("sub_action")
+        .or_else(|| args.get("stash_action"))
+        .and_then(Value::as_str);
+    let Some(stash_action) = stash_action else {
+        return args.clone();
+    };
+
+    let mut map = args.as_object().cloned().unwrap_or_default();
+    map.insert(
+        "action".to_string(),
+        Value::String(stash_action.to_string()),
+    );
+    Value::Object(map)
+}
+
 #[path = "edge_tools/diagnose.rs"]
 mod diagnose;
 #[path = "edge_tools/file_state.rs"]
@@ -150,7 +291,7 @@ pub(crate) use task_mgmt::TaskManager;
 #[path = "edge_tools/web_search.rs"]
 mod web_search;
 use file_state::FileState;
-pub(crate) use file_state::ReadDedupKey;
+pub(crate) use file_state::{ReadCoverage, ReadDedupKey};
 
 /// Shared file-state cache handle for cross-turn read-before-write tracking.
 pub(crate) type SharedFileState = std::sync::Arc<std::sync::Mutex<HashMap<PathBuf, FileState>>>;
@@ -275,7 +416,7 @@ pub(crate) fn per_tool_output_limit(tool_name: &str) -> usize {
 const AGGREGATE_OUTPUT_BUDGET: usize = 200_000;
 
 /// Soft threshold at which aggregate-aware gating starts warning.
-/// Tools that produce large output (read_file, git_show) will check this
+/// Tools that produce large output (read_file, git(action=show)) will check this
 /// before doing I/O and suggest lighter alternatives when exceeded.
 const AGGREGATE_SOFT_LIMIT: usize = 120_000;
 
@@ -327,7 +468,83 @@ fn normalize_empty_output(output: String, tool_name: &str) -> String {
     }
 }
 
+fn cli_tool_output_is_error(output: &str) -> bool {
+    astra_turn_core::tool_result_semantics::cloud_tool_result_status_label(output) == "error"
+}
+
 pub(crate) use astra_tools::git_gix::ToolExecutionOutcome;
+
+fn sandbox_denied_outcome_from_output(output: &str) -> Option<ToolExecutionOutcome> {
+    let message = crate::sandbox_retry::sandbox_denied_message(output)?.into_owned();
+    Some(ToolExecutionOutcome {
+        output: format!("Error: {message}"),
+        tool_result_fields: Some(crate::sandbox_retry::sandbox_denied_tool_result_fields(
+            &message,
+        )),
+        is_error: true,
+    })
+}
+
+fn tool_execution_outcome_from_output(output: String) -> ToolExecutionOutcome {
+    if let Some(outcome) = sandbox_denied_outcome_from_output(&output) {
+        return outcome;
+    }
+    if cli_tool_output_is_error(&output) {
+        ToolExecutionOutcome::error(output)
+    } else {
+        ToolExecutionOutcome::ok(output)
+    }
+}
+
+struct EdgeToolRun {
+    output: String,
+    error_kind: Option<astra_core::ErrorKind>,
+}
+
+impl EdgeToolRun {
+    fn ok(output: String) -> Self {
+        Self {
+            output,
+            error_kind: None,
+        }
+    }
+
+    fn error(output: String) -> Self {
+        Self {
+            output,
+            error_kind: None,
+        }
+    }
+
+    fn classified_error(output: String, kind: astra_core::ErrorKind) -> Self {
+        Self {
+            output,
+            error_kind: Some(kind),
+        }
+    }
+
+    fn into_outcome(self) -> ToolExecutionOutcome {
+        if let Some(outcome) = sandbox_denied_outcome_from_output(&self.output) {
+            return outcome;
+        }
+
+        let mut outcome = if self.error_kind.is_some() || cli_tool_output_is_error(&self.output) {
+            ToolExecutionOutcome::error(self.output)
+        } else {
+            ToolExecutionOutcome::ok(self.output)
+        };
+        if let Some(kind) = self.error_kind {
+            let metadata = outcome
+                .tool_result_fields
+                .get_or_insert_with(serde_json::Map::new);
+            metadata.insert(
+                "error_kind".to_string(),
+                Value::String(kind.as_str().to_string()),
+            );
+        }
+        outcome
+    }
+}
 
 /// Parse a grep output line to extract the file path and line number.
 /// Handles format: `file:line:content` or `file:line:col:content`.
@@ -700,7 +917,7 @@ pub struct ToolExecutor {
     preferred_repos: std::sync::Mutex<Vec<String>>,
     /// Per-turn budget pressure (0.0 = normal, 1.0 = critical).
     /// Set before each tool execution batch, read by tools that produce
-    /// variable-size output (git_diff, git_show) to scale their limits.
+    /// variable-size output (git(action=diff), git(action=show)) to scale their limits.
     budget_pressure: std::sync::Mutex<f64>,
     /// Build/test iteration tracker — tracks error deltas across fix cycles.
     build_test_tracker: std::sync::Mutex<build_test::BuildTestTracker>,
@@ -851,6 +1068,25 @@ pub struct ToolExecutor {
     /// activation can reach plugin tools. Populated by the TUI after
     /// `PluginRegistry::register` loads the user's skill manifests.
     plugin_schemas: std::sync::RwLock<Vec<Value>>,
+    /// Tool names advertised in the current LLM request's `tools[]`.
+    /// `None` means the caller has not installed a per-turn surface yet;
+    /// execution fails closed because this node cannot prove the model saw
+    /// the tool in the current request.
+    current_visible_tool_names: std::sync::RwLock<Option<HashSet<String>>>,
+    /// Tool names listed in this turn's `<deferred_tools>` block and therefore
+    /// eligible for `tool_search(select:NAME)` activation.
+    current_activatable_tool_names: std::sync::RwLock<Option<HashSet<String>>>,
+    /// Deferred tool names whose full schema has been fetched via
+    /// `tool_search(query="select:NAME")` in this session.
+    activated_deferred_tools: std::sync::RwLock<HashSet<String>>,
+    /// Poison-resilience cache: last schemas passed to
+    /// `set_current_visible_tool_schemas`. Used to rebuild
+    /// `current_visible_tool_names` after lock poison recovery.
+    last_visible_schemas: std::sync::Mutex<Vec<Value>>,
+    /// Poison-resilience cache: last names passed to
+    /// `set_current_activatable_tool_names`. Used to rebuild
+    /// `current_activatable_tool_names` after lock poison recovery.
+    last_activatable_names: std::sync::Mutex<Option<HashSet<String>>>,
     /// Cached plan-mode authoring flag keyed by the session it was
     /// computed for. Mirrors the server-side write guard so a CLI run
     /// that talks to the same plan store cannot bypass plan mode by
@@ -890,6 +1126,20 @@ impl ToolExecutor {
         let root: PathBuf = project_root.into();
         let preferred_repos = detect_git_remote_repos(&root);
         let sandbox = astra_runtime::tool_sandbox::SandboxPolicy::for_project(&root);
+        #[cfg(test)]
+        let initial_visible_schemas = test_visible_tool_schemas();
+        #[cfg(test)]
+        let initial_visible_tool_names = Some(
+            astra_turn_core::tool::deferred_activation::tool_names_from_schemas(
+                &initial_visible_schemas,
+            ),
+        );
+        #[cfg(not(test))]
+        let initial_visible_tool_names = None;
+        #[cfg(test)]
+        let last_visible_schemas = initial_visible_schemas;
+        #[cfg(not(test))]
+        let last_visible_schemas = Vec::new();
         Self {
             project_root: root.clone(),
             cloud_base: None,
@@ -908,6 +1158,11 @@ impl ToolExecutor {
             .build()
             .unwrap_or_else(|_| Client::new()),
             plugin_schemas: std::sync::RwLock::new(Vec::new()),
+            current_visible_tool_names: std::sync::RwLock::new(initial_visible_tool_names),
+            current_activatable_tool_names: std::sync::RwLock::new(None),
+            activated_deferred_tools: std::sync::RwLock::new(HashSet::new()),
+            last_visible_schemas: std::sync::Mutex::new(last_visible_schemas),
+            last_activatable_names: std::sync::Mutex::new(None),
             sandbox_policy: std::sync::RwLock::new(Some(sandbox)),
             preferred_repos: std::sync::Mutex::new(preferred_repos),
             budget_pressure: std::sync::Mutex::new(0.0),
@@ -986,9 +1241,13 @@ impl ToolExecutor {
     /// `None` clears the slot — passed at turn boundaries so a stale
     /// sender never leaks across turns.
     pub fn set_ask_user_request_tx(&self, tx: Option<crate::cli::chat_stream::AskUserRequestTx>) {
-        if let Ok(mut guard) = self.ask_user_request_tx.lock() {
-            *guard = tx;
-        }
+        let mut guard = self.ask_user_request_tx.lock().unwrap_or_else(|e| {
+            tracing::error!(
+                "ask_user_request_tx lock poisoned; recovering and overwriting stale sender"
+            );
+            e.into_inner()
+        });
+        *guard = tx;
     }
 
     /// Install the per-turn plan-review channel so `exit_plan_mode`
@@ -999,9 +1258,13 @@ impl ToolExecutor {
         &self,
         tx: Option<crate::cli::chat_stream::PlanReviewRequestTx>,
     ) {
-        if let Ok(mut guard) = self.plan_review_request_tx.lock() {
-            *guard = tx;
-        }
+        let mut guard = self.plan_review_request_tx.lock().unwrap_or_else(|e| {
+            tracing::error!(
+                "plan_review_request_tx lock poisoned; recovering and overwriting stale sender"
+            );
+            e.into_inner()
+        });
+        *guard = tx;
     }
 
     /// Drain a permission-mode change recorded by a tool overlay (see
@@ -1025,6 +1288,16 @@ impl ToolExecutor {
             .and_then(|mut g| g.take())
     }
 
+    /// Names of deferred tools that have been activated via `tool_search`
+    /// this turn. These should stay visible until the turn ends to prevent
+    /// schema thrashing (add→remove→add cache breaks).
+    pub fn activated_deferred_tool_names(&self) -> Vec<String> {
+        match self.activated_deferred_tools.read() {
+            Ok(guard) => guard.iter().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Set the spawn context for agent spawning.
     pub fn with_spawn_context(mut self, ctx: agent_spawning::AgentActionContext) -> Self {
         self.spawn_context = Some(ctx);
@@ -1035,21 +1308,337 @@ impl ToolExecutor {
     /// can resolve MCP / skill-backed tools. Called once at TUI start
     /// after `PluginRegistry::register` loads manifests.
     ///
-    /// Poison handling: recovers via `into_inner()` so a prior panic
-    /// doesn't permanently disable plugin lookup. Logs a warning so
-    /// operators notice the underlying panic. Silent-drop (the previous
-    /// `if let Ok` form) would leave deferred activation broken with
-    /// zero observability — the exact class of footgun that motivated
-    /// this rewrite's other fixes.
+    /// Poison handling: plugin schemas are a rebuildable cache. Reset cached
+    /// state on poison instead of reusing possibly half-written inner data.
     pub fn set_plugin_schemas(&self, schemas: Vec<Value>) {
-        let mut guard = self.plugin_schemas.write().unwrap_or_else(|poisoned| {
-            tracing::warn!(
-                "CLI plugin_schemas RwLock was poisoned; recovering inner. \
-                 A prior panic held the write lock — investigate that panic first."
-            );
-            poisoned.into_inner()
-        });
+        let mut guard = rwlock_write_reset_on_poison(&self.plugin_schemas, "plugin_schemas");
         *guard = schemas;
+    }
+
+    /// Install the visible `tools[]` names for the current LLM request.
+    ///
+    /// Deferred tools are executable only when they are visible here or have
+    /// been activated with `tool_search(select:NAME)`.
+    pub fn set_current_visible_tool_schemas(&self, schemas: &[Value]) {
+        // Cache schemas for poison-resilience repair.
+        {
+            let mut cache = self
+                .last_visible_schemas
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *cache = schemas.to_vec();
+        }
+        let names = astra_turn_core::tool::deferred_activation::tool_names_from_schemas(schemas);
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.current_visible_tool_names,
+            "current_visible_tool_names",
+        );
+        *guard = Some(names);
+    }
+
+    /// Install the names that this turn's deferred manifest allows
+    /// `tool_search(select:NAME)` to activate.
+    pub fn set_current_activatable_tool_names(&self, names: HashSet<String>) {
+        // Cache names for poison-resilience repair.
+        {
+            let mut cache = self
+                .last_activatable_names
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *cache = Some(names.clone());
+        }
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.current_activatable_tool_names,
+            "current_activatable_tool_names",
+        );
+        *guard = Some(names);
+    }
+
+    /// Snapshot of the names that the model's `<deferred_tools>` manifest
+    /// currently advertises. Used by the host to keep its validator-side
+    /// `deferred_tool_names` set in lockstep with what the prompt rendered.
+    pub fn current_activatable_tool_names_snapshot(&self) -> HashSet<String> {
+        rwlock_read_clone_or_default(
+            &self.current_activatable_tool_names,
+            "current_activatable_tool_names_snapshot",
+        )
+        .unwrap_or_default()
+    }
+
+    fn current_searchable_tool_names(&self) -> Option<HashSet<String>> {
+        let visible = rwlock_read_clone_or_default(
+            &self.current_visible_tool_names,
+            "current_visible_tool_names_search_pool",
+        );
+        let activatable = rwlock_read_clone_or_default(
+            &self.current_activatable_tool_names,
+            "current_activatable_tool_names_search_pool",
+        );
+
+        match (visible, activatable) {
+            (None, None) => None,
+            (visible, activatable) => {
+                let mut names = HashSet::new();
+                if let Some(visible) = visible {
+                    names.extend(visible);
+                }
+                if let Some(activatable) = activatable {
+                    names.extend(activatable);
+                }
+                names.retain(|name| self.tool_has_runtime_binding(name));
+                Some(names)
+            }
+        }
+    }
+
+    fn tool_has_runtime_binding(&self, name: &str) -> bool {
+        let Some(meta) = astra_turn_core::tool::registry::meta::tool_meta(name) else {
+            // Unknown / plugin tool: not subject to CLI-side runtime binding.
+            return true;
+        };
+        meta.requires
+            .iter()
+            .all(|capability| self.capability_has_runtime_binding(*capability))
+    }
+
+    fn capability_has_runtime_binding(
+        &self,
+        capability: astra_turn_core::capability::Capability,
+    ) -> bool {
+        if !capability.is_executor_gated() {
+            // Non-gated capabilities are always available — they are backed by
+            // services or static features on this node.
+            return true;
+        }
+        // Executor-gated capabilities require an active executor handle.
+        self.executor_binding_is_active(capability)
+    }
+
+    /// Check whether this runtime node has an active executor for a gated capability.
+    fn executor_binding_is_active(
+        &self,
+        capability: astra_turn_core::capability::Capability,
+    ) -> bool {
+        use astra_turn_core::capability::Capability;
+        match capability {
+            Capability::AgentSpawner => self.spawn_context.is_some(),
+            // Future executor-gated capabilities add arms here.
+            _ => {
+                // If a new executor-gated capability is added but this arm isn't
+                // updated, fail closed. The compiler will warn about an unreachable
+                // pattern when `is_executor_gated()` returns true for a variant not
+                // listed here, so tests catch it.
+                false
+            }
+        }
+    }
+
+    /// Repair admission-state locks from poison-recovery caches.
+    ///
+    /// When a lock is poisoned, `rwlock_check_contains_or_default` and
+    /// `rwlock_read_clone_or_default` reset the guarded value to `T::default()`,
+    /// which for `current_visible_tool_names` is `None` (denying all tools).
+    /// This method rebuilds the visible and activatable tool name sets from
+    /// the caches populated during `set_current_visible_tool_schemas` and
+    /// `set_current_activatable_tool_names`, limiting the blast radius of a
+    /// single-thread panic to one missed admission check rather than the
+    /// remainder of the session.
+    fn repair_admission_state_if_poisoned(&self) {
+        // Rebuild current_visible_tool_names from cached schemas.
+        //
+        // Lock ordering matters: acquire the target write lock BEFORE reading
+        // the source cache, so a concurrent `set_current_visible_tool_schemas`
+        // (which writes both the cache and `current_visible_tool_names` under
+        // the same write lock) cannot land between our cache read and target
+        // write. Otherwise repair could compute names from a stale cache and
+        // clobber a fresh value just installed by the setter.
+        {
+            let mut guard = self.current_visible_tool_names.write().unwrap_or_else(|e| {
+                tracing::error!("current_visible_tool_names lock poisoned; recovering...");
+                self.current_visible_tool_names.clear_poison();
+                e.into_inner()
+            });
+            let schemas = self
+                .last_visible_schemas
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !schemas.is_empty() {
+                let names =
+                    astra_turn_core::tool::deferred_activation::tool_names_from_schemas(&schemas);
+                *guard = Some(names);
+            }
+        }
+        // Rebuild current_activatable_tool_names from cached names.
+        // Same lock ordering rationale as above.
+        {
+            let mut guard = self
+                .current_activatable_tool_names
+                .write()
+                .unwrap_or_else(|e| {
+                    tracing::error!("current_activatable_tool_names lock poisoned; recovering...");
+                    self.current_activatable_tool_names.clear_poison();
+                    e.into_inner()
+                });
+            let names = self
+                .last_activatable_names
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(ref names) = *names {
+                *guard = Some(names.clone());
+            }
+        }
+    }
+
+    fn tool_can_validate_without_runtime_binding(&self, name: &str, args: &Value) -> bool {
+        let action = args.get("action").and_then(Value::as_str);
+        astra_turn_core::tool::registry::meta::tool_allows_validation_without_runtime_binding(
+            name, action,
+        )
+    }
+
+    fn tool_binding_admission_denial(&self, name: &str, args: &Value) -> Option<EdgeToolRun> {
+        if self.tool_has_runtime_binding(name) {
+            return None;
+        }
+        if self.tool_can_validate_without_runtime_binding(name, args) {
+            return None;
+        }
+        Some(EdgeToolRun::classified_error(
+            format!(
+                "Tool `{name}` has no executor attached for this turn. \
+                 It was listed in the deferred manifest, but `tool_search(select:{name})` \
+                 cannot activate a tool without a backing executor. \
+                 Use only currently bound tools and report this as a runtime tool-closure error."
+            ),
+            astra_core::ErrorKind::ToolBinding,
+        ))
+    }
+
+    fn tool_admission_denial(&self, name: &str, args: &Value) -> Option<EdgeToolRun> {
+        // ── Phase 1: Structural binding (no locks) ───────────────────────
+        //
+        // First principles: "does this tool have an executor attached?" is
+        // the most fundamental admission question — and the one a poisoned
+        // RwLock must NEVER be allowed to bypass. We ask it before touching
+        // any lock, so lock recovery cannot widen the set of admitted tools.
+        //
+        // Whether a tool needs binding is declared by its Capability list.
+        // Each capability self-declares `is_executor_gated()`. The binding
+        // check is structural (no tool-name special cases) and runs lock-free.
+        if let Some(denial) = self.tool_binding_admission_denial(name, args) {
+            return Some(denial);
+        }
+
+        // ── Phase 2: Admission-set membership (lock-protected) ──────────
+        //
+        // An executor is bound; now confirm the tool was actually
+        // advertised / activated in this session.
+        let visible_contains = rwlock_check_contains_or_default(
+            &self.current_visible_tool_names,
+            "current_visible_tool_names_admission",
+            |names: &Option<HashSet<String>>| names.as_ref().is_some_and(|n| n.contains(name)),
+        );
+
+        match visible_contains {
+            // Visible and binding passed → admit.
+            Some(true) => return None,
+            // Poison on the visible set: self-heal by rebuilding from caches,
+            // then fall through to the deferred-activation check. The rebuild
+            // cannot widen the binding gate — Phase 1 already passed — so the
+            // worst outcome is a spuriously denied deferred tool.
+            None => {
+                self.repair_admission_state_if_poisoned();
+            }
+            // Explicitly not present in the visible set: continue to
+            // deferred-activation path below.
+            Some(false) => {}
+        }
+
+        // If no visible-set restriction is configured, deny (fail-closed).
+        // First principles: if the visible tool set was never configured (e.g.
+        // crash recovery before `set_current_visible_tool_schemas` ran), we
+        // cannot confirm the tool was ever advertised in this session. Admitting
+        // would widen the gate past what Phase 1 (binding) alone guarantees.
+        let visible_set = rwlock_read_clone_or_default(
+            &self.current_visible_tool_names,
+            "current_visible_tool_names_fallback",
+        );
+        match visible_set.as_ref() {
+            Some(_) => {}
+            None => {
+                return Some(EdgeToolRun::classified_error(
+                    astra_turn_core::tool::deferred_activation::tool_not_admitted_message(
+                        name, false,
+                    ),
+                    astra_core::ErrorKind::ToolBinding,
+                ));
+            }
+        };
+
+        let activatable = rwlock_read_clone_or_default(
+            &self.current_activatable_tool_names,
+            "current_activatable_tool_names_admission",
+        );
+        let activated_contains = rwlock_check_contains_or_default(
+            &self.activated_deferred_tools,
+            "activated_deferred_tools_admission",
+            |names: &HashSet<String>| names.contains(name),
+        );
+        // Binding already passed in Phase 1, so the only remaining question
+        // is admission-set membership. A poisoned activated set is
+        // conservatively treated as "not activated": the worst outcome is a
+        // spuriously denied deferred tool (recoverable via re-activation),
+        // never an executor-less tool admitted to run.
+        let is_activated = activated_contains.unwrap_or(false);
+        let can_select = activatable
+            .as_ref()
+            .is_some_and(|allowed| allowed.contains(name));
+        if is_activated
+            && activatable
+                .as_ref()
+                .is_none_or(|allowed| allowed.contains(name))
+        {
+            return None;
+        }
+        Some(EdgeToolRun::error(
+            astra_turn_core::tool::deferred_activation::tool_not_admitted_message(name, can_select),
+        ))
+    }
+
+    fn record_tool_search_activation_output(&self, output: &str) {
+        let names =
+            astra_turn_core::tool::deferred_activation::activated_tool_names_from_tool_search_output(
+                output,
+            );
+        if names.is_empty() {
+            return;
+        }
+        let allowed = rwlock_read_clone_or_default(
+            &self.current_activatable_tool_names,
+            "current_activatable_tool_names_activation",
+        );
+        let names: Vec<String> = names
+            .into_iter()
+            .filter(|name| {
+                allowed
+                    .as_ref()
+                    .is_none_or(|allowed| allowed.contains(name))
+                    && self.tool_has_runtime_binding(name)
+            })
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.activated_deferred_tools,
+            "activated_deferred_tools",
+        );
+        guard.extend(names);
+    }
+
+    pub(super) fn plugin_schemas_snapshot(&self, label: &str) -> Vec<Value> {
+        rwlock_read_clone_or_default(&self.plugin_schemas, label)
     }
 
     /// Set the shared context cache for cross-agent knowledge sharing.
@@ -1068,9 +1657,13 @@ impl ToolExecutor {
         &self,
         ctx: Option<agent_messaging::SendMessageRuntimeContext>,
     ) {
-        if let Ok(mut guard) = self.send_message_context.lock() {
-            *guard = ctx;
-        }
+        let mut guard = self.send_message_context.lock().unwrap_or_else(|e| {
+            tracing::error!(
+                "send_message_context lock poisoned; recovering and overwriting stale slot"
+            );
+            e.into_inner()
+        });
+        *guard = ctx;
     }
 
     /// Set the observability session for context analysis tools.
@@ -1109,9 +1702,13 @@ impl ToolExecutor {
         &self,
         sink: Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
     ) {
-        if let Ok(mut slot) = self.bash_progress_sink.write() {
-            *slot = sink;
-        }
+        let mut slot = self.bash_progress_sink.write().unwrap_or_else(|e| {
+            tracing::error!(
+                "bash_progress_sink lock poisoned; recovering and overwriting stale sink"
+            );
+            e.into_inner()
+        });
+        *slot = sink;
     }
 
     /// Non-blocking read of the active bash progress sink. Used by
@@ -1554,9 +2151,9 @@ impl ToolExecutor {
 
     // ─── Task management methods (delegated to task_mgmt module) ────────────
 
-    fn validate_task_tool_args_for_action(action: &str, args: &Value) -> Result<(), String> {
-        let allowed: &[&str] = match action {
-            "create" => &[
+    fn task_action_allowed_fields(action: &str) -> Option<&'static [&'static str]> {
+        match action {
+            "create" => Some(&[
                 "action",
                 "title",
                 "description",
@@ -1566,10 +2163,10 @@ impl ToolExecutor {
                 "metadata",
                 "add_blocks",
                 "add_blocked_by",
-            ],
-            "list" => &["action", "status_filter"],
-            "get" => &["action", "task_id"],
-            "update" => &[
+            ]),
+            "list" => Some(&["action", "status_filter"]),
+            "get" => Some(&["action", "task_id"]),
+            "update" => Some(&[
                 "action",
                 "task_id",
                 "new_status",
@@ -1586,35 +2183,71 @@ impl ToolExecutor {
                 "remove_blocked_by",
                 "reason",
                 "error_message",
-            ],
-            "stop" => &["action", "task_id", "reason"],
-            "list_user" => &["action", "user_status"],
-            "adopt" => &["action", "source_session_id", "task_id"],
-            "archive" => &["action", "task_id", "older_than_days", "reason"],
-            _ => return Ok(()),
+            ]),
+            "stop" => Some(&["action", "task_id", "reason"]),
+            "list_user" => Some(&["action", "user_status"]),
+            "adopt" => Some(&["action", "source_session_id", "task_id"]),
+            "archive" => Some(&["action", "task_id", "older_than_days", "reason"]),
+            _ => None,
+        }
+    }
+
+    fn task_actions_allowing_field(field: &str, current_action: &str) -> Vec<&'static str> {
+        const TASK_ACTIONS: &[&str] = &[
+            "create",
+            "list",
+            "get",
+            "update",
+            "stop",
+            "list_user",
+            "adopt",
+            "archive",
+        ];
+        TASK_ACTIONS
+            .iter()
+            .copied()
+            .filter(|action| *action != current_action)
+            .filter(|action| {
+                Self::task_action_allowed_fields(action)
+                    .is_some_and(|allowed| allowed.contains(&field))
+            })
+            .collect()
+    }
+
+    fn task_unknown_field_message(action: &str, key: &str, allowed: &[&str]) -> String {
+        let other_actions = Self::task_actions_allowing_field(key, action);
+        let action_hint = if other_actions.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; field is valid for: {}",
+                other_actions
+                    .iter()
+                    .map(|action| format!("task.{action}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        format!(
+            "unknown field '{key}' for task.{action} (valid: {}{})",
+            allowed.join(", "),
+            action_hint
+        )
+    }
+
+    fn validate_task_tool_args_for_action(action: &str, args: &Value) -> Result<(), String> {
+        let Some(allowed) = Self::task_action_allowed_fields(action) else {
+            return Ok(());
         };
         let Some(obj) = args.as_object() else {
             return Err(format!("task.{action} arguments must be an object"));
         };
         for key in obj.keys() {
             if !allowed.contains(&key.as_str()) {
-                if action == "create" && Self::is_task_dependency_removal_field(key) {
-                    return Err(format!(
-                        "unknown field '{key}' for task.create. Dependency removal fields (`remove_blocks`, `remove_blocked_by`) are update-only: first create the task, then call task(action='update', task_id='<created task_id>', {key}=[...]). Valid task.create fields: {}",
-                        allowed.join(", ")
-                    ));
-                }
-                return Err(format!(
-                    "unknown field '{key}' for task.{action} (valid: {})",
-                    allowed.join(", ")
-                ));
+                return Err(Self::task_unknown_field_message(action, key, allowed));
             }
         }
         Ok(())
-    }
-
-    fn is_task_dependency_removal_field(key: &str) -> bool {
-        matches!(key, "remove_blocks" | "remove_blocked_by")
     }
 
     fn task_output_json(output: &str) -> Option<Value> {
@@ -2388,9 +3021,6 @@ impl ToolExecutor {
     }
 
     async fn task_output(&self, args: &Value) -> String {
-        let Some(ref bg_commands) = self.bg_task_commands else {
-            return format_background_task_unavailable(self.cloud_base.is_some());
-        };
         let task_id = match background_task_id_arg(args) {
             Ok(Some(id)) => id,
             Err(error) => return error.to_string(),
@@ -2408,6 +3038,17 @@ impl ToolExecutor {
             .and_then(Value::as_u64)
             .unwrap_or(30_000)
             .clamp(1, 300_000);
+
+        if let Some(output) = self
+            .fanout_group_task_output_response(&task_id, offset, max_bytes, None)
+            .await
+        {
+            return output;
+        }
+
+        let Some(ref bg_commands) = self.bg_task_commands else {
+            return format_background_task_unavailable(self.cloud_base.is_some());
+        };
 
         if block {
             let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
@@ -2481,6 +3122,123 @@ impl ToolExecutor {
                 }
             }
         }
+    }
+
+    async fn fanout_group_task_output_response(
+        &self,
+        task_id: &str,
+        offset: u64,
+        max_bytes: usize,
+        miss_reason: Option<&str>,
+    ) -> Option<String> {
+        match self
+            .fanout_group_task_output_snapshot(task_id, offset, max_bytes)
+            .await
+        {
+            Some(snapshot) => Some(format_background_task_output(task_id, offset, &snapshot)),
+            None => {
+                if let Some(reason) = miss_reason {
+                    tracing::debug!(
+                        task_id,
+                        reason,
+                        "fanout group snapshot fallback did not match task_output id"
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    async fn fanout_group_task_output_snapshot(
+        &self,
+        task_id: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Option<BgTaskOutputSnapshot> {
+        let ctx = self.spawn_context.as_ref()?;
+        let group = ctx
+            .spawner
+            .list_fanout_groups()
+            .await
+            .into_iter()
+            .find(|group| group.group_id == task_id)?;
+        let summary = group.summary();
+        let terminal = group.is_terminal();
+        let status = if terminal {
+            if summary.failed > 0 || summary.timed_out > 0 || summary.spawn_rejected > 0 {
+                "failed"
+            } else {
+                "completed"
+            }
+        } else if summary.active > 0 {
+            "running"
+        } else {
+            "pending"
+        };
+        // Estimate ~150 bytes per slot JSON entry. Cap serialized slots to avoid
+        // allocating hundreds of KB for large fanout groups when the caller only
+        // needs a small window.
+        const BYTES_PER_SLOT: usize = 150;
+        let overhead = 512; // fixed JSON overhead (keys, summary, hint, etc.)
+        let max_slots = if max_bytes > overhead {
+            ((max_bytes - overhead) / BYTES_PER_SLOT).max(1)
+        } else {
+            1
+        };
+        let total_slots = group.slots.len();
+        let truncated = total_slots > max_slots;
+        let slots_json: Vec<_> = group
+            .slots
+            .iter()
+            .take(max_slots)
+            .map(|slot| {
+                json!({
+                    "slot_index": slot.slot_index,
+                    "id": &slot.slot_id,
+                    "agent_id": &slot.agent_id,
+                    "status": slot.status.as_str(),
+                    "result_collected": slot.result_collected,
+                    "terminal_reason": &slot.terminal_reason,
+                })
+            })
+            .collect();
+        let output = json!({
+            "type": "agent_fanout_group",
+            "group_id": &group.group_id,
+            "title": &group.title,
+            "status": status,
+            "summary": group.summary_sentence(),
+            "target_count": summary.target_count,
+            "accepted": summary.accepted,
+            "active": summary.active,
+            "terminal": summary.terminal,
+            "completed": summary.completed,
+            "failed": summary.failed,
+            "cancelled_by_user": summary.cancelled_by_user,
+            "cancelled_by_parent_budget": summary.cancelled_by_parent_budget,
+            "timed_out": summary.timed_out,
+            "spawn_rejected": summary.spawn_rejected,
+            "collected": summary.collected,
+            "uncollected": summary.uncollected,
+            "slots": slots_json,
+            "slots_truncated": if truncated { Some(total_slots) } else { None },
+            "hint": "This id belongs to an agent_fanout group, not a shell background task. Use agent_fanout(action='get_results', group_id=...) for full slot results.",
+        })
+        .to_string();
+        let start = output.floor_char_boundary((offset as usize).min(output.len()));
+        let end = output.floor_char_boundary((start + max_bytes).min(output.len()));
+        let chunk = output[start..end].to_string();
+        Some(BgTaskOutputSnapshot {
+            kind: "agent fanout".to_string(),
+            title: Some(group.title),
+            output: chunk,
+            end_offset: end as u64,
+            total_bytes: output.len() as u64,
+            total_lines: output.lines().count() as u64,
+            status: status.to_string(),
+            terminal,
+            output_ref: format!("agent_fanout:{}", group.group_id),
+        })
     }
 
     async fn task_kill_bg(&self, args: &Value) -> String {
@@ -3535,12 +4293,47 @@ impl ToolExecutor {
 
     /// Expand the sandbox boundary to include an additional directory.
     /// Called when the user approves access to a path outside the project.
-    pub fn expand_sandbox_path(&self, dir: PathBuf) {
-        if let Ok(mut guard) = self.sandbox_policy.write() {
-            if let Some(ref mut policy) = *guard {
-                policy.allowed_paths.push(dir);
-            }
+    ///
+    /// Validates the path before mutating the policy. Rejects:
+    /// - non-absolute paths ([`SandboxExpansionError::NotAbsolute`])
+    /// - the filesystem root `/` ([`SandboxExpansionError::RootPath`])
+    /// - parent-dir (`..`) traversal escapes ([`SandboxExpansionError::TraversalEscape`])
+    /// - system-sensitive directories and credential paths
+    ///   ([`SandboxExpansionError::SystemSensitivePath`])
+    ///
+    /// This is defense-in-depth: most call paths pre-validate via
+    /// `sandbox_retry::checked_expand_path`, but this gate ensures
+    /// user-supplied inputs (e.g. `--add-dir`, `ASTRA_CLI_ADD_DIRS`)
+    /// cannot open `/` or `/etc`.
+    pub fn expand_sandbox_path(&self, dir: PathBuf) -> Result<PathBuf, SandboxExpansionError> {
+        if !dir.is_absolute() {
+            return Err(SandboxExpansionError::NotAbsolute);
         }
+        if dir == Path::new("/") {
+            return Err(SandboxExpansionError::RootPath);
+        }
+        if dir
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(SandboxExpansionError::TraversalEscape);
+        }
+        if astra_sandbox::is_sensitive_system_dir(&dir)
+            || astra_sandbox::is_never_readable_path(&dir)
+        {
+            return Err(SandboxExpansionError::SystemSensitivePath);
+        }
+        if let Ok(mut guard) = self.sandbox_policy.write() {
+            match *guard {
+                Some(ref mut policy) => {
+                    policy.allowed_paths.push(dir.clone());
+                }
+                None => return Err(SandboxExpansionError::NoSandboxPolicy),
+            }
+        } else {
+            return Err(SandboxExpansionError::PolicyLockPoisoned);
+        }
+        Ok(dir)
     }
 
     /// Run passive workspace checks (optional **rust-analyzer LSP**, `cargo`, `tsc`) after
@@ -3661,8 +4454,8 @@ impl ToolExecutor {
     }
     fn finalize_tool_output(&self, output: String, name: &str) -> String {
         let output = normalize_empty_output(output, name);
-        let output = truncate_output(output, global_output_limit());
-        self.maybe_persist_large_output(output, name)
+        let persisted = self.maybe_persist_large_output(output, name);
+        truncate_output(persisted, global_output_limit())
     }
 
     pub async fn execute_with_metadata_cancelable(
@@ -3671,6 +4464,13 @@ impl ToolExecutor {
         args: &Value,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> ToolExecutionOutcome {
+        // Admission gate (fail-closed). Every public execution entry point
+        // must pass through `tool_admission_denial` before any tool runs —
+        // including the cancel-aware shell path and metadata-tagged paths,
+        // which otherwise bypass `execute_run`'s gate.
+        if let Some(denied) = self.tool_admission_denial(name, args) {
+            return denied.into_outcome();
+        }
         if let Some(outcome) = self.execute_blocking_shell_tool(name, args, cancel_token) {
             return outcome;
         }
@@ -3692,22 +4492,14 @@ impl ToolExecutor {
         if name == "bash" {
             let output = self.finalize_tool_output(self.bash_with_cancel(args, cancel_token), name);
             self.record_output_size(output.len());
-            return Some(if output.starts_with("Error") {
-                ToolExecutionOutcome::error(output)
-            } else {
-                ToolExecutionOutcome::ok(output)
-            });
+            return Some(tool_execution_outcome_from_output(output));
         }
         #[cfg(windows)]
         if name == "powershell" {
             let output =
                 self.finalize_tool_output(self.powershell_with_cancel(args, cancel_token), name);
             self.record_output_size(output.len());
-            return Some(if output.starts_with("Error") {
-                ToolExecutionOutcome::error(output)
-            } else {
-                ToolExecutionOutcome::ok(output)
-            });
+            return Some(tool_execution_outcome_from_output(output));
         }
         #[cfg(not(windows))]
         let _ = cancel_token; // powershell branch is the only other cancel-aware tool
@@ -3715,6 +4507,12 @@ impl ToolExecutor {
     }
 
     pub async fn execute_with_metadata(&self, name: &str, args: &Value) -> ToolExecutionOutcome {
+        // Admission gate (fail-closed). This is a public entry point called
+        // directly by the server executor; without this gate, `mo_query`, `mo`,
+        // and `git` metadata-tagged paths would bypass `execute_run`'s gate.
+        if let Some(denied) = self.tool_admission_denial(name, args) {
+            return denied.into_outcome();
+        }
         if name == "mo_query" {
             let mut outcome = self.mo_query_with_metadata(args);
             let output = self.finalize_tool_output(outcome.output, name);
@@ -3751,7 +4549,8 @@ impl ToolExecutor {
                     return outcome;
                 }
                 "stash" => {
-                    let mut outcome = self.git_stash_with_metadata(args);
+                    let stash_args = git_stash_action_args(args);
+                    let mut outcome = self.git_stash_with_metadata(&stash_args);
                     outcome.output = self.finalize_tool_output(outcome.output, name);
                     self.record_output_size(outcome.output.len());
                     return outcome;
@@ -3765,39 +4564,31 @@ impl ToolExecutor {
                 _ => {} // Other git actions handled in execute() below
             }
         }
-        if name == "git_stash" {
-            let mut outcome = self.git_stash_with_metadata(args);
-            let output = self.finalize_tool_output(outcome.output, name);
-            self.record_output_size(output.len());
-            outcome.output = output;
-            return outcome;
-        }
-        if name == "git_commit" {
-            let mut outcome = self.git_commit_with_metadata(args);
-            let output = self.finalize_tool_output(outcome.output, name);
-            self.record_output_size(output.len());
-            outcome.output = output;
-            return outcome;
-        }
-        if name == "git_revert_commit" {
-            let mut outcome = self.git_revert_commit_with_metadata(args);
-            let output = self.finalize_tool_output(outcome.output, name);
-            self.record_output_size(output.len());
-            outcome.output = output;
-            return outcome;
-        }
-        if name == "git_worktree" {
-            let mut outcome = self.git_worktree_with_metadata(args);
-            let output = self.finalize_tool_output(outcome.output, name);
-            self.record_output_size(output.len());
-            outcome.output = output;
-            return outcome;
-        }
-
-        ToolExecutionOutcome::text(self.execute(name, args).await)
+        self.execute_run(name, args).await.into_outcome()
     }
 
     pub async fn execute(&self, name: &str, args: &Value) -> String {
+        self.execute_run(name, args).await.output
+    }
+
+    async fn execute_run(&self, name: &str, args: &Value) -> EdgeToolRun {
+        if let Some(error) = self.tool_admission_denial(name, args) {
+            return error;
+        }
+        let output = self.execute_raw(name, args).await;
+        // Structural error propagation: `execute_raw` returns a plain String,
+        // discarding any structured error kind at the source. Recover it here
+        // so downstream `tool_work_surface_events` can route on `error_kind`
+        // metadata instead of re-deriving it from fragile string matching.
+        if cli_tool_output_is_error(&output) {
+            let kind = astra_core::classify_tool_output(&output);
+            EdgeToolRun::classified_error(output, kind)
+        } else {
+            EdgeToolRun::ok(output)
+        }
+    }
+
+    async fn execute_raw(&self, name: &str, args: &Value) -> String {
         let output = if let Err(error) =
             crate::tool_safety_guard::ToolSafetyGuard::check_dispatch(name, args)
         {
@@ -3819,7 +4610,11 @@ impl ToolExecutor {
                 // Uses the local CLI catalog plus plugin-installed schemas,
                 // so `select:NAME` matches the tools this surface actually
                 // exposes while still resolving MCP/skill-backed tools.
-                "tool_search" => self.tool_search(args),
+                "tool_search" => {
+                    let output = self.tool_search(args);
+                    self.record_tool_search_activation_output(&output);
+                    output
+                }
                 "read_file" => self.read_file(args),
                 "write_file" => {
                     // delete=true routes to delete_file handler
@@ -3837,9 +4632,11 @@ impl ToolExecutor {
                         Ok(args) => args,
                         Err(error) => return error,
                     };
-                    // edits array routes to multi_edit handler
+                    // edits array routes through the str_replace batch
+                    // wrapper so both same-file and per-edit path batches
+                    // share one contract.
                     if args.get("edits").and_then(Value::as_array).is_some() {
-                        self.multi_edit(&args)
+                        self.str_replace_batch(&args)
                     } else {
                         self.str_replace(&args)
                     }
@@ -3875,7 +4672,10 @@ impl ToolExecutor {
                         "contributors" => git_gix::git_contributors(&self.project_root, args),
                         "commit" => self.git_commit(args),
                         "revert_commit" => self.git_revert_commit(args),
-                        "stash" => self.git_stash(args),
+                        "stash" => {
+                            let stash_args = git_stash_action_args(args);
+                            self.git_stash(&stash_args)
+                        }
                         "checkout_file" => self.git_checkout_file(args),
                         "worktree" => self.git_worktree(args),
                         "push" => git_gix::git_push(&self.project_root, args),
@@ -3884,31 +4684,6 @@ impl ToolExecutor {
                         ),
                     }
                 }
-                "git_status" => git_gix::git_status(&self.project_root, args),
-                "git_diff" => git_gix::git_diff(
-                    &self.project_root,
-                    args,
-                    self.get_budget_pressure(),
-                    self.aggregate_output_bytes
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                ),
-                "git_log" => git_gix::git_log(&self.project_root, args),
-                "git_show" => git_gix::git_show(
-                    &self.project_root,
-                    args,
-                    self.get_budget_pressure(),
-                    self.aggregate_output_bytes
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                ),
-                "git_blame" => git_gix::git_blame(&self.project_root, args),
-                "git_file_history" => git_gix::git_file_history(&self.project_root, args),
-                "git_contributors" => git_gix::git_contributors(&self.project_root, args),
-                "git_log_search" => git_gix::git_log_search(&self.project_root, args),
-                "git_commit" => self.git_commit(args),
-                "git_revert_commit" => self.git_revert_commit(args),
-                "git_stash" => self.git_stash(args),
-                "git_checkout_file" => self.git_checkout_file(args),
-                "git_worktree" => self.git_worktree(args),
                 "find_definition" => self.find_definition(args),
                 "find_references" => self.find_references(args),
                 "call_graph" => self.call_graph(args),
@@ -3943,13 +4718,22 @@ impl ToolExecutor {
                         ),
                     }
                 }
-                "github_list_prs" => self.github_list_prs(args).await,
-                "github_get_pr" => self.github_get_pr(args).await,
-                "github_ci_status" => self.github_ci_status(args).await,
-                "github_list_issues" => self.github_list_issues(args).await,
-                "github_get_issue" => self.github_get_issue(args).await,
-                "github_repo_stats" => self.github_repo_stats(args).await,
-                "github_create_issue" => self.github_create_issue(args).await,
+                "github" => {
+                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                    match action {
+                        "list_prs" => self.github_list_prs(args).await,
+                        "get_pr" => self.github_get_pr(args).await,
+                        "ci_status" => self.github_ci_status(args).await,
+                        "list_issues" => self.github_list_issues(args).await,
+                        "get_issue" => self.github_get_issue(args).await,
+                        "repo_stats" => self.github_repo_stats(args).await,
+                        "create_issue" => self.github_create_issue(args).await,
+                        "" => "Error: missing required parameter 'action'. Use one of: list_prs, get_pr, ci_status, list_issues, get_issue, repo_stats, create_issue".to_string(),
+                        other => format!(
+                            "Error: unknown github action '{other}'. Use one of: list_prs, get_pr, ci_status, list_issues, get_issue, repo_stats, create_issue"
+                        ),
+                    }
+                }
                 "web_fetch" => {
                     let cache_scope = self
                         .active_session_id
@@ -4034,7 +4818,7 @@ impl ToolExecutor {
                         "delegate" => {
                             "Error: agent.delegate has been removed because it had no execution \
                              backend in CLI mode and silently no-op'd. Use agent(action='spawn', \
-                             description='...', prompt='...', run_in_background: true) instead. \
+                             description='...', prompt='...') instead. \
                              To run N sub-agents in parallel, use agent_fanout(action='start', \
                              target_count=N, slots=[...])."
                                 .to_string()
@@ -4090,7 +4874,7 @@ impl ToolExecutor {
                             "Error: invalid agent call shape. Use the top-level \
                              `action='spawn'` field, not a `spawn` wrapper key. \
                              Example: agent(action='spawn', description='...', \
-                             prompt='...', run_in_background: true). For parallel \
+                             prompt='...'). For parallel \
                              fan-out, use agent_fanout(action='start', target_count=N, \
                              slots=[...]); do not pass `agents:[...]`."
                                 .to_string()
@@ -4186,7 +4970,7 @@ impl ToolExecutor {
                         }
                         "" => "Error: missing required parameter `action` for `task`. Use one of: create, update, list, get, stop, list_user, adopt, archive. For typed background tasks use `task_output`, `task_list`, or `task_stop`.".to_string(),
                         other => match Self::validate_task_tool_args_for_action(other, args) {
-                            Ok(()) => format!("Error: unknown `task` action '{other}'. Valid: create, update, list, get, stop, list_user, adopt, archive. For typed background tasks use `task_output`, `task_list`, or `task_stop`. For parallel sub-agents use `agent_fanout(action='start', target_count=N, slots=[...])` and collect with `agent_fanout(action='get_results', group_id=...)`."),
+                            Ok(()) => format!("Error: unknown `task` action '{other}'. Valid: create, update, list, get, stop, list_user, adopt, archive. For typed background tasks use `task_output`, `task_list`, or `task_stop`. For parallel sub-agents use `agent_fanout(action='start', target_count=N, slots=[...])`; it returns results by default. Backgrounding is user-controlled with Ctrl+B while the live tool is running."),
                             Err(error) => format!("Error: {error}"),
                         },
                     }
@@ -4257,7 +5041,7 @@ impl ToolExecutor {
         // Normalize empty output, then apply global safety net
         let output = self.finalize_tool_output(output, name);
         if name != "memory"
-            && !output.starts_with("Error")
+            && !cli_tool_output_is_error(&output)
             && let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty())
         {
             let client = astra_tools::memoria::MemoriaClient::new(
@@ -4304,11 +5088,12 @@ impl ToolExecutor {
         let agg = self
             .aggregate_output_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
+        let agg = agg.saturating_add(output.len());
         if agg <= AGGREGATE_SOFT_LIMIT {
             return output;
         }
         // Never persist error outputs (they're small and actionable)
-        if output.starts_with("Error:") {
+        if cli_tool_output_is_error(&output) {
             return output;
         }
 
@@ -4420,10 +5205,7 @@ impl ToolExecutor {
 
                 let resolved = resolve_args(&step.args, &ctx);
                 let output = self.execute(&step.tool, &resolved).await;
-                let is_err = output.starts_with("Error")
-                    || output.starts_with("error")
-                    || output.starts_with("Sandbox:")
-                    || output.contains("\"error\":");
+                let is_err = cli_tool_output_is_error(&output);
 
                 ctx.record_step(
                     idx,
@@ -4687,12 +5469,7 @@ impl ToolExecutor {
         }
 
         let mut pool = full_tool_schemas();
-        let plugins = self.plugin_schemas.read().unwrap_or_else(|poisoned| {
-            tracing::warn!("CLI plugin_schemas RwLock poisoned on capability view; recovering.");
-            poisoned.into_inner()
-        });
-        pool.extend(plugins.iter().cloned());
-        drop(plugins);
+        pool.extend(self.plugin_schemas_snapshot("plugin_schemas_capability_view"));
 
         let outcome = astra_turn_core::tool_surface::resolve_with_diagnostics(
             astra_turn_core::tool_surface::Surface::CliLocal,
@@ -4909,7 +5686,86 @@ mod tests {
         parse_memory_search_contents, utf16_col_to_char_idx,
     };
     use crate::lock_recovery::LockRecovery;
+    use std::collections::HashSet;
     use std::path::PathBuf;
+    use std::sync::Arc;
+
+    struct ImmediateSpawnExecutor;
+
+    struct NoopDelegationLookup;
+
+    #[async_trait::async_trait]
+    impl astra_messaging::DelegationLookup for NoopDelegationLookup {
+        async fn get_parent(&self, _run_id: &str) -> Option<String> {
+            None
+        }
+
+        async fn get_agent_id(&self, _run_id: &str) -> Option<String> {
+            None
+        }
+
+        async fn get_depth(&self, _run_id: &str) -> Option<u32> {
+            None
+        }
+
+        async fn record_sub_run(&self, _info: astra_messaging::SubRunInfo) {}
+    }
+
+    #[async_trait::async_trait]
+    impl astra_runtime::orchestration::SpawnAgentExecutor for ImmediateSpawnExecutor {
+        async fn execute(
+            &self,
+            config: astra_runtime::orchestration::SpawnRunConfig,
+        ) -> Result<astra_runtime::orchestration::SpawnRunResult, String> {
+            Ok(astra_runtime::orchestration::SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                status: "completed".into(),
+                finish_reason: "normal".into(),
+                cancelled_by_user: None,
+                output: Some("child result".into()),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 0,
+            })
+        }
+    }
+
+    fn fanout_test_context(
+        spawner: Arc<astra_runtime::orchestration::DynamicAgentSpawner>,
+    ) -> astra_runtime::orchestration::AgentToolContext {
+        astra_runtime::orchestration::AgentToolContext {
+            run_id: "run-parent".into(),
+            agent_id: "root-agent".into(),
+            delegation_chain: Vec::new(),
+            current_model: None,
+            recursion_depth: 0,
+            is_fork_child: false,
+            working_dir: PathBuf::from("."),
+            spawner,
+            inherited_permissions: astra_runtime::orchestration::InheritedPermissions::auto_approve(
+            ),
+            active_skills: Vec::new(),
+            live_event_sink: None,
+            trace_context: None,
+            execution_metadata: None,
+        }
+    }
+
+    fn test_spawner() -> Arc<astra_runtime::orchestration::DynamicAgentSpawner> {
+        let transport = Arc::new(astra_messaging::InProcessTransport::new());
+        let tracker = Arc::new(NoopDelegationLookup);
+        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
+        Arc::new(
+            astra_runtime::orchestration::DynamicAgentSpawner::new(router)
+                .with_executor(Arc::new(ImmediateSpawnExecutor)),
+        )
+    }
 
     pub(super) fn test_executor() -> ToolExecutor {
         ToolExecutor::new(std::env::temp_dir())
@@ -5042,6 +5898,54 @@ mod tests {
             "{result}"
         );
         assert!(result.contains("task may still be running"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn task_output_projects_fanout_group_when_registry_does_not_answer() {
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let spawner = test_spawner();
+        let ctx = fanout_test_context(spawner);
+        let executor = test_executor()
+            .with_spawn_context(ctx)
+            .with_bg_task_commands(commands);
+
+        let started = executor
+            .execute(
+                "agent_fanout",
+                &serde_json::json!({
+                    "action": "start",
+                    "group_id": "review-fanout",
+                    "target_count": 1,
+                    "slots": [{
+                        "id": "review",
+                        "description": "Review one area",
+                        "prompt": "Return a short result."
+                    }]
+                }),
+            )
+            .await;
+        assert!(started.contains("\"status\":\"completed\""), "{started}");
+
+        let result = executor
+            .task_output(&serde_json::json!({
+                "task_id": "review-fanout",
+                "timeout_ms": 5
+            }))
+            .await;
+
+        assert!(
+            result.contains("Read agent fanout output review-fanout"),
+            "{result}"
+        );
+        assert!(result.contains("agent_fanout_group"), "{result}");
+        assert!(
+            result.contains("agent_fanout(action='get_results'"),
+            "{result}"
+        );
+        assert!(
+            !result.contains("Background task registry did not respond"),
+            "{result}"
+        );
     }
 
     #[tokio::test]
@@ -5240,10 +6144,13 @@ mod tests {
             .await;
 
         assert!(output.contains("agent_fanout(action='start'"), "{output}");
+        assert!(output.contains("returns results by default"), "{output}");
+        assert!(output.contains("Ctrl+B"), "{output}");
         assert!(
-            output.contains("agent_fanout(action='get_results'"),
+            !output.contains("agent_fanout(action='get_results'"),
             "{output}"
         );
+        assert!(!output.contains("run_in_background: true"), "{output}");
         assert!(!output.contains("run_in_background=true"), "{output}");
         assert!(!output.contains("agent(action='get_result'"), "{output}");
     }
@@ -5511,6 +6418,233 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deferred_tool_requires_tool_search_activation_on_cli_path() {
+        let executor = test_executor();
+        executor.set_current_visible_tool_schemas(&[
+            serde_json::json!({"type": "function", "function": {"name": "bash"}}),
+            serde_json::json!({"type": "function", "function": {"name": "tool_search"}}),
+        ]);
+        executor.set_current_activatable_tool_names(HashSet::from(["memory".to_string()]));
+
+        let before = executor.execute("memory", &serde_json::json!({})).await;
+        assert!(
+            before.contains("deferred") && before.contains("select:memory"),
+            "unactivated deferred tool must be blocked with activation guidance; got: {before}"
+        );
+
+        let search = executor
+            .execute(
+                "tool_search",
+                &serde_json::json!({"query": "select:memory"}),
+            )
+            .await;
+        assert!(search.contains("memory"), "{search}");
+
+        let after = executor.execute("memory", &serde_json::json!({})).await;
+        assert!(
+            !after.contains("not available in this turn") && after.contains("missing required"),
+            "activated deferred tool must reach real executor path; got: {after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unbound_agent_fanout_cannot_be_deferred_activated() {
+        let executor = test_executor();
+        executor.set_current_visible_tool_schemas(&[
+            serde_json::json!({"type": "function", "function": {"name": "bash"}}),
+            serde_json::json!({"type": "function", "function": {"name": "tool_search"}}),
+        ]);
+        executor.set_current_activatable_tool_names(HashSet::from(["agent_fanout".to_string()]));
+
+        let fanout_args = serde_json::json!({
+            "action": "start",
+            "target_count": 1,
+            "slots": [{
+                "id": "review",
+                "description": "Review",
+                "prompt": "Review the current change."
+            }]
+        });
+        let direct_outcome = executor
+            .execute_with_metadata("agent_fanout", &fanout_args)
+            .await;
+        let direct = &direct_outcome.output;
+        assert!(
+            direct.contains("no executor attached for this turn"),
+            "unbound agent_fanout must report binding failure, got: {direct}"
+        );
+        assert_eq!(
+            direct_outcome
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("error_kind"))
+                .and_then(serde_json::Value::as_str),
+            Some(astra_core::ErrorKind::ToolBinding.as_str())
+        );
+
+        let search = executor
+            .execute(
+                "tool_search",
+                &serde_json::json!({"query": "select:agent_fanout"}),
+            )
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&search).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not activate an unbound agent_fanout; got: {search}"
+        );
+
+        let after_outcome = executor
+            .execute_with_metadata("agent_fanout", &fanout_args)
+            .await;
+        let after = &after_outcome.output;
+        assert!(
+            after.contains("no executor attached for this turn"),
+            "tool_search must not silently mark unbound agent_fanout activated; got: {after}"
+        );
+        assert_eq!(
+            after_outcome
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("error_kind"))
+                .and_then(serde_json::Value::as_str),
+            Some(astra_core::ErrorKind::ToolBinding.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn unbound_future_agent_action_fails_closed_on_runtime_binding() {
+        let executor = test_executor();
+        executor.set_current_visible_tool_schemas(&[
+            serde_json::json!({"type": "function", "function": {"name": "bash"}}),
+            serde_json::json!({"type": "function", "function": {"name": "tool_search"}}),
+        ]);
+
+        let outcome = executor
+            .execute_with_metadata(
+                "agent",
+                &serde_json::json!({"action": "stop", "agent_id": "a1"}),
+            )
+            .await;
+        let output = &outcome.output;
+
+        assert!(
+            output.contains("no executor attached for this turn"),
+            "future executor action must fail closed on missing binding; got: {output}"
+        );
+        assert_eq!(
+            outcome
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("error_kind"))
+                .and_then(serde_json::Value::as_str),
+            Some(astra_core::ErrorKind::ToolBinding.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_search_select_cannot_activate_policy_hidden_tool() {
+        let executor = test_executor();
+        executor.set_current_visible_tool_schemas(&[
+            serde_json::json!({"type": "function", "function": {"name": "bash"}}),
+            serde_json::json!({"type": "function", "function": {"name": "tool_search"}}),
+        ]);
+        executor.set_current_activatable_tool_names(HashSet::from(["web_fetch".to_string()]));
+
+        let out = executor
+            .execute(
+                "tool_search",
+                &serde_json::json!({"query": "select:ask_user"}),
+            )
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "hidden ask_user must not resolve through tool_search; got: {out}"
+        );
+        assert!(
+            parsed["missing"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("ask_user")),
+            "hidden ask_user must be reported missing from the current search pool; got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonvisible_ask_user_is_denied_before_prompt_sink_error() {
+        let executor = test_executor();
+        executor.set_current_visible_tool_schemas(&[
+            serde_json::json!({"type": "function", "function": {"name": "bash"}}),
+            serde_json::json!({"type": "function", "function": {"name": "tool_search"}}),
+        ]);
+
+        let out = executor
+            .execute(
+                "ask_user",
+                &serde_json::json!({
+                    "questions": [{
+                        "id": "decision",
+                        "header": "Decision",
+                        "question": "Continue?",
+                        "options": [
+                            {"label": "Yes", "description": "Continue."},
+                            {"label": "No", "description": "Stop."}
+                        ]
+                    }]
+                }),
+            )
+            .await;
+
+        assert!(out.contains("not available in this turn"), "{out}");
+        assert!(!out.contains("select:ask_user"), "{out}");
+        assert!(
+            !out.contains("requires an interactive TUI prompt sink"),
+            "visibility guard must run before the ask_user backend; got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonvisible_internal_legacy_tool_is_denied_before_handler() {
+        let executor = test_executor();
+        executor.set_current_visible_tool_schemas(&[
+            serde_json::json!({"type": "function", "function": {"name": "bash"}}),
+            serde_json::json!({"type": "function", "function": {"name": "tool_search"}}),
+        ]);
+
+        let out = executor
+            .execute(
+                "run_build_test",
+                &serde_json::json!({"command": "echo should-not-run"}),
+            )
+            .await;
+
+        assert!(out.contains("not available in this turn"), "{out}");
+        assert!(!out.contains("select:run_build_test"), "{out}");
+        assert!(
+            !out.contains("should-not-run"),
+            "internal handler must not execute when the tool was not visible or activated; got: {out}"
+        );
+    }
+
+    #[test]
+    fn task_update_unknown_field_names_action_that_accepts_field() {
+        let err = ToolExecutor::validate_task_tool_args_for_action(
+            "update",
+            &serde_json::json!({
+                "action": "update",
+                "task_id": "task-1",
+                "subtasks": []
+            }),
+        )
+        .expect_err("task.update must reject create-only subtasks");
+
+        assert!(err.contains("unknown field 'subtasks' for task.update"));
+        assert!(err.contains("field is valid for: task.create"), "{err}");
+    }
+
+    #[tokio::test]
     async fn introspect_capability_reports_inactive_agent_spawner() {
         let executor = test_executor();
         let out = executor
@@ -5616,6 +6750,7 @@ mod tests {
             }
         });
         executor.set_plugin_schemas(vec![plugin]);
+        executor.set_current_activatable_tool_names(HashSet::from(["mcp__weather".to_string()]));
 
         let out = executor
             .execute(
@@ -5632,12 +6767,11 @@ mod tests {
         assert!(parsed["matches"][0].get("parameters").is_some());
     }
 
-    /// Poison recovery: if a prior panic poisoned the plugin_schemas
-    /// RwLock, tool_search must STILL function rather than silently
-    /// drop the plugin pool. Silent drop would leave deferred
-    /// activation broken with zero observability.
+    /// Poison recovery: plugin schemas are a cache. If a prior panic poisoned
+    /// the RwLock, reset to a known empty state rather than reading possibly
+    /// half-written inner data; a later `set_plugin_schemas` repopulates it.
     #[tokio::test]
-    async fn tool_search_recovers_from_poisoned_plugin_schemas_lock() {
+    async fn tool_search_resets_poisoned_plugin_schemas_lock() {
         let executor = test_executor();
         let plugin = serde_json::json!({
             "type": "function",
@@ -5647,7 +6781,8 @@ mod tests {
                 "parameters": {"type": "object", "properties": {}}
             }
         });
-        executor.set_plugin_schemas(vec![plugin]);
+        executor.set_plugin_schemas(vec![plugin.clone()]);
+        executor.set_current_activatable_tool_names(HashSet::from(["mcp__calc".to_string()]));
 
         // Simulate a prior panic-poisoned write lock.
         let arc = std::sync::Arc::new(&executor.plugin_schemas);
@@ -5660,7 +6795,21 @@ mod tests {
             "lock should be poisoned for the test to be meaningful"
         );
 
-        // Now the select must still resolve the plugin via recovery.
+        // The first select after poison must be stable and clear the poisoned
+        // cache, not read inner state from the panicking writer.
+        let out = executor
+            .execute(
+                "tool_search",
+                &serde_json::json!({"query": "select:mcp__calc"}),
+            )
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            !parsed["missing"].as_array().unwrap().is_empty(),
+            "poisoned plugin cache should reset before reuse; got: {out}"
+        );
+
+        executor.set_plugin_schemas(vec![plugin]);
         let out = executor
             .execute(
                 "tool_search",
@@ -5670,7 +6819,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(
             parsed["missing"].as_array().unwrap().is_empty(),
-            "poisoned lock must not silently drop plugins; got: {out}"
+            "reinstalled plugin schema must resolve after poison reset; got: {out}"
         );
         assert_eq!(parsed["matches"][0]["name"].as_str(), Some("mcp__calc"));
     }

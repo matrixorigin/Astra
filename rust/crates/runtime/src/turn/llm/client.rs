@@ -231,6 +231,12 @@ pub(crate) fn classify_llm_error(msg: &str) -> astra_core::ErrorKind {
         astra_core::ErrorKind::ContextWindow
     } else if lower.contains("rate") || lower.contains("429") {
         astra_core::ErrorKind::RateLimit
+    } else if lower.contains("connection pool timed out")
+        || lower.contains("pool timed out while waiting for an open connection")
+        || lower.contains("pool timed out waiting for an open connection")
+        || lower.contains("pool timed out") && lower.contains("open connection")
+    {
+        astra_core::ErrorKind::DatabaseError
     } else if lower.contains("timeout") || lower.contains("timed out") {
         astra_core::ErrorKind::StreamIdle
     } else if lower.contains("connect") || lower.contains("transport") || lower.contains("network")
@@ -4489,6 +4495,10 @@ mod tests {
         assert_eq!(
             classify_llm_error("request timed out"),
             ErrorKind::StreamIdle
+        );
+        assert_eq!(
+            classify_llm_error("Error: pool timed out while waiting for an open connection"),
+            ErrorKind::DatabaseError
         );
         assert_eq!(
             classify_llm_error("connection refused"),

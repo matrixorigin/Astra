@@ -232,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_strips_active_task_attachment_wrappers() {
+    fn sanitize_strips_obsolete_active_task_attachment_garbage() {
         let msgs = vec![
             json!({"role": "user", "content": "review code"}),
             json!({"role": "user", "content": "[Active task attachment]\nResume the active task/thread below unless the user explicitly changes topic.\n[User follow-up]\n继续"}),

@@ -1635,7 +1635,7 @@ sandbox:
 
 ```
 Normal skill:     ChatLoop → SkillExecutor → skill.execute() (in-process)
-Sandboxed skill:  ChatLoop → SkillExecutor → SandboxRunner → Docker container
+Sandboxed skill:  ChatLoop → SkillExecutor → SandboxRuntime → Docker container
                                                   │
                                                   ├── Mount: skill code (read-only)
                                                   ├── Env: credentials (injected)
@@ -2450,7 +2450,7 @@ class SkillTableRegistry:
 **Per-skill schema separation** (optional, MatrixOne-native): Skills can opt into a dedicated database (`CREATE DATABASE sk_github`) instead of shared prefix. The registry abstracts this — callers use logical table names, the registry resolves to physical `{db}.{table}`. Migration between shared-prefix and separate-database is a registry config change, not a code change.
 
 **Integration points**:
-- `SandboxRunner` uses `validate_access()` before proxying DB queries for sandboxed skills
+- `SandboxRuntime` uses `validate_access()` before proxying DB queries for sandboxed skills
 - `SkillDataBridge` uses `tables_for()` to validate cross-skill access
 - `init_db()` populates the registry from skill manifests at startup
 

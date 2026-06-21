@@ -334,6 +334,40 @@ mod connection_quota_tests {
             "u64::MAX allocation must be rejected, got {result:?}"
         );
     }
+
+    #[tokio::test]
+    async fn shared_pool_clone_drop_releases_quota_only_on_last_wrapper() {
+        let _g = crate::sync_poison::recover_mutex_lock(&TEST_MUTEX);
+        reset_quota();
+        GLOBAL_CONNECTION_ALLOCATED.store(10, Ordering::Release);
+        let settings = MatrixOneSettings {
+            db_pool_max_connections: 10,
+            ..MatrixOneSettings::default()
+        };
+        let pool = MySqlPoolOptions::new()
+            .connect_lazy(&settings.database_url_with_password())
+            .expect("lazy pool should not connect");
+        let shared = SharedPool {
+            pool: Arc::new(pool),
+            settings,
+            quota_released: Arc::new(AtomicBool::new(false)),
+        };
+
+        let clone = shared.clone();
+        drop(clone);
+        assert_eq!(
+            GLOBAL_CONNECTION_ALLOCATED.load(Ordering::Acquire),
+            10,
+            "dropping a clone must not release quota while the pool wrapper is still alive"
+        );
+
+        drop(shared);
+        assert_eq!(
+            GLOBAL_CONNECTION_ALLOCATED.load(Ordering::Acquire),
+            0,
+            "the last SharedPool wrapper releases the reserved quota"
+        );
+    }
 }
 
 pub mod composite_snapshot;
@@ -627,6 +661,13 @@ pub struct SharedPool {
     quota_released: Arc<AtomicBool>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedPoolStats {
+    pub max_connections: u32,
+    pub size: u32,
+    pub num_idle: usize,
+}
+
 impl SharedPool {
     pub async fn new(settings: &MatrixOneSettings) -> Result<Self, sqlx::Error> {
         let max = settings.db_pool_max_connections as u64;
@@ -674,6 +715,14 @@ impl SharedPool {
         &self.settings
     }
 
+    pub fn stats(&self) -> SharedPoolStats {
+        SharedPoolStats {
+            max_connections: self.settings.db_pool_max_connections,
+            size: self.pool.size(),
+            num_idle: self.pool.num_idle(),
+        }
+    }
+
     pub async fn close(&self) {
         self.pool.close().await;
         self.release_quota();
@@ -682,7 +731,14 @@ impl SharedPool {
 
 impl Drop for SharedPool {
     fn drop(&mut self) {
-        self.release_quota();
+        // `SharedPool` is cloned into many service structs. Releasing the
+        // process-wide quota when an arbitrary clone is dropped makes the
+        // quota counter lie while the underlying pool is still alive. Release
+        // only when the last SharedPool wrapper goes away, unless an explicit
+        // `close()` already released it.
+        if Arc::strong_count(&self.pool) == 1 {
+            self.release_quota();
+        }
     }
 }
 

@@ -74,8 +74,6 @@ use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 use astra_turn_core::tool_registry_report::SelectionReport;
 use tokio_util::sync::CancellationToken;
 
-use crate::turn::agentic::turn_intent::infer_turn_intent;
-
 /// Anchors journal wall-clock timestamps to a single process-local epoch so
 /// later reads stay monotonic even if `SystemTime` jumps backwards.
 ///
@@ -171,11 +169,12 @@ pub trait AgenticLoopHost: Send {
 
     /// Optional semantic judge for the current user turn.
     ///
-    /// The default implementation provides a deterministic baseline from the
-    /// current message plus `TaskExecutionProfile`; hosts can override it with a
-    /// higher-fidelity classifier if they have one.
-    async fn judge_turn_intent(&mut self, state: &AgenticLoopState) -> Option<TurnIntent> {
-        infer_turn_intent(&state.message, state.task_profile)
+    /// Hosts with an LLM-backed intent judge should override this. The default
+    /// does not infer semantic continuation from text; continuing the current
+    /// objective is a high-impact decision and should come from a structured
+    /// judge result, not phrase matching.
+    async fn judge_turn_intent(&mut self, _state: &AgenticLoopState) -> Option<TurnIntent> {
+        None
     }
 
     /// Whether the host already injects round budget guidance into the system
@@ -279,6 +278,21 @@ pub trait AgenticLoopHost: Send {
 
     /// Valid tool names from the host's tool schemas.
     fn valid_tool_names(&self) -> &HashSet<String>;
+
+    /// Names listed in the current turn's `<deferred_tools>` manifest.
+    ///
+    /// The validator uses this to differentiate "unknown tool" denials
+    /// (truly hallucinated names) from "not yet activated" denials
+    /// (deferred but reachable via `tool_search(query="select:NAME")`).
+    /// Default: empty — hosts that don't render a deferred manifest get
+    /// the legacy "Unknown tool" copy on every miss.
+    ///
+    /// Returned by value because some hosts compute the set lazily from
+    /// shared state (`Arc<ToolExecutor>`) and don't keep a borrowable
+    /// `HashSet`. The validator clones once per round, so this isn't hot.
+    fn deferred_tool_names(&self) -> HashSet<String> {
+        HashSet::new()
+    }
 
     /// Active capability set for this host. Prompt rendering should read this
     /// rather than inferring capabilities from the resolved tool list.
@@ -580,14 +594,6 @@ pub struct StallTrackingState {
     /// when the model has produced a long streak of consecutive single-tool
     /// rounds despite the soft prompt-layer nudge. One-shot per turn.
     pub forced_parallel_batching: bool,
-    /// Escalation of `forced_parallel_batching`: fires a second, harder
-    /// corrective when the model has continued streaking despite the
-    /// first force injection. Session 8d9e5903 T11 showed 18 consecutive
-    /// single-tool rounds without any mid-loop correction because the
-    /// first-tier was silenced by a scaffolding-detection bug (fixed
-    /// separately); even with that bug fixed, one-shot correction is
-    /// insufficient when the streak keeps growing. One-shot per turn.
-    pub forced_parallel_batching_escalated: bool,
     /// Whether the round-budget convergence guard injected its phase-1
     /// corrective this loop. Phase-1 fires when `state.llm_rounds_completed`
     /// crosses the effective round-budget hard limit; it tells the model
@@ -631,6 +637,11 @@ pub struct StallTrackingState {
     /// identical tool calls that are served from cache instead of reusing
     /// the earlier result. One-shot per turn.
     pub forced_cache_waste_corrective: bool,
+    /// Whether broad search fanout has already triggered a convergence
+    /// corrective this turn. This is intentionally advisory and one-shot: it
+    /// catches implementation tasks that keep widening search instead of
+    /// synthesizing, editing, verifying, or finishing.
+    pub forced_search_fanout_corrective: bool,
     /// Whether a broad exploration-family corrective injected a guidance
     /// message and restricted the dominant low-yield family this loop. Fires
     /// when consecutive multi-call rounds stay inside the same exploratory
@@ -989,11 +1000,10 @@ pub enum VolatileKind {
     BudgetAdvisory,
     /// Tactical adaptation hint.
     TacticalAdaptation,
-    /// "Context was just compacted — continue working, do not
-    /// summarize." Injected by `handle_token_budget` after a
-    /// successful compact+spill pass so the model resumes the task
-    /// instead of misreading the smaller context as an interruption
-    /// (session 0e37eb46 regression).
+    /// Neutral compaction context note. Injected after a successful
+    /// compact+spill pass so the model understands the smaller context
+    /// without treating the note itself as a new user request or automatic
+    /// resume authorization.
     CompactResume,
     /// Circuit-breaker intermediate / soft-stop messages.
     CircuitBreaker,
@@ -1172,10 +1182,9 @@ pub struct AgenticLoopState {
     /// cleared; the bridge prunes it naturally when a later diagnosis drops the
     /// tool from its recommendation.
     pub boosted_tools: HashSet<String>,
-    /// One-shot flag set by pipeline `widen_selection` strategy. When true,
-    /// the upcoming tool-visibility assembly skips the deprioritized → restricted
-    /// merge for this turn so the LLM sees the full catalogue again. The flag
-    /// is consumed (reset to false) on use.
+    /// One-shot flag set by pipeline `widen_selection` strategy. The flag is
+    /// consumed (reset to false) on the next authoritative tool-visibility
+    /// assembly; soft health diagnostics no longer hide tools from the schema.
     pub widen_selection_pending: bool,
     pub step_recorder: StepRecorder,
 
@@ -1241,6 +1250,13 @@ pub struct AgenticLoopState {
     /// runaway delegation loops where the parent agent keeps delegating
     /// without synthesizing results.
     pub delegations_this_turn: u32,
+    /// Chain of agent_ids that led to this delegation (for circular detection).
+    /// Inherited from parent delegation and appended with parent agent_id.
+    /// Format: ["orchestrator", "coder", "reviewer"] means orchestrator→coder→reviewer.
+    pub delegation_chain: Vec<String>,
+    /// Agent ID of this agent itself. Set from delegation config for sub-agents;
+    /// falls back to "orchestrator" for the root agent.
+    pub self_agent_id: String,
 
     // ── Composite Snapshot ──
     /// Optional data snapshot provider for building composite snapshots.
@@ -1329,8 +1345,7 @@ pub struct AgenticLoopState {
     /// Optional permission sync context for runtime permission management.
     /// When set, tool execution checks permissions before running and can
     /// request permission from parent agent via mailbox if denied.
-    pub permission_context:
-        Option<std::sync::Arc<tokio::sync::RwLock<crate::orchestration::PermissionSyncContext>>>,
+    pub permission_context: Option<crate::orchestration::PermissionSyncHandle>,
 
     /// Optional permission request handler for processing child requests.
     /// When set, incoming PermissionRequest messages are handled automatically.
@@ -2359,6 +2374,8 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         api_token: String::new(),
         delegation_engine: None,
         delegations_this_turn: 0,
+        delegation_chain: Vec::new(),
+        self_agent_id: "orchestrator".to_string(),
         run_control: None,
         project_context: None,
         checkpoint_gate: None,
@@ -2409,6 +2426,17 @@ pub(crate) mod tests {
 
     use astra_services::session_journal::SURGICAL_REMOVAL_TOOL_NAME;
     use serde_json::json;
+
+    fn edge_runtime_environment_fields() -> serde_json::Map<String, Value> {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+            astra_runtime_env::RunBinding::edge_developer("/workspace/project", &registry),
+        );
+        serde_json::Map::from_iter([(
+            "runtime_environment_advertisement".to_string(),
+            serde_json::to_value(advertisement).expect("serialize advertisement"),
+        )])
+    }
 
     /// Unwind-safe cleanup guard for tests that write under
     /// `session_journal::local_sessions_dir()`. Removes the provided directory
@@ -2500,10 +2528,8 @@ pub(crate) mod tests {
             Ok(result)
         }
 
-        async fn judge_turn_intent(&mut self, state: &AgenticLoopState) -> Option<TurnIntent> {
-            self.turn_intent
-                .clone()
-                .or_else(|| infer_turn_intent(&state.message, state.task_profile))
+        async fn judge_turn_intent(&mut self, _state: &AgenticLoopState) -> Option<TurnIntent> {
+            self.turn_intent.clone()
         }
 
         fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
@@ -2647,13 +2673,16 @@ pub(crate) mod tests {
             tool: name.to_string(),
             args: json!({}),
             output: output.to_string(),
-            tool_result_fields: None,
+            tool_result_fields: Some(edge_runtime_environment_fields()),
             status: "ok".to_string(),
             duration_ms: 10,
         }
     }
 
     fn make_detached_bash_edge_tool(task_id: &str) -> EdgeToolExecResult {
+        let mut fields = edge_runtime_environment_fields();
+        fields.insert("bash_detached".to_string(), json!(true));
+        fields.insert("background_task_id".to_string(), json!(task_id));
         EdgeToolExecResult {
             request_id: "req-bash".to_string(),
             tool: "bash".to_string(),
@@ -2661,10 +2690,40 @@ pub(crate) mod tests {
             output: format!(
                 "<bash_detached>The bash command was promoted to background task {task_id}.</bash_detached>"
             ),
-            tool_result_fields: Some(serde_json::Map::from_iter([
-                ("bash_detached".to_string(), json!(true)),
-                ("background_task_id".to_string(), json!(task_id)),
-            ])),
+            tool_result_fields: Some(fields),
+            status: "ok".to_string(),
+            duration_ms: 10,
+        }
+    }
+
+    fn make_running_agent_fanout_edge_tool(group_id: &str) -> EdgeToolExecResult {
+        EdgeToolExecResult {
+            request_id: "req-agent-fanout".to_string(),
+            tool: "agent_fanout".to_string(),
+            args: json!({
+                "action": "start",
+                "target_count": 3,
+                "slots": []
+            }),
+            output: json!({
+                "status": "started",
+                "group_id": group_id,
+                "target_count": 3,
+                "fanout": {
+                    "accepted": 3,
+                    "active": 3,
+                    "completed": 0,
+                    "failed": 0,
+                    "cancelled_by_user": 0,
+                    "cancelled_by_parent_budget": 0,
+                    "timed_out": 0,
+                    "terminal": 0,
+                    "group_id": group_id,
+                    "status": "running"
+                }
+            })
+            .to_string(),
+            tool_result_fields: Some(edge_runtime_environment_fields()),
             status: "ok".to_string(),
             duration_ms: 10,
         }
@@ -2676,7 +2735,7 @@ pub(crate) mod tests {
             tool: name.to_string(),
             args,
             output: output.to_string(),
-            tool_result_fields: None,
+            tool_result_fields: Some(edge_runtime_environment_fields()),
             status: "ok".to_string(),
             duration_ms: 10,
         }
@@ -2685,6 +2744,9 @@ pub(crate) mod tests {
     // ── State builder ───────────────────────────────────────────────────────
 
     pub(crate) fn make_state() -> AgenticLoopState {
+        let tool_policy =
+            astra_config::runtime_config::ToolSelectionConfig::default().resolve_for_model(None);
+
         AgenticLoopState {
             messages: Vec::new(),
             volatile_pending: Vec::new(),
@@ -2723,14 +2785,10 @@ pub(crate) mod tests {
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.95),
             call_counts: HashMap::new(),
-            max_identical_tool_calls: astra_config::runtime_config::RuntimeConfig::load()
-                .tool_selection
-                .effective_max_identical_calls(),
-            max_tools_per_turn: astra_config::runtime_config::RuntimeConfig::load()
-                .tool_selection
-                .effective_max_tools_per_turn(),
-            repeated_cache_hit_suppression: 3,
-            max_consecutive_empty_name: 3,
+            max_identical_tool_calls: tool_policy.max_identical_tool_calls,
+            max_tools_per_turn: tool_policy.max_tools_per_turn,
+            repeated_cache_hit_suppression: tool_policy.repeated_cache_hit_suppression,
+            max_consecutive_empty_name: tool_policy.max_consecutive_empty_name,
             stall: Default::default(),
             telemetry: Default::default(),
             skills: SkillState {
@@ -2752,6 +2810,8 @@ pub(crate) mod tests {
             api_token: String::new(),
             delegation_engine: None,
             delegations_this_turn: 0,
+            delegation_chain: Vec::new(),
+            self_agent_id: "orchestrator".to_string(),
             run_control: None,
             project_context: None,
             checkpoint_gate: None,
@@ -2772,7 +2832,9 @@ pub(crate) mod tests {
             max_cumulative_tokens: 0,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
             recent_file_reads: Vec::new(),
-            permission_context: None,
+            permission_context: Some(crate::orchestration::PermissionSyncContext::shared_root(
+                crate::orchestration::PermissionMode::Auto,
+            )),
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
@@ -3889,21 +3951,74 @@ pub(crate) mod tests {
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
 
-        assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
+        assert!(
+            matches!(
+                outcome,
+                Ok(AgenticLoopOutcome::Waiting(ref reason))
+                    if reason == "background_task_detached:bg-shell-1"
+            ),
+            "{outcome:?}"
+        );
         assert_eq!(
             host.turn_count(),
-            3,
-            "detached bash on turn 1, task_output on turn 2, text completes on turn 3"
+            1,
+            "detached bash must stop the current turn without a follow-up poll round"
         );
-        assert_eq!(state.total_tool_calls, 2);
+        assert_eq!(state.total_tool_calls, 1);
         assert!(state.telemetry.all_tools_used.contains("bash"));
-        assert!(state.telemetry.all_tools_used.contains("task_output"));
+        assert!(!state.telemetry.all_tools_used.contains("task_output"));
         assert!(
             state
                 .messages
                 .iter()
                 .any(|message| message.to_string().contains("bg-shell-1")),
             "background task id must remain visible in the tool result messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn running_agent_fanout_stops_without_followup_poll_round() {
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_running_agent_fanout_edge_tool("review-group")],
+                10,
+                5,
+                None,
+            ),
+            edge_tool_result(
+                vec![make_edge_tool("agent_fanout", "should not poll")],
+                10,
+                5,
+                None,
+            ),
+            text_result("done", 10, 5, None),
+        ])
+        .with_valid_tools(&["agent_fanout"]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(
+            matches!(
+                outcome,
+                Ok(AgenticLoopOutcome::Waiting(ref reason))
+                    if reason == "agent_fanout_running:review-group"
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            host.turn_count(),
+            1,
+            "running fanout must stop the current turn instead of polling get_results"
+        );
+        assert_eq!(state.total_tool_calls, 1);
+        assert!(state.telemetry.all_tools_used.contains("agent_fanout"));
+        assert!(
+            state
+                .messages
+                .iter()
+                .any(|message| message.to_string().contains("review-group")),
+            "fanout group id must remain visible in the tool result messages"
         );
     }
 
@@ -6028,7 +6143,7 @@ pub(crate) mod tests {
     // directive rides the volatile lane (not `state.messages[]`) so
     // it doesn't pollute history.
     #[tokio::test]
-    async fn compaction_injects_resume_directive_on_volatile_lane() {
+    async fn compaction_injects_context_note_on_volatile_lane() {
         let session_id = format!(
             "resume-directive-{}",
             std::time::SystemTime::now()
@@ -6071,18 +6186,19 @@ pub(crate) mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok(), "loop must complete");
 
-        // The resume directive must ride the volatile lane. We inspect
+        // The compaction context note must ride the volatile lane. We inspect
         // the lane AFTER the loop; MockHost's execute_turn never
         // drains it, so fires accumulate there for tests to observe.
-        let has_resume_directive = state.volatile_pending.iter().any(|inj| {
+        let has_context_note = state.volatile_pending.iter().any(|inj| {
             inj.content.contains("Context compacted")
-                && inj.content.to_lowercase().contains("continue")
+                && inj.content.contains("not a new user request")
+                && !inj.content.contains("Continue the task")
+                && !inj.content.contains("keep working")
         });
         assert!(
-            has_resume_directive,
-            "after compaction fires, a volatile Resume directive must be \
-             queued so the model continues instead of producing a \
-             progress summary (session 0e37eb46 regression). \
+            has_context_note,
+            "after compaction fires, a volatile context note must be \
+             queued without acting as resume authorization. \
              Current volatile_pending: {:#?}",
             state
                 .volatile_pending
@@ -9233,12 +9349,12 @@ print(json.dumps({'context': 'user said: ' + msg}))
         for (i, name) in [
             "read_file",
             "grep",
-            "git_diff",
+            "list_dir",
             "read_file",
             "grep",
-            "git_show",
-            "read_file",
             "glob",
+            "read_file",
+            "web_search",
         ]
         .into_iter()
         .enumerate()
@@ -9546,12 +9662,17 @@ mod parallel_execution_tests {
     use serde_json::json;
 
     fn tool_call_json_named(name: &str, id: &str) -> Value {
+        let arguments = if name == "bash" {
+            json!({"command": "true"})
+        } else {
+            json!({"path": format!("/tmp/{name}.txt")})
+        };
         json!({
             "id": id,
             "type": "function",
             "function": {
                 "name": name,
-                "arguments": json!({"path": format!("/tmp/{name}.txt")}).to_string()
+                "arguments": arguments.to_string()
             }
         })
     }

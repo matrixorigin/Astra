@@ -80,7 +80,7 @@ impl std::str::FromStr for PermissionMode {
         match s.to_lowercase().as_str() {
             "auto" => Ok(Self::Auto),
             "plan" => Ok(Self::Plan),
-            "accept_edits" | "accept-edits" => Ok(Self::AcceptEdits),
+            "accept_edits" => Ok(Self::AcceptEdits),
             "prompt" => Ok(Self::Prompt),
             "deny" => Ok(Self::Deny),
             _ => Err(format!(
@@ -110,11 +110,8 @@ impl PermissionPatternMatch {
 
 /// A permission rule that can be inherited or synchronized.
 ///
-/// Format: `tool_name` or `tool_name(pattern:*)` for prefix matching.
-/// Examples:
-/// - `bash` — matches all bash commands
-/// - `bash(git commit:*)` — matches bash commands starting with "git commit"
-/// - `edit` — matches all edit operations
+/// Persisted string form uses the current explicit grammar:
+/// `Tool()` for broad rules or `Tool(key="value")` for scoped rules.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PermissionRule {
     /// Tool name (lowercase).
@@ -122,8 +119,8 @@ pub struct PermissionRule {
     /// Optional command prefix for execute tools.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
-    /// Whether `pattern` is a legacy prefix/glob match or an exact
-    /// command/path match.
+    /// Whether `pattern` is a prefix/glob, exact command/path, or
+    /// literal path-prefix match.
     #[serde(default, skip_serializing_if = "PermissionPatternMatch::is_prefix")]
     pub pattern_match: PermissionPatternMatch,
     /// Optional operation kind constraint (`read`, `write`, `execute`).
@@ -172,9 +169,9 @@ impl PermissionRule {
         }
     }
 
-    /// Convert a parsed grammar-v2 rule into the enforcement shape.
+    /// Convert a parsed rule spec into the enforcement shape.
     #[must_use]
-    pub fn from_rule_v2(rule: crate::permission::rule_grammar::PermissionRuleV2) -> Self {
+    pub fn from_rule_spec(rule: crate::permission::rule_grammar::PermissionRuleSpec) -> Self {
         let lower_family = rule.tool.to_lowercase();
         let tool = if matches!(lower_family.as_str(), "network" | "mcp") {
             rule.extra
@@ -190,12 +187,6 @@ impl PermissionRule {
                 (Some(exact), PermissionPatternMatch::Exact)
             } else {
                 (rule.argv_prefix.clone(), PermissionPatternMatch::Prefix)
-            }
-        } else if matches!(lower_family.as_str(), "edit" | "read" | "view") {
-            if let Some(path_prefix) = rule.path_prefix.clone() {
-                (Some(path_prefix), PermissionPatternMatch::PathPrefix)
-            } else {
-                (rule.path_glob.clone(), PermissionPatternMatch::Prefix)
             }
         } else {
             (
@@ -226,30 +217,25 @@ impl PermissionRule {
         }
     }
 
-    /// Parse a rule from string format: `Tool` or `Tool(pattern:*)`.
+    /// Parse a rule from the current explicit string format.
+    pub fn try_parse(
+        rule_str: &str,
+    ) -> Result<Self, crate::permission::rule_grammar::RuleParseError> {
+        crate::permission::rule_grammar::parse_rule(rule_str).map(Self::from_rule_spec)
+    }
+
+    /// Parse a rule from the current explicit string format.
+    ///
+    /// Invalid inputs become a non-matching sentinel. Settings loading
+    /// validates rules first and surfaces the parse error to the user;
+    /// this fallback keeps direct internal callers fail-closed.
     pub fn parse(rule_str: &str) -> Self {
-        if let Ok(rule) = crate::permission::rule_grammar::parse_rule_v2(rule_str) {
-            return Self::from_rule_v2(rule);
-        }
-        if let Some(paren_start) = rule_str.find('(') {
-            if let Some(paren_end) = rule_str.rfind(')') {
-                let tool = rule_str[..paren_start].to_lowercase();
-                let inner = &rule_str[paren_start + 1..paren_end];
-                let pattern = inner.trim_end_matches(":*").trim_end_matches('*');
-                return Self {
-                    tool,
-                    pattern: Some(pattern.to_string()),
-                    pattern_match: PermissionPatternMatch::Prefix,
-                    op: None,
-                    cwd_root: None,
-                    git_branch: None,
-                    domain: None,
-                    capability: None,
-                };
-            }
-        }
+        Self::try_parse(rule_str).unwrap_or_else(|_| Self::invalid())
+    }
+
+    fn invalid() -> Self {
         Self {
-            tool: rule_str.to_lowercase(),
+            tool: "__invalid_permission_rule__".to_string(),
             pattern: None,
             pattern_match: PermissionPatternMatch::Prefix,
             op: None,
@@ -262,15 +248,13 @@ impl PermissionRule {
 
     /// Check if this rule matches a tool call.
     ///
-    /// Issue #326 P5 / R2 Major 2: a pattern that contains glob
-    /// metacharacters (`*` / `**` / `?` / `{a,b}`) is matched
-    /// against the command string via [`crate::permission::path_glob::glob_match`].
-    /// Patterns without metacharacters fall back to the legacy
-    /// word-boundary prefix match so existing rules continue to
-    /// behave the same way (`Bash(npm test:*)` still allows
-    /// `npm test --verbose`).
+    /// A pattern that contains glob metacharacters (`*` / `**` / `?` /
+    /// `{a,b}`) is matched against the command string via
+    /// [`crate::permission::path_glob::glob_match`]. Plain command
+    /// prefixes use word-boundary prefix matching so `npm test`
+    /// allows `npm test --verbose` but not `npm testify`.
     pub fn matches(&self, tool_name: &str, command: Option<&str>) -> bool {
-        self.matches_with_context(tool_name, &RuleMatchContext::legacy(command))
+        self.matches_with_context(tool_name, &RuleMatchContext::from_command_hint(command))
     }
 
     /// True when a bash allow rule is broad enough to bypass the safety
@@ -389,7 +373,7 @@ impl PermissionRule {
                     let lower_cmd = cmd.to_lowercase();
                     crate::permission::path_glob::glob_match(pattern, &lower_cmd)
                 } else {
-                    // Legacy word-boundary prefix path.
+                    // Word-boundary prefix path.
                     let lower_cmd = cmd.to_lowercase();
                     let lower_prefix = pattern.to_lowercase();
                     if !lower_cmd.starts_with(&lower_prefix) {
@@ -407,7 +391,7 @@ impl PermissionRule {
 }
 
 fn file_write_family_matches(rule_tool: &str, tool_name: &str, ctx: &RuleMatchContext) -> bool {
-    rule_tool == "edit"
+    rule_tool == "file_write"
         && matches!(
             crate::cloud::approval_policy::cloud_gated_tool_kind(tool_name),
             Some(crate::cloud::approval_policy::CloudGatedToolKind::Write)
@@ -420,7 +404,7 @@ fn file_write_family_matches(rule_tool: &str, tool_name: &str, ctx: &RuleMatchCo
         && crate::tool::categories::registry().is_file_op(tool_name)
 }
 
-/// Context for v2 permission-rule matching.
+/// Context for permission-rule matching.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuleMatchContext {
     pub command: Option<String>,
@@ -434,7 +418,7 @@ pub struct RuleMatchContext {
 
 impl RuleMatchContext {
     #[must_use]
-    pub fn legacy(command: Option<&str>) -> Self {
+    pub fn from_command_hint(command: Option<&str>) -> Self {
         Self {
             command: command.map(ToOwned::to_owned),
             path: command.map(ToOwned::to_owned),
@@ -593,54 +577,42 @@ fn current_git_branch(cwd: &Path) -> Option<String> {
 
 /// Cheap predicate: does `pattern` contain any of the glob
 /// metacharacters [`crate::permission::path_glob`] recognizes?
-/// Used to decide between glob-match and legacy prefix-match.
+/// Used to decide between glob-match and prefix-match.
 fn pattern_contains_glob_metachars(pattern: &str) -> bool {
     pattern.contains('*') || pattern.contains('?') || pattern.contains('{')
 }
 
 impl std::fmt::Display for PermissionRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let has_v2_constraints = self.op.is_some()
-            || self.cwd_root.is_some()
-            || self.git_branch.is_some()
-            || self.domain.is_some()
-            || self.capability.is_some();
-        if has_v2_constraints {
-            let mut rule = crate::permission::rule_grammar::PermissionRuleV2 {
-                tool: self.tool.clone(),
-                argv_exact: None,
-                argv_prefix: None,
-                path_glob: None,
-                path_prefix: None,
-                op: self.op.clone(),
-                cwd_root: self.cwd_root.clone(),
-                git_branch: self.git_branch.clone(),
-                domain: self.domain.clone(),
-                capability: self.capability.clone(),
-                extra: Default::default(),
-            };
-            if self.tool == "bash" {
-                if self.pattern_match == PermissionPatternMatch::Exact {
-                    rule.argv_exact = self.pattern.clone();
-                } else {
-                    rule.argv_prefix = self.pattern.clone();
-                }
-            } else if self.pattern_match == PermissionPatternMatch::PathPrefix {
-                rule.path_prefix = self.pattern.clone();
+        let mut rule = crate::permission::rule_grammar::PermissionRuleSpec {
+            tool: self.tool.clone(),
+            argv_exact: None,
+            argv_prefix: None,
+            path_glob: None,
+            path_prefix: None,
+            op: self.op.clone(),
+            cwd_root: self.cwd_root.clone(),
+            git_branch: self.git_branch.clone(),
+            domain: self.domain.clone(),
+            capability: self.capability.clone(),
+            extra: Default::default(),
+        };
+        if self.tool == "bash" {
+            if self.pattern_match == PermissionPatternMatch::Exact {
+                rule.argv_exact = self.pattern.clone();
             } else {
-                rule.path_glob = self.pattern.clone();
+                rule.argv_prefix = self.pattern.clone();
             }
-            write!(
-                f,
-                "{}",
-                crate::permission::rule_grammar::serialize_rule_v2(&rule)
-            )
+        } else if self.pattern_match == PermissionPatternMatch::PathPrefix {
+            rule.path_prefix = self.pattern.clone();
         } else {
-            match &self.pattern {
-                Some(pat) => write!(f, "{}({}:*)", self.tool, pat),
-                None => write!(f, "{}", self.tool),
-            }
+            rule.path_glob = self.pattern.clone();
         }
+        write!(
+            f,
+            "{}",
+            crate::permission::rule_grammar::serialize_rule(&rule)
+        )
     }
 }
 
@@ -670,11 +642,11 @@ pub struct InheritedPermissions {
     #[serde(default)]
     pub is_background: bool,
     /// Issue #326 P0 / R1 Major 10 / task #17:
-    /// Fingerprinted session overrides from the parent. The legacy
+    /// Fingerprinted session overrides from the parent. The
     /// `allow_rules` / `deny_rules` above carry **command-prefix-level**
     /// rules; this field carries **per-fingerprint** decisions
-    /// (`Bash(cargo test:*) → Allow` is **not** the same as
-    /// `Bash(*) → Allow`). Children must consult this BEFORE the legacy
+    /// (`Bash(argv_prefix="cargo test") → Allow` is **not** the same as
+    /// `Bash() → Allow`). Children must consult this BEFORE the inherited
     /// rules so a "user pressed Always on cargo test" decision doesn't
     /// get downgraded to "Bash is fully allowed".
     ///
@@ -684,8 +656,8 @@ pub struct InheritedPermissions {
     /// between `astra-turn-core::permission_types` and
     /// `astra-turn-core::approval_fingerprint`). The deserialization
     /// is best-effort: if a child receives a payload that fails to
-    /// parse, it falls back to the legacy allow/deny rules and logs a
-    /// warning — never silently downgrades.
+    /// parse, it falls back to the allow/deny rules and logs a
+    /// warning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprinted_overrides: Option<serde_json::Value>,
 }
@@ -708,7 +680,7 @@ impl InheritedPermissions {
     }
     /// Check if a tool is explicitly allowed by inherited rules.
     pub fn is_allowed(&self, tool_name: &str, command: Option<&str>) -> bool {
-        self.is_allowed_with_context(tool_name, &RuleMatchContext::legacy(command))
+        self.is_allowed_with_context(tool_name, &RuleMatchContext::from_command_hint(command))
     }
 
     /// Check if a tool is explicitly allowed by inherited rules.
@@ -720,7 +692,7 @@ impl InheritedPermissions {
 
     /// Check if a tool is explicitly denied by inherited rules.
     pub fn is_denied(&self, tool_name: &str, command: Option<&str>) -> bool {
-        self.is_denied_with_context(tool_name, &RuleMatchContext::legacy(command))
+        self.is_denied_with_context(tool_name, &RuleMatchContext::from_command_hint(command))
     }
 
     /// Check if a tool is explicitly denied by inherited rules.
@@ -747,6 +719,21 @@ impl InheritedPermissions {
             Some(set) => set.contains(&tool_name.to_lowercase()),
             None => true, // No allowlist = all tools allowed
         }
+    }
+
+    /// Set the tool allowlist. When set, only these tools may execute.
+    /// Used by the spawner to carry an agent type's `allowed_tools`
+    /// into the permission engine so the `ToolAllowlist` evaluation
+    /// step enforces it. This is the single source of truth for
+    /// execution-time tool restriction.
+    pub fn with_allowed_tools(mut self, tools: impl IntoIterator<Item = String>) -> Self {
+        let set: HashSet<String> = tools
+            .into_iter()
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty() && t != "*")
+            .collect();
+        self.allowed_tools = if set.is_empty() { None } else { Some(set) };
+        self
     }
 
     /// Add an allow rule.
@@ -779,7 +766,7 @@ pub struct PermissionRequest {
     pub hint: Option<String>,
     /// Full tool arguments (for parent to inspect).
     pub args: serde_json::Value,
-    /// Child's suggested rule if approved (e.g., "bash(git commit:*)").
+    /// Child's suggested rule if approved (e.g., `Bash(argv_prefix="git commit")`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggested_rule: Option<String>,
     /// Brief description of why the tool is needed.
@@ -945,6 +932,15 @@ pub struct PermissionSyncContext {
     telemetry: PermissionTelemetry,
 }
 
+/// Shared runtime permission context handle.
+///
+/// Runtime entrypoints should construct permission state through
+/// [`PermissionSyncContext::shared`] or [`PermissionSyncContext::shared_root`]
+/// instead of open-coding `Arc<RwLock<PermissionSyncContext>>`. Keeping the
+/// handle shape centralized prevents new CLI/server/edge entrypoints from
+/// silently reintroducing a missing-context path.
+pub type PermissionSyncHandle = std::sync::Arc<tokio::sync::RwLock<PermissionSyncContext>>;
+
 impl PermissionSyncContext {
     /// Create a new sync context with inherited permissions.
     pub fn new(inherited: InheritedPermissions) -> Self {
@@ -956,12 +952,28 @@ impl PermissionSyncContext {
         }
     }
 
+    /// Create a shared runtime permission context from an explicit inherited
+    /// permissions envelope.
+    pub fn shared(inherited: InheritedPermissions) -> PermissionSyncHandle {
+        Self::new(inherited).into_shared()
+    }
+
+    /// Convert an already-built context into a shared runtime handle.
+    pub fn into_shared(self) -> PermissionSyncHandle {
+        std::sync::Arc::new(tokio::sync::RwLock::new(self))
+    }
+
     /// Create a context with no inherited permissions (root agent).
     pub fn root(mode: PermissionMode) -> Self {
         Self::new(InheritedPermissions {
             mode,
             ..Default::default()
         })
+    }
+
+    /// Create a shared root runtime permission context.
+    pub fn shared_root(mode: PermissionMode) -> PermissionSyncHandle {
+        Self::shared(InheritedPermissions::new(mode))
     }
 
     /// Get the effective permission mode.
@@ -971,7 +983,7 @@ impl PermissionSyncContext {
 
     /// Check if a tool is allowed (by inherited or session rules).
     pub fn is_allowed(&self, tool_name: &str, command: Option<&str>) -> bool {
-        self.is_allowed_with_context(tool_name, &RuleMatchContext::legacy(command))
+        self.is_allowed_with_context(tool_name, &RuleMatchContext::from_command_hint(command))
     }
 
     /// Check if a tool is allowed (by inherited or session rules).
@@ -990,7 +1002,7 @@ impl PermissionSyncContext {
 
     /// Check if a tool is denied (by inherited or session rules).
     pub fn is_denied(&self, tool_name: &str, command: Option<&str>) -> bool {
-        self.is_denied_with_context(tool_name, &RuleMatchContext::legacy(command))
+        self.is_denied_with_context(tool_name, &RuleMatchContext::from_command_hint(command))
     }
 
     /// Check if a tool is denied (by inherited or session rules).
@@ -1035,6 +1047,20 @@ impl PermissionSyncContext {
             self.apply_update(update);
         }
     }
+    /// Refresh inherited (policy) state from a fresher context while
+    /// preserving this handle's own runtime telemetry and session overrides.
+    ///
+    /// Used by `refresh_root_permission_context` so that a periodic policy
+    /// refresh doesn't wipe the self-model feedback loop (`tools_blocked`,
+    /// `recent_denials`, ...) or forget in-session allow/deny decisions the
+    /// user already made this turn. Only the policy half (`inherited`) is
+    /// replaced; runtime accumulators stay.
+    pub fn merge_policy_from(&mut self, fresh: &PermissionSyncContext) {
+        self.inherited = fresh.inherited.clone();
+        // session_allow / session_deny / telemetry are intentionally
+        // preserved — they belong to this handle's runtime, not the policy.
+    }
+
     /// Create inherited permissions for a child agent.
     pub fn for_child(&self, is_background: bool) -> InheritedPermissions {
         let mut inherited = self.inherited.clone();
@@ -1146,10 +1172,8 @@ mod tests {
         let parsed = "accept_edits".parse::<PermissionMode>().unwrap();
         assert_eq!(parsed, PermissionMode::AcceptEdits);
         assert_eq!(parsed.to_string(), "accept_edits");
-        assert_eq!(
-            "accept-edits".parse::<PermissionMode>().unwrap(),
-            PermissionMode::AcceptEdits
-        );
+        assert_eq!(parsed.chip_text(), "Edits");
+        assert!("accept-edits".parse::<PermissionMode>().is_err());
     }
 
     #[test]
@@ -1161,17 +1185,22 @@ mod tests {
 
     #[test]
     fn test_permission_rule_parse() {
-        let rule = PermissionRule::parse("bash");
+        let rule = PermissionRule::parse("bash()");
         assert_eq!(rule.tool, "bash");
         assert!(rule.pattern.is_none());
 
-        let rule = PermissionRule::parse("Bash(git commit:*)");
+        let rule = PermissionRule::parse(r#"Bash(argv_prefix="git commit")"#);
         assert_eq!(rule.tool, "bash");
         assert_eq!(rule.pattern, Some("git commit".to_string()));
+
+        assert!(PermissionRule::try_parse("Bash(git commit:*)").is_err());
+        assert!(
+            !PermissionRule::parse("Bash(git commit:*)").matches("bash", Some("git commit -m fix"))
+        );
     }
 
     #[test]
-    fn permission_mode_rejects_legacy_aliases() {
+    fn permission_mode_rejects_removed_aliases() {
         for alias in ["yolo", "bypass-safety", "bypass_safety"] {
             assert!(alias.parse::<PermissionMode>().is_err());
         }
@@ -1179,7 +1208,7 @@ mod tests {
 
     #[test]
     fn test_permission_rule_matches() {
-        let rule = PermissionRule::parse("bash(git commit:*)");
+        let rule = PermissionRule::parse(r#"Bash(argv_prefix="git commit")"#);
 
         assert!(rule.matches("bash", Some("git commit -m 'fix'")));
         assert!(rule.matches("Bash", Some("git commit --amend")));
@@ -1191,14 +1220,14 @@ mod tests {
     #[test]
     fn dangerous_bash_allow_shapes_are_not_honored_as_allow_rules() {
         let mut inherited = InheritedPermissions::new(PermissionMode::Prompt);
-        inherited.add_allow(PermissionRule::parse("bash"));
+        inherited.add_allow(PermissionRule::parse("bash()"));
         inherited.add_allow(PermissionRule::parse(
             r#"Bash(argv_prefix="python", op="execute")"#,
         ));
         inherited.add_allow(PermissionRule::parse(
             r#"Bash(argv_prefix="npm test", op="execute")"#,
         ));
-        inherited.add_deny(PermissionRule::parse("Bash(python:*)"));
+        inherited.add_deny(PermissionRule::parse(r#"Bash(argv_prefix="python")"#));
 
         assert!(!inherited.is_allowed_with_context(
             "bash",
@@ -1222,36 +1251,32 @@ mod tests {
 
     #[test]
     fn rule_matches_with_glob_pattern() {
-        // Issue #326 P5 / R2 Major 2: glob metacharacters in
-        // the pattern switch from prefix-match to full glob.
-        let rule = PermissionRule::with_pattern("edit", "src/**/*.rs");
-        assert!(rule.matches("edit", Some("src/lib.rs")));
-        assert!(rule.matches("edit", Some("src/auth/login.rs")));
-        assert!(rule.matches("edit", Some("src/a/b/c/d.rs")));
-        assert!(!rule.matches("edit", Some("docs/readme.md")));
+        let rule = PermissionRule::with_pattern("file_write", "src/**/*.rs");
+        assert!(rule.matches("file_write", Some("src/lib.rs")));
+        assert!(rule.matches("file_write", Some("src/auth/login.rs")));
+        assert!(rule.matches("file_write", Some("src/a/b/c/d.rs")));
+        assert!(!rule.matches("file_write", Some("docs/readme.md")));
     }
 
     #[test]
     fn rule_matches_with_brace_alternatives() {
-        let rule = PermissionRule::with_pattern("edit", "**/*.{rs,ts,js}");
-        assert!(rule.matches("edit", Some("lib.rs")));
-        assert!(rule.matches("edit", Some("ui/component.ts")));
-        assert!(rule.matches("edit", Some("server.js")));
-        assert!(!rule.matches("edit", Some("config.toml")));
+        let rule = PermissionRule::with_pattern("file_write", "**/*.{rs,ts,js}");
+        assert!(rule.matches("file_write", Some("lib.rs")));
+        assert!(rule.matches("file_write", Some("ui/component.ts")));
+        assert!(rule.matches("file_write", Some("server.js")));
+        assert!(!rule.matches("file_write", Some("config.toml")));
     }
 
     #[test]
-    fn rule_matches_falls_back_to_prefix_when_no_metachars() {
-        // No * / ? / { → legacy word-boundary prefix path
-        // remains unchanged so existing v1 rules still work.
-        let rule = PermissionRule::parse("bash(npm test:*)");
+    fn rule_matches_plain_prefix_when_no_metachars() {
+        let rule = PermissionRule::parse(r#"Bash(argv_prefix="npm test")"#);
         assert!(rule.matches("bash", Some("npm test")));
         assert!(rule.matches("bash", Some("npm test --watch")));
         assert!(!rule.matches("bash", Some("npm run deploy")));
     }
 
     #[test]
-    fn v2_rule_enforces_cwd_root_constraint() {
+    fn current_rule_enforces_cwd_root_constraint() {
         let rule =
             PermissionRule::parse(r#"Bash(argv_prefix="npm test", cwd_root="packages/web")"#);
         let matching = RuleMatchContext {
@@ -1270,7 +1295,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_rule_enforces_git_branch_constraint() {
+    fn current_rule_enforces_git_branch_constraint() {
         let rule = PermissionRule::parse(r#"Bash(argv_prefix="git push", git_branch="main")"#);
         let main_branch = RuleMatchContext {
             command: Some("git push origin main".into()),
@@ -1288,7 +1313,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_rule_enforces_network_domain_constraint() {
+    fn current_rule_enforces_network_domain_constraint() {
         let rule = PermissionRule::parse(r#"Network(tool="web_fetch", domain="github.com")"#);
         let github = RuleMatchContext {
             domain: Some("api.github.com".into()),
@@ -1304,7 +1329,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_rule_enforces_mcp_capability_constraint() {
+    fn current_rule_enforces_mcp_capability_constraint() {
         let rule = PermissionRule::parse(
             r#"MCP(tool="mcp_jira_create_issue", capability="destructive=false")"#,
         );
@@ -1322,8 +1347,8 @@ mod tests {
     }
 
     #[test]
-    fn v2_rule_enforces_op_constraint() {
-        let rule = PermissionRule::parse(r#"Edit(path_glob="src/**/*.rs", op="write")"#);
+    fn current_rule_enforces_op_constraint() {
+        let rule = PermissionRule::parse(r#"file_write(path_glob="src/**/*.rs", op="write")"#);
         let write_ctx = RuleMatchContext {
             path: Some("src/main.rs".into()),
             op: Some("write".into()),
@@ -1335,9 +1360,9 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(rule.matches_with_context("edit", &write_ctx));
         assert!(rule.matches_with_context("write_file", &write_ctx));
         assert!(rule.matches_with_context("str_replace", &write_ctx));
+        assert!(!rule.matches_with_context("edit", &write_ctx));
         assert!(!rule.matches_with_context("edit", &read_ctx));
         assert!(!rule.matches_with_context("read_file", &read_ctx));
         assert!(!rule.matches_with_context("read_file", &write_ctx));
@@ -1345,8 +1370,8 @@ mod tests {
     }
 
     #[test]
-    fn v2_path_rule_without_glob_matches_exact_path() {
-        let rule = PermissionRule::parse(r#"write_file(path_glob="zzzz3.md", op="write")"#);
+    fn current_path_rule_without_glob_matches_exact_path() {
+        let rule = PermissionRule::parse(r#"file_write(path_glob="zzzz3.md", op="write")"#);
         let approved = RuleMatchContext {
             path: Some("zzzz3.md".into()),
             op: Some("write".into()),
@@ -1363,8 +1388,8 @@ mod tests {
     }
 
     #[test]
-    fn v2_path_prefix_rule_matches_sibling_prefixes() {
-        let rule = PermissionRule::parse(r#"write_file(path_prefix="zzz", op="write")"#);
+    fn current_path_prefix_rule_matches_sibling_prefixes() {
+        let rule = PermissionRule::parse(r#"file_write(path_prefix="zzz", op="write")"#);
         let approved = RuleMatchContext {
             path: Some("zzz2.md".into()),
             op: Some("write".into()),
@@ -1381,7 +1406,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_context_uses_v2_constraints_for_allow_rules() {
+    fn sync_context_uses_current_constraints_for_allow_rules() {
         let inherited = InheritedPermissions {
             mode: PermissionMode::Prompt,
             allow_rules: vec![PermissionRule::parse(
@@ -1408,8 +1433,8 @@ mod tests {
     #[test]
     fn test_inherited_permissions() {
         let mut inherited = InheritedPermissions::default();
-        inherited.add_allow(PermissionRule::parse("bash(git:*)"));
-        inherited.add_deny(PermissionRule::parse("bash(rm -rf:*)"));
+        inherited.add_allow(PermissionRule::parse(r#"Bash(argv_prefix="git")"#));
+        inherited.add_deny(PermissionRule::parse(r#"Bash(argv_prefix="rm -rf")"#));
 
         assert!(inherited.is_allowed("bash", Some("git status")));
         assert!(!inherited.is_allowed("bash", Some("npm install")));
@@ -1421,7 +1446,7 @@ mod tests {
     fn test_permission_sync_context() {
         let inherited = InheritedPermissions {
             mode: PermissionMode::Prompt,
-            allow_rules: vec![PermissionRule::parse("bash(git:*)")],
+            allow_rules: vec![PermissionRule::parse(r#"Bash(argv_prefix="git")"#)],
             deny_rules: vec![],
             ..Default::default()
         };
@@ -1429,7 +1454,7 @@ mod tests {
         let mut ctx = PermissionSyncContext::new(inherited);
         assert!(ctx.is_allowed("bash", Some("git status")));
 
-        let update = PermissionUpdate::allow(PermissionRule::parse("bash(npm:*)"));
+        let update = PermissionUpdate::allow(PermissionRule::parse(r#"Bash(argv_prefix="npm")"#));
         ctx.apply_update(&update);
         assert!(ctx.is_allowed("bash", Some("npm install")));
 
@@ -1439,10 +1464,49 @@ mod tests {
         assert!(child_perms.is_allowed("bash", Some("npm install")));
     }
 
+    #[tokio::test]
+    async fn permission_sync_shared_handle_preserves_explicit_envelope() {
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Deny,
+            allowed_tools: Some(["read_file".to_string()].into_iter().collect()),
+            ..Default::default()
+        };
+
+        let handle = PermissionSyncContext::shared(inherited);
+        let ctx = handle.read().await;
+
+        assert_eq!(ctx.mode(), PermissionMode::Deny);
+        assert!(ctx.inherited.is_tool_allowed_by_allowlist("read_file"));
+        assert!(!ctx.inherited.is_tool_allowed_by_allowlist("bash"));
+    }
+
+    #[tokio::test]
+    async fn permission_sync_shared_root_uses_root_envelope() {
+        let handle = PermissionSyncContext::shared_root(PermissionMode::AcceptEdits);
+        let ctx = handle.read().await;
+
+        assert_eq!(ctx.mode(), PermissionMode::AcceptEdits);
+        assert!(ctx.inherited.allow_rules.is_empty());
+        assert!(ctx.inherited.deny_rules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn permission_sync_into_shared_preserves_session_updates() {
+        let mut ctx = PermissionSyncContext::root(PermissionMode::Prompt);
+        ctx.apply_update(&PermissionUpdate::allow(PermissionRule::parse(
+            r#"Bash(argv_prefix="cargo test")"#,
+        )));
+
+        let handle = ctx.into_shared();
+        let shared = handle.read().await;
+
+        assert!(shared.is_allowed("bash", Some("cargo test -p astra-runtime")));
+    }
+
     #[test]
     fn test_permission_response() {
         let response = PermissionResponse::approve()
-            .with_update(PermissionUpdate::allow(PermissionRule::tool("edit")).persistent());
+            .with_update(PermissionUpdate::allow(PermissionRule::tool("write_file")).persistent());
 
         assert!(response.approved);
         assert_eq!(response.updates.len(), 1);

@@ -34,6 +34,7 @@ use crate::{
 use crate::cli::chat_stream::sse_loop::agentic_loop_turn::{
     ChatTurnSseFetchRequest, PrepareTurnTelemetry, fetch_chat_turn_sse,
 };
+use crate::cli::chat_stream::sse_loop::refresh_root_permission_context;
 
 use astra_runtime::tool_sandbox::SandboxPolicy;
 
@@ -242,8 +243,17 @@ fn deferred_input_status_line(input: &Value) -> Option<String> {
         .or_else(|| input.as_str())
         .map(str::trim)
         .filter(|text| !text.is_empty())?;
-    let mut preview: String = text.replace('\n', " ↩ ").chars().take(80).collect();
-    if text.replace('\n', " ↩ ").chars().count() > 80 {
+    let mut preview: String = text
+        .replace('\n', crate::DEFERRED_INPUT_FINGERPRINT_SEP)
+        .chars()
+        .take(80)
+        .collect();
+    if text
+        .replace('\n', crate::DEFERRED_INPUT_FINGERPRINT_SEP)
+        .chars()
+        .count()
+        > 80
+    {
         preview.push_str("...");
     }
     Some(format!("__deferred_input_applied__:{preview}"))
@@ -342,6 +352,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         if let Some(new_mode) = self.executor.take_pending_permission_mode_change() {
             let old_mode = self.perm_manager.mode();
             self.perm_manager.set_mode(new_mode);
+            refresh_root_permission_context(&mut state.permission_context, self.perm_manager).await;
             append_permission_mode_change_audit(
                 state.current_session_id.as_deref(),
                 self.chat_turn_index,
@@ -367,6 +378,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         self.perm_manager.pull_mode_from_mirror();
         let mode_after = self.perm_manager.mode();
         if mode_before != mode_after {
+            refresh_root_permission_context(&mut state.permission_context, self.perm_manager).await;
             append_permission_mode_change_audit(
                 state.current_session_id.as_deref(),
                 self.chat_turn_index,
@@ -518,6 +530,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             current_session_id: state.current_session_id.as_deref(),
             tool_results: state.tool_results.as_slice(),
             all_schemas: &self.all_schemas,
+            valid_tool_names: &mut self.valid_tool_names,
             turn_guard: &state.turn_guard,
             restricted_tools: &mut state.restricted_tools,
             widen_selection_pending: &mut state.widen_selection_pending,
@@ -589,6 +602,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // `turn_result?` below.
 
         // Sync latest approval overrides into state for checkpoint persistence.
+        refresh_root_permission_context(&mut state.permission_context, self.perm_manager).await;
         state.approval_overrides = self.perm_manager.export_session_overrides();
 
         let turn_result = turn_result?;
@@ -754,6 +768,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                         .stall
                         .forced_redundant_reads_corrective,
                     forced_cache_waste_corrective: state.stall.forced_cache_waste_corrective,
+                    forced_search_fanout_corrective: state.stall.forced_search_fanout_corrective,
                     forced_exploration_family_phase2: state.stall.forced_exploration_family_phase2,
                     forced_exploration_family_corrective: state
                         .stall
@@ -859,6 +874,10 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
 
     fn valid_tool_names(&self) -> &HashSet<String> {
         &self.valid_tool_names
+    }
+
+    fn deferred_tool_names(&self) -> HashSet<String> {
+        self.executor.current_activatable_tool_names_snapshot()
     }
 
     fn on_deferred_user_input(&mut self, input: &Value) {

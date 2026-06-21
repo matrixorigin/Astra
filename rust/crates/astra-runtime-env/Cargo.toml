@@ -1,0 +1,14 @@
+[package]
+name = "astra-runtime-env"
+version.workspace = true
+edition.workspace = true
+description = "Runtime environment bindings, capabilities, and tool surface resolution for Astra."
+
+[dependencies]
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

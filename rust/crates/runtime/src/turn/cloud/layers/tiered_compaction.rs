@@ -42,33 +42,9 @@ impl CompressionLayer for TieredCompaction {
             None => return CompressionResult::default(),
         };
 
-        let summary = if plan.user_queries.is_empty() {
-            format!(
-                "[Context compacted: {} messages ({} turns) removed. \
-                 Recent {} messages preserved.]",
-                plan.removed_count, plan.turns_removed, keep_tail
-            )
-        } else {
-            // Show at most 3 user queries (already trimmed to 100 chars each).
-            let preview: String = plan
-                .user_queries
-                .iter()
-                .take(3)
-                .map(|q| format!("- {}", q))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let more = if plan.user_queries.len() > 3 {
-                format!("\n… and {} more", plan.user_queries.len() - 3)
-            } else {
-                String::new()
-            };
-            format!(
-                "[Context compacted: {} messages ({} turns) removed. \
-                 Recent {} messages preserved.\n\
-                 Recent user queries:\n{}{}]",
-                plan.removed_count, plan.turns_removed, keep_tail, preview, more
-            )
-        };
+        let summary = "[Context compacted: older messages were removed to reduce token pressure. \
+                 The conversation continues below.]"
+            .to_string();
 
         let mut extra = BTreeMap::new();
         extra.insert("_compact_boundary".to_string(), Value::Bool(true));

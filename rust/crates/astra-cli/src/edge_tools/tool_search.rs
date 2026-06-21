@@ -13,19 +13,16 @@ use super::{ToolExecutor, local_tool_schemas};
 impl ToolExecutor {
     pub(super) fn tool_search(&self, args: &Value) -> String {
         let mut pool = local_tool_schemas();
-        // Poison recovery: lock may be poisoned by an earlier panic on
-        // the write side. Recover via `into_inner()` so plugin-backed
-        // deferred activation survives the poison. A silent `if let Ok`
-        // drop would leave the model unable to reach plugins with no
-        // observability.
-        let guard = self.plugin_schemas.read().unwrap_or_else(|poisoned| {
-            tracing::warn!(
-                "CLI plugin_schemas RwLock poisoned on read; recovering. \
-                 Investigate the upstream panic."
-            );
-            poisoned.into_inner()
-        });
-        pool.extend(guard.iter().cloned());
+        pool.extend(self.plugin_schemas_snapshot("plugin_schemas_tool_search"));
+        if let Some(allowed_names) = self.current_searchable_tool_names() {
+            pool.retain(|schema| {
+                schema
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| allowed_names.contains(name))
+            });
+        }
         astra_tools::tool_search::tool_search(&pool, args)
     }
 }

@@ -237,7 +237,7 @@ pub struct RulePersistedEvent {
     pub timestamp_ms: u64,
     pub correlation_id: String,
     pub target: PersistTarget,
-    /// The rule string we tried to persist, in v2 grammar form.
+    /// The rule string we tried to persist, in current grammar form.
     pub rule_text: String,
     /// True iff the on-disk save succeeded.
     pub saved: bool,
@@ -724,7 +724,7 @@ mod tests {
             timestamp_ms: 100,
             correlation_id: "c-0".into(),
             target: PersistTarget::Project,
-            rule_text: "Bash(npm test:*)".into(),
+            rule_text: r#"Bash(argv_prefix="npm test")"#.into(),
             saved: true,
             failure_reason: None,
         });

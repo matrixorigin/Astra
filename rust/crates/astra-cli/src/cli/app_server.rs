@@ -405,7 +405,6 @@ async fn run_turn(
         &ctx.api,
         token.clone(),
         unified_skill_registry.clone(),
-        pm.mode(),
         skill_search.clone(),
         Some(thread_id.clone()),
         model.clone(),

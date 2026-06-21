@@ -129,8 +129,8 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
             ctx.into_stats(),
         )))),
         TuiAppEvent::TurnError(msg) => Some(AppEvent::Wire(WireEvent::TurnError(msg))),
-        TuiAppEvent::TurnWarning(msg) => Some(AppEvent::Wire(WireEvent::TurnWarning(msg))),
-        TuiAppEvent::TurnInfo(msg) => Some(AppEvent::Wire(WireEvent::TurnInfo(msg))),
+        TuiAppEvent::SystemWarning(msg) => Some(AppEvent::Wire(WireEvent::SystemWarning(msg))),
+        TuiAppEvent::SystemInfo(msg) => Some(AppEvent::Wire(WireEvent::SystemInfo(msg))),
         TuiAppEvent::ExplainReport(items) => Some(AppEvent::Wire(WireEvent::ExplainReport(items))),
         TuiAppEvent::VerdictReport(items) => Some(AppEvent::Wire(WireEvent::VerdictReport(items))),
         TuiAppEvent::Compaction(event) => Some(AppEvent::Wire(WireEvent::Compaction(event))),
@@ -248,24 +248,24 @@ mod tests {
     }
 
     #[test]
-    fn turn_warning_carries_message() {
+    fn system_warning_carries_message() {
         let out = translate(
-            TuiAppEvent::TurnWarning("not logged in".into()),
+            TuiAppEvent::SystemWarning("not logged in".into()),
             TurnContext::default(),
         );
         assert!(
-            matches!(out, Some(AppEvent::Wire(WireEvent::TurnWarning(s))) if s == "not logged in")
+            matches!(out, Some(AppEvent::Wire(WireEvent::SystemWarning(s))) if s == "not logged in")
         );
     }
 
     #[test]
-    fn turn_info_carries_message() {
+    fn system_info_carries_message() {
         let out = translate(
-            TuiAppEvent::TurnInfo("token refreshed".into()),
+            TuiAppEvent::SystemInfo("token refreshed".into()),
             TurnContext::default(),
         );
         assert!(
-            matches!(out, Some(AppEvent::Wire(WireEvent::TurnInfo(s))) if s == "token refreshed")
+            matches!(out, Some(AppEvent::Wire(WireEvent::SystemInfo(s))) if s == "token refreshed")
         );
     }
 

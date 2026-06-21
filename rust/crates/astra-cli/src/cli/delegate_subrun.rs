@@ -27,7 +27,6 @@ use astra_runtime::{
 };
 use astra_services::coordination::AgentResult;
 
-use super::permission_manager::PermissionMode;
 use super::skill_subrun::{SubRunHost, persist_failed_subrun};
 use crate::edge_tools;
 
@@ -92,14 +91,14 @@ fn resolve_worktree_path(
 /// Creates a fresh agentic loop host for each delegated sub-run, runs it to
 /// completion, and collects the result as [`AgentResult`].
 ///
-/// Inherits the parent session's permission mode so sub-agents enforce the
-/// same approval policy.
+/// Inherits the parent session's permission envelope so sub-agents enforce the
+/// same mode, rules, and session approvals.
 pub(crate) struct CliDelegateSubRunExecutor {
     api: astra_thin_client::ThinClient,
     token: String,
     default_model: Option<String>,
     project_root: PathBuf,
-    permission_mode: PermissionMode,
+    inherited_permissions: astra_runtime::orchestration::InheritedPermissions,
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     skill_resolver: Option<Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     skill_search: SkillSearchSettings,
@@ -128,15 +127,16 @@ impl CliDelegateSubRunExecutor {
         token: String,
         default_model: Option<String>,
         project_root: PathBuf,
-        permission_mode: PermissionMode,
+        mut inherited_permissions: astra_runtime::orchestration::InheritedPermissions,
         cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     ) -> Self {
+        inherited_permissions.is_background = true;
         Self {
             api,
             token,
             default_model,
             project_root,
-            permission_mode,
+            inherited_permissions,
             cancel_token,
             skill_resolver: None,
             skill_search: SkillSearchSettings::default(),
@@ -244,11 +244,11 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
 
         // Issue #326 P5b: delegate sub-run is headless — strip project
         // allow rules but honour deny + user file.
-        let perm_manager = super::permission_manager::PermissionManager::with_load_policy(
-            self.permission_mode,
+        let perm_manager = super::permission_manager::PermissionManager::with_inherited(
             &self.project_root,
-            &super::permission_manager::PermissionLoadPolicy::HeadlessSafe,
+            self.inherited_permissions.clone(),
         );
+        let permission_context = perm_manager.runtime_permission_handle();
 
         // T-9: Worktree CWD injection — when team isolation provides a per-agent
         // worktree path via context, use it as the working directory instead of
@@ -468,6 +468,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             api_token: self.token.clone(),
             delegation_engine: None,
             delegations_this_turn: 0,
+            delegation_chain: config.delegation_chain.clone(),
+            self_agent_id: profile.agent_id.clone(),
             project_context: None,
             checkpoint_gate: config.checkpoint_gate.clone(),
             last_llm_context_manifest_trace: None,
@@ -487,7 +489,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             max_cumulative_tokens: 0,
             thinking: child_thinking,
             recent_file_reads: Vec::new(),
-            permission_context: None,
+            permission_context: Some(permission_context),
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
@@ -683,7 +685,11 @@ pub(crate) fn register_default_agents(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_restricted_tools, register_default_agents, resolve_worktree_path};
+    use super::{
+        CliDelegateSubRunExecutor, build_restricted_tools, register_default_agents,
+        resolve_worktree_path,
+    };
+    use crate::cli::permission_manager::PermissionMode;
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
 
@@ -714,6 +720,26 @@ mod tests {
             main.delegate_to.is_empty(),
             "empty delegate_to = all agents"
         );
+    }
+
+    #[test]
+    fn delegate_executor_constructor_marks_permissions_background() {
+        let inherited_permissions =
+            astra_runtime::orchestration::InheritedPermissions::new(PermissionMode::Auto);
+        let executor = CliDelegateSubRunExecutor::new(
+            astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
+            "token".to_string(),
+            None,
+            PathBuf::from("."),
+            inherited_permissions,
+            None,
+        );
+
+        assert_eq!(
+            executor.inherited_permissions.mode,
+            astra_runtime::orchestration::PermissionMode::Auto
+        );
+        assert!(executor.inherited_permissions.is_background);
     }
 
     #[test]
@@ -764,6 +790,7 @@ mod tests {
             },
             user_id: "test-user".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: HashMap::new(),
             execution_metadata: None,
         };

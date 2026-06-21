@@ -533,7 +533,7 @@ user asks for large work
   -> model calls task_update as each step starts/completes
 ```
 
-### Durable task lifecycle (cloud runner)
+### Durable task lifecycle (cloud worker)
 
 ```
 astra task queue "fix flaky auth test"
@@ -548,7 +548,7 @@ astra task worker --once --agent-id edge-ci-1
   -> release_lease(...)
 ```
 
-`task_leases` prevents duplicate execution across polling runners. Lease TTL
+`task_leases` prevents duplicate execution across polling workers. Lease TTL
 is clamped by the service layer and renewable via existing runtime endpoints.
 
 ### Parity targets (unchanged)

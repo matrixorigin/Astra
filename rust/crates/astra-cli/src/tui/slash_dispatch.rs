@@ -291,41 +291,24 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
         // ── Allow / permission mode ─────────────────────────────────
         "/allow" => {
-            use crate::cli::permission_manager::PermissionMode;
-            match args {
-                "" => {
+            use crate::cli::permission_command::{
+                PERMISSION_COMMAND_USAGE, PermissionCommandAction, parse_permission_command,
+            };
+
+            match parse_permission_command(args) {
+                PermissionCommandAction::Cycle => {
                     ctx.open_view(
                         "Opened permission mode picker",
                         Box::new(build_permission_mode_picker(ctx.state.perm_manager.mode())),
                     );
                     SlashResult::Handled
                 }
-                "all" | "auto" => {
-                    ctx.state.perm_manager.set_mode(PermissionMode::Auto);
-                    ctx.show_response(permission_mode_feedback(PermissionMode::Auto).into());
+                PermissionCommandAction::SetMode(mode) => {
+                    ctx.state.perm_manager.set_mode(mode);
+                    ctx.show_response(permission_mode_feedback(mode));
                     SlashResult::Handled
                 }
-                "plan" => {
-                    ctx.state.perm_manager.set_mode(PermissionMode::Plan);
-                    ctx.show_response(permission_mode_feedback(PermissionMode::Plan).into());
-                    SlashResult::Handled
-                }
-                "accept_edits" | "accept-edits" | "edit" => {
-                    ctx.state.perm_manager.set_mode(PermissionMode::AcceptEdits);
-                    ctx.show_response(permission_mode_feedback(PermissionMode::AcceptEdits).into());
-                    SlashResult::Handled
-                }
-                "prompt" | "default" => {
-                    ctx.state.perm_manager.set_mode(PermissionMode::Prompt);
-                    ctx.show_response(permission_mode_feedback(PermissionMode::Prompt).into());
-                    SlashResult::Handled
-                }
-                "deny" => {
-                    ctx.state.perm_manager.set_mode(PermissionMode::Deny);
-                    ctx.show_response(permission_mode_feedback(PermissionMode::Deny).into());
-                    SlashResult::Handled
-                }
-                "rules" | "status" => {
+                PermissionCommandAction::ShowRules => {
                     use crate::tui::bottom_pane::info_view::InfoView;
                     let summary = ctx.state.perm_manager.rules_summary();
                     ctx.open_view(
@@ -337,7 +320,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     );
                     SlashResult::Handled
                 }
-                "trust" => {
+                PermissionCommandAction::TrustWorkspace => {
                     match ctx.state.perm_manager.trust_workspace() {
                         Ok(message) => ctx.show_response(message),
                         Err(err) => {
@@ -346,7 +329,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     }
                     SlashResult::Handled
                 }
-                "untrust" => {
+                PermissionCommandAction::UntrustWorkspace => {
                     match ctx.state.perm_manager.untrust_workspace() {
                         Ok(message) => ctx.show_response(message),
                         Err(err) => {
@@ -355,7 +338,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     }
                     SlashResult::Handled
                 }
-                "trace" => {
+                PermissionCommandAction::ShowTrace => {
                     use crate::tui::bottom_pane::info_view::InfoView;
                     let lines = astra_turn_core::permission::audit::format_snapshot_lines(50);
                     ctx.open_view(
@@ -364,12 +347,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     );
                     SlashResult::Handled
                 }
-                arg if arg.starts_with("trace --export ") => {
-                    let path = arg.trim_start_matches("trace --export ").trim();
-                    if path.is_empty() {
-                        ctx.show_error("Missing export path".to_string());
-                        return SlashResult::Handled;
-                    }
+                PermissionCommandAction::ExportTrace(path) => {
                     let lines = astra_turn_core::permission::audit::snapshot_redacted_jsonl_lines();
                     let body = if lines.is_empty() {
                         String::new()
@@ -384,9 +362,13 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     }
                     SlashResult::Handled
                 }
-                _ => {
+                PermissionCommandAction::MissingTraceExport => {
+                    ctx.show_error("Missing export path".to_string());
+                    SlashResult::Handled
+                }
+                PermissionCommandAction::Unknown(args) => {
                     ctx.show_error(format!(
-                        "Unknown mode '{args}'. Use: auto, edit, plan, default, deny, all, rules, trust, untrust, trace"
+                        "Unknown mode '{args}'. Use: {PERMISSION_COMMAND_USAGE}"
                     ));
                     SlashResult::Handled
                 }
@@ -1219,12 +1201,7 @@ fn build_permission_mode_picker(
             is_current: current == crate::cli::permission_manager::PermissionMode::Prompt,
         },
         SelectionItem {
-            name: "Auto".into(),
-            description: Some("All tools auto-approved".into()),
-            is_current: current == crate::cli::permission_manager::PermissionMode::Auto,
-        },
-        SelectionItem {
-            name: "Edit".into(),
+            name: "Edits".into(),
             description: Some(
                 "Auto-approve workspace edits; still ask for shell and external writes".into(),
             ),
@@ -1238,41 +1215,31 @@ fn build_permission_mode_picker(
             is_current: current == crate::cli::permission_manager::PermissionMode::Plan,
         },
         SelectionItem {
+            name: "Auto".into(),
+            description: Some("All tools auto-approved".into()),
+            is_current: current == crate::cli::permission_manager::PermissionMode::Auto,
+        },
+        SelectionItem {
             name: "Deny".into(),
             description: Some("Deny all tool calls".into()),
             is_current: current == crate::cli::permission_manager::PermissionMode::Deny,
         },
     ];
     ListSelectionView::new(items, Some("Modes".into())).with_footer_hint(
-        "Shift+Tab cycles ask → auto → edit → plan · /allow rules · /allow trust · /allow trace",
+        "Shift+Tab cycles ask → edits → plan → auto · /allow rules · /allow trust · /allow trace",
     )
 }
 
 pub(crate) fn next_permission_mode_for_cycle(
     current: crate::cli::permission_manager::PermissionMode,
 ) -> crate::cli::permission_manager::PermissionMode {
-    use crate::cli::permission_manager::PermissionMode;
-
-    match current {
-        PermissionMode::Prompt | PermissionMode::Deny => PermissionMode::Auto,
-        PermissionMode::Auto => PermissionMode::AcceptEdits,
-        PermissionMode::AcceptEdits => PermissionMode::Plan,
-        PermissionMode::Plan => PermissionMode::Prompt,
-    }
+    crate::cli::permission_command::next_permission_mode_for_cycle(current)
 }
 
 pub(crate) fn permission_mode_feedback(
     mode: crate::cli::permission_manager::PermissionMode,
-) -> &'static str {
-    use crate::cli::permission_manager::PermissionMode;
-
-    match mode {
-        PermissionMode::Prompt => "Mode → Ask",
-        PermissionMode::Auto => "Mode → Auto",
-        PermissionMode::AcceptEdits => "Mode → Edits",
-        PermissionMode::Plan => "Mode → Plan",
-        PermissionMode::Deny => "Mode → Deny",
-    }
+) -> String {
+    crate::cli::permission_command::permission_mode_feedback(mode)
 }
 
 fn apply_permission_mode_selection(
@@ -1481,7 +1448,7 @@ pub(crate) fn handle_view_result(
             );
             return;
         }
-        "Edit" => {
+        "Edits" => {
             apply_permission_mode_selection(
                 state,
                 chat_widget,
@@ -3612,6 +3579,33 @@ mod blocking_io_guard_tests {
             );
         }
     }
+
+    #[test]
+    fn allow_dispatch_uses_shared_permission_parser() {
+        let source = include_str!("slash_dispatch.rs");
+        let start = source
+            .find("\"/allow\" => {")
+            .expect("/allow handler must exist");
+        let end = start
+            + source[start..]
+                .find("\n        \"/instructions\"")
+                .expect("/allow handler must close before /instructions");
+        let allow_block = &source[start..end];
+
+        assert!(allow_block.contains("parse_permission_command(args)"));
+        for legacy in [
+            "\"all\"",
+            "\"default\"",
+            "\"ask\"",
+            "\"status\"",
+            "\"accept-edits\"",
+        ] {
+            assert!(
+                !allow_block.contains(legacy),
+                "/allow dispatch must not reintroduce legacy token branch {legacy}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4018,12 +4012,12 @@ mod view_result_tests {
     }
 
     #[test]
-    fn edit_selection_updates_state_and_commits_feedback() {
+    fn accept_selection_updates_state_and_commits_feedback() {
         let mut state = SessionState::default();
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = ChatWidget::new("");
 
-        handle_view_result("Edit", &mut state, &mut bottom_pane, &mut chat_widget);
+        handle_view_result("Edits", &mut state, &mut bottom_pane, &mut chat_widget);
 
         assert_eq!(state.perm_manager.mode(), PermissionMode::AcceptEdits);
         assert_eq!(
@@ -4067,10 +4061,6 @@ mod view_result_tests {
     fn permission_mode_cycle_skips_deny_and_wraps() {
         assert_eq!(
             next_permission_mode_for_cycle(PermissionMode::Prompt),
-            PermissionMode::Auto
-        );
-        assert_eq!(
-            next_permission_mode_for_cycle(PermissionMode::Auto),
             PermissionMode::AcceptEdits
         );
         assert_eq!(
@@ -4079,11 +4069,17 @@ mod view_result_tests {
         );
         assert_eq!(
             next_permission_mode_for_cycle(PermissionMode::Plan),
-            PermissionMode::Prompt
+            PermissionMode::Auto
         );
         assert_eq!(
+            next_permission_mode_for_cycle(PermissionMode::Auto),
+            PermissionMode::Prompt
+        );
+        // `Deny` is sticky under the cycle: it must only be exited by an
+        // explicit `/allow <mode>`, never by a bare `/allow`.
+        assert_eq!(
             next_permission_mode_for_cycle(PermissionMode::Deny),
-            PermissionMode::Auto
+            PermissionMode::Deny
         );
     }
 

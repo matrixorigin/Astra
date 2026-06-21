@@ -458,7 +458,7 @@ impl ToolHealthTracker {
         let tools_list = blocked.join(", ");
         let mut msg = format!(
             "⚠ The following tools have failed {} or more times consecutively \
-             and should be avoided: [{}].",
+             and should not be retried blindly with the same inputs: [{}].",
             CONSECUTIVE_FAILURE_THRESHOLD, tools_list
         );
         // Provide specific alternative suggestions for common blocked tools
@@ -1279,7 +1279,7 @@ mod tests {
         let warning = tracker.deprioritize_warning().unwrap();
         assert!(warning.contains("bash"));
         assert!(warning.contains("3"));
-        assert!(warning.contains("avoided"));
+        assert!(warning.contains("retried blindly"));
         // Should include specific alternative suggestions
         assert!(
             warning.contains("read_file") || warning.contains("grep"),

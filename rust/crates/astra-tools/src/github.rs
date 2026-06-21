@@ -1097,12 +1097,12 @@ impl GitHubClient {
         }))
     }
 
-    pub async fn github_create_issue(&self, args: &Value) -> String {
+    pub async fn create_issue(&self, args: &Value) -> String {
         let repo = match args.get("repo").and_then(Value::as_str) {
             Some(r) => r.to_string(),
             None => {
                 return github_error_response(
-                    "github_create_issue",
+                    "github",
                     "issue",
                     None,
                     None,
@@ -1115,7 +1115,7 @@ impl GitHubClient {
             Some(t) if !t.trim().is_empty() => t,
             _ => {
                 return github_error_response(
-                    "github_create_issue",
+                    "github",
                     "issue",
                     None,
                     Some(&repo),
@@ -1126,22 +1126,22 @@ impl GitHubClient {
         };
         if !repo.contains('/') {
             return github_error_response(
-                "github_create_issue",
+                "github",
                 "issue",
                 None,
                 Some(&repo),
                 None,
-                "Error: github_create_issue requires repo in 'owner/repo' form",
+                "Error: github(action='create_issue') requires repo in 'owner/repo' form",
             );
         }
         if self.current_token().is_none() {
             return github_error_response(
-                "github_create_issue",
+                "github",
                 "issue",
                 None,
                 Some(&repo),
                 None,
-                "Error: GITHUB_TOKEN is required for github_create_issue",
+                "Error: GITHUB_TOKEN is required for github(action='create_issue')",
             );
         }
         let body = args.get("body").and_then(Value::as_str).unwrap_or("");
@@ -1162,20 +1162,13 @@ impl GitHubClient {
         {
             Ok(response) => response,
             Err(error) => {
-                return github_error_response(
-                    "github_create_issue",
-                    "issue",
-                    None,
-                    Some(&repo),
-                    None,
-                    error,
-                );
+                return github_error_response("github", "issue", None, Some(&repo), None, error);
             }
         };
 
         if !response.is_object() {
             return github_error_response(
-                "github_create_issue",
+                "github",
                 "issue",
                 None,
                 Some(&repo),
@@ -1186,7 +1179,8 @@ impl GitHubClient {
 
         github_response_string(json!({
             "ok": true,
-            "tool": "github_create_issue",
+            "tool": "github",
+            "action": "create_issue",
             "detail": Value::Null,
             "requested_repo": repo,
             "resolved_repo": Value::Null,

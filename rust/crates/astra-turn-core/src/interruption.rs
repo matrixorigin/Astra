@@ -45,6 +45,11 @@ pub enum InterruptionKind {
     HarnessBlocked,
     /// Harness debug breakpoint hit → session paused.
     HarnessPaused,
+    /// Turn guard pipeline aborted the loop (e.g. repeated correction streak
+    /// exceeded the abort threshold). Captures *why* the guard pipeline halted
+    /// the turn so resumption surfaces the reason instead of an opaque final
+    /// text string.
+    GuardAbort,
 }
 
 impl InterruptionKind {
@@ -68,6 +73,7 @@ impl InterruptionKind {
             Self::StreamIdle => "stream_idle",
             Self::HarnessBlocked => "harness_blocked",
             Self::HarnessPaused => "harness_paused",
+            Self::GuardAbort => "guard_abort",
         }
     }
 
@@ -90,6 +96,7 @@ impl InterruptionKind {
             "stream_idle" => Some(Self::StreamIdle),
             "harness_blocked" => Some(Self::HarnessBlocked),
             "harness_paused" => Some(Self::HarnessPaused),
+            "guard_abort" => Some(Self::GuardAbort),
             _ => None,
         }
     }
@@ -114,6 +121,9 @@ impl InterruptionKind {
             Self::ApprovalRejected => true,
             Self::HarnessBlocked => false,
             Self::HarnessPaused => true,
+            // Guard aborts are recoverable: the next turn can proceed under a
+            // fresh guard streak. Progress made before the abort is preserved.
+            Self::GuardAbort => true,
         }
     }
 }
@@ -443,19 +453,6 @@ struct StallSummary {
 }
 
 fn summarize_stall_signal_for_user(signal: &str) -> Option<StallSummary> {
-    if signal.starts_with("single_tool_streak=") {
-        let streak = signal.trim_start_matches("single_tool_streak=");
-        return Some(StallSummary {
-            cause: format!(
-                "the run stayed in one-tool-per-round mode for {streak} consecutive rounds"
-            ),
-            correction: format!(
-                "batch independent calls (different files / greps / reads) \
-                 into a single parallel round instead of another {streak}-round \
-                 single-tool streak"
-            ),
-        });
-    }
     if signal.starts_with("exploration_family=") {
         let kv = parse_kv_stall_signal(signal);
         if let (Some(family), Some(streak)) = (kv.get("exploration_family"), kv.get("streak")) {
@@ -499,6 +496,17 @@ fn summarize_stall_signal_for_user(signal: &str) -> Option<StallSummary> {
             ),
             correction:
                 "reuse the file content already in context instead of reopening overlapping ranges"
+                    .to_string(),
+        });
+    }
+    if signal.starts_with("single_tool_streak=") {
+        let streak = signal.trim_start_matches("single_tool_streak=");
+        return Some(StallSummary {
+            cause: format!(
+                "the run made {streak} consecutive rounds with only one tool call each"
+            ),
+            correction:
+                "batch independent tool calls together and stop serializing reads, searches, or status checks when they can run in parallel"
                     .to_string(),
         });
     }

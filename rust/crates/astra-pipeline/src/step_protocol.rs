@@ -1302,6 +1302,18 @@ impl InMemoryIdempotencyCache {
         self.cache.insert(cache_key.to_string(), result);
     }
 
+    /// Merge another in-memory cache into this one.
+    ///
+    /// Existing entries with the same cache key are replaced by `other`, while
+    /// unrelated entries are preserved. This is used during crash recovery when
+    /// DB-backed exactly-once records and event-stream records both contribute
+    /// valid completed tool results.
+    pub fn merge_from(&mut self, other: InMemoryIdempotencyCache) {
+        for (cache_key, result) in other.cache {
+            self.record_cache_key(&cache_key, result);
+        }
+    }
+
     /// Evict oldest entry by cached_at timestamp
     fn evict_oldest(&mut self) {
         if let Some(oldest_key) = self
@@ -2045,21 +2057,27 @@ mod tests {
         use serde_json::json;
 
         // PureRead tools
-        for tool in [
-            "read_file",
-            "grep",
-            "glob",
-            "list_dir",
-            "git_status",
-            "git_log",
-            "git_diff",
-            "git_blame",
-            "github_list_prs",
-            "github_ci_status",
-            "mo_query",
+        for (tool, args) in [
+            ("read_file", None),
+            ("grep", None),
+            ("glob", None),
+            ("list_dir", None),
+            ("git", Some(json!({"action": "status"}))),
+            ("git", Some(json!({"action": "log"}))),
+            ("git", Some(json!({"action": "diff"}))),
+            (
+                "git",
+                Some(json!({"action": "blame", "path": "src/main.rs"})),
+            ),
+            ("github", Some(json!({"action": "list_prs"}))),
+            (
+                "github",
+                Some(json!({"action": "ci_status", "pr_number": 1})),
+            ),
+            ("mo_query", None),
         ] {
             assert_eq!(
-                classify_tool_idempotency(tool, None),
+                classify_tool_idempotency(tool, args.as_ref()),
                 ToolIdempotency::PureRead,
                 "Expected PureRead for {tool}"
             );
@@ -2093,7 +2111,7 @@ mod tests {
         for tool in [
             "bash",
             "str_replace",
-            "github_create_issue",
+            "github",
             "mo_snapshot",
             "some_future_tool",
         ] {

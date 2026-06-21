@@ -814,11 +814,11 @@ mod tests {
                     "index": 5
                 }),
                 json!({
-                    "event_type": "run_blocked", "reason": "workspace_executor_unavailable",
+                    "event_type": "run_blocked", "reason": "route_mismatch",
                     "data": {
-                        "reason": "workspace_executor_unavailable",
-                        "workspace": {"kind": "git_checkout"},
-                        "executor": {"kind": "hosted_runner", "status": "degraded"}
+                        "reason": "route_mismatch",
+                        "workspace": {"kind": "cloud_workspace"},
+                        "executor": {"kind": "orchestrator_managed", "status": "degraded"}
                     },
                     "index": 6
                 }),
@@ -847,11 +847,11 @@ mod tests {
         assert_eq!(
             transformed[2],
             json!({
-                "type": "run_blocked", "reason": "workspace_executor_unavailable",
+                "type": "run_blocked", "reason": "route_mismatch",
                 "run_id": "run-123",
-                "reason": "workspace_executor_unavailable",
-                "workspace": {"kind": "git_checkout"},
-                "executor": {"kind": "hosted_runner", "status": "degraded"},
+                "reason": "route_mismatch",
+                "workspace": {"kind": "cloud_workspace"},
+                "executor": {"kind": "orchestrator_managed", "status": "degraded"},
                 "index": 6
             })
         );

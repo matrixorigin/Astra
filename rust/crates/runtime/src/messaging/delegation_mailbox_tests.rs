@@ -135,6 +135,7 @@ mod tests {
             },
             user_id: "test-user".into(),
             depth: 0,
+            delegation_chain: Vec::new(),
             context: {
                 let mut ctx = HashMap::new();
                 ctx.insert(

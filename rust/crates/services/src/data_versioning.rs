@@ -119,19 +119,8 @@ fn read_composite_snapshot_index_local(
         return Ok(None);
     }
     let content = std::fs::read_to_string(&path).map_err(internal_error)?;
-    let Some(decrypted) =
-        crate::checkpoint_crypto::decrypt_text(&content).map_err(internal_error)?
-    else {
-        return Err(internal_error(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "composite snapshot index decryption failed for {}",
-                path.display()
-            ),
-        )));
-    };
     let mut index: CompositeSnapshotIndex =
-        serde_json::from_str(&decrypted).map_err(internal_error)?;
+        serde_json::from_str(&content).map_err(internal_error)?;
     index.normalize_versions();
     Ok(Some(index))
 }
@@ -886,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn local_composite_snapshot_index_reads_encrypted_file() {
+    fn local_composite_snapshot_index_reads_plaintext_file() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
         let sid = uuid::Uuid::new_v4().to_string();
@@ -900,15 +889,11 @@ mod tests {
         let path = composite_snapshots_json_path(&sid).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let json = serde_json::to_string(&index).unwrap();
-        std::fs::write(
-            &path,
-            crate::checkpoint_crypto::encrypt_text(&json).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(&path, json).unwrap();
 
         let restored = read_composite_snapshot_index_local(&sid)
             .unwrap()
-            .expect("encrypted local index should load");
+            .expect("plaintext local index should load");
 
         assert_eq!(restored.snapshots.len(), 1);
         assert_eq!(restored.snapshots[0].snapshot_id, "snap-data-versioning");

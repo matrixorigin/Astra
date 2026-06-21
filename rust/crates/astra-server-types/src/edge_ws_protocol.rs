@@ -48,7 +48,7 @@ pub enum EdgeClientMessage {
         #[serde(default)]
         workspace_dir: Option<String>,
         #[serde(default)]
-        capabilities: Option<Vec<String>>,
+        capabilities: Option<Value>,
     },
 
     /// Tool execution result from the edge.
@@ -97,6 +97,15 @@ pub enum EdgeServerMessage {
     /// Server is closing the connection.
     #[serde(rename = "edge_closing")]
     Closing { reason: String },
+
+    /// Cancel an in-flight tool execution request.
+    ///
+    /// Sent when the caller times out, cancels via `CancellationToken`, or the
+    /// dispatch fails. The edge SHOULD abort the tool process and discard any
+    /// partial result. Failing to acknowledge is acceptable — the server has
+    /// already dropped the pending-result slot.
+    #[serde(rename = "edge_tool_cancel")]
+    ToolCancel { request_id: String },
 }
 
 fn default_tool_timeout_secs() -> u64 {
@@ -203,12 +212,18 @@ mod tests {
             edge_agent_id: "e1".into(),
             hostname: Some("h".into()),
             workspace_dir: None,
-            capabilities: None,
+            capabilities: Some(json!({
+                "schema_version": 1,
+                "binding": {
+                    "executor": {"kind": "edge_agent"}
+                }
+            })),
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "edge_auth");
         assert_eq!(v["token"], "Bearer tok");
         assert_eq!(v["edge_agent_id"], "e1");
+        assert_eq!(v["capabilities"]["schema_version"], 1);
     }
 
     #[test]

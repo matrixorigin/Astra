@@ -22,6 +22,14 @@ pub const EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT: &str = "deferred_tools_text";
 /// [`EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT`].
 pub const EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW: &str = "deferred_tools_context_window";
 
+/// Protocol key carrying the JSON array of names listed in this turn's
+/// `<deferred_tools>` manifest. Pairs with
+/// [`EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT`] (which is the rendered XML used
+/// for prompt assembly). The runtime reads the names from here so it can
+/// branch the validator denial copy and let `tool_search(select:NAME)`
+/// resolve deferred names without re-parsing the rendered XML.
+pub const EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES: &str = "deferred_tool_names";
+
 /// `git rev-parse --abbrev-ref HEAD` for edge_profile (best-effort).
 pub fn read_git_branch_abbrev() -> Option<String> {
     std::process::Command::new("git")

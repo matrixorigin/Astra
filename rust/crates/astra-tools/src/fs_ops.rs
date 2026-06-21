@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::code_intel;
 use crate::fuzzy_replacer::{
@@ -29,6 +30,105 @@ const BINARY_EXTS: &[&str] = &[
     "a", "lib", "wasm", "class", "pyc", "pyo", "mp3", "mp4", "avi", "mov", "wav", "flac", "ogg",
     "ttf", "otf", "woff", "woff2", "eot", "sqlite", "db", "mdb", "ico",
 ];
+
+const READ_FILE_ALLOWED_FIELDS: &[&str] = &[
+    "path",
+    "start_line",
+    "end_line",
+    "outline",
+    // System-level transaction/rollback fields injected by the rollback engine.
+    "transaction_id",
+    "rollback_on_failure",
+    "rollback_boundary",
+    "rollback_state",
+    "rollback",
+    // System-level field injected by headless tool pipeline for idempotency
+    // and work-surface deduplication.
+    "_tool_call_id",
+];
+
+pub fn validate_read_file_args(args: &Value) -> Result<(), String> {
+    let Some(object) = args.as_object() else {
+        return Err(
+            "Error: read_file arguments must be a JSON object with required field `path`."
+                .to_string(),
+        );
+    };
+    for key in object.keys() {
+        if !READ_FILE_ALLOWED_FIELDS.contains(&key.as_str()) {
+            let hint = read_file_unknown_field_hint(key);
+            return Err(format!(
+                "Error: unknown field `{key}` for read_file. Valid fields: {}. Required: path.{}",
+                READ_FILE_ALLOWED_FIELDS.join(", "),
+                hint
+            ));
+        }
+    }
+    match object.get("path") {
+        Some(Value::String(path)) if !path.trim().is_empty() => Ok(()),
+        Some(_) => Err(
+            "Error: field `path` for read_file must be a non-empty string. Valid fields: path, start_line, end_line, outline."
+                .to_string(),
+        ),
+        None => Err(
+            "Error: missing required field `path` for read_file. Valid fields: path, start_line, end_line, outline."
+                .to_string(),
+        ),
+    }?;
+    validate_read_file_line_arg(object, "start_line")?;
+    validate_read_file_line_arg(object, "end_line")?;
+    validate_read_file_line_range(object)?;
+    if let Some(value) = object.get("outline")
+        && !value.is_boolean()
+    {
+        return Err(
+            "Error: field `outline` for read_file must be a boolean. Valid fields: path, start_line, end_line, outline."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn read_file_unknown_field_hint(key: &str) -> &'static str {
+    match key {
+        "file" | "filename" => " Use `path` for the file path.",
+        "offset" => " `read_file` uses line numbers, not byte offsets; use `start_line`.",
+        "limit" | "length" | "count" => {
+            " `read_file` does not support count-style ranges; use `start_line` and `end_line`."
+        }
+        _ => "",
+    }
+}
+
+fn validate_read_file_line_arg(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<(), String> {
+    let Some(value) = object.get(field) else {
+        return Ok(());
+    };
+    match value.as_u64() {
+        Some(value) if value > 0 => Ok(()),
+        _ => Err(format!(
+            "Error: field `{field}` for read_file must be a positive integer. Valid fields: path, start_line, end_line, outline."
+        )),
+    }
+}
+
+fn validate_read_file_line_range(object: &serde_json::Map<String, Value>) -> Result<(), String> {
+    let (Some(start), Some(end)) = (
+        object.get("start_line").and_then(Value::as_u64),
+        object.get("end_line").and_then(Value::as_u64),
+    ) else {
+        return Ok(());
+    };
+    if start <= end {
+        return Ok(());
+    }
+    Err(format!(
+        "Error: invalid read_file line range: start_line must be <= end_line (got {start} > {end}). No file was read. Retry with start_line={end} and end_line={start}, or choose a valid narrower range."
+    ))
+}
 
 /// Build a structured str_replace failure message.
 ///
@@ -108,6 +208,12 @@ fn unique_path_variants(path: &Path) -> Vec<PathBuf> {
         && !variants.iter().any(|existing| existing == &canonical)
     {
         variants.push(canonical);
+    } else if let Ok(canonical_parent) = astra_sandbox::canonicalize_parent_and_append(path)
+        && !variants
+            .iter()
+            .any(|existing| existing == &canonical_parent)
+    {
+        variants.push(canonical_parent);
     }
     variants
 }
@@ -182,7 +288,22 @@ pub fn resolve_path_sandboxed(
             .canonicalize()
             .map_err(|e| format!("Cannot resolve path: {e}"))?
     } else {
-        normalized
+        // Canonicalize parent directory to resolve symlinks in the path
+        // prefix even when the leaf doesn't exist yet. Without this, a
+        // symlink in the workspace pointing outside (e.g. → /etc) would
+        // bypass the sandbox check for not-yet-created files.
+        match normalized.parent() {
+            Some(parent) if parent.exists() => {
+                let canonical_parent = parent
+                    .canonicalize()
+                    .map_err(|e| format!("Cannot resolve parent path: {e}"))?;
+                match normalized.file_name() {
+                    Some(name) => canonical_parent.join(name),
+                    None => normalized,
+                }
+            }
+            _ => normalized,
+        }
     };
 
     // Check workspace root first.
@@ -212,9 +333,17 @@ pub fn resolve_path_sandboxed(
 }
 
 pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
+    if let Err(error) = validate_read_file_args(args) {
+        return ToolResult::error(error);
+    }
     let path_str = match args.get("path").and_then(|v| v.as_str()) {
         Some(p) => p,
-        None => return ToolResult::error("Error: Missing 'path' parameter".into()),
+        None => {
+            return ToolResult::error(
+                "Error: missing required field `path` for read_file. Valid fields: path, start_line, end_line, outline."
+                    .into(),
+            );
+        }
     };
     let path = match resolve_path(workspace_root, path_str) {
         Ok(p) => p,
@@ -222,11 +351,11 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
     };
     let start_line = args
         .get("start_line")
-        .and_then(|v| v.as_u64())
+        .and_then(Value::as_u64)
         .map(|l| l as usize);
     let end_line = args
         .get("end_line")
-        .and_then(|v| v.as_u64())
+        .and_then(Value::as_u64)
         .map(|l| l as usize);
     let outline = args
         .get("outline")
@@ -473,16 +602,11 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
 
     let lines: Vec<&str> = content.lines().collect();
     if lines.is_empty() {
-        return ToolResult::text("(empty file)".into());
+        return ToolResult::text("(empty file)".to_string());
     }
 
     let start_line = start_line.unwrap_or(1);
     let end_line = end_line.unwrap_or(lines.len());
-    let (start_line, end_line) = if start_line > end_line {
-        (end_line, start_line)
-    } else {
-        (start_line, end_line)
-    };
     let start = start_line.saturating_sub(1).min(lines.len());
     let end = end_line.min(lines.len());
 
@@ -678,6 +802,9 @@ pub struct PreparedWriteFile {
     path: PathBuf,
     path_str: String,
     content: String,
+    /// SHA-256 hex digest of the file content as it was read (None for new files).
+    /// Verified before commit to detect concurrent modifications.
+    original_content_hash: Option<String>,
 }
 
 impl PreparedWriteFile {
@@ -696,7 +823,12 @@ impl PreparedWriteFile {
             return ToolResult::error(format!("Error: Cannot create directories: {e}"));
         }
 
-        match write_file_atomic_with_format(&self.path, self.content.as_bytes(), false) {
+        match write_file_atomic_with_format(
+            &self.path,
+            self.content.as_bytes(),
+            false,
+            self.original_content_hash.as_deref(),
+        ) {
             Ok(warning) => {
                 let mut message = format!(
                     "Successfully wrote {} bytes to {}",
@@ -717,6 +849,18 @@ pub fn prepare_write_file(
     workspace_root: &Path,
     args: &Value,
 ) -> Result<PreparedWriteFile, ToolResult> {
+    let Some(input) = args.as_object() else {
+        return Err(ToolResult::error(
+            "Error: write_file arguments must be an object".into(),
+        ));
+    };
+    reject_unknown_fields(
+        input,
+        "write_file",
+        &["content", "delete", "path", "_tool_call_id"],
+    )
+    .map_err(ToolResult::error)?;
+
     let path_str = match args.get("path").and_then(|v| v.as_str()) {
         Some(p) => p,
         None => {
@@ -739,10 +883,13 @@ pub fn prepare_write_file(
     };
     let content = normalize_content_before_write(&path, content);
 
+    let original_content_hash = sha256_digest_of_existing_file(&path);
+
     Ok(PreparedWriteFile {
         path,
         path_str: path_str.to_string(),
         content,
+        original_content_hash,
     })
 }
 
@@ -760,6 +907,9 @@ pub struct PreparedStrReplace {
     dry_run: bool,
     allow_structural_change: bool,
     success_message: String,
+    /// SHA-256 hex digest of the file content as it was read.
+    /// Verified before commit to detect concurrent modifications.
+    original_content_hash: Option<String>,
 }
 
 impl PreparedStrReplace {
@@ -783,6 +933,7 @@ impl PreparedStrReplace {
             &self.path,
             self.new_content.as_bytes(),
             self.allow_structural_change,
+            self.original_content_hash.as_deref(),
         ) {
             Ok(warning) => {
                 let mut message = self.success_message;
@@ -804,13 +955,17 @@ pub fn prepare_str_replace(
     let args = &args;
     let path_str = match args.get("path").and_then(|v| v.as_str()) {
         Some(p) => p,
-        None => return Err(ToolResult::error("Error: Missing 'path' parameter".into())),
+        None => {
+            return Err(ToolResult::error(
+                "Error: Missing 'path' parameter. Retry str_replace with path plus either old_str/new_str or edits.".into(),
+            ));
+        }
     };
     let old_str = match args.get("old_str").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => {
             return Err(ToolResult::error(
-                "Error: Missing 'old_str' parameter".into(),
+                "Error: Missing 'old_str' parameter. Retry str_replace single-edit mode with path, old_str, and new_str; or use edits for batch mode.".into(),
             ));
         }
     };
@@ -818,10 +973,17 @@ pub fn prepare_str_replace(
         Some(s) => s,
         None => {
             return Err(ToolResult::error(
-                "Error: Missing 'new_str' parameter".into(),
+                "Error: Missing 'new_str' parameter. Retry str_replace single-edit mode with path, old_str, and new_str; or use edits for batch mode.".into(),
             ));
         }
     };
+    if old_str == new_str {
+        return Err(ToolResult::error(str_replace_fail(
+            "old_str and new_str are identical — no change needed.",
+            "The replacement is a no-op; the file would be unchanged.",
+            "Provide a new_str that actually differs from old_str, or skip the edit.",
+        )));
+    }
     let replace_all = args
         .get("replace_all")
         .and_then(|v| v.as_bool())
@@ -849,6 +1011,12 @@ pub fn prepare_str_replace(
         Ok(c) => c,
         Err(e) => return Err(ToolResult::error(format!("Error: Cannot read file: {e}"))),
     };
+
+    // Capture content hash BEFORE any mutation so the commit phase
+    // can detect concurrent modifications (another process or a
+    // parallel agent writing the same file between our read and
+    // the final rename).
+    let original_hash = content_hash(&content);
 
     let count = content.matches(old_str).count();
     if count == 0 {
@@ -895,6 +1063,7 @@ pub fn prepare_str_replace(
                 dry_run,
                 allow_structural_change,
                 success_message,
+                original_content_hash: Some(original_hash),
             });
         }
 
@@ -948,6 +1117,7 @@ pub fn prepare_str_replace(
         dry_run,
         allow_structural_change,
         success_message,
+        original_content_hash: Some(original_hash),
     })
 }
 
@@ -957,7 +1127,7 @@ pub fn str_replace(workspace_root: &Path, args: &Value) -> ToolResult {
         Err(error) => return ToolResult::error(error),
     };
     if args.get("edits").and_then(Value::as_array).is_some() {
-        return multi_edit(workspace_root, &args);
+        return multi_path_edit(workspace_root, &args);
     }
     match prepare_str_replace(workspace_root, &args) {
         Ok(prepared) => prepared.apply(),
@@ -965,7 +1135,7 @@ pub fn str_replace(workspace_root: &Path, args: &Value) -> ToolResult {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PreparedMultiEdit {
     path: PathBuf,
     path_str: String,
@@ -973,6 +1143,12 @@ pub struct PreparedMultiEdit {
     edit_count: usize,
     dry_run: bool,
     allow_structural_change: bool,
+    /// Formatter warning captured during the staging phase (if any).
+    /// Carried through to the commit message.
+    warning: Option<String>,
+    /// SHA-256 hex digest of the file content as it was read.
+    /// Verified before commit to detect concurrent modifications.
+    original_content_hash: Option<String>,
 }
 
 impl PreparedMultiEdit {
@@ -996,6 +1172,7 @@ impl PreparedMultiEdit {
             &self.path,
             self.new_content.as_bytes(),
             self.allow_structural_change,
+            self.original_content_hash.as_deref(),
         ) {
             Ok(warning) => {
                 let mut message = format!(
@@ -1020,7 +1197,11 @@ pub fn prepare_multi_edit(
     let args = &args;
     let path_str = match args.get("path").and_then(|v| v.as_str()) {
         Some(p) => p,
-        None => return Err(ToolResult::error("Error: Missing 'path' parameter".into())),
+        None => {
+            return Err(ToolResult::error(
+                "Error: Missing 'path' parameter. Retry str_replace batch mode with path and edits.".into(),
+            ));
+        }
     };
     let edits = match args.get("edits").and_then(|v| v.as_array()) {
         Some(e) => e,
@@ -1080,10 +1261,8 @@ pub fn prepare_multi_edit(
         }
         let count = working.matches(old_str).count();
         if count == 0 {
-            return Err(ToolResult::error(str_replace_fail(
-                &format!("edit[{i}] old_str not found in {path_str}."),
-                "The exact byte sequence does not appear in the current file content (whitespace, indentation, or quote style may differ; or the file changed since you last read it).",
-                "Re-read the target region with read_file, copy the exact bytes (including leading whitespace) into old_str, then retry.",
+            return Err(ToolResult::error(str_replace_not_found_hint_for_edit(
+                path_str, &working, old_str, i,
             )));
         }
         if count > 1 {
@@ -1104,6 +1283,8 @@ pub fn prepare_multi_edit(
     }
     working = normalize_content_before_write(&path, &working);
 
+    let original_content_hash = sha256_digest_of_existing_file(&path);
+
     Ok(PreparedMultiEdit {
         path,
         path_str: path_str.to_string(),
@@ -1111,6 +1292,8 @@ pub fn prepare_multi_edit(
         edit_count: edits.len(),
         dry_run,
         allow_structural_change,
+        warning: None,
+        original_content_hash,
     })
 }
 
@@ -1119,6 +1302,10 @@ pub struct PreparedDeleteFile {
     path: PathBuf,
     path_str: String,
     before_content: Vec<u8>,
+    /// SHA-256 hex digest of the file content captured at prepare time.
+    /// Verified before commit to detect concurrent modifications: a delete
+    /// that silently destroys newer content than the model read is unsafe.
+    before_content_hash: Option<String>,
 }
 
 impl PreparedDeleteFile {
@@ -1131,6 +1318,15 @@ impl PreparedDeleteFile {
     }
 
     pub fn apply(&self) -> ToolResult {
+        // First principles: deleting a file that changed since it was read is
+        // a silent data-loss hazard. Re-verify the hash before removing, so a
+        // concurrent write between prepare→apply aborts instead of destroying
+        // new content. This mirrors write_file / str_replace pre-commit checks.
+        if let Err(e) =
+            verify_expected_original_hash(&self.path, self.before_content_hash.as_deref())
+        {
+            return ToolResult::error(e);
+        }
         match std::fs::remove_file(&self.path) {
             Ok(()) => ToolResult::text(format!("Successfully deleted {}", self.path_str)),
             Err(e) => ToolResult::error(format!("Error: Cannot delete file: {e}")),
@@ -1170,10 +1366,13 @@ pub fn prepare_delete_file(
         }
     };
 
+    let before_content_hash = sha256_digest_of_existing_file(&path);
+
     Ok(PreparedDeleteFile {
         path,
         path_str: path_str.to_string(),
         before_content,
+        before_content_hash,
     })
 }
 
@@ -1234,59 +1433,305 @@ pub fn multi_edit(workspace_root: &Path, args: &Value) -> ToolResult {
     }
 }
 
+#[derive(Debug)]
+struct PreparedMultiPathEdit {
+    prepared: Vec<PreparedMultiEdit>,
+}
+
+impl PreparedMultiPathEdit {
+    fn apply(&self) -> ToolResult {
+        if self.prepared.iter().all(|prepared| prepared.dry_run) {
+            let messages: Vec<String> = self
+                .prepared
+                .iter()
+                .map(|prepared| {
+                    format!(
+                        "Dry run: {} edit(s) would be applied to {}",
+                        prepared.edit_count, prepared.path_str
+                    )
+                })
+                .collect();
+            return ToolResult::text(if messages.len() == 1 {
+                messages.into_iter().next().unwrap_or_default()
+            } else {
+                format!(
+                    "Dry run: edits would be applied to {} file(s)\n{}",
+                    self.prepared.len(),
+                    messages.join("\n")
+                )
+            });
+        }
+
+        for prepared in &self.prepared {
+            if let Err(error) = verify_expected_original_hash(
+                &prepared.path,
+                prepared.original_content_hash.as_deref(),
+            ) {
+                return ToolResult::error(error);
+            }
+        }
+
+        // ── Two-phase atomic commit ────────────────────────────────────────
+        // Phase 1: Write every file to a staging path next to the target.
+        //          If any stage fails, no target file is touched.
+        // Phase 2: If all stages succeeded, atomically rename every staging
+        //          file to its target.  POSIX rename() is atomic on the same
+        //          filesystem, so each file transitions from old → new
+        //          without a window of partial content.
+        //
+        // This eliminates the dual journal+preimage rollback path entirely:
+        // there is nothing to roll back because no target is modified until
+        // every staging write has succeeded.
+        let mut staging_entries: Vec<(PathBuf, PathBuf, PreparedMultiEdit)> =
+            Vec::with_capacity(self.prepared.len());
+
+        // Phase 1: Stage all files.
+        for prepared in &self.prepared {
+            if prepared.dry_run {
+                // Dry-run batches are handled before reaching this point.
+                continue;
+            }
+            let staging_path = staging_tmp_path(&prepared.path);
+            // Best-effort cleanup of a stale staging file from a prior crash.
+            let _ = std::fs::remove_file(&staging_path);
+
+            if let Err(e) = std::fs::write(&staging_path, &prepared.new_content) {
+                // Clean up any already-staged files before returning.
+                for (_, staging, _) in &staging_entries {
+                    let _ = std::fs::remove_file(staging);
+                }
+                let _ = std::fs::remove_file(&staging_path);
+                return ToolResult::error(format!(
+                    "Error: Cannot stage write for {}: {e}",
+                    prepared.path_str
+                ));
+            }
+
+            // Format the staging file (best-effort, same as single-file path).
+            let warning = match format_file_in_place_best_effort(&staging_path) {
+                FormatterOutcome::Success | FormatterOutcome::NotFound => None,
+                FormatterOutcome::Warning(w) => Some(w),
+                FormatterOutcome::SyntaxError(error) => {
+                    if prepared.allow_structural_change {
+                        Some(error)
+                    } else {
+                        // Clean up all staged files.
+                        for (_, staging, _) in &staging_entries {
+                            let _ = std::fs::remove_file(staging);
+                        }
+                        let _ = std::fs::remove_file(&staging_path);
+                        return ToolResult::error(error);
+                    }
+                }
+            };
+
+            staging_entries.push((
+                prepared.path.clone(),
+                staging_path,
+                PreparedMultiEdit {
+                    warning: warning.clone(),
+                    ..prepared.clone()
+                },
+            ));
+        }
+
+        // Re-check all targets immediately before the first rename. This
+        // catches edits made while staging/formatting without leaving a partial
+        // multi-file commit behind.
+        for (_, _, prepared) in &staging_entries {
+            if let Err(error) = verify_expected_original_hash(
+                &prepared.path,
+                prepared.original_content_hash.as_deref(),
+            ) {
+                for (_, staging, _) in &staging_entries {
+                    let _ = std::fs::remove_file(staging);
+                }
+                return ToolResult::error(error);
+            }
+        }
+
+        // Phase 2: Commit all staged files via atomic rename.
+        let mut messages = Vec::with_capacity(staging_entries.len());
+        for (target, staging, prepared) in &staging_entries {
+            if let Err(e) = std::fs::rename(staging, target) {
+                // Rename failed — files already renamed before this point
+                // are committed (same-fs rename is atomic per-file).  Files
+                // not yet renamed have their staging artifacts still on disk;
+                // attempt cleanup but don't fail the overall result — the
+                // model already has error context.
+                for (_, remaining_staging, _) in
+                    staging_entries.iter().skip_while(|(t, _, _)| t != target)
+                {
+                    let _ = std::fs::remove_file(remaining_staging);
+                }
+                return ToolResult::error(format!(
+                    "Error: Cannot commit write for {} (rename failed): {e}",
+                    prepared.path_str
+                ));
+            }
+            let mut message = format!(
+                "Successfully applied {} edit(s) to {}",
+                prepared.edit_count, prepared.path_str
+            );
+            if let Some(ref warning) = prepared.warning {
+                message.push_str(&format!("\nWarning: {warning}"));
+            }
+            messages.push(message);
+        }
+
+        ToolResult::text(if self.prepared.len() == 1 {
+            messages.into_iter().next().unwrap_or_default()
+        } else {
+            format!(
+                "Successfully applied edits to {} file(s)\n{}",
+                self.prepared.len(),
+                messages.join("\n")
+            )
+        })
+    }
+}
+
+fn multi_path_edit(workspace_root: &Path, args: &Value) -> ToolResult {
+    match prepare_multi_path_edit(workspace_root, args) {
+        Ok(prepared) => prepared.apply(),
+        Err(error) => error,
+    }
+}
+
+/// Partition a multi-file `edits` array into per-file groups.
+///
+/// Each edit entry may carry an optional `path`; entries without `path`
+/// fall back to `top_path`. Returns `(path, scoped_edits)` pairs,
+/// where each scoped edit is a map with only `old_str`/`new_str` keys.
+pub fn partition_edits_by_path(
+    edits: &[Value],
+    top_path: Option<&str>,
+) -> Result<Vec<(String, Vec<Value>)>, String> {
+    let mut groups: Vec<(String, Vec<Value>)> = Vec::new();
+    for (index, edit) in edits.iter().enumerate() {
+        let edit_path = edit.get("path").and_then(Value::as_str).or(top_path);
+        let Some(path) = edit_path.filter(|p| !p.trim().is_empty()) else {
+            return Err(format!(
+                "Error: str_replace edit[{index}] is missing 'path'. Provide top-level path for a same-file batch, or path inside every edit for multi-file batch mode."
+            ));
+        };
+        let Some(edit_obj) = edit.as_object() else {
+            return Err(format!(
+                "Error: str_replace edit[{index}] must be an object"
+            ));
+        };
+        let mut scoped_edit = serde_json::Map::new();
+        for key in ["old_str", "new_str"] {
+            if let Some(value) = edit_obj.get(key) {
+                scoped_edit.insert(key.to_string(), value.clone());
+            }
+        }
+        if let Some((_, existing)) = groups
+            .iter_mut()
+            .find(|(existing_path, _)| existing_path == path)
+        {
+            existing.push(Value::Object(scoped_edit));
+        } else {
+            groups.push((path.to_string(), vec![Value::Object(scoped_edit)]));
+        }
+    }
+    Ok(groups)
+}
+
+fn prepare_multi_path_edit(
+    workspace_root: &Path,
+    args: &Value,
+) -> Result<PreparedMultiPathEdit, ToolResult> {
+    let args = normalize_str_replace_args(args).map_err(ToolResult::error)?;
+    let top_path = args.get("path").and_then(Value::as_str);
+    let edits = match args.get("edits").and_then(Value::as_array) {
+        Some(edits) => edits,
+        None => return Err(ToolResult::error("Error: Missing 'edits' array".into())),
+    };
+    if edits.is_empty() {
+        return Err(ToolResult::error("Error: 'edits' array is empty".into()));
+    }
+
+    let dry_run = args
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let allow_structural_change = args
+        .get("allow_structural_change")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let groups = partition_edits_by_path(edits, top_path).map_err(ToolResult::error)?;
+
+    let mut prepared = Vec::with_capacity(groups.len());
+    for (path, edits) in groups {
+        let mut scoped = serde_json::Map::new();
+        scoped.insert("path".to_string(), Value::String(path));
+        scoped.insert("edits".to_string(), Value::Array(edits));
+        if dry_run {
+            scoped.insert("dry_run".to_string(), Value::Bool(true));
+        }
+        if allow_structural_change {
+            scoped.insert("allow_structural_change".to_string(), Value::Bool(true));
+        }
+        prepared.push(prepare_multi_edit(workspace_root, &Value::Object(scoped))?);
+    }
+
+    Ok(PreparedMultiPathEdit { prepared })
+}
+
 pub fn normalize_str_replace_args(args: &Value) -> Result<Value, String> {
     let Some(input) = args.as_object() else {
         return Err("Error: str_replace arguments must be an object".to_string());
     };
     let mut out = input.clone();
 
-    if !out.contains_key("old_str")
-        && let Some(value) = first_string_value(input, &["original_text", "old_text", "original"])
-    {
-        out.insert("old_str".to_string(), Value::String(value.to_string()));
-    }
-    if !out.contains_key("new_str")
-        && let Some(value) =
-            first_string_value(input, &["new_text", "replacement_text", "replacement"])
-    {
-        out.insert("new_str".to_string(), Value::String(value.to_string()));
-    }
+    reject_unknown_fields(
+        input,
+        "str_replace",
+        &[
+            "allow_structural_change",
+            "dry_run",
+            "edits",
+            "new_str",
+            "old_str",
+            "path",
+            "replace_all",
+        ],
+    )?;
 
-    if !out.contains_key("edits")
-        && let Some(replacements) = input.get("replacements")
-    {
-        out.insert("edits".to_string(), normalize_edit_array(replacements)?);
-    }
     if let Some(edits) = out.get("edits").cloned() {
+        if out.contains_key("old_str") || out.contains_key("new_str") {
+            return Err(
+                "Error: str_replace edits mode is mutually exclusive with top-level old_str/new_str"
+                    .to_string(),
+            );
+        }
         out.insert("edits".to_string(), normalize_edit_array(&edits)?);
     }
 
     Ok(Value::Object(out))
 }
 
-fn first_string_value<'a>(
-    input: &'a serde_json::Map<String, Value>,
-    fields: &[&str],
-) -> Option<&'a str> {
-    fields
-        .iter()
-        .find_map(|field| input.get(*field).and_then(Value::as_str))
+fn reject_unknown_fields(
+    input: &serde_json::Map<String, Value>,
+    context: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    for key in input.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(format!(
+                "Error: unknown field '{key}' for {context} (valid: {})",
+                allowed.join(", ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn normalize_edit_array(value: &Value) -> Result<Value, String> {
-    let parsed_value;
-    let value = if let Some(raw) = value.as_str() {
-        parsed_value = serde_json::from_str::<Value>(raw).map_err(|error| {
-            format!(
-                "Error: str_replace 'edits'/'replacements' string must contain a JSON array: {error}"
-            )
-        })?;
-        &parsed_value
-    } else {
-        value
-    };
     let Some(items) = value.as_array() else {
-        return Err("Error: str_replace 'edits'/'replacements' must be an array".to_string());
+        return Err("Error: str_replace 'edits' must be an array".to_string());
     };
     let mut normalized = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
@@ -1295,22 +1740,23 @@ fn normalize_edit_array(value: &Value) -> Result<Value, String> {
                 "Error: str_replace edit[{index}] must be an object"
             ));
         };
-        let mut out = edit.clone();
-        if !out.contains_key("old_str")
-            && let Some(value) =
-                first_string_value(edit, &["original_text", "old_text", "original"])
-        {
-            out.insert("old_str".to_string(), Value::String(value.to_string()));
-        }
-        if !out.contains_key("new_str")
-            && let Some(value) =
-                first_string_value(edit, &["new_text", "replacement_text", "replacement"])
-        {
-            out.insert("new_str".to_string(), Value::String(value.to_string()));
-        }
-        normalized.push(Value::Object(out));
+        reject_unknown_fields(
+            edit,
+            &format!("str_replace.edits[{index}]"),
+            &["new_str", "old_str", "path"],
+        )?;
+        normalized.push(Value::Object(edit.clone()));
     }
     Ok(Value::Array(normalized))
+}
+
+/// Fast SHA-256 hex digest for concurrent-modification detection.
+/// Not security-critical — a content change within the same turn is
+/// overwhelmingly a real race, not a crafted collision.
+fn content_hash(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 const TEXT_TRAILING_NEWLINE_EXTS: &[&str] = &[
@@ -1468,11 +1914,56 @@ fn format_file_in_place_best_effort(path: &Path) -> FormatterOutcome {
 /// Pre-commit hooks / editors watching the target via inotify see
 /// **one** `MODIFY` event (the rename), not `CREATE` + partial
 /// writes during formatting.
+fn sha256_digest_of_existing_file(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(_) => return None,
+        }
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+fn verify_expected_original_hash(
+    path: &Path,
+    expected_original_hash: Option<&str>,
+) -> Result<(), String> {
+    let Some(expected) = expected_original_hash else {
+        return Ok(());
+    };
+    let Some(current) = sha256_digest_of_existing_file(path) else {
+        return Err(format!(
+            "Error: Cannot verify that file {path} is unchanged before commit. Re-read the file content and retry.",
+            path = path.display()
+        ));
+    };
+    if current != expected {
+        return Err(format!(
+            "Error: File {path} was modified since it was read (hash mismatch). \
+             Expected {expected}, found {current}. Re-read the file content and retry.",
+            path = path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn write_file_atomic_with_format(
     path: &Path,
     content: &[u8],
     allow_formatter_syntax_error: bool,
+    expected_original_hash: Option<&str>,
 ) -> Result<Option<String>, String> {
+    // Verify the file hasn't been modified since we read it.
+    verify_expected_original_hash(path, expected_original_hash)?;
+
     // Staging file lives next to the target — POSIX rename() is
     // only atomic within the same filesystem. Using a /tmp staging
     // file would break across mount points.
@@ -1677,10 +2168,31 @@ fn tree_sitter_has_error(source: &str, lang: crate::code_intel::Language) -> Opt
 /// (the echoed window depends on per-call old_str), and encourages the model
 /// to retry by re-emitting the full new_str instead of fixing the anchor.
 fn str_replace_not_found_hint(path_str: &str, content: &str, old_str: &str) -> String {
+    str_replace_not_found_hint_with_what(
+        format!("old_str not found in {path_str}."),
+        content,
+        old_str,
+    )
+}
+
+fn str_replace_not_found_hint_for_edit(
+    path_str: &str,
+    content: &str,
+    old_str: &str,
+    edit_index: usize,
+) -> String {
+    str_replace_not_found_hint_with_what(
+        format!("edit[{edit_index}] old_str not found in {path_str}."),
+        content,
+        old_str,
+    )
+}
+
+fn str_replace_not_found_hint_with_what(what: String, content: &str, old_str: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let old_lines: Vec<&str> = old_str.lines().collect();
     let mut msg = str_replace_fail(
-        &format!("old_str not found in {path_str}."),
+        &what,
         "The exact byte sequence does not appear in the current file content (whitespace, indentation, or quote style may differ; or the file changed since you last read it).",
         "Refer to the prior read_file tool_result for the current file content; copy the exact bytes into old_str and retry. If the file has changed, re-read it first.",
     );
@@ -2002,6 +2514,41 @@ mod tests {
     }
 
     #[test]
+    fn read_file_rejects_unknown_fields_before_missing_path() {
+        let tmp = TempDir::new().unwrap();
+        let result = read_file(
+            tmp.path(),
+            &serde_json::json!({
+                "file": "test.txt",
+                "offset": 1,
+                "limit": 300
+            }),
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("unknown field `file`"),
+            "{:?}",
+            result.output
+        );
+        assert!(
+            result.output.contains("Valid fields: path"),
+            "{:?}",
+            result.output
+        );
+        assert!(
+            result.output.contains("Use `path` for the file path"),
+            "{:?}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("Missing 'path'"),
+            "unknown-field contract should fire before legacy missing-path text: {}",
+            result.output
+        );
+    }
+
+    #[test]
     fn read_file_with_range() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("test.txt"), "a\nb\nc\nd").unwrap();
@@ -2263,7 +2810,7 @@ mod tests {
     }
 
     #[test]
-    fn read_file_swaps_reversed_ranges() {
+    fn read_file_rejects_reversed_ranges_without_reading() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("test.txt"), "a\nb\nc\nd").unwrap();
 
@@ -2272,10 +2819,56 @@ mod tests {
             &serde_json::json!({"path": "test.txt", "start_line": 4, "end_line": 2}),
         );
 
-        assert!(!result.is_error);
-        assert!(result.output.contains("2\tb"), "got: {}", result.output);
-        assert!(result.output.contains("3\tc"), "got: {}", result.output);
-        assert!(result.output.contains("4\td"), "got: {}", result.output);
+        assert!(result.is_error, "got: {}", result.output);
+        assert!(
+            result.output.contains("start_line must be <= end_line"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("No file was read"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("start_line=2"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("end_line=4"),
+            "got: {}",
+            result.output
+        );
+        assert!(!result.output.contains("2\tb"), "got: {}", result.output);
+    }
+
+    #[test]
+    fn read_file_rejects_invalid_optional_arg_types() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("test.txt"), "a\nb\nc\nd").unwrap();
+
+        let result = read_file(
+            tmp.path(),
+            &serde_json::json!({"path": "test.txt", "start_line": "2"}),
+        );
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("`start_line`") && result.output.contains("positive integer"),
+            "got: {}",
+            result.output
+        );
+
+        let result = read_file(
+            tmp.path(),
+            &serde_json::json!({"path": "test.txt", "outline": 1}),
+        );
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("`outline`") && result.output.contains("boolean"),
+            "got: {}",
+            result.output
+        );
     }
 
     #[test]
@@ -2389,6 +2982,28 @@ mod tests {
     }
 
     #[test]
+    fn prepare_write_file_rejects_unknown_fields() {
+        let tmp = TempDir::new().unwrap();
+        let err = prepare_write_file(
+            tmp.path(),
+            &serde_json::json!({
+                "path": "note.txt",
+                "content": "hello",
+                "mode": "append"
+            }),
+        )
+        .expect_err("unknown fields should fail");
+
+        assert!(err.is_error);
+        assert!(err.output.contains("unknown field 'mode'"));
+        assert!(err.output.contains("write_file"));
+        assert!(
+            !tmp.path().join("note.txt").exists(),
+            "unknown fields must fail before writing"
+        );
+    }
+
+    #[test]
     fn str_replace_basic() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("f.txt"), "foo bar baz").unwrap();
@@ -2419,7 +3034,112 @@ mod tests {
     }
 
     #[test]
-    fn str_replace_normalizes_replacements_original_text_aliases() {
+    fn str_replace_accepts_per_edit_paths_for_multi_file_batch() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "alpha beta").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "gamma delta").unwrap();
+        let args = serde_json::json!({
+            "edits": [
+                {"path": "a.txt", "old_str": "alpha", "new_str": "ALPHA"},
+                {"path": "b.txt", "old_str": "delta", "new_str": "DELTA"}
+            ]
+        });
+
+        let result = str_replace(tmp.path(), &args);
+
+        assert!(!result.is_error, "got error: {}", result.output);
+        assert!(
+            result.output.contains("2 file(s)"),
+            "multi-file summary should name the file count: {}",
+            result.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+            "ALPHA beta\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("b.txt")).unwrap(),
+            "gamma DELTA\n"
+        );
+    }
+
+    #[test]
+    fn str_replace_per_edit_path_batch_prevalidates_all_files_before_writing() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "alpha beta").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "gamma delta").unwrap();
+        let args = serde_json::json!({
+            "edits": [
+                {"path": "a.txt", "old_str": "alpha", "new_str": "ALPHA"},
+                {"path": "b.txt", "old_str": "missing", "new_str": "MISSING"}
+            ]
+        });
+
+        let result = str_replace(tmp.path(), &args);
+
+        assert!(result.is_error, "missing old_str should fail");
+        assert!(
+            result.output.contains("old_str not found"),
+            "got: {}",
+            result.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+            "alpha beta"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("b.txt")).unwrap(),
+            "gamma delta"
+        );
+    }
+
+    #[test]
+    fn str_replace_multi_path_rejects_stale_target_before_any_commit() {
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("a.txt");
+        let b = tmp.path().join("b.txt");
+        std::fs::write(&a, "alpha beta").unwrap();
+        std::fs::write(&b, "gamma delta").unwrap();
+        let args = serde_json::json!({
+            "edits": [
+                {"path": "a.txt", "old_str": "alpha", "new_str": "ALPHA"},
+                {"path": "b.txt", "old_str": "gamma", "new_str": "GAMMA"}
+            ]
+        });
+
+        let prepared = prepare_multi_path_edit(tmp.path(), &args).expect("prepared");
+        std::fs::write(&b, "external change").unwrap();
+
+        let result = prepared.apply();
+
+        assert!(result.is_error, "stale target must fail: {}", result.output);
+        assert!(
+            result.output.contains("modified since it was read"),
+            "expected stale-file diagnosis: {}",
+            result.output
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha beta");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "external change");
+    }
+
+    #[test]
+    fn str_replace_batch_requires_some_path_source() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "alpha beta").unwrap();
+        let args = serde_json::json!({
+            "edits": [
+                {"old_str": "alpha", "new_str": "ALPHA"}
+            ]
+        });
+
+        let result = str_replace(tmp.path(), &args);
+
+        assert!(result.is_error);
+        assert!(result.output.contains("edit[0] is missing 'path'"));
+    }
+
+    #[test]
+    fn str_replace_rejects_replacements_alias() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("f.txt"), "one two three").unwrap();
         let args = serde_json::json!({
@@ -2432,25 +3152,69 @@ mod tests {
 
         let result = str_replace(tmp.path(), &args);
 
-        assert!(!result.is_error, "got error: {}", result.output);
+        assert!(result.is_error, "alias must be rejected");
+        assert!(result.output.contains("unknown field 'replacements'"));
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
-        assert_eq!(content, "ONE two THREE\n");
+        assert_eq!(content, "one two three");
     }
 
     #[test]
-    fn str_replace_normalizes_json_string_replacements_aliases() {
+    fn str_replace_rejects_string_edits_payload() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("f.txt"), "red green blue").unwrap();
         let args = serde_json::json!({
             "path": "f.txt",
-            "replacements": r#"[{"original_text":"red","new_text":"RED"},{"original_text":"blue","new_text":"BLUE"}]"#
+            "edits": r#"[{"old_str":"red","new_str":"RED"},{"old_str":"blue","new_str":"BLUE"}]"#
         });
 
         let result = str_replace(tmp.path(), &args);
 
-        assert!(!result.is_error, "got error: {}", result.output);
+        assert!(result.is_error, "string edits payload must be rejected");
+        assert!(result.output.contains("'edits' must be an array"));
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
-        assert_eq!(content, "RED green BLUE\n");
+        assert_eq!(content, "red green blue");
+    }
+
+    #[test]
+    fn str_replace_rejects_top_level_single_fields_with_edits() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "red green blue").unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "old_str": "red",
+            "new_str": "RED",
+            "edits": [
+                {"old_str": "blue", "new_str": "BLUE"}
+            ]
+        });
+
+        let result = str_replace(tmp.path(), &args);
+
+        assert!(result.is_error, "mixed edit modes must be rejected");
+        assert!(result.output.contains("mutually exclusive"));
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(content, "red green blue");
+    }
+
+    #[test]
+    fn str_replace_rejects_unknown_edit_fields() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "red green blue").unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "edits": [
+                {"old_str": "red", "new_str": "RED", "comment": "legacy note"}
+            ]
+        });
+
+        let result = str_replace(tmp.path(), &args);
+
+        assert!(result.is_error, "unknown edit fields must be rejected");
+        assert!(result.output.contains("unknown field 'comment'"));
+        assert!(result.output.contains("str_replace.edits[0]"));
+        assert!(!result.output.contains("unknown field 'path'"));
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(content, "red green blue");
     }
 
     #[test]
@@ -2650,6 +3414,31 @@ mod tests {
         );
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
         assert_eq!(content, "line1\nline2\nline3\n");
+    }
+
+    #[test]
+    fn str_replace_rejects_identical_single_edit() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "same\n").unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "old_str": "same",
+            "new_str": "same"
+        });
+        let result = str_replace(tmp.path(), &args);
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("STR_REPLACE FAILED"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("no change needed"),
+            "got: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(content, "same\n");
     }
 
     #[test]
@@ -3173,9 +3962,59 @@ mod tests {
         });
         let result = multi_edit(tmp.path(), &args);
         assert!(result.is_error);
+        assert!(
+            result.output.contains("STR_REPLACE FAILED"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("edit[1] old_str not found"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("no_partial_match: true"),
+            "got: {}",
+            result.output
+        );
         // Original file should be unchanged (atomic)
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
         assert_eq!(content, "aaa bbb");
+    }
+
+    #[test]
+    fn multi_edit_missing_anchor_reports_structured_near_match_hint() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("f.txt"),
+            "  fn hello() {\n    println!(\"hi\");\n  }\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "edits": [{
+                "old_str": "fn hello() {\n  println!(\"hi\");\n}",
+                "new_str": "fn hello() {}"
+            }]
+        });
+
+        let result = multi_edit(tmp.path(), &args);
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("edit[0] old_str not found"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("whitespace_normalized_match: true"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("first_line_at: L1"),
+            "got: {}",
+            result.output
+        );
     }
 
     #[test]
@@ -3251,7 +4090,12 @@ mod tests {
             "resolve_path_sandboxed must allow /tmp when in allowed_paths: {:?}",
             result
         );
-        assert!(result.unwrap().starts_with("/tmp"));
+        let resolved = result.unwrap();
+        assert!(
+            is_within_workspace_root(&resolved, Path::new("/tmp")),
+            "resolved temp path must stay within the configured temp root: {:?}",
+            resolved
+        );
     }
 
     /// Regression: a workspace under $TMPDIR (e.g. /tmp/.../tmpXXX) plus a
@@ -3505,7 +4349,7 @@ mod tests {
         std::fs::write(&target, "original\n").unwrap();
 
         let _warning =
-            write_file_atomic_with_format(&target, b"pub fn new_body() {}\n", false).unwrap();
+            write_file_atomic_with_format(&target, b"pub fn new_body() {}\n", false, None).unwrap();
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "pub fn new_body() {}\n",
@@ -3530,7 +4374,7 @@ mod tests {
         // End-to-end: write, check content lands.
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().join("hello.txt");
-        let result = write_file_atomic_with_format(&target, b"hello world\n", false);
+        let result = write_file_atomic_with_format(&target, b"hello world\n", false, None);
         assert!(result.is_ok(), "atomic write must succeed: {result:?}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello world\n");
     }
@@ -3555,7 +4399,7 @@ mod tests {
             ro.set_mode(0o500); // r-x only, no write for owner
             std::fs::set_permissions(tmp.path(), ro).unwrap();
 
-            let result = write_file_atomic_with_format(&target, b"NEW\n", false);
+            let result = write_file_atomic_with_format(&target, b"NEW\n", false, None);
 
             // Restore perms before asserting so tempdir drop works.
             std::fs::set_permissions(tmp.path(), orig_perm).unwrap();

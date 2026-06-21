@@ -64,13 +64,12 @@ async fn filter_lessons_by_relevance(
     lessons: Vec<astra_runtime::self_model::LessonHint>,
     params: Option<&astra_runtime::memory_hooks::relevance::LlmConnParams>,
 ) -> Vec<astra_runtime::self_model::LessonHint> {
-    let Some(params) = params else {
-        return lessons;
-    };
-
     let texts: Vec<String> = lessons.iter().map(|lesson| lesson.action.clone()).collect();
-    let filtered =
-        astra_runtime::memory_hooks::relevance::filter_memories(params, user_message, &texts).await;
+    let filtered = if let Some(params) = params {
+        astra_runtime::memory_hooks::relevance::filter_memories(params, user_message, &texts).await
+    } else {
+        astra_runtime::memory_hooks::relevance::lexical_filter_memories(user_message, &texts)
+    };
     if filtered.len() == texts.len() {
         return lessons;
     }
@@ -141,6 +140,33 @@ pub(crate) async fn ensure_bootstrapped_lessons(
     token: &str,
     user_message: &str,
 ) {
+    if !state.session_lessons.is_empty() {
+        maybe_load_memory_model_params(state, api, token).await;
+        if let Some(params) = state.memory_model_params.as_ref() {
+            let texts: Vec<String> = state
+                .session_lessons
+                .iter()
+                .map(|lesson| lesson.action.clone())
+                .collect();
+            let dismissed =
+                astra_runtime::memory_hooks::relevance::select_dismissed_memory_indices(
+                    params,
+                    user_message,
+                    &texts,
+                )
+                .await;
+            if !dismissed.is_empty() {
+                let dismissed: std::collections::HashSet<usize> = dismissed.into_iter().collect();
+                state.session_lessons = state
+                    .session_lessons
+                    .drain(..)
+                    .enumerate()
+                    .filter_map(|(idx, lesson)| (!dismissed.contains(&idx)).then_some(lesson))
+                    .collect();
+            }
+        }
+    }
+
     if !should_bootstrap_lessons(state) {
         return;
     }
@@ -154,18 +180,26 @@ pub(crate) async fn ensure_bootstrapped_lessons(
     .await
     .unwrap_or_default();
 
-    state.session_lessons = if lessons.len() > 1 {
-        filter_lessons_by_relevance(user_message, lessons, state.memory_model_params.as_ref()).await
-    } else {
-        lessons
-    };
+    state.session_lessons =
+        filter_lessons_by_relevance(user_message, lessons, state.memory_model_params.as_ref())
+            .await;
     state.session_lessons_loaded = true;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::should_bootstrap_lessons;
+    use super::{filter_lessons_by_relevance, should_bootstrap_lessons};
     use crate::cli::session::session_state::SessionState;
+
+    fn lesson(action: &str) -> astra_runtime::self_model::LessonHint {
+        astra_runtime::self_model::LessonHint {
+            kind: astra_services::LessonKind::PromptShape,
+            trigger_signal: "memoria".into(),
+            action: action.into(),
+            compact: None,
+            workload_tag: None,
+        }
+    }
 
     #[test]
     fn should_bootstrap_lessons_true_on_fresh_state() {
@@ -183,6 +217,23 @@ mod tests {
         assert!(
             !should_bootstrap_lessons(&state),
             "loaded flag must prevent re-bootstrap"
+        );
+    }
+
+    #[tokio::test]
+    async fn filter_lessons_without_model_params_uses_local_relevance() {
+        let lessons = vec![
+            lesson("Do not treat curl checks as browser verification"),
+            lesson("Prefer cargo test for Rust executor changes"),
+        ];
+
+        let filtered =
+            filter_lessons_by_relevance("review Rust executor code", lessons, None).await;
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            filtered[0].action,
+            "Prefer cargo test for Rust executor changes"
         );
     }
 
@@ -206,6 +257,20 @@ mod tests {
         assert!(
             source.contains("filter_memories"),
             "relevance filtering should delegate to memory_relevance::filter_memories"
+        );
+    }
+
+    #[test]
+    fn session_lesson_feedback_uses_selector_not_keyword_lists() {
+        let source = include_str!("session_lessons.rs");
+        let prod_code = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
+        assert!(
+            prod_code.contains("select_dismissed_memory_indices"),
+            "lesson dismissal should delegate semantic judgment to selector"
+        );
+        assert!(
+            !prod_code.contains("contains(\""),
+            "lesson dismissal must not hard-code natural-language relevance feedback"
         );
     }
 

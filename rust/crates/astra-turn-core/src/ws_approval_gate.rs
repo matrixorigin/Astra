@@ -323,5 +323,10 @@ mod tests {
         assert!(!gate.requires_approval("read_file"));
         assert!(!gate.requires_approval("list_dir"));
         assert!(!gate.requires_approval("grep"));
+
+        assert!(gate.requires_approval_for("git", &json!({"action": "commit"})));
+        assert!(gate.requires_approval_for("github", &json!({"action": "create_issue"})));
+        assert!(!gate.requires_approval_for("git", &json!({"action": "diff"})));
+        assert!(!gate.requires_approval_for("github", &json!({"action": "list_prs"})));
     }
 }

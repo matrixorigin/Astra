@@ -64,7 +64,6 @@ pub async fn build_server_state(
         &matrix_rt,
     );
 
-    crate::server::sweeper_lease::spawn_runtime_sweepers(shared_pool.clone());
     Ok(state.with_matrix_cloud_runtime(Some(matrix_rt)))
 }
 

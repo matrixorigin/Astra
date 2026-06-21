@@ -25,5 +25,6 @@ uuid = { workspace = true }
 hostname = { workspace = true }
 fastrand = "2"
 reqwest = { workspace = true }
+astra-runtime-env.workspace = true
 astra-tools = { path = "../astra-tools" }
 astra-server-types.workspace = true

@@ -1,4 +1,6 @@
-use astra_turn_core::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind};
+use astra_turn_core::cloud_approval_policy::{
+    CloudGatedToolKind, cloud_gated_tool_kind, cloud_gated_tool_kind_with_args,
+};
 use serde_json::Value;
 
 /// Local/legacy mutating tools that are not covered by cloud approval policy.
@@ -19,12 +21,15 @@ pub(crate) fn tool_classified_from_arguments(name: &str) -> bool {
     matches!(
         cloud_gated_tool_kind(name),
         Some(CloudGatedToolKind::Execute)
-    ) || name == "git_worktree"
+    ) || matches!(name, "git" | "github" | "git_worktree")
 }
 
 /// True when a successful call with this tool name is known to invalidate
 /// cached read-only results without inspecting arguments.
 pub(crate) fn tool_name_invalidates_read_cache(name: &str) -> bool {
+    if tool_classified_from_arguments(name) {
+        return false;
+    }
     matches!(cloud_gated_tool_kind(name), Some(CloudGatedToolKind::Write))
         || NON_CLOUD_MUTATION_TOOLS.contains(&name)
 }
@@ -38,6 +43,14 @@ pub fn tool_call_invalidates_read_cache(name: &str, args: Option<&Value>) -> boo
     if !tool_classified_from_arguments(name) {
         return false;
     }
+    if name == "git_worktree" {
+        return git_worktree_invalidates_read_cache(args);
+    }
+    match cloud_gated_tool_kind_with_args(name, args) {
+        Some(CloudGatedToolKind::Write) => return true,
+        Some(CloudGatedToolKind::Execute) => {}
+        None => return false,
+    }
     if matches!(
         cloud_gated_tool_kind(name),
         Some(CloudGatedToolKind::Execute)
@@ -45,9 +58,6 @@ pub fn tool_call_invalidates_read_cache(name: &str, args: Option<&Value>) -> boo
         return args
             .and_then(astra_turn_core::tool_argument_hints::command_hint_from_args)
             .is_some_and(crate::bash_intent::bash_command_looks_mutating);
-    }
-    if name == "git_worktree" {
-        return git_worktree_invalidates_read_cache(args);
     }
     false
 }
@@ -78,10 +88,18 @@ mod tests {
     fn all_cloud_write_tools_invalidate_read_cache() {
         for &name in CLOUD_APPROVAL_REQUIRED_TOOLS.iter() {
             match cloud_gated_tool_kind(name) {
-                Some(CloudGatedToolKind::Write) => assert!(
-                    tool_name_invalidates_read_cache(name),
-                    "write-gated tool must invalidate read cache: {name}"
-                ),
+                Some(CloudGatedToolKind::Write) if tool_classified_from_arguments(name) => {
+                    assert!(
+                        !tool_name_invalidates_read_cache(name),
+                        "args-aware write tool must not invalidate by name alone: {name}"
+                    );
+                }
+                Some(CloudGatedToolKind::Write) => {
+                    assert!(
+                        tool_name_invalidates_read_cache(name),
+                        "write-gated tool must invalidate read cache: {name}"
+                    );
+                }
                 Some(CloudGatedToolKind::Execute) => assert!(
                     !tool_name_invalidates_read_cache(name),
                     "execute tools are classified from arguments: {name}"
@@ -109,6 +127,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn consolidated_git_and_github_invalidate_read_cache_by_action() {
+        assert!(!tool_name_invalidates_read_cache("git"));
+        assert!(!tool_name_invalidates_read_cache("github"));
+
+        assert!(!tool_call_invalidates_read_cache(
+            "git",
+            Some(&serde_json::json!({"action": "diff"}))
+        ));
+        assert!(tool_call_invalidates_read_cache(
+            "git",
+            Some(&serde_json::json!({"action": "commit", "message": "ship"}))
+        ));
+        assert!(!tool_call_invalidates_read_cache(
+            "github",
+            Some(&serde_json::json!({"action": "list_prs"}))
+        ));
+        assert!(tool_call_invalidates_read_cache(
+            "github",
+            Some(&serde_json::json!({"action": "create_issue", "title": "bug"}))
+        ));
     }
 
     #[test]

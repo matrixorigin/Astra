@@ -137,7 +137,7 @@ pub(crate) fn build_external_sources(
     if let Some(ref text) = tool_conditional {
         extra_dynamic_sections.push(crate::prompts::PromptSection::dynamic(
             text.clone(),
-            crate::prompts::PromptTokenBucket::BasePersona,
+            crate::prompts::PromptTokenBucket::Environment,
         ));
     }
 
@@ -795,11 +795,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tool_availability_protocol_is_visible_tool_scoped_in_pipeline_sources() {
+        let ep = serde_json::Map::new();
+        let state = make_state();
+        let sources = build_external_sources(
+            &ep,
+            &state,
+            "hi",
+            &["bash", "read_file", "tool_search"],
+            0.8,
+            None,
+            None,
+        );
+
+        let tool_section = sources
+            .extra_dynamic_sections
+            .iter()
+            .find(|section| section.text.contains("Tool Availability Protocol"))
+            .expect("tool availability protocol should be emitted for visible tools");
+        assert_eq!(
+            tool_section.token_bucket,
+            crate::prompts::PromptTokenBucket::Environment
+        );
+        assert!(
+            tool_section
+                .text
+                .contains("Call a structured tool only if it is visible")
+        );
+        assert!(
+            tool_section
+                .text
+                .contains("tool_search(query=\"select:NAME\")")
+        );
+        for direct_grep_phrase in [
+            "→ grep",
+            "grep for names/usages",
+            "grep callers/imports",
+            "After grep finds",
+        ] {
+            assert!(
+                !tool_section.text.contains(direct_grep_phrase),
+                "pipeline prompt must not instruct direct structured grep when grep is hidden: {direct_grep_phrase}"
+            );
+        }
+    }
+
     // `selected_tool_guidance_is_volatile` was deleted: it asserted on
-    // `## Self-Model` + `Explicit Tool Requests` strings that originated
-    // from the now-empty `self_model_section` / `tool_conditional_section`
-    // bodies (commit a1187f76). The volatile-lane routing contract is
-    // covered by the composite integration tests below.
+    // legacy `## Self-Model` + `Explicit Tool Requests` strings. The
+    // volatile-lane routing contract is covered by the composite integration
+    // tests below.
 
     #[test]
     fn external_sources_empty_memory_when_edge_profile_has_none() {

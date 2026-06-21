@@ -362,13 +362,7 @@ const CWD_MAX_WIDTH: usize = 26;
 const PRIMARY_LEFT_FLOOR_WIDTH: usize = 14;
 
 fn permission_mode_label(mode: PermissionMode) -> &'static str {
-    match mode {
-        PermissionMode::Prompt => "Ask",
-        PermissionMode::Auto => "Auto",
-        PermissionMode::Plan => "Plan",
-        PermissionMode::AcceptEdits => "Edits",
-        PermissionMode::Deny => "Deny",
-    }
+    mode.chip_text()
 }
 
 impl StatusLine {

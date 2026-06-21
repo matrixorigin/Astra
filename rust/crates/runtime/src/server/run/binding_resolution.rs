@@ -11,15 +11,16 @@ use serde_json::{Map, Value};
 
 use crate::server::run::engine::RunStartContext;
 use crate::server::tool_transport::{
-    ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy, ToolTransportKind,
-    WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind, binding_event_fields,
+    ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy,
+    ToolTransportKind, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
+    binding_event_fields,
 };
 
 pub(crate) fn resolve_request_execution_bindings(
     request: &astra_services::runs::ChatRequestData,
     server_workspace: &Path,
 ) -> (WorkspaceBinding, ExecutorBinding) {
-    resolve_request_execution_bindings_from_request(request, Some(server_workspace), None)
+    resolve_request_execution_bindings_from_request(request, Some(server_workspace), None, false)
         .expect("server workspace binding resolution should always succeed")
 }
 
@@ -41,19 +42,31 @@ pub(crate) fn request_uses_server_workspace(
 pub(crate) fn resolve_request_execution_bindings_without_server_workspace(
     request: &astra_services::runs::ChatRequestData,
     edge_profile: &Map<String, Value>,
+    has_edge_tools: bool,
 ) -> Option<(WorkspaceBinding, ExecutorBinding)> {
-    resolve_request_execution_bindings_from_request(request, None, Some(edge_profile))
+    resolve_request_execution_bindings_from_request(
+        request,
+        None,
+        Some(edge_profile),
+        has_edge_tools,
+    )
 }
 
 fn resolve_request_execution_bindings_from_request(
     request: &astra_services::runs::ChatRequestData,
     server_workspace: Option<&Path>,
     edge_profile: Option<&Map<String, Value>>,
+    has_edge_tools: bool,
 ) -> Option<(WorkspaceBinding, ExecutorBinding)> {
     let workspace = match request.workspace_binding.as_ref() {
         Some(binding) => workspace_binding_from_request(binding, server_workspace)?,
         None => match server_workspace {
             Some(server_workspace) => WorkspaceBinding::server_sandbox(server_workspace),
+            None if has_edge_tools => {
+                return Some(execution_bindings_for_legacy_edge_tools(
+                    edge_profile.unwrap_or(&Map::new()),
+                ));
+            }
             None => return edge_profile.map(execution_bindings_from_edge_profile),
         },
     };
@@ -104,10 +117,14 @@ pub(crate) fn execution_bindings_from_edge_profile(
             ToolTransportKind::EdgeLedger,
             ExecutorStatus::Unknown,
         ),
-        _ => ExecutorBinding {
+        WorkspaceBindingKind::None => ExecutorBinding::server_control_plane(),
+        WorkspaceBindingKind::ServerSandbox
+        | WorkspaceBindingKind::CloudWorkspace
+        | WorkspaceBindingKind::Unknown
+        | WorkspaceBindingKind::LocalFilesystem => ExecutorBinding {
             kind: ExecutorBindingKind::Unknown,
-            executor_id: "none".to_string(),
-            display_name: "No executor".to_string(),
+            executor_id: "unknown".to_string(),
+            display_name: "Unknown executor".to_string(),
             transport: ToolTransportKind::Unknown,
             status: ExecutorStatus::Unknown,
         },
@@ -115,10 +132,39 @@ pub(crate) fn execution_bindings_from_edge_profile(
     (workspace, executor)
 }
 
+fn execution_bindings_for_legacy_edge_tools(
+    edge_profile: &Map<String, Value>,
+) -> (WorkspaceBinding, ExecutorBinding) {
+    let cwd = first_non_empty_profile_string(edge_profile, &["cwd", "git_root"]);
+    let executor_id =
+        first_non_empty_profile_string(edge_profile, &["edge_agent_id", "agent_id", "edge_id"])
+            .unwrap_or_else(|| "edge-ledger".to_string());
+    let display_name = first_non_empty_profile_string(
+        edge_profile,
+        &["display_name", "hostname", "edge_agent_id", "agent_id"],
+    )
+    .unwrap_or_else(|| "Edge workspace".to_string());
+
+    let workspace = WorkspaceBinding {
+        kind: WorkspaceBindingKind::EdgeWorkspace,
+        display_name: display_name.clone(),
+        cwd,
+        authority: WorkspaceAuthority::ReadWrite,
+        fallback_policy: FallbackPolicy::Disabled,
+    };
+    let executor = ExecutorBinding::edge_agent(
+        executor_id,
+        display_name,
+        ToolTransportKind::EdgeLedger,
+        ExecutorStatus::Online,
+    );
+    (workspace, executor)
+}
+
 pub(crate) fn execution_bindings_from_metadata(
     metadata: Option<&Value>,
     server_workspace: &Path,
-) -> Option<(WorkspaceBinding, ExecutorBinding)> {
+) -> Option<ExecutionBindingSnapshot> {
     let metadata = metadata?.as_object()?;
     let mut workspace: WorkspaceBinding =
         serde_json::from_value(metadata.get("workspace")?.clone()).ok()?;
@@ -127,7 +173,7 @@ pub(crate) fn execution_bindings_from_metadata(
     }
     let executor: ExecutorBinding =
         serde_json::from_value(metadata.get("executor")?.clone()).ok()?;
-    Some((workspace, executor))
+    Some(ExecutionBindingSnapshot::inferred(workspace, executor))
 }
 
 #[derive(Default)]
@@ -139,12 +185,13 @@ pub(crate) struct RunExecutionBindingSnapshot {
 }
 
 pub(crate) fn agent_working_dir_for_bindings(
-    execution_bindings: Option<&(WorkspaceBinding, ExecutorBinding)>,
+    execution_bindings: Option<&ExecutionBindingSnapshot>,
     runtime_workspace: &Path,
 ) -> PathBuf {
-    let Some((workspace, _)) = execution_bindings else {
+    let Some(snapshot) = execution_bindings else {
         return runtime_workspace.to_path_buf();
     };
+    let workspace = &snapshot.workspace;
     if matches!(workspace.kind, WorkspaceBindingKind::ServerSandbox) {
         return runtime_workspace.to_path_buf();
     }
@@ -199,14 +246,14 @@ pub(crate) fn binding_snapshot_events(
 
 pub(crate) fn run_start_context_from_request(
     request: &astra_services::runs::ChatRequestData,
-    execution_bindings: Option<&(WorkspaceBinding, ExecutorBinding)>,
+    execution_bindings: Option<&ExecutionBindingSnapshot>,
     agent_binding: Option<&astra_services::AgentBindingRecord>,
 ) -> RunStartContext {
     RunStartContext {
         interaction_mode: request.interaction_mode,
         interactive_client: Some(request.interactive_client),
         execution_metadata: execution_bindings
-            .map(|(workspace, executor)| binding_event_fields(workspace, executor)),
+            .map(|snapshot| binding_event_fields(&snapshot.workspace, &snapshot.executor)),
         agent_binding_id: agent_binding.map(|binding| binding.id.clone()).or_else(|| {
             request
                 .agent_binding
@@ -263,17 +310,11 @@ pub(crate) fn executor_binding_from_request(
             executor
         }
         WorkspaceBindingKind::EdgeWorkspace => edge_executor_binding_from_request(binding),
-        WorkspaceBindingKind::UploadedSnapshot | WorkspaceBindingKind::GitCheckout => {
-            hosted_executor_binding_from_request(binding, &workspace.display_name)
+        WorkspaceBindingKind::CloudWorkspace => {
+            cloud_executor_binding_from_request(binding, &workspace.display_name)
         }
-        WorkspaceBindingKind::None => ExecutorBinding {
-            kind: ExecutorBindingKind::Unknown,
-            executor_id: "none".to_string(),
-            display_name: "No executor".to_string(),
-            transport: ToolTransportKind::Unknown,
-            status: ExecutorStatus::Unknown,
-        },
-        WorkspaceBindingKind::Unknown => ExecutorBinding {
+        WorkspaceBindingKind::None => ExecutorBinding::server_control_plane(),
+        WorkspaceBindingKind::Unknown | WorkspaceBindingKind::LocalFilesystem => ExecutorBinding {
             kind: ExecutorBindingKind::Unknown,
             executor_id: "unknown".to_string(),
             display_name: "Unknown executor".to_string(),
@@ -306,7 +347,7 @@ fn workspace_binding_from_request(
                 kind: WorkspaceBindingKind::EdgeWorkspace,
                 display_name: non_empty_string(binding.display_name.as_deref())
                     .unwrap_or_else(|| "Edge workspace".to_string()),
-                cwd: non_empty_string(binding.cwd.as_deref()),
+                cwd: workspace_request_root(binding),
                 authority: binding
                     .authority
                     .map(workspace_authority_from_request)
@@ -317,36 +358,22 @@ fn workspace_binding_from_request(
                     .unwrap_or(FallbackPolicy::Disabled),
             })
         }
-        astra_services::runs::WorkspaceBindingRequestKind::UploadedSnapshot => {
+        astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace => {
             Some(WorkspaceBinding {
-                kind: WorkspaceBindingKind::UploadedSnapshot,
+                kind: WorkspaceBindingKind::CloudWorkspace,
                 display_name: non_empty_string(binding.display_name.as_deref())
-                    .unwrap_or_else(|| "Uploaded snapshot".to_string()),
-                cwd: non_empty_string(binding.cwd.as_deref()),
+                    .unwrap_or_else(|| cloud_workspace_display_name(binding).to_string()),
+                cwd: workspace_request_root(binding),
                 authority: binding
                     .authority
                     .map(workspace_authority_from_request)
-                    .unwrap_or(WorkspaceAuthority::ReadOnly),
+                    .unwrap_or_else(|| cloud_workspace_default_authority(binding)),
                 fallback_policy: binding
                     .fallback_policy
                     .map(fallback_policy_from_request)
                     .unwrap_or(FallbackPolicy::Disabled),
             })
         }
-        astra_services::runs::WorkspaceBindingRequestKind::GitCheckout => Some(WorkspaceBinding {
-            kind: WorkspaceBindingKind::GitCheckout,
-            display_name: non_empty_string(binding.display_name.as_deref())
-                .unwrap_or_else(|| "Git checkout".to_string()),
-            cwd: non_empty_string(binding.cwd.as_deref()),
-            authority: binding
-                .authority
-                .map(workspace_authority_from_request)
-                .unwrap_or(WorkspaceAuthority::ReadWrite),
-            fallback_policy: binding
-                .fallback_policy
-                .map(fallback_policy_from_request)
-                .unwrap_or(FallbackPolicy::Disabled),
-        }),
         astra_services::runs::WorkspaceBindingRequestKind::None => Some(WorkspaceBinding {
             kind: WorkspaceBindingKind::None,
             display_name: non_empty_string(binding.display_name.as_deref())
@@ -359,6 +386,58 @@ fn workspace_binding_from_request(
                 .unwrap_or(FallbackPolicy::Disabled),
         }),
     }
+}
+
+fn cloud_workspace_display_name(
+    binding: &astra_services::runs::WorkspaceBindingRequest,
+) -> &'static str {
+    match binding.source.as_ref() {
+        Some(astra_services::runs::WorkspaceSourceRequest::UploadedSnapshot { .. }) => {
+            "Uploaded snapshot"
+        }
+        Some(astra_services::runs::WorkspaceSourceRequest::GitCheckout { .. }) => "Git checkout",
+        Some(astra_services::runs::WorkspaceSourceRequest::Scratch) => "Scratch workspace",
+        Some(astra_services::runs::WorkspaceSourceRequest::DatasetBundle { .. }) => {
+            "Dataset workspace"
+        }
+        Some(astra_services::runs::WorkspaceSourceRequest::ArtifactBundle { .. }) => {
+            "Artifact workspace"
+        }
+        Some(astra_services::runs::WorkspaceSourceRequest::Template { .. }) => "Template workspace",
+        _ => "Cloud workspace",
+    }
+}
+
+fn cloud_workspace_default_authority(
+    binding: &astra_services::runs::WorkspaceBindingRequest,
+) -> WorkspaceAuthority {
+    match binding.source.as_ref() {
+        Some(astra_services::runs::WorkspaceSourceRequest::UploadedSnapshot { .. })
+        | Some(astra_services::runs::WorkspaceSourceRequest::DatasetBundle { .. })
+        | Some(astra_services::runs::WorkspaceSourceRequest::ArtifactBundle { .. }) => {
+            WorkspaceAuthority::ReadOnly
+        }
+        _ => WorkspaceAuthority::ReadWrite,
+    }
+}
+
+fn workspace_request_root(
+    binding: &astra_services::runs::WorkspaceBindingRequest,
+) -> Option<String> {
+    non_empty_string(binding.root.as_deref()).or_else(|| match binding.source.as_ref()? {
+        astra_services::runs::WorkspaceSourceRequest::EdgePath { path } => {
+            non_empty_string(Some(path.as_str()))
+        }
+        astra_services::runs::WorkspaceSourceRequest::UploadedSnapshot { root, .. } => {
+            non_empty_string(root.as_deref())
+        }
+        astra_services::runs::WorkspaceSourceRequest::GitCheckout { .. }
+        | astra_services::runs::WorkspaceSourceRequest::Template { .. }
+        | astra_services::runs::WorkspaceSourceRequest::DatasetBundle { .. }
+        | astra_services::runs::WorkspaceSourceRequest::ArtifactBundle { .. }
+        | astra_services::runs::WorkspaceSourceRequest::Scratch
+        | astra_services::runs::WorkspaceSourceRequest::PersistentVolume { .. } => None,
+    })
 }
 
 fn edge_executor_binding_from_request(
@@ -387,19 +466,18 @@ fn edge_executor_binding_from_request(
     executor
 }
 
-fn hosted_executor_binding_from_request(
+fn cloud_executor_binding_from_request(
     binding: Option<&astra_services::runs::ExecutorBindingRequest>,
     workspace_display_name: &str,
 ) -> ExecutorBinding {
     let mut executor = ExecutorBinding {
-        kind: ExecutorBindingKind::HostedRunner,
-        executor_id: "hosted-runner".to_string(),
+        kind: ExecutorBindingKind::OrchestratorManaged,
+        executor_id: "orchestrator-managed".to_string(),
         display_name: workspace_display_name.to_string(),
-        transport: ToolTransportKind::RunnerRpc,
-        status: ExecutorStatus::Unknown,
+        transport: ToolTransportKind::SandboxResidentAgent,
+        status: ExecutorStatus::Online,
     };
     if let Some(binding) = binding {
-        executor.kind = executor_kind_from_request(binding.kind);
         if let Some(executor_id) = non_empty_string(binding.executor_id.as_deref()) {
             executor.executor_id = executor_id;
         }
@@ -407,13 +485,27 @@ fn hosted_executor_binding_from_request(
             executor.display_name = display_name;
         }
         if let Some(transport) = binding.transport {
-            executor.transport = tool_transport_from_request(transport);
+            executor.transport = cloud_tool_transport_from_request(transport);
         }
         if let Some(status) = binding.status {
             executor.status = executor_status_from_request(status);
         }
     }
     executor
+}
+
+fn cloud_tool_transport_from_request(
+    transport: astra_services::runs::ToolTransportKindRequest,
+) -> ToolTransportKind {
+    match transport {
+        astra_services::runs::ToolTransportKindRequest::GatewayRelay => {
+            ToolTransportKind::GatewayRelay
+        }
+        astra_services::runs::ToolTransportKindRequest::SandboxResidentAgent => {
+            ToolTransportKind::SandboxResidentAgent
+        }
+        _ => ToolTransportKind::SandboxResidentAgent,
+    }
 }
 
 fn first_non_empty_profile_string(
@@ -448,26 +540,6 @@ fn fallback_policy_from_request(
     }
 }
 
-fn executor_kind_from_request(
-    kind: astra_services::runs::ExecutorBindingRequestKind,
-) -> ExecutorBindingKind {
-    match kind {
-        astra_services::runs::ExecutorBindingRequestKind::ServerLocal => {
-            ExecutorBindingKind::ServerLocal
-        }
-        astra_services::runs::ExecutorBindingRequestKind::EdgeAgent => {
-            ExecutorBindingKind::EdgeAgent
-        }
-        astra_services::runs::ExecutorBindingRequestKind::ThinClient => {
-            ExecutorBindingKind::ThinClient
-        }
-        astra_services::runs::ExecutorBindingRequestKind::Mcp => ExecutorBindingKind::Mcp,
-        astra_services::runs::ExecutorBindingRequestKind::HostedRunner => {
-            ExecutorBindingKind::HostedRunner
-        }
-    }
-}
-
 fn tool_transport_from_request(
     transport: astra_services::runs::ToolTransportKindRequest,
 ) -> ToolTransportKind {
@@ -477,8 +549,13 @@ fn tool_transport_from_request(
         }
         astra_services::runs::ToolTransportKindRequest::EdgeWs => ToolTransportKind::EdgeWs,
         astra_services::runs::ToolTransportKindRequest::EdgeLedger => ToolTransportKind::EdgeLedger,
+        astra_services::runs::ToolTransportKindRequest::GatewayRelay => {
+            ToolTransportKind::GatewayRelay
+        }
+        astra_services::runs::ToolTransportKindRequest::SandboxResidentAgent => {
+            ToolTransportKind::SandboxResidentAgent
+        }
         astra_services::runs::ToolTransportKindRequest::McpHttp => ToolTransportKind::McpHttp,
-        astra_services::runs::ToolTransportKindRequest::RunnerRpc => ToolTransportKind::RunnerRpc,
     }
 }
 
@@ -597,7 +674,8 @@ mod tests {
         request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
             kind: astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox,
             display_name: Some("Requested server".to_string()),
-            cwd: Some("/client/claimed/path".to_string()),
+            root: Some("/client/claimed/path".to_string()),
+            source: None,
             authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
             fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
         });
@@ -624,6 +702,70 @@ mod tests {
     }
 
     #[test]
+    fn cloud_workspace_executor_binding_ignores_local_executor_spoofing() {
+        let mut request = test_request("run in cloud");
+        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+            kind: astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace,
+            display_name: Some("Cloud checkout".to_string()),
+            root: Some("/cloud/checkouts/run-1".to_string()),
+            source: Some(astra_services::runs::WorkspaceSourceRequest::GitCheckout {
+                repository: "https://example.com/org/repo.git".to_string(),
+                reference: None,
+            }),
+            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
+        });
+        request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+            kind: astra_services::runs::ExecutorBindingRequestKind::ServerLocal,
+            executor_id: Some("client-claimed-local".to_string()),
+            display_name: Some("Client claimed local executor".to_string()),
+            transport: Some(astra_services::runs::ToolTransportKindRequest::ServerLocal),
+            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+        });
+
+        let (workspace, executor) =
+            resolve_request_execution_bindings(&request, Path::new("/tmp/server-workspace"));
+
+        assert_eq!(workspace.kind, WorkspaceBindingKind::CloudWorkspace);
+        assert_eq!(executor.kind, ExecutorBindingKind::OrchestratorManaged);
+        assert_eq!(executor.executor_id, "client-claimed-local");
+        assert_eq!(executor.display_name, "Client claimed local executor");
+        assert_eq!(executor.transport, ToolTransportKind::SandboxResidentAgent);
+        assert_eq!(executor.status, ExecutorStatus::Online);
+    }
+
+    #[test]
+    fn cloud_workspace_executor_binding_allows_gateway_relay_transport() {
+        let mut request = test_request("run through provider gateway");
+        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+            kind: astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace,
+            display_name: Some("OpenShell workspace".to_string()),
+            root: Some("/sandbox".to_string()),
+            source: Some(
+                astra_services::runs::WorkspaceSourceRequest::PersistentVolume {
+                    volume_id: "openshell-workspace-1".to_string(),
+                },
+            ),
+            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
+        });
+        request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+            kind: astra_services::runs::ExecutorBindingRequestKind::OrchestratorManaged,
+            executor_id: Some("openshell-gateway".to_string()),
+            display_name: Some("OpenShell Gateway".to_string()),
+            transport: Some(astra_services::runs::ToolTransportKindRequest::GatewayRelay),
+            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+        });
+
+        let (_workspace, executor) =
+            resolve_request_execution_bindings(&request, Path::new("/tmp/server-workspace"));
+
+        assert_eq!(executor.kind, ExecutorBindingKind::OrchestratorManaged);
+        assert_eq!(executor.transport, ToolTransportKind::GatewayRelay);
+        assert_eq!(executor.executor_id, "openshell-gateway");
+    }
+
+    #[test]
     fn request_bindings_without_server_workspace_use_edge_profile_for_default_request() {
         let mut edge_profile = Map::new();
         edge_profile.insert("cwd".to_string(), Value::String("/repo".to_string()));
@@ -634,9 +776,12 @@ mod tests {
         edge_profile.insert("hostname".to_string(), Value::String("devbox".to_string()));
         let request = test_request("hello");
 
-        let (workspace, executor) =
-            resolve_request_execution_bindings_without_server_workspace(&request, &edge_profile)
-                .expect("edge profile should resolve");
+        let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
+            &request,
+            &edge_profile,
+            false,
+        )
+        .expect("edge profile should resolve");
 
         assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
         assert_eq!(workspace.cwd.as_deref(), Some("/repo"));
@@ -652,15 +797,41 @@ mod tests {
         request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
             kind: astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox,
             display_name: None,
-            cwd: None,
+            root: None,
+            source: None,
             authority: None,
             fallback_policy: None,
         });
 
         assert!(
-            resolve_request_execution_bindings_without_server_workspace(&request, &Map::new())
-                .is_none()
+            resolve_request_execution_bindings_without_server_workspace(
+                &request,
+                &Map::new(),
+                false
+            )
+            .is_none()
         );
+    }
+
+    #[test]
+    fn legacy_edge_tools_without_profile_still_bind_to_edge_ledger() {
+        let request = test_request("use client tools");
+
+        let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
+            &request,
+            &Map::new(),
+            true,
+        )
+        .expect("legacy edge tools should resolve to edge ledger bindings");
+
+        assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
+        assert_eq!(workspace.display_name, "Edge workspace");
+        assert_eq!(workspace.cwd, None);
+        assert_eq!(workspace.authority, WorkspaceAuthority::ReadWrite);
+        assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
+        assert_eq!(executor.executor_id, "edge-ledger");
+        assert_eq!(executor.transport, ToolTransportKind::EdgeLedger);
+        assert_eq!(executor.status, ExecutorStatus::Online);
     }
 
     #[test]
@@ -682,12 +853,15 @@ mod tests {
             }
         });
 
-        let (workspace, executor) =
+        let snapshot =
             execution_bindings_from_metadata(Some(&metadata), Path::new("/current/workspace"))
                 .expect("metadata should resolve");
+        let workspace = &snapshot.workspace;
+        let executor = &snapshot.executor;
 
         assert_eq!(workspace.kind, WorkspaceBindingKind::ServerSandbox);
         assert_eq!(workspace.cwd.as_deref(), Some("/current/workspace"));
         assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
+        assert!(snapshot.runtime.is_none());
     }
 }

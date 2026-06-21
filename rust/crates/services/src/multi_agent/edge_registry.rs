@@ -18,6 +18,7 @@ pub struct EdgeAgentRecord {
     pub edge_id: String,
     pub hostname: Option<String>,
     pub worktree_path: Option<String>,
+    pub capabilities: Option<serde_json::Value>,
     pub registered_at: String,
     pub last_heartbeat_at: String,
 }
@@ -86,6 +87,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
         worktree_path: Option<&str>,
         capabilities: Option<serde_json::Value>,
     ) -> Result<EdgeAgentRecord, String> {
+        let capabilities_for_record = capabilities.clone();
         let cap_json = capabilities
             .map(|v| serde_json::to_string(&v))
             .transpose()
@@ -153,6 +155,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                     edge_id: edge_id_header.to_string(),
                     hostname: hostname.map(|s| s.to_string()),
                     worktree_path: worktree_path.map(|s| s.to_string()),
+                    capabilities: capabilities_for_record.clone(),
                     registered_at,
                     last_heartbeat_at: now,
                 });
@@ -195,6 +198,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                         edge_id: edge_id_header.to_string(),
                         hostname: hostname.map(|s| s.to_string()),
                         worktree_path: worktree_path.map(|s| s.to_string()),
+                        capabilities: capabilities_for_record.clone(),
                         registered_at,
                         last_heartbeat_at,
                     });
@@ -250,7 +254,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
     #[tracing::instrument(skip(self), fields(user_id = %user_id))]
     async fn list_by_user(&self, user_id: &str) -> Result<Vec<EdgeAgentRecord>, String> {
         let rows = sqlx::query(
-            "SELECT registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
+            "SELECT registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, capabilities_json, \
              CAST(registered_at AS CHAR) AS registered_at, CAST(last_heartbeat_at AS CHAR) AS last_heartbeat_at \
              FROM edge_agent_registry WHERE user_id = ? ORDER BY last_heartbeat_at DESC",
         )
@@ -268,6 +272,11 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                     edge_id: r.try_get("edge_id").map_err(|e| e.to_string())?,
                     hostname: r.try_get("hostname").ok().flatten(),
                     worktree_path: r.try_get("worktree_path").ok().flatten(),
+                    capabilities: r
+                        .try_get::<Option<String>, _>("capabilities_json")
+                        .ok()
+                        .flatten()
+                        .and_then(|raw| serde_json::from_str(&raw).ok()),
                     registered_at: r.try_get::<String, _>("registered_at").unwrap_or_default(),
                     last_heartbeat_at: r
                         .try_get::<String, _>("last_heartbeat_at")

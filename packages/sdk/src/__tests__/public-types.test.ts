@@ -20,8 +20,9 @@ describe('public SDK types', () => {
       fallback_policy: 'disabled',
     };
     const executor: ExecutorBinding = {
-      kind: 'edge_agent',
-      executor_id: 'edge-1',
+      kind: 'orchestrator_managed',
+      executor_id: 'orchestrator-managed',
+      transport: 'sandbox_resident_agent',
       status: 'online',
     };
     const state: WorkspaceState = {
@@ -31,7 +32,7 @@ describe('public SDK types', () => {
       waitingFor: 'executor_offline',
       workspace,
       executor,
-      transport: 'edge_ws',
+      transport: 'sandbox_resident_agent',
       fallbackPolicy: 'disabled',
       messages: [],
       toolCalls: [],
@@ -53,7 +54,7 @@ describe('public SDK types', () => {
       tool_call: { id: 'call-1', function: { name: 'bash' } },
       workspace,
       executor,
-      transport: 'edge_ws',
+      transport: 'sandbox_resident_agent',
       fallback_policy: 'disabled',
     };
     const runError: RunErrorEvent = {

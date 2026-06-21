@@ -31,5 +31,8 @@ pub use memory_structure::{
 };
 pub use memory_writability::{is_transient_runtime_status_text, should_store_in_memory};
 pub use result_quality::{ResultQuality, classify_result, quality_feedback};
-pub use runtime_scaffolding::{SCAFFOLDING_BODY_PREFIXES, is_runtime_scaffolding_message};
+pub use runtime_scaffolding::{
+    SCAFFOLDING_BODY_PREFIXES, is_runtime_scaffolding_message,
+    scaffolding_body_prefixes_for_filtering,
+};
 pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};

@@ -10,8 +10,8 @@ use std::sync::Arc;
 use astra_core::SkillSearchSettings;
 use astra_runtime::{
     orchestration::{
-        PermissionSummary, SpawnAgentExecutor, SpawnRunConfig, SpawnRunResult,
-        spawn_completion_status_from_finish_reason,
+        InheritedPermissions, PermissionSummary, SpawnAgentExecutor, SpawnRunConfig,
+        SpawnRunResult, spawn_completion_status_from_finish_reason,
     },
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
@@ -29,7 +29,6 @@ use astra_turn_core::agent_live_event::SharedAgentLiveEventSink;
 use serde_json::{Value, json};
 
 use super::chat_stream::StreamEvent;
-use super::permission_manager::PermissionMode;
 use super::skill_subrun::SubRunHost;
 use crate::edge_tools;
 
@@ -56,7 +55,6 @@ pub struct CliSpawnAgentExecutor {
     /// falls back to `self.token` for parity with the pre-fix behaviour.
     token_provider: Option<TokenProvider>,
     project_root: PathBuf,
-    permission_mode: PermissionMode,
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     skill_resolver: Option<Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     skill_search: SkillSearchSettings,
@@ -311,7 +309,6 @@ impl CliSpawnAgentExecutor {
         api: astra_thin_client::ThinClient,
         token: String,
         project_root: PathBuf,
-        permission_mode: PermissionMode,
         cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     ) -> Self {
         Self {
@@ -319,7 +316,6 @@ impl CliSpawnAgentExecutor {
             token,
             token_provider: None,
             project_root,
-            permission_mode,
             cancel_token,
             skill_resolver: None,
             skill_search: SkillSearchSettings::default(),
@@ -450,22 +446,11 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         let agent_id_for_terminal = config.agent_id.clone();
         let started_at = std::time::Instant::now();
 
-        // Create permission manager - use inherited permissions if available
-        let perm_manager = if let Some(ref inherited) = config.inherited_permissions {
-            super::permission_manager::PermissionManager::with_inherited(
-                &self.project_root,
-                inherited.clone(),
-            )
-        } else {
-            // Issue #326 P5b: spawned agent sub-run is headless
-            // when no inherited permissions are provided either.
-            // Either way, project allow rules don't apply.
-            super::permission_manager::PermissionManager::with_load_policy(
-                self.permission_mode,
-                &self.project_root,
-                &super::permission_manager::PermissionLoadPolicy::HeadlessSafe,
-            )
-        };
+        let inherited_permissions: InheritedPermissions = config.inherited_permissions.clone();
+        let perm_manager = super::permission_manager::PermissionManager::with_inherited(
+            &self.project_root,
+            inherited_permissions,
+        );
 
         // Use the working directory from config (may be a worktree)
         let effective_root = config.working_dir.clone();
@@ -734,6 +719,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             api_token: token.clone(),
             delegation_engine: None,
             delegations_this_turn: 0,
+            delegation_chain: Vec::new(),
+            self_agent_id: "spawn_subrun".to_string(),
             project_context: None,
             checkpoint_gate: None,
             last_llm_context_manifest_trace: None,
@@ -753,7 +740,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             max_cumulative_tokens: 0,
             thinking: child_thinking,
             recent_file_reads: Vec::new(),
-            permission_context: config.permission_context,
+            permission_context: Some(config.permission_context),
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
@@ -789,34 +776,40 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         let prompt_tokens = state.total_prompt;
         let completion_tokens = state.total_completion;
         let duration_ms = start_time.elapsed().as_millis() as u64;
-        let (permission_summary, permission_requests, permission_requests_approved, tools_blocked) =
-            if let Some(ctx) = state.permission_context.as_ref() {
-                let ctx_guard = ctx.read().await;
-                let telemetry = ctx_guard.telemetry();
-                let mode = match ctx_guard.mode() {
-                    astra_runtime::orchestration::PermissionMode::Auto => "auto".to_string(),
-                    astra_runtime::orchestration::PermissionMode::Plan => "plan".to_string(),
-                    astra_runtime::orchestration::PermissionMode::AcceptEdits => {
-                        "accept_edits".to_string()
-                    }
-                    astra_runtime::orchestration::PermissionMode::Prompt => "prompt".to_string(),
-                    astra_runtime::orchestration::PermissionMode::Deny => "deny".to_string(),
-                };
-                (
-                    Some(PermissionSummary {
-                        mode,
-                        allow_rules: ctx_guard.effective_allow_rule_count(),
-                        deny_rules: ctx_guard.effective_deny_rule_count(),
-                        has_parent: has_parent_permissions,
-                        recent_denials: telemetry.recent_denials.clone(),
-                    }),
-                    telemetry.permission_requests,
-                    telemetry.permission_requests_approved,
-                    telemetry.tools_blocked,
-                )
-            } else {
-                (None, 0, 0, 0)
-            };
+        let ctx = match state.permission_context.as_ref() {
+            Some(ctx) => ctx,
+            None => {
+                // Fail with an actionable error rather than panicking the
+                // whole process. A missing permission_context means the
+                // spawn path didn't wire runtime permissions into the child
+                // agent state — surface it so the caller can fix the config
+                // instead of crashing the CLI.
+                return Err(format!(
+                    "spawned agent {agent_id} (run_id={run_id}) completed without a runtime permission_context; \
+                     the spawn path must install `permission_context` into SpawnRunConfig before delegating to the agentic loop"
+                ));
+            }
+        };
+        let ctx_guard = ctx.read().await;
+        let telemetry = ctx_guard.telemetry();
+        let mode = match ctx_guard.mode() {
+            astra_runtime::orchestration::PermissionMode::Auto => "auto".to_string(),
+            astra_runtime::orchestration::PermissionMode::Plan => "plan".to_string(),
+            astra_runtime::orchestration::PermissionMode::AcceptEdits => "accept_edits".to_string(),
+            astra_runtime::orchestration::PermissionMode::Prompt => "prompt".to_string(),
+            astra_runtime::orchestration::PermissionMode::Deny => "deny".to_string(),
+        };
+        let permission_summary = Some(PermissionSummary {
+            mode,
+            allow_rules: ctx_guard.effective_allow_rule_count(),
+            deny_rules: ctx_guard.effective_deny_rule_count(),
+            has_parent: has_parent_permissions,
+            recent_denials: telemetry.recent_denials.clone(),
+        });
+        let permission_requests = telemetry.permission_requests;
+        let permission_requests_approved = telemetry.permission_requests_approved;
+        let tools_blocked = telemetry.tools_blocked;
+        drop(ctx_guard);
 
         // Derive finish_reason from the structured interruption
         // record if present. This surfaces budget exhaustion /
@@ -877,6 +870,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     )
                     .to_string(),
                     finish_reason: finish_reason_from_state.unwrap_or_else(|| "normal".to_string()),
+                    cancelled_by_user: None,
                     output: Some(state.final_text),
                     error: None,
                     prompt_tokens,
@@ -907,6 +901,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     status: "cancelled".to_string(),
                     finish_reason: finish_reason_from_state
                         .unwrap_or_else(|| "cancelled".to_string()),
+                    cancelled_by_user: Some(true),
                     output: if state.final_text.is_empty() {
                         None
                     } else {
@@ -936,6 +931,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     run_id,
                     status: "failed".to_string(),
                     finish_reason: finish_reason_from_state.unwrap_or_else(|| "failed".to_string()),
+                    cancelled_by_user: None,
                     output: if state.final_text.is_empty() {
                         None
                     } else {
@@ -962,6 +958,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     status: "waiting".to_string(),
                     finish_reason: finish_reason_from_state
                         .unwrap_or_else(|| "waiting".to_string()),
+                    cancelled_by_user: None,
                     output: Some(reason),
                     error: None,
                     prompt_tokens,
@@ -994,7 +991,10 @@ mod tests {
         CliSpawnAgentExecutor, TokenProvider, agent_live_stream_event_sink, build_child_messages,
     };
     use crate::lock_recovery::LockRecovery;
-    use astra_runtime::orchestration::{SpawnAgentExecutor, SpawnRunConfig};
+    use astra_runtime::orchestration::{
+        InheritedPermissions, PermissionMode, PermissionSyncContext, SpawnAgentExecutor,
+        SpawnRunConfig,
+    };
     use astra_turn_core::agent_live_event::{
         AgentLiveEvent, AgentLiveEventKind, AgentLiveEventSink, AgentLiveSendError,
     };
@@ -1003,7 +1003,14 @@ mod tests {
     use std::sync::Arc;
 
     use crate::cli::chat_stream::StreamEvent;
-    use crate::cli::permission_manager::PermissionMode;
+    fn test_permission_context() -> (
+        InheritedPermissions,
+        astra_runtime::orchestration::PermissionSyncHandle,
+    ) {
+        let inherited_permissions = InheritedPermissions::new(PermissionMode::Prompt);
+        let permission_context = PermissionSyncContext::shared(inherited_permissions.clone());
+        (inherited_permissions, permission_context)
+    }
 
     #[derive(Debug, Default)]
     struct RecordingLiveSink(std::sync::Mutex<Vec<AgentLiveEvent>>);
@@ -1018,13 +1025,8 @@ mod tests {
     #[test]
     fn test_executor_creation() {
         let api = astra_thin_client::ThinClient::new("http://test", None).expect("test api");
-        let executor = CliSpawnAgentExecutor::new(
-            api,
-            "token".to_string(),
-            PathBuf::from("/tmp"),
-            PermissionMode::Prompt,
-            None,
-        );
+        let executor =
+            CliSpawnAgentExecutor::new(api, "token".to_string(), PathBuf::from("/tmp"), None);
         assert!(executor.skill_resolver.is_none());
         assert!(
             executor.token_provider.is_none(),
@@ -1037,14 +1039,9 @@ mod tests {
     #[test]
     fn resolve_effective_model_prefers_spawn_model_then_default() {
         let api = astra_thin_client::ThinClient::new("http://test", None).expect("test api");
-        let executor = CliSpawnAgentExecutor::new(
-            api,
-            "token".to_string(),
-            PathBuf::from("/tmp"),
-            PermissionMode::Prompt,
-            None,
-        )
-        .with_default_model(Some("session-default".to_string()));
+        let executor =
+            CliSpawnAgentExecutor::new(api, "token".to_string(), PathBuf::from("/tmp"), None)
+                .with_default_model(Some("session-default".to_string()));
 
         assert_eq!(
             executor
@@ -1101,7 +1098,6 @@ mod tests {
             api.clone(),
             "stale-token".to_string(),
             PathBuf::from("/tmp"),
-            PermissionMode::Prompt,
             None,
         );
         assert_eq!(
@@ -1119,7 +1115,6 @@ mod tests {
             api,
             "stale-frozen-fallback".to_string(),
             PathBuf::from("/tmp"),
-            PermissionMode::Prompt,
             None,
         )
         .with_token_provider(provider);
@@ -1150,7 +1145,6 @@ mod tests {
             api,
             "fallback-token".to_string(),
             PathBuf::from("/tmp"),
-            PermissionMode::Prompt,
             None,
         )
         .with_token_provider(provider);
@@ -1166,14 +1160,9 @@ mod tests {
     async fn async_token_provider_panic_surfaces_instead_of_using_stale_fallback() {
         let api = astra_thin_client::ThinClient::new("http://test", None).expect("test api");
         let provider: TokenProvider = std::sync::Arc::new(|| panic!("token store poisoned"));
-        let executor = CliSpawnAgentExecutor::new(
-            api,
-            "stale-token".to_string(),
-            PathBuf::from("/tmp"),
-            PermissionMode::Prompt,
-            None,
-        )
-        .with_token_provider(provider);
+        let executor =
+            CliSpawnAgentExecutor::new(api, "stale-token".to_string(), PathBuf::from("/tmp"), None)
+                .with_token_provider(provider);
 
         let err = executor.resolve_token_async().await.unwrap_err();
         assert!(
@@ -1187,14 +1176,10 @@ mod tests {
         let api = astra_thin_client::ThinClient::new("http://test", None).expect("test api");
         let provider: TokenProvider = std::sync::Arc::new(|| panic!("token store poisoned"));
         let live_sink = Arc::new(RecordingLiveSink::default());
-        let executor = CliSpawnAgentExecutor::new(
-            api,
-            "stale-token".to_string(),
-            PathBuf::from("/tmp"),
-            PermissionMode::Prompt,
-            None,
-        )
-        .with_token_provider(provider);
+        let (inherited_permissions, permission_context) = test_permission_context();
+        let executor =
+            CliSpawnAgentExecutor::new(api, "stale-token".to_string(), PathBuf::from("/tmp"), None)
+                .with_token_provider(provider);
 
         let err = executor
             .execute(SpawnRunConfig {
@@ -1212,14 +1197,15 @@ mod tests {
                 mailbox: None,
                 progress_emitter: None,
                 context_cache: None,
-                inherited_permissions: None,
+                inherited_permissions,
                 parent_address: None,
-                permission_context: None,
+                permission_context,
                 inherited_skills: Vec::new(),
                 live_event_sink: Some(live_sink.clone()),
                 inherited_prefix: None,
                 execution_metadata: None,
                 is_fork_child: false,
+                delegation_chain: Vec::new(),
             })
             .await
             .expect_err("token provider panic should fail execute");

@@ -6,18 +6,20 @@ use super::*;
 use astra_turn_core::edge_prompt_context::make_args_preview;
 use astra_turn_core::headless_tool_assembly::{
     READ_ONLY_TOOLS, headless_idempotency_hit_openai_pair,
-    headless_openai_duplicate_within_turn_pair, headless_unknown_local_tool_openai_pair,
-    openai_tool_roundtrip_values, unknown_local_tool_error_message,
+    headless_openai_duplicate_within_turn_pair, openai_tool_roundtrip_values,
+    unknown_local_tool_error_message,
 };
 use astra_turn_core::headless_tool_body_preview::emit_headless_tool_body_preview;
 use astra_turn_core::headless_tool_journal::{
     journal_record_blocked_tool, journal_record_cross_turn_cache_hit,
-    journal_record_duplicate_within_turn, journal_record_unknown_tool,
+    journal_record_duplicate_within_turn, journal_record_tool_not_admitted,
+    journal_record_unknown_tool,
 };
 use astra_turn_core::headless_tool_stderr_lines::{
     headless_stderr_cache_hit_line, headless_stderr_unknown_tool_detail,
     headless_stderr_unknown_tool_header,
 };
+use astra_turn_core::tool::deferred_activation::tool_not_admitted_message;
 use astra_turn_core::tool_result_semantics::tool_dedup_signature;
 
 const OUTCOME_MEMORY_FAILURE_BLOCK_WINDOW: usize = 2;
@@ -39,8 +41,10 @@ fn emit_blocked_tool_result(
     tool_call_records: &mut Vec<ToolCallRecord>,
 ) {
     step_recorder.begin_tool_with_key(blocked.name, blocked.id, None);
-    step_recorder.skip_tool_with_reason(
+    step_recorder.skip_tool_with_reason_and_metadata(
         blocked.name,
+        Some(blocked.id),
+        None,
         blocked.reason_code,
         false,
         Some(&blocked.err_msg),
@@ -60,6 +64,34 @@ fn emit_blocked_tool_result(
     ));
 }
 
+/// Decide which denial body to emit for a name the validator rejected.
+///
+/// First-principle: the model can only act on what we have already told it
+/// about. If `name` appears in this turn's `<deferred_tools>` manifest, it
+/// has been advertised — denying with the bare "Unknown tool" copy contradicts
+/// the prompt. Surface the activation hint instead. Otherwise the name is
+/// truly hallucinated; preserve the legacy "Unknown tool. Available: …" body
+/// so the model can self-correct.
+fn validator_denial_body(
+    name: &str,
+    valid_tool_names: &std::collections::HashSet<String>,
+    deferred_tool_names: &std::collections::HashSet<String>,
+) -> String {
+    if deferred_tool_names.contains(name) {
+        tool_not_admitted_message(name, true)
+    } else if deferred_tool_names.is_empty() && valid_tool_names.contains("tool_search") {
+        format!(
+            "Error: Tool '{name}' is not visible in this turn's `tools[]`. \
+             If you expect it to be deferred, first call `tool_search` with \
+             `query=\"select:{name}\"` to fetch the full schema. If \
+             `tool_search` reports it missing, use one of the currently \
+             visible tools instead."
+        )
+    } else {
+        unknown_local_tool_error_message(name, valid_tool_names)
+    }
+}
+
 fn trace_short_circuit_tool_skip(
     step_recorder: &mut astra_pipeline::step_recorder::StepRecorder,
     tool_id: &str,
@@ -76,15 +108,23 @@ fn trace_short_circuit_tool_skip(
         idempotency_key,
         args_preview,
     );
-    step_recorder.skip_tool_with_reason(tool_name, reason, was_cached, output);
+    step_recorder.skip_tool_with_reason_and_metadata(
+        tool_name,
+        Some(tool_id),
+        args_preview,
+        reason,
+        was_cached,
+        output,
+    );
 }
 
 impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
     pub(super) fn emit_turn_budget_stub(&mut self, slot: &HeadlessResolvedToolSlot) {
         let body = format!(
-            "⛔ Per-turn tool budget exhausted ({max_tools_per_turn} tools). \
-             Skipping this call. Prioritize the most important remaining \
-             tools in your next response — do not repeat all skipped calls.",
+            "⛔ Current-turn tool budget exhausted ({max_tools_per_turn} tools for the \
+             latest user request). Skipping this call. Do not repeat skipped calls \
+             in this turn; answer with the current state unless the user sends a \
+             new request.",
             max_tools_per_turn = self.ctx.max_tools_per_turn,
         );
         trace_short_circuit_tool_skip(
@@ -120,7 +160,11 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             slot.id,
             raw_tc.as_deref().unwrap_or("(synthetic edge)")
         );
-        let err_msg = unknown_local_tool_error_message(&slot.name, self.ctx.valid_tool_names);
+        let err_msg = validator_denial_body(
+            &slot.name,
+            self.ctx.valid_tool_names,
+            self.ctx.deferred_tool_names,
+        );
         if !self.ctx.quiet {
             self.ctx.term.emit_line(
                 HeadlessStderrStyle::Red,
@@ -131,11 +175,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 headless_stderr_unknown_tool_detail(&err_msg),
             );
         }
-        let (tool_msg, err_tr) = headless_unknown_local_tool_openai_pair(
-            &slot.id,
-            &slot.name,
-            self.ctx.valid_tool_names,
-        );
+        let (tool_msg, err_tr) =
+            openai_tool_roundtrip_values(&slot.id, &slot.name, err_msg.as_str());
         trace_short_circuit_tool_skip(
             self.ctx.step_recorder,
             &slot.id,
@@ -207,7 +248,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 let body = if prior_cache_hits >= self.ctx.repeated_cache_hit_suppression as usize {
                     skip_reason = REASON_REPEATED_CACHE_HIT_SUPPRESSED;
                     format!(
-                        "⛔ Repeated cached read suppressed: this exact {} request has already \
+                        "Repeated cached read skipped: this exact {} request has already \
                          been served from cache {} time(s). Use the earlier cached result in the \
                          conversation instead of calling again; if you need different evidence, \
                          change the arguments.",
@@ -215,7 +256,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     )
                 } else {
                     format!(
-                        "⛔ Cached repeat (call #{} for identical args, limit: {}). \
+                        "Cached repeat skipped (call #{} for identical args, limit: {}). \
                          The result is already in this conversation from an earlier call. \
                          Do NOT call this tool again with the same arguments.",
                         *count, self.ctx.max_identical_calls
@@ -292,8 +333,10 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     Some(&cache_key),
                     args_preview.as_deref(),
                 );
-                self.ctx.step_recorder.skip_tool_with_reason(
+                self.ctx.step_recorder.skip_tool_with_reason_and_metadata(
                     &slot.name,
+                    Some(&slot.id),
+                    args_preview.as_deref(),
                     REASON_REPEATED_CACHE_HIT_SUPPRESSED,
                     true,
                     Some(&body),
@@ -345,11 +388,15 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 Some(&cache_key),
                 args_preview.as_deref(),
             );
-            self.ctx.step_recorder.record_cache_hit_with_reason(
-                &slot.name,
-                cached.clone(),
-                "cached_cross_turn",
-            );
+            self.ctx
+                .step_recorder
+                .record_cache_hit_with_reason_and_metadata(
+                    &slot.name,
+                    Some(&slot.id),
+                    args_preview.as_deref(),
+                    cached.clone(),
+                    "cached_cross_turn",
+                );
             self.ctx
                 .turn_guard
                 .record_cache_hit_for_signature(&slot.name, &call_sig);
@@ -488,8 +535,18 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         );
 
         if !self.ctx.valid_tool_names.contains(&execution.name) {
-            let err_msg =
-                unknown_local_tool_error_message(&execution.name, self.ctx.valid_tool_names);
+            let err_msg = validator_denial_body(
+                &execution.name,
+                self.ctx.valid_tool_names,
+                self.ctx.deferred_tool_names,
+            );
+            let is_deferred_not_admitted = self.ctx.deferred_tool_names.contains(&execution.name);
+            let skip_reason = if is_deferred_not_admitted {
+                "tool_not_admitted"
+            } else {
+                "unknown_tool"
+            };
+            let args_preview = make_args_preview(&execution.name, &execution.args);
             if !self.ctx.quiet {
                 self.ctx.term.emit_line(
                     HeadlessStderrStyle::Red,
@@ -500,30 +557,39 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     headless_stderr_unknown_tool_detail(&err_msg),
                 );
             }
-            let (tool_msg, err_tr) = headless_unknown_local_tool_openai_pair(
-                &execution.id,
-                &execution.name,
-                self.ctx.valid_tool_names,
-            );
+            let (tool_msg, err_tr) =
+                openai_tool_roundtrip_values(&execution.id, &execution.name, err_msg.as_str());
             trace_short_circuit_tool_skip(
                 self.ctx.step_recorder,
                 &execution.id,
                 &execution.name,
-                "unknown_tool",
+                skip_reason,
                 None,
-                make_args_preview(&execution.name, &execution.args).as_deref(),
+                args_preview.as_deref(),
                 Some(&err_msg),
                 false,
             );
             self.ctx.messages.push(tool_msg);
             self.ctx.tool_results.push(err_tr);
-            self.ctx.tool_call_records.push(journal_record_unknown_tool(
-                execution.name.clone(),
-                execution.early_exit_ms,
-            ));
-            // Unknown local tool names are catalog misses, not runtime failures.
-            // Do not persist them into ToolHealth/deprioritized state; otherwise
-            // removed tools keep resurfacing as "failed repeatedly" context.
+            if is_deferred_not_admitted {
+                self.ctx
+                    .tool_call_records
+                    .push(journal_record_tool_not_admitted(
+                        execution.name.clone(),
+                        args_preview,
+                        &err_msg,
+                        execution.early_exit_ms,
+                    ));
+            } else {
+                self.ctx.tool_call_records.push(journal_record_unknown_tool(
+                    execution.name.clone(),
+                    execution.early_exit_ms,
+                ));
+            }
+            // Catalog misses and not-yet-activated deferred names are caller
+            // protocol issues, not runtime failures. Do not persist them into
+            // ToolHealth/deprioritized state; otherwise removed or deferred
+            // tools keep resurfacing as "failed repeatedly" context.
             return HeadlessPipelineStage::ShortCircuit;
         }
 
@@ -541,6 +607,31 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             mut execution,
             idem_key,
         } = validated;
+        if let Some(err_msg) = edge_result_runtime_environment_denial(&execution) {
+            emit_blocked_tool_result(
+                HeadlessBlockedTool {
+                    id: &execution.id,
+                    name: &execution.name,
+                    args: &execution.args,
+                    reason_code: "edge_runtime_capability_denied",
+                    journal_reason: err_msg.clone(),
+                    err_msg,
+                    early_exit_ms: execution.early_exit_ms,
+                    status_line: Some(format!(
+                        "  ⚠ Edge runtime capability denied: {}",
+                        execution.name
+                    )),
+                },
+                self.ctx.step_recorder,
+                self.ctx.quiet,
+                self.ctx.term,
+                self.ctx.messages,
+                self.ctx.tool_results,
+                self.ctx.tool_call_records,
+            );
+            return HeadlessPipelineStage::ShortCircuit;
+        }
+
         if self.ctx.restricted_tools.contains(&execution.name) {
             // The fallback recommendation has to know which tools
             // the model could actually call this turn — without
@@ -802,4 +893,39 @@ fn nonprogress_backoff_message(
         ),
         format!("  ⚠ Busy-poll backoff: {tool_name} (~{remaining_secs}s)"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn names<const N: usize>(values: [&str; N]) -> HashSet<String> {
+        values.into_iter().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn validator_denial_for_deferred_grep_uses_activation_hint() {
+        let valid = names(["tool_search", "bash"]);
+        let deferred = names(["grep"]);
+
+        let body = validator_denial_body("grep", &valid, &deferred);
+
+        assert!(body.contains("not available in this turn yet"));
+        assert!(body.contains("`<deferred_tools>`"));
+        assert!(body.contains("tool_search"));
+        assert!(body.contains("query=\"select:grep\""));
+        assert!(!body.contains("Unknown tool"));
+    }
+
+    #[test]
+    fn validator_denial_for_hidden_non_deferred_tool_stays_unknown() {
+        let valid = names(["tool_search", "bash"]);
+        let deferred = names(["agent"]);
+
+        let body = validator_denial_body("grep", &valid, &deferred);
+
+        assert!(body.contains("Unknown tool"));
+        assert!(!body.contains("query=\"select:grep\""));
+    }
 }

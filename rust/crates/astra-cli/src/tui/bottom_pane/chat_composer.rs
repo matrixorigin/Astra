@@ -53,7 +53,7 @@ const PASTE_INLINE_MAX_CHARS: usize = 800;
 const PASTE_INLINE_MAX_LINES: usize = 2;
 const COMPOSER_PLACEHOLDER: &str = "Message astra";
 const IDLE_COMPOSER_HELPER: &str = "Ctrl+E editor · Shift+Enter newline";
-const ACTIVE_TURN_HELPER: &str = "Queued for next tool · Ctrl+C stops";
+const ACTIVE_TURN_HELPER: &str = "Enter queues follow-up · Ctrl+C stops";
 
 impl ChatComposer {
     pub fn new() -> Self {
@@ -418,7 +418,7 @@ impl ChatComposer {
         }
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer, task_active: bool) {
+    pub fn render(&self, area: Rect, buf: &mut Buffer, task_active: bool, queueing: bool) {
         if area.height == 0 || area.width == 0 {
             return;
         }
@@ -432,18 +432,32 @@ impl ChatComposer {
         let content_h = area.height.saturating_sub(top_inset);
         let content_area = Rect::new(area.x, content_y, area.width, content_h.max(1));
 
-        // Keep the composer prompt visible without shouting. The
-        // submit flash still upgrades it to the full accent to signal
-        // that the input was accepted.
+        // Mode-shift feedback: when a deferred follow-up is queued, the
+        // composer's Enter semantics change from "send now" to "enqueue".
+        // That shift must be visible at a glance — otherwise the user
+        // hits Enter expecting a send and the input silently lands in a
+        // queue they didn't realize was active. Two signals combine:
+        //   1. the prefix glyph flips `·` → `»` (queue/"waiting" glyph), and
+        //   2. the prefix color brightens from accent_dim to accent, so
+        //      the chrome reads as "armed" rather than "idle prompt".
+        // The submit flash still wins outright when a send lands.
         let mut prefix_style = Style::default()
             .fg(theme.accent_dim())
             .add_modifier(ratatui::style::Modifier::BOLD)
             .bg(panel.bg.unwrap_or(Color::Reset));
+        if queueing && !self.is_flashing() {
+            prefix_style = prefix_style.fg(theme.accent);
+        }
         if self.is_flashing() {
             prefix_style = prefix_style.fg(theme.accent);
         }
-        let prefix = Span::styled(&self.prompt_prefix, prefix_style);
-        let prefix_width = self.prefix_display_width();
+        let prefix_str: &str = if queueing { "» " } else { &self.prompt_prefix };
+        let prefix = Span::styled(prefix_str, prefix_style);
+        // Measure the *rendered* prefix, not `self.prompt_prefix`: in queueing
+        // mode the glyph is `"» "` and the two strings could diverge in display
+        // width (e.g. a future emoji/CJK queue glyph). Computing width from
+        // the same string we emit keeps the cursor anchored to the text edge.
+        let prefix_width = (prefix_str.width() as u16).min(content_area.width).max(1);
         let prefix_area = Rect::new(
             content_area.x,
             content_area.y,
@@ -714,7 +728,7 @@ mod paste_tests {
 
     #[test]
     fn active_turn_helper_surfaces_queue_semantics() {
-        assert!(ACTIVE_TURN_HELPER.contains("Queued"));
+        assert!(ACTIVE_TURN_HELPER.contains("Enter queues"));
         assert!(ACTIVE_TURN_HELPER.contains("Ctrl+C"));
     }
 }

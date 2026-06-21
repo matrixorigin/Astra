@@ -7,7 +7,7 @@
 //! - [`sse`] — incremental `data: …\\n\\n` parser matching the server SSE framing (`data: {json}\\n\\n`).
 //! - [`ThinClient`](client::ThinClient) — `reqwest`-based transport.
 //!
-//! The crate deliberately avoids `runtime` / `services` so any front-end can depend on it without pulling the cognitive engine.
+//! The crate deliberately avoids `runtime` / `services` so any front-end can depend on it without pulling the cognitive engine. It depends on `astra-runtime-env` only for the shared runtime capability vocabulary.
 
 pub mod client;
 pub mod edge;
@@ -19,7 +19,7 @@ pub mod sse;
 pub use client::ThinClient;
 pub use edge::{
     ASTRA_EDGE_ID_HEADER, advertise_executor, builtin_capability_preset,
-    edge_register_with_capabilities,
+    edge_register_with_capabilities, edge_runtime_environment_capabilities,
 };
 pub use error::ThinClientError;
 pub use protocol::{

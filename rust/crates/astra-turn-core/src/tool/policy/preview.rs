@@ -101,8 +101,35 @@ pub fn render_preview(tool: &str, args: &Value, style: PreviewStyle, desc_budget
             }
         }
         "str_replace" => {
-            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-            format!("Editing: {}", short(path, path_budget(9)))
+            let path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    args.get("edits")
+                        .and_then(Value::as_array)
+                        .and_then(|edits| edits.first())
+                        .and_then(|edit| edit.get("path"))
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or("");
+            let suffix = args
+                .get("edits")
+                .and_then(Value::as_array)
+                .map(|edits| {
+                    let mut paths = std::collections::BTreeSet::new();
+                    for edit in edits {
+                        if let Some(path) = edit.get("path").and_then(Value::as_str) {
+                            paths.insert(path);
+                        }
+                    }
+                    if paths.len() > 1 {
+                        format!(" +{} files", paths.len() - 1)
+                    } else {
+                        String::new()
+                    }
+                })
+                .unwrap_or_default();
+            format!("Editing: {}{}", short(path, path_budget(9)), suffix)
         }
         "list_dir" => {
             let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
@@ -876,6 +903,22 @@ mod tests {
         assert_eq!(
             p("write_file", json!({"path": "/tmp/x", "delete": true})),
             "Deleting: /tmp/x"
+        );
+    }
+
+    #[test]
+    fn str_replace_preview_uses_per_edit_path() {
+        assert_eq!(
+            p(
+                "str_replace",
+                json!({
+                    "edits": [
+                        {"path": "src/a.rs", "old_str": "a", "new_str": "b"},
+                        {"path": "src/b.rs", "old_str": "c", "new_str": "d"}
+                    ]
+                })
+            ),
+            "Editing: src/a.rs +1 files"
         );
     }
 

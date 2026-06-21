@@ -1927,7 +1927,7 @@ output.
 #### Tool Output Batch Insert Contract
 
 Fan-out tools must not write one network round trip per output row. Any tool
-runner that emits more than 50 `session_tool_outputs` rows in one turn uses a
+executor that emits more than 50 `session_tool_outputs` rows in one turn uses a
 batch contract.
 
 ```sql
@@ -1983,7 +1983,7 @@ Failure protocol:
 
 - If any row in a batch fails validation, the transaction rolls back and no
   partial detail rows are visible.
-- The runner writes one failed batch row with `status='failed'` and a structured
+- The executor writes one failed batch row with `status='failed'` and a structured
   `error_code` in a separate transaction.
 - Context assembly must ignore outputs whose batch is not `completed`.
 
@@ -1994,7 +1994,7 @@ Performance contract:
 - Implementations must use the SQLx/MySQL bulk insert path or equivalent
   multi-row insert. Per-row insert loops are a contract violation.
 - Batch writes must expose `request_id` and `trace_id` on both batch and output
-  rows so slow write audits can locate the exact runner call.
+  rows so slow write audits can locate the exact executor call.
 
 <!-- /GAP-FIX: G23 -->
 
@@ -2056,23 +2056,23 @@ remain G14.
 
 <!-- GAP-FIX: G27 -->
 
-#### Tool Baseline, Raw Ref, and Runner Registration
+#### Tool Baseline, Raw Ref, and Executor Registration
 
 The baseline registry is a product contract, not sample documentation. Tool
-runners must register their preview template and normalization version before
+executors must register their preview template and normalization version before
 they can write `session_tool_outputs` in production.
 
 ```sql
-CREATE TABLE IF NOT EXISTS tool_runner_registry (
+CREATE TABLE IF NOT EXISTS tool_executor_registry (
   tool_name                 VARCHAR(128) PRIMARY KEY,
-  runner_version            VARCHAR(64) NOT NULL,
+  executor_version          VARCHAR(64) NOT NULL,
   preview_template_version  VARCHAR(64) NOT NULL,
   normalize_version         VARCHAR(16) NOT NULL DEFAULT 'raw_v1',
   default_raw_ref_scheme    VARCHAR(64) NOT NULL,
   status                    VARCHAR(32) NOT NULL DEFAULT 'active',
   created_at                TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at                TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  INDEX idx_tool_runner_status (status, updated_at)
+  INDEX idx_tool_executor_status (status, updated_at)
 );
 
 CREATE TABLE IF NOT EXISTS raw_ref_scheme_registry (
@@ -2136,7 +2136,7 @@ Normalization rules:
 - `raw_v1` is the identity transform: `sha256(raw_bytes)`. It is the required
   choice for tools such as raw slowlog capture where normalization would destroy
   forensic value.
-- If a runner bumps `preview_template_version` without bumping
+- If an executor bumps `preview_template_version` without bumping
   `normalize_version`, the template changelog must state that the change is
   display-only and does not affect hash semantics.
 
@@ -3447,7 +3447,7 @@ POST /artifacts/{artifact_id}/grants
 
 GET  /preview-templates
 GET  /preview-templates/{tool_name}/{version}
-GET  /tool-runners
+GET  /tool-executors
 GET  /raw-ref-schemes
 
 POST /notifications/adapters/{adapter}/callbacks
@@ -3643,7 +3643,7 @@ Exit criteria:
 - Add preview generation and artifact references to context manifest.
 - Add preview template registry and enforce per-tool preview contracts.
 - Add content hash normalization contracts for tools and skills.
-- Add tool runner registration, raw_ref scheme registry, and expanded baseline
+- Add tool executor registration, raw_ref scheme registry, and expanded baseline
   templates.
 - Add retention and deletion policy.
 - Add artifact reference counters, access scopes, project retention policy, and
@@ -3654,7 +3654,7 @@ Exit criteria:
 
 - 1000 `session_tool_outputs` rows insert in `<500ms` through the batch path on
   the supported MatrixOne deployment, excluding raw artifact upload time.
-- Tool runners cannot write production outputs without a registered preview
+- Tool executors cannot write production outputs without a registered preview
   template and `normalize_version`.
 - `raw_ref` strings parse through the canonical scheme registry and run the same
   artifact ACL check as direct download APIs.
@@ -3794,7 +3794,7 @@ subsequent UI and context work debuggable instead of speculative.
 - Resolved Sprint D G26 by adding manifest reasons for ambiguity, user memory,
   progressive loading, and intent-driven preview expansion, plus
   `turn_intent` and unknown-reason fallback.
-- Resolved Sprint D G27 by adding tool runner registration, canonical raw_ref
+- Resolved Sprint D G27 by adding tool executor registration, canonical raw_ref
   schemes, expanded baseline preview/normalize templates, `raw_v1`, and
   multi-source artifact provenance.
 

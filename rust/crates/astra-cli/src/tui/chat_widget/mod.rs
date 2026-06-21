@@ -141,10 +141,10 @@ pub(crate) enum WireEvent {
     /// Turn ended with an error. Error text gets humanised by
     /// `SystemCell::error` before storage.
     TurnError(String),
-    /// Turn-level warning. Rendered as `SystemCell::warning` in scrollback.
-    TurnWarning(String),
-    /// Turn-level informational message. Rendered as `SystemCell::info` in scrollback.
-    TurnInfo(String),
+    /// System-level warning (not necessarily turn-scoped). Rendered as `SystemCell::warning` in scrollback.
+    SystemWarning(String),
+    /// System-level informational message. Rendered as `SystemCell::info` in scrollback.
+    SystemInfo(String),
     ExplainReport(Vec<serde_json::Value>),
     VerdictReport(Vec<crate::VerdictEvent>),
     /// Structured compaction event — renders as a system info cell
@@ -982,8 +982,8 @@ impl ChatWidget {
             }
             WireEvent::TurnComplete(stats) => self.on_turn_complete(*stats),
             WireEvent::TurnError(msg) => self.on_turn_error(msg),
-            WireEvent::TurnWarning(msg) => self.on_turn_warning(msg),
-            WireEvent::TurnInfo(msg) => self.on_turn_info(msg),
+            WireEvent::SystemWarning(msg) => self.on_system_warning(msg),
+            WireEvent::SystemInfo(msg) => self.on_system_info(msg),
             WireEvent::ExplainReport(items) => self.on_explain_report(items),
             WireEvent::VerdictReport(items) => self.on_verdict_report(items),
             WireEvent::Compaction(event) => {
@@ -1732,11 +1732,11 @@ impl ChatWidget {
         self.commit_cell(Box::new(SystemCell::error(msg)));
     }
 
-    fn on_turn_warning(&mut self, msg: String) {
+    fn on_system_warning(&mut self, msg: String) {
         self.commit_cell(Box::new(SystemCell::warning(msg)));
     }
 
-    fn on_turn_info(&mut self, msg: String) {
+    fn on_system_info(&mut self, msg: String) {
         self.commit_cell(Box::new(SystemCell::info(msg)));
     }
 
@@ -4252,7 +4252,7 @@ mod tests {
             label: "auth reviewer".into(),
             tool_use_id: "spawn-tu-fanout".into(),
             agent_id: None,
-            fanout_slot: Some(AgentFanoutSlotIdentity::new("review-1", 3, 0).unwrap()),
+            fanout_slot: Some(AgentFanoutSlotIdentity::new("review-1", 3, 0, None).unwrap()),
             fanout_title: Some("review fanout".into()),
         }));
         w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
@@ -4287,7 +4287,9 @@ mod tests {
             label: "storage reviewer".into(),
             tool_use_id: "spawn-tu-fanout".into(),
             agent_id: None,
-            fanout_slot: Some(AgentFanoutSlotIdentity::new("review-1", 3, 1).unwrap()),
+            fanout_slot: Some(
+                AgentFanoutSlotIdentity::new("review-1", 3, 1, Some("storage".into())).unwrap(),
+            ),
             fanout_title: Some("review fanout".into()),
         }));
         w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {

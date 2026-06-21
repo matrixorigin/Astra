@@ -15,7 +15,7 @@ use crate::cloud::approval_policy::{
 };
 use crate::parallel_tool_exec::is_read_only_tool_with_args;
 use crate::permission::memory_profile::{permission_memory_profile, workspace_write_prefix};
-use crate::permission::rule_grammar::{PermissionRuleV2, serialize_rule_v2};
+use crate::permission::rule_grammar::{PermissionRuleSpec, serialize_rule};
 use crate::permission::scope::AllowScope;
 use crate::tool::args::hints::{command_hint_from_args, path_hint_from_args};
 
@@ -59,12 +59,12 @@ pub fn allow_rule_for_match_target(
     target: &AllowMatchTarget,
 ) -> String {
     match target {
-        AllowMatchTarget::Tool => tool_name.to_string(),
+        AllowMatchTarget::Tool => broad_rule(tool_name),
         AllowMatchTarget::Exact => {
-            exact_rule(tool_name, args).unwrap_or_else(|| tool_name.to_string())
+            exact_rule(tool_name, args).unwrap_or_else(|| broad_rule(tool_name))
         }
         AllowMatchTarget::Prefix(prefix) => {
-            prefix_rule(tool_name, args, prefix).unwrap_or_else(|| tool_name.to_string())
+            prefix_rule(tool_name, args, prefix).unwrap_or_else(|| broad_rule(tool_name))
         }
     }
 }
@@ -196,7 +196,7 @@ fn exact_rule(tool_name: &str, args: &Value) -> Option<String> {
     match cloud_gated_tool_kind(tool_name)? {
         CloudGatedToolKind::Execute => {
             let cmd = command_hint_from_args(args)?;
-            Some(serialize_rule_v2(&PermissionRuleV2 {
+            Some(serialize_rule(&PermissionRuleSpec {
                 tool: display_tool_name(tool_name),
                 argv_exact: Some(cmd.to_string()),
                 argv_prefix: None,
@@ -213,7 +213,7 @@ fn exact_rule(tool_name: &str, args: &Value) -> Option<String> {
         CloudGatedToolKind::Write => {
             let path = path_hint_from_args(args)?;
             let rule_tool = file_write_rule_tool(tool_name);
-            Some(serialize_rule_v2(&PermissionRuleV2 {
+            Some(serialize_rule(&PermissionRuleSpec {
                 tool: rule_tool,
                 argv_exact: None,
                 argv_prefix: None,
@@ -235,7 +235,7 @@ fn prefix_rule(tool_name: &str, _args: &Value, prefix: &str) -> Option<String> {
         return None;
     }
     match cloud_gated_tool_kind(tool_name)? {
-        CloudGatedToolKind::Execute => Some(serialize_rule_v2(&PermissionRuleV2 {
+        CloudGatedToolKind::Execute => Some(serialize_rule(&PermissionRuleSpec {
             tool: display_tool_name(tool_name),
             argv_exact: None,
             argv_prefix: Some(prefix.to_string()),
@@ -253,7 +253,7 @@ fn prefix_rule(tool_name: &str, _args: &Value, prefix: &str) -> Option<String> {
                 .and_then(|path| workspace_write_prefix(&path))
                 .filter(|root| root == prefix);
             let rule_tool = file_write_rule_tool(tool_name);
-            Some(serialize_rule_v2(&PermissionRuleV2 {
+            Some(serialize_rule(&PermissionRuleSpec {
                 tool: rule_tool,
                 argv_exact: None,
                 argv_prefix: None,
@@ -272,7 +272,7 @@ fn prefix_rule(tool_name: &str, _args: &Value, prefix: &str) -> Option<String> {
 
 fn file_write_rule_tool(tool_name: &str) -> String {
     if crate::tool::categories::registry().is_file_op(tool_name) {
-        "Edit".to_string()
+        "file_write".to_string()
     } else {
         tool_name.to_string()
     }
@@ -280,7 +280,7 @@ fn file_write_rule_tool(tool_name: &str) -> String {
 
 fn file_write_fingerprint_tool(tool_name: &str) -> &str {
     if crate::tool::categories::registry().is_file_op(tool_name) {
-        "edit"
+        "file_write"
     } else {
         tool_name
     }
@@ -292,6 +292,26 @@ fn display_tool_name(tool_name: &str) -> String {
         None => tool_name.to_string(),
         Some(first) => first.to_uppercase().to_string() + chars.as_str(),
     }
+}
+
+fn broad_rule(tool_name: &str) -> String {
+    serialize_rule(&PermissionRuleSpec {
+        tool: if tool_name == "bash" {
+            display_tool_name(tool_name)
+        } else {
+            tool_name.to_string()
+        },
+        argv_exact: None,
+        argv_prefix: None,
+        path_glob: None,
+        path_prefix: None,
+        op: None,
+        cwd_root: None,
+        git_branch: None,
+        domain: None,
+        capability: None,
+        extra: Default::default(),
+    })
 }
 
 #[cfg(test)]
@@ -325,7 +345,7 @@ mod tests {
         let args = serde_json::json!({"path": "a.md"});
         assert_eq!(
             allow_rule_for_match_target("write_file", &args, &AllowMatchTarget::Tool),
-            "write_file"
+            "write_file()"
         );
     }
 
@@ -371,7 +391,7 @@ mod tests {
             &args,
             &AllowMatchTarget::Prefix("zzz".to_string()),
         );
-        assert_eq!(rule, r#"Edit(path_prefix="zzz", op="write")"#);
+        assert_eq!(rule, r#"file_write(path_prefix="zzz", op="write")"#);
 
         let parsed = PermissionRule::parse(&rule);
         assert!(parsed.matches_with_context(
@@ -402,15 +422,22 @@ mod tests {
             &args,
             &AllowMatchTarget::Prefix("zzz".into()),
         );
-        let later =
-            crate::approval_fingerprint::ApprovalFingerprint::file_op("edit", Some("zzz2.md"));
+        let later = crate::approval_fingerprint::ApprovalFingerprint::file_op(
+            "file_write",
+            Some("zzz2.md"),
+        );
         let other =
-            crate::approval_fingerprint::ApprovalFingerprint::file_op("edit", Some("abc.md"));
+            crate::approval_fingerprint::ApprovalFingerprint::file_op("file_write", Some("abc.md"));
+        let other_tool = crate::approval_fingerprint::ApprovalFingerprint::file_op(
+            "str_replace",
+            Some("zzz2.md"),
+        );
         let mut overrides = crate::approval_fingerprint::FingerprintedOverrides::default();
         overrides.insert(approved, true);
 
         assert_eq!(overrides.check(&later), Some(true));
         assert_eq!(overrides.check(&other), None);
+        assert_eq!(overrides.check(&other_tool), None);
     }
 
     #[test]
@@ -430,7 +457,7 @@ mod tests {
         assert_eq!(
             rule,
             format!(
-                r#"Edit(path_prefix="{workspace_root}", op="write", cwd_root="{workspace_root}")"#
+                r#"file_write(path_prefix="{workspace_root}", op="write", cwd_root="{workspace_root}")"#
             )
         );
         let parsed = PermissionRule::parse(&rule);
@@ -529,7 +556,7 @@ mod tests {
         assert_eq!(
             allow_rule_for_match_target("write_file", &args, &target),
             format!(
-                r#"Edit(path_prefix="{workspace_root}", op="write", cwd_root="{workspace_root}")"#
+                r#"file_write(path_prefix="{workspace_root}", op="write", cwd_root="{workspace_root}")"#
             )
         );
     }

@@ -18,6 +18,10 @@ use astra_services::session_journal;
 use clap::Parser;
 use crossterm::style::Stylize;
 
+// Single source of truth: re-export from lib.rs so `crate::DEFERRED_INPUT_FINGERPRINT_SEP`
+// resolves identically in both the lib-compiled and binary-compiled copies of cli/tui modules.
+pub(crate) use astra_cli::DEFERRED_INPUT_FINGERPRINT_SEP;
+
 mod edge_tools;
 mod git_branch_cache;
 mod manifest_loader;
@@ -2369,7 +2373,7 @@ total_tokens_out: 500
 
     #[test]
     fn cli_chat_permission_mode_rejects_legacy_aliases() {
-        for mode in ["yolo", "bypass-safety", "bypass_safety"] {
+        for mode in ["accept-edits", "yolo", "bypass-safety", "bypass_safety"] {
             assert!(Cli::try_parse_from(["astra", "chat", "--permission-mode", mode]).is_err());
         }
     }
@@ -2377,7 +2381,7 @@ total_tokens_out: 500
     #[test]
     fn cli_chat_permission_mode_accept_edits() {
         let cli =
-            Cli::try_parse_from(["astra", "chat", "--permission-mode", "accept-edits"]).unwrap();
+            Cli::try_parse_from(["astra", "chat", "--permission-mode", "accept_edits"]).unwrap();
         match cli.command {
             Some(Command::Chat(ref args)) => {
                 assert_eq!(args.permission_mode.as_deref(), Some("accept_edits"));
@@ -2869,6 +2873,16 @@ total_tokens_out: 500
                 other => panic!("unexpected permissions subcommand: {other:?}"),
             },
             other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_permissions_command_rejects_removed_aliases() {
+        for removed in ["all", "status"] {
+            assert!(
+                Cli::try_parse_from(["astra", "permissions", removed]).is_err(),
+                "removed permissions subcommand must be rejected: {removed}"
+            );
         }
     }
 

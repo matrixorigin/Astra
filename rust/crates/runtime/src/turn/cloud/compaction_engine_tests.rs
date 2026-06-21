@@ -117,6 +117,12 @@ fn make_session_with_duplicate_reads() -> Vec<Value> {
 // ── Rest of tests ───────────────────────────────────────────────────
 
 /// Wrapper that converts Vec<Value> ↔ Vec<Message> around a layer's compress() call.
+///
+/// NOTE: boundary markers (`_compact_boundary`, `_messages_removed`,
+/// `_turns_removed`, `_reactive`) live in `Message.extra` and are INTENTIONALLY
+/// stripped by `From<Message> for Value` (they must not cross the provider
+/// wire — see compression_types.rs). Tests that assert on these markers
+/// should use `compress_layer_typed` instead so they inspect the typed form.
 fn compress_layer_values<L: CompressionLayer>(
     layer: &L,
     msgs: &mut Vec<serde_json::Value>,
@@ -129,6 +135,28 @@ fn compress_layer_values<L: CompressionLayer>(
     let result = layer.compress(&mut typed, budget);
     *msgs = typed.into_iter().map(serde_json::Value::from).collect();
     result
+}
+
+/// Typed variant: runs the layer on `Vec<Message>` WITHOUT round-tripping
+/// through `Vec<Value>`, so internal `_`-prefixed metadata (boundary markers,
+/// turn counts) survives for test assertions. The production wire serializer
+/// (`From<Message> for Value`) intentionally strips these; this helper lets
+/// tests verify layer behavior at the typed level where the markers live.
+fn compress_layer_typed<L: CompressionLayer>(
+    layer: &L,
+    msgs: &mut Vec<Message>,
+    budget: &TokenBudget,
+) -> CompressionResult {
+    layer.compress(msgs, budget)
+}
+
+/// Locate the compaction boundary marker in a typed message list and return
+/// a reference to it. Panics with a clear message if absent, matching the
+/// intent of the original `Vec<Value>` assertions.
+fn find_boundary_typed(msgs: &[Message]) -> &Message {
+    msgs.iter()
+        .find(|m| m.extra.get("_compact_boundary") == Some(&Value::Bool(true)))
+        .expect("compaction must insert a boundary marker")
 }
 
 #[test]
@@ -937,7 +965,7 @@ fn tiered_splice_order_preserves_pivot_content() {
     // Layout (10 msgs, head_end=2, keep_tail=4 ⇒ tail_start=6, which
     // points at an assistant ⇒ pivot scan finds the last user in
     // [head_end..tail_start). That user MUST be preserved.
-    let mut msgs = vec![
+    let msgs = vec![
         json!({"role": "system", "content": "System"}),
         json!({"role": "user", "content": "Turn1"}), // protected head
         json!({"role": "assistant", "content": "R1"}),
@@ -951,6 +979,10 @@ fn tiered_splice_order_preserves_pivot_content() {
     ];
 
     let original_len = msgs.len();
+    // Inspect typed messages: boundary markers (`_compact_boundary` etc.)
+    // live in Message.extra and are stripped by `From<Message> for Value`,
+    // so we must inspect them before the wire round-trip.
+    let mut typed: Vec<Message> = msgs.into_iter().map(Message::from).collect();
     let mut engine = CompactionEngine::new();
     // keep_recent_turns=2 → keep_tail=4 → tail_start=6 (an assistant) so
     // the pivot scan kicks in and finds Turn2 at idx 4.
@@ -961,7 +993,7 @@ fn tiered_splice_order_preserves_pivot_content() {
         current_round_index: None,
         now_secs: 0,
     };
-    let outcome = engine.compress_if_needed(&mut msgs, &budget);
+    let outcome = engine.compress_typed(&mut typed, &budget);
     assert!(
         outcome
             .layer_results
@@ -971,30 +1003,35 @@ fn tiered_splice_order_preserves_pivot_content() {
         outcome.layer_results
     );
     assert!(
-        msgs.len() < original_len,
+        typed.len() < original_len,
         "tiered compaction must shrink the message list (was {original_len}, now {})",
-        msgs.len()
+        typed.len()
     );
 
     // The pivot user (Turn2) must survive, AND the recent tail must survive.
+    fn content_of(m: &Message) -> &str {
+        m.content.as_deref().unwrap_or("")
+    }
     assert!(
-        msgs.iter().any(|m| m["content"].as_str() == Some("Turn2")),
-        "pivot user message Turn2 must survive: {msgs:?}"
+        typed.iter().any(|m| content_of(m) == "Turn2"),
+        "pivot user message Turn2 must survive: {typed:?}"
     );
     assert!(
-        msgs.iter().any(|m| m["content"].as_str() == Some("Turn4")),
+        typed.iter().any(|m| content_of(m) == "Turn4"),
         "recent tail user message Turn4 must survive"
     );
     assert!(
-        msgs.iter().any(|m| m["content"].as_str() == Some("R4")),
+        typed.iter().any(|m| content_of(m) == "R4"),
         "recent tail assistant message R4 must survive"
     );
-    // A boundary marker MUST be present.
-    let boundary = msgs
-        .iter()
-        .find(|m| m.get("_compact_boundary") == Some(&Value::Bool(true)))
-        .expect("compaction must insert a boundary marker");
-    assert!(boundary["_messages_removed"].as_u64().unwrap_or(0) > 0);
+    // A boundary marker MUST be present (typed-level, pre-wire-strip).
+    let boundary = find_boundary_typed(&typed);
+    let removed = boundary
+        .extra
+        .get("_messages_removed")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    assert!(removed > 0);
 }
 
 #[test]
@@ -1106,18 +1143,18 @@ fn reactive_turns_removed_metadata_excludes_preserved_pivot_turn() {
     // 8-message input where the only droppable message is the Tiered
     // boundary marker.
     let msgs = make_agentic_session_msgs(8, 2, 200);
-    let mut m = msgs.clone();
+    let mut typed: Vec<Message> = msgs.into_iter().map(Message::from).collect();
     let budget = budget(64000, 200000);
     let layer = ReactiveCompact::new(0.0);
-    let _ = compress_layer_values(&layer, &mut m, &budget);
+    let _ = compress_layer_typed(&layer, &mut typed, &budget);
 
     // Boundary marker must NOT report the pivot turn as "removed".
-    let boundary = m
-        .iter()
-        .find(|msg| msg["_compact_boundary"].as_bool() == Some(true));
-    assert!(boundary.is_some());
-    let b = boundary.unwrap();
-    let turns_removed = b["_turns_removed"].as_u64().unwrap();
+    let boundary = find_boundary_typed(&typed);
+    let turns_removed = boundary
+        .extra
+        .get("_turns_removed")
+        .and_then(|v| v.as_u64())
+        .unwrap();
     assert!(turns_removed > 0);
 }
 
@@ -1211,8 +1248,8 @@ fn tool_truncation_skips_results_in_protected_head() {
 }
 
 #[test]
-fn tiered_boundary_includes_user_queries_from_dropped_messages() {
-    let mut msgs = vec![
+fn tiered_boundary_has_stable_content_for_cache_friendliness() {
+    let msgs = vec![
         json!({"role": "system", "content": "System"}),
         json!({"role": "user", "content": "Turn 1: fix bug"}),
         json!({"role": "assistant", "content": "OK"}),
@@ -1225,17 +1262,20 @@ fn tiered_boundary_includes_user_queries_from_dropped_messages() {
         json!({"role": "assistant", "content": "OK"}),
     ];
     let budget = budget(64000, 100000);
-    // Use TieredCompaction directly to test boundary metadata in isolation
     let layer = TieredCompaction::new(1, 0.0);
-    let _ = compress_layer_values(&layer, &mut msgs, &budget);
-    let boundary = msgs
-        .iter()
-        .find(|m| m["_compact_boundary"].as_bool() == Some(true));
-    assert!(boundary.is_some(), "boundary marker must exist");
-    let content = boundary.unwrap()["content"].as_str().unwrap();
+    // Boundary metadata lives in Message.extra and is stripped by the wire
+    // serializer; assert at the typed level where it is observable.
+    let mut typed: Vec<Message> = msgs.into_iter().map(Message::from).collect();
+    let _ = compress_layer_typed(&layer, &mut typed, &budget);
+    let boundary = find_boundary_typed(&typed);
+    let content = boundary.content.as_deref().unwrap();
     assert!(
-        content.contains("fix bug") || content.contains("check tests"),
-        "boundary must mention dropped user queries"
+        content.contains("Context compacted"),
+        "boundary content must use stable prefix"
+    );
+    assert!(
+        !content.contains("fix bug") && !content.contains("check tests"),
+        "boundary content must NOT include dynamic data (breaks prompt cache)"
     );
 }
 
@@ -1268,16 +1308,24 @@ fn tool_truncation_uses_cjk_aware_estimation() {
 #[test]
 fn tiered_boundary_records_dropped_turn_count() {
     let msgs = make_agentic_session_msgs(6, 2, 100);
-    let mut m = msgs.clone();
+    let mut typed: Vec<Message> = msgs.into_iter().map(Message::from).collect();
     let budget = budget(64000, 100000);
-    let engine = CompactionEngine::default_pipeline_for(64000);
-    engine.compress_if_needed(&mut m, &budget);
-    let boundary = m
-        .iter()
-        .find(|msg| msg["_compact_boundary"].as_bool() == Some(true))
-        .expect("compaction must insert a boundary marker");
-    assert!(boundary["_messages_removed"].as_u64().unwrap_or(0) > 0);
-    assert!(boundary["_turns_removed"].as_u64().unwrap_or(0) > 0);
+    let mut engine = CompactionEngine::new();
+    engine.add_layer(Box::new(TieredCompaction::new(2, 0.0)));
+    engine.compress_typed(&mut typed, &budget);
+    let boundary = find_boundary_typed(&typed);
+    let removed = boundary
+        .extra
+        .get("_messages_removed")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let turns = boundary
+        .extra
+        .get("_turns_removed")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    assert!(removed > 0);
+    assert!(turns > 0);
 }
 
 #[test]
@@ -1320,7 +1368,7 @@ fn reactive_after_tiered_compacts_further() {
 
 #[test]
 fn reactive_splice_order_preserves_pivot_content() {
-    let mut msgs = vec![
+    let msgs = vec![
         json!({"role": "system", "content": "System"}),
         json!({"role": "user", "content": "Turn1"}),
         json!({"role": "assistant", "content": "R1"}),
@@ -1334,26 +1382,28 @@ fn reactive_splice_order_preserves_pivot_content() {
     ];
 
     let budget = budget(64000, 100000);
-    // Use ReactiveCompact directly to test splice ordering in isolation
+    // Use ReactiveCompact directly to test splice ordering in isolation.
+    // Inspect the typed form: `_reactive` and `_turns_removed` live in
+    // Message.extra and are stripped by the wire serializer.
     let layer = ReactiveCompact::new(0.0);
-    let result = compress_layer_values(&layer, &mut msgs, &budget);
+    let mut typed: Vec<Message> = msgs.into_iter().map(Message::from).collect();
+    let result = compress_layer_typed(&layer, &mut typed, &budget);
     assert!(
         result.estimated_tokens_freed > 0 || result.messages_removed > 0,
         "ReactiveCompact must fire on this input"
     );
-    let boundary = msgs
-        .iter()
-        .find(|m| m["_compact_boundary"].as_bool() == Some(true))
-        .expect("ReactiveCompact must insert a boundary marker");
-    let turns_removed = boundary["_turns_removed"]
-        .as_u64()
+    let boundary = find_boundary_typed(&typed);
+    let turns_removed = boundary
+        .extra
+        .get("_turns_removed")
+        .and_then(|v| v.as_u64())
         .expect("_turns_removed must be present");
     assert!(turns_removed >= 1, "boundary must record turns removed");
     // The reactive marker MUST be set so audit/telemetry can distinguish
     // reactive from tiered boundaries on the wire (regression guard).
     assert_eq!(
-        boundary["_reactive"],
-        Value::Bool(true),
+        boundary.extra.get("_reactive"),
+        Some(&Value::Bool(true)),
         "ReactiveCompact must mark its boundary with _reactive: true"
     );
 }
@@ -1498,7 +1548,7 @@ fn tool_truncation_cjk_guardrail_fallback() {
 fn tiered_compaction_cold_layer_stubs_content() {
     let big = "DATA".repeat(300);
     let _big_len = big.len();
-    let mut msgs = vec![
+    let msgs = vec![
         json!({"role": "system", "content": "S"}),
         json!({"role": "user", "content": "U1", "_round_index": 0}),
         json!({"role": "assistant", "content": &big, "_round_index": 0}),
@@ -1510,14 +1560,14 @@ fn tiered_compaction_cold_layer_stubs_content() {
     // trigger=1.0 → need pressure>1.0, so measured=90_000 > max=80_000
     let b = budget_with_round(80_000, 90_000, 3);
     let layer = TieredCompaction::new(1, 1.0);
-    let result = compress_layer_values(&layer, &mut msgs, &b);
+    // Boundary metadata lives in Message.extra and is stripped by the wire
+    // serializer; inspect the typed form where it survives.
+    let mut typed: Vec<Message> = msgs.into_iter().map(Message::from).collect();
+    let result = compress_layer_typed(&layer, &mut typed, &b);
     assert!(result.estimated_tokens_freed > 0);
     assert!(result.messages_removed > 0, "messages must be removed");
     // Boundary marker must exist after compaction.
-    let has_boundary = msgs
-        .iter()
-        .any(|m| m["_compact_boundary"].as_bool() == Some(true));
-    assert!(has_boundary, "boundary marker must exist");
+    let _ = find_boundary_typed(&typed);
 }
 
 #[test]
@@ -1541,7 +1591,7 @@ fn tiered_compaction_warm_layer_keeps_content() {
 #[test]
 fn reactive_compact_repacks_long_contexts() {
     let big = "DATA".repeat(400);
-    let mut msgs = vec![
+    let msgs = vec![
         json!({"role": "system", "content": "S"}),
         json!({"role": "user", "content": "U1"}),
         json!({"role": "assistant", "content": &big}),
@@ -1553,17 +1603,14 @@ fn reactive_compact_repacks_long_contexts() {
     // trigger=0.5 → need pressure>0.5, so measured=60_000 > max*0.5=40_000
     let b = budget(80_000, 60_000);
     let layer = ReactiveCompact::new(0.5);
-    let result = compress_layer_values(&layer, &mut msgs, &b);
+    // Boundary metadata lives in Message.extra and is stripped by the wire
+    // serializer; inspect the typed form where it survives.
+    let mut typed: Vec<Message> = msgs.into_iter().map(Message::from).collect();
+    let result = compress_layer_typed(&layer, &mut typed, &b);
     assert!(result.estimated_tokens_freed > 0);
     assert!(result.messages_removed > 0, "messages must be removed");
     // Boundary marker must be inserted.
-    let has_boundary = msgs
-        .iter()
-        .any(|m| m["_compact_boundary"].as_bool() == Some(true));
-    assert!(
-        has_boundary,
-        "boundary marker must exist after reactive compaction"
-    );
+    let _ = find_boundary_typed(&typed);
 }
 
 #[test]
@@ -1663,41 +1710,49 @@ mod proptest_tests {
             prop_assume!(total_msgs > keep_tail + 4, "need enough messages to compact");
 
             let msgs_original = make_agentic_session_msgs(num_turns, tools_per_turn, msg_size);
-            let mut msgs = msgs_original.clone();
             let budget = budget(64000, 500_000);
+
+            // Run on typed messages: boundary metadata lives in Message.extra
+            // and is stripped by the wire serializer, so invariant 3 must
+            // inspect the typed form. We rebuild a Vec<Value> only to check
+            // tail-content survival against the original wire values.
+            let mut typed: Vec<Message> =
+                msgs_original.iter().cloned().map(Message::from).collect();
+            let typed_len_before = typed.len();
 
             let mut engine = CompactionEngine::new();
             engine.add_layer(Box::new(TieredCompaction::new(keep_recent_turns, 0.0)));
-            let outcome = engine.compress_if_needed(&mut msgs, &budget);
+            let outcome = engine.compress_typed(&mut typed, &budget);
 
             // Invariant 1: messages never grow.
             assert!(
-                msgs.len() <= msgs_original.len(),
+                typed.len() <= typed_len_before,
                 "compaction must not grow messages (before={}, after={})",
-                msgs_original.len(),
-                msgs.len()
+                typed_len_before,
+                typed.len()
             );
 
             // Invariant 2: system message always survives.
-            assert!(
-                msgs[0]["role"].as_str() == Some("system"),
+            assert_eq!(
+                typed.first().map(|m| m.role.as_str()),
+                Some("system"),
                 "system message must survive compaction"
             );
 
             // Invariant 3: if compaction fired, a boundary marker must exist.
             if outcome.total_tokens_freed > 0 {
-                let has_boundary = msgs
-                    .iter()
-                    .any(|m| m.get("_compact_boundary") == Some(&Value::Bool(true)));
                 assert!(
-                    has_boundary,
+                    typed
+                        .iter()
+                        .any(|m| m.extra.get("_compact_boundary") == Some(&Value::Bool(true))),
                     "compaction fired but no boundary marker found"
                 );
             }
 
             // Invariant 4: the tail (last keep_tail messages) is preserved.
-            // Extract the last keep_tail user/assistant/tool messages from original
-            // and verify they survive in the compacted output.
+            // Compare typed.content against the original wire values.
+            let surviving_contents: Vec<Option<&str>> =
+                typed.iter().map(|m| m.content.as_deref()).collect();
             let original_tail: Vec<_> = msgs_original
                 .iter()
                 .rev()
@@ -1711,7 +1766,7 @@ mod proptest_tests {
                 let content = tail_msg["content"].as_str();
                 if let Some(c) = content {
                     assert!(
-                        msgs.iter().any(|m| m["content"].as_str() == Some(c)),
+                        surviving_contents.contains(&Some(c)),
                         "tail message with content '{c}' must survive compaction"
                     );
                 }

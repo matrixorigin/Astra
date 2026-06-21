@@ -756,9 +756,7 @@ fn detect_pending_recovery_session(cli_profile: Option<&str>) -> Option<String> 
 
 fn pending_recovery_status_line(state: &SessionState) -> Option<String> {
     state.pending_recovery.as_ref().map(|session_id| {
-        let mut line =
-            "previous session available via /resume or a short continue/fix/test follow-up"
-                .to_string();
+        let mut line = "previous session available via /resume".to_string();
         match astra_services::session_workspace::read_workspace_optional(session_id) {
             Ok(Some(workspace)) => {
                 if let Some(error) = workspace
@@ -1913,7 +1911,7 @@ mod tests {
         };
         assert_eq!(
             pending_recovery_status_line(&state).as_deref(),
-            Some("previous session available via /resume or a short continue/fix/test follow-up")
+            Some("previous session available via /resume")
         );
         assert_eq!(pending_recovery_status_line(&SessionState::default()), None);
     }

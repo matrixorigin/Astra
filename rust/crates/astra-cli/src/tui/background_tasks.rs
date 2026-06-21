@@ -83,6 +83,24 @@ impl BgTaskLiveControl {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum BgTaskCancelReason {
+    None = 0,
+    User = 1,
+    OutputCap = 2,
+}
+
+impl BgTaskCancelReason {
+    fn from_atomic(value: &AtomicU8) -> Self {
+        match value.load(Ordering::Acquire) {
+            1 => Self::User,
+            2 => Self::OutputCap,
+            _ => Self::None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum BgTaskEvent {
     Started {
@@ -138,6 +156,7 @@ pub(crate) struct BackgroundTaskHandle {
     last_output_size: u64,
     last_activity: Instant,
     last_tail_probe_at: Option<Instant>,
+    cancel_reason: Arc<AtomicU8>,
 }
 
 impl BackgroundTaskHandle {
@@ -194,6 +213,15 @@ impl BackgroundTaskHandle {
             }
         }
     }
+
+    fn set_cancel_reason_if_empty(&self, reason: BgTaskCancelReason) {
+        let _ = self.cancel_reason.compare_exchange(
+            BgTaskCancelReason::None as u8,
+            reason as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
 }
 
 // ── Registry ────────────────────────────────────────────────────────
@@ -206,6 +234,14 @@ const MAX_OUTPUT_BYTES: u64 = 64 * 1024;
 /// beyond this limit are soft-rejected (return an empty id) to prevent
 /// unbounded resource consumption.  The LLM can retry or re-plan.
 const MAX_CONCURRENT_TASKS: usize = 32;
+#[cfg(not(test))]
+const MAX_RETAINED_COMPLETED_TASKS: usize = 128;
+#[cfg(test)]
+const MAX_RETAINED_COMPLETED_TASKS: usize = 3;
+#[cfg(not(test))]
+const MAX_RETAINED_FAILED_TASKS: usize = 128;
+#[cfg(test)]
+const MAX_RETAINED_FAILED_TASKS: usize = 3;
 const STALL_THRESHOLD: Duration = Duration::from_secs(45);
 const STALL_TAIL_RECHECK_COOLDOWN: Duration = Duration::from_secs(2);
 const PROMPT_PATTERNS: &[&str] = &[
@@ -220,6 +256,13 @@ const PROMPT_PATTERNS: &[&str] = &[
     "Are you sure",
     "(yes/no)",
 ];
+
+fn output_cap_error() -> String {
+    format!(
+        "background shell output exceeded {} bytes; shell was terminated",
+        MAX_OUTPUT_BYTES
+    )
+}
 
 pub(crate) struct BackgroundTaskRegistry {
     tasks: HashMap<String, BackgroundTaskHandle>,
@@ -251,6 +294,7 @@ impl BackgroundTaskRegistry {
         let stdout_path = self.output_dir.join(format!("{id}.stdout"));
         let stderr_path = self.output_dir.join(format!("{id}.stderr"));
         let status = Arc::new(AtomicU8::new(BgTaskStatus::Running as u8));
+        let cancel_reason = Arc::new(AtomicU8::new(BgTaskCancelReason::None as u8));
 
         let handle = BackgroundTaskHandle {
             id: id.clone(),
@@ -268,6 +312,7 @@ impl BackgroundTaskRegistry {
             last_output_size: 0,
             last_activity: Instant::now(),
             last_tail_probe_at: None,
+            cancel_reason: cancel_reason.clone(),
         };
         self.tasks.insert(id.clone(), handle);
 
@@ -292,6 +337,7 @@ impl BackgroundTaskRegistry {
                 cancel,
                 &task_id,
                 &task_status,
+                cancel_reason,
             )
             .await
         });
@@ -339,6 +385,7 @@ impl BackgroundTaskRegistry {
         let stdout_path = self.output_dir.join(format!("{id}.stdout"));
         let stderr_path = self.output_dir.join(format!("{id}.stderr"));
         let status = Arc::new(AtomicU8::new(BgTaskStatus::Running as u8));
+        let cancel_reason = Arc::new(AtomicU8::new(BgTaskCancelReason::None as u8));
 
         // Seed output files with partial bytes the foreground runner
         // already showed. The LLM and user must see one continuous
@@ -373,6 +420,7 @@ impl BackgroundTaskRegistry {
             last_output_size: partial_stdout.len() as u64 + partial_stderr.len() as u64,
             last_activity: Instant::now(),
             last_tail_probe_at: None,
+            cancel_reason: cancel_reason.clone(),
         };
         self.tasks.insert(id.clone(), handle);
 
@@ -391,6 +439,7 @@ impl BackgroundTaskRegistry {
                 stdout_path,
                 stderr_path,
                 cancel,
+                cancel_reason,
                 task_id,
                 command_label,
             })
@@ -444,6 +493,7 @@ impl BackgroundTaskRegistry {
             last_output_size,
             last_activity: Instant::now(),
             last_tail_probe_at: None,
+            cancel_reason: Arc::new(AtomicU8::new(BgTaskCancelReason::None as u8)),
         };
         self.tasks.insert(id.to_string(), handle);
         Ok(())
@@ -481,6 +531,7 @@ impl BackgroundTaskRegistry {
         // terminal `TaskCompletion`. `poll_completions` then translates
         // that to a single `Killed` event. No premature status-set,
         // no duplicate event.
+        handle.set_cancel_reason_if_empty(BgTaskCancelReason::User);
         handle.cancel_token.cancel();
         Ok(())
     }
@@ -550,12 +601,47 @@ impl BackgroundTaskRegistry {
         }
     }
 
-    /// Prune terminated tasks from the registry to prevent unbounded
-    /// memory growth in long-running sessions.  Tasks that have reached a
-    /// terminal state (completed / failed / killed) are removed from the
-    /// in-memory map; their output files remain on disk.
-    pub fn prune_terminated(&mut self) {
-        self.tasks.retain(|_, h| !h.status().is_terminal());
+    /// Bound retained terminal shell handles without hiding recent results.
+    ///
+    /// Recent terminal tasks stay visible after their notification so Ctrl+T
+    /// and task_output can inspect them. Failed tasks get a separate retention
+    /// cap because they drive footer attention and usually need diagnosis.
+    /// Output files remain on disk either way.
+    pub fn prune_retained_terminal_tasks(&mut self) {
+        let keep_completed = self.retained_terminal_task_ids(
+            |status| matches!(status, BgTaskStatus::Completed | BgTaskStatus::Killed),
+            MAX_RETAINED_COMPLETED_TASKS,
+        );
+        let keep_failed = self.retained_terminal_task_ids(
+            |status| status == BgTaskStatus::Failed,
+            MAX_RETAINED_FAILED_TASKS,
+        );
+        self.tasks.retain(|id, h| {
+            !matches!(
+                h.status(),
+                BgTaskStatus::Completed | BgTaskStatus::Killed | BgTaskStatus::Failed
+            ) || keep_completed.contains(id)
+                || keep_failed.contains(id)
+        });
+    }
+
+    fn retained_terminal_task_ids(
+        &self,
+        matches_status: impl Fn(BgTaskStatus) -> bool,
+        max_retained: usize,
+    ) -> std::collections::HashSet<String> {
+        let mut terminal: Vec<_> = self
+            .tasks
+            .values()
+            .filter(|h| matches_status(h.status()))
+            .map(|h| (h.id.clone(), h.ended_at_ms.unwrap_or(h.started_at_ms)))
+            .collect();
+        terminal.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        terminal
+            .into_iter()
+            .take(max_retained)
+            .map(|(id, _)| id)
+            .collect()
     }
 
     /// Kill all running tasks. Returns IDs of killed tasks.
@@ -675,10 +761,9 @@ impl BackgroundTaskRegistry {
 
     /// Poll for completed tasks. Call from the TUI tick.
     /// Returns events for tasks that finished since last poll.
-    /// Also prunes tasks that were terminal on entry, ensuring one
-    /// full tick of display + persist before removal.
+    /// Also trims old terminal handles over their retention caps.
     pub fn poll_completions(&mut self) -> Vec<BgTaskEvent> {
-        self.prune_terminated();
+        self.prune_retained_terminal_tasks();
         self.drain_join_set();
         std::mem::take(&mut self.pending_completions)
     }
@@ -705,18 +790,8 @@ impl BackgroundTaskRegistry {
                 .unwrap_or(0);
             let current_size = stdout_size.saturating_add(stderr_size);
             if current_size > MAX_OUTPUT_BYTES {
+                handle.set_cancel_reason_if_empty(BgTaskCancelReason::OutputCap);
                 handle.cancel_token.cancel();
-                if handle.set_status_if_non_terminal(BgTaskStatus::Failed) {
-                    handle.ended_at_ms = Some(unix_epoch_millis());
-                    stall_events.push(BgTaskEvent::Failed {
-                        id: handle.id.clone(),
-                        title: handle.description.clone(),
-                        error: format!(
-                            "background shell output exceeded {} bytes; shell was terminated",
-                            MAX_OUTPUT_BYTES
-                        ),
-                    });
-                }
                 continue;
             }
             if current_size != handle.last_output_size {
@@ -841,6 +916,7 @@ async fn run_shell_task(
     cancel: CancellationToken,
     task_id: &str,
     status: &Arc<AtomicU8>,
+    cancel_reason: Arc<AtomicU8>,
 ) -> TaskCompletion {
     let stdout_file = match std::fs::File::create(stdout_path) {
         Ok(f) => f,
@@ -904,9 +980,11 @@ async fn run_shell_task(
             };
         }
     };
+    let mut process_group_guard = ProcessGroupKillGuard::new(&child);
 
     let result = tokio::select! {
         exit = child.wait() => {
+            process_group_guard.disarm();
             match exit {
                 Ok(exit_status) => {
                     let code = exit_status.code();
@@ -954,15 +1032,26 @@ async fn run_shell_task(
             }
         }
         _ = cancel.cancelled() => {
+            let reason = BgTaskCancelReason::from_atomic(&cancel_reason);
             kill_child_tree(&mut child).await;
+            process_group_guard.disarm();
             // Status is set by poll_completions via CAS — single writer.
             let _ = &status;
-            TaskCompletion {
-                id: task_id.to_string(),
-                status: BgTaskStatus::Killed,
-                exit_code: None,
-                summary: String::new(),
-                error: None,
+            match reason {
+                BgTaskCancelReason::OutputCap => TaskCompletion {
+                    id: task_id.to_string(),
+                    status: BgTaskStatus::Failed,
+                    exit_code: None,
+                    summary: String::new(),
+                    error: Some(output_cap_error()),
+                },
+                _ => TaskCompletion {
+                    id: task_id.to_string(),
+                    status: BgTaskStatus::Killed,
+                    exit_code: None,
+                    summary: String::new(),
+                    error: None,
+                },
             }
         }
     };
@@ -1030,6 +1119,7 @@ struct AdoptedShellRun {
     stdout_path: PathBuf,
     stderr_path: PathBuf,
     cancel: CancellationToken,
+    cancel_reason: Arc<AtomicU8>,
     task_id: String,
     command_label: String,
 }
@@ -1042,15 +1132,18 @@ async fn run_adopted_shell(run: AdoptedShellRun) -> TaskCompletion {
         stdout_path,
         stderr_path,
         cancel,
+        cancel_reason,
         task_id,
         command_label,
     } = run;
 
     let stdout_drain = tokio::spawn(drain_stream_to_file(stdout, stdout_path.clone()));
     let stderr_drain = tokio::spawn(drain_stream_to_file(stderr, stderr_path.clone()));
+    let mut process_group_guard = ProcessGroupKillGuard::new(&child);
 
     let result = tokio::select! {
         exit = child.wait() => {
+            process_group_guard.disarm();
             // Drain remaining buffered output before reporting status.
             let _ = stdout_drain.await;
             let _ = stderr_drain.await;
@@ -1101,21 +1194,71 @@ async fn run_adopted_shell(run: AdoptedShellRun) -> TaskCompletion {
             }
         }
         _ = cancel.cancelled() => {
+            let reason = BgTaskCancelReason::from_atomic(&cancel_reason);
             kill_child_tree(&mut child).await;
+            process_group_guard.disarm();
             // Reader tasks complete on stream-close after kill.
             let _ = stdout_drain.await;
             let _ = stderr_drain.await;
-            TaskCompletion {
-                id: task_id.clone(),
-                status: BgTaskStatus::Killed,
-                exit_code: None,
-                summary: String::new(),
-                error: None,
+            match reason {
+                BgTaskCancelReason::OutputCap => TaskCompletion {
+                    id: task_id.clone(),
+                    status: BgTaskStatus::Failed,
+                    exit_code: None,
+                    summary: String::new(),
+                    error: Some(output_cap_error()),
+                },
+                _ => TaskCompletion {
+                    id: task_id.clone(),
+                    status: BgTaskStatus::Killed,
+                    exit_code: None,
+                    summary: String::new(),
+                    error: None,
+                },
             }
         }
     };
 
     result
+}
+
+#[cfg(unix)]
+struct ProcessGroupKillGuard {
+    pgid: Option<nix::unistd::Pid>,
+}
+
+#[cfg(unix)]
+impl ProcessGroupKillGuard {
+    fn new(child: &tokio::process::Child) -> Self {
+        Self {
+            pgid: child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32)),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.pgid = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupKillGuard {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid.take() {
+            let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct ProcessGroupKillGuard;
+
+#[cfg(not(unix))]
+impl ProcessGroupKillGuard {
+    fn new(_child: &tokio::process::Child) -> Self {
+        Self
+    }
+
+    fn disarm(&mut self) {}
 }
 
 async fn kill_child_tree(child: &mut tokio::process::Child) {
@@ -1495,7 +1638,7 @@ mod tests {
     /// it. The earlier shape used `TempDir::keep()` which leaked
     /// `/tmp/<dir>` once per test invocation.
     fn test_handle_with_status(status: BgTaskStatus) -> (BackgroundTaskHandle, TempDir) {
-        let dir = TempDir::new().expect("temp dir");
+        let dir = crate::tests::test_temp_dir();
         let handle = BackgroundTaskHandle {
             id: "bg-1".into(),
             description: "test".into(),
@@ -1512,6 +1655,7 @@ mod tests {
             last_output_size: 0,
             last_activity: Instant::now(),
             last_tail_probe_at: None,
+            cancel_reason: Arc::new(AtomicU8::new(BgTaskCancelReason::None as u8)),
         };
         (handle, dir)
     }
@@ -1563,7 +1707,7 @@ mod tests {
 
     #[test]
     fn try_spawn_shell_rejects_capacity_without_empty_id() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let mut dirs = Vec::new();
         for idx in 0..MAX_CONCURRENT_TASKS {
@@ -1625,7 +1769,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_and_complete_shell_task() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("echo hello", "test echo");
 
@@ -1649,7 +1793,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_output_since_reads_incremental_chunks_by_offset() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("printf 'hello\\nworld\\n'", "test chunks");
 
@@ -1673,7 +1817,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_output_since_counts_final_line_without_trailing_newline() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("printf 'short'", "line count");
 
@@ -1687,7 +1831,7 @@ mod tests {
 
     #[tokio::test]
     async fn completion_event_carries_task_title_for_notifications() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("printf ok", "cargo test -p astra-cli");
 
@@ -1705,7 +1849,7 @@ mod tests {
 
     #[tokio::test]
     async fn grep_no_match_background_shell_completes_without_failure() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("grep needle /dev/null", "grep needle /dev/null");
 
@@ -1725,7 +1869,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_combined_output_stats_counts_stdout_and_stderr_source_files() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell(
             "printf 'out1\\nout2\\n'; printf 'err1\\n' >&2",
@@ -1744,7 +1888,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_combined_output_since_reads_stderr_only_projection() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("printf 'stderr-line\\n' >&2; exit 2", "stderr only");
 
@@ -1762,7 +1906,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_combined_output_since_uses_offsets_over_rendered_projection() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell(
             "printf 'stdout-line\\n'; printf 'stderr-line\\n' >&2",
@@ -1791,7 +1935,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_combined_output_since_reports_missing_stdout_when_stderr_is_empty() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("printf 'short'", "missing stdout");
 
@@ -1811,7 +1955,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_output_since_rejects_offsets_past_end() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("printf 'short'", "test offset bounds");
 
@@ -1825,7 +1969,7 @@ mod tests {
 
     #[test]
     fn terminal_task_with_missing_output_artifact_reports_explicit_error() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let (mut handle, _dir) = test_handle_with_status(BgTaskStatus::Completed);
         handle.id = "bg-shell-missing-output".to_string();
@@ -1843,7 +1987,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill_running_task() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("sleep 60", "long sleep");
 
@@ -1860,7 +2004,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_output_reads_file() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("echo 'line1'; echo 'line2'", "test output");
 
@@ -1872,7 +2016,7 @@ mod tests {
 
     #[tokio::test]
     async fn render_background_task_list_xml_reports_typed_rows() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("sleep 1", "build <all> & test");
 
@@ -1894,7 +2038,7 @@ mod tests {
 
     #[tokio::test]
     async fn render_background_task_list_xml_reports_output_and_terminal_metadata() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("printf 'first\\nlast\\n'", "cargo test");
 
@@ -1921,7 +2065,7 @@ mod tests {
 
     #[tokio::test]
     async fn render_background_task_list_xml_reports_missing_output_artifact() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("printf done", "missing output");
 
@@ -1941,7 +2085,7 @@ mod tests {
 
     #[test]
     fn restored_running_projection_is_visible_stale_and_not_killable() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let stdout = tmp.path().join("restored.stdout");
         let stderr = tmp.path().join("restored.stderr");
         std::fs::write(&stdout, "still building\n").unwrap();
@@ -1985,7 +2129,7 @@ mod tests {
 
     #[test]
     fn restored_terminal_projection_keeps_terminal_status() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let stdout = tmp.path().join("done.stdout");
         let stderr = tmp.path().join("done.stderr");
         std::fs::write(&stdout, "done\n").unwrap();
@@ -2015,7 +2159,7 @@ mod tests {
 
     #[test]
     fn render_background_task_list_orders_attention_before_running() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let (mut running, _running_dir) = test_handle_with_status(BgTaskStatus::Running);
         running.id = "bg-running".into();
@@ -2047,7 +2191,7 @@ mod tests {
 
     #[test]
     fn attention_counts_include_failed_but_not_completed_or_killed() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         for (id, status) in [
             ("running", BgTaskStatus::Running),
@@ -2066,9 +2210,91 @@ mod tests {
         assert_eq!(reg.failed_count(), 1);
     }
 
+    #[test]
+    fn poll_completions_retains_terminal_tasks_for_inspection() {
+        let tmp = crate::tests::test_temp_dir();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        for (id, status) in [
+            ("failed", BgTaskStatus::Failed),
+            ("completed", BgTaskStatus::Completed),
+        ] {
+            let (mut handle, _dir) = test_handle_with_status(status);
+            handle.id = id.to_string();
+            handle.description = id.to_string();
+            handle.stdout_path = tmp.path().join(format!("{id}.stdout"));
+            handle.stderr_path = tmp.path().join(format!("{id}.stderr"));
+            handle.ended_at_ms = Some(unix_epoch_millis());
+            std::fs::write(&handle.stdout_path, format!("{id} output\n")).unwrap();
+            std::fs::write(&handle.stderr_path, "").unwrap();
+            reg.tasks.insert(handle.id.clone(), handle);
+        }
+
+        assert!(reg.poll_completions().is_empty());
+        assert!(reg.poll_completions().is_empty());
+
+        assert_eq!(reg.failed_count(), 1);
+        assert!(reg.get("failed").is_some());
+        assert!(reg.get("completed").is_some());
+        assert!(
+            reg.get_combined_output("failed", 4096)
+                .expect("failed output")
+                .0
+                .contains("failed output")
+        );
+        assert!(
+            reg.get_combined_output("completed", 4096)
+                .expect("completed output")
+                .0
+                .contains("completed output")
+        );
+    }
+
+    #[test]
+    fn terminal_retention_prunes_old_terminal_tasks_by_status_bucket() {
+        let tmp = crate::tests::test_temp_dir();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        for idx in 0..(MAX_RETAINED_COMPLETED_TASKS + 2) {
+            let (mut handle, _dir) = test_handle_with_status(BgTaskStatus::Completed);
+            handle.id = format!("completed-{idx}");
+            handle.started_at_ms = idx as u64;
+            handle.ended_at_ms = Some(idx as u64);
+            handle.stdout_path = tmp.path().join(format!("completed-{idx}.stdout"));
+            handle.stderr_path = tmp.path().join(format!("completed-{idx}.stderr"));
+            std::fs::write(&handle.stdout_path, "ok\n").unwrap();
+            std::fs::write(&handle.stderr_path, "").unwrap();
+            reg.tasks.insert(handle.id.clone(), handle);
+        }
+        for idx in 0..(MAX_RETAINED_FAILED_TASKS + 2) {
+            let (mut handle, _dir) = test_handle_with_status(BgTaskStatus::Failed);
+            handle.id = format!("failed-{idx}");
+            handle.started_at_ms = idx as u64;
+            handle.ended_at_ms = Some(idx as u64);
+            reg.tasks.insert(handle.id.clone(), handle);
+        }
+
+        reg.prune_retained_terminal_tasks();
+
+        assert!(reg.get("completed-0").is_none());
+        assert!(reg.get("completed-1").is_none());
+        for idx in 2..(MAX_RETAINED_COMPLETED_TASKS + 2) {
+            assert!(
+                reg.get(&format!("completed-{idx}")).is_some(),
+                "newer completed task {idx} should be retained"
+            );
+        }
+        assert!(reg.get("failed-0").is_none());
+        assert!(reg.get("failed-1").is_none());
+        for idx in 2..(MAX_RETAINED_FAILED_TASKS + 2) {
+            assert!(
+                reg.get(&format!("failed-{idx}")).is_some(),
+                "newer failed task {idx} should be retained"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn combined_output_preserves_stdout_when_stderr_missing() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("echo stdout-only", "stdout fallback");
 
@@ -2085,7 +2311,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_task_stdin_is_null_not_tui_input() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell(
             "if read line; then echo read:$line; else echo no-stdin; fi",
@@ -2102,7 +2328,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_nonexistent_command_fails() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("/nonexistent_binary_xyz", "should fail");
 
@@ -2171,7 +2397,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill_terminal_task_returns_error() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("true", "quick");
         // Manually set terminal
@@ -2188,7 +2414,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_cap_fails_and_terminates_noisy_tasks() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("yes 'aaaaaaaaaa'", "large output");
         wait_until(Duration::from_secs(3), Duration::from_millis(25), || {
@@ -2203,9 +2429,20 @@ mod tests {
         })
         .await
         .expect("background shell should exceed output cap");
-        reg.stall_check();
-
-        let events = reg.poll_completions();
+        let mut events = Vec::new();
+        wait_until(Duration::from_secs(3), Duration::from_millis(25), || {
+            reg.stall_check();
+            events.extend(reg.poll_completions());
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    BgTaskEvent::Failed { id: eid, error, .. }
+                        if eid == &id && error.contains("output exceeded")
+                )
+            })
+        })
+        .await
+        .expect("output cap cancellation should produce a failure event");
         assert!(
             events.iter().any(|event| matches!(
                 event,
@@ -2218,7 +2455,7 @@ mod tests {
 
     #[test]
     fn stall_check_throttles_same_size_tail_rechecks() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let (mut handle, _dir) = test_handle_with_status(BgTaskStatus::Running);
         handle.id = "bg-throttle".into();
@@ -2255,7 +2492,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn killing_shell_task_kills_descendant_process_group() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let pid_file = tmp.path().join("child.pid");
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let command = format!("sleep 60 & echo $! > {}; wait", pid_file.display());
@@ -2288,7 +2525,7 @@ mod tests {
 
     #[tokio::test]
     async fn progress_events_emitted_during_long_task() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
 
         let _id = reg.spawn_shell(
@@ -2332,7 +2569,7 @@ mod tests {
     /// at most once in the full event stream.
     #[tokio::test]
     async fn poll_completions_yields_each_event_exactly_once() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("echo hi", "dedup test");
 
@@ -2368,7 +2605,7 @@ mod tests {
 
     #[tokio::test]
     async fn running_task_reports_elapsed_time() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("sleep 0.3", "elapsed test");
 
@@ -2388,7 +2625,7 @@ mod tests {
     /// signals cancellation.
     #[tokio::test]
     async fn kill_does_not_duplicate_terminal_event() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("sleep 60", "kill dedup test");
 
@@ -2413,7 +2650,7 @@ mod tests {
     /// poll_completions consumes the events.
     #[tokio::test]
     async fn drain_join_set_marks_empty_output_task_terminal() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("true", "empty output");
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2463,7 +2700,7 @@ mod tests {
         let stdout = child.stdout.take().expect("take child stdout");
         let stderr = child.stderr.take().expect("take child stderr");
 
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
 
         // Pretend the bash runner already consumed the first chunk.
@@ -2516,7 +2753,7 @@ mod tests {
     async fn drain_stream_to_file_appends_to_existing_output_without_sync_io() {
         use tokio::io::AsyncWriteExt;
 
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let path = tmp.path().join("adopted.stdout");
         std::fs::write(&path, "before-detach\n").expect("seed output");
 
@@ -2535,7 +2772,7 @@ mod tests {
     /// the kill setting Killed status prematurely.
     #[tokio::test]
     async fn fast_completion_wins_over_kill_signal() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         // Task that completes nearly instantly
         let id = reg.spawn_shell("true", "fast task");

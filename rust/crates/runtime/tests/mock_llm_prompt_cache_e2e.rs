@@ -107,6 +107,7 @@ fn build_host_with_tools(
         "test-user".to_string(),
         "test-session".to_string(),
     )
+    .with_server_sandbox_workspace("/tmp/astra-mock-prompt-cache")
     .with_edge_tools(tools)
     .with_test_llm_rounds(rounds)
     .with_llm_request_capture(capture);
@@ -137,11 +138,11 @@ async fn tool_schema_changes_invalidate_cacheable_prefix() {
     ];
     let cases: &[(&str, Vec<Value>)] = &[
         (
-            "extra_tool_appended",
+            "write_tool_appended",
             vec![
                 tool_named("bash", "Execute a bash command"),
                 tool_named("read_file", "Read a file"),
-                tool_named("extra_tool", "An extra tool injected"),
+                tool_named("write_file", "Write a file"),
             ],
         ),
         (

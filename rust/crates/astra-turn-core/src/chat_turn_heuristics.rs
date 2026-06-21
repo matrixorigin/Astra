@@ -477,42 +477,8 @@ pub fn looks_like_mutating_task(input: &str) -> bool {
     has_mutating
 }
 
-fn recent_tools_imply_live_domain(recent_tools: &[String]) -> bool {
-    recent_tools.iter().any(|tool| {
-        tool.starts_with("github_")
-            || tool.starts_with("memory_")
-            || matches!(tool.as_str(), "git_status" | "git_diff")
-    })
-}
-
-pub fn looks_like_live_query_with_context(input: &str, recent_tools: &[String]) -> bool {
-    if looks_like_factual_query(input) {
-        return true;
-    }
-
-    if !recent_tools_imply_live_domain(recent_tools) {
-        return false;
-    }
-
-    let q = input.trim().to_lowercase();
-    let is_short_followup = q.chars().count() <= 12;
-    if !is_short_followup {
-        return false;
-    }
-
-    [
-        "最新",
-        "latest",
-        "那",
-        "呢",
-        "还有",
-        "然后",
-        "继续",
-        "what about",
-        "how about",
-    ]
-    .iter()
-    .any(|kw| q.contains(kw))
+pub fn looks_like_live_query_with_context(input: &str, _recent_tools: &[String]) -> bool {
+    looks_like_factual_query(input)
 }
 
 pub fn should_force_factual_tool_retry(
@@ -626,11 +592,10 @@ pub fn extract_repos_from_memory(text: &str) -> Vec<String> {
     repos
 }
 
-// ── Shared low-information continuation detection ──────────────────────────
+// ── Shared prompt text normalization ───────────────────────────────────────
 //
 /// Trim trailing punctuation, ellipsis markers, and Chinese tone particles
-/// from a user message.  Used by both the CLI continuation short-circuit and
-/// the server adaptive-tuning routing path.
+/// from a user message.
 pub fn trim_trailing_punctuation(s: &str) -> &str {
     s.trim().trim_end_matches(|ch: char| {
         matches!(
@@ -650,67 +615,6 @@ pub fn trim_trailing_punctuation(s: &str) -> &str {
                 | '啦'
         )
     })
-}
-
-/// Check whether the (already trimmed) text starts with a Chinese
-/// low-information continuation prefix such as "继续", "还有呢", etc.
-///
-/// This list is the single source of truth for both CLI and server
-/// continuation heuristics.
-pub fn starts_with_chinese_continuation_prefix(trimmed: &str) -> bool {
-    [
-        "继续",
-        "接着",
-        "补下",
-        "补一下",
-        "还有什么",
-        "还有呢",
-        "然后呢",
-        "下一步",
-        "接下来",
-    ]
-    .iter()
-    .any(|prefix| trimmed.starts_with(prefix))
-}
-
-/// Detect very short continuation prompts such as "continue", "继续", or
-/// colloquial follow-ups like "还有什么？".
-pub fn is_short_continuation_prompt(line: &str) -> bool {
-    let trimmed = trim_trailing_punctuation(line);
-    if trimmed.is_empty() || trimmed.chars().count() > 16 {
-        return false;
-    }
-
-    let lower = trimmed.to_ascii_lowercase();
-    if matches!(
-        lower.as_str(),
-        "continue"
-            | "go on"
-            | "go ahead"
-            | "resume"
-            | "do it"
-            | "fix it"
-            | "try it"
-            | "run it"
-            | "yes"
-            | "ok"
-            | "okay"
-            | "sure"
-            | "proceed"
-            | "next"
-            | "keep going"
-    ) {
-        return true;
-    }
-
-    if matches!(
-        trimmed,
-        "继续" | "好的" | "好" | "可以" | "是的" | "对" | "行" | "嗯"
-    ) {
-        return true;
-    }
-
-    starts_with_chinese_continuation_prefix(trimmed)
 }
 
 #[cfg(test)]
@@ -889,7 +793,7 @@ mod tests {
         let none: Vec<String> = vec![];
         let policy = TurnInteractionPolicy::from_visible_tool_names(
             TurnInteractionMode::Deny,
-            vec!["github_ci_status".into()],
+            vec!["github".into()],
         );
         assert!(should_force_factual_tool_retry(
             TaskExecutionProfile::default(),
@@ -959,11 +863,12 @@ mod tests {
     }
 
     #[test]
-    fn contextual_live_query_detects_short_followup() {
-        let recent = vec!["github_ci_status".to_string()];
-        assert!(looks_like_live_query_with_context("最新的", &recent));
+    fn live_query_detection_ignores_recent_tools_for_short_followups() {
+        let recent = vec!["github".to_string()];
+        assert!(!looks_like_live_query_with_context("最新的", &recent));
         assert!(looks_like_live_query_with_context("pr呢？", &recent));
         assert!(!looks_like_live_query_with_context("hello", &recent));
+        assert!(!looks_like_live_query_with_context("然后呢", &recent));
     }
 
     #[test]
@@ -1116,54 +1021,5 @@ mod tests {
     fn trim_trailing_punctuation_preserves_non_trailing() {
         assert_eq!(trim_trailing_punctuation("继续啊呀"), "继续");
         assert_eq!(trim_trailing_punctuation("next step"), "next step");
-    }
-
-    // ── starts_with_chinese_continuation_prefix ───────────────────────────
-
-    #[test]
-    fn chinese_continuation_prefix_positive() {
-        assert!(starts_with_chinese_continuation_prefix("继续改代码"));
-        assert!(starts_with_chinese_continuation_prefix("还有呢？"));
-        assert!(starts_with_chinese_continuation_prefix("下一步"));
-        assert!(starts_with_chinese_continuation_prefix("接下来做什么"));
-    }
-
-    #[test]
-    fn chinese_continuation_prefix_negative() {
-        assert!(!starts_with_chinese_continuation_prefix("补充说明架构"));
-        assert!(!starts_with_chinese_continuation_prefix("修复 bug"));
-        assert!(!starts_with_chinese_continuation_prefix("你好"));
-    }
-
-    #[test]
-    fn short_continuation_prompt_is_detected() {
-        assert!(is_short_continuation_prompt("继续"));
-        assert!(is_short_continuation_prompt("continue"));
-        assert!(is_short_continuation_prompt("resume"));
-        assert!(is_short_continuation_prompt("go ahead"));
-        assert!(is_short_continuation_prompt("do it"));
-        assert!(is_short_continuation_prompt("fix it"));
-        assert!(is_short_continuation_prompt("yes"));
-        assert!(is_short_continuation_prompt("ok"));
-        assert!(is_short_continuation_prompt("sure"));
-        assert!(is_short_continuation_prompt("proceed"));
-        assert!(is_short_continuation_prompt("next"));
-        assert!(is_short_continuation_prompt("keep going"));
-        assert!(is_short_continuation_prompt("好的"));
-        assert!(is_short_continuation_prompt("可以"));
-        assert!(is_short_continuation_prompt("是的"));
-        assert!(is_short_continuation_prompt("行"));
-        assert!(!is_short_continuation_prompt(
-            "继续修这个 bug，并顺便看下另一个问题"
-        ));
-        assert!(!is_short_continuation_prompt("fix this bug"));
-    }
-
-    #[test]
-    fn short_continuation_prompt_detects_colloquial_followups() {
-        assert!(is_short_continuation_prompt("继续啊"));
-        assert!(is_short_continuation_prompt("继续完成所有的啊"));
-        assert!(is_short_continuation_prompt("接着啊"));
-        assert!(is_short_continuation_prompt("还有什么？"));
     }
 }

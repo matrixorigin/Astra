@@ -608,8 +608,9 @@ fn update_working_memory_for_turn_settlement(state: &mut AgenticLoopState) {
     memory.clear_blockers();
 
     if let Some(summary) = task_summary {
-        memory.set_next_action(format!(
-            "Resume unfinished task-board work: {}",
+        memory.clear_next_action();
+        memory.push_blocker(format!(
+            "unfinished_task_board: {}",
             bounded_working_memory_line(&summary)
         ));
         if let Some(interruption) = interruption.as_ref()
@@ -698,7 +699,11 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
         if state.interruption.is_none() {
             state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
                 astra_turn_core::interruption::InterruptionKind::EmptyCompletion,
-                astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+                astra_turn_core::interruption::ResumeAction::RequiresIntervention {
+                    description:
+                        "unfinished task-board work remains; wait for explicit user direction before continuing"
+                            .to_string(),
+                },
                 settlement_interruption_summary(state, Some(detail)),
             ));
         }
@@ -750,7 +755,7 @@ fn task_board_terminal_message(
     message.push_str("\n\nRemaining task-board work: ");
     message.push_str(&snapshot.short_summary());
     message.push_str(
-        ". Resume and finish or explicitly close these tasks before reporting completion.",
+        ". It is preserved on the board; continue it only if the user explicitly asks, or close it explicitly before reporting completion.",
     );
     message
 }
@@ -780,13 +785,13 @@ fn reset_per_turn_corrective_state(state: &mut AgenticLoopState) {
     state.stall.forced_execution_retry = false;
     state.stall.forced_execution_escalation = false;
     state.stall.forced_parallel_batching = false;
-    state.stall.forced_parallel_batching_escalated = false;
     state.stall.forced_round_budget_phase1 = false;
     state.stall.forced_round_budget_phase2 = false;
     state.stall.forced_completion_soft_stop = false;
     state.stall.forced_task_board_completion_gate = false;
     state.stall.forced_redundant_reads_corrective = false;
     state.stall.forced_cache_waste_corrective = false;
+    state.stall.forced_search_fanout_corrective = false;
     state.stall.forced_exploration_family_corrective = false;
     state.stall.forced_exploration_family_phase2 = false;
     state.stall.exploration_family_corrective_family = None;
@@ -1106,6 +1111,13 @@ mod tests {
             serde_json::json!({
                 "role": "user",
                 "content": format!(
+                    "{}\nold search fanout",
+                    crate::turn::agentic_loop::execution_phase::SEARCH_FANOUT_MARKER
+                ),
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": format!(
                     "{}\nold exploration family phase2",
                     crate::turn::agentic_loop::execution_phase::EXPLORATION_FAMILY_PHASE2_MARKER
                 ),
@@ -1119,6 +1131,7 @@ mod tests {
         state.stall.forced_round_budget_phase2 = true;
         state.stall.forced_redundant_reads_corrective = true;
         state.stall.forced_cache_waste_corrective = true;
+        state.stall.forced_search_fanout_corrective = true;
         state.stall.forced_exploration_family_corrective = true;
         state.stall.forced_exploration_family_phase2 = true;
         state.stall.exploration_family_corrective_family = Some("diff".into());
@@ -1161,6 +1174,7 @@ mod tests {
         assert!(!state.stall.forced_round_budget_phase2);
         assert!(!state.stall.forced_redundant_reads_corrective);
         assert!(!state.stall.forced_cache_waste_corrective);
+        assert!(!state.stall.forced_search_fanout_corrective);
         assert!(!state.stall.forced_exploration_family_corrective);
         assert!(!state.stall.forced_exploration_family_phase2);
         assert!(state.stall.exploration_family_corrective_family.is_none());
@@ -1345,11 +1359,19 @@ mod tests {
             state.final_text.contains("task-1") || state.final_text.contains("finish validation"),
             "terminal output should surface unfinished task context"
         );
+        let interruption = state
+            .interruption
+            .as_ref()
+            .expect("unfinished task-board work should record an interruption");
+        assert!(matches!(
+            &interruption.resume_action,
+            astra_turn_core::interruption::ResumeAction::RequiresIntervention { .. }
+        ));
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
     }
 
     #[tokio::test]
-    async fn finalize_and_render_persists_unfinished_task_resume_memory() {
+    async fn finalize_and_render_persists_unfinished_task_as_blocker_not_auto_resume() {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
         attach_pipeline_session(&mut state);
@@ -1382,8 +1404,12 @@ mod tests {
             .working_memory()
             .render_prompt_section();
         assert!(
-            rendered.contains("Next action: Resume unfinished task-board work:"),
-            "unfinished task-board state must become durable resume guidance: {rendered}"
+            rendered.contains("Blockers:") && rendered.contains("unfinished_task_board:"),
+            "unfinished task-board state must be preserved without auto-resume pressure: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Next action:"),
+            "unfinished task-board state must not become an automatic next action: {rendered}"
         );
         assert!(rendered.contains("finish validation"));
     }

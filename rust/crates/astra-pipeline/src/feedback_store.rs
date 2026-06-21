@@ -16,10 +16,11 @@
 //! `ToolQualityTracker` — aggregated, anonymised, and merged/sanitised
 //! before being written to the learning snapshot on disk.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use tokio::sync::Mutex;
 
+use astra_text_utils::text_tokenize::tokenize;
 use astra_turn_types::StructuredFeedback;
 
 /// Maximum stored feedback rules per session.
@@ -44,6 +45,8 @@ struct StoreInner {
 
 struct SessionRules {
     rules: Vec<StructuredFeedback>,
+    suppressed_rule_keys: HashSet<String>,
+    last_injected_rule_keys: Vec<String>,
 }
 
 impl FeedbackStore {
@@ -73,17 +76,25 @@ impl FeedbackStore {
         let entry = inner
             .sessions
             .entry(session_id.to_string())
-            .or_insert_with(|| SessionRules { rules: Vec::new() });
+            .or_insert_with(|| SessionRules {
+                rules: Vec::new(),
+                suppressed_rule_keys: HashSet::new(),
+                last_injected_rule_keys: Vec::new(),
+            });
 
         if entry
             .rules
             .iter()
             .any(|r| r.rule.eq_ignore_ascii_case(&feedback.rule))
         {
+            entry
+                .suppressed_rule_keys
+                .remove(&Self::rule_key(&feedback));
             return;
         }
         if entry.rules.len() >= MAX_RULES_PER_SESSION {
-            entry.rules.remove(0);
+            let removed = entry.rules.remove(0);
+            entry.suppressed_rule_keys.remove(&Self::rule_key(&removed));
         }
         entry.rules.push(feedback);
     }
@@ -95,7 +106,12 @@ impl FeedbackStore {
             .await
             .sessions
             .get(session_id)
-            .map(|s| s.rules.len())
+            .map(|s| {
+                s.rules
+                    .iter()
+                    .filter(|rule| !s.suppressed_rule_keys.contains(&Self::rule_key(rule)))
+                    .count()
+            })
             .unwrap_or(0)
     }
 
@@ -110,34 +126,41 @@ impl FeedbackStore {
     }
 
     /// Build injection text, optionally filtering rules by relevance to the
-    /// current user message. When `user_message` is provided, rules whose
-    /// keywords overlap with the message are injected first ("relevant"),
-    /// followed by up to `MAX_IRRELEVANT_RULES` others so the model still
-    /// has background context without unbounded token growth.
+    /// current user message. When `user_message` is provided, only rules with
+    /// concrete lexical evidence in the current task are injected.
     pub async fn build_injection_filtered(
         &self,
         session_id: &str,
         user_message: Option<&str>,
     ) -> String {
-        let inner = self.inner.lock().await;
-        let Some(entry) = inner.sessions.get(session_id) else {
+        let mut inner = self.inner.lock().await;
+        let Some(entry) = inner.sessions.get_mut(session_id) else {
             return String::new();
         };
         if entry.rules.is_empty() {
             return String::new();
         }
 
-        let rules: Vec<&StructuredFeedback> = match user_message {
-            Some(msg) => Self::filter_relevant(&entry.rules, msg),
-            None => entry.rules.iter().collect(),
+        let selected_indices: Vec<usize> = match user_message {
+            Some(msg) => {
+                Self::filter_relevant_indices(&entry.rules, &entry.suppressed_rule_keys, msg)
+            }
+            None => Self::active_rule_indices(&entry.rules, &entry.suppressed_rule_keys),
         };
 
-        if rules.is_empty() {
+        if selected_indices.is_empty() {
+            entry.last_injected_rule_keys.clear();
             return String::new();
         }
 
+        entry.last_injected_rule_keys = selected_indices
+            .iter()
+            .map(|&idx| Self::rule_key(&entry.rules[idx]))
+            .collect();
+
         let mut lines = vec!["[Learned Feedback Rules]".to_string()];
-        for fb in &rules {
+        for &idx in &selected_indices {
+            let fb = &entry.rules[idx];
             let mut line = format!("- Rule: {}", fb.rule);
             if fb.reason != "Not stated" {
                 line.push_str(&format!(" | Why: {}", fb.reason));
@@ -150,42 +173,194 @@ impl FeedbackStore {
         lines.join("\n")
     }
 
-    /// Maximum number of non-matching rules to include as background context.
-    const MAX_IRRELEVANT_RULES: usize = 3;
+    /// Suppress rules from the most recent injection by their injected-list
+    /// indices. The caller owns semantic interpretation of user/model feedback.
+    ///
+    /// Returns the number of newly suppressed rules.
+    pub async fn suppress_last_injected_rule_indices(
+        &self,
+        session_id: &str,
+        indices: &[usize],
+    ) -> usize {
+        if indices.is_empty() {
+            return 0;
+        }
+        let mut inner = self.inner.lock().await;
+        let Some(entry) = inner.sessions.get_mut(session_id) else {
+            return 0;
+        };
+        let requested: HashSet<usize> = indices.iter().copied().collect();
+        let mut changed = 0usize;
+        for (idx, key) in entry.last_injected_rule_keys.iter().enumerate() {
+            if requested.contains(&idx) && entry.suppressed_rule_keys.insert(key.clone()) {
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            entry.last_injected_rule_keys = entry
+                .last_injected_rule_keys
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, key)| (!requested.contains(&idx)).then_some(key.clone()))
+                .collect();
+        }
+        changed
+    }
 
-    /// Select rules relevant to the current user message. Rules with keyword
-    /// overlap are always included; up to `MAX_IRRELEVANT_RULES` others are
-    /// appended so the model retains some background awareness.
-    fn filter_relevant<'a>(
-        rules: &'a [StructuredFeedback],
+    /// Select only rules with concrete evidence in the current user message.
+    fn filter_relevant_indices(
+        rules: &[StructuredFeedback],
+        suppressed_rule_keys: &HashSet<String>,
         user_message: &str,
-    ) -> Vec<&'a StructuredFeedback> {
-        let msg_lower = user_message.to_lowercase();
-        let msg_words: std::collections::HashSet<&str> = msg_lower
-            .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
-            .filter(|w| w.chars().count() >= 2)
-            .collect();
+    ) -> Vec<usize> {
+        let query_terms = Self::meaningful_terms(user_message);
+        if query_terms.is_empty() {
+            return Vec::new();
+        }
 
-        let mut relevant = Vec::new();
-        let mut irrelevant = Vec::new();
-
-        for fb in rules {
-            let rule_text = format!("{} {}", fb.rule, fb.apply_when).to_lowercase();
-            let has_overlap = rule_text
-                .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
-                .filter(|w| w.chars().count() >= 2)
-                .any(|w| msg_words.contains(w));
-
-            if has_overlap {
-                relevant.push(fb);
-            } else {
-                irrelevant.push(fb);
+        let mut scored = Vec::new();
+        for (idx, fb) in rules.iter().enumerate() {
+            if suppressed_rule_keys.contains(&Self::rule_key(fb)) {
+                continue;
+            }
+            let rule_text = Self::rule_relevance_text(fb);
+            let rule_terms = Self::meaningful_terms(&rule_text);
+            let overlap_score = Self::overlap_score(&query_terms, &rule_terms);
+            if overlap_score > 0 {
+                scored.push((idx, overlap_score));
             }
         }
 
-        // Always include all relevant rules + a few irrelevant for background
-        relevant.extend(irrelevant.into_iter().take(Self::MAX_IRRELEVANT_RULES));
-        relevant
+        scored.sort_by(|(left_idx, left_score), (right_idx, right_score)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| left_idx.cmp(right_idx))
+        });
+        scored.into_iter().map(|(idx, _)| idx).collect()
+    }
+
+    fn active_rule_indices(
+        rules: &[StructuredFeedback],
+        suppressed_rule_keys: &HashSet<String>,
+    ) -> Vec<usize> {
+        rules
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, rule)| {
+                (!suppressed_rule_keys.contains(&Self::rule_key(rule))).then_some(idx)
+            })
+            .collect()
+    }
+
+    fn rule_relevance_text(fb: &StructuredFeedback) -> String {
+        let mut text = format!("{} {}", fb.rule, fb.apply_when);
+        if fb.reason != "Not stated" {
+            text.push(' ');
+            text.push_str(&fb.reason);
+        }
+        text
+    }
+
+    fn meaningful_terms(text: &str) -> HashSet<String> {
+        tokenize(text)
+            .into_iter()
+            .filter(|term| Self::is_meaningful_term(term))
+            .collect()
+    }
+
+    fn overlap_score(query_terms: &HashSet<String>, rule_terms: &HashSet<String>) -> usize {
+        query_terms
+            .intersection(rule_terms)
+            .filter(|term| Self::is_strong_overlap_term(term))
+            .map(|term| if term.is_ascii() { 2 } else { 1 })
+            .sum()
+    }
+
+    fn is_strong_overlap_term(term: &str) -> bool {
+        if term.is_ascii() {
+            return term.chars().count() >= 3;
+        }
+        term.chars().count() >= 2
+    }
+
+    fn is_meaningful_term(term: &str) -> bool {
+        if term.trim().is_empty() {
+            return false;
+        }
+        if matches!(
+            term,
+            "the"
+                | "and"
+                | "for"
+                | "with"
+                | "that"
+                | "this"
+                | "from"
+                | "into"
+                | "when"
+                | "rule"
+                | "rules"
+                | "general"
+                | "always"
+                | "never"
+                | "should"
+                | "would"
+                | "could"
+                | "don't"
+                | "dont"
+                | "doesn't"
+                | "doesnt"
+                | "do"
+                | "not"
+                | "use"
+                | "using"
+                | "used"
+                | "user"
+                | "task"
+                | "please"
+                | "help"
+                | "need"
+                | "want"
+                | "about"
+                | "because"
+                | "instead"
+                | "prefer"
+                | "run"
+        ) {
+            return false;
+        }
+        if matches!(
+            term,
+            "的" | "了"
+                | "是"
+                | "在"
+                | "和"
+                | "与"
+                | "或"
+                | "这"
+                | "那"
+                | "用"
+                | "要"
+                | "不"
+                | "做"
+                | "说"
+                | "把"
+                | "给"
+                | "对"
+                | "错"
+        ) {
+            return false;
+        }
+        true
+    }
+
+    fn rule_key(fb: &StructuredFeedback) -> String {
+        format!(
+            "{}\n{}\n{}",
+            fb.rule.to_lowercase(),
+            fb.reason.to_lowercase(),
+            fb.apply_when.to_lowercase()
+        )
     }
 
     /// Get a snapshot of rules for a session.
@@ -195,7 +370,13 @@ impl FeedbackStore {
             .await
             .sessions
             .get(session_id)
-            .map(|s| s.rules.clone())
+            .map(|s| {
+                s.rules
+                    .iter()
+                    .filter(|rule| !s.suppressed_rule_keys.contains(&Self::rule_key(rule)))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -430,7 +611,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filtered_injection_caps_irrelevant_rules() {
+    async fn filtered_injection_drops_irrelevant_rules() {
         let store = FeedbackStore::new();
         for i in 0..6 {
             store
@@ -445,8 +626,56 @@ mod tests {
             .await;
         let rule_count = injection.matches("- Rule:").count();
         assert_eq!(
-            rule_count, 3,
-            "should cap irrelevant rules at 3, got {rule_count}"
+            rule_count, 0,
+            "irrelevant rules must not be injected, got {rule_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn filtered_injection_does_not_fill_with_unrelated_browser_rule() {
+        let store = FeedbackStore::new();
+        store
+            .add(
+                "s1",
+                make_fb_with_apply(
+                    "Do not treat curl/server/process checks as browser verification",
+                    "HTML/browser verification",
+                ),
+            )
+            .await;
+
+        let injection = store
+            .build_injection_filtered("s1", Some("review the Rust executor code"))
+            .await;
+
+        assert!(
+            injection.is_empty(),
+            "unrelated learned feedback must stay out of the prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_feedback_suppresses_last_injected_rules() {
+        let store = FeedbackStore::new();
+        store
+            .add("s1", make_fb_with_apply("don't use mocks", "testing"))
+            .await;
+
+        let first = store
+            .build_injection_filtered("s1", Some("write tests with mocks"))
+            .await;
+        assert!(first.contains("don't use mocks"));
+
+        let suppressed = store.suppress_last_injected_rule_indices("s1", &[0]).await;
+        assert_eq!(suppressed, 1);
+        assert_eq!(store.len("s1").await, 0);
+
+        let second = store
+            .build_injection_filtered("s1", Some("write tests with mocks"))
+            .await;
+        assert!(
+            second.is_empty(),
+            "dismissed rule should not be re-injected"
         );
     }
 
@@ -559,6 +788,10 @@ mod tests {
         assert!(
             injection.contains("bash"),
             "Chinese+ASCII mixed keyword should match"
+        );
+        assert!(
+            !injection.contains("clippy"),
+            "unrelated rule should not be included as filler"
         );
     }
 

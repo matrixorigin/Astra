@@ -409,7 +409,7 @@ fn cli_chat_subcommand() {
     // Permission modes
     for (input, expected) in [
         ("auto", "auto"),
-        ("accept-edits", "accept_edits"),
+        ("accept_edits", "accept_edits"),
         ("plan", "plan"),
     ] {
         let cli = Cli::try_parse_from(["astra", "chat", "--permission-mode", input]).unwrap();
@@ -420,7 +420,7 @@ fn cli_chat_subcommand() {
             _ => panic!("expected Chat perm={input}"),
         }
     }
-    for alias in ["yolo", "bypass-safety", "bypass_safety"] {
+    for alias in ["accept-edits", "yolo", "bypass-safety", "bypass_safety"] {
         assert!(Cli::try_parse_from(["astra", "chat", "--permission-mode", alias]).is_err());
     }
 }
@@ -441,6 +441,13 @@ fn cli_permissions_subcommand() {
             }
             _ => panic!("expected Permissions {mode}"),
         }
+    }
+
+    for removed in ["all", "status"] {
+        assert!(
+            Cli::try_parse_from(["astra", "permissions", removed]).is_err(),
+            "removed permissions subcommand must be rejected: {removed}"
+        );
     }
 }
 

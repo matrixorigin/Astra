@@ -1001,6 +1001,60 @@ impl ToolCallRecord {
                 .as_deref()
                 .is_some_and(|e| e.starts_with("blocked_tool:"))
     }
+
+    /// True when the tool call did not produce new observations because the
+    /// runtime served or pointed back to an already-known result.
+    ///
+    /// This is intentionally a result-semantics predicate, not a read_file
+    /// special case. Evaluation and loop guards can use it to distinguish
+    /// "successful execution with fresh evidence" from cache hits, duplicate
+    /// suppressions, and unchanged-result stubs.
+    pub fn is_noop_or_cached_result(&self) -> bool {
+        self.error
+            .as_deref()
+            .is_some_and(is_noop_or_cached_result_text)
+            || self
+                .result_preview
+                .as_deref()
+                .is_some_and(is_noop_or_cached_result_text)
+            || self
+                .result_full
+                .as_deref()
+                .is_some_and(is_noop_or_cached_result_text)
+    }
+}
+
+/// Classify a journal entry as a cache-hit / dedup stub rather than fresh
+/// evidence.
+///
+/// All emit sites bracket these markers at the start of the string
+/// (`[cached_cross_turn:`, `[Same read_file request…`, `[File already fully
+/// read…`, `[File unchanged since the earlier read…`, `Cached repeat skipped…`,
+/// `Repeated cached read skipped…`). We therefore anchor on the leading
+/// prefix instead of doing loose `contains()` over the whole payload: a tool
+/// that legitimately prints "I already read the file, refer to the docs" must
+/// not be misclassified as a cache no-op.
+fn is_noop_or_cached_result_text(text: &str) -> bool {
+    const ANCHORED_PREFIXES: &[&str] = &[
+        "[cached_cross_turn:",
+        "[Same read_file request",
+        "[File already fully read",
+        "[File unchanged since the earlier read",
+        "Cached repeat skipped",
+        "Duplicate call skipped",
+        "Repeated cached read skipped",
+        "⛔ Cached repeat",
+        "⛔ Repeated cached read suppressed",
+    ];
+
+    let trimmed = text.trim_start();
+    if ANCHORED_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
+        return true;
+    }
+
+    // `error:` is a short status code, not free-form prose, so exact match is
+    // both sufficient and immune to payload drift.
+    matches!(trimmed, "cached_cross_turn" | "duplicate_within_turn")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7059,6 +7113,42 @@ mod tests {
                     ..Default::default()
                 }
                 .was_blocked_by_policy()
+            );
+        }
+
+        // ── is_noop_or_cached_result ──
+        {
+            assert!(
+                ToolCallRecord {
+                    name: "read_file".to_string(),
+                    ok: true,
+                    error: Some("cached_cross_turn".into()),
+                    result_preview: Some("[cached_cross_turn: reused 200 bytes]".into()),
+                    ..Default::default()
+                }
+                .is_noop_or_cached_result()
+            );
+            assert!(
+                base_tool_record(
+                    "read_file",
+                    true,
+                    Some(
+                        "[File already fully read earlier in this turn and unchanged — refer to the earlier read_file result]"
+                    )
+                )
+                .is_noop_or_cached_result()
+            );
+            assert!(
+                base_tool_record(
+                    "bash",
+                    false,
+                    Some("Cached repeat skipped (call #3 for identical args, limit: 2).")
+                )
+                .is_noop_or_cached_result()
+            );
+            assert!(
+                !base_tool_record("read_file", true, Some("fn main() {}"))
+                    .is_noop_or_cached_result()
             );
         }
 
