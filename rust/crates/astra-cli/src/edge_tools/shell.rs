@@ -4362,7 +4362,7 @@ impl ToolExecutor {
             Ok(invocation) => invocation,
             Err(message) => {
                 self.restore_bash_detach_handle(slot, handle).await;
-                return Some(super::ToolExecutionOutcome::error(message));
+                return Some(super::tool_execution_outcome_from_output(message));
             }
         };
         let config =
@@ -4376,11 +4376,7 @@ impl ToolExecutor {
                 let output =
                     self.finalize_tool_output(self.render_bash_output(&command, out), "bash");
                 self.record_output_size(output.len());
-                Some(if output.starts_with("Error") {
-                    super::ToolExecutionOutcome::error(output)
-                } else {
-                    super::ToolExecutionOutcome::ok(output)
-                })
+                Some(super::tool_execution_outcome_from_output(output))
             }
             Ok(DetachableShellOutput::Detached {
                 payload,

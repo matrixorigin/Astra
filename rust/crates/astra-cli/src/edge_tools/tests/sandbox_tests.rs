@@ -90,3 +90,56 @@ fn write_file_existing_external_file_respects_expanded_sandbox_boundary() {
     assert_eq!(parsed["success"].as_bool(), Some(true), "{result}");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
 }
+
+#[tokio::test]
+async fn execute_with_metadata_sandbox_denial_is_structured_and_hides_wire_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = ToolExecutor::new(dir.path());
+
+    let outcome = exe
+        .execute_with_metadata("read_file", &serde_json::json!({"path": "/etc/passwd"}))
+        .await;
+
+    assert!(outcome.is_error);
+    assert!(
+        !outcome
+            .output
+            .contains(crate::sandbox_retry::SANDBOX_DENIED_PREFIX),
+        "{}",
+        outcome.output
+    );
+    assert!(outcome.output.starts_with("Error: "), "{}", outcome.output);
+    let fields = outcome.tool_result_fields.expect("metadata fields");
+    assert_eq!(
+        fields.get("error_kind").and_then(serde_json::Value::as_str),
+        Some(crate::sandbox_retry::SANDBOX_DENIED_ERROR_KIND)
+    );
+}
+
+#[tokio::test]
+async fn cancelable_bash_sandbox_denial_is_structured_and_hides_wire_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = ToolExecutor::new(dir.path());
+
+    let outcome = exe
+        .execute_with_metadata_cancelable(
+            "bash",
+            &serde_json::json!({"command": "cat /etc/passwd"}),
+            None,
+        )
+        .await;
+
+    assert!(outcome.is_error);
+    assert!(
+        !outcome
+            .output
+            .contains(crate::sandbox_retry::SANDBOX_DENIED_PREFIX),
+        "{}",
+        outcome.output
+    );
+    let fields = outcome.tool_result_fields.expect("metadata fields");
+    assert_eq!(
+        fields.get("error_kind").and_then(serde_json::Value::as_str),
+        Some(crate::sandbox_retry::SANDBOX_DENIED_ERROR_KIND)
+    );
+}

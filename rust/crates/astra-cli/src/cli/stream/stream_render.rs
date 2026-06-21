@@ -3235,10 +3235,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 // If the sandbox denied the operation, prompt the user for
                 // authorization. On approval, temporarily expand the sandbox
                 // boundary and retry the tool.
-                if crate::sandbox_retry::is_sandbox_denied(&outcome.output) {
-                    let sandbox_msg = crate::sandbox_retry::sandbox_denied_message(&outcome.output)
-                        .map(|message| message.into_owned())
-                        .unwrap_or_default();
+                if let Some(sandbox_msg) = normalize_sandbox_denied_outcome(&mut outcome) {
                     if let Some(expand_dir) =
                         crate::sandbox_retry::sandbox_expand_dir_from_denial(args, &sandbox_msg)
                     {
@@ -3395,6 +3392,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                     self.cancel_token.cloned(),
                                 )
                                 .await;
+                                normalize_sandbox_denied_outcome(&mut outcome);
                                 tool_result_fields = outcome.tool_result_fields;
                                 tool_execution_marked_error = outcome.is_error;
                                 outcome.output
@@ -4072,16 +4070,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // we no longer assume the parallel batch was pre-approved.
         let mut outputs = outputs;
         for pos in 0..outputs.len() {
-            if !crate::sandbox_retry::is_sandbox_denied(&outputs[pos].0.output) {
+            let Some(sandbox_msg) = normalize_sandbox_denied_outcome(&mut outputs[pos].0) else {
                 continue;
-            }
+            };
             let (_, req) = conc_reqs[pos];
             let tool = req.tool.clone();
             let args = req.args.clone();
             let sandbox_tool_key = format!("sandbox_expand:{tool}");
-            let sandbox_msg = crate::sandbox_retry::sandbox_denied_message(&outputs[pos].0.output)
-                .map(|message| message.into_owned())
-                .unwrap_or_default();
             let Some(expand_dir) =
                 crate::sandbox_retry::sandbox_expand_dir_from_denial(&args, &sandbox_msg)
             else {
@@ -4102,17 +4097,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     // Surface the deny reason so the LLM and user can
                     // see why the sandbox refused to widen, instead of
                     // silently continuing with the original
-                    // SANDBOX_DENIED output.
-                    let prefix = "SANDBOX_DENIED: ";
-                    let suffix = format!(" (sandbox_expand:{tool} denied: {reason})");
-                    if !outputs[pos].0.output.contains(&suffix) {
-                        if outputs[pos].0.output.starts_with(prefix) {
-                            outputs[pos].0.output.push_str(&suffix);
-                        } else {
-                            outputs[pos].0.output =
-                                format!("{prefix}{}{suffix}", outputs[pos].0.output);
-                        }
-                    }
+                    // sandbox-denied output.
+                    outputs[pos].0.output =
+                        format!("Error: {sandbox_msg} (sandbox_expand:{tool} denied: {reason})");
+                    outputs[pos].0.is_error = true;
                     false
                 }
                 crate::cli::permission_manager::PermissionDecision::NeedApproval {
@@ -4172,12 +4160,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         // forcing PermissionMode::Auto for headless
                         // entries; reaching this branch with no sink
                         // means a misconfiguration. Surface a clear
-                        // reason in the SANDBOX_DENIED output.
-                        let suffix = " (approval required for sandbox_expand but no TUI; \
-                                       pass --mode auto or add allow rule)";
-                        if !outputs[pos].0.output.contains(suffix) {
-                            outputs[pos].0.output.push_str(suffix);
-                        }
+                        // reason without exposing the sandbox-denied wire
+                        // prefix.
+                        outputs[pos].0.output = format!(
+                            "Error: {sandbox_msg} (approval required for sandbox_expand but no TUI; pass --mode auto or add allow rule)"
+                        );
+                        outputs[pos].0.is_error = true;
                         false
                     }
                 }
@@ -4197,6 +4185,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     self.cancel_token.cloned(),
                 ))
                 .await;
+            let mut retried = retried;
+            normalize_sandbox_denied_outcome(&mut retried);
             outputs[pos] = (retried, retry_dur);
         }
 
@@ -5746,6 +5736,25 @@ fn edge_tool_outcome_status(outcome: &crate::edge_tools::ToolExecutionOutcome) -
     }
 }
 
+fn normalize_sandbox_denied_outcome(
+    outcome: &mut crate::edge_tools::ToolExecutionOutcome,
+) -> Option<String> {
+    let message = crate::sandbox_retry::sandbox_denied_message_from_result(
+        &outcome.output,
+        outcome.tool_result_fields.as_ref(),
+    )?
+    .into_owned();
+    outcome.tool_result_fields = Some(
+        crate::sandbox_retry::merge_sandbox_denied_tool_result_fields(
+            outcome.tool_result_fields.take(),
+            &message,
+        ),
+    );
+    outcome.output = format!("Error: {message}");
+    outcome.is_error = true;
+    Some(message)
+}
+
 async fn catch_tool_execution_panic<F>(future: F) -> (crate::edge_tools::ToolExecutionOutcome, u64)
 where
     F: Future<Output = crate::edge_tools::ToolExecutionOutcome>,
@@ -6301,9 +6310,10 @@ mod tests {
         approval_stale_revalidation_error, catch_tool_execution_panic, dispatch_turn_event_block,
         edge_tool_is_cacheable_read, edge_tool_outcome_status, execute_with_metadata_responsive,
         extract_cli_diff_block, format_tool_display_from_preview, is_edge_auth_failure,
-        merge_edge_tool_rounds, path_mtime_ms, reusable_speculative_output, style_tool_description,
-        sync_incremental_accum_state, sync_incremental_tool_result_state, task_preview_from_args,
-        theme, tool_completion_icon, tool_dedup_signature,
+        merge_edge_tool_rounds, normalize_sandbox_denied_outcome, path_mtime_ms,
+        reusable_speculative_output, style_tool_description, sync_incremental_accum_state,
+        sync_incremental_tool_result_state, task_preview_from_args, theme, tool_completion_icon,
+        tool_dedup_signature,
     };
     use crate::cli::chat_stream;
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
@@ -7535,6 +7545,54 @@ mod tests {
         assert!(
             s2.lines_written >= 2,
             "md mode should still track lines_written"
+        );
+    }
+
+    #[test]
+    fn sandbox_denied_outcome_normalizes_legacy_prefix() {
+        let mut outcome = crate::edge_tools::ToolExecutionOutcome::error(
+            "SANDBOX_DENIED: Path '/tmp/out.md' is outside the project directory '/tmp/project'; sandbox approval is required for this external path."
+                .to_string(),
+        );
+
+        let message = normalize_sandbox_denied_outcome(&mut outcome).expect("sandbox denial");
+
+        assert_eq!(
+            message,
+            "Path '/tmp/out.md' is outside the project directory '/tmp/project'; sandbox approval is required for this external path."
+        );
+        assert_eq!(outcome.output, format!("Error: {message}"));
+        let fields = outcome.tool_result_fields.expect("metadata fields");
+        assert_eq!(
+            fields.get("error_kind").and_then(Value::as_str),
+            Some(crate::sandbox_retry::SANDBOX_DENIED_ERROR_KIND)
+        );
+        assert!(
+            !outcome
+                .output
+                .contains(crate::sandbox_retry::SANDBOX_DENIED_PREFIX)
+        );
+    }
+
+    #[test]
+    fn sandbox_denied_outcome_normalizes_metadata_only_result() {
+        let mut outcome = crate::edge_tools::ToolExecutionOutcome {
+            output: "Error: operation blocked by local policy".to_string(),
+            tool_result_fields: Some(crate::sandbox_retry::sandbox_denied_tool_result_fields(
+                "Path '/tmp/out.md' is outside the project directory '/tmp/project'; sandbox approval is required for this external path.",
+            )),
+            is_error: true,
+        };
+
+        let message = normalize_sandbox_denied_outcome(&mut outcome).expect("sandbox denial");
+
+        assert_eq!(
+            outcome.output,
+            "Error: Path '/tmp/out.md' is outside the project directory '/tmp/project'; sandbox approval is required for this external path."
+        );
+        assert_eq!(
+            message,
+            "Path '/tmp/out.md' is outside the project directory '/tmp/project'; sandbox approval is required for this external path."
         );
     }
 

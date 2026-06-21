@@ -18,7 +18,7 @@
 use std::borrow::Cow;
 use std::path::{Component, Path, PathBuf};
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Derive which directory should be added to the sandbox's allow-list
 /// when a tool returned SANDBOX_DENIED for the given arguments.
@@ -343,6 +343,16 @@ fn sandbox_expand_path_is_sensitive(path: &Path) -> bool {
 /// executor tree.
 pub const SANDBOX_DENIED_PREFIX: &str = "SANDBOX_DENIED: ";
 
+/// Stable structured error kind for sandbox boundary denials.
+///
+/// The visible output should be a human-readable `Error: ...` message; this
+/// metadata is the machine-readable retry signal.
+pub const SANDBOX_DENIED_ERROR_KIND: &str = "sandbox_denied";
+
+const ERROR_KIND_FIELD: &str = "error_kind";
+const MESSAGE_FIELD: &str = "message";
+const SANDBOX_DENIED_MESSAGE_FIELD: &str = "sandbox_denied_message";
+
 /// True when `output` is a sandbox-denied result from one of the edge
 /// tools. Keep this the single check site so the prefix contract has
 /// one consumer.
@@ -378,6 +388,90 @@ pub fn sandbox_denied_message(output: &str) -> Option<Cow<'_, str>> {
     }
 
     None
+}
+
+/// True when a tool result is a sandbox denial.
+///
+/// Prefer structured metadata (`error_kind=sandbox_denied`) over visible text.
+/// The legacy text parser remains as a compatibility fallback for older edge
+/// tool emitters.
+#[must_use]
+pub fn is_sandbox_denied_result(
+    output: &str,
+    tool_result_fields: Option<&Map<String, Value>>,
+) -> bool {
+    sandbox_denied_message_from_result(output, tool_result_fields).is_some()
+}
+
+/// Return the human-readable sandbox denial message from a tool result.
+///
+/// This is the result-level equivalent of [`sandbox_denied_message`]: metadata
+/// wins when present; otherwise we parse legacy visible output.
+#[must_use]
+pub fn sandbox_denied_message_from_result<'a>(
+    output: &'a str,
+    tool_result_fields: Option<&'a Map<String, Value>>,
+) -> Option<Cow<'a, str>> {
+    if let Some(fields) = tool_result_fields
+        && fields.get(ERROR_KIND_FIELD).and_then(Value::as_str) == Some(SANDBOX_DENIED_ERROR_KIND)
+    {
+        if let Some(message) = fields
+            .get(MESSAGE_FIELD)
+            .or_else(|| fields.get(SANDBOX_DENIED_MESSAGE_FIELD))
+            .and_then(Value::as_str)
+        {
+            return Some(normalize_sandbox_denied_message(message));
+        }
+        if let Some(message) = sandbox_denied_message(output) {
+            return Some(message);
+        }
+        let trimmed = output
+            .strip_prefix("Error: ")
+            .unwrap_or(output)
+            .trim()
+            .trim_end_matches('.');
+        if !trimmed.is_empty() {
+            return Some(Cow::Borrowed(trimmed));
+        }
+        return Some(Cow::Borrowed(
+            "Sandbox approval is required for this external path",
+        ));
+    }
+
+    sandbox_denied_message(output)
+}
+
+/// Build canonical metadata for a sandbox-denied tool result.
+#[must_use]
+pub fn sandbox_denied_tool_result_fields(message: &str) -> Map<String, Value> {
+    merge_sandbox_denied_tool_result_fields(None, message)
+}
+
+/// Merge sandbox-denied metadata into an existing tool result field map.
+#[must_use]
+pub fn merge_sandbox_denied_tool_result_fields(
+    existing: Option<Map<String, Value>>,
+    message: &str,
+) -> Map<String, Value> {
+    let mut fields = existing.unwrap_or_default();
+    fields.insert(
+        ERROR_KIND_FIELD.to_string(),
+        Value::String(SANDBOX_DENIED_ERROR_KIND.to_string()),
+    );
+    fields.insert(
+        MESSAGE_FIELD.to_string(),
+        Value::String(normalize_sandbox_denied_message(message).into_owned()),
+    );
+    fields
+}
+
+fn normalize_sandbox_denied_message(message: &str) -> Cow<'_, str> {
+    let message = message.strip_prefix("Error: ").unwrap_or(message);
+    if let Some(message) = message.strip_prefix(SANDBOX_DENIED_PREFIX) {
+        Cow::Borrowed(message)
+    } else {
+        Cow::Borrowed(message)
+    }
 }
 
 #[must_use]
@@ -433,8 +527,10 @@ fn quote_aware_tokens(input: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SANDBOX_DENIED_PREFIX, extract_first_absolute_path, is_sandbox_denied,
-        sandbox_denied_message, sandbox_expand_dir_from_args, sandbox_expand_dir_from_denial,
+        SANDBOX_DENIED_ERROR_KIND, SANDBOX_DENIED_PREFIX, extract_first_absolute_path,
+        is_sandbox_denied, is_sandbox_denied_result, sandbox_denied_message,
+        sandbox_denied_message_from_result, sandbox_denied_tool_result_fields,
+        sandbox_expand_dir_from_args, sandbox_expand_dir_from_denial,
         sandbox_retry_no_expand_dir_output,
     };
     use serde_json::json;
@@ -784,6 +880,45 @@ mod tests {
     #[test]
     fn sandbox_denied_message_none_for_non_prefixed() {
         assert!(sandbox_denied_message("ok: contents").is_none());
+    }
+
+    #[test]
+    fn sandbox_denied_result_detects_metadata_without_wire_prefix() {
+        let fields = sandbox_denied_tool_result_fields(
+            "Path '/home/user/out.md' is outside the project directory '/home/user/project'; sandbox approval is required for this external path.",
+        );
+        let output = "Error: operation blocked by local policy";
+
+        assert!(is_sandbox_denied_result(output, Some(&fields)));
+        assert!(!is_sandbox_denied(output));
+    }
+
+    #[test]
+    fn sandbox_denied_result_message_prefers_metadata() {
+        let fields = sandbox_denied_tool_result_fields(
+            "Path '/tmp/out.md' is outside the project directory '/tmp/project'; sandbox approval is required for this external path.",
+        );
+
+        let msg = sandbox_denied_message_from_result("Error: generic fallback", Some(&fields))
+            .expect("metadata message");
+        assert_eq!(
+            msg.as_ref(),
+            "Path '/tmp/out.md' is outside the project directory '/tmp/project'; sandbox approval is required for this external path."
+        );
+    }
+
+    #[test]
+    fn sandbox_denied_result_fields_are_stable() {
+        let fields = sandbox_denied_tool_result_fields("SANDBOX_DENIED: path outside");
+
+        assert_eq!(
+            fields.get("error_kind").and_then(|value| value.as_str()),
+            Some(SANDBOX_DENIED_ERROR_KIND)
+        );
+        assert_eq!(
+            fields.get("message").and_then(|value| value.as_str()),
+            Some("path outside")
+        );
     }
 
     #[test]

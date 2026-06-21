@@ -440,6 +440,28 @@ fn cli_tool_output_is_error(output: &str) -> bool {
 
 pub(crate) use astra_tools::git_gix::ToolExecutionOutcome;
 
+fn sandbox_denied_outcome_from_output(output: &str) -> Option<ToolExecutionOutcome> {
+    let message = crate::sandbox_retry::sandbox_denied_message(output)?.into_owned();
+    Some(ToolExecutionOutcome {
+        output: format!("Error: {message}"),
+        tool_result_fields: Some(crate::sandbox_retry::sandbox_denied_tool_result_fields(
+            &message,
+        )),
+        is_error: true,
+    })
+}
+
+fn tool_execution_outcome_from_output(output: String) -> ToolExecutionOutcome {
+    if let Some(outcome) = sandbox_denied_outcome_from_output(&output) {
+        return outcome;
+    }
+    if cli_tool_output_is_error(&output) {
+        ToolExecutionOutcome::error(output)
+    } else {
+        ToolExecutionOutcome::ok(output)
+    }
+}
+
 struct EdgeToolRun {
     output: String,
     error_kind: Option<astra_core::ErrorKind>,
@@ -468,6 +490,10 @@ impl EdgeToolRun {
     }
 
     fn into_outcome(self) -> ToolExecutionOutcome {
+        if let Some(outcome) = sandbox_denied_outcome_from_output(&self.output) {
+            return outcome;
+        }
+
         let mut outcome = if self.error_kind.is_some() || cli_tool_output_is_error(&self.output) {
             ToolExecutionOutcome::error(self.output)
         } else {
@@ -4397,22 +4423,14 @@ impl ToolExecutor {
         if name == "bash" {
             let output = self.finalize_tool_output(self.bash_with_cancel(args, cancel_token), name);
             self.record_output_size(output.len());
-            return Some(if cli_tool_output_is_error(&output) {
-                ToolExecutionOutcome::error(output)
-            } else {
-                ToolExecutionOutcome::ok(output)
-            });
+            return Some(tool_execution_outcome_from_output(output));
         }
         #[cfg(windows)]
         if name == "powershell" {
             let output =
                 self.finalize_tool_output(self.powershell_with_cancel(args, cancel_token), name);
             self.record_output_size(output.len());
-            return Some(if cli_tool_output_is_error(&output) {
-                ToolExecutionOutcome::error(output)
-            } else {
-                ToolExecutionOutcome::ok(output)
-            });
+            return Some(tool_execution_outcome_from_output(output));
         }
         #[cfg(not(windows))]
         let _ = cancel_token; // powershell branch is the only other cancel-aware tool
