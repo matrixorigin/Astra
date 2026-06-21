@@ -221,9 +221,7 @@ fn sensitive_path_match_for_shell_segment(segment: &str) -> Option<SensitivePath
         return Some(hit);
     }
 
-    let Some(command_index) = first_command_token_index(&tokens) else {
-        return None;
-    };
+    let command_index = first_command_token_index(&tokens)?;
     let command = shell_basename(&tokens[command_index]);
     let args_start = command_index + 1;
 
@@ -483,9 +481,7 @@ fn find_sensitive_path_match(tokens: &[String], start: usize) -> Option<Sensitiv
 
 fn copy_like_sensitive_path_match(tokens: &[String], start: usize) -> Option<SensitivePathMatch> {
     let operands = shell_path_operands(tokens, start);
-    let Some((last_index, _)) = operands.last().copied() else {
-        return None;
-    };
+    let (last_index, _) = operands.last().copied()?;
 
     for (idx, token) in operands {
         let access = if idx == last_index {
