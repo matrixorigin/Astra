@@ -442,6 +442,13 @@ fn cli_permissions_subcommand() {
             _ => panic!("expected Permissions {mode}"),
         }
     }
+
+    for removed in ["all", "status"] {
+        assert!(
+            Cli::try_parse_from(["astra", "permissions", removed]).is_err(),
+            "removed permissions subcommand must be rejected: {removed}"
+        );
+    }
 }
 
 #[test]

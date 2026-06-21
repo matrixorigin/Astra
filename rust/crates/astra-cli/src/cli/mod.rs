@@ -39,6 +39,7 @@ pub mod mcp_config;
 pub mod mock_llm;
 pub mod notifications;
 pub mod one_shot_session_routing;
+pub(crate) mod permission_command;
 pub mod permission_manager;
 pub mod plan;
 pub mod preferences_client;

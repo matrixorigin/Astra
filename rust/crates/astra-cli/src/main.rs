@@ -2877,6 +2877,16 @@ total_tokens_out: 500
     }
 
     #[test]
+    fn cli_permissions_command_rejects_removed_aliases() {
+        for removed in ["all", "status"] {
+            assert!(
+                Cli::try_parse_from(["astra", "permissions", removed]).is_err(),
+                "removed permissions subcommand must be rejected: {removed}"
+            );
+        }
+    }
+
+    #[test]
     fn cli_allow_alias_parses_permissions_command() {
         let cli = Cli::try_parse_from(["astra", "allow", "prompt"]).unwrap();
         match cli.command {
