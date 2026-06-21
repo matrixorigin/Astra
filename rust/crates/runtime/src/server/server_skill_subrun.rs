@@ -276,9 +276,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         let compact_strategy = astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
             effective_model.as_deref().unwrap_or(""),
         );
-        let permission_context = Arc::new(tokio::sync::RwLock::new(
-            crate::orchestration::PermissionSyncContext::new(self.inherited_permissions.clone()),
-        ));
+        let permission_context =
+            crate::orchestration::PermissionSyncContext::shared(self.inherited_permissions.clone());
 
         // Build a sub-run session ID for isolation.
         let safe_name = crate::skills::loader::sanitize_for_path(skill_name);

@@ -153,15 +153,12 @@ fn extend_restricted_with_blocked_tools(
     // callers don't need signature changes; add future block sources here.
 }
 
-type RootPermissionContextHandle =
-    Arc<tokio::sync::RwLock<astra_runtime::orchestration::PermissionSyncContext>>;
+type RootPermissionContextHandle = astra_runtime::orchestration::PermissionSyncHandle;
 
 fn root_permission_context_handle(
     perm_manager: &crate::cli::permission_manager::PermissionManager,
 ) -> RootPermissionContextHandle {
-    Arc::new(tokio::sync::RwLock::new(
-        perm_manager.runtime_permission_context(),
-    ))
+    perm_manager.runtime_permission_handle()
 }
 
 async fn refresh_root_permission_context(
@@ -172,7 +169,7 @@ async fn refresh_root_permission_context(
     if let Some(existing) = handle.as_ref() {
         *existing.write().await = latest;
     } else {
-        *handle = Some(Arc::new(tokio::sync::RwLock::new(latest)));
+        *handle = Some(latest.into_shared());
     }
 }
 

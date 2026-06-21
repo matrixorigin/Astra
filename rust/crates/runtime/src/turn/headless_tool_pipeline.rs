@@ -5,7 +5,8 @@ use astra_services::session_journal::ToolCallRecord;
 use astra_thin_client::ThinClient;
 use serde_json::{Map, Value};
 
-use super::agentic::headless_round::{HeadlessRoundTerminal, PermissionSyncHandle};
+use super::agentic::headless_round::HeadlessRoundTerminal;
+use crate::orchestration::PermissionSyncHandle;
 use astra_pipeline::step_protocol::{IdempotencyKey, InMemoryIdempotencyCache};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
@@ -444,12 +445,11 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::sync::Arc;
 
     use super::*;
     use serde_json::json;
 
-    use crate::orchestration::{PermissionMode, PermissionSyncContext};
+    use crate::orchestration::{PermissionMode, PermissionSyncContext, PermissionSyncHandle};
     use crate::skills::hooks::{HookAction, ToolEventHook, ToolEventHookRegistry, ToolEventKind};
     use crate::turn::agentic::headless_round::NoopHeadlessTerminal;
     use astra_pipeline::step_protocol::CachedToolResult;
@@ -560,7 +560,7 @@ mod tests {
         call_counts: HashMap<String, u32>,
         tool_call_records: Vec<ToolCallRecord>,
         tool_event_hooks: ToolEventHookRegistry,
-        permission_context: Option<Arc<tokio::sync::RwLock<PermissionSyncContext>>>,
+        permission_context: Option<PermissionSyncHandle>,
         term: NoopHeadlessTerminal,
         repeated_cache_hit_suppression: u32,
         max_consecutive_empty_name: u32,
@@ -594,9 +594,7 @@ mod tests {
                 call_counts: HashMap::new(),
                 tool_call_records: Vec::new(),
                 tool_event_hooks: ToolEventHookRegistry::default(),
-                permission_context: Some(Arc::new(tokio::sync::RwLock::new(
-                    PermissionSyncContext::root(PermissionMode::Auto),
-                ))),
+                permission_context: Some(PermissionSyncContext::shared_root(PermissionMode::Auto)),
                 term: NoopHeadlessTerminal,
                 // Tests assume the legacy threshold of 2 unless they override.
                 // Production runs derive these from the per-model policy.

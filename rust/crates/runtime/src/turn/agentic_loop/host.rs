@@ -1344,8 +1344,7 @@ pub struct AgenticLoopState {
     /// Optional permission sync context for runtime permission management.
     /// When set, tool execution checks permissions before running and can
     /// request permission from parent agent via mailbox if denied.
-    pub permission_context:
-        Option<std::sync::Arc<tokio::sync::RwLock<crate::orchestration::PermissionSyncContext>>>,
+    pub permission_context: Option<crate::orchestration::PermissionSyncHandle>,
 
     /// Optional permission request handler for processing child requests.
     /// When set, incoming PermissionRequest messages are handled automatically.

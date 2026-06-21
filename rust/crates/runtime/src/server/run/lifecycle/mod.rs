@@ -2664,9 +2664,7 @@ impl AgenticRunLifecycleService {
             Self::thinking_from_chat_context(&request.context, request.model.as_deref());
         let root_permissions =
             Self::inherited_permissions_from_request(request, &request_constraints);
-        let root_permission_context = Some(Arc::new(RwLock::new(PermissionSyncContext::new(
-            root_permissions.clone(),
-        ))));
+        let root_permission_context = Some(PermissionSyncContext::shared(root_permissions.clone()));
 
         // Create harness sink early so sub-run executors can share it.
         #[cfg(feature = "harness")]
@@ -6445,9 +6443,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             .resolve_for_model(config.agent_profile.model_override.as_deref());
         let restricted_tools: std::collections::HashSet<String> =
             load_deployment_disabled_tools().into_iter().collect();
-        let permission_context = Arc::new(RwLock::new(PermissionSyncContext::new(
-            self.inherited_permissions.clone(),
-        )));
+        let permission_context = PermissionSyncContext::shared(self.inherited_permissions.clone());
 
         let mut loop_state = AgenticLoopState {
             messages: vec![user_message],
@@ -7751,9 +7747,8 @@ mod tests {
 
     fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunConfig {
         let inherited_permissions = crate::orchestration::InheritedPermissions::auto_approve();
-        let permission_context = Arc::new(RwLock::new(
-            crate::orchestration::PermissionSyncContext::new(inherited_permissions.clone()),
-        ));
+        let permission_context =
+            crate::orchestration::PermissionSyncContext::shared(inherited_permissions.clone());
         SpawnRunConfig {
             run_id: "child-run".to_string(),
             agent_id: "child@1234".to_string(),

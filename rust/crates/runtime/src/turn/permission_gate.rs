@@ -4,12 +4,10 @@
 //! When a tool is blocked by permissions, it returns an error result
 //! instead of executing, or requests permission from the parent agent.
 
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
 
 use crate::orchestration::permission_sync::{
-    PermissionRequest, PermissionResponse, PermissionSyncContext, PermissionUpdate,
+    PermissionRequest, PermissionResponse, PermissionSyncHandle, PermissionUpdate,
 };
 use astra_messaging::router::AgentMailbox;
 use astra_turn_core::permission::engine::{DecisionSource, HardDecision, evaluate_permission};
@@ -53,7 +51,7 @@ pub enum PermissionCheckResult {
 pub async fn check_tool_permission(
     tool_name: &str,
     args: Option<&str>,
-    permission_context: Option<&Arc<RwLock<PermissionSyncContext>>>,
+    permission_context: Option<&PermissionSyncHandle>,
     mailbox: Option<&mut AgentMailbox>,
     timeout: Duration,
 ) -> PermissionCheckResult {
@@ -185,7 +183,7 @@ pub fn permission_denied_error_result(tool_name: &str, reason: &str) -> String {
 pub async fn check_tool_permission_in_plan_mode(
     tool_name: &str,
     args: Option<&str>,
-    permission_context: Option<&Arc<RwLock<PermissionSyncContext>>>,
+    permission_context: Option<&PermissionSyncHandle>,
     mailbox: Option<&mut AgentMailbox>,
     timeout: Duration,
     plan_mode_active: bool,
@@ -224,9 +222,11 @@ mod tests {
     use super::*;
     use crate::orchestration::permission_sync::{
         InheritedPermissions, PermissionMode, PermissionResponseMessaging, PermissionRule,
+        PermissionSyncContext,
     };
     use astra_turn_core::permission::types::RuleMatchContext;
     use std::collections::HashSet;
+    use std::sync::Arc;
 
     fn is_allowed(result: &PermissionCheckResult) -> bool {
         matches!(
@@ -264,7 +264,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let result =
             check_tool_permission("edit", None, Some(&ctx), None, Duration::from_secs(5)).await;
@@ -282,7 +282,7 @@ mod tests {
             is_background: true,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let result =
             check_tool_permission("edit", None, Some(&ctx), None, Duration::from_secs(5)).await;
@@ -300,7 +300,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let result =
             check_tool_permission("edit", None, Some(&ctx), None, Duration::from_secs(5)).await;
@@ -327,7 +327,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         // Should approve without needing a mailbox
         let result = check_tool_permission(
@@ -362,7 +362,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         // "view" is in the allowlist — should approve
         let result =
@@ -408,7 +408,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         // No mailbox — orchestrator is not registered (the actual
         // production state on a fresh REPL).
@@ -458,7 +458,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let result = check_tool_permission(
             "read_file",
@@ -492,7 +492,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         // `edit` is NOT in the code-review-style allowlist.
         let result = check_tool_permission(
@@ -520,7 +520,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let result = check_tool_permission(
             "bash",
@@ -547,7 +547,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let result = check_tool_permission(
             "git",
@@ -601,7 +601,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let router_clone = router.clone();
         let parent_addr_clone = parent_addr.clone();
@@ -686,7 +686,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let router_clone = router.clone();
         let parent_addr_clone = parent_addr.clone();
@@ -769,7 +769,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         // Pretend the session is mid-plan with active plan id present.
         let result = check_tool_permission_in_plan_mode(
@@ -803,7 +803,7 @@ mod tests {
             mode: PermissionMode::Auto,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         for (tool, args) in [
             ("str_replace", None),
@@ -841,7 +841,7 @@ mod tests {
             mode: PermissionMode::Auto,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         for command in ["git status --short", "ls src", "grep -R needle src"] {
             let args = serde_json::json!({ "command": command }).to_string();
@@ -867,7 +867,7 @@ mod tests {
             mode: PermissionMode::Auto,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         for tool in &[
             "read_file",
@@ -910,7 +910,7 @@ mod tests {
             mode: PermissionMode::Auto,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let result = check_tool_permission_in_plan_mode(
             "bash",
@@ -936,7 +936,7 @@ mod tests {
             mode: PermissionMode::Auto,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let result = check_tool_permission_in_plan_mode(
             "exit_plan_mode",
@@ -991,7 +991,7 @@ mod tests {
             is_background: false,
             ..Default::default()
         };
-        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+        let ctx = PermissionSyncContext::shared(inherited);
 
         let result = check_tool_permission(
             "bash",

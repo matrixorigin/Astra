@@ -2351,6 +2351,12 @@ impl PermissionManager {
         self.evaluation_context()
     }
 
+    pub(crate) fn runtime_permission_handle(
+        &self,
+    ) -> astra_runtime::orchestration::PermissionSyncHandle {
+        self.runtime_permission_context().into_shared()
+    }
+
     fn evaluation_context(&self) -> astra_turn_core::permission::types::PermissionSyncContext {
         let mut inherited = self
             .inherited

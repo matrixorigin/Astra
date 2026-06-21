@@ -248,9 +248,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             &self.project_root,
             self.inherited_permissions.clone(),
         );
-        let permission_context = std::sync::Arc::new(tokio::sync::RwLock::new(
-            perm_manager.runtime_permission_context(),
-        ));
+        let permission_context = perm_manager.runtime_permission_handle();
 
         // T-9: Worktree CWD injection — when team isolation provides a per-agent
         // worktree path via context, use it as the working directory instead of

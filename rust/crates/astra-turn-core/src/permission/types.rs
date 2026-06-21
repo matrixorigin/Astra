@@ -917,6 +917,15 @@ pub struct PermissionSyncContext {
     telemetry: PermissionTelemetry,
 }
 
+/// Shared runtime permission context handle.
+///
+/// Runtime entrypoints should construct permission state through
+/// [`PermissionSyncContext::shared`] or [`PermissionSyncContext::shared_root`]
+/// instead of open-coding `Arc<RwLock<PermissionSyncContext>>`. Keeping the
+/// handle shape centralized prevents new CLI/server/edge entrypoints from
+/// silently reintroducing a missing-context path.
+pub type PermissionSyncHandle = std::sync::Arc<tokio::sync::RwLock<PermissionSyncContext>>;
+
 impl PermissionSyncContext {
     /// Create a new sync context with inherited permissions.
     pub fn new(inherited: InheritedPermissions) -> Self {
@@ -928,12 +937,28 @@ impl PermissionSyncContext {
         }
     }
 
+    /// Create a shared runtime permission context from an explicit inherited
+    /// permissions envelope.
+    pub fn shared(inherited: InheritedPermissions) -> PermissionSyncHandle {
+        Self::new(inherited).into_shared()
+    }
+
+    /// Convert an already-built context into a shared runtime handle.
+    pub fn into_shared(self) -> PermissionSyncHandle {
+        std::sync::Arc::new(tokio::sync::RwLock::new(self))
+    }
+
     /// Create a context with no inherited permissions (root agent).
     pub fn root(mode: PermissionMode) -> Self {
         Self::new(InheritedPermissions {
             mode,
             ..Default::default()
         })
+    }
+
+    /// Create a shared root runtime permission context.
+    pub fn shared_root(mode: PermissionMode) -> PermissionSyncHandle {
+        Self::shared(InheritedPermissions::new(mode))
     }
 
     /// Get the effective permission mode.
@@ -1411,6 +1436,45 @@ mod tests {
         assert!(child_perms.is_background);
         assert!(child_perms.is_allowed("bash", Some("git status")));
         assert!(child_perms.is_allowed("bash", Some("npm install")));
+    }
+
+    #[tokio::test]
+    async fn permission_sync_shared_handle_preserves_explicit_envelope() {
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Deny,
+            allowed_tools: Some(["read_file".to_string()].into_iter().collect()),
+            ..Default::default()
+        };
+
+        let handle = PermissionSyncContext::shared(inherited);
+        let ctx = handle.read().await;
+
+        assert_eq!(ctx.mode(), PermissionMode::Deny);
+        assert!(ctx.inherited.is_tool_allowed_by_allowlist("read_file"));
+        assert!(!ctx.inherited.is_tool_allowed_by_allowlist("bash"));
+    }
+
+    #[tokio::test]
+    async fn permission_sync_shared_root_uses_root_envelope() {
+        let handle = PermissionSyncContext::shared_root(PermissionMode::AcceptEdits);
+        let ctx = handle.read().await;
+
+        assert_eq!(ctx.mode(), PermissionMode::AcceptEdits);
+        assert!(ctx.inherited.allow_rules.is_empty());
+        assert!(ctx.inherited.deny_rules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn permission_sync_into_shared_preserves_session_updates() {
+        let mut ctx = PermissionSyncContext::root(PermissionMode::Prompt);
+        ctx.apply_update(&PermissionUpdate::allow(PermissionRule::parse(
+            r#"Bash(argv_prefix="cargo test")"#,
+        )));
+
+        let handle = ctx.into_shared();
+        let shared = handle.read().await;
+
+        assert!(shared.is_allowed("bash", Some("cargo test -p astra-runtime")));
     }
 
     #[test]

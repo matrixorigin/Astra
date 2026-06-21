@@ -574,9 +574,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             &self.project_root,
             self.inherited_permissions.clone(),
         );
-        let permission_context = std::sync::Arc::new(tokio::sync::RwLock::new(
-            perm_manager.runtime_permission_context(),
-        ));
+        let permission_context = perm_manager.runtime_permission_handle();
 
         let executor = edge_tools::ToolExecutor::new(&self.project_root)
             .with_cloud(self.api.api_origin(), &self.token);

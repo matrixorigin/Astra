@@ -994,12 +994,10 @@ mod tests {
     use crate::cli::chat_stream::StreamEvent;
     fn test_permission_context() -> (
         InheritedPermissions,
-        Arc<tokio::sync::RwLock<PermissionSyncContext>>,
+        astra_runtime::orchestration::PermissionSyncHandle,
     ) {
         let inherited_permissions = InheritedPermissions::new(PermissionMode::Prompt);
-        let permission_context = Arc::new(tokio::sync::RwLock::new(PermissionSyncContext::new(
-            inherited_permissions.clone(),
-        )));
+        let permission_context = PermissionSyncContext::shared(inherited_permissions.clone());
         (inherited_permissions, permission_context)
     }
 

@@ -1756,9 +1756,8 @@ impl DynamicAgentSpawner {
         // SpawnContext requires an envelope so a child cannot enter runtime
         // execution without an authorization context.
         let inherited_permissions = context.inherited_permissions.clone();
-        let permission_context = std::sync::Arc::new(tokio::sync::RwLock::new(
-            super::permission_sync::PermissionSyncContext::new(inherited_permissions.clone()),
-        ));
+        let permission_context =
+            super::permission_sync::PermissionSyncContext::shared(inherited_permissions.clone());
 
         // 8. Build run config
         let run_config = SpawnRunConfig {

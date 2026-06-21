@@ -605,9 +605,7 @@ mod tests {
         let mut host = MockHost::new(vec![text_result("Handled request.")]);
         let mut state = make_state();
         state.messaging.mailbox = Some(parent_mb);
-        state.permission_context = Some(Arc::new(tokio::sync::RwLock::new(
-            PermissionSyncContext::root(PermissionMode::Auto),
-        )));
+        state.permission_context = Some(PermissionSyncContext::shared_root(PermissionMode::Auto));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -646,17 +644,15 @@ mod tests {
             "arguments": r#"{"command": "echo hi"}"#
         })];
 
-        let permission_context = Arc::new(tokio::sync::RwLock::new(PermissionSyncContext::new(
-            InheritedPermissions {
-                mode: PermissionMode::Prompt,
-                allow_rules: vec![],
-                deny_rules: vec![],
-                ask_rules: vec![],
-                allowed_tools: Some(HashSet::from(["view".to_string()])),
-                is_background: false,
-                ..Default::default()
-            },
-        )));
+        let permission_context = PermissionSyncContext::shared(InheritedPermissions {
+            mode: PermissionMode::Prompt,
+            allow_rules: vec![],
+            deny_rules: vec![],
+            ask_rules: vec![],
+            allowed_tools: Some(HashSet::from(["view".to_string()])),
+            is_background: false,
+            ..Default::default()
+        });
         let mut messages = Vec::new();
         let mut tool_results = Vec::new();
         let valid_tool_names = HashSet::from(["bash".to_string()]);
@@ -1182,6 +1178,7 @@ mod tests {
 
         // Skill was pre-resolved; grep will be matched from edge_tool_round
         let pre_resolved = vec![("skill:0".to_string(), "Skill instructions".to_string())];
+        let permission_context = PermissionSyncContext::shared_root(PermissionMode::Auto);
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index: 0,
@@ -1212,7 +1209,7 @@ mod tests {
             tool_event_hooks: &tool_event_hooks,
             term: &mut term,
             mailbox: None,
-            permission_context: None,
+            permission_context: Some(&permission_context),
             progress_emitter: None,
             pre_resolved_results: &pre_resolved,
             server_tool_executor: None,
@@ -1338,25 +1335,23 @@ mod tests {
 
         let (router, parent_mb, mut child_mb, _dt) = setup_two_agents().await;
 
-        // Parent has a handler that approves bash(git:*) requests
-        let parent_ctx = Arc::new(tokio::sync::RwLock::new(PermissionSyncContext::root(
-            PermissionMode::Prompt,
-        )));
+        // Parent has a handler that approves bash requests
+        let parent_ctx = PermissionSyncContext::shared_root(PermissionMode::Prompt);
         let handler = PermissionRequestHandler::new(parent_ctx.clone());
 
-        // Child has permission context that requires asking parent for bash
+        // Child has permission context that requires asking parent for bash.
+        // Use a bare ask rule so this test cannot be accidentally satisfied by
+        // the read-only shortcut before it reaches the mailbox.
         let child_inherited = InheritedPermissions {
             mode: PermissionMode::Prompt,
             allow_rules: vec![],
             deny_rules: vec![],
-            ask_rules: vec![PermissionRule::parse("bash(*)")],
+            ask_rules: vec![PermissionRule::parse("bash")],
             allowed_tools: None,
             is_background: false,
             ..Default::default()
         };
-        let child_permission_ctx = Arc::new(tokio::sync::RwLock::new(PermissionSyncContext::new(
-            child_inherited,
-        )));
+        let child_permission_ctx = PermissionSyncContext::shared(child_inherited);
 
         // Spawn parent handler task
         let parent_router = router.clone();
@@ -1374,7 +1369,7 @@ mod tests {
                 response
                     .updates
                     .push(PermissionUpdate::allow(PermissionRule::parse(
-                        "bash(git:*)",
+                        r#"Bash(argv_prefix="touch")"#,
                     )));
 
                 // Extract the target address from the Direct variant
@@ -1390,9 +1385,9 @@ mod tests {
 
         // Child sends tool call that requires permission
         let tool_calls = vec![json!({
-            "id": "call-bash-git",
+            "id": "call-bash-touch",
             "name": "bash",
-            "arguments": r#"{"command": "git status"}"#
+            "arguments": r#"{"command": "touch astra-permission-approved-test"}"#
         })];
 
         let mut messages = Vec::new();
@@ -1464,6 +1459,10 @@ mod tests {
             "tool should not be blocked by permission: {:?}",
             error
         );
+
+        let telemetry = child_permission_ctx.read().await.telemetry();
+        assert_eq!(telemetry.permission_requests, 1);
+        assert_eq!(telemetry.permission_requests_approved, 1);
     }
 
     /// Test: child requests permission but parent denies
@@ -1474,25 +1473,21 @@ mod tests {
         let (router, parent_mb, mut child_mb, _dt) = setup_two_agents().await;
 
         // Parent has deny mode - rejects all requests
-        let parent_ctx = Arc::new(tokio::sync::RwLock::new(PermissionSyncContext::root(
-            PermissionMode::Deny,
-        )));
+        let parent_ctx = PermissionSyncContext::shared_root(PermissionMode::Deny);
         let handler = PermissionRequestHandler::new(parent_ctx.clone());
 
-        // Child requires asking parent for bash. The ask rule pins the
-        // request-parent flow before the read-only shortcut can decide locally.
+        // Child requires asking parent for bash. The bare ask rule pins the
+        // request-parent flow before any local shortcut can decide.
         let child_inherited = InheritedPermissions {
             mode: PermissionMode::Prompt,
             allow_rules: vec![],
             deny_rules: vec![],
-            ask_rules: vec![PermissionRule::parse("bash(*)")],
+            ask_rules: vec![PermissionRule::parse("bash")],
             allowed_tools: None,
             is_background: false,
             ..Default::default()
         };
-        let child_permission_ctx = Arc::new(tokio::sync::RwLock::new(PermissionSyncContext::new(
-            child_inherited,
-        )));
+        let child_permission_ctx = PermissionSyncContext::shared(child_inherited);
 
         // Spawn parent handler that denies
         let parent_router = router.clone();
@@ -1592,6 +1587,10 @@ mod tests {
             "tool should be blocked by permission denial: {:?}",
             error
         );
+
+        let telemetry = child_permission_ctx.read().await.telemetry();
+        assert_eq!(telemetry.permission_requests, 1);
+        assert_eq!(telemetry.permission_requests_approved, 0);
     }
 
     /// Empty tool names (model bug) must be rejected before dedup counting

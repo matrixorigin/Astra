@@ -26,9 +26,7 @@ pub use astra_turn_core::headless_tool_body_preview::{
     HeadlessRoundTerminal, HeadlessStderrStyle, NoopHeadlessTerminal,
 };
 
-pub(crate) type PermissionSyncHandle = std::sync::Arc<
-    tokio::sync::RwLock<crate::orchestration::permission_sync::PermissionSyncContext>,
->;
+use crate::orchestration::PermissionSyncHandle;
 
 /// Typed execution context for one headless tool round.
 pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
