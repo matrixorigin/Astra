@@ -213,7 +213,7 @@ fn accept_edits_mode_renders_cyan_chip() {
     let chip = s
         .left
         .iter()
-        .find(|seg| seg.text == "Accept")
+        .find(|seg| seg.text == "Edits")
         .expect("accept_edits chip segment");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Cyan));
     assert!(

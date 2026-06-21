@@ -326,7 +326,7 @@ const ALLOW_SUBCOMMANDS: &[(&str, &str)] = &[
     ("auto", "Auto-approve all tool use"),
     ("plan", "Read-only investigation mode; mutations are denied"),
     (
-        "accept-edits",
+        "accept_edits",
         "Auto-approve workspace-local file edits while still prompting for shell and external writes",
     ),
     ("deny", "Deny all tool use"),
@@ -793,11 +793,11 @@ pub static COMMANDS: &[CommandMeta] = &[
     // ── System ────────────────────────────────────────────────────────────
     CommandMeta::new(
         "/allow",
-        "Permission mode: /allow [auto|plan|accept-edits|prompt|default|ask|deny|all|rules|trust|untrust|trace]",
+        "Permission mode: /allow [auto|plan|accept_edits|prompt|default|ask|deny|all|rules|trust|untrust|trace]",
         CommandGroup::System,
     )
     .with_subcommands(ALLOW_SUBCOMMANDS)
-    .with_arg_hint("[auto|accept-edits|plan|prompt|default|ask|deny|all|rules]")
+    .with_arg_hint("[auto|accept_edits|plan|prompt|default|ask|deny|all|rules]")
     .with_tui_handler(TuiHandler::Inline),
     CommandMeta::new(
         "/instructions",
@@ -1106,15 +1106,16 @@ mod tests {
             .iter()
             .find(|meta| meta.name == "/allow")
             .expect("/allow command");
-        assert!(allow.description.contains("accept-edits"));
+        assert!(allow.description.contains("accept_edits"));
         assert!(allow.description.contains("plan"));
         assert_eq!(
             allow.arg_hint,
-            Some("[auto|accept-edits|plan|prompt|default|ask|deny|all|rules]")
+            Some("[auto|accept_edits|plan|prompt|default|ask|deny|all|rules]")
         );
 
         let subs = subcommand_completions("/allow").expect("/allow subcommands");
-        assert!(subs.iter().any(|(tok, _)| *tok == "accept-edits"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "accept_edits"));
+        assert!(!subs.iter().any(|(tok, _)| *tok == "accept-edits"));
         assert!(subs.iter().any(|(tok, _)| *tok == "default"));
         assert!(subs.iter().any(|(tok, _)| *tok == "ask"));
         assert!(subs.iter().any(|(tok, _)| *tok == "plan"));

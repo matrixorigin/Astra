@@ -2373,7 +2373,7 @@ total_tokens_out: 500
 
     #[test]
     fn cli_chat_permission_mode_rejects_legacy_aliases() {
-        for mode in ["yolo", "bypass-safety", "bypass_safety"] {
+        for mode in ["accept-edits", "yolo", "bypass-safety", "bypass_safety"] {
             assert!(Cli::try_parse_from(["astra", "chat", "--permission-mode", mode]).is_err());
         }
     }
@@ -2381,7 +2381,7 @@ total_tokens_out: 500
     #[test]
     fn cli_chat_permission_mode_accept_edits() {
         let cli =
-            Cli::try_parse_from(["astra", "chat", "--permission-mode", "accept-edits"]).unwrap();
+            Cli::try_parse_from(["astra", "chat", "--permission-mode", "accept_edits"]).unwrap();
         match cli.command {
             Some(Command::Chat(ref args)) => {
                 assert_eq!(args.permission_mode.as_deref(), Some("accept_edits"));

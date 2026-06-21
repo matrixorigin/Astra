@@ -42,7 +42,7 @@ impl PermissionMode {
         match self {
             Self::Auto => "Auto",
             Self::Plan => "Plan",
-            Self::AcceptEdits => "Accept",
+            Self::AcceptEdits => "Edits",
             Self::Prompt => "Ask",
             Self::Deny => "Deny",
         }
@@ -80,7 +80,7 @@ impl std::str::FromStr for PermissionMode {
         match s.to_lowercase().as_str() {
             "auto" => Ok(Self::Auto),
             "plan" => Ok(Self::Plan),
-            "accept_edits" | "accept-edits" => Ok(Self::AcceptEdits),
+            "accept_edits" => Ok(Self::AcceptEdits),
             "prompt" => Ok(Self::Prompt),
             "deny" => Ok(Self::Deny),
             _ => Err(format!(
@@ -1158,11 +1158,8 @@ mod tests {
         let parsed = "accept_edits".parse::<PermissionMode>().unwrap();
         assert_eq!(parsed, PermissionMode::AcceptEdits);
         assert_eq!(parsed.to_string(), "accept_edits");
-        assert_eq!(parsed.chip_text(), "Accept");
-        assert_eq!(
-            "accept-edits".parse::<PermissionMode>().unwrap(),
-            PermissionMode::AcceptEdits
-        );
+        assert_eq!(parsed.chip_text(), "Edits");
+        assert!("accept-edits".parse::<PermissionMode>().is_err());
     }
 
     #[test]

@@ -4976,10 +4976,7 @@ mod tests {
             "AUTO".parse::<PermissionMode>().unwrap(),
             PermissionMode::Auto
         );
-        assert_eq!(
-            "accept-edits".parse::<PermissionMode>().unwrap(),
-            PermissionMode::AcceptEdits
-        );
+        assert!("accept-edits".parse::<PermissionMode>().is_err());
         assert!("invalid".parse::<PermissionMode>().is_err());
     }
 

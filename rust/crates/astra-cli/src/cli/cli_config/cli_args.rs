@@ -732,7 +732,7 @@ pub(crate) enum PermissionsSubcommand {
     /// Auto-approve allowed tool calls
     Auto,
     /// Auto-approve workspace-local edits while still prompting for shell and external writes
-    #[command(name = "accept_edits", alias = "accept-edits")]
+    #[command(name = "accept_edits")]
     AcceptEdits,
     /// Read-only investigation mode: allow reads, deny mutations
     Plan,

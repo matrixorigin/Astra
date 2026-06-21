@@ -452,7 +452,7 @@ pub(crate) async fn handle_slash_command(
                         .magenta()
                     );
                 }
-                "accept_edits" | "accept-edits" => {
+                "accept_edits" => {
                     state.perm_manager.set_mode(PermissionMode::AcceptEdits);
                     eprintln!(
                         "  {} Permission mode → {} (workspace-local edits auto-approved)",
@@ -532,7 +532,7 @@ pub(crate) async fn handle_slash_command(
                     }
                     Err(_) => {
                         eprintln!(
-                            "  {} Unknown mode '{}'. Use: auto, plan, accept-edits, prompt, deny, all, rules, trust, untrust, trace",
+                            "  {} Unknown mode '{}'. Use: auto, plan, accept_edits, prompt, deny, all, rules, trust, untrust, trace",
                             theme::icon_warn(),
                             arg
                         );

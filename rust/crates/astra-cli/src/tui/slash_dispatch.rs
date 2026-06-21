@@ -310,7 +310,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     ctx.show_response(permission_mode_feedback(PermissionMode::Plan).into());
                     SlashResult::Handled
                 }
-                "accept_edits" | "accept-edits" | "edit" => {
+                "accept_edits" => {
                     ctx.state.perm_manager.set_mode(PermissionMode::AcceptEdits);
                     ctx.show_response(permission_mode_feedback(PermissionMode::AcceptEdits).into());
                     SlashResult::Handled
@@ -386,7 +386,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 }
                 _ => {
                     ctx.show_error(format!(
-                        "Unknown mode '{args}'. Use: auto, edit, plan, default, deny, all, rules, trust, untrust, trace"
+                        "Unknown mode '{args}'. Use: auto, accept_edits, plan, default, deny, all, rules, trust, untrust, trace"
                     ));
                     SlashResult::Handled
                 }
@@ -1219,7 +1219,7 @@ fn build_permission_mode_picker(
             is_current: current == crate::cli::permission_manager::PermissionMode::Prompt,
         },
         SelectionItem {
-            name: "Accept".into(),
+            name: "Edits".into(),
             description: Some(
                 "Auto-approve workspace edits; still ask for shell and external writes".into(),
             ),
@@ -1244,7 +1244,7 @@ fn build_permission_mode_picker(
         },
     ];
     ListSelectionView::new(items, Some("Modes".into())).with_footer_hint(
-        "Shift+Tab cycles ask → accept → plan → auto · /allow rules · /allow trust · /allow trace",
+        "Shift+Tab cycles ask → edits → plan → auto · /allow rules · /allow trust · /allow trace",
     )
 }
 
@@ -1269,7 +1269,7 @@ pub(crate) fn permission_mode_feedback(
     match mode {
         PermissionMode::Prompt => "Mode → Ask",
         PermissionMode::Auto => "Mode → Auto",
-        PermissionMode::AcceptEdits => "Mode → Accept",
+        PermissionMode::AcceptEdits => "Mode → Edits",
         PermissionMode::Plan => "Mode → Plan",
         PermissionMode::Deny => "Mode → Deny",
     }
@@ -1481,7 +1481,7 @@ pub(crate) fn handle_view_result(
             );
             return;
         }
-        "Accept" => {
+        "Edits" => {
             apply_permission_mode_selection(
                 state,
                 chat_widget,
@@ -4023,12 +4023,12 @@ mod view_result_tests {
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = ChatWidget::new("");
 
-        handle_view_result("Accept", &mut state, &mut bottom_pane, &mut chat_widget);
+        handle_view_result("Edits", &mut state, &mut bottom_pane, &mut chat_widget);
 
         assert_eq!(state.perm_manager.mode(), PermissionMode::AcceptEdits);
         assert_eq!(
             last_system_message(&chat_widget).as_deref(),
-            Some("Mode → Accept")
+            Some("Mode → Edits")
         );
     }
 

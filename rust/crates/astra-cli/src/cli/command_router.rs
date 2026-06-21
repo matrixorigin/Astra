@@ -1064,7 +1064,7 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
                 permission_mode_display_label(PermissionMode::Plan).magenta()
             );
         }
-        "accept_edits" | "accept-edits" => {
+        "accept_edits" => {
             state.perm_manager.set_mode(PermissionMode::AcceptEdits);
             eprintln!(
                 "  {} Permission mode → {} (workspace-local edits auto-approved)",
@@ -1134,7 +1134,7 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
             }
             Err(_) => {
                 eprintln!(
-                    "  {} Unknown mode '{}'. Use: auto, plan, accept-edits, prompt, deny, all, rules, trust, untrust, trace",
+                    "  {} Unknown mode '{}'. Use: auto, plan, accept_edits, prompt, deny, all, rules, trust, untrust, trace",
                     theme::icon_warn(),
                     arg
                 );
@@ -1158,7 +1158,7 @@ mod permission_mode_display_tests {
         assert_eq!(permission_mode_display_label(PermissionMode::Auto), "Auto");
         assert_eq!(
             permission_mode_display_label(PermissionMode::AcceptEdits),
-            "Accept"
+            "Edits"
         );
         assert_eq!(permission_mode_display_label(PermissionMode::Plan), "Plan");
         assert_eq!(permission_mode_display_label(PermissionMode::Deny), "Deny");
@@ -1170,6 +1170,16 @@ mod permission_mode_display_tests {
         state.perm_manager.set_mode(PermissionMode::Auto);
 
         handle_permission_command("default", &mut state);
+
+        assert_eq!(state.perm_manager.mode(), PermissionMode::Prompt);
+    }
+
+    #[test]
+    fn accept_edits_hyphen_alias_does_not_change_mode() {
+        let mut state = SessionState::default();
+        state.perm_manager.set_mode(PermissionMode::Prompt);
+
+        handle_permission_command("accept-edits", &mut state);
 
         assert_eq!(state.perm_manager.mode(), PermissionMode::Prompt);
     }
