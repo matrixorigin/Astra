@@ -537,21 +537,14 @@ pub fn sandbox_denied_message(output: &str) -> Option<Cow<'_, str>> {
         return Some(Cow::Owned(message.to_string()));
     }
 
-    let trimmed = output.strip_prefix("Error: ").unwrap_or(output);
-    if trimmed.contains("outside the project directory")
-        && (trimmed.contains("sandbox approval") || trimmed.contains("Ask the user"))
-    {
-        return Some(Cow::Borrowed(trimmed.trim_end_matches('.')));
-    }
-
     None
 }
 
 /// True when a tool result is a sandbox denial.
 ///
-/// Prefer structured metadata (`error_kind=sandbox_denied`) over visible text.
-/// The legacy text parser remains as a compatibility fallback for older edge
-/// tool emitters.
+/// Prefer structured metadata (`error_kind=sandbox_denied`) over the internal
+/// edge-tool wire prefix. Ordinary user-facing error text is not a retry
+/// signal.
 #[must_use]
 pub fn is_sandbox_denied_result(
     output: &str,
@@ -563,7 +556,8 @@ pub fn is_sandbox_denied_result(
 /// Return the human-readable sandbox denial message from a tool result.
 ///
 /// This is the result-level equivalent of [`sandbox_denied_message`]: metadata
-/// wins when present; otherwise we parse legacy visible output.
+/// wins when present; otherwise the internal wire prefix is the only retry
+/// signal.
 #[must_use]
 pub fn sandbox_denied_message_from_result<'a>(
     output: &'a str,
@@ -1155,6 +1149,20 @@ mod tests {
         assert!(!is_sandbox_denied(
             "Error: something else. SANDBOX_DENIED:  … (not at start)"
         ));
+    }
+
+    #[test]
+    fn sandbox_denied_message_rejects_unstructured_boundary_text() {
+        let output = "Error: Path '/home/user/out.md' is outside the project directory '/home/user/project'; sandbox approval is required for this external path.";
+
+        assert!(
+            sandbox_denied_message(output).is_none(),
+            "sandbox recovery must be driven by structured metadata or the internal wire prefix, not by guessing from user-facing prose"
+        );
+        assert!(
+            sandbox_denied_message_from_result(output, None).is_none(),
+            "result-level detection must also reject unstructured prose without metadata"
+        );
     }
 
     #[test]

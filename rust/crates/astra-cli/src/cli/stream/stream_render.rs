@@ -7947,7 +7947,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_denied_outcome_normalizes_legacy_prefix() {
+    fn sandbox_denied_outcome_normalizes_internal_wire_prefix() {
         let mut outcome = crate::edge_tools::ToolExecutionOutcome::error(
             "SANDBOX_DENIED: Path '/tmp/out.md' is outside the project directory '/tmp/project'; sandbox approval is required for this external path."
                 .to_string(),
