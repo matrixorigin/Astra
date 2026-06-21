@@ -1345,6 +1345,164 @@ impl<'a> CliSseStreamHost<'a> {
         }
         result
     }
+
+    async fn preflight_explicit_path_sandbox_expansion(
+        &mut self,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> Result<bool, String> {
+        let mut expanded = false;
+        for target in crate::sandbox_retry::explicit_file_tool_path_targets(tool, args) {
+            expanded |= self
+                .preflight_explicit_path_sandbox_expansion_target(&target)
+                .await?;
+        }
+        Ok(expanded)
+    }
+
+    async fn preflight_explicit_path_sandbox_expansion_target(
+        &mut self,
+        target: &crate::sandbox_retry::ExplicitPathPreflightTarget,
+    ) -> Result<bool, String> {
+        let tool = target.tool.as_str();
+        let args = &target.args;
+        let Err(resolve_error) = self.executor.resolve_checked(&target.path) else {
+            return Ok(false);
+        };
+        let Some(sandbox_msg) = crate::sandbox_retry::sandbox_denied_message(&resolve_error)
+            .map(|message| message.into_owned())
+        else {
+            return Ok(false);
+        };
+        let Some(expand_dir) =
+            crate::sandbox_retry::sandbox_expand_dir_from_denial(args, &sandbox_msg)
+        else {
+            return Err(crate::sandbox_retry::sandbox_retry_no_expand_dir_output(
+                tool,
+                &sandbox_msg,
+            ));
+        };
+
+        self.resolve_sandbox_expansion_approval(tool, &sandbox_msg, &expand_dir)
+            .await?;
+        self.executor.expand_sandbox_path(expand_dir);
+        Ok(true)
+    }
+
+    async fn resolve_sandbox_expansion_approval(
+        &mut self,
+        tool: &str,
+        sandbox_msg: &str,
+        expand_dir: &Path,
+    ) -> Result<(), String> {
+        let sandbox_tool_key = format!("sandbox_expand:{tool}");
+        let guard_args = serde_json::json!({"reason": sandbox_msg});
+        let decision = {
+            let Some(pm) = self.perm_manager.as_mut() else {
+                return Err(format!(
+                    "Error: {sandbox_msg} (sandbox_expand:{tool} denied: no permission manager configured)"
+                ));
+            };
+            crate::tool_safety_guard::ToolSafetyGuard::check_request(
+                Some(&mut **pm),
+                &sandbox_tool_key,
+                &guard_args,
+            )
+        };
+
+        match decision {
+            crate::cli::permission_manager::PermissionDecision::Allow => Ok(()),
+            crate::cli::permission_manager::PermissionDecision::Deny(reason) => Err(format!(
+                "Error: {sandbox_msg} (sandbox_expand:{tool} denied: {reason})"
+            )),
+            crate::cli::permission_manager::PermissionDecision::NeedApproval {
+                tool: approval_tool,
+                header,
+                detail,
+                reason,
+            } => {
+                use crate::cli::chat_stream::ApprovalResponse;
+
+                let Some(tx) = &self.approval_request_tx else {
+                    astra_core::agent_warn!(
+                        "permission",
+                        "Denied sandbox expansion {sandbox_tool_key}: approval prompt unavailable. reason={reason}"
+                    );
+                    if let Some(pm) = self.perm_manager.as_mut() {
+                        pm.record_approval(&approval_tool, Some(&guard_args), false);
+                    }
+                    let reason = if self.render_policy.is_silent() {
+                        "approval required for an external path, but this run cannot ask for approvals in the current mode"
+                    } else {
+                        "approval required for an external path, but no approval prompt is available in this interface"
+                    };
+                    return Err(format!(
+                        "Error: {sandbox_msg} (sandbox_expand:{tool} denied: {reason})"
+                    ));
+                };
+
+                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(chat_stream::ApprovalRequest::bare(
+                    approval_tool.clone(),
+                    format!("🔒 {header}"),
+                    detail,
+                    reason,
+                    guard_args.clone(),
+                    resp_tx,
+                ));
+                let response = if let Some(token) = self.cancel_token {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => ApprovalResponse::Deny,
+                        r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
+                    }
+                } else {
+                    resp_rx.await.unwrap_or(ApprovalResponse::Deny)
+                };
+
+                if response.is_approved() {
+                    let save_warning_tx = self.stream_event_tx.clone();
+                    if let Some(pm) = self.perm_manager.as_mut() {
+                        let workspace_untrusted = !pm.project_allow_rules_active();
+                        let always_scope =
+                            approval_default_always_scope(&approval_scope_context_for_tool(
+                                &approval_tool,
+                                &guard_args,
+                                false,
+                                workspace_untrusted,
+                            ));
+                        let selected_scope = response.always_scope(always_scope);
+                        apply_approval_memory_action(
+                            pm,
+                            approval_memory_action(&response, always_scope, true),
+                            &approval_tool,
+                            &guard_args,
+                            response.match_target(),
+                            save_warning_tx.as_ref(),
+                        );
+                        if matches!(
+                            selected_scope,
+                            Some(
+                                astra_turn_core::permission::scope::AllowScope::Project
+                                    | astra_turn_core::permission::scope::AllowScope::RestOfSession
+                                    | astra_turn_core::permission::scope::AllowScope::User
+                            )
+                        ) {
+                            pm.trust_sandbox_root(expand_dir.to_path_buf());
+                        }
+                    }
+                    Ok(())
+                } else {
+                    if let Some(pm) = self.perm_manager.as_mut() {
+                        pm.record_approval(&approval_tool, Some(&guard_args), false);
+                    }
+                    Err(format!(
+                        "Error: {sandbox_msg} (sandbox_expand:{tool} denied: user denied sandbox expansion)"
+                    ))
+                }
+            }
+        }
+    }
 }
 
 impl<'a> CliSseStreamHost<'a> {
@@ -3152,6 +3310,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             denied_output = Some(error);
             allowed = false;
         }
+        if allowed
+            && let Err(error) = self
+                .preflight_explicit_path_sandbox_expansion(tool, args)
+                .await
+        {
+            denied_output = Some(error);
+            allowed = false;
+        }
         let start = std::time::Instant::now();
         let mut tool_result_fields = None;
         let mut tool_execution_marked_error = false;
@@ -3924,6 +4090,26 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // speculative output. Journal/observability still fire exactly
         // once from the post-execution pass below.
         let speculative_by_id = self.harvest_speculation_for_batch(&conc_reqs).await;
+        let mut preflight_errors = std::collections::HashMap::new();
+        for (_, req) in &conc_reqs {
+            if reusable_speculative_output(speculative_by_id.get(&req.request_id).cloned())
+                .is_some()
+            {
+                continue;
+            }
+            if let Err(error) = self
+                .preflight_explicit_path_sandbox_expansion(&req.tool, &req.args)
+                .await
+            {
+                astra_core::agent_warn!(
+                    "permission",
+                    "Parallel sandbox preflight for {} failed before execution: {}",
+                    req.tool,
+                    error
+                );
+                preflight_errors.insert(req.request_id.clone(), error);
+            }
+        }
         let outputs: Vec<(crate::edge_tools::ToolExecutionOutcome, u64)> = join_all(
             conc_reqs
                 .iter()
@@ -3935,8 +4121,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     let executor = std::sync::Arc::clone(&executor);
                     let cancel_token_for_tool = self.cancel_token.cloned();
                     let speculative = speculative_by_id.get(&req.request_id).cloned();
+                    let preflight_error = preflight_errors.get(&req.request_id).cloned();
                     let cancel_token = self.cancel_token.cloned();
                     async move {
+                        if let Some(error) = preflight_error {
+                            return (crate::edge_tools::ToolExecutionOutcome::error(error), 0u64);
+                        }
                         if let Some(output) = reusable_speculative_output(speculative) {
                             return (
                                 crate::edge_tools::ToolExecutionOutcome {
@@ -6866,6 +7056,203 @@ mod tests {
         let (decision, ()) = tokio::join!(decision_fut, responder);
 
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn sandbox_preflight_auto_expands_explicit_external_path() {
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let base = tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("tempdir");
+        let project = base.path().join("project");
+        let external = base.path().join("external");
+        std::fs::create_dir(&project).expect("project");
+        std::fs::create_dir(&external).expect("external");
+        let target = external.join("notes.md");
+        std::fs::write(&target, "outside\n").expect("target");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(&project));
+        let before = executor
+            .resolve_checked(&target.to_string_lossy())
+            .expect_err("external path should start outside the sandbox");
+        assert!(crate::sandbox_retry::is_sandbox_denied(&before), "{before}");
+
+        let mut tool_cache = EdgeToolCache::new(8);
+        let mut pm =
+            crate::cli::permission_manager::PermissionManager::with_project(false, &project);
+        pm.set_mode(crate::cli::permission_manager::PermissionMode::Auto);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: std::sync::Arc::clone(&executor),
+                render_policy: RenderPolicy::Silent,
+                perm_manager: Some(&mut pm),
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: None,
+            },
+            80,
+            false,
+        );
+
+        let expanded = host
+            .preflight_explicit_path_sandbox_expansion(
+                "read_file",
+                &serde_json::json!({"path": target.to_string_lossy()}),
+            )
+            .await
+            .expect("auto should approve sandbox expansion");
+
+        assert!(expanded);
+        executor
+            .resolve_checked(&target.to_string_lossy())
+            .expect("external path should be allowed after preflight");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn sandbox_preflight_deny_mode_returns_clean_error_without_expanding() {
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let base = tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("tempdir");
+        let project = base.path().join("project");
+        let external = base.path().join("external");
+        std::fs::create_dir(&project).expect("project");
+        std::fs::create_dir(&external).expect("external");
+        let target = external.join("notes.md");
+        std::fs::write(&target, "outside\n").expect("target");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(&project));
+
+        let mut tool_cache = EdgeToolCache::new(8);
+        let mut pm =
+            crate::cli::permission_manager::PermissionManager::with_project(false, &project);
+        pm.set_mode(crate::cli::permission_manager::PermissionMode::Deny);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: std::sync::Arc::clone(&executor),
+                render_policy: RenderPolicy::Silent,
+                perm_manager: Some(&mut pm),
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: None,
+            },
+            80,
+            false,
+        );
+
+        let error = host
+            .preflight_explicit_path_sandbox_expansion(
+                "read_file",
+                &serde_json::json!({"path": target.to_string_lossy()}),
+            )
+            .await
+            .expect_err("deny mode should reject sandbox expansion");
+
+        assert!(error.starts_with("Error: "), "{error}");
+        assert!(
+            !error.contains(crate::sandbox_retry::SANDBOX_DENIED_PREFIX),
+            "{error}"
+        );
+        assert!(error.contains("sandbox_expand:read_file denied"), "{error}");
+        assert!(
+            executor.resolve_checked(&target.to_string_lossy()).is_err(),
+            "denied preflight must not expand the sandbox"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn parallel_batch_preflights_external_paths_in_auto_mode() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let base = tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("tempdir");
+        let project = base.path().join("project");
+        let external = base.path().join("external");
+        std::fs::create_dir(&project).expect("project");
+        std::fs::create_dir(&external).expect("external");
+        let first = external.join("one.txt");
+        let second = external.join("two.txt");
+        std::fs::write(&first, "one\n").expect("first");
+        std::fs::write(&second, "two\n").expect("second");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(&project));
+
+        let mut tool_cache = EdgeToolCache::new(8);
+        let mut pm =
+            crate::cli::permission_manager::PermissionManager::with_project(false, &project);
+        pm.set_mode(crate::cli::permission_manager::PermissionMode::Auto);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: Some(&mut pm),
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: None,
+            },
+            80,
+            false,
+        );
+
+        let results = host
+            .execute_tools_batch(vec![
+                ToolBatchRequest {
+                    request_id: "pf-1".to_string(),
+                    tool: "read_file".to_string(),
+                    args: serde_json::json!({"path": first.to_string_lossy()}),
+                },
+                ToolBatchRequest {
+                    request_id: "pf-2".to_string(),
+                    tool: "read_file".to_string(),
+                    args: serde_json::json!({"path": second.to_string_lossy()}),
+                },
+            ])
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.status == "success"));
+        assert!(results[0].output.contains("one"), "{}", results[0].output);
+        assert!(results[1].output.contains("two"), "{}", results[1].output);
+        assert!(results.iter().all(|result| {
+            !result
+                .output
+                .contains(crate::sandbox_retry::SANDBOX_DENIED_PREFIX)
+        }));
     }
 
     #[serial_test::serial]

@@ -20,6 +20,203 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Map, Value};
 
+#[derive(Debug, Clone)]
+pub(crate) struct ExplicitPathPreflightTarget {
+    pub(crate) tool: String,
+    pub(crate) args: Value,
+    pub(crate) path: String,
+}
+
+impl ExplicitPathPreflightTarget {
+    fn new(tool: impl Into<String>, args: Value, path: impl Into<String>) -> Self {
+        Self {
+            tool: tool.into(),
+            args,
+            path: path.into(),
+        }
+    }
+}
+
+fn push_unique_explicit_path<'a>(paths: &mut Vec<Cow<'a, str>>, path: Cow<'a, str>) {
+    if !paths
+        .iter()
+        .any(|existing| existing.as_ref() == path.as_ref())
+    {
+        paths.push(path);
+    }
+}
+
+fn push_explicit_arg_path<'a>(paths: &mut Vec<Cow<'a, str>>, args: &'a Value, key: &str) {
+    if let Some(path) = args.get(key).and_then(Value::as_str) {
+        push_unique_explicit_path(paths, Cow::Borrowed(path));
+    }
+}
+
+#[must_use]
+pub(crate) fn explicit_file_tool_path_args<'a>(tool: &str, args: &'a Value) -> Vec<Cow<'a, str>> {
+    let mut paths = Vec::new();
+    match tool {
+        "read_file" | "write_file" | "str_replace" | "multi_edit" | "delete_file" | "list_dir"
+        | "grep" => {
+            push_explicit_arg_path(&mut paths, args, "path");
+        }
+        "notebook_edit" => {
+            push_explicit_arg_path(&mut paths, args, "notebook_path");
+            push_explicit_arg_path(&mut paths, args, "path");
+        }
+        "glob" => {
+            push_explicit_arg_path(&mut paths, args, "path");
+            if paths.is_empty()
+                && let Some(base) = args
+                    .get("pattern")
+                    .and_then(Value::as_str)
+                    .and_then(glob_preflight_base_from_absolute_pattern)
+            {
+                push_unique_explicit_path(&mut paths, Cow::Owned(base));
+            }
+        }
+        "symbols" | "find_references" | "symbol_search" | "dead_code" | "call_graph"
+        | "rename_symbol" => {
+            push_explicit_arg_path(&mut paths, args, "path");
+        }
+        "find_definition" => {
+            push_explicit_arg_path(&mut paths, args, "path");
+            push_explicit_arg_path(&mut paths, args, "file");
+        }
+        "lsp" | "hover_info" | "extract_members" => {
+            push_explicit_arg_path(&mut paths, args, "file");
+        }
+        "bash" => {
+            if args
+                .get("command")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(astra_turn_core::cloud_approval_policy::bash_command_is_read_only)
+                && let Some(path) = sandbox_expand_dir_from_args(args)
+            {
+                push_unique_explicit_path(
+                    &mut paths,
+                    Cow::Owned(path.to_string_lossy().into_owned()),
+                );
+            }
+        }
+        "git" => {
+            if args.get("action").and_then(Value::as_str) == Some("worktree") {
+                let worktree_sub_action = args.get("sub_action").and_then(Value::as_str);
+                if matches!(worktree_sub_action, Some("add" | "remove")) {
+                    push_explicit_arg_path(&mut paths, args, "path");
+                }
+            }
+        }
+        "rollback_file_edits" => {
+            push_explicit_arg_path(&mut paths, args, "path");
+        }
+        "session" => {
+            if args.get("action").and_then(Value::as_str) == Some("rollback_edits") {
+                push_explicit_arg_path(&mut paths, args, "path");
+            }
+        }
+        _ => {}
+    }
+    paths
+}
+
+#[must_use]
+pub(crate) fn explicit_file_tool_path_arg<'a>(tool: &str, args: &'a Value) -> Option<Cow<'a, str>> {
+    explicit_file_tool_path_args(tool, args).into_iter().next()
+}
+
+#[must_use]
+pub(crate) fn explicit_file_tool_path_targets(
+    tool: &str,
+    args: &Value,
+) -> Vec<ExplicitPathPreflightTarget> {
+    let mut targets = Vec::new();
+    for path in explicit_file_tool_path_args(tool, args) {
+        targets.push(ExplicitPathPreflightTarget::new(
+            tool,
+            args.clone(),
+            path.into_owned(),
+        ));
+    }
+    if tool == "agent" && args.get("action").and_then(Value::as_str) == Some("run_chain") {
+        targets.extend(agent_run_chain_explicit_path_targets(args));
+    }
+    targets
+}
+
+fn agent_run_chain_explicit_path_targets(args: &Value) -> Vec<ExplicitPathPreflightTarget> {
+    let Ok(chain) = serde_json::from_value::<astra_runtime::tool_registry::ToolChain>(args.clone())
+    else {
+        return Vec::new();
+    };
+    let input = args
+        .get("input")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let ctx = astra_turn_core::tool_registry_chain::ChainContext::new(input);
+    chain
+        .steps
+        .into_iter()
+        .filter(|step| step.skip_if_prev_contains.is_none())
+        .filter(|step| !value_contains_chain_output_reference(&step.args))
+        .flat_map(|step| {
+            let resolved_args =
+                astra_turn_core::tool_registry_chain::resolve_args(&step.args, &ctx);
+            let tool = step.tool;
+            let paths = explicit_file_tool_path_args(&tool, &resolved_args)
+                .into_iter()
+                .map(Cow::into_owned)
+                .collect::<Vec<_>>();
+            paths
+                .into_iter()
+                .map(move |path| {
+                    ExplicitPathPreflightTarget::new(tool.clone(), resolved_args.clone(), path)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn value_contains_chain_output_reference(value: &Value) -> bool {
+    match value {
+        Value::String(value) => value.contains("$prev") || value.contains("$step."),
+        Value::Array(values) => values.iter().any(value_contains_chain_output_reference),
+        Value::Object(map) => map.values().any(value_contains_chain_output_reference),
+        _ => false,
+    }
+}
+
+#[must_use]
+pub(crate) fn glob_preflight_base_from_absolute_pattern(pattern: &str) -> Option<String> {
+    if !Path::new(pattern).is_absolute()
+        || pattern.contains("~/")
+        || pattern.split(['/', '\\']).any(|part| part == "..")
+    {
+        return None;
+    }
+
+    let normalized = pattern.replace('\\', "/");
+    let parts: Vec<&str> = normalized.split('/').skip(1).collect();
+    let first_glob = parts.iter().position(|part| {
+        part.contains('*') || part.contains('?') || part.contains('[') || part.contains('{')
+    });
+
+    match first_glob {
+        Some(0) => Some("/".to_string()),
+        Some(index) => Some(format!("/{}", parts[..index].join("/"))),
+        None => {
+            let path = Path::new(pattern);
+            Some(
+                path.parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or_else(|| "/".to_string()),
+            )
+        }
+    }
+}
+
 /// Derive which directory should be added to the sandbox's allow-list
 /// when a tool returned SANDBOX_DENIED for the given arguments.
 ///
@@ -527,16 +724,160 @@ fn quote_aware_tokens(input: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SANDBOX_DENIED_ERROR_KIND, SANDBOX_DENIED_PREFIX, extract_first_absolute_path,
-        is_sandbox_denied, is_sandbox_denied_result, sandbox_denied_message,
-        sandbox_denied_message_from_result, sandbox_denied_tool_result_fields,
-        sandbox_expand_dir_from_args, sandbox_expand_dir_from_denial,
-        sandbox_retry_no_expand_dir_output,
+        SANDBOX_DENIED_ERROR_KIND, SANDBOX_DENIED_PREFIX, explicit_file_tool_path_arg,
+        explicit_file_tool_path_targets, extract_first_absolute_path,
+        glob_preflight_base_from_absolute_pattern, is_sandbox_denied, is_sandbox_denied_result,
+        sandbox_denied_message, sandbox_denied_message_from_result,
+        sandbox_denied_tool_result_fields, sandbox_expand_dir_from_args,
+        sandbox_expand_dir_from_denial, sandbox_retry_no_expand_dir_output,
     };
     use serde_json::json;
     use std::path::PathBuf;
 
     // ── sandbox_expand_dir_from_args ─────────────────────────────────────
+
+    #[test]
+    fn glob_preflight_base_splits_absolute_pattern_like_glob_tool() {
+        assert_eq!(
+            glob_preflight_base_from_absolute_pattern("/home/user/external-workspace/**/*.ts"),
+            Some("/home/user/external-workspace".to_string())
+        );
+        assert_eq!(
+            glob_preflight_base_from_absolute_pattern("/home/user/external-workspace/package.json"),
+            Some("/home/user/external-workspace".to_string())
+        );
+        assert_eq!(
+            glob_preflight_base_from_absolute_pattern("src/**/*.rs"),
+            None
+        );
+        assert_eq!(
+            glob_preflight_base_from_absolute_pattern("/home/user/../secret/**/*.rs"),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_targets_cover_static_paths_without_false_positive_patterns() {
+        let file_args = json!({"path": "/home/user/external-workspace/file.rs"});
+        for tool in [
+            "read_file",
+            "write_file",
+            "str_replace",
+            "multi_edit",
+            "delete_file",
+            "list_dir",
+            "grep",
+        ] {
+            assert_eq!(
+                explicit_file_tool_path_arg(tool, &file_args).as_deref(),
+                Some("/home/user/external-workspace/file.rs"),
+                "{tool} should expose its path for sandbox preflight"
+            );
+        }
+
+        let grep_args = json!({"pattern": "/home/user/external-workspace/**/*.rs"});
+        assert!(
+            explicit_file_tool_path_targets("grep", &grep_args).is_empty(),
+            "grep pattern is search text, not a filesystem path"
+        );
+
+        let glob_args = json!({"pattern": "/home/user/external-workspace/**/*.rs"});
+        let glob_targets = explicit_file_tool_path_targets("glob", &glob_args);
+        assert_eq!(glob_targets.len(), 1);
+        assert_eq!(glob_targets[0].path, "/home/user/external-workspace");
+
+        let git_args = json!({
+            "action": "worktree",
+            "sub_action": "add",
+            "branch": "feature/review",
+            "path": "/home/user/external-workspace/astra-feature-review"
+        });
+        let git_targets = explicit_file_tool_path_targets("git", &git_args);
+        assert_eq!(git_targets.len(), 1);
+        assert_eq!(
+            git_targets[0].path,
+            "/home/user/external-workspace/astra-feature-review"
+        );
+
+        let session_config_args = json!({
+            "action": "set_config",
+            "path": "display.max_output_lines",
+            "value": 120
+        });
+        assert!(
+            explicit_file_tool_path_arg("session", &session_config_args).is_none(),
+            "session config path is a configuration key, not a filesystem path"
+        );
+    }
+
+    #[test]
+    fn explicit_targets_cover_agent_run_chain_static_paths_only() {
+        let chain_args = json!({
+            "action": "run_chain",
+            "name": "external-chain",
+            "description": "external chain",
+            "steps": [
+                {
+                    "id": "read-static",
+                    "tool": "read_file",
+                    "args": {
+                        "path": "/home/user/external-workspace/static.md"
+                    }
+                },
+                {
+                    "id": "read-input",
+                    "tool": "read_file",
+                    "args": {
+                        "path": "$input.read_path"
+                    }
+                }
+            ],
+            "input": {
+                "read_path": "/home/user/external-workspace/input.md"
+            }
+        });
+        let chain_targets = explicit_file_tool_path_targets("agent", &chain_args);
+        let target_paths: Vec<_> = chain_targets
+            .iter()
+            .map(|target| (target.tool.as_str(), target.path.as_str()))
+            .collect();
+        assert_eq!(
+            target_paths,
+            vec![
+                ("read_file", "/home/user/external-workspace/static.md"),
+                ("read_file", "/home/user/external-workspace/input.md"),
+            ]
+        );
+
+        let dynamic_chain_args = json!({
+            "action": "run_chain",
+            "name": "dynamic-chain",
+            "description": "dynamic chain",
+            "steps": [
+                {
+                    "id": "first",
+                    "tool": "read_file",
+                    "args": {
+                        "path": "/home/user/external-workspace/static.md"
+                    }
+                },
+                {
+                    "id": "second",
+                    "tool": "read_file",
+                    "args": {
+                        "path": "$prev.path"
+                    }
+                }
+            ],
+            "input": {}
+        });
+        let dynamic_targets = explicit_file_tool_path_targets("agent", &dynamic_chain_args);
+        assert_eq!(dynamic_targets.len(), 1);
+        assert_eq!(
+            dynamic_targets[0].path,
+            "/home/user/external-workspace/static.md"
+        );
+    }
 
     #[test]
     fn expand_dir_from_read_file_path() {
