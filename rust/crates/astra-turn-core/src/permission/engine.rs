@@ -368,29 +368,7 @@ pub struct DecisionEnvelope {
     pub risk_tags: Vec<RiskTag>,
 }
 
-fn legacy_plan_mode_tool_alias(tool_name: &str, args: &Value) -> Option<&'static str> {
-    let action = args.get("action").and_then(Value::as_str).map(str::trim);
-    match tool_name {
-        "session" => match action {
-            Some("enter_plan_mode") => Some("enter_plan_mode"),
-            Some("exit_plan_mode") => Some("exit_plan_mode"),
-            _ => None,
-        },
-        "agent" if action == Some("run_chain") => match args.get("chain").and_then(Value::as_str) {
-            Some("enter_plan_mode") => Some("enter_plan_mode"),
-            Some("exit_plan_mode") => Some("exit_plan_mode"),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-pub(crate) fn plan_mode_denial_reason(tool_name: &str, args: &Value) -> String {
-    if let Some(canonical_tool) = legacy_plan_mode_tool_alias(tool_name, args) {
-        return format!(
-            "Tool '{tool_name}' denied by permission mode. Use `{canonical_tool}` directly — plan mode no longer routes through `{tool_name}`."
-        );
-    }
+pub(crate) fn plan_mode_denial_reason(tool_name: &str) -> String {
     format!(
         "Tool '{tool_name}' denied by permission mode. Plan mode allows read-only tools plus `enter_plan_mode` / `exit_plan_mode`; author the plan, then call `exit_plan_mode(plan=...)`."
     )
@@ -881,7 +859,7 @@ pub fn evaluate_permission(
             );
         }
         let decision = HardDecision::Deny {
-            reason: plan_mode_denial_reason(tool_name, args),
+            reason: plan_mode_denial_reason(tool_name),
         };
         push_matched(&mut trace, EvaluationStep::Mode, &decision, &mode_label);
         return envelope(
@@ -1866,24 +1844,19 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_denial_reason_guides_legacy_plan_tool_aliases() {
-        let session_reason =
-            plan_mode_denial_reason("session", &serde_json::json!({"action": "exit_plan_mode"}));
-        assert!(session_reason.contains("Use `exit_plan_mode` directly"));
-        assert!(session_reason.contains("no longer routes through `session`"));
-
-        let agent_reason = plan_mode_denial_reason(
-            "agent",
-            &serde_json::json!({"action": "run_chain", "chain": "exit_plan_mode"}),
-        );
-        assert!(agent_reason.contains("Use `exit_plan_mode` directly"));
-        assert!(agent_reason.contains("no longer routes through `agent`"));
+    fn plan_mode_denial_reason_does_not_special_case_unsupported_plan_tool_shapes() {
+        for tool_name in ["session", "agent"] {
+            let reason = plan_mode_denial_reason(tool_name);
+            assert!(reason.contains("Plan mode allows read-only tools"));
+            assert!(reason.contains("exit_plan_mode(plan=...)"));
+            assert!(!reason.contains("no longer routes through"));
+            assert!(!reason.contains("Use `exit_plan_mode` directly"));
+        }
     }
 
     #[test]
     fn generic_plan_mode_denial_reason_points_to_exit_tool() {
-        let reason =
-            plan_mode_denial_reason("bash", &serde_json::json!({"command": "touch plan.txt"}));
+        let reason = plan_mode_denial_reason("bash");
         assert!(reason.contains("Plan mode allows read-only tools"));
         assert!(reason.contains("exit_plan_mode(plan=...)"));
     }

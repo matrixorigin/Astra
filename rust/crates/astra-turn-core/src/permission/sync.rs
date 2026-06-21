@@ -341,7 +341,6 @@ impl PermissionRequestHandler {
                 } else {
                     PermissionResponse::deny(crate::permission::engine::plan_mode_denial_reason(
                         &request.tool_name,
-                        &request.args,
                     ))
                 }
             }
@@ -475,7 +474,7 @@ mod handler_tests {
     }
 
     #[tokio::test]
-    async fn handler_plan_mode_guides_legacy_aliases_to_exit_plan_mode() {
+    async fn handler_plan_mode_uses_generic_denial_for_unsupported_plan_tool_shapes() {
         let handler =
             PermissionRequestHandler::new(PermissionSyncContext::shared_root(PermissionMode::Plan));
 
@@ -484,12 +483,10 @@ mod handler_tests {
         let response = handler.handle_request(&request).await;
 
         assert!(!response.approved);
-        assert!(
-            response
-                .reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("Use `exit_plan_mode` directly"))
-        );
+        let reason = response.reason.as_deref().expect("denial reason");
+        assert!(reason.contains("Plan mode allows read-only tools"));
+        assert!(!reason.contains("Use `exit_plan_mode` directly"));
+        assert!(!reason.contains("no longer routes through"));
     }
 
     #[tokio::test]
