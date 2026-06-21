@@ -894,3 +894,38 @@ fn nonprogress_backoff_message(
         format!("  ⚠ Busy-poll backoff: {tool_name} (~{remaining_secs}s)"),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn names<const N: usize>(values: [&str; N]) -> HashSet<String> {
+        values.into_iter().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn validator_denial_for_deferred_grep_uses_activation_hint() {
+        let valid = names(["tool_search", "bash"]);
+        let deferred = names(["grep"]);
+
+        let body = validator_denial_body("grep", &valid, &deferred);
+
+        assert!(body.contains("not available in this turn yet"));
+        assert!(body.contains("`<deferred_tools>`"));
+        assert!(body.contains("tool_search"));
+        assert!(body.contains("query=\"select:grep\""));
+        assert!(!body.contains("Unknown tool"));
+    }
+
+    #[test]
+    fn validator_denial_for_hidden_non_deferred_tool_stays_unknown() {
+        let valid = names(["tool_search", "bash"]);
+        let deferred = names(["agent"]);
+
+        let body = validator_denial_body("grep", &valid, &deferred);
+
+        assert!(body.contains("Unknown tool"));
+        assert!(!body.contains("query=\"select:grep\""));
+    }
+}
