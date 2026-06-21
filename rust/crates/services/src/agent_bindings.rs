@@ -7,8 +7,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
 use crate::registry_payload::{
-    RegistryStatus, canonical_serialize, exact_id_string, exact_non_empty_string,
-    parse_registry_status, reject_secret_like_json, validate_registered_endpoint_url,
+    RegistryStatus, canonical_serialize, exact_id_string, exact_non_empty_markdown_string,
+    exact_non_empty_string, parse_registry_status, reject_secret_like_json,
+    validate_registered_endpoint_url,
 };
 use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, error_response_coded, internal_error,
@@ -504,7 +505,7 @@ pub fn validate_agent_binding_payload(
         255,
         "agent_binding_invalid",
     )?;
-    exact_non_empty_string("agent_md", &payload.agent_md, "agent_binding_invalid")?;
+    exact_non_empty_markdown_string("agent_md", &payload.agent_md, "agent_binding_invalid")?;
     let max_agent_md_bytes = astra_config::runtime_config::RuntimeConfig::cached()
         .agent_binding_registry
         .max_agent_md_bytes as usize;
@@ -810,6 +811,27 @@ mod tests {
             err.1.error_code.as_deref(),
             Some("agent_binding_idempotency_conflict")
         );
+    }
+
+    #[tokio::test]
+    async fn binding_accepts_multiline_agent_md() {
+        let svc = InMemoryAgentBindingService::new();
+        let mut request = valid_request();
+        request.binding.agent_md = "Role\nMission\nOutput contract".into();
+
+        let created = svc.create_binding(request).await.unwrap();
+        assert_eq!(created.status, AgentBindingStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn binding_rejects_trailing_agent_md_whitespace() {
+        let svc = InMemoryAgentBindingService::new();
+        let mut request = valid_request();
+        request.binding.agent_md = "Role\n".into();
+
+        let err = svc.create_binding(request).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1.error_code.as_deref(), Some("agent_binding_invalid"));
     }
 
     #[tokio::test]

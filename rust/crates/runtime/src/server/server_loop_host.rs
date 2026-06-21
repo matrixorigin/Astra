@@ -1310,6 +1310,8 @@ impl ServerAgenticLoopHost {
     /// Updates `edge_tools`, `valid_tools`, and `admissible_extras`
     /// so the LLM sees MCP tools and the validator admits them.
     pub fn install_runtime_tool_schemas(&mut self, schemas: Vec<Value>) {
+        let runtime_tools_are_the_only_tool_surface =
+            !schemas.is_empty() && self.edge_tools.is_empty();
         for schema in &schemas {
             if let Some(name) = schema
                 .get("function")
@@ -1321,6 +1323,9 @@ impl ServerAgenticLoopHost {
             }
         }
         self.edge_tools.extend(schemas);
+        if runtime_tools_are_the_only_tool_surface {
+            self.server_side_tools = true;
+        }
     }
 
     fn read_plan_resume_hint(&self) -> Option<String> {
@@ -4311,6 +4316,67 @@ mod tests {
         assert!(host.valid_tool_names().contains("mcp__tools__query"));
         assert!(!host.valid_tool_names().contains("bash"));
         assert!(!host.valid_tool_names().contains("tool_search"));
+    }
+
+    #[test]
+    fn registry_runtime_mcp_tools_switch_empty_host_to_server_side_execution() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(false))
+        .with_server_tool_catalog_enabled(false)
+        .with_static_tool_catalog_admissible(false)
+        .build();
+
+        assert!(!host.server_side_tools);
+
+        host.install_runtime_tool_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__tools__query",
+                "description": "Binding-discovered MCP tool",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        })]);
+
+        assert!(
+            host.server_side_tools,
+            "registry runtime MCP tools are executed by ServerToolExecutor, not edge ledger"
+        );
+        assert!(host.valid_tool_names().contains("mcp__tools__query"));
+    }
+
+    #[test]
+    fn runtime_mcp_install_does_not_reclassify_existing_edge_tool_surface() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(false))
+        .with_edge_tools(sample_edge_tools())
+        .build();
+
+        assert!(!host.server_side_tools);
+
+        host.install_runtime_tool_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__tools__query",
+                "description": "Binding-discovered MCP tool",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        })]);
+
+        assert!(
+            !host.server_side_tools,
+            "existing edge/client tool surfaces must keep edge-ledger execution"
+        );
+        assert!(host.valid_tool_names().contains("mcp__tools__query"));
     }
 
     fn message_text(message: &Value) -> String {

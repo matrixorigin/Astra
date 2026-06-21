@@ -103,6 +103,26 @@ pub(crate) fn exact_non_empty_string(
     Ok(())
 }
 
+pub(crate) fn exact_non_empty_markdown_string(
+    field: &'static str,
+    value: &str,
+    code: &'static str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if value.is_empty()
+        || value.trim() != value
+        || value.chars().any(|ch| ch.is_control() && ch != '\n')
+    {
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{field} must be a non-empty exact markdown string without leading/trailing whitespace or control characters other than line feed"
+            ),
+            code,
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn exact_id_string(
     field: &'static str,
     value: &str,

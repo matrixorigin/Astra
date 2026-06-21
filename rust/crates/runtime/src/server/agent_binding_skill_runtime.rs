@@ -15,10 +15,24 @@ use crate::turn::skill_tool::{ResolvedSkill, SkillResolver, SkillToolInfo};
 const SKILL_DISCOVERY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SKILL_DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SKILL_DISCOVERY_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const SKILL_LIST_REQUEST_ID: &str = "astra-agent-binding-skills-list";
 
 #[derive(Serialize)]
 struct SkillListRequest<'a> {
+    jsonrpc: &'a str,
+    id: &'a str,
     method: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillListJsonRpcResponse {
+    jsonrpc: String,
+    id: Value,
+    #[serde(default)]
+    result: Option<SkillListResponse>,
+    #[serde(default)]
+    error: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -144,6 +158,54 @@ fn skill_discovery_secret_value(authorization: &str) -> Value {
 
 fn redact_skill_discovery_error(raw: &str, authorization: &str) -> String {
     redact_known_secrets(raw, &skill_discovery_secret_value(authorization))
+}
+
+fn decode_skill_list_response(
+    body: &[u8],
+) -> Result<SkillListResponse, (StatusCode, Json<ErrorResponse>)> {
+    let response: SkillListJsonRpcResponse = serde_json::from_slice(body).map_err(|error| {
+        skill_error(
+            StatusCode::BAD_GATEWAY,
+            format!("Agent Binding skills/list response is invalid: {error}"),
+            "agent_binding_schema_invalid",
+        )
+    })?;
+    if response.jsonrpc != "2.0" {
+        return Err(skill_error(
+            StatusCode::BAD_GATEWAY,
+            "Agent Binding skills/list JSON-RPC response jsonrpc must be 2.0",
+            "agent_binding_schema_invalid",
+        ));
+    }
+    if response.id != Value::String(SKILL_LIST_REQUEST_ID.to_string()) {
+        return Err(skill_error(
+            StatusCode::BAD_GATEWAY,
+            "Agent Binding skills/list JSON-RPC response id mismatch",
+            "agent_binding_schema_invalid",
+        ));
+    }
+    if let Some(error) = response.error {
+        let code = error
+            .get("code")
+            .map(Value::to_string)
+            .unwrap_or_else(|| "unknown".to_string());
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown skill JSON-RPC error");
+        return Err(skill_error(
+            StatusCode::BAD_GATEWAY,
+            format!("Agent Binding skill JSON-RPC error {code}: {message}"),
+            "agent_binding_discovery_failed",
+        ));
+    }
+    response.result.ok_or_else(|| {
+        skill_error(
+            StatusCode::BAD_GATEWAY,
+            "Agent Binding skills/list JSON-RPC response missing result",
+            "agent_binding_schema_invalid",
+        )
+    })
 }
 
 async fn read_response_body_limited(
@@ -304,6 +366,8 @@ pub(crate) async fn prepare_agent_binding_skill_resolver(
         .post(endpoint_url)
         .header(reqwest::header::AUTHORIZATION, authorization)
         .json(&SkillListRequest {
+            jsonrpc: "2.0",
+            id: SKILL_LIST_REQUEST_ID,
             method: "skills/list",
         })
         .send()
@@ -345,13 +409,7 @@ pub(crate) async fn prepare_agent_binding_skill_resolver(
         ));
     }
 
-    let response: SkillListResponse = serde_json::from_slice(&body).map_err(|error| {
-        skill_error(
-            StatusCode::BAD_GATEWAY,
-            format!("Agent Binding skills/list response is invalid: {error}"),
-            "agent_binding_schema_invalid",
-        )
-    })?;
+    let response = decode_skill_list_response(&body)?;
     build_resolver(endpoint_url, response.skills)
 }
 
@@ -443,7 +501,11 @@ mod tests {
                 .map(ToString::to_string);
             *capture.body.lock().await = Some(body);
             Json(json!({
-                "skills": []
+                "jsonrpc": "2.0",
+                "id": SKILL_LIST_REQUEST_ID,
+                "result": {
+                    "skills": []
+                }
             }))
         }
 
@@ -472,8 +534,58 @@ mod tests {
         );
         assert_eq!(
             capture.body.lock().await.as_ref(),
-            Some(&json!({"method": "skills/list"}))
+            Some(&json!({
+                "jsonrpc": "2.0",
+                "id": SKILL_LIST_REQUEST_ID,
+                "method": "skills/list"
+            }))
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn prepare_agent_binding_skill_resolver_rejects_json_rpc_error_response() {
+        use axum::{Router, http::StatusCode as AxumStatusCode, routing::post};
+
+        let app = Router::new().route(
+            "/skills",
+            post(|| async {
+                (
+                    AxumStatusCode::OK,
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": SKILL_LIST_REQUEST_ID,
+                        "error": {
+                            "code": -32602,
+                            "message": "invalid params"
+                        }
+                    })),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let endpoint = format!("http://{addr}/skills");
+
+        let err =
+            match prepare_agent_binding_skill_resolver("skills", &endpoint, "Bearer runtime-grant")
+                .await
+            {
+                Ok(_) => panic!("JSON-RPC error skill discovery must fail"),
+                Err(err) => err,
+            };
+
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            err.1.0.error_code.as_deref(),
+            Some("agent_binding_discovery_failed")
+        );
+        assert!(err.1.0.detail.contains("invalid params"));
         server.abort();
     }
 
