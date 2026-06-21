@@ -639,9 +639,9 @@ mod tests {
         let kiro = dir.path().join(".astra");
         std::fs::create_dir_all(&kiro).unwrap();
         let path = kiro.join("permissions.json");
-        std::fs::write(&path, br#"{"allow":["Bash(ls:*)"]}"#).unwrap();
+        std::fs::write(&path, br#"{"allow":["Bash(argv_prefix=\"ls\")"]}"#).unwrap();
         let first = project_permissions_hash(dir.path()).unwrap();
-        std::fs::write(&path, br#"{"allow":["Bash(cargo test:*)"]}"#).unwrap();
+        std::fs::write(&path, br#"{"allow":["Bash(argv_prefix=\"cargo test\")"]}"#).unwrap();
         let second = project_permissions_hash(dir.path()).unwrap();
         assert_ne!(first, second);
     }
@@ -652,7 +652,7 @@ mod tests {
         let kiro = dir.path().join(".astra");
         std::fs::create_dir_all(&kiro).unwrap();
         let path = kiro.join("permissions.json");
-        std::fs::write(&path, br#"{"allow":["Bash(ls:*)"]}"#).unwrap();
+        std::fs::write(&path, br#"{"allow":["Bash(argv_prefix=\"ls\")"]}"#).unwrap();
         let trusted_hash = project_permissions_hash(dir.path()).unwrap();
 
         let ledger_path = dir.path().join("trusted_workspaces.json");
@@ -668,7 +668,7 @@ mod tests {
         let trusted = evaluate_workspace_trust_from_path(dir.path(), ledger_path.clone());
         assert!(trusted.applies_project_allow());
 
-        std::fs::write(&path, br#"{"allow":["Bash(cargo test:*)"]}"#).unwrap();
+        std::fs::write(&path, br#"{"allow":["Bash(argv_prefix=\"cargo test\")"]}"#).unwrap();
         let changed = evaluate_workspace_trust_from_path(dir.path(), ledger_path);
         assert!(!changed.applies_project_allow());
         assert_eq!(changed.reason, WorkspaceTrustReason::RulesHashChanged);

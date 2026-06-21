@@ -414,9 +414,17 @@ fn content_aware_fingerprint(
         }
         Some(CloudGatedToolKind::Write) => {
             let path = path_hint_from_args(args);
-            ApprovalFingerprint::file_op(name, path.as_deref())
+            ApprovalFingerprint::file_op(file_write_fingerprint_tool(name), path.as_deref())
         }
         None => ApprovalFingerprint::bare(name),
+    }
+}
+
+fn file_write_fingerprint_tool(tool_name: &str) -> &str {
+    if astra_turn_core::tool_categories::registry().is_file_op(tool_name) {
+        "file_write"
+    } else {
+        tool_name
     }
 }
 
@@ -442,7 +450,7 @@ fn approval_lookup_fingerprint(
         }
         Some(CloudGatedToolKind::Write) => {
             if let Some(path) = path_hint_from_args(args) {
-                ApprovalFingerprint::file_op_exact(name, Some(&path))
+                ApprovalFingerprint::file_op_exact(file_write_fingerprint_tool(name), Some(&path))
             } else {
                 ApprovalFingerprint::bare(name)
             }
@@ -462,7 +470,7 @@ fn cloud_detail_lookup_fingerprint(
             ApprovalFingerprint::shell(tool, cmd, false)
         }
         (Some(CloudGatedToolKind::Write), Some(path)) => {
-            ApprovalFingerprint::file_op_exact(tool, Some(path))
+            ApprovalFingerprint::file_op_exact(file_write_fingerprint_tool(tool), Some(path))
         }
         _ => ApprovalFingerprint::bare(tool),
     }
@@ -484,7 +492,7 @@ fn approval_lookup_fingerprint_candidates(
         if astra_turn_core::tool_categories::registry().is_file_op(name) {
             push_unique_fingerprint(
                 &mut candidates,
-                ApprovalFingerprint::file_op_exact("edit", Some(&path)),
+                ApprovalFingerprint::file_op_exact("file_write", Some(&path)),
             );
         }
         if let Some(resolved) = resolved_write_path(&path) {
@@ -495,7 +503,7 @@ fn approval_lookup_fingerprint_candidates(
             if astra_turn_core::tool_categories::registry().is_file_op(name) {
                 push_unique_fingerprint(
                     &mut candidates,
-                    ApprovalFingerprint::file_op_exact("edit", Some(&resolved)),
+                    ApprovalFingerprint::file_op_exact("file_write", Some(&resolved)),
                 );
             }
         }
@@ -517,7 +525,7 @@ fn cloud_detail_lookup_fingerprint_candidates(
         if astra_turn_core::tool_categories::registry().is_file_op(tool) {
             push_unique_fingerprint(
                 &mut candidates,
-                ApprovalFingerprint::file_op_exact("edit", Some(path)),
+                ApprovalFingerprint::file_op_exact("file_write", Some(path)),
             );
         }
         if let Some(resolved) = resolved_write_path(path) {
@@ -528,7 +536,7 @@ fn cloud_detail_lookup_fingerprint_candidates(
             if astra_turn_core::tool_categories::registry().is_file_op(tool) {
                 push_unique_fingerprint(
                     &mut candidates,
-                    ApprovalFingerprint::file_op_exact("edit", Some(&resolved)),
+                    ApprovalFingerprint::file_op_exact("file_write", Some(&resolved)),
                 );
             }
         }
@@ -609,7 +617,7 @@ fn sensitive_path_match_for_request(tool_name: &str, args: &serde_json::Value) -
 // ─── Permission types: re-exports from astra-turn-core ──────────────
 //
 // Issue #326 P1 / R1 §1 / R2 Major 4: previously this file defined
-// its own `PermissionMode`, `PermissionRule`, and `PermissionDecision`
+// its own `PermissionMode`, `PermissionRule`, and decision type
 // alongside the ones in `astra-turn-core::permission_types`. Three
 // independent type names with overlapping semantics caused a string-
 // roundtrip wart at every crate boundary (`with_inherited` matched
@@ -618,9 +626,9 @@ fn sensitive_path_match_for_request(tool_name: &str, args: &serde_json::Value) -
 // We now use turn-core's types directly via type aliases; the rule
 // parser and matcher are identical (compared field-by-field) so this
 // is a pure rename + import change. The CLI keeps its own
-// `PermissionDecision` (renamed to `GateOutcome` in P1) because its
-// shape (Allow / Deny / NeedApproval) is genuinely different from
-// turn-core's `PermissionDecision` (Approve / Deny / Escalate).
+// `GateOutcome` because its shape (Allow / Deny / NeedApproval) is
+// genuinely different from turn-core's callback decision type
+// (Approve / Deny / Escalate).
 pub(crate) use astra_turn_core::permission::types::PermissionMode;
 pub(crate) use astra_turn_core::permission::types::PermissionRule;
 
@@ -710,15 +718,6 @@ pub(crate) struct PermissionSettings {
     /// unless the user sets this to `true` at project or user scope.
     #[serde(default)]
     pub allow_sensitive_path_writes: bool,
-    /// Issue #326 P1.5b / R2 Major 2: grammar version. Files
-    /// without this field (every file written by astra prior to
-    /// this PR) are treated as v1 and parsed leniently. New
-    /// saves stamp `grammar_version = 2` so future readers know
-    /// the file is in the structured-key form
-    /// (`Bash(argv_prefix="…")`). The grammar-v2 parser is
-    /// backward-compatible: v1 strings still parse correctly.
-    #[serde(default)]
-    pub grammar_version: u32,
 }
 
 /// Outcome of loading a `permissions.json` file.
@@ -751,7 +750,7 @@ pub enum PermissionSettingsLoadError {
     /// error). Stat-level errors (file simply not present) are *not*
     /// reported here — those are normal first-run conditions.
     Io { path: PathBuf, source: io::Error },
-    /// File parsed as JSON but contains a malformed v2 rule string.
+    /// File parsed as JSON but contains a malformed permission rule string.
     InvalidRule {
         path: PathBuf,
         rule: String,
@@ -994,7 +993,7 @@ impl PermissionSettings {
 
     fn validate_rules(&self, path: &Path) -> Result<(), PermissionSettingsLoadError> {
         for rule in self.allow.iter().chain(self.deny.iter()) {
-            if let Err(err) = astra_turn_core::permission::rule_grammar::parse_rule_v2(rule) {
+            if let Err(err) = astra_turn_core::permission::rule_grammar::parse_rule(rule) {
                 return Err(PermissionSettingsLoadError::InvalidRule {
                     path: path.to_path_buf(),
                     rule: rule.clone(),
@@ -1014,10 +1013,7 @@ impl PermissionSettings {
     fn save_to_file(&self, dir: &Path, path: &Path) -> io::Result<()> {
         fs::create_dir_all(dir)?;
 
-        let mut to_serialize = self.clone();
-        to_serialize.grammar_version = astra_turn_core::permission::rule_grammar::GRAMMAR_VERSION;
-
-        let json = serde_json::to_string_pretty(&to_serialize)?;
+        let json = serde_json::to_string_pretty(self)?;
 
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
         std::io::Write::write_all(&mut tmp, json.as_bytes())?;
@@ -1195,24 +1191,28 @@ impl PermissionSettings {
     fn parsed_allow_rules(&self) -> Vec<PermissionRule> {
         self.allow
             .iter()
-            .map(|s| parse_rule_with_grammar_v2(s))
+            .map(|s| parse_permission_rule(s))
             .collect()
     }
 
     fn parsed_deny_rules(&self) -> Vec<PermissionRule> {
-        self.deny
-            .iter()
-            .map(|s| parse_rule_with_grammar_v2(s))
-            .collect()
+        self.deny.iter().map(|s| parse_permission_rule(s)).collect()
     }
 }
 
-/// Issue #326 P1.5b: parse legacy and grammar-v2 rule strings into
-/// the shared turn-core enforcement type. Load-time validation has
-/// already made v2 parse failures loud; this helper keeps existing
-/// v1 strings backward-compatible.
-fn parse_rule_with_grammar_v2(s: &str) -> PermissionRule {
+fn parse_permission_rule(s: &str) -> PermissionRule {
     PermissionRule::parse(s)
+}
+
+fn normalize_permission_rule_text(rule: &str) -> String {
+    let trimmed = rule.trim();
+    if astra_turn_core::permission::rule_grammar::parse_rule(trimmed).is_ok() {
+        return trimmed.to_string();
+    }
+    if !trimmed.is_empty() && !trimmed.contains('(') {
+        return format!("{trimmed}()");
+    }
+    trimmed.to_string()
 }
 
 pub(crate) struct PermissionManager {
@@ -1721,8 +1721,9 @@ impl PermissionManager {
     /// Issue #326 P0 / R1 Major 10 / task #17: if the parent envelope
     /// carries a `fingerprinted_overrides` JSON blob, we deserialize
     /// it back into the child's `session_overrides` so the child
-    /// honours per-fingerprint decisions (`Bash(cargo test:*) → Allow`)
-    /// instead of relying on the legacy `tool_name → bool` collapse.
+    /// honours per-fingerprint decisions
+    /// (`Bash(argv_prefix="cargo test")` -> Allow) instead of relying
+    /// on a broad `tool_name -> bool` collapse.
     /// A deserialization failure logs a warning and leaves overrides
     /// empty rather than silently downgrading to a wider rule.
     pub(crate) fn with_inherited(
@@ -1868,8 +1869,8 @@ impl PermissionManager {
     /// Issue #326 P0 / R1 Major 10 / task #17: previously this method
     /// called `session_overrides.to_legacy_overrides()`, which collapses
     /// every fingerprinted decision into a `tool_name → bool` map. So
-    /// a parent who pressed "Always" on `Bash(cargo test:*)` would
-    /// hand the child a `Bash → Allow` envelope, and the child could
+    /// a parent who pressed "Always" on `Bash(argv_prefix="cargo test")`
+    /// would hand the child a `Bash -> Allow` envelope, and the child could
     /// then run `Bash(rm -rf …)` without ever asking. That is exactly
     /// the bypass review-r1 calls out.
     ///
@@ -1877,7 +1878,7 @@ impl PermissionManager {
     /// as JSON because runtime types can't depend on
     /// `approval_fingerprint`). The child is expected to consult those
     /// fingerprints first; only if no fingerprint matches does it fall
-    /// through to the legacy `allow_rules` / `deny_rules`. The
+    /// through to the inherited `allow_rules` / `deny_rules`. The
     /// `to_legacy_overrides()` helper still exists for telemetry /
     /// display but is **no longer wired into enforcement**.
     pub(crate) fn inherited_permissions_for_child(
@@ -2203,7 +2204,7 @@ impl PermissionManager {
         // The lookup fingerprint uses the tool-name-only classifier for
         // cloud details so read-only bash commands do not collapse to `bare`.
         // For path-shaped tools we probe both the raw detail and the
-        // workspace-resolved absolute path so legacy exact/prefix rules and
+        // workspace-resolved absolute path so exact/prefix rules and
         // workspace-scoped write memory can both match.
         let fps = cloud_detail_lookup_fingerprint_candidates(tool, detail);
         let sensitive_path = cloud_detail_is_sensitive(tool, detail);
@@ -2595,7 +2596,7 @@ impl PermissionManager {
                 // different things per kind: a shell command for
                 // Execute, a path for Write. Build the allow-rule arg
                 // shape to match so `make_allow_rule` produces the
-                // right pattern (`Bash(cargo:*)` vs `write_file`).
+                // right pattern (`Bash(argv_prefix="cargo")` vs `write_file`).
                 let kind = cloud_gated_tool_kind(tool);
                 let rule_args = match (kind, detail) {
                     (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
@@ -2670,7 +2671,10 @@ impl PermissionManager {
                         )
                     }
                     (Some(CloudGatedToolKind::Write), d) => {
-                        astra_turn_core::approval_fingerprint::ApprovalFingerprint::file_op(tool, d)
+                        astra_turn_core::approval_fingerprint::ApprovalFingerprint::file_op(
+                            file_write_fingerprint_tool(tool),
+                            d,
+                        )
                     }
                     _ => astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(tool),
                 };
@@ -2861,7 +2865,7 @@ impl PermissionManager {
     pub(crate) fn add_allow_rule(&mut self, rule: &str) {
         use astra_turn_core::permission::audit::PersistTarget;
 
-        let rule_text = rule.to_string();
+        let rule_text = normalize_permission_rule_text(rule);
         if self.settings.allow.contains(&rule_text) {
             return;
         }
@@ -2877,7 +2881,7 @@ impl PermissionManager {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let correlation_id = format!("rule-{}-{}", timestamp_ms, rule);
+        let correlation_id = format!("rule-{}-{}", timestamp_ms, rule_text);
         let save_result = PermissionSettings::modify(&root, |settings| -> Result<(), String> {
             if !settings.allow.contains(&rule_text) {
                 settings.allow.push(rule_text.clone());
@@ -2934,7 +2938,7 @@ impl PermissionManager {
     fn add_user_allow_rule_with_home(&mut self, rule: &str, home: Option<&Path>) {
         use astra_turn_core::permission::audit::PersistTarget;
 
-        let rule_text = rule.to_string();
+        let rule_text = normalize_permission_rule_text(rule);
         if self.user_settings.allow.contains(&rule_text) {
             return;
         }
@@ -2947,7 +2951,7 @@ impl PermissionManager {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let correlation_id = format!("rule-{}-{}", timestamp_ms, rule);
+        let correlation_id = format!("rule-{}-{}", timestamp_ms, rule_text);
         let save_result = match home {
             Some(home) => {
                 PermissionSettings::modify_user_in_home(home, |settings| -> Result<(), String> {
@@ -3278,19 +3282,15 @@ impl PermissionManager {
         &mut self,
         name: &str,
         args: &serde_json::Value,
-    ) -> PermissionDecision {
+    ) -> GateOutcome {
         let decision = self.check_nonblocking_inner(name, args);
-        if let PermissionDecision::Deny(reason) = &decision {
+        if let GateOutcome::Deny(reason) = &decision {
             self.record_rejection(name, reason);
         }
         decision
     }
 
-    fn check_nonblocking_inner(
-        &mut self,
-        name: &str,
-        args: &serde_json::Value,
-    ) -> PermissionDecision {
+    fn check_nonblocking_inner(&mut self, name: &str, args: &serde_json::Value) -> GateOutcome {
         fn trim_sandbox_reason_for_ui(raw: &str) -> String {
             const INSTRUCTION: &str =
                 "Ask the user for permission before accessing files outside the project.";
@@ -3313,7 +3313,7 @@ impl PermissionManager {
         );
 
         if let Some(reason) = sandbox_expand_sensitive_target_denial(name, args) {
-            return PermissionDecision::Deny(reason);
+            return GateOutcome::Deny(reason);
         }
 
         if matches!(envelope.source, DecisionSource::SandboxExpansion)
@@ -3323,9 +3323,9 @@ impl PermissionManager {
                 self.check_overrides_any(&approval_lookup_fingerprint_candidates(name, args))
             {
                 return if allowed {
-                    PermissionDecision::Allow
+                    GateOutcome::Allow
                 } else {
-                    PermissionDecision::Deny("Sandbox expansion denied for session".into())
+                    GateOutcome::Deny("Sandbox expansion denied for session".into())
                 };
             }
             let reason = args
@@ -3335,10 +3335,10 @@ impl PermissionManager {
             if let Some(target) = parse_sandbox_target_path(reason)
                 && self.path_under_trusted_root(&target)
             {
-                return PermissionDecision::Allow;
+                return GateOutcome::Allow;
             }
             if self.check_allow_rules(name, args) {
-                return PermissionDecision::Allow;
+                return GateOutcome::Allow;
             }
         }
 
@@ -3350,9 +3350,9 @@ impl PermissionManager {
                 true,
             ) {
                 return if allowed {
-                    PermissionDecision::Allow
+                    GateOutcome::Allow
                 } else {
-                    PermissionDecision::Deny("Sensitive path denied for session".into())
+                    GateOutcome::Deny("Sensitive path denied for session".into())
                 };
             }
             if self.mode == PermissionMode::Auto
@@ -3363,24 +3363,24 @@ impl PermissionManager {
                     "permission",
                     "Auto mode allowed write to sensitive path (opt-in): tool={name}"
                 );
-                return PermissionDecision::Allow;
+                return GateOutcome::Allow;
             }
             if self.mode == PermissionMode::Auto {
-                return PermissionDecision::Deny(
+                return GateOutcome::Deny(
                     "Sensitive path requires explicit opt-in in Auto mode".to_string(),
                 );
             }
         }
 
         match envelope.decision {
-            HardDecision::Allow => PermissionDecision::Allow,
-            HardDecision::Deny { reason } => PermissionDecision::Deny(reason),
+            HardDecision::Allow => GateOutcome::Allow,
+            HardDecision::Deny { reason } => GateOutcome::Deny(reason),
             HardDecision::NeedExternal { prompt } => {
                 if matches!(envelope.source, DecisionSource::Mode { .. }) {
                     let fp = content_aware_fingerprint(name, args);
                     match self.denial_tracker.should_prompt(&fp) {
                         astra_turn_core::approval_fingerprint::DenialAction::SkipTool => {
-                            return PermissionDecision::Deny(format!(
+                            return GateOutcome::Deny(format!(
                                 "{name}: auto-denied (repeated denials)"
                             ));
                         }
@@ -3400,7 +3400,7 @@ impl PermissionManager {
                         let (header, detail) = Self::format_tool_display(name, args);
                         (header, detail, prompt.reason)
                     };
-                PermissionDecision::NeedApproval {
+                GateOutcome::NeedApproval {
                     tool: prompt.tool,
                     header,
                     detail,
@@ -3588,19 +3588,11 @@ impl PermissionManager {
     }
 }
 
-/// Outcome of a non-blocking permission gate evaluation.
+/// Outcome of the CLI permission gate.
 ///
-/// Issue #326 P1 / R1 §1: this used to be called `PermissionDecision`,
-/// which collided with `astra_turn_core::permission::types::PermissionDecision`
-/// (a different shape: Approve / Deny / Escalate). The CLI gate
-/// produces a different envelope (Allow / Deny / NeedApproval) — the
-/// turn-core type is for callbacks inside the runtime, this one is
-/// what the gate hands back to the stream host. We rename to
-/// `GateOutcome` so the two never get confused at a use site.
-///
-/// The legacy alias `PermissionDecision` is kept for one PR cycle
-/// to avoid churning every call site; new code should use
-/// `GateOutcome`.
+/// This is intentionally distinct from the turn-core callback decision
+/// type: the CLI gate returns Allow / Deny / NeedApproval for
+/// stream-host routing.
 #[derive(Debug)]
 pub(crate) enum GateOutcome {
     Allow,
@@ -3613,11 +3605,6 @@ pub(crate) enum GateOutcome {
         reason: String,
     },
 }
-
-/// Backwards-compatible alias for the previous name. Exists only so
-/// the existing call sites in `stream_render.rs` etc. keep compiling
-/// during the P1 type-merge transition. Will be removed in P2.
-pub(crate) type PermissionDecision = GateOutcome;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug)]
@@ -3730,7 +3717,7 @@ fn is_read_only_allowlisted(lower_cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalPromptKind, ExecuteDecision, ModifyError, PermissionDecision, PermissionLoadPolicy,
+        ApprovalPromptKind, ExecuteDecision, GateOutcome, ModifyError, PermissionLoadPolicy,
         PermissionManager, PermissionMode, PermissionRule, PermissionSettings,
         PermissionSettingsLoadError, SideEffect, cloud_always_feedback_message,
         content_aware_fingerprint, decode_mode_for_mirror, encode_mode_for_mirror,
@@ -3949,20 +3936,20 @@ mod tests {
 
         assert!(matches!(
             pm.check_nonblocking("bash", &args),
-            PermissionDecision::NeedApproval { .. }
+            GateOutcome::NeedApproval { .. }
         ));
 
         pm.record_turn_approval("bash", Some(&args), true);
         assert!(matches!(
             pm.check_nonblocking("bash", &args),
-            PermissionDecision::Allow
+            GateOutcome::Allow
         ));
         assert!(pm.export_session_overrides().is_none());
 
         pm.clear_turn_overrides();
         assert!(matches!(
             pm.check_nonblocking("bash", &args),
-            PermissionDecision::NeedApproval { .. }
+            GateOutcome::NeedApproval { .. }
         ));
     }
 
@@ -3979,7 +3966,7 @@ mod tests {
 
         assert!(matches!(
             pm.check_nonblocking("write_file", &args),
-            PermissionDecision::NeedApproval { .. }
+            GateOutcome::NeedApproval { .. }
         ));
 
         let events = astra_services::session_journal::read_journal(&session_id).unwrap();
@@ -4335,29 +4322,29 @@ mod tests {
     // ── Permission rules ──────────────────────────────────────────────────────
 
     #[test]
-    fn rule_parse_bare_tool() {
-        let rule = PermissionRule::parse("Edit");
-        assert_eq!(rule.tool, "edit");
+    fn rule_parse_broad_tool() {
+        let rule = PermissionRule::parse("write_file()");
+        assert_eq!(rule.tool, "write_file");
         assert_eq!(rule.pattern, None);
     }
 
     #[test]
     fn rule_parse_with_prefix_pattern() {
-        let rule = PermissionRule::parse("Bash(git commit:*)");
+        let rule = PermissionRule::parse(r#"Bash(argv_prefix="git commit")"#);
         assert_eq!(rule.tool, "bash");
         assert_eq!(rule.pattern, Some("git commit".to_string()));
     }
 
     #[test]
     fn rule_matches_bare_tool() {
-        let rule = PermissionRule::parse("bash");
+        let rule = PermissionRule::parse("bash()");
         assert!(rule.matches("bash", Some("anything")));
         assert!(rule.matches("bash", None));
     }
 
     #[test]
     fn rule_matches_prefix() {
-        let rule = PermissionRule::parse("Bash(git commit:*)");
+        let rule = PermissionRule::parse(r#"Bash(argv_prefix="git commit")"#);
         assert!(rule.matches("bash", Some("git commit -m 'fix'")));
         assert!(!rule.matches("bash", Some("git push origin main")));
         assert!(!rule.matches("bash", None));
@@ -4366,7 +4353,9 @@ mod tests {
     #[test]
     fn deny_rules_block_matching_commands() {
         let mut pm = PermissionManager::new(true); // auto_approve=true
-        pm.settings.deny.push("Bash(rm:*)".to_string());
+        pm.settings
+            .deny
+            .push(r#"Bash(argv_prefix="rm")"#.to_string());
         pm.cached_deny = pm.settings.parsed_deny_rules();
         let args = serde_json::json!({"command": "rm -rf /tmp/test"});
         assert!(!pm.check("bash", &args));
@@ -4375,7 +4364,9 @@ mod tests {
     #[test]
     fn allow_rules_permit_matching_commands() {
         let mut pm = PermissionManager::new(false); // auto_approve=false
-        pm.settings.allow.push("Bash(cargo test:*)".to_string());
+        pm.settings
+            .allow
+            .push(r#"Bash(argv_prefix="cargo test")"#.to_string());
         pm.cached_allow = pm.settings.parsed_allow_rules();
         let args = serde_json::json!({"command": "cargo test --release"});
         // Allow rules skip the interactive prompt.
@@ -4385,7 +4376,7 @@ mod tests {
     #[test]
     fn allow_rules_ignore_dangerous_broad_bash_shapes() {
         let mut pm = PermissionManager::new(false);
-        pm.settings.allow.push("bash".to_string());
+        pm.settings.allow.push("bash()".to_string());
         pm.settings
             .allow
             .push(r#"Bash(argv_prefix="python", op="execute")"#.to_string());
@@ -4405,11 +4396,11 @@ mod tests {
     }
 
     #[test]
-    fn allow_rules_enforce_v2_op_and_path_context() {
+    fn allow_rules_enforce_op_and_path_context() {
         let mut pm = PermissionManager::new(false);
         pm.settings
             .allow
-            .push(r#"write_file(path_glob="src/**/*.rs", op="write")"#.to_string());
+            .push(r#"file_write(path_glob="src/**/*.rs", op="write")"#.to_string());
         pm.cached_allow = pm.settings.parsed_allow_rules();
 
         assert!(pm.check_allow_rules(
@@ -4420,7 +4411,7 @@ mod tests {
     }
 
     #[test]
-    fn allow_rules_enforce_v2_network_domain_context() {
+    fn allow_rules_enforce_network_domain_context() {
         let mut pm = PermissionManager::new(false);
         pm.settings
             .allow
@@ -4438,7 +4429,7 @@ mod tests {
     }
 
     #[test]
-    fn allow_rules_enforce_v2_mcp_capability_context() {
+    fn allow_rules_enforce_mcp_capability_context() {
         let mut pm = PermissionManager::new(false);
         pm.settings.allow.push(
             r#"MCP(tool="mcp_jira_create_issue", capability="destructive=false")"#.to_string(),
@@ -4459,13 +4450,17 @@ mod tests {
     fn settings_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let mut settings = PermissionSettings::default();
-        settings.allow.push("Bash(git:*)".to_string());
-        settings.deny.push("Bash(rm -rf:*)".to_string());
+        settings
+            .allow
+            .push(r#"Bash(argv_prefix="git")"#.to_string());
+        settings
+            .deny
+            .push(r#"Bash(argv_prefix="rm -rf")"#.to_string());
         settings.save(dir.path()).unwrap();
 
         let loaded = PermissionSettings::load(dir.path());
-        assert_eq!(loaded.allow, vec!["Bash(git:*)"]);
-        assert_eq!(loaded.deny, vec!["Bash(rm -rf:*)"]);
+        assert_eq!(loaded.allow, vec![r#"Bash(argv_prefix="git")"#]);
+        assert_eq!(loaded.deny, vec![r#"Bash(argv_prefix="rm -rf")"#]);
     }
 
     // ── Issue #326 P0: corrupt permissions.json must surface ────────────────
@@ -4496,7 +4491,7 @@ mod tests {
     }
 
     #[test]
-    fn try_load_returns_invalid_rule_for_unknown_v2_key() {
+    fn try_load_returns_invalid_rule_for_unknown_key() {
         let dir = tempfile::tempdir().unwrap();
         let kiro = dir.path().join(".astra");
         std::fs::create_dir_all(&kiro).unwrap();
@@ -4532,11 +4527,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_load_facade_still_returns_default_on_corrupt() {
-        // Backwards-compat: existing call sites that use `load()` get
-        // a defaulted settings struct (and a `tracing::warn` they may
-        // or may not be capturing). The new signal is on
-        // `PermissionManager::load_errors()`, not on `load()`.
+    fn load_facade_returns_default_on_corrupt() {
+        // Existing call sites that use `load()` get a defaulted
+        // settings struct (and a `tracing::warn` they may or may not
+        // be capturing). The structured signal is on
+        // `PermissionManager::load_errors()`.
         let dir = tempfile::tempdir().unwrap();
         let kiro = dir.path().join(".astra");
         std::fs::create_dir_all(&kiro).unwrap();
@@ -4554,16 +4549,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let result = PermissionSettings::modify(dir.path(), |s| -> Result<(), &'static str> {
-            s.allow.push("Bash(npm test:*)".to_string());
+            s.allow.push(r#"Bash(argv_prefix="npm test")"#.to_string());
             Ok(())
         })
         .unwrap();
 
-        assert_eq!(result.allow, vec!["Bash(npm test:*)"]);
+        assert_eq!(result.allow, vec![r#"Bash(argv_prefix="npm test")"#]);
 
         // Re-load directly to confirm the change actually hit disk.
         let reloaded = PermissionSettings::load(dir.path());
-        assert_eq!(reloaded.allow, vec!["Bash(npm test:*)"]);
+        assert_eq!(reloaded.allow, vec![r#"Bash(argv_prefix="npm test")"#]);
     }
 
     #[test]
@@ -4575,21 +4570,24 @@ mod tests {
 
         // Process A: write a rule first.
         let mut a = PermissionSettings::default();
-        a.allow.push("Bash(rule-a:*)".to_string());
+        a.allow.push(r#"Bash(argv_prefix="rule-a")"#.to_string());
         a.save(dir.path()).unwrap();
 
         // Process B: open a stale baseline by NOT calling load.
         // Use modify to add a different rule — modify will re-load
         // under the flock and see rule-a, then add rule-b on top.
         let result = PermissionSettings::modify(dir.path(), |s| -> Result<(), &'static str> {
-            s.allow.push("Bash(rule-b:*)".to_string());
+            s.allow.push(r#"Bash(argv_prefix="rule-b")"#.to_string());
             Ok(())
         })
         .unwrap();
 
         assert_eq!(
             result.allow,
-            vec!["Bash(rule-a:*)", "Bash(rule-b:*)"],
+            vec![
+                r#"Bash(argv_prefix="rule-a")"#,
+                r#"Bash(argv_prefix="rule-b")"#
+            ],
             "modify must merge with the on-disk baseline, not overwrite"
         );
     }
@@ -4629,11 +4627,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Pre-write a baseline so we can detect any unexpected change.
         let mut baseline = PermissionSettings::default();
-        baseline.allow.push("Bash(baseline:*)".to_string());
+        baseline
+            .allow
+            .push(r#"Bash(argv_prefix="baseline")"#.to_string());
         baseline.save(dir.path()).unwrap();
 
         let err = PermissionSettings::modify(dir.path(), |s| -> Result<(), &'static str> {
-            s.allow.push("Bash(would-be:*)".to_string());
+            s.allow.push(r#"Bash(argv_prefix="would-be")"#.to_string());
             Err("user changed their mind")
         })
         .unwrap_err();
@@ -4641,7 +4641,7 @@ mod tests {
 
         // File on disk is unchanged.
         let reloaded = PermissionSettings::load(dir.path());
-        assert_eq!(reloaded.allow, vec!["Bash(baseline:*)"]);
+        assert_eq!(reloaded.allow, vec![r#"Bash(argv_prefix="baseline")"#]);
     }
 
     // ── Issue #326 P5b: PermissionLoadPolicy ──────────────────────────
@@ -4654,8 +4654,8 @@ mod tests {
         std::fs::write(
             kiro.join("permissions.json"),
             r#"{
-                "allow": ["Bash(curl:*)"],
-                "deny": ["Bash(rm -rf:*)"]
+                "allow": ["Bash(argv_prefix=\"curl\")"],
+                "deny": ["Bash(argv_prefix=\"rm -rf\")"]
             }"#,
         )
         .unwrap();
@@ -4673,7 +4673,7 @@ mod tests {
         );
         // Project deny rules preserved — a project can still tighten
         // sub-run restrictions.
-        assert_eq!(pm.settings.deny, vec!["Bash(rm -rf:*)"]);
+        assert_eq!(pm.settings.deny, vec![r#"Bash(argv_prefix="rm -rf")"#]);
     }
 
     #[test]
@@ -4684,8 +4684,8 @@ mod tests {
         std::fs::write(
             kiro.join("permissions.json"),
             r#"{
-                "allow": ["Bash(rm:*)"],
-                "deny": ["Edit(/etc/**)"],
+                "allow": ["Bash(argv_prefix=\"rm\")"],
+                "deny": ["file_write(path_glob=\"/etc/**\", op=\"write\")"],
                 "allow_sensitive_path_writes": true
             }"#,
         )
@@ -4697,7 +4697,10 @@ mod tests {
             &PermissionLoadPolicy::InteractiveUntrusted,
         );
         assert!(pm.settings.allow.is_empty());
-        assert_eq!(pm.settings.deny, vec!["Edit(/etc/**)"]);
+        assert_eq!(
+            pm.settings.deny,
+            vec![r#"file_write(path_glob="/etc/**", op="write")"#]
+        );
         assert!(
             !pm.settings.allow_sensitive_path_writes,
             "untrusted must zero allow_sensitive_path_writes"
@@ -4712,8 +4715,8 @@ mod tests {
         std::fs::write(
             kiro.join("permissions.json"),
             r#"{
-                "allow": ["Bash(npm test:*)"],
-                "deny": ["Bash(rm -rf:*)"],
+                "allow": ["Bash(argv_prefix=\"npm test\")"],
+                "deny": ["Bash(argv_prefix=\"rm -rf\")"],
                 "allow_sensitive_path_writes": true
             }"#,
         )
@@ -4724,8 +4727,8 @@ mod tests {
             dir.path(),
             &PermissionLoadPolicy::InteractiveTrusted,
         );
-        assert_eq!(pm.settings.allow, vec!["Bash(npm test:*)"]);
-        assert_eq!(pm.settings.deny, vec!["Bash(rm -rf:*)"]);
+        assert_eq!(pm.settings.allow, vec![r#"Bash(argv_prefix="npm test")"#]);
+        assert_eq!(pm.settings.deny, vec![r#"Bash(argv_prefix="rm -rf")"#]);
         assert!(pm.settings.allow_sensitive_path_writes);
     }
 
@@ -4755,8 +4758,8 @@ mod tests {
         std::fs::write(
             kiro.join("permissions.json"),
             r#"{
-                "allow": ["Bash(npm test:*)"],
-                "deny": ["Bash(rm:*)"]
+                "allow": ["Bash(argv_prefix=\"npm test\")"],
+                "deny": ["Bash(argv_prefix=\"rm\")"]
             }"#,
         )
         .unwrap();
@@ -4769,7 +4772,7 @@ mod tests {
         );
 
         assert!(pm.settings.allow.is_empty());
-        assert_eq!(pm.settings.deny, vec!["Bash(rm:*)"]);
+        assert_eq!(pm.settings.deny, vec![r#"Bash(argv_prefix="rm")"#]);
         assert!(matches!(
             pm.workspace_trust.as_ref().map(|t| &t.reason),
             Some(WorkspaceTrustReason::UnknownWorkspace)
@@ -4818,7 +4821,7 @@ mod tests {
         std::fs::create_dir_all(&kiro).unwrap();
         std::fs::write(
             kiro.join("permissions.json"),
-            r#"{"allow":["Bash(npm test:*)"],"deny":["Bash(rm:*)"]}"#,
+            r#"{"allow":["Bash(argv_prefix=\"npm test\")"],"deny":["Bash(argv_prefix=\"rm\")"]}"#,
         )
         .unwrap();
         let ledger_path = dir.path().join("trusted_workspaces.json");
@@ -4837,8 +4840,8 @@ mod tests {
             ledger_path,
         );
 
-        assert_eq!(pm.settings.allow, vec!["Bash(npm test:*)"]);
-        assert_eq!(pm.settings.deny, vec!["Bash(rm:*)"]);
+        assert_eq!(pm.settings.allow, vec![r#"Bash(argv_prefix="npm test")"#]);
+        assert_eq!(pm.settings.deny, vec![r#"Bash(argv_prefix="rm")"#]);
     }
 
     #[test]
@@ -4847,7 +4850,11 @@ mod tests {
         let kiro = dir.path().join(".astra");
         std::fs::create_dir_all(&kiro).unwrap();
         let permissions_path = kiro.join("permissions.json");
-        std::fs::write(&permissions_path, r#"{"allow":["Bash(ls:*)"]}"#).unwrap();
+        std::fs::write(
+            &permissions_path,
+            r#"{"allow":["Bash(argv_prefix=\"ls\")"]}"#,
+        )
+        .unwrap();
         let trusted_hash = project_permissions_hash(dir.path()).unwrap();
 
         let ledger_path = dir.path().join("trusted_workspaces.json");
@@ -4860,7 +4867,11 @@ mod tests {
         );
         ledger.save().unwrap();
 
-        std::fs::write(&permissions_path, r#"{"allow":["Bash(cargo test:*)"]}"#).unwrap();
+        std::fs::write(
+            &permissions_path,
+            r#"{"allow":["Bash(argv_prefix=\"cargo test\")"]}"#,
+        )
+        .unwrap();
         let pm = PermissionManager::with_workspace_trust_mode_from_ledger_path(
             PermissionMode::Prompt,
             dir.path(),
@@ -5074,7 +5085,7 @@ mod tests {
     fn with_project_mode_loads_settings() {
         let dir = tempfile::tempdir().unwrap();
         let mut settings = PermissionSettings::default();
-        settings.deny.push("Bash(rm:*)".to_string());
+        settings.deny.push(r#"Bash(argv_prefix="rm")"#.to_string());
         settings.save(dir.path()).unwrap();
 
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
@@ -5090,7 +5101,7 @@ mod tests {
         let mut pm = PermissionManager::new(true);
         let args = serde_json::json!({"reason": "path outside project"});
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
-        assert!(matches!(decision, PermissionDecision::Allow));
+        assert!(matches!(decision, GateOutcome::Allow));
     }
 
     #[test]
@@ -5107,7 +5118,7 @@ mod tests {
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
 
         match decision {
-            PermissionDecision::Deny(reason) => {
+            GateOutcome::Deny(reason) => {
                 assert!(
                     reason.contains("Sensitive path cannot be approved through sandbox expansion"),
                     "unexpected denial reason: {reason}"
@@ -5131,7 +5142,7 @@ mod tests {
         let decision = pm.check_nonblocking("sandbox_expand:bash", &args);
 
         assert!(
-            matches!(decision, PermissionDecision::Deny(ref reason) if reason.contains("Sensitive path")),
+            matches!(decision, GateOutcome::Deny(ref reason) if reason.contains("Sensitive path")),
             "home-relative credential sandbox expansion must deny; got {decision:?}"
         );
     }
@@ -5142,7 +5153,7 @@ mod tests {
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         pm.settings
             .allow
-            .push("sandbox_expand:read_file".to_string());
+            .push("sandbox_expand:read_file()".to_string());
         pm.cached_allow = pm.settings.parsed_allow_rules();
         let args = serde_json::json!({
             "reason": format!(
@@ -5154,7 +5165,7 @@ mod tests {
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
 
         assert!(
-            matches!(decision, PermissionDecision::Deny(ref reason) if reason.contains("Sensitive path")),
+            matches!(decision, GateOutcome::Deny(ref reason) if reason.contains("Sensitive path")),
             "sandbox_expand allow rules must not unlock sensitive targets; got {decision:?}"
         );
     }
@@ -5165,21 +5176,20 @@ mod tests {
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
         let args = serde_json::json!({"reason": "path outside project"});
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
-        assert!(matches!(decision, PermissionDecision::Deny(_)));
+        assert!(matches!(decision, GateOutcome::Deny(_)));
     }
 
     #[test]
     fn sandbox_expand_prompt_mode_needs_approval() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
-        // Clear user settings so that ~/.astra/permissions.json allow rules (e.g.
-        // `sandbox_expand:bash` granted in a previous interactive session) do not
-        // bypass the prompt in this isolated unit test.
+        // Clear user settings so that ~/.astra/permissions.json allow rules granted
+        // in a previous interactive session do not bypass the prompt in this test.
         pm.replace_user_settings(PermissionSettings::default());
         let args = serde_json::json!({"reason": "path outside project"});
         let decision = pm.check_nonblocking("sandbox_expand:bash", &args);
         match decision {
-            PermissionDecision::NeedApproval { tool, header, .. } => {
+            GateOutcome::NeedApproval { tool, header, .. } => {
                 assert_eq!(tool, "sandbox_expand:bash");
                 assert!(header.contains("bash"));
             }
@@ -5199,7 +5209,7 @@ mod tests {
         let decision = pm.check_nonblocking("sandbox_expand:write_file", &args);
 
         match decision {
-            PermissionDecision::NeedApproval {
+            GateOutcome::NeedApproval {
                 tool,
                 header,
                 detail,
@@ -5227,7 +5237,7 @@ mod tests {
         let args = serde_json::json!({"reason": raw_fs_msg});
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
         match decision {
-            PermissionDecision::NeedApproval {
+            GateOutcome::NeedApproval {
                 header,
                 detail,
                 reason,
@@ -5255,7 +5265,7 @@ mod tests {
         pm.record_approval("sandbox_expand:read_file", None, true);
         let args = serde_json::json!({"reason": "path outside project"});
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
-        assert!(matches!(decision, PermissionDecision::Allow));
+        assert!(matches!(decision, GateOutcome::Allow));
     }
 
     #[test]
@@ -5297,7 +5307,7 @@ mod tests {
         });
         let decision = pm.check_nonblocking("sandbox_expand:glob", &args_b);
         assert!(
-            matches!(decision, PermissionDecision::Allow),
+            matches!(decision, GateOutcome::Allow),
             "glob on a sub-path of the trusted root should be auto-allowed; got {decision:?}"
         );
 
@@ -5313,7 +5323,7 @@ mod tests {
         });
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args_c);
         assert!(
-            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            matches!(decision, GateOutcome::NeedApproval { .. }),
             "an unrelated outside path must still prompt; got {decision:?}"
         );
     }
@@ -5358,12 +5368,12 @@ mod tests {
 
             if *expect_allow {
                 assert!(
-                    matches!(decision, PermissionDecision::Allow),
+                    matches!(decision, GateOutcome::Allow),
                     "[{idx}] '{template}' — expected Allow, got {decision:?}"
                 );
             } else {
                 assert!(
-                    matches!(decision, PermissionDecision::NeedApproval { .. }),
+                    matches!(decision, GateOutcome::NeedApproval { .. }),
                     "[{idx}] '{template}' — expected NeedApproval, got {decision:?}"
                 );
             }
@@ -5390,7 +5400,7 @@ mod tests {
         });
         let decision = pm.check_nonblocking("sandbox_expand:write_file", &args);
         assert!(
-            matches!(decision, PermissionDecision::Allow),
+            matches!(decision, GateOutcome::Allow),
             "missing descendants under a trusted existing directory should keep the Always UX"
         );
     }
@@ -5419,7 +5429,7 @@ mod tests {
         });
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
         assert!(
-            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            matches!(decision, GateOutcome::NeedApproval { .. }),
             "a non-existent approved path must not become trusted after it appears as a symlink"
         );
     }
@@ -5450,7 +5460,7 @@ mod tests {
         });
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
         assert!(
-            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            matches!(decision, GateOutcome::NeedApproval { .. }),
             "canonicalized candidate should point at the symlink target, not the trusted root"
         );
     }
@@ -5468,14 +5478,14 @@ mod tests {
         // "I never want this tool to widen the sandbox".
         pm.settings
             .deny
-            .push("sandbox_expand:read_file".to_string());
+            .push("sandbox_expand:read_file()".to_string());
         pm.cached_deny = pm.settings.parsed_deny_rules();
 
         let args = serde_json::json!({"reason": "/tmp/foo"});
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
 
         match decision {
-            PermissionDecision::Deny(reason) => {
+            GateOutcome::Deny(reason) => {
                 assert!(
                     reason.contains("rule") || reason.contains("Denied"),
                     "expected deny-by-rule message, got: {reason}"
@@ -5506,7 +5516,7 @@ mod tests {
             serde_json::json!({"reason": "Path '/b/deeper' is outside the project '/root'."});
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args_b);
         assert!(
-            matches!(decision, PermissionDecision::Allow),
+            matches!(decision, GateOutcome::Allow),
             "second sandbox_expand:read_file should be auto-allowed; got {decision:?}"
         );
     }
@@ -5518,7 +5528,7 @@ mod tests {
         pm.record_approval("sandbox_expand:read_file", None, false);
         let args = serde_json::json!({"reason": "path outside project"});
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
-        assert!(matches!(decision, PermissionDecision::Deny(_)));
+        assert!(matches!(decision, GateOutcome::Deny(_)));
     }
 
     #[test]
@@ -5530,7 +5540,7 @@ mod tests {
         let args = serde_json::json!({"path": "test.txt"});
         let decision = pm.check_nonblocking("read_file", &args);
         // read_file is classified as Read → always allowed
-        assert!(matches!(decision, PermissionDecision::Allow));
+        assert!(matches!(decision, GateOutcome::Allow));
     }
 
     #[test]
@@ -5540,7 +5550,7 @@ mod tests {
         let args = serde_json::json!({"path": "src/main.rs", "content": "fn main() {}"});
         let decision = pm.check_nonblocking("write_file", &args);
         match decision {
-            PermissionDecision::NeedApproval {
+            GateOutcome::NeedApproval {
                 detail: Some(detail),
                 ..
             } => {
@@ -5560,7 +5570,7 @@ mod tests {
         let args = serde_json::json!({"command": "cargo test -p astra-cli"});
         let decision = pm.check_nonblocking("bash", &args);
         match decision {
-            PermissionDecision::NeedApproval {
+            GateOutcome::NeedApproval {
                 detail: Some(detail),
                 reason,
                 ..
@@ -5590,7 +5600,7 @@ mod tests {
         let args = serde_json::json!({"action": "commit", "message": "ship it"});
         let decision = pm.check_nonblocking("git", &args);
         assert!(
-            matches!(decision, PermissionDecision::Allow),
+            matches!(decision, GateOutcome::Allow),
             "Auto mode should auto-allow explicit tools, got: {decision:?}"
         );
     }
@@ -5601,7 +5611,7 @@ mod tests {
         let args = serde_json::json!({"action": "commit", "message": "ship it"});
         let decision = pm.check_nonblocking("git", &args);
         assert!(
-            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            matches!(decision, GateOutcome::NeedApproval { .. }),
             "Prompt mode should require approval for explicit tools, got: {decision:?}"
         );
     }
@@ -5615,7 +5625,7 @@ mod tests {
         let args = serde_json::json!({"path": "note.txt", "content": "hi"});
         let decision = pm.check_nonblocking("write_file", &args);
         assert!(
-            matches!(decision, PermissionDecision::Deny(_)),
+            matches!(decision, GateOutcome::Deny(_)),
             "expected Deny, got {decision:?}"
         );
         let recs = pm.recent_rejections();
@@ -5633,7 +5643,7 @@ mod tests {
         let mut pm = PermissionManager::new(true);
         let args = serde_json::json!({"command": "sudo rm -rf /"});
         let decision = pm.check_nonblocking("bash", &args);
-        assert!(matches!(decision, PermissionDecision::Deny(_)));
+        assert!(matches!(decision, GateOutcome::Deny(_)));
         let recs = pm.recent_rejections();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].0, "bash");
@@ -5645,7 +5655,7 @@ mod tests {
         let mut pm = PermissionManager::new(false);
         let args = serde_json::json!({"action": "commit", "message": "ship it"});
         let decision = pm.check_nonblocking("git", &args);
-        assert!(matches!(decision, PermissionDecision::NeedApproval { .. }));
+        assert!(matches!(decision, GateOutcome::NeedApproval { .. }));
         assert!(pm.recent_rejections().is_empty());
     }
 
@@ -5661,7 +5671,7 @@ mod tests {
         // Must NOT be Allow — git safety is bypass-immune
         let decision = pm.check_nonblocking("bash", &args);
         assert!(
-            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            matches!(decision, GateOutcome::NeedApproval { .. }),
             "session override must not bypass git safety: got {decision:?}"
         );
     }
@@ -5674,7 +5684,7 @@ mod tests {
         let args = serde_json::json!({"command": "sudo rm -rf /"});
         let decision = pm.check_nonblocking("bash", &args);
         assert!(
-            matches!(decision, PermissionDecision::Deny(_)),
+            matches!(decision, GateOutcome::Deny(_)),
             "session override must not bypass dangerous command check: got {decision:?}"
         );
     }
@@ -5689,7 +5699,7 @@ mod tests {
         let args = serde_json::json!({"path": ".git/config", "content": "bad"});
         let decision = pm.check_nonblocking("write_file", &args);
         assert!(
-            matches!(decision, PermissionDecision::Deny(_)),
+            matches!(decision, GateOutcome::Deny(_)),
             "Auto mode must deny sensitive paths by default instead of prompting: got {decision:?}"
         );
 
@@ -5697,7 +5707,7 @@ mod tests {
         pm.settings.allow_sensitive_path_writes = true;
         let decision2 = pm.check_nonblocking("write_file", &args);
         assert!(
-            matches!(decision2, PermissionDecision::Allow),
+            matches!(decision2, GateOutcome::Allow),
             "opt-in should unlock Auto mode sensitive writes: got {decision2:?}"
         );
     }
@@ -5710,7 +5720,7 @@ mod tests {
 
         let decision = pm.check_nonblocking("write_file", &args);
         assert!(
-            matches!(decision, PermissionDecision::Allow),
+            matches!(decision, GateOutcome::Allow),
             "content-specific sensitive path approval should be honored: got {decision:?}"
         );
     }
@@ -5725,7 +5735,7 @@ mod tests {
 
         let decision = pm.check_nonblocking("write_file", &sensitive);
         assert!(
-            matches!(decision, PermissionDecision::Deny(_)),
+            matches!(decision, GateOutcome::Deny(_)),
             "non-sensitive directory approval must not unlock sensitive sibling in Auto mode: got {decision:?}"
         );
     }
@@ -5744,7 +5754,7 @@ mod tests {
         let later = serde_json::json!({"path": ".git/hooks/pre-commit", "content": "hook"});
         let decision = pm.check_nonblocking("write_file", &later);
         assert!(
-            matches!(decision, PermissionDecision::Allow),
+            matches!(decision, GateOutcome::Allow),
             "sensitive prefix approval should cover matching sensitive path: got {decision:?}"
         );
     }
@@ -5757,7 +5767,7 @@ mod tests {
         let args = serde_json::json!({"command": "echo hello"});
         let decision = pm.check_nonblocking("bash", &args);
         assert!(
-            matches!(decision, PermissionDecision::Allow),
+            matches!(decision, GateOutcome::Allow),
             "session override should allow safe commands: got {decision:?}"
         );
     }
@@ -5769,7 +5779,7 @@ mod tests {
         let args = serde_json::json!({"path": ".git/config", "content": "bad"});
         let decision = pm.check_nonblocking("write_file", &args);
         assert!(
-            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            matches!(decision, GateOutcome::NeedApproval { .. }),
             "Prompt mode should require approval for dangerous path: got {decision:?}"
         );
     }
@@ -5791,7 +5801,7 @@ mod tests {
     #[test]
     fn make_allow_rule_bash_keeps_subcommand() {
         // Issue #326 P1.5 / R1 Major 5: previously this saved
-        // `Bash(cargo:*)`, which would silently allow `cargo
+        // `Bash(argv_prefix="cargo")`, which would silently allow `cargo
         // uninstall --no-confirm`. We now keep the subcommand.
         let args = serde_json::json!({"command": "cargo test --release"});
         let rule = PermissionManager::make_allow_rule("bash", &args);
@@ -5891,7 +5901,7 @@ mod tests {
     fn make_allow_rule_file_write_uses_path_rule() {
         let args = serde_json::json!({"path": "/tmp/foo"});
         let rule = PermissionManager::make_allow_rule("write_file", &args);
-        assert_eq!(rule, r#"Edit(path_glob="/tmp/foo", op="write")"#);
+        assert_eq!(rule, r#"file_write(path_glob="/tmp/foo", op="write")"#);
 
         let parsed = PermissionRule::parse(&rule);
         assert!(parsed.matches_with_context(
@@ -5918,7 +5928,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_write_file_rule_covers_file_edit_family_inside_workspace() {
+    fn persisted_file_write_rule_covers_file_write_family_inside_workspace() {
         let mut pm = PermissionManager::new(false);
         let approved_args = serde_json::json!({"path": "zzzz3.md", "content": "# zzzz3"});
         let rule = PermissionManager::make_allow_rule("write_file", &approved_args);
@@ -5949,7 +5959,7 @@ mod tests {
         assert_eq!(
             rule,
             format!(
-                r#"Edit(path_prefix="{workspace_root}", op="write", cwd_root="{workspace_root}")"#
+                r#"file_write(path_prefix="{workspace_root}", op="write", cwd_root="{workspace_root}")"#
             )
         );
     }
@@ -5969,7 +5979,7 @@ mod tests {
         assert_eq!(rule, r#"Bash(argv_prefix="cargo test", op="execute")"#);
 
         // Single-word / flag-shaped commands fall back to exact rules instead
-        // of broad `Bash(ls:*)` or `Bash(true:*)` allow rules.
+        // of broad `Bash(argv_prefix="ls")` or `Bash(argv_prefix="true")` allow rules.
         let args = serde_json::json!({"command": "ls -la > /tmp/out"});
         let rule = PermissionManager::make_allow_rule("bash", &args);
         assert_eq!(
@@ -6006,7 +6016,7 @@ mod tests {
 
     #[test]
     fn rule_prefix_respects_word_boundary() {
-        let rule = PermissionRule::parse("Bash(git commit:*)");
+        let rule = PermissionRule::parse(r#"Bash(argv_prefix="git commit")"#);
         // Should match "git commit -m 'fix'"
         assert!(rule.matches("bash", Some("git commit -m 'fix'")));
         // Should NOT match "git commitizen" (different word)
@@ -6017,7 +6027,7 @@ mod tests {
 
     #[test]
     fn rule_prefix_allows_separators_after_match() {
-        let rule = PermissionRule::parse("Bash(cargo:*)");
+        let rule = PermissionRule::parse(r#"Bash(argv_prefix="cargo")"#);
         assert!(rule.matches("bash", Some("cargo test")));
         assert!(rule.matches("bash", Some("cargo-test"))); // false: '-' is a separator
         assert!(rule.matches("bash", Some("cargo=build")));
@@ -6030,7 +6040,9 @@ mod tests {
     fn user_level_allow_rule_permits_tool() {
         let mut pm = PermissionManager::new(false);
         // Simulate user-level allow rule
-        pm.user_settings.allow.push("Bash(cargo:*)".to_string());
+        pm.user_settings
+            .allow
+            .push(r#"Bash(argv_prefix="cargo")"#.to_string());
         pm.cached_user_allow = pm.user_settings.parsed_allow_rules();
 
         let args = serde_json::json!({"command": "cargo test"});
@@ -6041,10 +6053,12 @@ mod tests {
     fn user_level_deny_blocks_even_with_project_allow() {
         let mut pm = PermissionManager::new(false);
         // Project allows bash
-        pm.settings.allow.push("bash".to_string());
+        pm.settings.allow.push("bash()".to_string());
         pm.cached_allow = pm.settings.parsed_allow_rules();
-        // User denies bash(rm:*)
-        pm.user_settings.deny.push("Bash(rm:*)".to_string());
+        // User denies rm commands.
+        pm.user_settings
+            .deny
+            .push(r#"Bash(argv_prefix="rm")"#.to_string());
         pm.cached_user_deny = pm.user_settings.parsed_deny_rules();
 
         let args = serde_json::json!({"command": "rm -rf /tmp/foo"});
@@ -6055,11 +6069,15 @@ mod tests {
     #[test]
     fn project_deny_overrides_user_allow() {
         let mut pm = PermissionManager::new(false);
-        // User allows bash(git:*)
-        pm.user_settings.allow.push("Bash(git:*)".to_string());
+        // User allows git commands.
+        pm.user_settings
+            .allow
+            .push(r#"Bash(argv_prefix="git")"#.to_string());
         pm.cached_user_allow = pm.user_settings.parsed_allow_rules();
-        // Project denies bash(git push:*)
-        pm.settings.deny.push("Bash(git push:*)".to_string());
+        // Project denies git push commands.
+        pm.settings
+            .deny
+            .push(r#"Bash(argv_prefix="git push")"#.to_string());
         pm.cached_deny = pm.settings.parsed_deny_rules();
 
         let args = serde_json::json!({"command": "git push --force"});
@@ -6070,16 +6088,16 @@ mod tests {
     #[test]
     fn user_allow_does_not_override_project_deny() {
         let mut pm = PermissionManager::new(false);
-        // Project denies edit
-        pm.settings.deny.push("edit".to_string());
+        // Project denies write_file.
+        pm.settings.deny.push("write_file()".to_string());
         pm.cached_deny = pm.settings.parsed_deny_rules();
-        // User allows edit
-        pm.user_settings.allow.push("edit".to_string());
+        // User allows write_file.
+        pm.user_settings.allow.push("write_file()".to_string());
         pm.cached_user_allow = pm.user_settings.parsed_allow_rules();
 
         let args = serde_json::json!({});
-        // Deny from project level → blocks
-        assert!(pm.check_deny_rules("edit", &args));
+        // Deny from project level blocks.
+        assert!(pm.check_deny_rules("write_file", &args));
     }
 
     #[test]
@@ -6090,18 +6108,17 @@ mod tests {
         let path = dir.join("permissions.json");
 
         let settings = PermissionSettings {
-            allow: vec!["Bash(cargo:*)".to_string()],
-            deny: vec!["Bash(rm:*)".to_string()],
+            allow: vec![r#"Bash(argv_prefix="cargo")"#.to_string()],
+            deny: vec![r#"Bash(argv_prefix="rm")"#.to_string()],
             allow_sensitive_path_writes: false,
-            grammar_version: 0,
         };
         let json = serde_json::to_string_pretty(&settings).unwrap();
         fs::write(&path, json).unwrap();
 
         let loaded: PermissionSettings =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(loaded.allow, vec!["Bash(cargo:*)"]);
-        assert_eq!(loaded.deny, vec!["Bash(rm:*)"]);
+        assert_eq!(loaded.allow, vec![r#"Bash(argv_prefix="cargo")"#]);
+        assert_eq!(loaded.deny, vec![r#"Bash(argv_prefix="rm")"#]);
     }
 
     #[test]
@@ -6113,8 +6130,8 @@ mod tests {
         fs::write(
             dir.join("permissions.json"),
             serde_json::json!({
-                "allow": ["Bash(cargo test:*)"],
-                "deny": ["Bash(rm:*)"]
+                "allow": ["Bash(argv_prefix=\"cargo test\")"],
+                "deny": ["Bash(argv_prefix=\"rm\")"]
             })
             .to_string(),
         )
@@ -6122,23 +6139,24 @@ mod tests {
 
         let updated =
             PermissionSettings::modify_user_in_home(home, |settings| -> Result<(), String> {
-                settings.allow.push("Bash(npm test:*)".to_string());
+                settings
+                    .allow
+                    .push(r#"Bash(argv_prefix="npm test")"#.to_string());
                 Ok(())
             })
             .unwrap();
 
         assert_eq!(
             updated.allow,
-            vec!["Bash(cargo test:*)", "Bash(npm test:*)"]
+            vec![
+                r#"Bash(argv_prefix="cargo test")"#,
+                r#"Bash(argv_prefix="npm test")"#
+            ]
         );
         let reloaded = PermissionSettings::try_load_inner(&dir.join("permissions.json"));
         assert!(reloaded.error.is_none());
         assert_eq!(reloaded.settings.allow, updated.allow);
-        assert_eq!(reloaded.settings.deny, vec!["Bash(rm:*)"]);
-        assert_eq!(
-            reloaded.settings.grammar_version,
-            astra_turn_core::permission::rule_grammar::GRAMMAR_VERSION
-        );
+        assert_eq!(reloaded.settings.deny, vec![r#"Bash(argv_prefix="rm")"#]);
     }
 
     #[test]
@@ -6147,7 +6165,7 @@ mod tests {
         let home = tmp.path();
         let mut pm = PermissionManager::new(false);
 
-        pm.add_user_allow_rule_with_home("Bash(npm test:*)", Some(home));
+        pm.add_user_allow_rule_with_home(r#"Bash(argv_prefix="npm test")"#, Some(home));
 
         assert!(pm.last_save_error().is_none());
         let args = serde_json::json!({"command": "npm test -- --grep auth"});
@@ -6155,7 +6173,10 @@ mod tests {
         let reloaded =
             PermissionSettings::try_load_inner(&home.join(".astra").join("permissions.json"));
         assert!(reloaded.error.is_none());
-        assert_eq!(reloaded.settings.allow, vec!["Bash(npm test:*)"]);
+        assert_eq!(
+            reloaded.settings.allow,
+            vec![r#"Bash(argv_prefix="npm test")"#]
+        );
     }
 
     #[test]
@@ -6163,7 +6184,7 @@ mod tests {
         let mut pm = PermissionManager::new(false);
         pm.user_settings
             .allow
-            .push("sandbox_expand:bash".to_string());
+            .push("sandbox_expand:bash()".to_string());
         pm.cached_user_allow = pm.user_settings.parsed_allow_rules();
         let args = serde_json::json!({
             "reason": "Path '/tmp/outside' is outside the project directory '/tmp/project'."
@@ -6171,7 +6192,7 @@ mod tests {
 
         let decision = pm.check_nonblocking("sandbox_expand:bash", &args);
 
-        assert!(matches!(decision, PermissionDecision::Allow));
+        assert!(matches!(decision, GateOutcome::Allow));
     }
 
     #[test]
@@ -6193,7 +6214,7 @@ mod tests {
         std::fs::create_dir_all(&kiro).unwrap();
         std::fs::write(
             kiro.join("permissions.json"),
-            r#"{"allow":["Bash(cargo:*)"],"deny":["Bash(rm:*)"]}"#,
+            r#"{"allow":["Bash(argv_prefix=\"cargo\")"],"deny":["Bash(argv_prefix=\"rm\")"]}"#,
         )
         .unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, root);
@@ -6210,14 +6231,14 @@ mod tests {
 
     #[test]
     fn display_permission_rule_bare() {
-        let rule = PermissionRule::parse("Edit");
-        assert_eq!(format!("{rule}"), "edit");
+        let rule = PermissionRule::parse("write_file()");
+        assert_eq!(format!("{rule}"), "write_file()");
     }
 
     #[test]
     fn display_permission_rule_with_pattern() {
-        let rule = PermissionRule::parse("Bash(git commit:*)");
-        assert_eq!(format!("{rule}"), "bash(git commit:*)");
+        let rule = PermissionRule::parse(r#"Bash(argv_prefix="git commit")"#);
+        assert_eq!(format!("{rule}"), r#"bash(argv_prefix="git commit")"#);
     }
 
     // ── inherited permissions ──────────────────────────────────────────────────
@@ -6238,7 +6259,7 @@ mod tests {
         };
 
         let mut inherited = InheritedPermissions::new(RuntimeMode::Prompt);
-        inherited.add_allow(RuntimeRule::parse("bash(git commit:*)"));
+        inherited.add_allow(RuntimeRule::parse(r#"Bash(argv_prefix="git commit")"#));
 
         let pm = PermissionManager::with_inherited(std::path::Path::new("/tmp"), inherited);
 
@@ -6255,7 +6276,7 @@ mod tests {
         };
 
         let mut inherited = InheritedPermissions::new(RuntimeMode::Prompt);
-        inherited.add_deny(RuntimeRule::parse("bash(rm -rf:*)"));
+        inherited.add_deny(RuntimeRule::parse(r#"Bash(argv_prefix="rm -rf")"#));
 
         let pm = PermissionManager::with_inherited(std::path::Path::new("/tmp"), inherited);
 
@@ -6275,7 +6296,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         pm.session_overrides.insert(bare_fp("bash"), true);
-        pm.session_overrides.insert(bare_fp("edit"), false);
+        pm.session_overrides.insert(bare_fp("file_write"), false);
 
         let inherited = pm.inherited_permissions_for_child(true);
 
@@ -6293,8 +6314,8 @@ mod tests {
     #[test]
     fn child_inherits_fingerprinted_session_overrides_not_collapsed_to_tool_level() {
         // Contract test for issue #326 P0 / R1 Major 10 / task #17:
-        // parent allowed `Bash(cargo test:*)` via session override.
-        // The child must NOT see this as `Bash(*) → Allow` (which would
+        // parent allowed `Bash(argv_prefix="cargo test")` via session override.
+        // The child must NOT see this as `Bash() → Allow` (which would
         // let it run `Bash(rm -rf …)`); it must reconstruct the same
         // command-prefix-level fingerprint and only allow `cargo test`.
         use astra_runtime::orchestration::PermissionMode as RuntimeMode;
@@ -6305,7 +6326,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut parent = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
-        // Parent presses Always on `Bash(cargo test:*)` → session override.
+        // Parent presses Always on `Bash(argv_prefix="cargo test")` -> session override.
         let cargo_test_fp = ApprovalFingerprint {
             tool_name: "bash".to_string(),
             command_exact: None,
@@ -6521,7 +6542,7 @@ mod tests {
         let args = serde_json::json!({"path": "src/lib.rs", "content": "pub fn ok() {}\n"});
         let local = pm.check_nonblocking("write_file", &args);
         assert!(
-            matches!(local, PermissionDecision::Allow),
+            matches!(local, GateOutcome::Allow),
             "local check must auto-allow after cloud 'always': got {local:?}"
         );
     }
@@ -6542,7 +6563,7 @@ mod tests {
         let write_args = serde_json::json!({"path": "foo.rs", "content": "hello"});
         let local = pm.check_nonblocking("write_file", &write_args);
         assert!(
-            matches!(local, PermissionDecision::Allow),
+            matches!(local, GateOutcome::Allow),
             "auto-run must allow write_file: got {local:?}"
         );
     }
@@ -6562,7 +6583,7 @@ mod tests {
         let args1 = serde_json::json!({"path": "src/lib.rs", "content": "pub fn one() {}\n"});
         assert!(matches!(
             pm.check_nonblocking("write_file", &args1),
-            PermissionDecision::Allow
+            GateOutcome::Allow
         ));
 
         // 2nd call: cloud approval must auto-allow (session override)
@@ -6581,7 +6602,7 @@ mod tests {
         let args2 = serde_json::json!({"path": "src/main.rs", "content": "fn main() {}\n"});
         assert!(matches!(
             pm.check_nonblocking("write_file", &args2),
-            PermissionDecision::Allow
+            GateOutcome::Allow
         ));
     }
 
@@ -6712,12 +6733,12 @@ mod tests {
         // causing approved tools to be re-prompted every call.
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
-        let args = serde_json::json!({"file_path": "src/main.rs", "content": "hello"});
+        let args = serde_json::json!({"path": "src/main.rs", "content": "hello"});
 
         // First call should need approval (no override yet).
         let decision = pm.check_nonblocking("write_file", &args);
         assert!(
-            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            matches!(decision, GateOutcome::NeedApproval { .. }),
             "first call should need approval"
         );
 
@@ -6727,7 +6748,7 @@ mod tests {
         // Second call with same tool+path should be auto-approved via session override.
         let decision = pm.check_nonblocking("write_file", &args);
         assert!(
-            matches!(decision, PermissionDecision::Allow),
+            matches!(decision, GateOutcome::Allow),
             "second call should be auto-approved via session override, got: {decision:?}"
         );
     }
@@ -6744,7 +6765,7 @@ mod tests {
 
         let decision = pm.check_nonblocking("bash", &similar_args);
         assert!(
-            matches!(decision, PermissionDecision::Allow),
+            matches!(decision, GateOutcome::Allow),
             "workspace command-family approval should cover cd-wrapped cargo test; got {decision:?}"
         );
     }
@@ -6777,17 +6798,17 @@ mod tests {
         );
 
         let decision = pm.check_nonblocking("write_file", &args_a);
-        assert!(matches!(decision, PermissionDecision::Allow));
+        assert!(matches!(decision, GateOutcome::Allow));
 
         let decision = pm.check_nonblocking("write_file", &args_b);
         assert!(
-            matches!(decision, PermissionDecision::Allow),
+            matches!(decision, GateOutcome::Allow),
             "workspace write trust should cover later safe file edits anywhere in the workspace"
         );
 
         let decision = pm.check_nonblocking("str_replace", &replace_args);
         assert!(
-            matches!(decision, PermissionDecision::Allow),
+            matches!(decision, GateOutcome::Allow),
             "workspace write trust should cover sibling file-edit tools, got {decision:?}"
         );
     }
@@ -6803,13 +6824,13 @@ mod tests {
 
         let decision = pm.check_nonblocking("write_file", &args);
         assert!(
-            matches!(decision, PermissionDecision::Allow),
+            matches!(decision, GateOutcome::Allow),
             "exact path approval should match the same deep path: got {decision:?}"
         );
 
         let sibling_decision = pm.check_nonblocking("write_file", &sibling);
         assert!(
-            matches!(sibling_decision, PermissionDecision::NeedApproval { .. }),
+            matches!(sibling_decision, GateOutcome::NeedApproval { .. }),
             "exact path approval must not match a sibling path: got {sibling_decision:?}"
         );
     }
@@ -6825,7 +6846,7 @@ mod tests {
         let args = serde_json::json!({"path": "any/path.rs", "content": "x"});
         let decision = pm.check_nonblocking("write_file", &args);
         assert!(
-            matches!(decision, PermissionDecision::Allow),
+            matches!(decision, GateOutcome::Allow),
             "bare override should subsume any content-aware check"
         );
     }
@@ -6954,20 +6975,20 @@ mod tests {
         let args = serde_json::json!({"path": ".ssh/id_rsa", "content": "x"});
         let d = pm.check_nonblocking("write_file", &args);
         assert!(
-            matches!(d, PermissionDecision::Deny(_)),
+            matches!(d, GateOutcome::Deny(_)),
             "Auto mode must deny sensitive paths by default instead of prompting, got {d:?}"
         );
 
         // Non-sensitive path still auto-allowed.
         let safe = serde_json::json!({"path": "src/foo.rs", "content": "x"});
         let d2 = pm.check_nonblocking("write_file", &safe);
-        assert!(matches!(d2, PermissionDecision::Allow));
+        assert!(matches!(d2, GateOutcome::Allow));
 
         // Opt-in via project settings flips it to Allow.
         pm.settings.allow_sensitive_path_writes = true;
         let d3 = pm.check_nonblocking("write_file", &args);
         assert!(
-            matches!(d3, PermissionDecision::Allow),
+            matches!(d3, GateOutcome::Allow),
             "allow_sensitive_path_writes opt-in should let Auto mode proceed, got {d3:?}"
         );
     }
@@ -7015,7 +7036,7 @@ mod tests {
         );
         let decision = pm.check_nonblocking("grep", &args);
         assert!(
-            matches!(decision, PermissionDecision::Allow),
+            matches!(decision, GateOutcome::Allow),
             "Auto mode should allow read-only session journal search without an opt-in prompt: {decision:?}"
         );
     }
@@ -7037,7 +7058,7 @@ mod tests {
 
         let decision = pm.check_nonblocking("write_file", &args);
         assert!(
-            matches!(decision, PermissionDecision::Deny(_)),
+            matches!(decision, GateOutcome::Deny(_)),
             "session journals are internal read-only diagnostics, not writable state: {decision:?}"
         );
     }
@@ -7255,22 +7276,22 @@ mod tests {
 
         // Prompt mode → NeedApproval.
         let d1 = pm.check_nonblocking("write_file", &args);
-        assert!(matches!(d1, PermissionDecision::NeedApproval { .. }));
+        assert!(matches!(d1, GateOutcome::NeedApproval { .. }));
 
         // Switch to Auto → Allow.
         pm.set_mode(PermissionMode::Auto);
         let d2 = pm.check_nonblocking("write_file", &args);
-        assert!(matches!(d2, PermissionDecision::Allow));
+        assert!(matches!(d2, GateOutcome::Allow));
 
         // Also allows str_replace.
         let args2 = serde_json::json!({"path": "src/bar.rs", "old_str": "a", "new_str": "b"});
         let d3 = pm.check_nonblocking("str_replace", &args2);
-        assert!(matches!(d3, PermissionDecision::Allow));
+        assert!(matches!(d3, GateOutcome::Allow));
 
         // And bash.
         let args3 = serde_json::json!({"command": "cargo build"});
         let d4 = pm.check_nonblocking("bash", &args3);
-        assert!(matches!(d4, PermissionDecision::Allow));
+        assert!(matches!(d4, GateOutcome::Allow));
     }
 
     #[test]
@@ -7297,7 +7318,7 @@ mod tests {
         // Local check should also allow.
         let args = serde_json::json!({"path": "src/foo.rs", "old_str": "a", "new_str": "b"});
         let local_decision = pm.check_nonblocking("str_replace", &args);
-        assert!(matches!(local_decision, PermissionDecision::Allow));
+        assert!(matches!(local_decision, GateOutcome::Allow));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -7328,24 +7349,24 @@ mod tests {
         let args = serde_json::json!({"path": "src/x.rs", "content": "x"});
         let d1 = pm.check_nonblocking("write_file", &args);
         assert!(
-            matches!(d1, PermissionDecision::NeedApproval { .. }),
+            matches!(d1, GateOutcome::NeedApproval { .. }),
             "expected NeedApproval in Prompt mode, got {d1:?}",
         );
 
         // Mid-session: user types `/mode auto`. The decision for d1 (already
         // returned) is not retroactively mutated — that's structurally true
-        // because PermissionDecision is a value type with no back-reference
+        // because GateOutcome is a value type with no back-reference
         // to the manager. What we pin down is that the NEXT check sees the
         // new mode.
         pm.set_mode(PermissionMode::Auto);
         let d2 = pm.check_nonblocking("write_file", &args);
         assert!(
-            matches!(d2, PermissionDecision::Allow),
+            matches!(d2, GateOutcome::Allow),
             "next check after set_mode(Auto) must Allow, got {d2:?}",
         );
 
         // And the old decision object is untouched.
-        assert!(matches!(d1, PermissionDecision::NeedApproval { .. }));
+        assert!(matches!(d1, GateOutcome::NeedApproval { .. }));
     }
 
     #[test]
@@ -7359,7 +7380,7 @@ mod tests {
         let args = serde_json::json!({"path": "src/foo.rs", "old_str": "a", "new_str": "b"});
         let d1 = pm.check_nonblocking("str_replace", &args);
         assert!(
-            matches!(d1, PermissionDecision::NeedApproval { .. }),
+            matches!(d1, GateOutcome::NeedApproval { .. }),
             "expected NeedApproval before rule add, got {d1:?}",
         );
 
@@ -7367,7 +7388,7 @@ mod tests {
 
         let d2 = pm.check_nonblocking("str_replace", &args);
         assert!(
-            matches!(d2, PermissionDecision::Allow),
+            matches!(d2, GateOutcome::Allow),
             "next str_replace check must Allow after add_allow_rule, got {d2:?}",
         );
     }
@@ -7377,9 +7398,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
-        pm.add_allow_rule("Bash(ls:*)");
+        pm.add_allow_rule(r#"Bash(argv_prefix="ls")"#);
         let first = pm.settings.allow.clone();
-        pm.add_allow_rule("Bash(ls:*)");
+        pm.add_allow_rule(r#"Bash(argv_prefix="ls")"#);
         let second = pm.settings.allow.clone();
         assert_eq!(
             first, second,
@@ -7397,20 +7418,28 @@ mod tests {
         // PermissionSettings::modify so it reads that fresh baseline
         // instead of saving its stale in-memory settings over it.
         let mut external = PermissionSettings::default();
-        external.allow.push("Bash(rule-a:*)".to_string());
+        external
+            .allow
+            .push(r#"Bash(argv_prefix="rule-a")"#.to_string());
         external.save(dir.path()).unwrap();
 
-        pm.add_allow_rule("Bash(rule-b:*)");
+        pm.add_allow_rule(r#"Bash(argv_prefix="rule-b")"#);
 
         let reloaded = PermissionSettings::load(dir.path());
         assert_eq!(
             reloaded.allow,
-            vec!["Bash(rule-a:*)", "Bash(rule-b:*)"],
+            vec![
+                r#"Bash(argv_prefix="rule-a")"#,
+                r#"Bash(argv_prefix="rule-b")"#
+            ],
             "add_allow_rule must preserve concurrent disk additions"
         );
         assert_eq!(
             pm.settings.allow,
-            vec!["Bash(rule-a:*)", "Bash(rule-b:*)"],
+            vec![
+                r#"Bash(argv_prefix="rule-a")"#,
+                r#"Bash(argv_prefix="rule-b")"#
+            ],
             "manager cache should refresh to the lock-merged settings"
         );
     }
@@ -7422,15 +7451,15 @@ mod tests {
 
         let args = serde_json::json!({"path": "secrets.env", "content": "x"});
         let d1 = pm.check_nonblocking("write_file", &args);
-        assert!(matches!(d1, PermissionDecision::NeedApproval { .. }));
+        assert!(matches!(d1, GateOutcome::NeedApproval { .. }));
 
         // Operator adds a deny rule mid-session.
-        pm.settings.deny.push("write_file".into());
+        pm.settings.deny.push("write_file()".into());
         pm.cached_deny = pm.settings.parsed_deny_rules();
 
         let d2 = pm.check_nonblocking("write_file", &args);
         assert!(
-            matches!(d2, PermissionDecision::Deny(_)),
+            matches!(d2, GateOutcome::Deny(_)),
             "deny rule must win over pending NeedApproval, got {d2:?}",
         );
     }
@@ -7447,7 +7476,7 @@ mod tests {
 
         let d_bash = pm.check_nonblocking("bash", &bash_args);
         assert!(
-            matches!(d_bash, PermissionDecision::Allow),
+            matches!(d_bash, GateOutcome::Allow),
             "bash must allow after session override, got {d_bash:?}",
         );
 
@@ -7455,7 +7484,7 @@ mod tests {
         let write_args = serde_json::json!({"path": "a.txt", "content": "y"});
         let d_write = pm.check_nonblocking("write_file", &write_args);
         assert!(
-            matches!(d_write, PermissionDecision::NeedApproval { .. }),
+            matches!(d_write, GateOutcome::NeedApproval { .. }),
             "unrelated tool must still require approval, got {d_write:?}",
         );
     }
@@ -7468,27 +7497,27 @@ mod tests {
         let args = serde_json::json!({"path": "src/a.rs", "content": "x"});
         let d1 = pm.check_nonblocking("write_file", &args);
         assert!(
-            matches!(d1, PermissionDecision::Allow),
+            matches!(d1, GateOutcome::Allow),
             "Auto mode must allow write_file, got {d1:?}",
         );
 
         pm.set_mode(PermissionMode::Deny);
         let d2 = pm.check_nonblocking("write_file", &args);
         assert!(
-            matches!(d2, PermissionDecision::Deny(_)),
+            matches!(d2, GateOutcome::Deny(_)),
             "Deny mode must reject write_file after flip, got {d2:?}",
         );
 
         // The earlier Allow decision is not retroactively mutated.
-        assert!(matches!(d1, PermissionDecision::Allow));
+        assert!(matches!(d1, GateOutcome::Allow));
     }
 
     #[test]
     fn phase_h_multiple_concurrent_in_flight_decisions_are_independent() {
         // Simulates two parallel NeedApproval decisions issued back-to-back
         // in Prompt mode. A mode change between them must only affect the
-        // second, not retroactively the first, and both PermissionDecision
-        // values are independent.
+        // second, not retroactively the first, and both decision values are
+        // independent.
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
@@ -7496,15 +7525,15 @@ mod tests {
         let b = serde_json::json!({"path": "b.txt", "content": "B"});
 
         let da = pm.check_nonblocking("write_file", &a);
-        assert!(matches!(da, PermissionDecision::NeedApproval { .. }));
+        assert!(matches!(da, GateOutcome::NeedApproval { .. }));
 
         pm.set_mode(PermissionMode::Auto);
 
         let db = pm.check_nonblocking("write_file", &b);
-        assert!(matches!(db, PermissionDecision::Allow));
+        assert!(matches!(db, GateOutcome::Allow));
 
         // `da` object remains NeedApproval — it's a snapshot by value.
-        assert!(matches!(da, PermissionDecision::NeedApproval { .. }));
+        assert!(matches!(da, GateOutcome::NeedApproval { .. }));
     }
 
     #[test]
@@ -7512,20 +7541,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
-        pm.add_allow_rule("Bash(rm:*)");
+        pm.add_allow_rule(r#"Bash(argv_prefix="rm")"#);
         // Operator realizes mistake, adds a specific deny for dangerous rm.
-        pm.settings.deny.push("Bash(rm:*)".into());
+        pm.settings.deny.push(r#"Bash(argv_prefix="rm")"#.into());
         pm.cached_deny = pm.settings.parsed_deny_rules();
 
         let args = serde_json::json!({"command": "rm -rf /tmp/foo"});
         let d = pm.check_nonblocking("bash", &args);
         assert!(
-            matches!(d, PermissionDecision::Deny(_)),
+            matches!(d, GateOutcome::Deny(_)),
             "deny rule must override prior allow rule, got {d:?}",
         );
     }
 
-    // ── Phase H v2 — REAL concurrency + reverse-order scenarios ──────────────
+    // ── Phase H concurrency + reverse-order scenarios ───────────────────────
     //
     // Addresses two review findings on the original Phase H:
     //   1. "Concurrent in-flight" test was actually serial `&mut pm` calls.
@@ -7561,9 +7590,9 @@ mod tests {
                 for i in 0..iterations {
                     let mut g = pm.lock_recover();
                     match i % 3 {
-                        0 => g.add_allow_rule("Bash(echo:*)"),
+                        0 => g.add_allow_rule(r#"Bash(argv_prefix="echo")"#),
                         1 => {
-                            g.settings.deny.push("Bash(rm:*)".into());
+                            g.settings.deny.push(r#"Bash(argv_prefix="rm")"#.into());
                             g.cached_deny = g.settings.parsed_deny_rules();
                         }
                         _ => g.set_mode(if i % 2 == 0 {
@@ -7603,7 +7632,7 @@ mod tests {
         let mut g = pm.lock_recover();
         let d = g.check_nonblocking("bash", &serde_json::json!({"command": "rm -rf /"}));
         assert!(
-            matches!(d, PermissionDecision::Deny(_)),
+            matches!(d, GateOutcome::Deny(_)),
             "deny rule survived concurrent churn → got {d:?}",
         );
     }
@@ -7625,19 +7654,19 @@ mod tests {
         let args = serde_json::json!({"path": "src/foo.rs", "old_str": "a", "new_str": "b"});
         let first = pm.check_nonblocking("str_replace", &args);
         assert!(
-            matches!(first, PermissionDecision::Allow),
+            matches!(first, GateOutcome::Allow),
             "first check with allow-rule installed must Allow, got {first:?}",
         );
 
         // Operator realizes mistake and bans str_replace at deny tier.
-        pm.settings.deny.push("str_replace".into());
+        pm.settings.deny.push("str_replace()".into());
         pm.cached_deny = pm.settings.parsed_deny_rules();
 
         // The very NEXT check must see the deny — no allow-cache, no stale
         // decision reuse.
         let second = pm.check_nonblocking("str_replace", &args);
         assert!(
-            matches!(second, PermissionDecision::Deny(_)),
+            matches!(second, GateOutcome::Deny(_)),
             "deny added after a prior allow must bite next check, got {second:?}",
         );
     }
@@ -7657,25 +7686,25 @@ mod tests {
 
         assert!(matches!(
             pm.check_nonblocking("str_replace", &sr_args),
-            PermissionDecision::Allow
+            GateOutcome::Allow
         ));
         assert!(matches!(
             pm.check_nonblocking("read_file", &rf_args),
-            PermissionDecision::Allow
+            GateOutcome::Allow
         ));
 
         // Ban str_replace only.
-        pm.settings.deny.push("str_replace".into());
+        pm.settings.deny.push("str_replace()".into());
         pm.cached_deny = pm.settings.parsed_deny_rules();
 
         let sr_decision = pm.check_nonblocking("str_replace", &sr_args);
         assert!(
-            matches!(sr_decision, PermissionDecision::Deny(_)),
+            matches!(sr_decision, GateOutcome::Deny(_)),
             "str_replace must be denied after rule added, got {sr_decision:?}"
         );
         let rf_decision = pm.check_nonblocking("read_file", &rf_args);
         assert!(
-            matches!(rf_decision, PermissionDecision::Allow),
+            matches!(rf_decision, GateOutcome::Allow),
             "read_file must still Allow, got {rf_decision:?}"
         );
     }
@@ -7760,7 +7789,7 @@ mod tests {
             &serde_json::json!({"path": "src/main.rs", "content": "hi"}),
         );
         assert!(
-            matches!(decision, PermissionDecision::Allow),
+            matches!(decision, GateOutcome::Allow),
             "after restart, saved rule must still Allow; got {decision:?}"
         );
     }
@@ -7779,7 +7808,7 @@ mod tests {
             &serde_json::json!({"path": "tests/another.rs", "content": "hi"}),
         );
         assert!(
-            matches!(decision, PermissionDecision::Allow),
+            matches!(decision, GateOutcome::Allow),
             "workspace write trust should survive restart for later safe paths; got {decision:?}"
         );
     }
@@ -7797,7 +7826,7 @@ mod tests {
                 &serde_json::json!({"path": ".env", "content": "TOKEN=1"}),
             );
             assert!(
-                matches!(same_session, PermissionDecision::Allow),
+                matches!(same_session, GateOutcome::Allow),
                 "same-session sensitive override should still work; got {same_session:?}"
             );
         }

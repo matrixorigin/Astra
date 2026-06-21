@@ -1398,10 +1398,23 @@ fn content_aware_fingerprint(tool_name: &str, args: &Value) -> ApprovalFingerpri
             let path = path_hint_from_args(args);
             path.map_or_else(
                 || ApprovalFingerprint::bare(tool_name),
-                |path| ApprovalFingerprint::file_op_exact(tool_name, Some(&path)),
+                |path| {
+                    ApprovalFingerprint::file_op_exact(
+                        file_write_fingerprint_tool(tool_name),
+                        Some(&path),
+                    )
+                },
             )
         }
         None => ApprovalFingerprint::bare(tool_name),
+    }
+}
+
+fn file_write_fingerprint_tool(tool_name: &str) -> &str {
+    if crate::tool::categories::registry().is_file_op(tool_name) {
+        "file_write"
+    } else {
+        tool_name
     }
 }
 
@@ -1416,7 +1429,7 @@ fn content_aware_fingerprint_candidates(tool_name: &str, args: &Value) -> Vec<Ap
         if crate::tool::categories::registry().is_file_op(tool_name) {
             push_unique_fingerprint(
                 &mut candidates,
-                ApprovalFingerprint::file_op_exact("edit", Some(&path)),
+                ApprovalFingerprint::file_op_exact("file_write", Some(&path)),
             );
         }
         if let Some(resolved) = resolved_write_path(&path) {
@@ -1427,7 +1440,7 @@ fn content_aware_fingerprint_candidates(tool_name: &str, args: &Value) -> Vec<Ap
             if crate::tool::categories::registry().is_file_op(tool_name) {
                 push_unique_fingerprint(
                     &mut candidates,
-                    ApprovalFingerprint::file_op_exact("edit", Some(&resolved)),
+                    ApprovalFingerprint::file_op_exact("file_write", Some(&resolved)),
                 );
             }
         }
@@ -1680,7 +1693,7 @@ mod tests {
             .into_owned();
         assert_eq!(
             rule,
-            format!(r#"Edit(path_prefix="{cwd}", op="write", cwd_root="{cwd}")"#)
+            format!(r#"file_write(path_prefix="{cwd}", op="write", cwd_root="{cwd}")"#)
         );
     }
 
@@ -1691,7 +1704,7 @@ mod tests {
             &serde_json::json!({"path": "/tmp/zzzz3.md", "content": "# zzzz3"}),
         );
 
-        assert_eq!(rule, r#"Edit(path_glob="/tmp/zzzz3.md", op="write")"#);
+        assert_eq!(rule, r#"file_write(path_glob="/tmp/zzzz3.md", op="write")"#);
     }
 
     #[test]
@@ -1913,7 +1926,7 @@ mod tests {
         let ctx = crate::permission::types::PermissionSyncContext::new(
             crate::permission::types::InheritedPermissions {
                 mode: crate::permission::types::PermissionMode::Prompt,
-                ask_rules: vec![crate::permission::types::PermissionRule::parse("bash(*)")],
+                ask_rules: vec![crate::permission::types::PermissionRule::parse("bash()")],
                 ..Default::default()
             },
         );

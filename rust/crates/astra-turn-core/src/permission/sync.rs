@@ -93,18 +93,18 @@ mod tests {
 
     #[test]
     fn test_permission_rule_parse() {
-        let rule = PermissionRule::parse("bash");
+        let rule = PermissionRule::parse("bash()");
         assert_eq!(rule.tool, "bash");
         assert!(rule.pattern.is_none());
 
-        let rule = PermissionRule::parse("Bash(git commit:*)");
+        let rule = PermissionRule::parse(r#"Bash(argv_prefix="git commit")"#);
         assert_eq!(rule.tool, "bash");
         assert_eq!(rule.pattern, Some("git commit".to_string()));
     }
 
     #[test]
     fn test_permission_rule_matches() {
-        let rule = PermissionRule::parse("bash(git commit:*)");
+        let rule = PermissionRule::parse(r#"Bash(argv_prefix="git commit")"#);
 
         assert!(rule.matches("bash", Some("git commit -m 'fix'")));
         assert!(rule.matches("Bash", Some("git commit --amend")));
@@ -116,8 +116,8 @@ mod tests {
     #[test]
     fn test_inherited_permissions() {
         let mut inherited = InheritedPermissions::default();
-        inherited.add_allow(PermissionRule::parse("bash(git:*)"));
-        inherited.add_deny(PermissionRule::parse("bash(rm -rf:*)"));
+        inherited.add_allow(PermissionRule::parse(r#"Bash(argv_prefix="git")"#));
+        inherited.add_deny(PermissionRule::parse(r#"Bash(argv_prefix="rm -rf")"#));
 
         assert!(inherited.is_allowed("bash", Some("git status")));
         assert!(!inherited.is_allowed("bash", Some("npm install")));
@@ -129,7 +129,7 @@ mod tests {
     fn test_permission_sync_context() {
         let inherited = InheritedPermissions {
             mode: PermissionMode::Prompt,
-            allow_rules: vec![PermissionRule::parse("bash(git:*)")],
+            allow_rules: vec![PermissionRule::parse(r#"Bash(argv_prefix="git")"#)],
             deny_rules: vec![],
             ..Default::default()
         };
@@ -140,7 +140,7 @@ mod tests {
         assert!(ctx.is_allowed("bash", Some("git status")));
 
         // Apply session override
-        let update = PermissionUpdate::allow(PermissionRule::parse("bash(npm:*)"));
+        let update = PermissionUpdate::allow(PermissionRule::parse(r#"Bash(argv_prefix="npm")"#));
         ctx.apply_update(&update);
         assert!(ctx.is_allowed("bash", Some("npm install")));
 
@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn test_permission_response() {
         let response = PermissionResponse::approve()
-            .with_update(PermissionUpdate::allow(PermissionRule::tool("edit")).persistent());
+            .with_update(PermissionUpdate::allow(PermissionRule::tool("write_file")).persistent());
 
         assert!(response.approved);
         assert_eq!(response.updates.len(), 1);
@@ -206,7 +206,7 @@ mod tests {
     #[test]
     fn test_permission_response_to_message() {
         let response = PermissionResponse::approve().with_update(PermissionUpdate::allow(
-            PermissionRule::parse("bash(git:*)"),
+            PermissionRule::parse(r#"Bash(argv_prefix="git")"#),
         ));
         let from = AgentAddress::new("parent-run", "parent-agent");
         let to = AgentAddress::new("child-run", "child-agent");
@@ -607,7 +607,7 @@ mod handler_tests {
     #[tokio::test]
     async fn handler_respects_inherited_allow() {
         let mut inherited = InheritedPermissions::new(PermissionMode::Prompt);
-        inherited.add_allow(PermissionRule::parse("bash(git:*)"));
+        inherited.add_allow(PermissionRule::parse(r#"Bash(argv_prefix="git")"#));
         let ctx = PermissionSyncContext::new(inherited);
         let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)));
 
@@ -621,7 +621,7 @@ mod handler_tests {
     #[tokio::test]
     async fn handler_respects_inherited_deny() {
         let mut inherited = InheritedPermissions::new(PermissionMode::Auto);
-        inherited.add_deny(PermissionRule::parse("bash(rm -rf:*)"));
+        inherited.add_deny(PermissionRule::parse(r#"Bash(argv_prefix="rm -rf")"#));
         let ctx = PermissionSyncContext::new(inherited);
         let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)));
 
@@ -638,7 +638,9 @@ mod handler_tests {
         let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx))).with_callback(
             Box::new(|req, _ctx| {
                 if req.tool_name == "bash" {
-                    PermissionDecision::approve_with_rule(PermissionRule::parse("bash(git:*)"))
+                    PermissionDecision::approve_with_rule(PermissionRule::parse(
+                        r#"Bash(argv_prefix="git")"#,
+                    ))
                 } else {
                     PermissionDecision::deny("unknown tool")
                 }
@@ -659,7 +661,7 @@ mod handler_tests {
         let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)));
 
         let request = PermissionRequest::new("bash", serde_json::json!({"command": "git status"}))
-            .with_suggested_rule("bash(git:*)");
+            .with_suggested_rule(r#"Bash(argv_prefix="git")"#);
         let response = handler.handle_request(&request).await;
 
         assert!(response.approved);

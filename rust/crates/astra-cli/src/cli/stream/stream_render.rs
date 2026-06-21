@@ -1411,11 +1411,11 @@ impl<'a> CliSseStreamHost<'a> {
         };
 
         match decision {
-            crate::cli::permission_manager::PermissionDecision::Allow => Ok(()),
-            crate::cli::permission_manager::PermissionDecision::Deny(reason) => Err(format!(
+            crate::cli::permission_manager::GateOutcome::Allow => Ok(()),
+            crate::cli::permission_manager::GateOutcome::Deny(reason) => Err(format!(
                 "Error: {sandbox_msg} (sandbox_expand:{tool} denied: {reason})"
             )),
-            crate::cli::permission_manager::PermissionDecision::NeedApproval {
+            crate::cli::permission_manager::GateOutcome::NeedApproval {
                 tool: approval_tool,
                 header,
                 detail,
@@ -2982,7 +2982,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let cloud_approved = self.cloud_pre_approved.remove(request_id);
 
         let decision = if cloud_approved {
-            crate::cli::permission_manager::PermissionDecision::Allow
+            crate::cli::permission_manager::GateOutcome::Allow
         } else {
             match self.perm_manager.as_mut() {
                 Some(pm) => crate::tool_safety_guard::ToolSafetyGuard::check_request(
@@ -2995,14 +2995,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         };
         let mut denied_output = None;
         let mut allowed = match decision {
-            crate::cli::permission_manager::PermissionDecision::Allow => true,
-            crate::cli::permission_manager::PermissionDecision::Deny(reason) => {
+            crate::cli::permission_manager::GateOutcome::Allow => true,
+            crate::cli::permission_manager::GateOutcome::Deny(reason) => {
                 denied_output = Some(crate::cli::permission_manager::format_denied_message(
                     &reason,
                 ));
                 false
             }
-            crate::cli::permission_manager::PermissionDecision::NeedApproval {
+            crate::cli::permission_manager::GateOutcome::NeedApproval {
                 tool: t,
                 header,
                 detail,
@@ -3057,8 +3057,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     let always_scope = approval_default_always_scope(&scope_ctx);
                     // Show what Always will remember in product
                     // language. The persisted rule remains an internal
-                    // detail; the UI must not leak `Bash(...:*)` or
-                    // other permissions.json DSL.
+                    // detail; the UI must not leak permissions.json DSL.
                     if always_scope == astra_turn_core::permission::scope::AllowScope::Project {
                         // Include the package root when available so
                         // the user understands the memory boundary.
@@ -3414,9 +3413,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 &guard_args,
                             );
                             let approved = match decision {
-                                crate::cli::permission_manager::PermissionDecision::Allow => true,
-                                crate::cli::permission_manager::PermissionDecision::Deny(_) => false,
-                                crate::cli::permission_manager::PermissionDecision::NeedApproval {
+                                crate::cli::permission_manager::GateOutcome::Allow => true,
+                                crate::cli::permission_manager::GateOutcome::Deny(_) => false,
+                                crate::cli::permission_manager::GateOutcome::NeedApproval {
                                     header,
                                     detail,
                                     reason,
@@ -3974,10 +3973,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     None, &req.tool, &req.args,
                 ),
             };
-            let ok = matches!(
-                decision,
-                crate::cli::permission_manager::PermissionDecision::Allow
-            );
+            let ok = matches!(decision, crate::cli::permission_manager::GateOutcome::Allow);
             if !ok {
                 all_allowed = false;
                 break;
@@ -4282,8 +4278,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 &guard_args,
             );
             let approved = match decision {
-                crate::cli::permission_manager::PermissionDecision::Allow => true,
-                crate::cli::permission_manager::PermissionDecision::Deny(reason) => {
+                crate::cli::permission_manager::GateOutcome::Allow => true,
+                crate::cli::permission_manager::GateOutcome::Deny(reason) => {
                     // Surface the deny reason so the LLM and user can
                     // see why the sandbox refused to widen, instead of
                     // silently continuing with the original
@@ -4293,7 +4289,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     outputs[pos].0.is_error = true;
                     false
                 }
-                crate::cli::permission_manager::PermissionDecision::NeedApproval {
+                crate::cli::permission_manager::GateOutcome::NeedApproval {
                     tool: approval_tool,
                     header,
                     detail,
@@ -7390,7 +7386,7 @@ mod tests {
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         assert!(matches!(
             reloaded.check_nonblocking("write_file", &args),
-            crate::cli::permission_manager::PermissionDecision::Allow
+            crate::cli::permission_manager::GateOutcome::Allow
         ));
     }
 
@@ -7453,13 +7449,13 @@ mod tests {
         let args = serde_json::json!({"path": ".env"});
         assert!(matches!(
             pm.check_nonblocking("write_file", &args),
-            crate::cli::permission_manager::PermissionDecision::Allow
+            crate::cli::permission_manager::GateOutcome::Allow
         ));
         let mut reloaded =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         assert!(matches!(
             reloaded.check_nonblocking("write_file", &args),
-            crate::cli::permission_manager::PermissionDecision::NeedApproval { .. }
+            crate::cli::permission_manager::GateOutcome::NeedApproval { .. }
         ));
     }
 
