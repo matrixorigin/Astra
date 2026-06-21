@@ -35,9 +35,9 @@ use astra_core::{ErrorResponse, SharedPool, connect_matrixone, error_response};
 use astra_services::coordination::{AgentProfile, AgentTier};
 use astra_services::runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunRecord,
-    DurableRunStatusKind, RunInputData, RunInputRecord, RunLifecycleService, RunListRecord,
-    RunMutationRecord, RunProjectionCheckpointRecord, RunProjectionRecord, RunStatusRecord,
-    durable_run_status_kind,
+    DurableRunStatusKind, RequestedTurnInteractionMode, RunInputData, RunInputRecord,
+    RunLifecycleService, RunListRecord, RunMutationRecord, RunProjectionCheckpointRecord,
+    RunProjectionRecord, RunStatusRecord, durable_run_status_kind,
 };
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 use astra_services::skills::SkillService;
@@ -58,8 +58,8 @@ use crate::MatrixOneSettings;
 use crate::observability::ObservabilityHub;
 use crate::orchestration::{
     AgentProgressEvent, AgentToolContext, DynamicAgentSpawner, InheritedPermissions,
-    ProgressBroadcaster, ProgressEventType, SpawnAgentExecutor, SpawnRunConfig, SpawnRunResult,
-    SpawnedAgentState,
+    PermissionMode, PermissionSyncContext, ProgressBroadcaster, ProgressEventType,
+    SpawnAgentExecutor, SpawnRunConfig, SpawnRunResult, SpawnedAgentState,
 };
 use crate::server::run::cloud_workspace_provisioning::CloudWorkspaceProvisioner;
 use crate::server::run::workspace_provisioning::{
@@ -597,6 +597,7 @@ fn build_server_skill_executor(
     execution_bindings: Option<&ExecutionBindingSnapshot>,
     forward_headers: &HashMap<String, String>,
     request_constraints: RequestConstraints,
+    inherited_permissions: InheritedPermissions,
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
     session_id: &str,
     edge_connection_pool: Option<&astra_server_types::edge_connection_pool::EdgeConnectionPool>,
@@ -621,6 +622,7 @@ fn build_server_skill_executor(
     .with_edge_profile(edge_profile.clone())
     .with_forward_headers(forward_headers.clone())
     .with_request_constraints(request_constraints)
+    .with_inherited_permissions(inherited_permissions)
     .with_skill_resolver(skill_resolver)
     .with_cancel_token(cancel_token);
     if let Some(snapshot) = execution_bindings {
@@ -1796,10 +1798,19 @@ impl AgenticRunLifecycleService {
         ))
     }
 
-    fn inherited_permissions_from_constraints(
+    fn root_permission_mode_from_request(request: &ChatRequestData) -> PermissionMode {
+        match request.interaction_mode {
+            Some(RequestedTurnInteractionMode::Deny) => PermissionMode::Deny,
+            _ => PermissionMode::Auto,
+        }
+    }
+
+    fn inherited_permissions_from_request(
+        request: &ChatRequestData,
         constraints: &RequestConstraints,
     ) -> InheritedPermissions {
-        let mut inherited = InheritedPermissions::auto_approve();
+        let mut inherited =
+            InheritedPermissions::new(Self::root_permission_mode_from_request(request));
         inherited.allowed_tools = constraints.allowed_tools.clone();
         inherited
     }
@@ -1869,7 +1880,8 @@ impl AgenticRunLifecycleService {
             is_fork_child: false,
             working_dir: workspace.to_path_buf(),
             spawner: entry.spawner,
-            inherited_permissions: Self::inherited_permissions_from_constraints(
+            inherited_permissions: Self::inherited_permissions_from_request(
+                request,
                 &request_constraints,
             ),
             active_skills: Vec::new(),
@@ -2650,6 +2662,11 @@ impl AgenticRunLifecycleService {
             .unwrap_or_default();
         let thinking_config =
             Self::thinking_from_chat_context(&request.context, request.model.as_deref());
+        let root_permissions =
+            Self::inherited_permissions_from_request(request, &request_constraints);
+        let root_permission_context = Some(Arc::new(RwLock::new(PermissionSyncContext::new(
+            root_permissions.clone(),
+        ))));
 
         // Create harness sink early so sub-run executors can share it.
         #[cfg(feature = "harness")]
@@ -2686,6 +2703,7 @@ impl AgenticRunLifecycleService {
             execution_bindings,
             &request.forward_headers,
             request_constraints.clone(),
+            root_permissions.clone(),
             skill_resolver.clone(),
             session_id,
             self.edge_connection_pool.as_ref(),
@@ -2813,7 +2831,7 @@ impl AgenticRunLifecycleService {
             max_cumulative_tokens: 0,
             thinking: thinking_config,
             recent_file_reads: Vec::new(),
-            permission_context: None,
+            permission_context: root_permission_context,
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
@@ -5867,12 +5885,16 @@ impl ServerSpawnAgentExecutor {
             })
     }
 
-    fn build_subrun_executor(&self) -> ServerSubRunExecutor {
+    fn build_subrun_executor(
+        &self,
+        inherited_permissions: InheritedPermissions,
+    ) -> ServerSubRunExecutor {
         let mut executor = ServerSubRunExecutor::new(
             self.matrixone.clone(),
             Arc::clone(&self.encryptor),
             Arc::clone(&self.edge_callback_ledger),
         );
+        executor = executor.with_inherited_permissions(inherited_permissions);
         if let Some(pool) = self.shared_pool.clone() {
             executor = executor.with_pool(pool);
         }
@@ -6081,6 +6103,8 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
 
         let request_constraints =
             spawn_child_request_constraints(&context.request_constraints, &config);
+        let mut child_permissions = config.inherited_permissions.clone();
+        child_permissions.allowed_tools = request_constraints.allowed_tools.clone();
         let subrun = SubRunConfig {
             run_id: config.run_id.clone(),
             agent_profile: profile,
@@ -6110,7 +6134,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             harness_sink: context.harness_sink.clone(),
         };
 
-        let executor = self.build_subrun_executor();
+        let executor = self.build_subrun_executor(child_permissions);
         #[cfg(feature = "bridge-e2e-hooks")]
         let executor = if !context.test_child_llm_rounds.is_empty() {
             executor.with_test_llm_rounds(context.test_child_llm_rounds.clone())
@@ -6153,6 +6177,7 @@ pub struct ServerSubRunExecutor {
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
     skill_service: Option<Arc<dyn SkillService>>,
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
+    inherited_permissions: InheritedPermissions,
     /// Shared ToolExecutionService so executors share the same disabled_tools set.
     pub tool_execution_service: Option<ToolExecutionService>,
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -6175,6 +6200,7 @@ impl ServerSubRunExecutor {
             edge_registry_service: None,
             skill_service: None,
             memory_extraction_service: None,
+            inherited_permissions: InheritedPermissions::auto_approve(),
             tool_execution_service: None,
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds: Vec::new(),
@@ -6191,6 +6217,14 @@ impl ServerSubRunExecutor {
         svc: Arc<crate::session_memory::MemoryExtractionService>,
     ) -> Self {
         self.memory_extraction_service = Some(svc);
+        self
+    }
+
+    pub fn with_inherited_permissions(
+        mut self,
+        inherited_permissions: InheritedPermissions,
+    ) -> Self {
+        self.inherited_permissions = inherited_permissions;
         self
     }
 
@@ -6411,6 +6445,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
             .resolve_for_model(config.agent_profile.model_override.as_deref());
         let restricted_tools: std::collections::HashSet<String> =
             load_deployment_disabled_tools().into_iter().collect();
+        let permission_context = Arc::new(RwLock::new(PermissionSyncContext::new(
+            self.inherited_permissions.clone(),
+        )));
 
         let mut loop_state = AgenticLoopState {
             messages: vec![user_message],
@@ -6529,7 +6566,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             max_cumulative_tokens: 0,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
             recent_file_reads: Vec::new(),
-            permission_context: None,
+            permission_context: Some(permission_context),
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
@@ -7284,7 +7321,7 @@ mod tests {
             parent_agent_id: "root-agent".to_string(),
             recursion_depth: 0,
             parent_is_fork_child: false,
-            inherited_permissions: None,
+            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp/astra"),
             live_event_sink: None,
@@ -7363,7 +7400,7 @@ mod tests {
             parent_agent_id: "root-agent".to_string(),
             recursion_depth: 0,
             parent_is_fork_child: false,
-            inherited_permissions: None,
+            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp/astra"),
             live_event_sink: None,
@@ -7713,6 +7750,10 @@ mod tests {
     }
 
     fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunConfig {
+        let inherited_permissions = crate::orchestration::InheritedPermissions::auto_approve();
+        let permission_context = Arc::new(RwLock::new(
+            crate::orchestration::PermissionSyncContext::new(inherited_permissions.clone()),
+        ));
         SpawnRunConfig {
             run_id: "child-run".to_string(),
             agent_id: "child@1234".to_string(),
@@ -7728,9 +7769,9 @@ mod tests {
             mailbox: None,
             progress_emitter: None,
             context_cache: None,
-            inherited_permissions: None,
+            inherited_permissions,
             parent_address: None,
-            permission_context: None,
+            permission_context,
             inherited_skills: Vec::new(),
             live_event_sink: None,
             inherited_prefix: None,
@@ -8210,6 +8251,53 @@ mod tests {
             interaction_mode: None,
             interactive_client: false,
         }
+    }
+
+    #[test]
+    fn server_root_permissions_default_to_auto_for_server_approval_gate() {
+        let mut request = test_request("edit files");
+        request.interaction_mode = Some(RequestedTurnInteractionMode::Prompt);
+        let constraints = RequestConstraints::default();
+
+        let inherited =
+            AgenticRunLifecycleService::inherited_permissions_from_request(&request, &constraints);
+
+        assert_eq!(inherited.mode, PermissionMode::Auto);
+        assert!(inherited.allowed_tools.is_none());
+    }
+
+    #[test]
+    fn server_root_permissions_map_deny_and_preserve_tool_allowlist() {
+        let mut request = test_request("no tools");
+        request.interaction_mode = Some(RequestedTurnInteractionMode::Deny);
+        let constraints = RequestConstraints {
+            allowed_tools: Some(["read_file".to_string()].into_iter().collect()),
+            ..Default::default()
+        };
+
+        let inherited =
+            AgenticRunLifecycleService::inherited_permissions_from_request(&request, &constraints);
+
+        assert_eq!(inherited.mode, PermissionMode::Deny);
+        assert!(
+            inherited
+                .allowed_tools
+                .as_ref()
+                .is_some_and(|tools| tools.contains("read_file"))
+        );
+    }
+
+    #[test]
+    fn server_subrun_executor_keeps_inherited_permissions() {
+        let inherited_permissions = InheritedPermissions::new(PermissionMode::Deny);
+        let executor = ServerSubRunExecutor::new(
+            test_settings(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
+        )
+        .with_inherited_permissions(inherited_permissions);
+
+        assert_eq!(executor.inherited_permissions.mode, PermissionMode::Deny);
     }
 
     struct FailingWorkspaceRecordStore;
@@ -11962,6 +12050,28 @@ mod tests {
         assert!(
             fn_body.contains("with_execution_binding_snapshot"),
             "build_server_skill_executor must pass execution bindings to server skill sub-runs"
+        );
+    }
+
+    #[test]
+    fn build_server_skill_executor_wires_inherited_permissions() {
+        let source = include_str!("mod.rs");
+        let fn_start = source
+            .find("fn build_server_skill_executor(")
+            .expect("build_server_skill_executor must exist");
+        let fn_end = source[fn_start..]
+            .find("\npub(crate) fn ")
+            .or_else(|| source[fn_start..].find("\nfn "))
+            .map(|p| fn_start + p)
+            .unwrap_or(source.len());
+        let fn_body = &source[fn_start..fn_end];
+        assert!(
+            fn_body.contains("inherited_permissions"),
+            "build_server_skill_executor must accept request-level permissions"
+        );
+        assert!(
+            fn_body.contains("with_inherited_permissions"),
+            "build_server_skill_executor must pass request-level permissions to server skill sub-runs"
         );
     }
 

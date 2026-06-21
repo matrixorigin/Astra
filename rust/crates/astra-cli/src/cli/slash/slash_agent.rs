@@ -2553,7 +2553,8 @@ mod tests {
             parent_agent_id: "main".to_string(),
             recursion_depth: 0,
             parent_is_fork_child: false,
-            inherited_permissions: None,
+            inherited_permissions: astra_runtime::orchestration::InheritedPermissions::auto_approve(
+            ),
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,

@@ -37,7 +37,6 @@ pub(crate) async fn build_one_shot_spawner(
     api: &astra_thin_client::ThinClient,
     token: String,
     unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
-    perm_mode: super::permission_manager::PermissionMode,
     skill_search: astra_core::SkillSearchSettings,
     session_id: Option<String>,
     default_model: Option<String>,
@@ -56,7 +55,7 @@ pub(crate) async fn build_one_shot_spawner(
         std::sync::Arc::new(astra_runtime::orchestration::ProgressBroadcaster::default());
 
     let mut spawn_executor =
-        spawn_subrun::CliSpawnAgentExecutor::new(api.clone(), token, project_root, perm_mode, None)
+        spawn_subrun::CliSpawnAgentExecutor::new(api.clone(), token, project_root, None)
             .with_default_model(default_model)
             .with_skill_resolver(skill_resolver)
             .with_skill_search(skill_search);
@@ -196,7 +195,7 @@ pub(crate) async fn initialize_multi_agent_runtime(
         token.clone(),
         state.model.clone(),
         project_root.clone(),
-        state.perm_manager.mode(),
+        state.perm_manager.inherited_permissions_for_child(true),
         None,
     )
     .with_skill_resolver(skill_resolver.clone())
@@ -226,18 +225,13 @@ pub(crate) async fn initialize_multi_agent_runtime(
     .with_prefix_store(prefix_store.clone());
     state.delegation_engine = Some(std::sync::Arc::new(engine));
 
-    let mut spawn_executor = spawn_subrun::CliSpawnAgentExecutor::new(
-        api.clone(),
-        token,
-        project_root,
-        state.perm_manager.mode(),
-        None,
-    )
-    .with_default_model(state.model.clone())
-    .with_skill_resolver(skill_resolver)
-    .with_skill_search(state.skill_search.clone())
-    .with_bg_task_commands(state.bg_task_commands.clone())
-    .with_bg_task_list_cache(state.bg_task_list_cache.clone());
+    let mut spawn_executor =
+        spawn_subrun::CliSpawnAgentExecutor::new(api.clone(), token, project_root, None)
+            .with_default_model(state.model.clone())
+            .with_skill_resolver(skill_resolver)
+            .with_skill_search(state.skill_search.clone())
+            .with_bg_task_commands(state.bg_task_commands.clone())
+            .with_bg_task_list_cache(state.bg_task_list_cache.clone());
     // Wire a token provider so each spawn reads the freshest access
     // token at execution time. Without this, sub-agents fail with 401
     // in long-running sessions after the parent's auth refresh

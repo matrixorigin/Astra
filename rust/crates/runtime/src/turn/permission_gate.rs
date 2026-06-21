@@ -698,7 +698,7 @@ mod tests {
                     let response =
                         crate::orchestration::permission_sync::PermissionResponse::approve()
                             .with_update(PermissionUpdate::allow(PermissionRule::parse(
-                                "Bash(touch:*)",
+                                r#"Bash(argv_prefix="touch")"#,
                             )));
                     router_clone
                         .send(response.to_message(

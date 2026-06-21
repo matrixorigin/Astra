@@ -34,6 +34,7 @@ use crate::{
 use crate::cli::chat_stream::sse_loop::agentic_loop_turn::{
     ChatTurnSseFetchRequest, PrepareTurnTelemetry, fetch_chat_turn_sse,
 };
+use crate::cli::chat_stream::sse_loop::refresh_root_permission_context;
 
 use astra_runtime::tool_sandbox::SandboxPolicy;
 
@@ -351,6 +352,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         if let Some(new_mode) = self.executor.take_pending_permission_mode_change() {
             let old_mode = self.perm_manager.mode();
             self.perm_manager.set_mode(new_mode);
+            refresh_root_permission_context(&mut state.permission_context, self.perm_manager).await;
             append_permission_mode_change_audit(
                 state.current_session_id.as_deref(),
                 self.chat_turn_index,
@@ -376,6 +378,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         self.perm_manager.pull_mode_from_mirror();
         let mode_after = self.perm_manager.mode();
         if mode_before != mode_after {
+            refresh_root_permission_context(&mut state.permission_context, self.perm_manager).await;
             append_permission_mode_change_audit(
                 state.current_session_id.as_deref(),
                 self.chat_turn_index,
@@ -599,6 +602,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // `turn_result?` below.
 
         // Sync latest approval overrides into state for checkpoint persistence.
+        refresh_root_permission_context(&mut state.permission_context, self.perm_manager).await;
         state.approval_overrides = self.perm_manager.export_session_overrides();
 
         let turn_result = turn_result?;

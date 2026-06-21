@@ -88,6 +88,8 @@ pub struct ServerSkillSubRunExecutor {
     /// from the parent lifecycle service. `None` → no extraction in
     /// skill sub-runs (rarely surfaces user-relevant memory).
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
+    /// Request-level permissions inherited from the parent server run.
+    inherited_permissions: crate::orchestration::InheritedPermissions,
 }
 
 impl ServerSkillSubRunExecutor {
@@ -116,6 +118,7 @@ impl ServerSkillSubRunExecutor {
             #[cfg(feature = "harness")]
             harness_sink: None,
             memory_extraction_service: None,
+            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
         }
     }
 
@@ -195,6 +198,14 @@ impl ServerSkillSubRunExecutor {
         self
     }
 
+    pub fn with_inherited_permissions(
+        mut self,
+        inherited_permissions: crate::orchestration::InheritedPermissions,
+    ) -> Self {
+        self.inherited_permissions = inherited_permissions;
+        self
+    }
+
     pub fn with_edge_connection_pool(
         mut self,
         pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
@@ -265,6 +276,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         let compact_strategy = astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
             effective_model.as_deref().unwrap_or(""),
         );
+        let permission_context = Arc::new(tokio::sync::RwLock::new(
+            crate::orchestration::PermissionSyncContext::new(self.inherited_permissions.clone()),
+        ));
 
         // Build a sub-run session ID for isolation.
         let safe_name = crate::skills::loader::sanitize_for_path(skill_name);
@@ -480,7 +494,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             max_cumulative_tokens: SUBRUN_MAX_CUMULATIVE_TOKENS,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
             recent_file_reads: Vec::new(),
-            permission_context: None,
+            permission_context: Some(permission_context),
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
@@ -608,6 +622,10 @@ mod tests {
         assert!(executor.cancel_token.is_none());
         assert!(executor.skill_resolver.is_none());
         assert!(executor.llm_token_service.is_none());
+        assert_eq!(
+            executor.inherited_permissions.mode,
+            crate::orchestration::PermissionMode::Auto
+        );
     }
 
     #[test]
@@ -631,6 +649,24 @@ mod tests {
         assert!(executor.llm_token_service.is_some());
         assert_eq!(executor.edge_tools.len(), 1);
         assert!(executor.cancel_token.is_some());
+    }
+
+    #[test]
+    fn server_skill_subrun_executor_keeps_inherited_permissions() {
+        let inherited_permissions = crate::orchestration::InheritedPermissions::new(
+            crate::orchestration::PermissionMode::Deny,
+        );
+        let executor = ServerSkillSubRunExecutor::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "test-session".to_string(),
+        )
+        .with_inherited_permissions(inherited_permissions);
+
+        assert_eq!(
+            executor.inherited_permissions.mode,
+            crate::orchestration::PermissionMode::Deny
+        );
     }
 
     #[test]

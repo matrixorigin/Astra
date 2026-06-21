@@ -102,7 +102,7 @@ fn maybe_wire_delegation_engine(
         token.to_string(),
         state.model.clone(),
         project_root.clone(),
-        state.perm_manager.mode(),
+        state.perm_manager.inherited_permissions_for_child(true),
         None,
     );
     let mut registry = astra_services::AgentProfileRegistry::new();
@@ -486,7 +486,6 @@ async fn execute_headless_task_body(
         api,
         token.clone(),
         pipeline_modules.unified_skill_registry.clone(),
-        pm.mode(),
         skill_search.clone(),
         session_id.clone(),
         effective_model.clone(),
@@ -1804,7 +1803,6 @@ async fn execute_cli_command_impl(
                 api,
                 token.clone(),
                 astra_runtime::skills::default_unified_registry().clone(),
-                pm.mode(),
                 skill_search.clone(),
                 session_id.clone(),
                 effective_model.clone(),

@@ -360,7 +360,7 @@ pub struct SpawnContext {
     /// Working directory for the spawned agent.
     pub working_dir: PathBuf,
     /// Permissions inherited from the parent agent.
-    pub inherited_permissions: Option<super::permission_sync::InheritedPermissions>,
+    pub inherited_permissions: super::permission_sync::InheritedPermissions,
     /// Skills inherited from the parent agent (subset of parent's active skills).
     pub inherited_skills: Vec<String>,
     /// Optional live-event sink for child token/tool/status mirroring.
@@ -490,13 +490,13 @@ pub struct SpawnRunConfig {
     /// Optional shared context cache for cross-agent knowledge sharing.
     pub context_cache: Option<Arc<SharedContextCache>>,
     /// Inherited permissions from parent agent.
-    pub inherited_permissions: Option<super::permission_sync::InheritedPermissions>,
+    pub inherited_permissions: super::permission_sync::InheritedPermissions,
     /// Parent agent address for permission requests (if this is a child agent).
     pub parent_address: Option<astra_messaging::types::AgentAddress>,
     /// Permission context for runtime permission management.
-    /// Created from inherited_permissions or as a fresh root context.
+    /// Created from the explicit inherited permissions envelope.
     pub permission_context:
-        Option<std::sync::Arc<tokio::sync::RwLock<super::permission_sync::PermissionSyncContext>>>,
+        std::sync::Arc<tokio::sync::RwLock<super::permission_sync::PermissionSyncContext>>,
     /// Skills inherited from parent agent.
     pub inherited_skills: Vec<String>,
     /// Optional live-event sink for child token/tool/status mirroring.
@@ -1752,11 +1752,13 @@ impl DynamicAgentSpawner {
             &context.parent_agent_id,
         );
 
-        // 7b. Build permission context from inherited permissions
-        let permission_context = context.inherited_permissions.as_ref().map(|inherited| {
-            let ctx = super::permission_sync::PermissionSyncContext::new(inherited.clone());
-            std::sync::Arc::new(tokio::sync::RwLock::new(ctx))
-        });
+        // 7b. Build permission context from explicit inherited permissions.
+        // SpawnContext requires an envelope so a child cannot enter runtime
+        // execution without an authorization context.
+        let inherited_permissions = context.inherited_permissions.clone();
+        let permission_context = std::sync::Arc::new(tokio::sync::RwLock::new(
+            super::permission_sync::PermissionSyncContext::new(inherited_permissions.clone()),
+        ));
 
         // 8. Build run config
         let run_config = SpawnRunConfig {
@@ -1775,7 +1777,7 @@ impl DynamicAgentSpawner {
             progress_emitter: Some(emitter.clone()),
             context_cache: Some(Arc::clone(&self.context_cache)),
             // Inherit permissions from parent context
-            inherited_permissions: context.inherited_permissions.clone(),
+            inherited_permissions,
             // Parent address for permission requests
             parent_address: Some(parent_address),
             // Permission context for runtime permission management
@@ -2782,24 +2784,18 @@ fn estimate_cache_read_tokens(prefix: &astra_turn_core::fork_prefix::ForkPrefix)
 fn build_permission_summary(context: &SpawnContext) -> PermissionSummary {
     let mut summary = PermissionSummary::default();
 
-    if let Some(ref inherited) = context.inherited_permissions {
-        summary.mode = match inherited.mode {
-            super::permission_sync::PermissionMode::Auto => "auto".to_string(),
-            super::permission_sync::PermissionMode::Plan => "plan".to_string(),
-            super::permission_sync::PermissionMode::AcceptEdits => "accept_edits".to_string(),
-            super::permission_sync::PermissionMode::Prompt => "prompt".to_string(),
-            super::permission_sync::PermissionMode::Deny => "deny".to_string(),
-        };
-        summary.allow_rules = inherited.allow_rules.len() as u32;
-        summary.deny_rules = inherited.deny_rules.len() as u32;
-        // Has parent if parent_run_id is not empty and not "root"
-        summary.has_parent =
-            !context.parent_run_id.is_empty() && context.parent_run_id != ROOT_RUN_ID;
-    } else {
-        summary.mode = "auto".to_string();
-        summary.has_parent =
-            !context.parent_run_id.is_empty() && context.parent_run_id != ROOT_RUN_ID;
-    }
+    let inherited = &context.inherited_permissions;
+    summary.mode = match inherited.mode {
+        super::permission_sync::PermissionMode::Auto => "auto".to_string(),
+        super::permission_sync::PermissionMode::Plan => "plan".to_string(),
+        super::permission_sync::PermissionMode::AcceptEdits => "accept_edits".to_string(),
+        super::permission_sync::PermissionMode::Prompt => "prompt".to_string(),
+        super::permission_sync::PermissionMode::Deny => "deny".to_string(),
+    };
+    summary.allow_rules = inherited.allow_rules.len() as u32;
+    summary.deny_rules = inherited.deny_rules.len() as u32;
+    // Has parent if parent_run_id is not empty and not "root"
+    summary.has_parent = !context.parent_run_id.is_empty() && context.parent_run_id != ROOT_RUN_ID;
 
     summary
 }
@@ -2919,7 +2915,7 @@ mod tests {
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
-            inherited_permissions: None,
+            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             live_event_sink: None,
             trace_context: None,
@@ -2930,6 +2926,45 @@ mod tests {
 
         let result = spawner.spawn(input, &context).await.unwrap();
         assert!(matches!(result, SpawnAgentOutput::Launched { .. }));
+    }
+
+    #[tokio::test]
+    async fn spawn_builds_permission_context_from_explicit_inherited_permissions() {
+        let executor = Arc::new(CapturingPermissionExecutor::new());
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(executor.clone() as Arc<dyn SpawnAgentExecutor>);
+        let input = SpawnAgentInput {
+            description: "Test agent".to_string(),
+            prompt: "Do a test".to_string(),
+            agent_type: "explore".to_string(),
+            run_in_background: false,
+            ..Default::default()
+        };
+        let context = SpawnContext {
+            parent_run_id: "parent-123".to_string(),
+            parent_agent_id: "parent".to_string(),
+            recursion_depth: 0,
+            parent_is_fork_child: false,
+            working_dir: PathBuf::from("/tmp"),
+            inherited_permissions: crate::orchestration::InheritedPermissions::new(
+                crate::orchestration::permission_sync::PermissionMode::Deny,
+            ),
+            inherited_skills: vec![],
+            live_event_sink: None,
+            trace_context: None,
+            spawn_tool_call_id: None,
+            execution_metadata: None,
+            delegation_chain: Vec::new(),
+        };
+
+        let result = spawner.spawn(input, &context).await.unwrap();
+        assert!(matches!(result, SpawnAgentOutput::Completed { .. }));
+
+        let mode = executor.take_captured().expect("executor captured config");
+        assert_eq!(
+            mode,
+            crate::orchestration::permission_sync::PermissionMode::Deny
+        );
     }
 
     #[tokio::test]
@@ -2985,7 +3020,7 @@ mod tests {
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
-            inherited_permissions: None,
+            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             live_event_sink: None,
             trace_context: None,
@@ -3038,7 +3073,7 @@ mod tests {
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
-            inherited_permissions: None,
+            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             live_event_sink: None,
             trace_context: None,
@@ -3092,7 +3127,7 @@ mod tests {
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
-            inherited_permissions: None,
+            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             live_event_sink: None,
             trace_context: None,
@@ -3143,7 +3178,7 @@ mod tests {
             parent_agent_id: "main".to_string(),
             recursion_depth: 0,
             parent_is_fork_child: false,
-            inherited_permissions: None,
+            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
@@ -3209,11 +3244,27 @@ mod tests {
         captured_depth: std::sync::Mutex<Option<u8>>,
     }
 
+    struct CapturingPermissionExecutor {
+        captured: std::sync::Mutex<Option<crate::orchestration::permission_sync::PermissionMode>>,
+    }
+
     impl CapturingDepthExecutor {
         fn new() -> Self {
             Self {
                 captured_depth: std::sync::Mutex::new(None),
             }
+        }
+    }
+
+    impl CapturingPermissionExecutor {
+        fn new() -> Self {
+            Self {
+                captured: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn take_captured(&self) -> Option<crate::orchestration::permission_sync::PermissionMode> {
+            self.captured.lock().unwrap().take()
         }
     }
 
@@ -3239,6 +3290,30 @@ mod tests {
     impl SpawnAgentExecutor for CapturingPrefixExecutor {
         async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
             *self.captured.lock().unwrap() = Some(config.inherited_prefix.clone());
+            Ok(SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                status: "completed".into(),
+                finish_reason: "normal".into(),
+                cancelled_by_user: None,
+                output: Some("ok".into()),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 0,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl SpawnAgentExecutor for CapturingPermissionExecutor {
+        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            let mode = config.permission_context.read().await.mode();
+            *self.captured.lock().unwrap() = Some(mode);
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
@@ -3506,7 +3581,7 @@ mod tests {
             parent_agent_id: "main".to_string(),
             recursion_depth: 0,
             parent_is_fork_child: false,
-            inherited_permissions: None,
+            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
@@ -3554,7 +3629,7 @@ mod tests {
             parent_agent_id: "main".to_string(),
             recursion_depth: 2,
             parent_is_fork_child: false,
-            inherited_permissions: None,
+            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
@@ -3591,7 +3666,7 @@ mod tests {
             parent_agent_id: "main".to_string(),
             recursion_depth: 0,
             parent_is_fork_child: false,
-            inherited_permissions: None,
+            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
@@ -3627,7 +3702,7 @@ mod tests {
             parent_agent_id: "main".to_string(),
             recursion_depth: astra_turn_core::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH,
             parent_is_fork_child: false,
-            inherited_permissions: None,
+            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
@@ -3662,7 +3737,7 @@ mod tests {
             parent_agent_id: "main".to_string(),
             recursion_depth: 0,
             parent_is_fork_child: false,
-            inherited_permissions: None,
+            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
@@ -3766,7 +3841,7 @@ mod tests {
             parent_agent_id: "main".to_string(),
             recursion_depth: 0,
             parent_is_fork_child: false,
-            inherited_permissions: None,
+            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
@@ -3806,7 +3881,7 @@ mod tests {
             parent_agent_id: "main".to_string(),
             recursion_depth: 0,
             parent_is_fork_child: false,
-            inherited_permissions: None,
+            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
@@ -3861,7 +3936,7 @@ mod tests {
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
-            inherited_permissions: None,
+            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec!["review-changes".to_string(), "analyze-session".to_string()],
             live_event_sink: None,
             trace_context: None,
@@ -3889,7 +3964,7 @@ mod tests {
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
-            inherited_permissions: None,
+            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: Vec::new(),
             live_event_sink: None,
             trace_context: None,
@@ -3965,7 +4040,7 @@ mod tests {
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
-            inherited_permissions: None,
+            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             live_event_sink: None,
             trace_context: None,
@@ -5712,7 +5787,7 @@ mod tests {
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
-            inherited_permissions: None,
+            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             live_event_sink: None,
             trace_context: None,

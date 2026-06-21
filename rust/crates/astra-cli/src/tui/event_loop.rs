@@ -3943,7 +3943,8 @@ mod tests {
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
-            inherited_permissions: None,
+            inherited_permissions: astra_runtime::orchestration::InheritedPermissions::auto_approve(
+            ),
             inherited_skills: Vec::new(),
             live_event_sink: None,
             trace_context: None,

@@ -1458,7 +1458,7 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
         recursion_depth: ctx.recursion_depth,
         parent_is_fork_child: ctx.is_fork_child,
         working_dir: ctx.working_dir.clone(),
-        inherited_permissions: Some(inherited_permissions),
+        inherited_permissions,
         inherited_skills: ctx.active_skills.clone(),
         live_event_sink: ctx.live_event_sink.clone(),
         trace_context: ctx.trace_context.clone(),

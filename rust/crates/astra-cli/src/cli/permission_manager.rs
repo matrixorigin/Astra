@@ -2339,6 +2339,18 @@ impl PermissionManager {
         })
     }
 
+    /// Snapshot the current root-session policy for the runtime tool gate.
+    ///
+    /// The CLI permission manager is the source of truth for interactive
+    /// modes, persisted rules, and per-session approval fingerprints. Runtime
+    /// execution must receive the same policy instead of treating a root TUI
+    /// session as "no permission context configured".
+    pub(crate) fn runtime_permission_context(
+        &self,
+    ) -> astra_runtime::orchestration::PermissionSyncContext {
+        self.evaluation_context()
+    }
+
     fn evaluation_context(&self) -> astra_turn_core::permission::types::PermissionSyncContext {
         let mut inherited = self
             .inherited
