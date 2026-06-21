@@ -214,7 +214,7 @@ impl ApprovalMetadata {
 
     /// Issue #326 P4 / R2 Major 1: attach the wide UI
     /// grouping key. Same-group entries can be batch-resolved
-    /// together; cross-group "Accept all" is rejected by
+    /// together; cross-group "Yes to all" is rejected by
     /// `ApprovalBatchGroupKey::allows_accept_all` for
     /// destructive groups.
     #[must_use]
@@ -354,7 +354,7 @@ impl PendingApproval {
     fn selection_hint(&self) -> Option<String> {
         if self.always_uses_session_fallback() {
             return Some(
-                "Always allow stays session-only until you trust this workspace. Choose Trust Workspace or run `/allow trust` to save workspace rules."
+                "Don't ask again stays session-only until you trust this workspace. Choose Trust Workspace or run `/allow trust` to save workspace rules."
                     .to_string(),
             );
         }
@@ -648,7 +648,7 @@ impl ApprovalQueue {
     /// `None` group keys are intentionally not batchable: pressing a
     /// batch button on a legacy/ungrouped queue resolves only the
     /// focused entry, never the whole queue. For grouped approvals,
-    /// `Accept all` is further gated by
+    /// `Yes to all` is further gated by
     /// [`ApprovalBatchGroupKey::allows_accept_all`]; destructive groups
     /// must be approved item-by-item.
     ///
@@ -1208,11 +1208,11 @@ mod tests {
         assert_eq!(q.len(), 2);
         assert!(
             rx_a.try_recv().is_err(),
-            "dangerous Accept all must not send"
+            "dangerous Yes to all must not send"
         );
         assert!(
             rx_b.try_recv().is_err(),
-            "dangerous Accept all must not send"
+            "dangerous Yes to all must not send"
         );
 
         assert_eq!(q.respond_focused_group(ApprovalResponse::Deny), 2);
@@ -1247,13 +1247,13 @@ mod tests {
             ApprovalMetadata::default().with_batch_group_key(group),
         );
 
-        // Move from Allow once to Accept all (index 3).
+        // Move from Yes to Yes to all (index 3).
         for _ in 0..3 {
             q.focused_button_move_right();
         }
         assert!(
             q.focused_button_action().is_none(),
-            "dangerous groups must not activate Accept all"
+            "dangerous groups must not activate Yes to all"
         );
 
         q.focused_button_move_right();
@@ -1262,7 +1262,7 @@ mod tests {
             Some(super::super::button_row::ButtonAction::RespondAll(
                 ApprovalResponse::Deny
             )),
-            "Reject all remains available for dangerous groups"
+            "No to all remains available for dangerous groups"
         );
     }
 
@@ -1280,14 +1280,14 @@ mod tests {
             ApprovalMetadata::default().with_workspace_untrusted(true),
         );
 
-        // Allow once -> Always.
+        // Yes -> don't ask again.
         q.focused_button_move_right();
         assert_eq!(
             q.focused_button_action(),
             Some(super::super::button_row::ButtonAction::Respond(
                 ApprovalResponse::AlwaysAllow
             )),
-            "benign untrusted-workspace request should keep Always available via session fallback"
+            "benign untrusted-workspace request should keep don't-ask-again available via session fallback"
         );
 
         q.focused_button_move_left();
@@ -1296,7 +1296,7 @@ mod tests {
             Some(super::super::button_row::ButtonAction::Respond(
                 ApprovalResponse::AllowOnce
             )),
-            "Allow once remains available for untrusted workspaces"
+            "Yes remains available for untrusted workspaces"
         );
     }
 
@@ -1364,7 +1364,7 @@ mod tests {
         assert_eq!(
             view.selection_hint.as_deref(),
             Some(
-                "Always allow stays session-only until you trust this workspace. Choose Trust Workspace or run `/allow trust` to save workspace rules."
+                "Don't ask again stays session-only until you trust this workspace. Choose Trust Workspace or run `/allow trust` to save workspace rules."
             )
         );
     }

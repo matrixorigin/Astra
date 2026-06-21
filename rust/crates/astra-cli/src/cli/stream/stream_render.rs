@@ -405,11 +405,11 @@ fn persist_scoped_allow_rule(
         };
         astra_core::agent_warn!(
             "permission",
-            "Always allow for {remember_preview} is session-only; failed to save rule {rule} to {target_label}: {err}"
+            "Don't ask again for {remember_preview} is session-only; failed to save rule {rule} to {target_label}: {err}"
         );
         if let Some(tx) = save_warning_tx {
             let _ = tx.send(chat_stream::StreamEvent::StatusLine(format!(
-                "Failed to save Always allow for {remember_preview} to {target_label}: {err}"
+                "Failed to save don't-ask-again rule for {remember_preview} to {target_label}: {err}"
             )));
         }
     }
@@ -3301,12 +3301,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                                 if let Some(err) = pm.take_last_save_error() {
                                                     astra_core::agent_warn!(
                                                         "permission",
-                                                        "Always allow for {remember_preview} is session-only; failed to save rule {rule}: {err}"
+                                                        "Don't ask again for {remember_preview} is session-only; failed to save rule {rule}: {err}"
                                                     );
                                                     if let Some(tx) = &self.stream_event_tx {
                                                         let _ = tx.send(chat_stream::StreamEvent::StatusLine(
                                                             format!(
-                                                                "Failed to save Always allow for {remember_preview}: {err}"
+                                                                "Failed to save don't-ask-again rule for {remember_preview}: {err}"
                                                             ),
                                                         ));
                                                     }
@@ -3332,12 +3332,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                                 if let Some(err) = pm.take_last_save_error() {
                                                     astra_core::agent_warn!(
                                                         "permission",
-                                                        "Always allow for {remember_preview} is session-only; failed to save user rule {rule}: {err}"
+                                                        "Don't ask again for {remember_preview} is session-only; failed to save user rule {rule}: {err}"
                                                     );
                                                     if let Some(tx) = &self.stream_event_tx {
                                                         let _ = tx.send(chat_stream::StreamEvent::StatusLine(
                                                             format!(
-                                                                "Failed to save Always allow for {remember_preview}: {err}"
+                                                                "Failed to save don't-ask-again rule for {remember_preview}: {err}"
                                                             ),
                                                         ));
                                                     }

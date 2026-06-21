@@ -1219,12 +1219,7 @@ fn build_permission_mode_picker(
             is_current: current == crate::cli::permission_manager::PermissionMode::Prompt,
         },
         SelectionItem {
-            name: "Auto".into(),
-            description: Some("All tools auto-approved".into()),
-            is_current: current == crate::cli::permission_manager::PermissionMode::Auto,
-        },
-        SelectionItem {
-            name: "Edit".into(),
+            name: "Accept".into(),
             description: Some(
                 "Auto-approve workspace edits; still ask for shell and external writes".into(),
             ),
@@ -1238,13 +1233,18 @@ fn build_permission_mode_picker(
             is_current: current == crate::cli::permission_manager::PermissionMode::Plan,
         },
         SelectionItem {
+            name: "Auto".into(),
+            description: Some("All tools auto-approved".into()),
+            is_current: current == crate::cli::permission_manager::PermissionMode::Auto,
+        },
+        SelectionItem {
             name: "Deny".into(),
             description: Some("Deny all tool calls".into()),
             is_current: current == crate::cli::permission_manager::PermissionMode::Deny,
         },
     ];
     ListSelectionView::new(items, Some("Modes".into())).with_footer_hint(
-        "Shift+Tab cycles ask → auto → edit → plan · /allow rules · /allow trust · /allow trace",
+        "Shift+Tab cycles ask → accept → plan → auto · /allow rules · /allow trust · /allow trace",
     )
 }
 
@@ -1254,10 +1254,10 @@ pub(crate) fn next_permission_mode_for_cycle(
     use crate::cli::permission_manager::PermissionMode;
 
     match current {
-        PermissionMode::Prompt | PermissionMode::Deny => PermissionMode::Auto,
-        PermissionMode::Auto => PermissionMode::AcceptEdits,
+        PermissionMode::Prompt | PermissionMode::Deny => PermissionMode::AcceptEdits,
         PermissionMode::AcceptEdits => PermissionMode::Plan,
-        PermissionMode::Plan => PermissionMode::Prompt,
+        PermissionMode::Plan => PermissionMode::Auto,
+        PermissionMode::Auto => PermissionMode::Prompt,
     }
 }
 
@@ -1269,7 +1269,7 @@ pub(crate) fn permission_mode_feedback(
     match mode {
         PermissionMode::Prompt => "Mode → Ask",
         PermissionMode::Auto => "Mode → Auto",
-        PermissionMode::AcceptEdits => "Mode → Edits",
+        PermissionMode::AcceptEdits => "Mode → Accept",
         PermissionMode::Plan => "Mode → Plan",
         PermissionMode::Deny => "Mode → Deny",
     }
@@ -1481,7 +1481,7 @@ pub(crate) fn handle_view_result(
             );
             return;
         }
-        "Edit" => {
+        "Accept" => {
             apply_permission_mode_selection(
                 state,
                 chat_widget,
@@ -4018,17 +4018,17 @@ mod view_result_tests {
     }
 
     #[test]
-    fn edit_selection_updates_state_and_commits_feedback() {
+    fn accept_selection_updates_state_and_commits_feedback() {
         let mut state = SessionState::default();
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = ChatWidget::new("");
 
-        handle_view_result("Edit", &mut state, &mut bottom_pane, &mut chat_widget);
+        handle_view_result("Accept", &mut state, &mut bottom_pane, &mut chat_widget);
 
         assert_eq!(state.perm_manager.mode(), PermissionMode::AcceptEdits);
         assert_eq!(
             last_system_message(&chat_widget).as_deref(),
-            Some("Mode → Edits")
+            Some("Mode → Accept")
         );
     }
 
@@ -4067,10 +4067,6 @@ mod view_result_tests {
     fn permission_mode_cycle_skips_deny_and_wraps() {
         assert_eq!(
             next_permission_mode_for_cycle(PermissionMode::Prompt),
-            PermissionMode::Auto
-        );
-        assert_eq!(
-            next_permission_mode_for_cycle(PermissionMode::Auto),
             PermissionMode::AcceptEdits
         );
         assert_eq!(
@@ -4079,11 +4075,15 @@ mod view_result_tests {
         );
         assert_eq!(
             next_permission_mode_for_cycle(PermissionMode::Plan),
+            PermissionMode::Auto
+        );
+        assert_eq!(
+            next_permission_mode_for_cycle(PermissionMode::Auto),
             PermissionMode::Prompt
         );
         assert_eq!(
             next_permission_mode_for_cycle(PermissionMode::Deny),
-            PermissionMode::Auto
+            PermissionMode::AcceptEdits
         );
     }
 

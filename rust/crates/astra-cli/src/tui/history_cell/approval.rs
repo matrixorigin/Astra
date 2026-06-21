@@ -7,7 +7,7 @@
 //!   rm -rf /tmp/scratch
 //!   destructive path outside cwd
 //!
-//! ▸ Allow once    Always allow    Reject
+//! ▸ Yes    Yes, and don't ask again    No
 //!   ← → move · Enter confirm · Esc close
 //! ```
 //!
@@ -1019,12 +1019,13 @@ mod tests {
             true,
         )
         .with_selection_hint(
-            "Always allow stays session-only until you trust this workspace. Run `astra permissions trust` to save workspace rules.",
+            "Don't ask again stays session-only until you trust this workspace. Run `astra permissions trust` to save workspace rules.",
         );
         let rendered = render(&cell);
         assert!(
-            rendered
-                .contains("Note · Always allow stays session-only until you trust this workspace."),
+            rendered.contains(
+                "Note · Don't ask again stays session-only until you trust this workspace."
+            ),
             "selection hints should render as a note, got:\n{rendered}"
         );
         assert!(

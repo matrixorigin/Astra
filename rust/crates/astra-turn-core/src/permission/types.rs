@@ -42,7 +42,7 @@ impl PermissionMode {
         match self {
             Self::Auto => "Auto",
             Self::Plan => "Plan",
-            Self::AcceptEdits => "Edits",
+            Self::AcceptEdits => "Accept",
             Self::Prompt => "Ask",
             Self::Deny => "Deny",
         }
@@ -1146,6 +1146,7 @@ mod tests {
         let parsed = "accept_edits".parse::<PermissionMode>().unwrap();
         assert_eq!(parsed, PermissionMode::AcceptEdits);
         assert_eq!(parsed.to_string(), "accept_edits");
+        assert_eq!(parsed.chip_text(), "Accept");
         assert_eq!(
             "accept-edits".parse::<PermissionMode>().unwrap(),
             PermissionMode::AcceptEdits

@@ -11,7 +11,7 @@ use crate::cli::chat_stream::ApprovalResponse;
 fn primary_row_has_simple_ux_buttons_in_expected_order() {
     let row = ButtonRow::primary();
     let labels: Vec<&str> = row.buttons().iter().map(|b| b.label).collect();
-    assert_eq!(labels, vec!["Allow once", "Always allow", "Reject"]);
+    assert_eq!(labels, vec!["Yes", "Yes, and don't ask again", "No"]);
 }
 
 #[test]
@@ -19,7 +19,7 @@ fn primary_row_starts_with_accept_focused() {
     let row = ButtonRow::primary();
     assert_eq!(row.focus(), 0);
     let focused = row.focused().expect("focused button");
-    assert_eq!(focused.label, "Allow once");
+    assert_eq!(focused.label, "Yes");
 }
 
 #[test]
@@ -38,7 +38,7 @@ fn right_arrow_advances_focus() {
     let mut row = ButtonRow::primary();
     row.move_right();
     assert_eq!(row.focus(), 1);
-    assert_eq!(row.focused().unwrap().label, "Always allow");
+    assert_eq!(row.focused().unwrap().label, "Yes, and don't ask again");
 }
 
 #[test]
@@ -111,11 +111,11 @@ fn primary_row_does_not_expose_legacy_scope_or_match_target_labels() {
 fn focus_reject_jumps_to_reject_regardless_of_origin() {
     let mut row = ButtonRow::primary();
     row.focus_reject();
-    assert_eq!(row.focused().unwrap().label, "Reject");
+    assert_eq!(row.focused().unwrap().label, "No");
 
     row.move_left(); // now on Always
     row.focus_reject();
-    assert_eq!(row.focused().unwrap().label, "Reject");
+    assert_eq!(row.focused().unwrap().label, "No");
 }
 
 // ─── Batch row ────────────────────────────────────────────────────
@@ -124,7 +124,7 @@ fn focus_reject_jumps_to_reject_regardless_of_origin() {
 fn batch_row_has_two_buttons() {
     let row = ButtonRow::batch();
     let labels: Vec<&str> = row.buttons().iter().map(|b| b.label).collect();
-    assert_eq!(labels, vec!["Accept all", "Reject all"]);
+    assert_eq!(labels, vec!["Yes to all", "No to all"]);
 }
 
 #[test]

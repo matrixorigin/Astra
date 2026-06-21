@@ -1037,11 +1037,10 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
     match arg {
         "" => {
             let next = match state.perm_manager.mode() {
-                PermissionMode::Prompt => PermissionMode::Plan,
-                PermissionMode::Plan => PermissionMode::AcceptEdits,
-                PermissionMode::AcceptEdits => PermissionMode::Auto,
-                PermissionMode::Auto => PermissionMode::Deny,
-                PermissionMode::Deny => PermissionMode::Prompt,
+                PermissionMode::Prompt | PermissionMode::Deny => PermissionMode::AcceptEdits,
+                PermissionMode::AcceptEdits => PermissionMode::Plan,
+                PermissionMode::Plan => PermissionMode::Auto,
+                PermissionMode::Auto => PermissionMode::Prompt,
             };
             state.perm_manager.set_mode(next);
             eprintln!(
@@ -1146,13 +1145,7 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
 }
 
 pub(crate) fn permission_mode_display_label(mode: PermissionMode) -> &'static str {
-    match mode {
-        PermissionMode::Prompt => "Ask",
-        PermissionMode::Auto => "Auto",
-        PermissionMode::AcceptEdits => "Edits",
-        PermissionMode::Plan => "Plan",
-        PermissionMode::Deny => "Deny",
-    }
+    mode.chip_text()
 }
 
 #[cfg(test)]
@@ -1166,7 +1159,7 @@ mod permission_mode_display_tests {
         assert_eq!(permission_mode_display_label(PermissionMode::Auto), "Auto");
         assert_eq!(
             permission_mode_display_label(PermissionMode::AcceptEdits),
-            "Edits"
+            "Accept"
         );
         assert_eq!(permission_mode_display_label(PermissionMode::Plan), "Plan");
         assert_eq!(permission_mode_display_label(PermissionMode::Deny), "Deny");

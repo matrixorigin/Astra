@@ -68,20 +68,16 @@ fn backtab_cycles_mode_when_composer_has_text() {
 
 #[test]
 fn next_mode_cycle_full_loop_skips_deny() {
-    // Prompt → Auto → AcceptEdits → Plan → Prompt (wrap).
-    // Deny → Auto (same as Prompt — both return to Auto).
+    // Prompt → AcceptEdits → Plan → Auto → Prompt (wrap).
+    // Deny → AcceptEdits (same as Prompt).
     // Deny is intentionally excluded from the Shift+Tab cycle;
-    // cycling past it lands on Auto.
+    // cycling past it lands on the next everyday interactive mode.
     assert_eq!(
         next_permission_mode_for_cycle(PermissionMode::Prompt),
-        PermissionMode::Auto
+        PermissionMode::AcceptEdits
     );
     assert_eq!(
         next_permission_mode_for_cycle(PermissionMode::Deny),
-        PermissionMode::Auto
-    );
-    assert_eq!(
-        next_permission_mode_for_cycle(PermissionMode::Auto),
         PermissionMode::AcceptEdits
     );
     assert_eq!(
@@ -90,6 +86,10 @@ fn next_mode_cycle_full_loop_skips_deny() {
     );
     assert_eq!(
         next_permission_mode_for_cycle(PermissionMode::Plan),
+        PermissionMode::Auto
+    );
+    assert_eq!(
+        next_permission_mode_for_cycle(PermissionMode::Auto),
         PermissionMode::Prompt
     );
 }
@@ -97,10 +97,10 @@ fn next_mode_cycle_full_loop_skips_deny() {
 #[test]
 fn next_mode_cycle_starting_from_default() {
     // Starting from Prompt (the default), verify the first Shift+Tab
-    // goes to Auto.
+    // goes to Accept.
     assert_eq!(
         next_permission_mode_for_cycle(PermissionMode::Prompt),
-        PermissionMode::Auto
+        PermissionMode::AcceptEdits
     );
 }
 

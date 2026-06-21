@@ -416,11 +416,12 @@ pub(crate) async fn handle_slash_command(
             match arg {
                 "" => {
                     let next = match state.perm_manager.mode() {
-                        PermissionMode::Prompt => PermissionMode::Plan,
-                        PermissionMode::Plan => PermissionMode::AcceptEdits,
-                        PermissionMode::AcceptEdits => PermissionMode::Auto,
-                        PermissionMode::Auto => PermissionMode::Deny,
-                        PermissionMode::Deny => PermissionMode::Prompt,
+                        PermissionMode::Prompt | PermissionMode::Deny => {
+                            PermissionMode::AcceptEdits
+                        }
+                        PermissionMode::AcceptEdits => PermissionMode::Plan,
+                        PermissionMode::Plan => PermissionMode::Auto,
+                        PermissionMode::Auto => PermissionMode::Prompt,
                     };
                     state.perm_manager.set_mode(next);
                     eprintln!(

@@ -4,7 +4,7 @@
 //! keys shift focus; Enter resolves the approval.
 //!
 //! When the pending queue contains more than one entry we prepend two
-//! **batch buttons** (Accept all / Reject all). Those are surfaced
+//! **batch buttons** (Yes to all / No to all). Those are surfaced
 //! through a separate constructor so the cell widget can render them on
 //! a dedicated row.
 
@@ -31,15 +31,15 @@ pub(crate) struct Button {
 /// Primary approval buttons in presentation order.
 pub(crate) const PRIMARY_BUTTONS: &[Button] = &[
     Button {
-        label: "Allow once",
+        label: "Yes",
         action: ButtonAction::Respond(ApprovalResponse::AllowOnce),
     },
     Button {
-        label: "Always allow",
+        label: "Yes, and don't ask again",
         action: ButtonAction::Respond(ApprovalResponse::AlwaysAllow),
     },
     Button {
-        label: "Reject",
+        label: "No",
         action: ButtonAction::Respond(ApprovalResponse::Deny),
     },
 ];
@@ -47,12 +47,12 @@ pub(crate) const PRIMARY_BUTTONS: &[Button] = &[
 /// Batch buttons shown when multiple approvals are pending.
 pub(crate) const BATCH_BUTTONS: &[Button] = &[
     Button {
-        label: "Accept all",
+        label: "Yes to all",
         action: ButtonAction::RespondAll(ApprovalResponse::AllowOnce),
     },
-    // Same one-shot semantics as the single Reject (P5e).
+    // Same one-shot semantics as the single No (P5e).
     Button {
-        label: "Reject all",
+        label: "No to all",
         action: ButtonAction::RespondAll(ApprovalResponse::Deny),
     },
 ];
@@ -61,23 +61,23 @@ pub(crate) const BATCH_BUTTONS: &[Button] = &[
 /// cell when the queue has more than one entry.
 pub(crate) const PRIMARY_WITH_BATCH: &[Button] = &[
     Button {
-        label: "Allow once",
+        label: "Yes",
         action: ButtonAction::Respond(ApprovalResponse::AllowOnce),
     },
     Button {
-        label: "Always allow",
+        label: "Yes, and don't ask again",
         action: ButtonAction::Respond(ApprovalResponse::AlwaysAllow),
     },
     Button {
-        label: "Reject",
+        label: "No",
         action: ButtonAction::Respond(ApprovalResponse::Deny),
     },
     Button {
-        label: "Accept all",
+        label: "Yes to all",
         action: ButtonAction::RespondAll(ApprovalResponse::AllowOnce),
     },
     Button {
-        label: "Reject all",
+        label: "No to all",
         action: ButtonAction::RespondAll(ApprovalResponse::Deny),
     },
 ];
@@ -106,7 +106,7 @@ impl ButtonRow {
         }
     }
 
-    /// Primary row plus Accept-all/Reject-all, used on a focused cell
+    /// Primary row plus Yes-to-all/No-to-all, used on a focused cell
     /// when more than one approval is pending.
     pub fn primary_with_batch() -> Self {
         Self {
@@ -145,7 +145,7 @@ impl ButtonRow {
         self.focus = (self.focus + 1) % self.buttons.len();
     }
 
-    /// Jump focus to the `Reject` button so Esc-as-default-reject can
+    /// Jump focus to the `No` button so Esc-as-default-reject can
     /// still reuse the same activation path when we prefer to.
     pub fn focus_reject(&mut self) {
         if let Some(pos) = self
