@@ -54,3 +54,39 @@ fn expand_sandbox_to_root_opens_everything() {
     assert!(exe.resolve_checked("/etc/passwd").is_ok());
     assert!(exe.resolve_checked("/var/secret").is_ok());
 }
+
+#[test]
+fn write_file_existing_external_file_respects_expanded_sandbox_boundary() {
+    let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let project = base.path().join("project");
+    let external = base.path().join("external");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::create_dir(&external).unwrap();
+    let target = external.join("notes.md");
+    std::fs::write(&target, "old\n").unwrap();
+
+    let exe = ToolExecutor::new(&project);
+    let before_expand = exe.read_file(&serde_json::json!({
+        "path": target.to_string_lossy()
+    }));
+    assert!(
+        crate::sandbox_retry::is_sandbox_denied(&before_expand),
+        "{before_expand}"
+    );
+
+    exe.expand_sandbox_path(external);
+
+    let read = exe.read_file(&serde_json::json!({
+        "path": target.to_string_lossy()
+    }));
+    assert!(read.contains("old"), "{read}");
+
+    let result = exe.write_file(&serde_json::json!({
+        "path": target.to_string_lossy(),
+        "content": "new\n"
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).expect("write_file json");
+
+    assert_eq!(parsed["success"].as_bool(), Some(true), "{result}");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+}

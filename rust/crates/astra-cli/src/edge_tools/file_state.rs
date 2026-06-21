@@ -183,6 +183,17 @@ impl ToolExecutor {
             .any(|root| path.starts_with(root))
     }
 
+    pub(super) fn is_within_sandbox_boundary(&self, path: &Path) -> bool {
+        let guard = self
+            .sandbox_policy
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match guard.as_ref() {
+            Some(policy) => policy.is_path_allowed(path),
+            None => true,
+        }
+    }
+
     /// Get the mtime of a file in milliseconds. Returns 0 on error.
     pub(super) fn file_mtime_ms(path: &Path) -> u128 {
         fs::metadata(path)

@@ -3236,180 +3236,179 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 // authorization. On approval, temporarily expand the sandbox
                 // boundary and retry the tool.
                 if crate::sandbox_retry::is_sandbox_denied(&outcome.output) {
-                    if let Some(pm) = &mut self.perm_manager {
-                        let sandbox_msg =
-                            crate::sandbox_retry::sandbox_denied_message(&outcome.output)
-                                .unwrap_or("");
-                        let sandbox_tool_key = format!("sandbox_expand:{tool}");
-                        let guard_args = serde_json::json!({"reason": sandbox_msg});
-                        let decision = crate::tool_safety_guard::ToolSafetyGuard::check_request(
-                            Some(&mut **pm),
-                            &sandbox_tool_key,
-                            &guard_args,
-                        );
-                        let approved = match decision {
-                            crate::cli::permission_manager::PermissionDecision::Allow => true,
-                            crate::cli::permission_manager::PermissionDecision::Deny(_) => false,
-                            crate::cli::permission_manager::PermissionDecision::NeedApproval {
-                                header,
-                                detail,
-                                reason,
-                                ..
-                            } => {
-                                if let Some(tx) = &self.approval_request_tx {
-                                    use crate::cli::chat_stream::ApprovalResponse;
-                                    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                                    // `🔒 ` prefix visually marks sandbox-escape
-                                    // prompts; header/detail/reason otherwise
-                                    // come straight from the permission manager
-                                    // so we don't echo the same text thrice.
-                                    let _ = tx.send(chat_stream::ApprovalRequest::bare(
-                                        sandbox_tool_key.clone(),
-                                        format!("🔒 {header}"),
-                                        detail,
-                                        reason,
-                                        args.clone(),
-                                        resp_tx,
-                                    ));
-                                    let response = if let Some(token) = self.cancel_token {
-                                        tokio::select! {
-                                            biased;
-                                            _ = token.cancelled() => ApprovalResponse::Deny,
-                                            r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
+                    let sandbox_msg = crate::sandbox_retry::sandbox_denied_message(&outcome.output)
+                        .map(|message| message.into_owned())
+                        .unwrap_or_default();
+                    if let Some(expand_dir) =
+                        crate::sandbox_retry::sandbox_expand_dir_from_denial(args, &sandbox_msg)
+                    {
+                        if let Some(pm) = &mut self.perm_manager {
+                            let sandbox_tool_key = format!("sandbox_expand:{tool}");
+                            let guard_args = serde_json::json!({"reason": sandbox_msg.clone()});
+                            let decision = crate::tool_safety_guard::ToolSafetyGuard::check_request(
+                                Some(&mut **pm),
+                                &sandbox_tool_key,
+                                &guard_args,
+                            );
+                            let approved = match decision {
+                                crate::cli::permission_manager::PermissionDecision::Allow => true,
+                                crate::cli::permission_manager::PermissionDecision::Deny(_) => false,
+                                crate::cli::permission_manager::PermissionDecision::NeedApproval {
+                                    header,
+                                    detail,
+                                    reason,
+                                    ..
+                                } => {
+                                    if let Some(tx) = &self.approval_request_tx {
+                                        use crate::cli::chat_stream::ApprovalResponse;
+                                        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                                        // `🔒 ` prefix visually marks sandbox-escape
+                                        // prompts; header/detail/reason otherwise
+                                        // come straight from the permission manager
+                                        // so we don't echo the same text thrice.
+                                        let _ = tx.send(chat_stream::ApprovalRequest::bare(
+                                            sandbox_tool_key.clone(),
+                                            format!("🔒 {header}"),
+                                            detail,
+                                            reason,
+                                            args.clone(),
+                                            resp_tx,
+                                        ));
+                                        let response = if let Some(token) = self.cancel_token {
+                                            tokio::select! {
+                                                biased;
+                                                _ = token.cancelled() => ApprovalResponse::Deny,
+                                                r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
+                                            }
+                                        } else {
+                                            resp_rx.await.unwrap_or(ApprovalResponse::Deny)
+                                        };
+                                        let selected_scope = response.always_scope(
+                                            astra_turn_core::permission::scope::AllowScope::Project,
+                                        );
+                                        match selected_scope {
+                                            Some(astra_turn_core::permission::scope::AllowScope::Project) => {
+                                                // Persistent: writes a tool-level allow
+                                                // rule to settings for future sessions.
+                                                let rule = crate::cli::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
+                                                let remember_preview =
+                                                    astra_turn_core::permission::match_target::remember_preview(
+                                                        &sandbox_tool_key,
+                                                        &guard_args,
+                                                        "in this workspace",
+                                                    );
+                                                pm.add_allow_rule(&rule);
+                                                if let Some(err) = pm.take_last_save_error() {
+                                                    astra_core::agent_warn!(
+                                                        "permission",
+                                                        "Always allow for {remember_preview} is session-only; failed to save rule {rule}: {err}"
+                                                    );
+                                                    if let Some(tx) = &self.stream_event_tx {
+                                                        let _ = tx.send(chat_stream::StreamEvent::StatusLine(
+                                                            format!(
+                                                                "Failed to save Always allow for {remember_preview}: {err}"
+                                                            ),
+                                                        ));
+                                                    }
+                                                }
+                                                pm.trust_sandbox_root_from_reason(&sandbox_msg);
+                                            }
+                                            Some(
+                                                astra_turn_core::permission::scope::AllowScope::RestOfSession,
+                                            ) => {
+                                                pm.trust_sandbox_root_from_reason(&sandbox_msg);
+                                            }
+                                            Some(
+                                                astra_turn_core::permission::scope::AllowScope::User,
+                                            ) => {
+                                                let rule = crate::cli::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
+                                                let remember_preview =
+                                                    astra_turn_core::permission::match_target::remember_preview(
+                                                        &sandbox_tool_key,
+                                                        &guard_args,
+                                                        "for this user",
+                                                    );
+                                                pm.add_user_allow_rule(&rule);
+                                                if let Some(err) = pm.take_last_save_error() {
+                                                    astra_core::agent_warn!(
+                                                        "permission",
+                                                        "Always allow for {remember_preview} is session-only; failed to save user rule {rule}: {err}"
+                                                    );
+                                                    if let Some(tx) = &self.stream_event_tx {
+                                                        let _ = tx.send(chat_stream::StreamEvent::StatusLine(
+                                                            format!(
+                                                                "Failed to save Always allow for {remember_preview}: {err}"
+                                                            ),
+                                                        ));
+                                                    }
+                                                }
+                                                pm.trust_sandbox_root_from_reason(&sandbox_msg);
+                                            }
+                                            Some(
+                                                astra_turn_core::permission::scope::AllowScope::OnceThisCall
+                                                | astra_turn_core::permission::scope::AllowScope::RestOfTurn,
+                                            )
+                                            | None => {}
                                         }
+                                        if matches!(
+                                            selected_scope,
+                                            Some(
+                                                astra_turn_core::permission::scope::AllowScope::Project
+                                                    | astra_turn_core::permission::scope::AllowScope::RestOfSession
+                                                    | astra_turn_core::permission::scope::AllowScope::User
+                                            )
+                                        ) {
+                                            pm.record_approval(&sandbox_tool_key, Some(args), true);
+                                        }
+                                        response.is_approved()
+                                    } else if self.render_policy.is_silent() {
+                                        // Sub-run mode: auto-deny sandbox expansion
+                                        astra_core::agent_warn!(
+                                            "permission",
+                                            "Auto-denied sandbox expansion {sandbox_tool_key} in sub-run mode: {reason}"
+                                        );
+                                        pm.record_approval(&sandbox_tool_key, Some(args), false);
+                                        false
                                     } else {
-                                        resp_rx.await.unwrap_or(ApprovalResponse::Deny)
-                                    };
-                                    let selected_scope = response.always_scope(
-                                        astra_turn_core::permission::scope::AllowScope::Project,
-                                    );
-                                    match selected_scope {
-                                        Some(astra_turn_core::permission::scope::AllowScope::Project) => {
-                                            // Persistent: writes a tool-level allow
-                                            // rule to settings for future sessions.
-                                            let rule = crate::cli::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
-                                            let remember_preview =
-                                                astra_turn_core::permission::match_target::remember_preview(
-                                                    &sandbox_tool_key,
-                                                    &guard_args,
-                                                    "in this workspace",
-                                                );
-                                            pm.add_allow_rule(&rule);
-                                            if let Some(err) = pm.take_last_save_error() {
-                                                astra_core::agent_warn!(
-                                                    "permission",
-                                                    "Always allow for {remember_preview} is session-only; failed to save rule {rule}: {err}"
-                                                );
-                                                if let Some(tx) = &self.stream_event_tx {
-                                                    let _ = tx.send(chat_stream::StreamEvent::StatusLine(
-                                                        format!(
-                                                            "Failed to save Always allow for {remember_preview}: {err}"
-                                                        ),
-                                                    ));
-                                                }
-                                            }
-                                            pm.trust_sandbox_root_from_reason(sandbox_msg);
-                                        }
-                                        Some(
-                                            astra_turn_core::permission::scope::AllowScope::RestOfSession,
-                                        ) => {
-                                            pm.trust_sandbox_root_from_reason(sandbox_msg);
-                                        }
-                                        Some(
-                                            astra_turn_core::permission::scope::AllowScope::User,
-                                        ) => {
-                                            let rule = crate::cli::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
-                                            let remember_preview =
-                                                astra_turn_core::permission::match_target::remember_preview(
-                                                    &sandbox_tool_key,
-                                                    &guard_args,
-                                                    "for this user",
-                                                );
-                                            pm.add_user_allow_rule(&rule);
-                                            if let Some(err) = pm.take_last_save_error() {
-                                                astra_core::agent_warn!(
-                                                    "permission",
-                                                    "Always allow for {remember_preview} is session-only; failed to save user rule {rule}: {err}"
-                                                );
-                                                if let Some(tx) = &self.stream_event_tx {
-                                                    let _ = tx.send(chat_stream::StreamEvent::StatusLine(
-                                                        format!(
-                                                            "Failed to save Always allow for {remember_preview}: {err}"
-                                                        ),
-                                                    ));
-                                                }
-                                            }
-                                            pm.trust_sandbox_root_from_reason(sandbox_msg);
-                                        }
-                                        Some(
-                                            astra_turn_core::permission::scope::AllowScope::OnceThisCall
-                                            | astra_turn_core::permission::scope::AllowScope::RestOfTurn,
-                                        )
-                                        | None => {}
+                                        // Issue #326 P0 (tui-only) / #331:
+                                        // legacy interactive stdin path is dead
+                                        // code now that the REPL is gone. With
+                                        // no approval channel and not silent =
+                                        // configuration mismatch, fail closed.
+                                        astra_core::agent_warn!(
+                                            "permission",
+                                            "Auto-denied sandbox expansion {sandbox_tool_key}: \
+                                             no approval sink installed (no TUI, not silent). \
+                                             Pass --mode auto or attach to a TUI session. reason={reason}"
+                                        );
+                                        pm.record_approval(&sandbox_tool_key, Some(args), false);
+                                        false
                                     }
-                                    if matches!(
-                                        selected_scope,
-                                        Some(
-                                            astra_turn_core::permission::scope::AllowScope::Project
-                                                | astra_turn_core::permission::scope::AllowScope::RestOfSession
-                                                | astra_turn_core::permission::scope::AllowScope::User
-                                        )
-                                    ) {
-                                        pm.record_approval(&sandbox_tool_key, Some(args), true);
-                                    }
-                                    response.is_approved()
-                                } else if self.render_policy.is_silent() {
-                                    // Sub-run mode: auto-deny sandbox expansion
-                                    astra_core::agent_warn!(
-                                        "permission",
-                                        "Auto-denied sandbox expansion {sandbox_tool_key} in sub-run mode: {reason}"
-                                    );
-                                    pm.record_approval(&sandbox_tool_key, Some(args), false);
-                                    false
-                                } else {
-                                    // Issue #326 P0 (tui-only) / #331:
-                                    // legacy interactive stdin path is dead
-                                    // code now that the REPL is gone. With
-                                    // no approval channel and not silent =
-                                    // configuration mismatch, fail closed.
-                                    astra_core::agent_warn!(
-                                        "permission",
-                                        "Auto-denied sandbox expansion {sandbox_tool_key}: \
-                                         no approval sink installed (no TUI, not silent). \
-                                         Pass --mode auto or attach to a TUI session. reason={reason}"
-                                    );
-                                    pm.record_approval(&sandbox_tool_key, Some(args), false);
-                                    false
                                 }
+                            };
+                            if approved {
+                                self.executor.expand_sandbox_path(expand_dir);
+                                outcome = execute_with_metadata_responsive(
+                                    std::sync::Arc::clone(&self.executor),
+                                    tool.to_string(),
+                                    args.clone(),
+                                    self.cancel_token.cloned(),
+                                )
+                                .await;
+                                tool_result_fields = outcome.tool_result_fields;
+                                tool_execution_marked_error = outcome.is_error;
+                                outcome.output
+                            } else {
+                                tool_execution_marked_error = true;
+                                format!("Error: {sandbox_msg}")
                             }
-                        };
-                        if approved {
-                            // Single source of truth in `sandbox_retry` — both
-                            // the sequential path here and the parallel batch
-                            // path call the same derivation so their behaviour
-                            // stays byte-identical.
-                            if let Some(dir) =
-                                crate::sandbox_retry::sandbox_expand_dir_from_args(args)
-                            {
-                                self.executor.expand_sandbox_path(dir);
-                            }
-                            outcome = execute_with_metadata_responsive(
-                                std::sync::Arc::clone(&self.executor),
-                                tool.to_string(),
-                                args.clone(),
-                                self.cancel_token.cloned(),
-                            )
-                            .await;
-                            tool_result_fields = outcome.tool_result_fields;
+                        } else {
                             tool_execution_marked_error = outcome.is_error;
                             outcome.output
-                        } else {
-                            tool_execution_marked_error = true;
-                            format!("Error: {sandbox_msg}")
                         }
                     } else {
-                        tool_execution_marked_error = outcome.is_error;
-                        outcome.output
+                        tool_execution_marked_error = true;
+                        crate::sandbox_retry::sandbox_retry_no_expand_dir_output(tool, &sandbox_msg)
                     }
                 } else {
                     tool_result_fields = outcome.tool_result_fields;
@@ -4081,9 +4080,17 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             let args = req.args.clone();
             let sandbox_tool_key = format!("sandbox_expand:{tool}");
             let sandbox_msg = crate::sandbox_retry::sandbox_denied_message(&outputs[pos].0.output)
-                .unwrap_or("")
-                .to_string();
-            let guard_args = serde_json::json!({"reason": sandbox_msg});
+                .map(|message| message.into_owned())
+                .unwrap_or_default();
+            let Some(expand_dir) =
+                crate::sandbox_retry::sandbox_expand_dir_from_denial(&args, &sandbox_msg)
+            else {
+                outputs[pos].0 = crate::edge_tools::ToolExecutionOutcome::error(
+                    crate::sandbox_retry::sandbox_retry_no_expand_dir_output(&tool, &sandbox_msg),
+                );
+                continue;
+            };
+            let guard_args = serde_json::json!({"reason": sandbox_msg.clone()});
             let decision = crate::tool_safety_guard::ToolSafetyGuard::check_request(
                 self.perm_manager.as_deref_mut(),
                 &sandbox_tool_key,
@@ -4178,9 +4185,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             if !approved {
                 continue;
             }
-            if let Some(dir) = crate::sandbox_retry::sandbox_expand_dir_from_args(&args) {
-                self.executor.expand_sandbox_path(dir);
-            }
+            self.executor.expand_sandbox_path(expand_dir);
             if let Some(pm) = &mut self.perm_manager {
                 pm.record_approval(&sandbox_tool_key, Some(&args), true);
             }

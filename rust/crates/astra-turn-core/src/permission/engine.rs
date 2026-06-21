@@ -703,10 +703,11 @@ pub fn evaluate_permission(
                     .and_then(Value::as_str)
                     .unwrap_or("Access to path outside project boundary")
                     .to_string();
+                let action = sandbox_expand_action_label(inner_tool);
                 let decision = HardDecision::NeedExternal {
                     prompt: ApprovalPrompt {
                         tool: tool_name.to_string(),
-                        header: format!("{inner_tool} wants to read outside the project"),
+                        header: format!("{inner_tool} wants to {action} outside the project"),
                         detail: None,
                         reason,
                         risk_tags: risk_tags.clone(),
@@ -1225,6 +1226,30 @@ fn push_matched(
     });
 }
 
+fn sandbox_expand_action_label(inner_tool: &str) -> &'static str {
+    match cloud_gated_tool_kind(inner_tool) {
+        Some(CloudGatedToolKind::Write) => "write",
+        Some(CloudGatedToolKind::Execute) => "execute",
+        None if matches!(
+            inner_tool,
+            "read_file"
+                | "list_dir"
+                | "grep"
+                | "glob"
+                | "symbols"
+                | "find_definition"
+                | "find_references"
+                | "symbol_search"
+                | "hover_info"
+                | "extract_members"
+        ) =>
+        {
+            "read"
+        }
+        None => "access",
+    }
+}
+
 fn approval_prompt(
     tool_name: &str,
     args: &Value,
@@ -1549,6 +1574,56 @@ mod tests {
             deny_idx < sandbox_idx,
             "DenyRules ({deny_idx}) must run before SandboxExpand ({sandbox_idx})"
         );
+    }
+
+    #[test]
+    fn sandbox_expand_prompt_headers_describe_inner_tool_action() {
+        for mode in [
+            crate::permission::types::PermissionMode::Prompt,
+            crate::permission::types::PermissionMode::AcceptEdits,
+        ] {
+            let ctx = crate::permission::types::PermissionSyncContext::new(
+                crate::permission::types::InheritedPermissions {
+                    mode,
+                    ..Default::default()
+                },
+            );
+
+            for (tool, expected_header) in [
+                (
+                    "sandbox_expand:read_file",
+                    "read_file wants to read outside the project",
+                ),
+                (
+                    "sandbox_expand:write_file",
+                    "write_file wants to write outside the project",
+                ),
+                (
+                    "sandbox_expand:bash",
+                    "bash wants to execute outside the project",
+                ),
+            ] {
+                let envelope = evaluate_permission(
+                    tool,
+                    &serde_json::json!({
+                        "reason": "Path '/tmp/outside' is outside the project directory '/tmp/project'; sandbox approval is required for this external path."
+                    }),
+                    &ctx,
+                );
+
+                match envelope.decision {
+                    HardDecision::NeedExternal { prompt } => {
+                        assert_eq!(prompt.tool, tool);
+                        assert_eq!(prompt.header, expected_header);
+                        assert!(prompt.detail.is_none());
+                    }
+                    other => {
+                        panic!("{mode:?} sandbox expansion should prompt for {tool}; got {other:?}")
+                    }
+                }
+                assert_eq!(envelope.source, DecisionSource::SandboxExpansion);
+            }
+        }
     }
 
     /// Catastrophic-command checks (the `rm -rf /` circuit breaker)

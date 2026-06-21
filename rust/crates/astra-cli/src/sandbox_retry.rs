@@ -15,7 +15,8 @@
 //! stdin, no async state) so they can be unit-tested and called from
 //! both paths.
 
-use std::path::{Path, PathBuf};
+use std::borrow::Cow;
+use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
 
@@ -23,72 +24,78 @@ use serde_json::Value;
 /// when a tool returned SANDBOX_DENIED for the given arguments.
 ///
 /// Priority:
-/// 1. `args.path` or `args.file_path` (file-tool shape) — take parent,
-///    or the file itself when the parent would be `/`.
-/// 2. `args.command` (bash shape) — extract first absolute path token
-///    and apply the same parent logic.
+/// 1. Explicit file path-like argument fields (`path`, `file_path`, `file`,
+///    `notebook_path`) - take parent, the path itself when it is an existing
+///    directory, or the file itself when the parent would be `/`.
+/// 2. Explicit working-directory fields (`cwd`, `workdir`, `working_dir`) -
+///    take the directory itself.
+/// 3. `args.command` (bash shape) - extract the first concrete path token
+///    (`/abs/path`, `~/path`, `$HOME/path`, or `${HOME}/path`) and apply the
+///    same parent logic.
 ///
-/// Returns `None` when no concrete path can be derived (e.g. tool
-/// arguments carry only relative paths — those are already inside the
-/// project root per the sandbox contract).
+/// Returns `None` when no safe concrete path can be derived (e.g. relative
+/// paths, traversal, ambiguous shell syntax, or protected credential paths).
 ///
-/// **Never returns `/`** — widening to root would defeat the sandbox.
+/// **Never returns `/` or a protected sensitive path** - widening either would
+/// defeat the sandbox contract.
 #[must_use]
 pub fn sandbox_expand_dir_from_args(args: &Value) -> Option<PathBuf> {
-    // Only absolute paths are candidates for sandbox expansion: relative
-    // paths are already inside the project root per the sandbox
-    // contract, so a SANDBOX_DENIED on a relative path indicates a
-    // different issue (the relative path resolved to outside via `../`
-    // traversal etc.) and the conservative move is to NOT auto-widen.
-    //
-    // We also reject paths containing `..` components: `canonicalize()`
-    // isn't safe here because the target file may not yet exist (e.g. a
-    // write tool creating a new file), so we can't resolve traversal
-    // reliably. A token like `/allowed/../etc/passwd` would otherwise
-    // widen to `/allowed` — but Path::parent is purely lexical and the
-    // real parent after `..` resolution is `/etc`. Refusing to expand
-    // keeps the sandbox tight; the user sees the original denial and
-    // can resubmit with a clean absolute path.
-    let parent_or_self = |p: &str| -> Option<PathBuf> {
-        let path = Path::new(p);
-        if !path.is_absolute() {
-            return None;
-        }
-        // Reject `..` / `.` traversal tokens — see note above.
-        // We check the raw string rather than Path::components because
-        // components() silently drops `.` (so `/./etc` would normalize
-        // to `/etc`) while we want to refuse the whole non-canonical
-        // input rather than guess at the author's intent.
-        for segment in p.split('/') {
-            if segment == ".." || segment == "." {
-                return None;
-            }
-        }
-        let parent = path.parent()?;
-        // Defensive: after normalization above, `parent == /` means the
-        // file sits directly under root (e.g. `/passwd`). Expand exactly
-        // the file, never the root directory.
-        if parent == Path::new("/") || parent.as_os_str().is_empty() {
-            Some(PathBuf::from(p))
-        } else {
-            Some(parent.to_path_buf())
-        }
-    };
-
-    if let Some(p) = args
-        .get("path")
-        .or_else(|| args.get("file_path"))
-        .and_then(Value::as_str)
-        && let Some(dir) = parent_or_self(p)
-    {
+    if let Some(dir) = sandbox_expand_dir_from_path_args(args) {
         return Some(dir);
     }
 
     args.get("command")
         .and_then(Value::as_str)
-        .and_then(extract_first_absolute_path)
-        .and_then(|p| parent_or_self(&p))
+        .and_then(extract_first_sandbox_expand_path)
+        .and_then(|p| sandbox_expand_dir_from_pathish(&p))
 }
+
+/// Derive a sandbox expansion directory from tool arguments and, when the
+/// arguments are not enough, from the sandbox-denied message itself.
+///
+/// This covers bash commands such as `cat ~/repo/file`: the command argument
+/// may not carry a literal absolute path, but the denial is recoverable because
+/// home-directory references resolve deterministically for the local executor.
+#[must_use]
+pub fn sandbox_expand_dir_from_denial(args: &Value, sandbox_msg: &str) -> Option<PathBuf> {
+    if let Some(dir) = sandbox_expand_dir_from_path_args(args) {
+        return Some(dir);
+    }
+
+    if let Some(dir) = sandbox_expand_dir_from_denial_message(sandbox_msg) {
+        return Some(dir);
+    }
+
+    args.get("command")
+        .and_then(Value::as_str)
+        .and_then(extract_first_sandbox_expand_path)
+        .and_then(|p| sandbox_expand_dir_from_pathish(&p))
+}
+
+fn sandbox_expand_dir_from_path_args(args: &Value) -> Option<PathBuf> {
+    for key in SANDBOX_PATH_ARG_KEYS {
+        if let Some(dir) = args
+            .get(*key)
+            .and_then(Value::as_str)
+            .and_then(sandbox_expand_dir_from_pathish)
+        {
+            return Some(dir);
+        }
+    }
+    for key in SANDBOX_DIR_ARG_KEYS {
+        if let Some(dir) = args
+            .get(*key)
+            .and_then(Value::as_str)
+            .and_then(sandbox_expand_dir_from_dir_pathish)
+        {
+            return Some(dir);
+        }
+    }
+    None
+}
+
+const SANDBOX_PATH_ARG_KEYS: &[&str] = &["path", "file_path", "file", "notebook_path"];
+const SANDBOX_DIR_ARG_KEYS: &[&str] = &["cwd", "workdir", "working_dir"];
 
 /// Extract the first absolute-path token from a bash command.
 ///
@@ -115,7 +122,7 @@ pub fn extract_first_absolute_path(command: &str) -> Option<String> {
         // Strip trailing shell punctuation (`;`, `&`, `)`) — a path
         // token followed by `;` or `&` is still a concrete absolute
         // path to the sandbox; we must not hand back the punctuation.
-        let token = raw.trim_end_matches([';', '&', ')']).to_string();
+        let token = trim_shell_path_token(&raw);
         if token.is_empty() {
             continue;
         }
@@ -131,17 +138,203 @@ pub fn extract_first_absolute_path(command: &str) -> Option<String> {
             if token.contains('$') {
                 continue;
             }
-            return Some(token);
+            return Some(token.to_string());
         }
         // Windows absolute path: `C:\...`. Avoids indexing past the end
         // for short tokens (pre-fix bug: `&token[1..3]` panicked on any
         // 2-char or shorter token).
         let bytes = token.as_bytes();
         if bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
-            return Some(token);
+            return Some(token.to_string());
         }
     }
     None
+}
+
+fn extract_first_sandbox_expand_path(command: &str) -> Option<String> {
+    let tokens = quote_aware_tokens(command);
+    for raw in tokens {
+        let token = trim_shell_path_token(&raw);
+        if token.is_empty() {
+            continue;
+        }
+        if token.starts_with('/') {
+            if token.starts_with("//") || token.contains('$') {
+                continue;
+            }
+            return Some(token.to_string());
+        }
+        if is_home_reference(token) {
+            return Some(token.to_string());
+        }
+        let bytes = token.as_bytes();
+        if bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
+fn sandbox_expand_dir_from_denial_message(message: &str) -> Option<PathBuf> {
+    let mut segments = message.split('\'');
+    let mut before = segments.next().unwrap_or_default();
+    while let Some(segment) = segments.next() {
+        let after = segments.next().unwrap_or_default();
+        if !quoted_segment_names_sandbox_boundary(before) {
+            if quoted_segment_is_sensitive_path(segment) {
+                return None;
+            }
+            if let Some(dir) = sandbox_expand_dir_from_pathish(segment) {
+                return Some(dir);
+            }
+        }
+        before = after;
+    }
+    None
+}
+
+fn quoted_segment_names_sandbox_boundary(before_quote: &str) -> bool {
+    let before_quote = before_quote.trim_end().to_ascii_lowercase();
+    before_quote.ends_with("project directory")
+        || before_quote.ends_with("project root")
+        || before_quote.ends_with("workspace directory")
+        || before_quote.ends_with("workspace root")
+}
+
+fn quoted_segment_is_sensitive_path(segment: &str) -> bool {
+    let token = trim_shell_path_token(segment);
+    let Some(path) = expand_concrete_pathish(token) else {
+        return false;
+    };
+    path.is_absolute() && sandbox_expand_path_is_sensitive(&path)
+}
+
+fn sandbox_expand_dir_from_pathish(pathish: &str) -> Option<PathBuf> {
+    let token = trim_shell_path_token(pathish);
+    if pathish_has_forbidden_segment(token) {
+        return None;
+    }
+    let path = expand_concrete_pathish(token)?;
+    checked_expand_path(path, false)
+}
+
+fn sandbox_expand_dir_from_dir_pathish(pathish: &str) -> Option<PathBuf> {
+    let token = trim_shell_path_token(pathish);
+    if pathish_has_forbidden_segment(token) {
+        return None;
+    }
+    let path = expand_concrete_pathish(token)?;
+    checked_expand_path(path, true)
+}
+
+fn checked_expand_path(path: PathBuf, directory_arg: bool) -> Option<PathBuf> {
+    if !path.is_absolute() || path == Path::new("/") {
+        return None;
+    }
+    if has_forbidden_component(&path) || sandbox_expand_path_is_sensitive(&path) {
+        return None;
+    }
+    if directory_arg || path.is_dir() {
+        return Some(path);
+    }
+
+    let parent = path.parent()?;
+    if parent == Path::new("/") || parent.as_os_str().is_empty() {
+        Some(path)
+    } else {
+        Some(parent.to_path_buf())
+    }
+}
+
+fn expand_concrete_pathish(token: &str) -> Option<PathBuf> {
+    if token.is_empty() || token.contains('\0') {
+        return None;
+    }
+    if let Some(home_path) = expand_home_reference(token) {
+        return Some(home_path);
+    }
+    if token.contains('$') {
+        return None;
+    }
+    let path = PathBuf::from(token);
+    path.is_absolute().then_some(path)
+}
+
+fn expand_home_reference(token: &str) -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    if matches!(token, "~" | "$HOME" | "${HOME}") {
+        return Some(home);
+    }
+    let suffix = token
+        .strip_prefix("~/")
+        .or_else(|| token.strip_prefix("$HOME/"))
+        .or_else(|| token.strip_prefix("${HOME}/"))?;
+    (!suffix.contains('$')).then(|| home.join(suffix))
+}
+
+fn is_home_reference(token: &str) -> bool {
+    matches!(token, "~" | "$HOME" | "${HOME}")
+        || token.starts_with("~/")
+        || token.starts_with("$HOME/")
+        || token.starts_with("${HOME}/")
+}
+
+fn trim_shell_path_token(token: &str) -> &str {
+    token
+        .trim()
+        .trim_matches(['"', '\''])
+        .trim_end_matches([';', '&', ')', ','])
+        .trim_matches(['"', '\''])
+}
+
+fn has_forbidden_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+}
+
+fn pathish_has_forbidden_segment(pathish: &str) -> bool {
+    pathish
+        .split(['/', '\\'])
+        .any(|segment| matches!(segment, "." | ".."))
+}
+
+fn sandbox_expand_path_is_sensitive(path: &Path) -> bool {
+    let lower = path.to_string_lossy().to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "/etc/shadow" | "/etc/sudoers" | "/etc/passwd"
+    ) {
+        return true;
+    }
+    if lower.starts_with("/etc/sudoers.d/") {
+        return true;
+    }
+    for marker in [
+        "/.ssh",
+        "/.aws",
+        "/.kube",
+        "/.gnupg",
+        "/.azure",
+        "/.config/gh",
+        "/.config/gcloud",
+        "/.docker/config.json",
+        "/.git-credentials",
+        "/.netrc",
+    ] {
+        if lower == marker.trim_start_matches('/')
+            || lower.ends_with(marker)
+            || lower.contains(&format!("{marker}/"))
+        {
+            return true;
+        }
+    }
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    matches!(
+        file_name,
+        "id_rsa" | "id_ed25519" | "id_ecdsa" | "id_ed25519_sk" | ".env"
+    )
 }
 
 /// Prefix emitted by tool executors when a call is blocked by the
@@ -155,15 +348,43 @@ pub const SANDBOX_DENIED_PREFIX: &str = "SANDBOX_DENIED: ";
 /// one consumer.
 #[must_use]
 pub fn is_sandbox_denied(output: &str) -> bool {
-    output.starts_with(SANDBOX_DENIED_PREFIX)
+    sandbox_denied_message(output).is_some()
 }
 
 /// Strip the SANDBOX_DENIED_PREFIX and return just the message body.
 ///
 /// Returns `None` if the string doesn't carry the prefix.
 #[must_use]
-pub fn sandbox_denied_message(output: &str) -> Option<&str> {
-    output.strip_prefix(SANDBOX_DENIED_PREFIX)
+pub fn sandbox_denied_message(output: &str) -> Option<Cow<'_, str>> {
+    if let Some(message) = output.strip_prefix(SANDBOX_DENIED_PREFIX) {
+        return Some(Cow::Borrowed(message));
+    }
+
+    if let Ok(value) = serde_json::from_str::<Value>(output)
+        && let Some(message) = value
+            .get("error")
+            .or_else(|| value.get("message"))
+            .and_then(Value::as_str)
+            .and_then(|message| message.strip_prefix(SANDBOX_DENIED_PREFIX))
+    {
+        return Some(Cow::Owned(message.to_string()));
+    }
+
+    let trimmed = output.strip_prefix("Error: ").unwrap_or(output);
+    if trimmed.contains("outside the project directory")
+        && (trimmed.contains("sandbox approval") || trimmed.contains("Ask the user"))
+    {
+        return Some(Cow::Borrowed(trimmed.trim_end_matches('.')));
+    }
+
+    None
+}
+
+#[must_use]
+pub fn sandbox_retry_no_expand_dir_output(tool: &str, sandbox_msg: &str) -> String {
+    format!(
+        "Error: {tool} was blocked by the sandbox, but Astra could not safely choose a concrete non-sensitive directory to approve.\nPath check: {sandbox_msg}"
+    )
 }
 
 /// Minimal quote-aware tokenizer: splits on whitespace unless it's
@@ -175,8 +396,17 @@ fn quote_aware_tokens(input: &str) -> Vec<String> {
     let mut current = String::new();
     let mut in_single = false;
     let mut in_double = false;
+    let mut escaped = false;
     for ch in input.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
         match ch {
+            '\\' if !in_single => {
+                escaped = true;
+            }
             '\'' if !in_double => {
                 in_single = !in_single;
             }
@@ -191,6 +421,9 @@ fn quote_aware_tokens(input: &str) -> Vec<String> {
             c => current.push(c),
         }
     }
+    if escaped {
+        current.push('\\');
+    }
     if !current.is_empty() {
         tokens.push(current);
     }
@@ -201,7 +434,8 @@ fn quote_aware_tokens(input: &str) -> Vec<String> {
 mod tests {
     use super::{
         SANDBOX_DENIED_PREFIX, extract_first_absolute_path, is_sandbox_denied,
-        sandbox_denied_message, sandbox_expand_dir_from_args,
+        sandbox_denied_message, sandbox_expand_dir_from_args, sandbox_expand_dir_from_denial,
+        sandbox_retry_no_expand_dir_output,
     };
     use serde_json::json;
     use std::path::PathBuf;
@@ -237,6 +471,27 @@ mod tests {
         assert_eq!(
             sandbox_expand_dir_from_args(&args),
             Some(PathBuf::from("/home/user/outside"))
+        );
+    }
+
+    #[test]
+    fn expand_dir_from_home_reference_path_arg() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let args = json!({"path": "~/astra-review-guide.md"});
+        assert_eq!(sandbox_expand_dir_from_args(&args), Some(home));
+    }
+
+    #[test]
+    fn expand_dir_from_bash_home_env_reference() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let args = json!({"command": "cat ${HOME}/external-workspace/Tool.ts"});
+        assert_eq!(
+            sandbox_expand_dir_from_args(&args),
+            Some(home.join("external-workspace"))
         );
     }
 
@@ -300,6 +555,15 @@ mod tests {
     }
 
     #[test]
+    fn expand_dir_handles_shell_escaped_spaces_in_command_paths() {
+        let args = json!({"command": r#"cat /home/user/My\ Project/report.md"#});
+        assert_eq!(
+            sandbox_expand_dir_from_args(&args),
+            Some(PathBuf::from("/home/user/My Project"))
+        );
+    }
+
+    #[test]
     fn expand_dir_rejects_parent_traversal_in_path() {
         // `/allowed/../etc/passwd` lexically has parent `/allowed/..`, which
         // Path::parent reports as `/allowed` — but after `..` resolution the
@@ -322,6 +586,63 @@ mod tests {
         // simpler contract than trying to partially-normalize.
         let args = json!({"path": "/./etc/hosts"});
         assert_eq!(sandbox_expand_dir_from_args(&args), None);
+    }
+
+    #[test]
+    fn expand_dir_rejects_sensitive_path_args() {
+        for args in [
+            json!({"path": "/home/user/.ssh/id_rsa"}),
+            json!({"path": "/etc/shadow"}),
+            json!({"cwd": "/home/user/.ssh"}),
+        ] {
+            assert_eq!(
+                sandbox_expand_dir_from_args(&args),
+                None,
+                "sandbox expansion must not derive a directory for sensitive path args: {args}"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_dir_from_denial_message_when_args_are_not_enough() {
+        let args = json!({"command": "custom_reader --target outside"});
+        let message = "The command references '/home/user/external-workspace/Tool.ts' which is outside the project directory '/home/user/project'.";
+        assert_eq!(
+            sandbox_expand_dir_from_denial(&args, message),
+            Some(PathBuf::from("/home/user/external-workspace"))
+        );
+    }
+
+    #[test]
+    fn expand_dir_from_denial_message_home_reference() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let args = json!({"command": "cat ~/external-workspace/Tool.ts"});
+        let message = "The command references '~/external-workspace/Tool.ts' which is outside the project directory '/project'.";
+        assert_eq!(
+            sandbox_expand_dir_from_denial(&args, message),
+            Some(home.join("external-workspace"))
+        );
+    }
+
+    #[test]
+    fn expand_dir_from_denial_message_does_not_use_project_root_fallback() {
+        let args = json!({"path": "../secret.txt"});
+        let message = "Path '../secret.txt' is outside the project directory '/home/user/project'; sandbox approval is required for this external path.";
+        assert_eq!(sandbox_expand_dir_from_denial(&args, message), None);
+    }
+
+    #[test]
+    fn expand_dir_from_denial_message_rejects_sensitive_target() {
+        let args = json!({"command": "external_reader --target secret"});
+        let message =
+            "Path '/home/user/.ssh/id_rsa' is outside the project directory '/home/user/project'.";
+        assert_eq!(
+            sandbox_expand_dir_from_denial(&args, message),
+            None,
+            "sandbox retry must fail closed if a denial names a sensitive path"
+        );
     }
 
     // ── extract_first_absolute_path ──────────────────────────────────────
@@ -361,6 +682,14 @@ mod tests {
             !extract_first_absolute_path("echo '/a/b'")
                 .unwrap()
                 .contains('\'')
+        );
+    }
+
+    #[test]
+    fn extract_path_handles_shell_escaped_spaces() {
+        assert_eq!(
+            extract_first_absolute_path(r#"cat /path\ with\ spaces/file"#),
+            Some("/path with spaces/file".to_string())
         );
     }
 
@@ -413,6 +742,17 @@ mod tests {
     }
 
     #[test]
+    fn is_sandbox_denied_detects_structured_write_file_error() {
+        let output = json!({
+            "success": false,
+            "error": "SANDBOX_DENIED: Path '/home/user/out.md' is outside the project directory '/home/user/project'; sandbox approval is required for this external path."
+        })
+        .to_string();
+
+        assert!(is_sandbox_denied(&output));
+    }
+
+    #[test]
     fn is_sandbox_denied_rejects_non_prefixed() {
         assert!(!is_sandbox_denied("ok: file contents…"));
         assert!(!is_sandbox_denied(
@@ -423,12 +763,40 @@ mod tests {
     #[test]
     fn sandbox_denied_message_strips_prefix() {
         let msg = sandbox_denied_message("SANDBOX_DENIED: path outside").unwrap();
-        assert_eq!(msg, "path outside");
+        assert_eq!(msg.as_ref(), "path outside");
+    }
+
+    #[test]
+    fn sandbox_denied_message_strips_structured_error_prefix() {
+        let output = json!({
+            "success": false,
+            "error": "SANDBOX_DENIED: Path '/home/user/out.md' is outside the project directory '/home/user/project'; sandbox approval is required for this external path."
+        })
+        .to_string();
+
+        let msg = sandbox_denied_message(&output).unwrap();
+        assert_eq!(
+            msg.as_ref(),
+            "Path '/home/user/out.md' is outside the project directory '/home/user/project'; sandbox approval is required for this external path."
+        );
     }
 
     #[test]
     fn sandbox_denied_message_none_for_non_prefixed() {
         assert!(sandbox_denied_message("ok: contents").is_none());
+    }
+
+    #[test]
+    fn sandbox_retry_no_expand_dir_output_is_not_retryable_denial() {
+        let output = sandbox_retry_no_expand_dir_output(
+            "read_file",
+            "Path '../secret.txt' is outside the project directory '/home/user/project'.",
+        );
+
+        assert!(!output.contains(SANDBOX_DENIED_PREFIX));
+        assert!(!is_sandbox_denied(&output));
+        assert!(output.contains("concrete non-sensitive directory"));
+        assert!(output.contains("Path check:"));
     }
 
     // ── Integration invariant (regression guard for session 3b7ac18f)

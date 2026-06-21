@@ -5084,6 +5084,33 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_expand_accept_edits_mode_still_needs_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::AcceptEdits, dir.path());
+        pm.replace_user_settings(PermissionSettings::default());
+        let args = serde_json::json!({
+            "reason": "Path '/tmp/outside.md' is outside the project directory '/tmp/project'; sandbox approval is required for this external path."
+        });
+
+        let decision = pm.check_nonblocking("sandbox_expand:write_file", &args);
+
+        match decision {
+            PermissionDecision::NeedApproval {
+                tool,
+                header,
+                detail,
+                reason,
+            } => {
+                assert_eq!(tool, "sandbox_expand:write_file");
+                assert_eq!(header, "write_file wants to write outside the project");
+                assert_eq!(detail, None);
+                assert!(reason.contains("/tmp/outside.md"), "{reason}");
+            }
+            other => panic!("AcceptEdits must ask before expanding outside sandbox; got {other:?}"),
+        }
+    }
+
+    #[test]
     fn sandbox_expand_prompt_does_not_echo_reason_into_detail() {
         // Regression: the UI used to show the same sandbox message in
         // header, detail, and reason because both stream_render and
