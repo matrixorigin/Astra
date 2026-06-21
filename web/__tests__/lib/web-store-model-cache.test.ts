@@ -76,11 +76,12 @@ describe("resolveBackendModelName", () => {
     expect(result).toBe("unknown-model-xyz");
   });
 
-  it("returns undefined immediately when no model provided", async () => {
+  it("rejects missing model before listModels lookup", async () => {
     const { client, mockListModels } = makeRuntime();
 
-    const result = await resolveBackendModelName(client, undefined);
-    expect(result).toBeUndefined();
+    await expect(resolveBackendModelName(client, "")).rejects.toThrow(
+      "model is required",
+    );
     expect(mockListModels).not.toHaveBeenCalled();
   });
 

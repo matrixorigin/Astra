@@ -100,6 +100,7 @@ describe('scenarios / multi-turn context wire contract', () => {
       {
         message: 'turn 1: inspect the cache regression',
         sessionId: 'sess-ctx',
+        selectedModel: { model: 'claude-sonnet-4.6' },
         context: { turn: 1, facts: ['cache_read_tokens unexpectedly zero'] },
         executionBudget: { initialTurns: 1, hardTurnLimit: 4 },
       },
@@ -112,6 +113,7 @@ describe('scenarios / multi-turn context wire contract', () => {
       {
         message: 'turn 2: apply the fix',
         sessionId: 'sess-ctx',
+        selectedModel: { model: 'claude-sonnet-4.6' },
         context: {
           turn: 2,
           facts: ['cache_read_tokens unexpectedly zero', 'tool schema changed mid-session'],

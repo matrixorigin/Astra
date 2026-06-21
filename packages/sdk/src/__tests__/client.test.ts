@@ -281,7 +281,10 @@ describe("AstraClient — Runs", () => {
     const chatResp = { session_id: "s1", run_id: "r1", status: "running" };
     globalThis.fetch = mockFetch(200, chatResp);
 
-    const result = await createClient().createRun({ message: "hello" });
+    const result = await createClient().createRun({
+      message: "hello",
+      selectedModel: { model: "test-model" },
+    });
     expect(result.runId).toBe("r1");
     expect(result.sessionId).toBe("s1");
     const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];

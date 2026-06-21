@@ -96,6 +96,7 @@ const RUN_SYNC_PAGE_SIZE = 200;
 const MAX_DEFERRED_INPUT_CHARS = 20_000;
 const LEGACY_LOCAL_CHAT_IDS = new Set(["chat-web-agent-notes"]);
 const WORKSPACE_SELECTION_METADATA_KEY = "workspace_selection";
+const DEFAULT_WEB_MODEL = "sonnet-4.6-adaptive";
 
 type StreamResult = {
   assistantText: string;
@@ -106,6 +107,11 @@ type StreamResult = {
 
 function runtimeOperationError(operation: string, error: unknown) {
   return new Error(`${operation}: ${runtimeErrorDetail(error)}`);
+}
+
+export function selectedWebModel(model?: string | null): string {
+  const normalized = model?.trim();
+  return normalized || DEFAULT_WEB_MODEL;
 }
 
 declare global {
@@ -511,7 +517,7 @@ export function getCurrentUser(): UserSummary {
 export function listModelSummaries(): ModelSummary[] {
   return [
     {
-      id: "sonnet-4.6-adaptive",
+      id: DEFAULT_WEB_MODEL,
       name: "Sonnet 4.6",
       subtitle: "Responsive everyday work",
       tier: "included",
@@ -886,7 +892,7 @@ export async function sendMessage(
   const agentResult = await callBackendAgent({
     sessionId: chat.id,
     text: payload.content,
-    model: payload.options?.model,
+    model: selectedWebModel(payload.options?.model ?? chat.model),
     activeSkills: payload.options?.activeSkills,
   });
   assertBackendSessionMatchesChat(chat.id, agentResult.sessionId);
@@ -1715,7 +1721,7 @@ export async function ensureChatBackendSession(
     return chat.backendSessionId;
   }
 
-  const model = params.model ?? chat.model ?? "sonnet-4.6-adaptive";
+  const model = selectedWebModel(params.model ?? chat.model);
   const session = await createBackendSession({
     title: chat.title,
     projectId: chat.projectId,
@@ -2332,7 +2338,7 @@ function appendAssistantMessage(
 async function callBackendAgent(params: {
   sessionId?: string;
   text: string;
-  model?: string;
+  model: string;
   activeSkills?: string[];
 }): Promise<{ ok: boolean; sessionId?: string; assistantText: string }> {
   const controller = new AbortController();
@@ -2353,7 +2359,7 @@ async function callBackendAgent(params: {
       {
         message: params.text,
         sessionId: params.sessionId,
-        model,
+        selectedModel: { model },
         allowSkills: activeSkills.length ? activeSkills : undefined,
         context: {
           source: "web_v1",
@@ -2541,10 +2547,11 @@ function parseRunSseText(text: string): StreamResult {
 
 export async function resolveBackendModelName(
   runtime: RuntimeConfig | WebRuntimeClient,
-  model?: string,
-) {
-  if (!model) {
-    return model;
+  model: string,
+): Promise<string> {
+  const requestedModel = model.trim();
+  if (!requestedModel) {
+    throw new Error("model is required");
   }
 
   try {
@@ -2554,7 +2561,7 @@ export async function resolveBackendModelName(
         : new WebRuntimeClient(runtime);
     const accessToken = client.config.accessToken;
     if (!accessToken) {
-      return model;
+      return requestedModel;
     }
 
     const cached = modelCache.get(accessToken);
@@ -2571,14 +2578,14 @@ export async function resolveBackendModelName(
       throw err;
     });
     const matched = models.find(
-      (item) => item.model_id === model || item.name === model,
+      (item) => item.model_id === requestedModel || item.name === requestedModel,
     );
-    return matched?.name ?? model;
+    return matched?.name ?? requestedModel;
   } catch (error) {
     console.warn(
       "[web-store] resolveBackendModelName failed, returning raw model name:",
       error instanceof Error ? error.message : error,
     );
-    return model;
+    return requestedModel;
   }
 }
