@@ -31,7 +31,7 @@ pub use astra_turn_core::tool_registry_selection_edge_hints::{
 pub use astra_turn_core::tool_registry_state::ConversationState;
 pub use plugin::{PluginRegistry, PluginToolEntry};
 pub use registry::ToolRegistry;
-pub use scoring::{DEFAULT_TOOL_BUDGET_TOKENS, DynamicFilter, pre_filter_dynamic, tfidf_score};
+pub use scoring::{DEFAULT_TOOL_BUDGET_TOKENS, FilterOptions, pre_filter_dynamic, tfidf_score};
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn prefilter_greeting_returns_empty() {
         let state = ConversationState::from_message("hi", 1);
-        let ranked = pre_filter_dynamic(&state, "hi", &DynamicFilter::new());
+        let ranked = pre_filter_dynamic(&state, "hi", &FilterOptions::default());
         assert!(
             ranked.is_empty(),
             "pure greeting should skip dynamic tools, got {} tools",
@@ -698,7 +698,7 @@ mod tests {
         let baseline = pre_filter_dynamic(
             &state,
             "show me the github pull requests",
-            &DynamicFilter::new(),
+            &FilterOptions::default(),
         );
 
         // With tracker: record many successful uses for a specific tool
@@ -717,7 +717,10 @@ mod tests {
         let boosted = pre_filter_dynamic(
             &state,
             "show me the github pull requests",
-            &DynamicFilter::new().quality(Some(&tracker)),
+            &FilterOptions {
+                quality_tracker: Some(&tracker),
+                ..Default::default()
+            },
         );
 
         let find_score = |results: &[(usize, f64)], name: &str| -> Option<f64> {
@@ -751,11 +754,14 @@ mod tests {
             // No record_feedback → tool never used → use_rate = 0
         }
 
-        let baseline = pre_filter_dynamic(&state, "show me the git log", &DynamicFilter::new());
+        let baseline = pre_filter_dynamic(&state, "show me the git log", &FilterOptions::default());
         let penalized = pre_filter_dynamic(
             &state,
             "show me the git log",
-            &DynamicFilter::new().quality(Some(&tracker)),
+            &FilterOptions {
+                quality_tracker: Some(&tracker),
+                ..Default::default()
+            },
         );
 
         let find_score = |results: &[(usize, f64)], name: &str| -> Option<f64> {
@@ -832,7 +838,7 @@ mod tests {
         let fetch_results = pre_filter_dynamic(
             &fetch_state,
             "show me the latest PRs",
-            &DynamicFilter::new(),
+            &FilterOptions::default(),
         );
 
         // Multi-intent conflicting query: fetch + mutate
@@ -844,7 +850,7 @@ mod tests {
         let conflict_results = pre_filter_dynamic(
             &conflict_state,
             "show me the latest PRs and create a new issue",
-            &DynamicFilter::new(),
+            &FilterOptions::default(),
         );
 
         // Conflicting query should select at least as many tools (lower threshold)
@@ -896,7 +902,7 @@ mod tests {
         let results_uncalibrated = scoring::pre_filter_dynamic(
             &state,
             "list open PRs in matrixone",
-            &DynamicFilter::new(),
+            &FilterOptions::default(),
         );
 
         // With calibrator that has high correction rate for "github"
@@ -907,7 +913,10 @@ mod tests {
         let results_calibrated = scoring::pre_filter_dynamic(
             &state,
             "list open PRs in matrixone",
-            &DynamicFilter::new().calibrator(Some(&cal)),
+            &FilterOptions {
+                calibrator: Some(&cal),
+                ..Default::default()
+            },
         );
 
         // Calibrated should include at least as many tools (lower threshold → more tools)
@@ -1026,7 +1035,7 @@ mod tests {
     fn prefilter_all_tools_have_nonnegative_scores() {
         let state = ConversationState::from_message("analyze everything", 1);
         let ranked =
-            scoring::pre_filter_dynamic(&state, "analyze everything", &DynamicFilter::new());
+            scoring::pre_filter_dynamic(&state, "analyze everything", &FilterOptions::default());
         for (idx, score) in &ranked {
             assert!(
                 *score >= 0.0,

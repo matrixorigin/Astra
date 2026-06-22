@@ -127,13 +127,20 @@ impl ToolSurface {
             .chain(plugin_schemas.iter().cloned())
         {
             if let Some(name) = tool_schema_name(&schema) {
+                if by_name.contains_key(name) {
+                    tracing::warn!(
+                        target: "astra.tool_surface",
+                        name,
+                        "tool surface: schema name collision — '{name}' is already registered; overwriting with later entry"
+                    );
+                }
                 by_name.insert(name.to_string(), schema);
             }
         }
 
         // Resolve the pinned name set: defaults + additive overrides, minus
-        // any `-name` removals. Unknown names (no schema in `by_name`) are
-        // silently dropped per the config contract.
+        // any `-name` removals. Unknown names emit a warning — they are likely
+        // typos (`+web_fetc`) or stale entries after a tool was renamed.
         let mut pinned_names: std::collections::BTreeSet<String> =
             DEFAULT_PINNED.iter().map(|s| (*s).to_string()).collect();
         for entry in &cfg.pinned_tools {
@@ -149,6 +156,12 @@ impl ToolSurface {
                 pinned_names.remove(name);
             } else if by_name.contains_key(trimmed) {
                 pinned_names.insert(trimmed.to_string());
+            } else {
+                tracing::warn!(
+                    target: "astra.tool_surface",
+                    entry = trimmed,
+                    "tool_surface.pinned_tools: unknown tool name '{trimmed}' ignored — typo or renamed tool?"
+                );
             }
         }
 

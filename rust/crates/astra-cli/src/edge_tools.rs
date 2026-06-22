@@ -1276,16 +1276,15 @@ impl ToolExecutor {
                 &surface,
                 |name| self.tool_has_runtime_binding(name),
             );
-        if retained.len() < guard.len() {
-            let retained_set: HashSet<&str> = retained.iter().map(String::as_str).collect();
-            let before = guard.len();
-            guard.retain(|name| retained_set.contains(name.as_str()));
-            tracing::debug!(
-                before,
-                after = guard.len(),
-                "pruned stale CLI activated_deferred_tools entries"
-            );
-        }
+        // Use set-based comparison, not length comparison: same-count with
+        // different names (e.g., {a,b} → {c,d}) must also trigger pruning.
+        let retained_set: HashSet<&str> = retained.iter().map(String::as_str).collect();
+        guard.retain(|name| retained_set.contains(name.as_str()));
+        tracing::debug!(
+            before = guard.len(),
+            after = guard.len(),
+            "pruned CLI activated_deferred_tools entries"
+        );
         retained
     }
 

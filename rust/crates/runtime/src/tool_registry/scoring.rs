@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 
 use astra_text_utils::text_tokenize::tokenize;
 use astra_turn_core::routing_metrics::{ConfidenceCalibrator, DisambiguationAction};
-use astra_turn_core::tool_registry_meta::{IntentType, Scope, TOOL_CATALOG, ToolMeta};
+use astra_turn_core::tool_registry_meta::{IntentType, Scope, ToolMeta, TOOL_CATALOG};
 use astra_turn_core::tool_registry_report::ToolQualityTracker;
 use astra_turn_core::tool_registry_state::ConversationState;
 
@@ -221,7 +221,11 @@ fn file_context_tool_boost(tool_name: &str, file_context: &[String]) -> f64 {
         "docker" => matches!(tool_name, "bash" | "read_file" | "write_file"),
         _ => false,
     });
-    if boost { 0.05 } else { 0.0 }
+    if boost {
+        0.05
+    } else {
+        0.0
+    }
 }
 
 fn explicit_lsp_signal(query_lower: &str) -> bool {
@@ -485,106 +489,29 @@ fn tool_relevance_score(
     }
 }
 
-/// Builder for dynamic tool pre-filtering. Encapsulates all optional scoring
-/// inputs that were previously threaded through 12 combinatorial wrapper
-/// functions.
+/// Pre-filter configuration for dynamic tool selection.
 ///
-/// Construct via [`DynamicFilter::new`] then chain builder methods. Pass the
-/// built filter to [`pre_filter_dynamic`].
+/// All fields are optional and default to `None`/`&[]`/`0.0`.
+/// Use struct literal syntax for construction:
 ///
-/// # Example
 /// ```ignore
-/// let filter = DynamicFilter::new()
-///     .pinned(&pinned_names)
-///     .quality(quality_tracker)
-///     .pressure(budget_pressure)
-///     .co_occurrence(&co_occurrence);
+/// let filter = FilterOptions {
+///     pinned_names: Some(&pinned_set),
+///     budget_pressure: 0.5,
+///     ..Default::default()
+/// };
 /// let ranked = pre_filter_dynamic(&state, query, &filter);
 /// ```
-#[derive(Clone)]
-pub struct DynamicFilter<'a> {
-    pinned_names: Option<&'a HashSet<String>>,
-    quality_tracker: Option<&'a ToolQualityTracker>,
-    calibrator: Option<&'a ConfidenceCalibrator>,
-    memory_domain_hints: &'a [crate::pipeline::routing::DomainHint],
-    budget_pressure: f64,
-    co_occurrence: Option<&'a HashMap<String, f64>>,
-    file_context: Option<&'a [String]>,
-    outcome_bias: Option<&'a HashMap<String, f64>>,
-}
-
-impl<'a> DynamicFilter<'a> {
-    /// Create a new filter with all defaults (no pinned exclusion, no quality
-    /// tracking, no pressure). Equivalent to the old bare `pre_filter_dynamic`.
-    pub fn new() -> Self {
-        Self {
-            pinned_names: None,
-            quality_tracker: None,
-            calibrator: None,
-            memory_domain_hints: &[],
-            budget_pressure: 0.0,
-            co_occurrence: None,
-            file_context: None,
-            outcome_bias: None,
-        }
-    }
-
-    /// Exclude pinned tools from dynamic selection. When set, tools whose
-    /// names appear in `names` are filtered out before scoring.
-    pub fn pinned(mut self, names: &'a HashSet<String>) -> Self {
-        self.pinned_names = Some(names);
-        self
-    }
-
-    /// Apply quality-based boost/penalty from historical effectiveness data.
-    pub fn quality(mut self, tracker: Option<&'a ToolQualityTracker>) -> Self {
-        self.quality_tracker = tracker;
-        self
-    }
-
-    /// Apply confidence calibration to scoring thresholds.
-    pub fn calibrator(mut self, cal: Option<&'a ConfidenceCalibrator>) -> Self {
-        self.calibrator = cal;
-        self
-    }
-
-    /// Provide memory domain hints for gate softening.
-    pub fn memory_hints(mut self, hints: &'a [crate::pipeline::routing::DomainHint]) -> Self {
-        self.memory_domain_hints = hints;
-        self
-    }
-
-    /// Set budget pressure (0.0 = none, 0.9 = aggressive). When > 0.01,
-    /// applies a rising minimum-score floor and caps forced-recall count.
-    pub fn pressure(mut self, pressure: f64) -> Self {
-        self.budget_pressure = pressure;
-        self
-    }
-
-    /// Provide tool co-occurrence scores for chain-aware boosting.
-    pub fn co_occurrence(mut self, scores: &'a HashMap<String, f64>) -> Self {
-        self.co_occurrence = Some(scores);
-        self
-    }
-
-    /// Provide file context for file-aware scoring.
-    pub fn file_context(mut self, files: &'a [String]) -> Self {
-        self.file_context = Some(files);
-        self
-    }
-
-    /// Provide outcome-memory bias (per-tool adjustment from recent
-    /// success/failure evidence).
-    pub fn outcome_bias(mut self, bias: &'a HashMap<String, f64>) -> Self {
-        self.outcome_bias = Some(bias);
-        self
-    }
-}
-
-impl Default for DynamicFilter<'_> {
-    fn default() -> Self {
-        Self::new()
-    }
+#[derive(Clone, Default)]
+pub struct FilterOptions<'a> {
+    pub pinned_names: Option<&'a HashSet<String>>,
+    pub quality_tracker: Option<&'a ToolQualityTracker>,
+    pub calibrator: Option<&'a ConfidenceCalibrator>,
+    pub memory_domain_hints: &'a [crate::pipeline::routing::DomainHint],
+    pub budget_pressure: f64,
+    pub co_occurrence: Option<&'a HashMap<String, f64>>,
+    pub file_context: Option<&'a [String]>,
+    pub outcome_bias: Option<&'a HashMap<String, f64>>,
 }
 
 /// Pre-filter: rank dynamic tools by relevance and filter by minimum score.
@@ -597,7 +524,7 @@ impl Default for DynamicFilter<'_> {
 pub fn pre_filter_dynamic(
     state: &ConversationState,
     query: &str,
-    filter: &DynamicFilter<'_>,
+    filter: &FilterOptions<'_>,
 ) -> Vec<(usize, f64)> {
     let empty_map = HashMap::new();
     let co_occurrence = filter.co_occurrence.unwrap_or(&empty_map);
@@ -1142,7 +1069,7 @@ mod tests {
     #[test]
     fn pre_filter_empty_query() {
         let state = state_at_turn(1);
-        let results = pre_filter_dynamic(&state, "", &DynamicFilter::new());
+        let results = pre_filter_dynamic(&state, "", &FilterOptions::default());
         // Empty query may still return tools due to cold-start logic
         // Just verify it doesn't panic
         let _ = results;
@@ -1151,7 +1078,14 @@ mod tests {
     #[test]
     fn pre_filter_with_pressure_max() {
         let state = state_at_turn(1);
-        let results = pre_filter_dynamic(&state, "read file", &DynamicFilter::new().pressure(1.0));
+        let results = pre_filter_dynamic(
+            &state,
+            "read file",
+            &FilterOptions {
+                budget_pressure: 1.0,
+                ..Default::default()
+            },
+        );
         // High pressure = stricter filter, but shouldn't panic
         let _ = results;
     }
@@ -1221,7 +1155,7 @@ mod tests {
     #[test]
     fn pre_filter_punctuation_only_query() {
         let state = state_at_turn(1);
-        let results = pre_filter_dynamic(&state, "!!!???", &DynamicFilter::new());
+        let results = pre_filter_dynamic(&state, "!!!???", &FilterOptions::default());
         // Should not panic — may return empty or few results
         for (_, score) in &results {
             assert!(*score >= 0.0);
@@ -1236,7 +1170,7 @@ mod tests {
         // in every tool re-split the full haystack.
         let state = state_at_turn(1);
         let long_query = "read ".repeat(2000);
-        let results = pre_filter_dynamic(&state, &long_query, &DynamicFilter::new());
+        let results = pre_filter_dynamic(&state, &long_query, &FilterOptions::default());
         for (_, score) in &results {
             assert!(*score >= 0.0 && *score <= 10.0);
         }
@@ -1267,7 +1201,7 @@ mod tests {
         let state = state_at_turn(1);
         // "查询代码 " = 13 bytes (3×3-byte CJK + 1×ASCII space).
         let long_cjk = "查询代码 ".repeat(2000);
-        let results = pre_filter_dynamic(&state, &long_cjk, &DynamicFilter::new());
+        let results = pre_filter_dynamic(&state, &long_cjk, &FilterOptions::default());
         for (_, score) in &results {
             assert!(*score >= 0.0 && *score <= 10.0);
         }
@@ -1279,7 +1213,7 @@ mod tests {
             is_conversational: true,
             ..Default::default()
         };
-        let results = pre_filter_dynamic(&state, "hello how are you", &DynamicFilter::new());
+        let results = pre_filter_dynamic(&state, "hello how are you", &FilterOptions::default());
         assert!(
             results.is_empty(),
             "conversational queries should return empty dynamic tools"

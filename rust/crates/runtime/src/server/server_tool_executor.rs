@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 use tokio_util::sync::CancellationToken;
 
@@ -27,8 +27,8 @@ use astra_core::SharedPool;
 use astra_runtime_env::WorkspaceRecord;
 use astra_tools::executor::DefaultToolExecutor;
 use astra_tools::task_mgmt::{
-    InMemoryTaskStore, MAX_CREATE_SUBTASKS, SessionTask, TaskManager, TaskManagerSnapshot,
-    TaskStore,
+    InMemoryTaskStore, SessionTask, TaskManager, TaskManagerSnapshot, TaskStore,
+    MAX_CREATE_SUBTASKS,
 };
 use astra_tools::tool_engine::ToolEngine;
 use astra_tools::{AskUserGate, ToolExecutor};
@@ -38,22 +38,22 @@ use async_trait::async_trait;
 
 use crate::orchestration::AgentToolContext;
 use crate::server::server_bash_execution::execute_server_bash;
-use crate::server::tool_ask_user::{AskUserExecutionContext, execute_ask_user};
+use crate::server::tool_ask_user::{execute_ask_user, AskUserExecutionContext};
 use crate::server::tool_database_snapshots::{self, DatabaseSnapshotRollbackJournal};
 use crate::server::tool_exactly_once;
 use crate::server::tool_execution_result::{result_metadata_str, tool_result_from_output};
 use crate::server::tool_local_execution::{
-    LocalToolExecutionLifecycle, LocalToolPreflight, LocalToolPreflightContext,
     record_preview_template_missing, run_local_tool_preflight, spawn_resource_tool_call_recording,
-    unknown_local_tool_result,
+    unknown_local_tool_result, LocalToolExecutionLifecycle, LocalToolPreflight,
+    LocalToolPreflightContext,
 };
 use crate::server::tool_plan_gate::{
-    PlanModeSnapshot, is_plan_mode_blocked_tool, plan_mode_authoring_active,
+    is_plan_mode_blocked_tool, plan_mode_authoring_active, PlanModeSnapshot,
 };
-use crate::server::tool_route_runtime::{ToolRouteRuntimeContext, execute_tool_route_with_events};
+use crate::server::tool_route_runtime::{execute_tool_route_with_events, ToolRouteRuntimeContext};
 use crate::server::tool_session_config::{
-    ToolPreferenceAction, execute_adjust_config, execute_compress_context,
-    execute_tool_preference_update,
+    execute_adjust_config, execute_compress_context, execute_tool_preference_update,
+    ToolPreferenceAction,
 };
 use crate::server::tool_session_state_rollback::{
     self, RollbackSessionStateContext, SessionStateRestoreContext, SessionStateRollbackAction,
@@ -61,16 +61,15 @@ use crate::server::tool_session_state_rollback::{
 };
 
 use crate::server::tool_transport::{
-    ExecutionBindingState, ExecutorBinding, ServerLocalToolTransport,
-    TOOL_ERROR_KIND_AGENT_WAITING, TOOL_ERROR_KIND_APPROVAL_TIMEOUT, TOOL_ERROR_KIND_CANCELLED,
-    TOOL_ERROR_KIND_CAPABILITY_DENIED, TOOL_ERROR_KIND_EXECUTOR_OFFLINE,
-    TOOL_ERROR_KIND_TOOL_TIMEOUT, TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED,
-    TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH, ToolExecutionRequest, ToolExecutionService,
-    WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind, binding_event_fields,
-    capability_filtered_server_tool_schemas,
+    binding_event_fields, capability_filtered_server_tool_schemas, ExecutionBindingState,
+    ExecutorBinding, ServerLocalToolTransport, ToolExecutionRequest, ToolExecutionService,
+    WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind, TOOL_ERROR_KIND_AGENT_WAITING,
+    TOOL_ERROR_KIND_APPROVAL_TIMEOUT, TOOL_ERROR_KIND_CANCELLED, TOOL_ERROR_KIND_CAPABILITY_DENIED,
+    TOOL_ERROR_KIND_EXECUTOR_OFFLINE, TOOL_ERROR_KIND_TOOL_TIMEOUT,
+    TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED, TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH,
 };
 use crate::server::tool_work_surface_events::{
-    WorkSurfaceEventEmitter, binding_snapshot_events, task_board_snapshot_event,
+    binding_snapshot_events, task_board_snapshot_event, WorkSurfaceEventEmitter,
 };
 use crate::tool_sandbox::SandboxPolicy;
 use astra_turn_core::file_edit_journal::FileEditJournal;
@@ -630,16 +629,16 @@ impl ServerToolExecutor {
         // — without this, the set accumulates every deferred tool ever
         // activated for the entire session. Done under the same write lock
         // so concurrent activations cannot be lost between compute and store.
-        if retained.len() < guard.len() {
-            let retained_set: HashSet<&str> = retained.iter().map(String::as_str).collect();
-            let before = guard.len();
-            guard.retain(|name| retained_set.contains(name.as_str()));
-            tracing::debug!(
-                before,
-                after = guard.len(),
-                "pruning stale activated_deferred_tools entries"
-            );
-        }
+        //
+        // Use set-based comparison, not length comparison: same-count with
+        // different names (e.g., {a,b} → {c,d}) must also trigger pruning.
+        let retained_set: HashSet<&str> = retained.iter().map(String::as_str).collect();
+        guard.retain(|name| retained_set.contains(name.as_str()));
+        tracing::debug!(
+            before = guard.len(),
+            after = guard.len(),
+            "pruning stale activated_deferred_tools entries"
+        );
         retained
     }
 
@@ -1897,12 +1896,10 @@ mod tests {
             serde_json::from_str(&rollback_missing_snapshot.output).expect("rollback JSON");
         assert_eq!(value["success"], false);
         assert_eq!(value["scope"], "snapshot");
-        assert!(
-            value["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("missing 'snapshot_id'")
-        );
+        assert!(value["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("missing 'snapshot_id'"));
     }
 
     #[tokio::test]
@@ -5560,46 +5557,36 @@ esac
             server_sandbox_local_path_mismatch("cd subdir && pwd", workspace_root, &workspace)
                 .is_none()
         );
-        assert!(
-            server_sandbox_local_path_mismatch(
-                "cat /Users/server/astra-workspaces/session-1/marker.txt",
-                workspace_root,
-                &workspace,
-            )
-            .is_none()
-        );
-        assert!(
-            server_sandbox_local_path_mismatch(
-                "cd ~/github/astra && git status",
-                workspace_root,
-                &workspace,
-            )
-            .is_some()
-        );
-        assert!(
-            server_sandbox_local_path_mismatch(
-                "cd $HOME/github/astra && git status",
-                workspace_root,
-                &workspace,
-            )
-            .is_some()
-        );
-        assert!(
-            server_sandbox_local_path_mismatch(
-                "cd ${HOME}/github/astra && git status",
-                workspace_root,
-                &workspace,
-            )
-            .is_some()
-        );
-        assert!(
-            server_sandbox_local_path_mismatch(
-                "cd /Users/xupeng/github/astra && git status",
-                workspace_root,
-                &workspace,
-            )
-            .is_some()
-        );
+        assert!(server_sandbox_local_path_mismatch(
+            "cat /Users/server/astra-workspaces/session-1/marker.txt",
+            workspace_root,
+            &workspace,
+        )
+        .is_none());
+        assert!(server_sandbox_local_path_mismatch(
+            "cd ~/github/astra && git status",
+            workspace_root,
+            &workspace,
+        )
+        .is_some());
+        assert!(server_sandbox_local_path_mismatch(
+            "cd $HOME/github/astra && git status",
+            workspace_root,
+            &workspace,
+        )
+        .is_some());
+        assert!(server_sandbox_local_path_mismatch(
+            "cd ${HOME}/github/astra && git status",
+            workspace_root,
+            &workspace,
+        )
+        .is_some());
+        assert!(server_sandbox_local_path_mismatch(
+            "cd /Users/xupeng/github/astra && git status",
+            workspace_root,
+            &workspace,
+        )
+        .is_some());
     }
 
     #[test]
@@ -5621,42 +5608,34 @@ esac
         let workspace_root = Path::new("/Users/server/astra-workspaces/session-1");
         let workspace = WorkspaceBinding::server_sandbox(workspace_root);
 
-        assert!(
-            server_sandbox_tool_path_mismatch(
-                "read_file",
-                &json!({"path": "/Users/server/astra-workspaces/session-1/marker.txt"}),
-                workspace_root,
-                &workspace,
-            )
-            .is_none()
-        );
-        assert!(
-            server_sandbox_tool_path_mismatch(
-                "read_file",
-                &json!({"path": "/Users/xupeng/github/astra/src/lib.rs"}),
-                workspace_root,
-                &workspace,
-            )
-            .is_some()
-        );
-        assert!(
-            server_sandbox_tool_path_mismatch(
-                "read_file",
-                &json!({"path": "$HOME/github/astra/src/lib.rs"}),
-                workspace_root,
-                &workspace,
-            )
-            .is_some()
-        );
-        assert!(
-            server_sandbox_tool_path_mismatch(
-                "read_file",
-                &json!({"path": "${HOME}/github/astra/src/lib.rs"}),
-                workspace_root,
-                &workspace,
-            )
-            .is_some()
-        );
+        assert!(server_sandbox_tool_path_mismatch(
+            "read_file",
+            &json!({"path": "/Users/server/astra-workspaces/session-1/marker.txt"}),
+            workspace_root,
+            &workspace,
+        )
+        .is_none());
+        assert!(server_sandbox_tool_path_mismatch(
+            "read_file",
+            &json!({"path": "/Users/xupeng/github/astra/src/lib.rs"}),
+            workspace_root,
+            &workspace,
+        )
+        .is_some());
+        assert!(server_sandbox_tool_path_mismatch(
+            "read_file",
+            &json!({"path": "$HOME/github/astra/src/lib.rs"}),
+            workspace_root,
+            &workspace,
+        )
+        .is_some());
+        assert!(server_sandbox_tool_path_mismatch(
+            "read_file",
+            &json!({"path": "${HOME}/github/astra/src/lib.rs"}),
+            workspace_root,
+            &workspace,
+        )
+        .is_some());
         assert!(
             server_sandbox_tool_path_mismatch(
                 "list_dir",
@@ -5677,42 +5656,34 @@ esac
             .is_none(),
             "grep pattern is content, not a filesystem target"
         );
-        assert!(
-            server_sandbox_tool_path_mismatch(
-                "grep",
-                &json!({"pattern": "needle", "path": "/Users/xupeng/github/astra"}),
-                workspace_root,
-                &workspace,
-            )
-            .is_some()
-        );
-        assert!(
-            server_sandbox_tool_path_mismatch(
-                "glob",
-                &json!({"pattern": "/Users/xupeng/github/astra/**/*.rs"}),
-                workspace_root,
-                &workspace,
-            )
-            .is_some()
-        );
-        assert!(
-            server_sandbox_tool_path_mismatch(
-                "glob",
-                &json!({"pattern": "/Users/server/astra-workspaces/session-1/**/*.rs"}),
-                workspace_root,
-                &workspace,
-            )
-            .is_none()
-        );
-        assert!(
-            server_sandbox_tool_path_mismatch(
-                "git",
-                &json!({"action": "file_history", "file": "/Users/xupeng/github/astra/src/lib.rs"}),
-                workspace_root,
-                &workspace,
-            )
-            .is_some()
-        );
+        assert!(server_sandbox_tool_path_mismatch(
+            "grep",
+            &json!({"pattern": "needle", "path": "/Users/xupeng/github/astra"}),
+            workspace_root,
+            &workspace,
+        )
+        .is_some());
+        assert!(server_sandbox_tool_path_mismatch(
+            "glob",
+            &json!({"pattern": "/Users/xupeng/github/astra/**/*.rs"}),
+            workspace_root,
+            &workspace,
+        )
+        .is_some());
+        assert!(server_sandbox_tool_path_mismatch(
+            "glob",
+            &json!({"pattern": "/Users/server/astra-workspaces/session-1/**/*.rs"}),
+            workspace_root,
+            &workspace,
+        )
+        .is_none());
+        assert!(server_sandbox_tool_path_mismatch(
+            "git",
+            &json!({"action": "file_history", "file": "/Users/xupeng/github/astra/src/lib.rs"}),
+            workspace_root,
+            &workspace,
+        )
+        .is_some());
     }
 
     #[tokio::test]
@@ -6187,12 +6158,10 @@ esac
             .expect("rollback_database_snapshots json");
         assert_eq!(value["success"].as_bool(), Some(false));
         assert_eq!(value["scope"].as_str(), Some("snapshot"));
-        assert!(
-            value["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("missing 'snapshot_id'")
-        );
+        assert!(value["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("missing 'snapshot_id'"));
     }
 
     #[cfg(unix)]
@@ -6216,11 +6185,9 @@ esac
             .await;
         assert!(!result.is_error, "got: {}", result.output);
         let fields = result.metadata.as_ref().expect("mo_query metadata");
-        assert!(
-            fields["pre_state_snapshot_id"]
-                .as_str()
-                .is_some_and(|snapshot_id| snapshot_id.starts_with("moq_"))
-        );
+        assert!(fields["pre_state_snapshot_id"]
+            .as_str()
+            .is_some_and(|snapshot_id| snapshot_id.starts_with("moq_")));
         let expected_database = astra_core::resolve_database_name(&|key| std::env::var(key).ok());
         assert_eq!(
             fields["pre_state_snapshot_database"].as_str(),
@@ -6268,11 +6235,9 @@ esac
         let result = exec.execute_with_metadata("memory", &json!({})).await;
 
         assert!(result.is_error, "{result:?}");
-        assert!(
-            result
-                .output
-                .contains("missing required parameter `action`")
-        );
+        assert!(result
+            .output
+            .contains("missing required parameter `action`"));
         assert!(
             result
                 .metadata
@@ -7997,8 +7962,8 @@ esac
     /// runtime's block_on, so the spawned task can never run.
     #[test]
     fn handle_block_on_inside_block_in_place_completes() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
 
         let done = Arc::new(AtomicBool::new(false));
         let done2 = done.clone();

@@ -102,17 +102,19 @@ fn manifest_for_model(
         return None;
     };
     let resolved_budget = crate::prompts::budget_for_model(Some(resolved_model_name)).model_limit;
-    if source_budget != resolved_budget {
+    let effective_budget = if source_budget != resolved_budget {
         tracing::warn!(
             target: LOG_TARGET,
             model = resolved_model_name,
             source_budget,
             resolved_budget,
             declared_count = declared_names.len(),
-            "deferred tool manifest omitted because model context-window metadata changed"
+            "deferred tool manifest budget mismatch — using min({source_budget}, {resolved_budget})"
         );
-        return None;
-    }
+        source_budget.min(resolved_budget)
+    } else {
+        source_budget
+    };
     let Some(block) = edge_profile
         .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT)
         .and_then(Value::as_str)
@@ -166,7 +168,7 @@ fn manifest_for_model(
     names.sort();
     Some(DeferredManifest {
         text: block,
-        context_window: source_budget,
+        context_window: effective_budget,
         names,
     })
 }
@@ -221,7 +223,11 @@ fn filter_block_to_names(block: &str, names: &HashSet<String>) -> Option<String>
     }
     rendered.push_str(rest);
 
-    if kept == 0 { None } else { Some(rendered) }
+    if kept == 0 {
+        None
+    } else {
+        Some(rendered)
+    }
 }
 
 #[cfg(test)]

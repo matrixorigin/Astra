@@ -2,11 +2,11 @@ use serde_json::Value;
 
 use astra_config::ToolSurfaceConfig;
 
-use super::scoring::{DEFAULT_TOOL_BUDGET_TOKENS, DynamicFilter, pre_filter_dynamic};
+use super::scoring::{pre_filter_dynamic, FilterOptions, DEFAULT_TOOL_BUDGET_TOKENS};
 use crate::pipeline::routing::{RoutingDecision, ToolFilter};
 use astra_turn_core::routing_metrics::ConfidenceCalibrator;
 use astra_turn_core::tool::schema::tool_schema_name;
-use astra_turn_core::tool_registry_meta::{TOOL_CATALOG, ToolMeta};
+use astra_turn_core::tool_registry_meta::{ToolMeta, TOOL_CATALOG};
 use astra_turn_core::tool_registry_report::{SelectionReport, ToolQualityTracker};
 use astra_turn_core::tool_registry_state::ConversationState;
 
@@ -258,7 +258,10 @@ impl ToolRegistry {
         }
 
         let pinned_names = self.pinned_name_set();
-        let filter = DynamicFilter::new().pinned(pinned_names);
+        let filter = FilterOptions {
+            pinned_names: Some(pinned_names),
+            ..Default::default()
+        };
         let ranked = pre_filter_dynamic(&state, query, &filter);
         let schemas = self.budget_select_measured(&ranked, budget);
         let names = Self::selected_names(&schemas);
@@ -318,9 +321,11 @@ impl ToolRegistry {
         }
 
         let pinned_names = self.pinned_name_set();
-        let filter = DynamicFilter::new()
-            .pinned(pinned_names)
-            .quality(quality_tracker);
+        let filter = FilterOptions {
+            pinned_names: Some(pinned_names),
+            quality_tracker,
+            ..Default::default()
+        };
         let ranked = pre_filter_dynamic(&state, query, &filter);
         let schemas = self.budget_select_measured(&ranked, budget);
         let names = Self::selected_names(&schemas);
@@ -452,17 +457,18 @@ impl ToolRegistry {
         let has_file_context = !file_context.is_empty();
         let has_outcome_bias = !outcome_bias.is_empty();
         let pinned_names = self.pinned_name_set();
-        let mut filter = DynamicFilter::new()
-            .pinned(pinned_names)
-            .quality(quality_tracker)
-            .calibrator(calibrator)
-            .memory_hints(memory_domain_hints);
+        let mut filter = FilterOptions {
+            pinned_names: Some(pinned_names),
+            quality_tracker,
+            calibrator,
+            memory_domain_hints,
+            ..Default::default()
+        };
         if budget_pressure > 0.01 || has_co_occurrence || has_file_context || has_outcome_bias {
-            filter = filter
-                .pressure(budget_pressure)
-                .co_occurrence(co_occurrence)
-                .file_context(file_context)
-                .outcome_bias(outcome_bias);
+            filter.budget_pressure = budget_pressure;
+            filter.co_occurrence = Some(co_occurrence);
+            filter.file_context = Some(file_context);
+            filter.outcome_bias = Some(outcome_bias);
         }
         let ranked = pre_filter_dynamic(&routing.conversation_state, &effective_query, &filter);
         let schemas = self.budget_select_measured(&ranked, budget);
