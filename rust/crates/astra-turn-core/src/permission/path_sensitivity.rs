@@ -83,6 +83,9 @@ fn is_tilde_hidden_home_app_state_path(path: &str) -> bool {
         return false;
     };
     let first = relative.split(['/', '\\']).next().unwrap_or(relative);
+    // Strip glob metacharacters for classification — a glob like `~/.xxx/*` targets
+    // the same sensitive directory as `~/.xxx/foo`.
+    let first = first.trim_end_matches(['*', '?', '[', ']', '{', '}']);
     first.starts_with('.') && first.len() > 1
 }
 

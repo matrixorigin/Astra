@@ -213,14 +213,23 @@ async fn edge_dispatch_cleanup_stale_removes_completed() {
         .await
         .expect("deliver_result");
 
-    // Sleep to cross the second boundary — MatrixOne NOW(6) may truncate to
-    // second precision, so created_at (set at insert time) could appear
-    // "in the future" relative to a same-second NOW(6) call.
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    // Make only this test row stale. Using cleanup_stale(0) races under
+    // nextest/online parallelism because it can expire unrelated pending
+    // dispatches created by sibling tests.
+    sqlx::query(
+        "UPDATE edge_pending_dispatch \
+         SET completed_at = DATE_SUB(NOW(6), INTERVAL 2 DAY) \
+         WHERE request_id = ?",
+    )
+    .bind(&request_id)
+    .execute(pool.get())
+    .await
+    .expect("backdate completed dispatch");
 
-    // Cleanup with 0 seconds — removes all completed rows
+    // Cleanup rows older than one day. The backdated row is removed without
+    // touching newly-created pending rows from concurrently-running tests.
     let removed = svc
-        .cleanup_stale(std::time::Duration::from_secs(0))
+        .cleanup_stale(std::time::Duration::from_secs(24 * 60 * 60))
         .await
         .expect("cleanup_stale");
     assert!(removed >= 1, "should have removed at least 1 completed row");

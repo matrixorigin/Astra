@@ -72,10 +72,10 @@ fn mcp_error(
 
 fn agent_binding_mcp_http_client() -> &'static reqwest::Client {
     AGENT_BINDING_MCP_HTTP_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .pool_idle_timeout(Duration::from_secs(90))
-            .build()
-            .expect("agent binding MCP HTTP client configuration is static")
+        astra_core::net::build_internal_http_client(
+            reqwest::Client::builder().pool_idle_timeout(Duration::from_secs(90)),
+            "agent binding MCP client",
+        )
     })
 }
 

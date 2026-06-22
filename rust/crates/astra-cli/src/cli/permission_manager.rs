@@ -6957,7 +6957,7 @@ mod tests {
         assert!(
             matches!(
                 &secret_decision,
-                GateOutcome::Deny(reason) if reason.contains("credential/system-sensitive")
+                GateOutcome::Deny(reason) if reason.contains("sensitive credential")
             ),
             "credential-shaped files under hidden home app state must still gate: {secret_decision:?}"
         );
@@ -6967,7 +6967,7 @@ mod tests {
         assert!(
             matches!(
                 &bash_secret_decision,
-                GateOutcome::Deny(reason) if reason.contains("credential/system-sensitive")
+                GateOutcome::Deny(reason) if reason.contains("sensitive credential")
             ),
             "shell reads of hidden-home credentials must still gate: {bash_secret_decision:?}"
         );
