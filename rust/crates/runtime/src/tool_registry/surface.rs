@@ -216,6 +216,19 @@ impl ToolSurface {
         self.pinned.clone()
     }
 
+    /// Resolved pinned names in the same stable order as [`pinned_schemas`].
+    ///
+    /// This is the single runtime answer to "which tools are T1 for this
+    /// surface?". Callers that need cache markers, edge metadata, or diagnostics
+    /// should derive from the resolved surface instead of rebuilding the
+    /// DEFAULT_PINNED + TOML override rules locally.
+    pub fn pinned_names(&self) -> Vec<String> {
+        self.pinned
+            .iter()
+            .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
+            .collect()
+    }
+
     /// The deferred manifest — one `name + short_desc` entry per non-pinned
     /// tool, ready to render into the system-reminder block.
     pub fn deferred(&self) -> &[DeferredEntry] {

@@ -182,8 +182,8 @@ fn deferred_tools_block_for_bridge_model(
 ///
 /// When the key is present, the names reflect the resolved `ToolSurface` pinned
 /// set (user TOML overrides included). When absent (test-only path or
-/// server-side tools), falls back to the compile-time default so cache_control
-/// markers still land somewhere reasonable.
+/// server-side tools), falls back to the runtime-configured surface so
+/// cache_control markers still match TOML overrides.
 fn pinned_tool_names_for_bridge(
     edge_profile: &Map<String, Value>,
 ) -> std::collections::HashSet<String> {
@@ -196,7 +196,7 @@ fn pinned_tool_names_for_bridge(
                 .map(str::to_string)
                 .collect()
         })
-        .unwrap_or_else(crate::turn::prompt_cache::default_pinned_tool_names)
+        .unwrap_or_else(crate::turn::prompt_cache::runtime_pinned_tool_names)
 }
 
 /// Decide whether the bridge should run its own `prefetch_memories` call.
@@ -4632,7 +4632,7 @@ pub mod bridge_inprocess_test_helpers {
 mod tests {
     use super::*;
     use crate::turn::bridge::sse_helpers::apply_forward_llm_sse_event;
-    use crate::turn::prompt_cache::default_pinned_tool_names;
+    use crate::turn::prompt_cache::{default_pinned_tool_names, runtime_pinned_tool_names};
     use astra_services::SessionArtifactStore;
     use astra_services::{
         SessionArtifactJsonRecord, SessionArtifactJsonStore, StoredSessionArtifact,
@@ -5179,7 +5179,7 @@ mod tests {
     use crate::turn::prompt_cache::CACHE_ENV_MUTEX;
 
     #[test]
-    fn pinned_tool_names_for_bridge_uses_edge_profile_override_or_default_fallback() {
+    fn pinned_tool_names_for_bridge_uses_edge_profile_override_or_runtime_fallback() {
         let mut edge_profile = Map::new();
         edge_profile.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_PINNED_TOOL_NAMES.to_string(),
@@ -5191,7 +5191,7 @@ mod tests {
         assert!(!overridden.contains("read_file"));
 
         let fallback = pinned_tool_names_for_bridge(&Map::new());
-        assert_eq!(fallback, default_pinned_tool_names());
+        assert_eq!(fallback, runtime_pinned_tool_names());
     }
 
     #[test]

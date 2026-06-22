@@ -108,10 +108,9 @@
 use serde_json::{Value, json};
 
 use crate::prompts;
+use astra_config::ToolSurfaceConfig;
 use astra_turn_core::microcompact::{PromptCacheProtocol, ProviderCacheStrategy};
 use astra_turn_core::pipeline_config::ProviderCachePolicy;
-
-const RUNTIME_STATIC_PREFIX_EXTRAS: &[&str] = &["send_message", "web_search"];
 
 // ── PromptCacheConfig ────────────────────────────────────────────────────────
 
@@ -686,30 +685,34 @@ pub(crate) fn annotate_tool_schemas_for_caching_with_pinned(
 }
 
 /// Default pinned tool names — the static-lib set that should appear in every
-/// turn of every session. Derived from the runtime `ToolSurface` default, plus
-/// runtime tools that are not part of that surface constant.
+/// tool-bearing turn when no user tool-surface override is active.
 ///
 /// Returning a fresh `HashSet` per call keeps the API safe across threads
-/// without a static — the set is small (~15 entries) so this is cheap.
+/// without a static — the set is small, so this is cheap.
+#[cfg(test)]
 pub(crate) fn default_pinned_tool_names() -> std::collections::HashSet<String> {
-    let mut out: std::collections::HashSet<String> = crate::tool_registry::surface::DEFAULT_PINNED
-        .iter()
-        .map(|name| (*name).to_string())
-        .collect();
-    // Auto-injected/runtime schemas outside DEFAULT_PINNED. Include them so
-    // the cache marker sits at the real static-prefix boundary when they are
-    // present in the final tool list.
-    //
-    // `web_search` is a first-class runtime tool (astra-tools crate) that
-    // ships with every session but is absent from TOOL_CATALOG. Session
-    // d0640d3d observed it as the last of 21 tools; without it in the
-    // pinned set the marker landed on `skill` (idx 19) and web_search
-    // (idx 20) fell outside the cached tool prefix, shaving ~500 tokens
-    // off every cache hit on the deepseek-anthropic path.
-    for name in RUNTIME_STATIC_PREFIX_EXTRAS {
-        out.insert(name.to_string());
-    }
-    out
+    cache_static_prefix_tool_names_for_config(&ToolSurfaceConfig::default())
+}
+
+/// Runtime-configured pinned tool names for fallback paths that do not receive
+/// edge metadata. CLI/Edge should normally send the resolved names explicitly;
+/// server-side-tools and tests use this to keep cache markers aligned with TOML
+/// overrides.
+pub(crate) fn runtime_pinned_tool_names() -> std::collections::HashSet<String> {
+    cache_static_prefix_tool_names_for_config(
+        &astra_config::runtime_config::RuntimeConfig::cached().tool_surface,
+    )
+}
+
+pub(crate) fn cache_static_prefix_tool_names_for_config(
+    cfg: &ToolSurfaceConfig,
+) -> std::collections::HashSet<String> {
+    let mut schemas = astra_tools::schemas::all_tool_schemas();
+    schemas.push(crate::turn::skill_tool::skill_tool_schema_v2());
+    crate::tool_registry::surface::ToolSurface::build(schemas, cfg, &[])
+        .pinned_names()
+        .into_iter()
+        .collect()
 }
 
 /// Add a cache breakpoint on the last conversation message for Anthropic.
@@ -843,28 +846,49 @@ mod tests {
                 "{name} is part of the runtime default surface and must be cache-pinned"
             );
         }
-        for name in RUNTIME_STATIC_PREFIX_EXTRAS {
-            assert!(
-                pinned.contains(*name),
-                "{name} is a runtime static-prefix extra and must be cache-pinned"
-            );
-        }
         for name in [
             "lsp",
             "github",
             "web_fetch",
+            "web_search",
             "session",
             "mo",
             "agent",
             "symbols",
             "powershell",
             "run_script",
+            "send_message",
         ] {
             assert!(
                 !pinned.contains(name),
                 "{name} is deferred/dynamic by default and must not extend the static cache prefix"
             );
         }
+    }
+
+    #[test]
+    fn cache_static_prefix_tool_names_follow_toml_surface_overrides() {
+        let cfg = ToolSurfaceConfig {
+            pinned_tools: vec!["github".into(), "-grep".into()],
+        };
+        let pinned = cache_static_prefix_tool_names_for_config(&cfg);
+
+        assert!(
+            pinned.contains("github"),
+            "config-pinned github must be part of the cache static prefix"
+        );
+        assert!(
+            !pinned.contains("grep"),
+            "config-demoted grep must not remain cache pinned"
+        );
+        assert!(
+            pinned.contains("bash"),
+            "other default pinned tools must remain cache pinned"
+        );
+        assert!(
+            !pinned.contains("web_search"),
+            "deferred web_search must not become cache pinned without an explicit TOML pin"
+        );
     }
 
     #[test]
@@ -2076,8 +2100,9 @@ mod cache_stability_regression {
                 "{name} must stay in default pinned set (static-lib guarantee)"
             );
         }
-        // Auto-pinned via upsert_schema — not in TOOL_CATALOG but structurally part of the static lib.
-        for name in ["skill", "send_message"] {
+        // Runtime-injected, not in TOOL_CATALOG, but structurally part of the
+        // resolved default surface when skills are available.
+        for name in ["skill"] {
             assert!(
                 pinned.contains(name),
                 "{name} is auto-pinned at runtime; default set must mirror that"

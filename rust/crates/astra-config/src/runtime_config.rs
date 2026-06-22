@@ -339,7 +339,7 @@ impl Default for RuntimeConfig {
 ///
 /// - **Pinned** — schemas live in the request `tools[]` array on every turn.
 ///   Small set, byte-stable across a session so the Anthropic prompt cache
-///   hits. Default = 12 coding-core tools (see runtime `DEFAULT_PINNED`).
+///   hits. Default = 13 coding-core tools (see runtime `DEFAULT_PINNED`).
 /// - **Deferred** — every other tool appears as `name + short_desc` in a
 ///   system-reminder block. The model calls `tool_search(query="select:X")`
 ///   to pull a schema into context when it needs X.

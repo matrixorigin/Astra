@@ -831,7 +831,7 @@ pub struct ServerAgenticLoopHost {
     /// Resolved pinned (T1) tool names for this session. Populated from the
     /// CLI-side `edge_profile.pinned_tool_names`. Used to place cache_control
     /// markers at the correct pinned/dynamic boundary. Falls back to
-    /// `prompt_cache::default_pinned_tool_names()` when the edge omits this key
+    /// `prompt_cache::runtime_pinned_tool_names()` when the edge omits this key
     /// (e.g. test fixtures or server-side-tools mode).
     pinned_tool_names: HashSet<String>,
     /// Executor whose admission state mirrors the current wire tool surface.
@@ -1292,8 +1292,8 @@ impl ServerAgenticLoopHostBuilder {
         // sends `EDGE_PROFILE_KEY_PINNED_TOOL_NAMES` as the ToolSurface's
         // resolved pinned name set (user TOML overrides included). When the
         // edge omits it (test fixtures or server-side-tools mode), fall back
-        // to the static constant so cache_control markers still land somewhere
-        // reasonable.
+        // to the runtime-configured surface so cache_control markers still
+        // match TOML overrides.
         let pinned_tool_names: HashSet<String> = self
             .edge_profile
             .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_PINNED_TOOL_NAMES)
@@ -1304,7 +1304,7 @@ impl ServerAgenticLoopHostBuilder {
                     .map(str::to_string)
                     .collect()
             })
-            .unwrap_or_else(|| crate::turn::prompt_cache::default_pinned_tool_names());
+            .unwrap_or_else(|| crate::turn::prompt_cache::runtime_pinned_tool_names());
 
         let progress_rx = self.progress_broadcaster.as_ref().map(|b| b.subscribe());
         let progress_filter = self
