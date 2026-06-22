@@ -6,21 +6,14 @@
 
 use serde_json::Value;
 
+use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_registry_meta::ToolMeta;
 
 /// Sort tool schemas alphabetically by `function.name` for prompt-cache stability.
 pub(super) fn sort_schemas_by_name(schemas: &mut [Value]) {
     schemas.sort_by(|a, b| {
-        let na = a
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(|n| n.as_str())
-            .unwrap_or("");
-        let nb = b
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(|n| n.as_str())
-            .unwrap_or("");
+        let na = tool_schema_name(a).unwrap_or("");
+        let nb = tool_schema_name(b).unwrap_or("");
         na.cmp(nb)
     });
 }
@@ -417,7 +410,7 @@ mod tests {
             );
 
             for s in out {
-                if let Some(name) = s.get("function").and_then(|f| f.get("name")).and_then(Value::as_str) {
+                if let Some(name) = tool_schema_name(&s) {
                     prop_assert!(!deny.denied(name), "denied tool materialized/selected: {name}");
                 }
             }
@@ -451,7 +444,7 @@ mod tests {
 
             let names = |out: Vec<Value>| -> Vec<String> {
                 out.into_iter()
-                    .filter_map(|s| s.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).map(|x| x.to_string()))
+                    .filter_map(|s| tool_schema_name(&s).map(|x| x.to_string()))
                     .collect()
             };
             prop_assert_eq!(names(a), names(b));

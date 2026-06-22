@@ -380,6 +380,7 @@ pub mod log;
 pub mod model_override;
 pub mod net;
 pub mod runtime_limits;
+pub mod tool_schema;
 
 /// Re-export for [`crate::agent_*!`] macros (call sites do not need a direct `tracing` dependency).
 #[doc(hidden)]

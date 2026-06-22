@@ -8,7 +8,7 @@
 //! 4. **Budget gate** — enforce token budget, greedily fill from ranked list
 //!
 //! Cross-language coverage comes from rich multilingual triggers on each tool,
-//! NOT from embeddings. With only ~23 tools, keyword coverage + intent rules
+//! NOT from embeddings. With a compact built-in catalog, keyword coverage + intent rules
 //! achieve high accuracy without ML dependencies.
 
 pub use astra_turn_core::tool_registry_meta::{IntentType, Scope, TOOL_CATALOG, ToolMeta};
@@ -26,16 +26,12 @@ pub use astra_turn_core::tool_registry_report::{
     SelectionFeedback, SelectionReport, ToolQualityTracker,
 };
 pub use astra_turn_core::tool_registry_selection_edge_hints::{
-    apply_selector_hints_to_edge_profile, top_unpinned_tool_names_from_report,
+    apply_selector_hints_to_edge_profile, top_dynamic_tool_names,
 };
 pub use astra_turn_core::tool_registry_state::ConversationState;
 pub use plugin::{PluginRegistry, PluginToolEntry};
 pub use registry::ToolRegistry;
-pub use scoring::{
-    DEFAULT_TOOL_BUDGET_TOKENS, pre_filter_dynamic, pre_filter_dynamic_calibrated,
-    pre_filter_dynamic_with_memory, pre_filter_dynamic_with_outcome_bias,
-    pre_filter_dynamic_with_pressure, pre_filter_dynamic_with_quality, tfidf_score,
-};
+pub use scoring::{DEFAULT_TOOL_BUDGET_TOKENS, DynamicFilter, pre_filter_dynamic, tfidf_score};
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
@@ -48,6 +44,7 @@ pub use astra_turn_core::tool_registry_state as state;
 mod tests {
     use super::*;
     use astra_text_utils::text_tokenize::tokenize;
+    use astra_turn_core::tool::schema::tool_schema_name;
     use astra_turn_core::tool_registry_state::word_boundary_match;
     use scoring::tfidf_score;
     use serde_json::Value;
@@ -77,13 +74,13 @@ mod tests {
     }
 
     #[test]
-    fn all_tools_are_pinned() {
-        assert_eq!(ToolRegistry::pinned_count(), 23);
+    fn catalog_pinned_count_matches_runtime_default_catalog_core() {
+        assert_eq!(ToolRegistry::pinned_count(), 12);
     }
 
     #[test]
     fn catalog_dynamic_count_matches_unpinned_tools() {
-        assert_eq!(ToolRegistry::dynamic_count(), 11);
+        assert_eq!(ToolRegistry::dynamic_count(), 22);
     }
 
     #[test]
@@ -93,7 +90,7 @@ mod tests {
             .filter(|t| t.pinned)
             .map(|t| t.name)
             .collect();
-        // Original core 6 — file + edit + memory basics.
+        // Runtime default catalog core — file, edit, search, git, memory, and activation.
         assert!(pinned.contains(&"bash"));
         assert!(pinned.contains(&"read_file"));
         assert!(pinned.contains(&"str_replace"));
@@ -113,6 +110,10 @@ mod tests {
         assert!(
             pinned.contains(&"git"),
             "consolidated git tool must be pinned — git ops appear in most coding turns"
+        );
+        assert!(
+            !pinned.contains(&"web_fetch") && !pinned.contains(&"session"),
+            "runtime-deferred tools must not stay catalog-pinned"
         );
     }
 
@@ -254,7 +255,7 @@ mod tests {
     #[test]
     fn prefilter_greeting_returns_empty() {
         let state = ConversationState::from_message("hi", 1);
-        let ranked = pre_filter_dynamic(&state, "hi");
+        let ranked = pre_filter_dynamic(&state, "hi", &Default::default());
         assert!(
             ranked.is_empty(),
             "pure greeting should skip dynamic tools, got {} tools",
@@ -322,6 +323,32 @@ mod tests {
         // Pinned always present
         assert!(names.contains(&"bash".to_string()));
         assert!(names.contains(&"read_file".to_string()));
+    }
+
+    #[test]
+    fn runtime_surface_selects_default_deferred_tool_as_dynamic_when_relevant() {
+        let registry = ToolRegistry::new_with_tool_surface(
+            mock_schemas(),
+            &astra_config::ToolSurfaceConfig::default(),
+        );
+        let selected = registry.select_with_budget(
+            "fetch the contents of https://example.com and summarize the web page",
+            1,
+            800,
+        );
+        let names = ToolRegistry::selected_names(&selected);
+
+        assert!(
+            !registry
+                .pinned_schemas()
+                .iter()
+                .any(|(name, _)| name == "web_fetch"),
+            "web_fetch is intentionally deferred by the runtime surface"
+        );
+        assert!(
+            names.contains(&"web_fetch".to_string()),
+            "runtime-surface selector must be able to add relevant deferred catalog tools dynamically; got: {names:?}"
+        );
     }
 
     #[test]
@@ -543,7 +570,7 @@ mod tests {
         let bash_json = serde_json::to_string(
             schemas
                 .iter()
-                .find(|s| s["function"]["name"] == "bash")
+                .find(|schema| tool_schema_name(schema) == Some("bash"))
                 .unwrap(),
         )
         .unwrap();
@@ -592,6 +619,7 @@ mod tests {
     fn feedback_perfect_precision() {
         let report = SelectionReport {
             tools_selected: vec!["bash".into(), "github".into()],
+            dynamic_tools_selected: vec!["github".into()],
             selected_count: 2,
             budget_used: 50,
             budget_total: 3000,
@@ -611,6 +639,7 @@ mod tests {
     fn feedback_no_tools_used() {
         let report = SelectionReport {
             tools_selected: vec!["bash".into(), "github".into()],
+            dynamic_tools_selected: vec!["github".into()],
             selected_count: 2,
             budget_used: 50,
             budget_total: 3000,
@@ -630,6 +659,7 @@ mod tests {
     fn feedback_tool_not_in_selection() {
         let report = SelectionReport {
             tools_selected: vec!["bash".into()],
+            dynamic_tools_selected: Vec::new(),
             selected_count: 1,
             budget_used: 30,
             budget_total: 3000,
@@ -646,8 +676,6 @@ mod tests {
 
     #[test]
     fn quality_tracker_boosts_tool_ranking() {
-        use scoring::pre_filter_dynamic_with_quality;
-
         let state = ConversationState::from_message_with_context(
             "show me the github pull requests",
             2,
@@ -655,8 +683,11 @@ mod tests {
         );
 
         // Without tracker: get baseline ranking
-        let baseline =
-            pre_filter_dynamic_with_quality(&state, "show me the github pull requests", None);
+        let baseline = pre_filter_dynamic(
+            &state,
+            "show me the github pull requests",
+            &DynamicFilter::new(),
+        );
 
         // With tracker: record many successful uses for a specific tool
         let mut tracker = ToolQualityTracker::new();
@@ -671,10 +702,10 @@ mod tests {
             tracker.record_quality("github", 0.95);
         }
 
-        let boosted = pre_filter_dynamic_with_quality(
+        let boosted = pre_filter_dynamic(
             &state,
             "show me the github pull requests",
-            Some(&tracker),
+            &DynamicFilter::new().quality(Some(&tracker)),
         );
 
         let find_score = |results: &[(usize, f64)], name: &str| -> Option<f64> {
@@ -699,8 +730,6 @@ mod tests {
 
     #[test]
     fn quality_tracker_penalizes_ineffective_tool() {
-        use scoring::pre_filter_dynamic_with_quality;
-
         let state = ConversationState::from_message_with_context("show me the git log", 2, &[]);
 
         // Record many selections but zero uses for a dynamic tool
@@ -710,9 +739,12 @@ mod tests {
             // No record_feedback → tool never used → use_rate = 0
         }
 
-        let baseline = pre_filter_dynamic_with_quality(&state, "show me the git log", None);
-        let penalized =
-            pre_filter_dynamic_with_quality(&state, "show me the git log", Some(&tracker));
+        let baseline = pre_filter_dynamic(&state, "show me the git log", &DynamicFilter::new());
+        let penalized = pre_filter_dynamic(
+            &state,
+            "show me the git log",
+            &DynamicFilter::new().quality(Some(&tracker)),
+        );
 
         let find_score = |results: &[(usize, f64)], name: &str| -> Option<f64> {
             results.iter().find_map(|(idx, score)| {
@@ -782,13 +814,14 @@ mod tests {
 
     #[test]
     fn disambiguation_widens_tool_selection() {
-        use scoring::pre_filter_dynamic_with_quality;
-
         // Single-intent query: just fetch
         let fetch_state =
             ConversationState::from_message_with_context("show me the latest PRs", 2, &[]);
-        let fetch_results =
-            pre_filter_dynamic_with_quality(&fetch_state, "show me the latest PRs", None);
+        let fetch_results = pre_filter_dynamic(
+            &fetch_state,
+            "show me the latest PRs",
+            &DynamicFilter::new(),
+        );
 
         // Multi-intent conflicting query: fetch + mutate
         let conflict_state = ConversationState::from_message_with_context(
@@ -796,10 +829,10 @@ mod tests {
             2,
             &[],
         );
-        let conflict_results = pre_filter_dynamic_with_quality(
+        let conflict_results = pre_filter_dynamic(
             &conflict_state,
             "show me the latest PRs and create a new issue",
-            None,
+            &DynamicFilter::new(),
         );
 
         // Conflicting query should select at least as many tools (lower threshold)
@@ -849,18 +882,17 @@ mod tests {
 
         // Without calibrator
         let results_uncalibrated =
-            scoring::pre_filter_dynamic(&state, "list open PRs in matrixone");
+            scoring::pre_filter_dynamic(&state, "list open PRs in matrixone", &Default::default());
 
         // With calibrator that has high correction rate for "github"
         let cal = ConfidenceCalibrator::new(0.7);
         for _ in 0..10 {
             cal.record("github", true);
         }
-        let results_calibrated = scoring::pre_filter_dynamic_calibrated(
+        let results_calibrated = scoring::pre_filter_dynamic(
             &state,
             "list open PRs in matrixone",
-            None,
-            Some(&cal),
+            &DynamicFilter::new().calibrator(Some(&cal)),
         );
 
         // Calibrated should include at least as many tools (lower threshold → more tools)
@@ -980,7 +1012,7 @@ mod tests {
     #[test]
     fn prefilter_all_tools_have_nonnegative_scores() {
         let state = ConversationState::from_message("analyze everything", 1);
-        let ranked = scoring::pre_filter_dynamic(&state, "analyze everything");
+        let ranked = scoring::pre_filter_dynamic(&state, "analyze everything", &Default::default());
         for (idx, score) in &ranked {
             assert!(
                 *score >= 0.0,

@@ -172,23 +172,8 @@ fn deferred_tools_block_for_bridge_model(
     edge_profile: &Map<String, Value>,
     resolved_model_name: &str,
 ) -> String {
-    let Some(source_budget) = edge_profile
-        .get(
-            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW,
-        )
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-    else {
-        return String::new();
-    };
-    let resolved_budget = crate::prompts::budget_for_model(Some(resolved_model_name)).model_limit;
-    if source_budget != resolved_budget {
-        return String::new();
-    }
-    edge_profile
-        .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT)
-        .and_then(Value::as_str)
-        .and_then(|text| deferred_tools_section_for_edge_profile(Some(text)))
+    crate::turn::deferred_tools_edge_profile::block_for_model(edge_profile, resolved_model_name)
+        .and_then(|text| deferred_tools_section_for_edge_profile(Some(&text)))
         .map(|section| section.text)
         .unwrap_or_default()
 }
@@ -7751,11 +7736,43 @@ mod tests {
                     .into(),
             ),
         );
+        ep.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES
+                .to_string(),
+            serde_json::json!(["github"]),
+        );
 
         let block = deferred_tools_block_for_bridge_model(&ep, "gpt-4o-2024-08-06");
         assert!(
             block.contains("<deferred_tools>"),
             "same effective context budget should preserve the CLI-rendered deferred block"
+        );
+    }
+
+    #[test]
+    fn deferred_tools_block_drops_text_without_names_manifest() {
+        let mut ep: Map<String, Value> = Map::new();
+        ep.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT
+                .to_string(),
+            Value::String(
+                "<deferred_tools><tool><name>github</name></tool></deferred_tools>".to_string(),
+            ),
+        );
+        ep.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW
+                .to_string(),
+            Value::Number(
+                crate::prompts::budget_for_model(Some("gpt-4o"))
+                    .model_limit
+                    .into(),
+            ),
+        );
+
+        let block = deferred_tools_block_for_bridge_model(&ep, "gpt-4o");
+        assert!(
+            block.is_empty(),
+            "bridge must not render deferred prompt text without the paired names manifest used by validator/tool_search"
         );
     }
 

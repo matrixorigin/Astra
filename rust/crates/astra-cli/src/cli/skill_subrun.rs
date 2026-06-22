@@ -14,7 +14,6 @@ use astra_core::SkillSearchSettings;
 use astra_runtime::{
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
-    prompts,
     semantic_dedup::SemanticDedup,
     turn::agentic::headless_round::HeadlessStderrStyle,
     turn::agentic_loop::finalization::run_agentic_loop_with_host,
@@ -28,7 +27,7 @@ use astra_runtime::{
         ChatTurnBasePayloadInput, chat_turn_base_payload, merge_edge_profile_extensions,
         set_payload_tool_results_if_non_empty,
     },
-    turn::tool_schema_prune::openai_tool_names_from_schemas,
+    turn::tool_schema_prune::{inject_required_tool_names, openai_tool_names_from_schemas},
     turn::turn_guard::TurnGuard,
 };
 use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
@@ -233,56 +232,23 @@ impl AgenticLoopHost for SubRunHost {
         // canonical schemas so the tool-schema hash matches the parent's
         // cached prefix (cache key alignment). Falls back to live
         // registry if no frozen schemas are available.
-        let tool_surface = astra_runtime::tool_registry::surface::ToolSurface::from_runtime_config(
-            &self.all_schemas,
-        );
-        let activatable_tool_names: std::collections::HashSet<String> = tool_surface
-            .deferred()
-            .iter()
-            .map(|entry| entry.name.clone())
-            .collect();
-        let activatable_for_wire: Vec<String> = {
-            let mut names: Vec<String> = activatable_tool_names.iter().cloned().collect();
-            names.sort();
-            names
-        };
-        if let Some(deferred_tools_text) = tool_surface.deferred_block_text(effective_model) {
-            let deferred_tools_context_window =
-                prompts::budget_for_model(effective_model).model_limit;
-            merge_edge_profile_extensions(
-                &mut payload,
-                &json!({
-                    astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT:
-                        deferred_tools_text,
-                    astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW:
-                        deferred_tools_context_window,
-                    astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES:
-                        activatable_for_wire,
-                }),
+        let base_tool_surface =
+            astra_runtime::tool_registry::surface::ToolSurface::from_runtime_config(
+                &self.all_schemas,
             );
-        }
         let schemas_to_use = resolve_subrun_schemas(
             self.inherited_prefix.as_ref(),
-            tool_surface.pinned_schemas(),
+            base_tool_surface.pinned_schemas(),
         );
-        self.executor
-            .set_current_visible_tool_schemas(&schemas_to_use);
-        // Mirror the deferred manifest onto the executor so a deferred-tool
-        // call inside the sub-run gets the activation hint instead of the
-        // bare "Unknown tool" denial. Without this, the parent's executor
-        // (cloned via `Arc`) would still hold the parent turn's set, which
-        // can drift from this sub-run's surface.
-        self.executor
-            .set_current_activatable_tool_names(activatable_tool_names);
-        astra_runtime::turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools(
+        state.last_turn_policy = attach_subrun_tool_surface(
             &mut payload,
             schemas_to_use,
+            &self.all_schemas,
             &mut state.restricted_tools,
-            None,  // no selection report
-            0.5,   // neutral confidence
-            None,  // no learned task type
+            &self.executor,
+            effective_model,
+            interaction_mode,
         );
-        state.last_turn_policy = turn_policy_from_payload_edge_tools(&payload, interaction_mode);
 
         set_payload_tool_results_if_non_empty(&mut payload, &state.tool_results);
 
@@ -384,24 +350,13 @@ impl AgenticLoopHost for SubRunHost {
     }
 
     fn inject_tool_schema(&mut self, schema: Value) {
-        if let Some(name) = schema
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(Value::as_str)
-        {
-            let name_owned = name.to_string();
-            self.valid_tool_names.insert(name_owned.clone());
-            if let Some(existing) = self.all_schemas.iter_mut().find(|tool| {
-                tool.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str)
-                    == Some(name_owned.as_str())
-            }) {
-                *existing = schema;
-            } else {
-                self.all_schemas.push(schema);
-            }
-        }
+        crate::cli::tool_surface_injection::install_injected_tool_schema(
+            self.executor.as_ref(),
+            schema,
+            &mut self.all_schemas,
+            &mut self.valid_tool_names,
+            None,
+        );
     }
 
     fn on_turn_completed(&mut self, state: &AgenticLoopState) {
@@ -841,16 +796,114 @@ fn resolve_subrun_schemas(
     }
 }
 
+fn empty_selection_report_for_schemas(
+    schemas: &[Value],
+) -> astra_runtime::tool_registry::SelectionReport {
+    let mut tools_selected: Vec<String> = openai_tool_names_from_schemas(schemas)
+        .into_iter()
+        .collect();
+    tools_selected.sort();
+    astra_runtime::tool_registry::SelectionReport {
+        selected_count: tools_selected.len() as u32,
+        tools_selected,
+        dynamic_tools_selected: Vec::new(),
+        budget_used: 0,
+        budget_total: 0,
+    }
+}
+
+fn attach_subrun_tool_surface(
+    payload: &mut Value,
+    mut schemas_to_use: Vec<Value>,
+    all_schemas: &[Value],
+    restricted_tools: &mut HashSet<String>,
+    executor: &edge_tools::ToolExecutor,
+    effective_model: Option<&str>,
+    interaction_mode: TurnInteractionMode,
+) -> TurnInteractionPolicy {
+    let activated = executor.activated_deferred_tool_names();
+    let mut selection_report = empty_selection_report_for_schemas(&schemas_to_use);
+    if !activated.is_empty() {
+        let refs: Vec<&str> = activated.iter().map(String::as_str).collect();
+        inject_required_tool_names(
+            &mut schemas_to_use,
+            &mut selection_report,
+            &refs,
+            all_schemas,
+        );
+    }
+    schemas_to_use = executor.runtime_bound_tool_schemas(schemas_to_use);
+    selection_report = empty_selection_report_for_schemas(&schemas_to_use);
+
+    astra_runtime::turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools(
+        payload,
+        schemas_to_use,
+        restricted_tools,
+        Some(&selection_report),
+        0.5,   // neutral confidence
+        None,  // no learned task type
+    );
+    let final_visible_schemas: Vec<Value> = payload
+        .get("edge_tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let final_visible_tool_names =
+        astra_turn_core::tool::schema::tool_names_from_schemas(&final_visible_schemas);
+    let eligible_surface_schemas: Vec<Value> = all_schemas
+        .iter()
+        .filter(|schema| {
+            schema
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .is_none_or(|name| !restricted_tools.contains(name))
+        })
+        .cloned()
+        .collect();
+    let eligible_surface_schemas = executor.runtime_bound_tool_schemas(eligible_surface_schemas);
+    let tool_surface = astra_runtime::tool_registry::surface::ToolSurface::build_excluding_visible(
+        eligible_surface_schemas,
+        &astra_config::runtime_config::RuntimeConfig::cached().tool_surface,
+        &[],
+        &final_visible_tool_names,
+    );
+    if let Some(manifest) = tool_surface.deferred_manifest(effective_model) {
+        let activatable_tool_names: HashSet<String> = manifest.names.iter().cloned().collect();
+        merge_edge_profile_extensions(
+            payload,
+            &json!({
+                astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT:
+                    manifest.text,
+                astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW:
+                    manifest.context_window,
+                astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES:
+                    manifest.names,
+            }),
+        );
+        executor.set_current_activatable_tool_names(activatable_tool_names);
+    } else {
+        executor.set_current_activatable_tool_names(HashSet::new());
+    }
+    // Mirror the deferred manifest onto the executor so a deferred-tool call
+    // inside the sub-run gets the activation hint instead of a bare unknown-tool
+    // denial. Install this before visible schemas so activation snapshots see a
+    // consistent visible ∪ activatable surface during the transition.
+    executor.set_current_visible_tool_schemas(&final_visible_schemas);
+    turn_policy_from_payload_edge_tools(payload, interaction_mode)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         CliSkillSubRunExecutor, SUBRUN_MAX_CUMULATIVE_TOKENS, SUBRUN_MAX_TURNS, SubRunHost,
-        resolve_subrun_schemas,
+        attach_subrun_tool_surface, resolve_subrun_schemas,
     };
     use astra_runtime::turn::agentic_loop::host::ASK_USER_TOOL_NAME;
     use astra_runtime::turn::agentic_loop::host::{
         AgenticLoopHost, TurnInteractionMode, interaction_scoped_tool_restrictions,
     };
+    use astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES;
     use astra_skills::executor::isolated::SkillSubRunExecutor;
     use serde_json::{Value, json};
     use std::collections::HashSet;
@@ -933,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn subrun_host_inject_tool_schema() {
+    fn subrun_host_inject_tool_schema_accepts_skill() {
         let root = PathBuf::from(".");
         let mut host = SubRunHost {
             api: astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
@@ -959,16 +1012,41 @@ mod tests {
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
             journal: None,
         };
-        let schema = json!({
-            "type": "function",
-            "function": {
-                "name": "test_tool",
-                "description": "A test tool",
-            }
-        });
-        host.inject_tool_schema(schema);
-        assert!(host.valid_tool_names.contains("test_tool"));
+        host.inject_tool_schema(astra_runtime::turn::skill_tool::skill_tool_schema_v2());
+        assert!(host.valid_tool_names.contains("skill"));
         assert_eq!(host.all_schemas.len(), 1);
+    }
+
+    #[test]
+    fn subrun_host_inject_tool_schema_rejects_unknown_tool() {
+        let root = PathBuf::from(".");
+        let mut host = SubRunHost {
+            api: astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
+            token: String::new(),
+            model: None,
+            project_root: root.clone(),
+            executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
+            all_schemas: Vec::new(),
+            valid_tool_names: HashSet::new(),
+            perm_manager: PermissionManager::with_project(true, &root),
+            max_completion_tokens: None,
+            effort: None,
+            agent_type: None,
+            cancel_token: None,
+            skill_resolver: None,
+            progress_tx: None,
+            agent_id: String::new(),
+            stream_event_tx: None,
+            stream_event_sink: None,
+            tool_cache: crate::cli::stream::stream_render::EdgeToolCache::new(3),
+            inherited_prefix: None,
+            fork_cache_sink: None,
+            fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
+            journal: None,
+        };
+        host.inject_tool_schema(schema("not_registered"));
+        assert!(host.valid_tool_names.is_empty());
+        assert!(host.all_schemas.is_empty());
     }
 
     #[test]
@@ -990,6 +1068,194 @@ mod tests {
         assert_eq!(policy.visible_tool_names, vec!["mo_query".to_string()]);
         assert_eq!(policy.evidence_tool_names, vec!["mo_query".to_string()]);
         assert!(!policy.allow_ask_user);
+    }
+
+    #[tokio::test]
+    async fn subrun_surface_injects_activated_deferred_tool_and_excludes_it_from_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = edge_tools::ToolExecutor::new(root.path());
+        executor.set_current_visible_tool_schemas(&[schema("tool_search")]);
+        executor.set_current_activatable_tool_names(HashSet::from(["memory".to_string()]));
+
+        let selected = executor
+            .execute("tool_search", &json!({"query": "select:memory"}))
+            .await;
+        let selected: Value = serde_json::from_str(&selected).unwrap();
+        assert_eq!(selected["matches"][0]["name"].as_str(), Some("memory"));
+        assert_eq!(
+            executor.activated_deferred_tool_names(),
+            vec!["memory".to_string()]
+        );
+
+        let mut payload = json!({});
+        let mut restricted_tools = HashSet::new();
+        let all_schemas = vec![schema("tool_search"), schema("memory"), schema("read_file")];
+
+        let policy = attach_subrun_tool_surface(
+            &mut payload,
+            vec![schema("tool_search")],
+            &all_schemas,
+            &mut restricted_tools,
+            &executor,
+            None,
+            TurnInteractionMode::NonInteractive,
+        );
+
+        let visible_tool_names: HashSet<String> = payload["edge_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|schema| schema["function"]["name"].as_str())
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            visible_tool_names.contains("memory"),
+            "subrun must keep activated deferred tools in the next visible schema set: {visible_tool_names:?}"
+        );
+        assert!(policy.visible_tool_names.contains(&"memory".to_string()));
+
+        let deferred_tool_names: HashSet<String> = payload["edge_profile"]
+            [EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !deferred_tool_names.contains("memory"),
+            "activated visible tool must not also remain in the deferred manifest: visible={visible_tool_names:?} deferred={deferred_tool_names:?}"
+        );
+        assert_eq!(
+            executor.activated_deferred_tool_names(),
+            vec!["memory".to_string()],
+            "executor activation must survive the subrun visible/deferred partition flip"
+        );
+    }
+
+    #[test]
+    fn subrun_surface_clears_stale_activatable_when_no_deferred_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = edge_tools::ToolExecutor::new(root.path());
+        executor.set_current_visible_tool_schemas(&[schema("tool_search")]);
+        executor.set_current_activatable_tool_names(HashSet::from(["memory".to_string()]));
+
+        let mut payload = json!({});
+        let mut restricted_tools = HashSet::new();
+        let all_schemas = vec![schema("tool_search")];
+
+        let policy = attach_subrun_tool_surface(
+            &mut payload,
+            vec![schema("tool_search")],
+            &all_schemas,
+            &mut restricted_tools,
+            &executor,
+            None,
+            TurnInteractionMode::NonInteractive,
+        );
+
+        assert_eq!(policy.visible_tool_names, vec!["tool_search".to_string()]);
+        assert!(
+            payload["edge_profile"][EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES]
+                .as_array()
+                .is_none_or(|names| names.is_empty()),
+            "subrun payload without a deferred prompt block must not carry deferred names: {payload}"
+        );
+        assert!(
+            executor
+                .current_activatable_tool_names_snapshot()
+                .is_empty(),
+            "subrun must clear stale activatable names when no deferred manifest is rendered"
+        );
+    }
+
+    #[tokio::test]
+    async fn subrun_surface_does_not_advertise_unbound_deferred_runtime_tool() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = edge_tools::ToolExecutor::new(root.path());
+
+        let mut payload = json!({});
+        let mut restricted_tools = HashSet::new();
+        let all_schemas = vec![schema("tool_search"), schema("agent_fanout")];
+
+        let policy = attach_subrun_tool_surface(
+            &mut payload,
+            vec![schema("tool_search")],
+            &all_schemas,
+            &mut restricted_tools,
+            &executor,
+            None,
+            TurnInteractionMode::NonInteractive,
+        );
+
+        assert_eq!(policy.visible_tool_names, vec!["tool_search".to_string()]);
+        assert!(
+            payload["edge_profile"][EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES]
+                .as_array()
+                .is_none_or(|names| names.is_empty()),
+            "subrun payload must not advertise a deferred runtime tool that local tool_search cannot activate: {payload}"
+        );
+        assert!(
+            executor
+                .current_activatable_tool_names_snapshot()
+                .is_empty(),
+            "subrun executor activatable set must agree with the payload deferred manifest"
+        );
+        let search = executor
+            .execute("tool_search", &json!({"query": "select:agent_fanout"}))
+            .await;
+        let search_json: Value = serde_json::from_str(&search).unwrap();
+        assert!(
+            search_json["matches"].as_array().unwrap().is_empty(),
+            "subrun tool_search must not resolve unbound agent_fanout: {search_json}"
+        );
+    }
+
+    #[test]
+    fn subrun_surface_does_not_put_unbound_runtime_tool_in_tools_array() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = edge_tools::ToolExecutor::new(root.path());
+
+        let mut payload = json!({});
+        let mut restricted_tools = HashSet::new();
+        let all_schemas = vec![schema("tool_search"), schema("agent_fanout")];
+
+        let policy = attach_subrun_tool_surface(
+            &mut payload,
+            vec![schema("tool_search"), schema("agent_fanout")],
+            &all_schemas,
+            &mut restricted_tools,
+            &executor,
+            None,
+            TurnInteractionMode::NonInteractive,
+        );
+
+        assert_eq!(policy.visible_tool_names, vec!["tool_search".to_string()]);
+        let edge_tool_names: HashSet<String> = payload["edge_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|schema| schema["function"]["name"].as_str())
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            !edge_tool_names.contains("agent_fanout"),
+            "subrun tools[] must not advertise an unbound runtime tool: {payload}"
+        );
+        let recommended: Vec<String> = payload["edge_profile"]["recommended_tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry["name"].as_str())
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            !recommended.iter().any(|name| name == "agent_fanout"),
+            "subrun edge_profile must not recommend a tool absent from the executable surface: {recommended:?}"
+        );
     }
 
     #[tokio::test]

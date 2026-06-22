@@ -137,10 +137,13 @@ impl ChatTurnRequestBody {
 
 /// Extract tool name from an OpenAI-format tool definition.
 ///
-/// Handles `{"function": {"name": "bash", ...}}` — the standard format used
-/// in edge_tools arrays. Returns `None` for malformed entries.
+/// Delegates to the single-source admission contract
+/// (`astra_turn_core::tool::schema::tool_schema_name`) so that only
+/// `type: "function"` schemas with a non-empty name are admitted. Non-function
+/// tool types (custom MCP shapes, future reserved types) and malformed entries
+/// fail closed and return `None`.
 fn extract_tool_name(tool: &serde_json::Value) -> Option<&str> {
-    tool.get("function")?.get("name")?.as_str()
+    astra_turn_core::tool::schema::tool_schema_name(tool)
 }
 
 // ─── Prepared result ─────────────────────────────────────────────────────────
@@ -680,7 +683,10 @@ mod tests {
     }
 
     fn tool_value(name: &str) -> serde_json::Value {
-        json!({ "function": { "name": name } })
+        // Mirrors the OpenAI function-tool schema shape required by the
+        // single-source admission contract (`tool_schema_name`):
+        // `type: "function"` + non-empty `function.name`.
+        json!({ "type": "function", "function": { "name": name } })
     }
 
     #[derive(Clone)]
@@ -1416,6 +1422,18 @@ mod tests {
     #[test]
     fn extract_tool_name_non_string_name() {
         assert_eq!(extract_tool_name(&json!({"function": {"name": 42}})), None);
+    }
+
+    /// Fail-closed contract: a non-`function` type must not leak its name,
+    /// even when `function.name` is present and valid. This is the core
+    /// guarantee of the single-source admission contract (`tool_schema_name`).
+    #[test]
+    fn extract_tool_name_rejects_non_function_type_with_valid_name() {
+        let custom_with_name = json!({"type": "custom", "function": {"name": "leaked"}});
+        assert_eq!(extract_tool_name(&custom_with_name), None);
+
+        let missing_type_with_name = json!({"function": {"name": "leaked"}});
+        assert_eq!(extract_tool_name(&missing_type_with_name), None);
     }
 
     // ── sync_opt_field_with_cache ───────────────────────────────────

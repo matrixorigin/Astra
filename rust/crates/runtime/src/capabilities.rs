@@ -24,6 +24,7 @@ use astra_skills::manifest::{
     ExecutionContext, LoadedSkill, SkillManifest, SkillSourceKind, TrustTier,
 };
 use astra_skills::traits::{SkillError, SkillProvider};
+use astra_turn_core::tool::schema::tool_schema_name;
 
 use crate::skills::{BundledSkillProvider, LocalSkillProvider, UnifiedSkillRegistry};
 
@@ -250,13 +251,6 @@ pub fn surface_uses_server_skill_catalog(surface: CapabilitySurface) -> bool {
             SkillCapabilitySource::ServerHome | SkillCapabilitySource::ServerDatabaseVisible
         )
     })
-}
-
-fn tool_schema_name(schema: &Value) -> Option<&str> {
-    schema
-        .get("function")
-        .and_then(|function| function.get("name"))
-        .and_then(Value::as_str)
 }
 
 /// Build the server-visible skill registry for Web / remote CLI execution.
@@ -561,6 +555,25 @@ mod tests {
         );
 
         assert_eq!(names(resolved), vec!["shared".to_string()]);
+    }
+
+    #[test]
+    fn tool_surface_rejects_named_non_function_schemas() {
+        let resolved =
+            resolve_tool_schemas(ToolCatalogRequest::new(CapabilitySurface::Web).with_source(
+                ToolCapabilitySource::ServerBuiltin,
+                vec![
+                    schema("server"),
+                    json!({"type": "custom", "function": {"name": "custom_shape"}}),
+                    json!({"function": {"name": "missing_type"}}),
+                ],
+            ));
+
+        assert_eq!(
+            names(resolved),
+            vec!["server".to_string()],
+            "surface resolution must admit only valid OpenAI function tool schemas"
+        );
     }
 
     #[test]

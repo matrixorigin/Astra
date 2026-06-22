@@ -683,22 +683,19 @@ pub(crate) fn annotate_tool_schemas_for_caching_with_pinned(
 }
 
 /// Default pinned tool names — the static-lib set that should appear in every
-/// turn of every session. Derived from `TOOL_CATALOG` + schemas that are
-/// auto-pinned via `ToolRegistry::upsert_schema` (skill, send_message, etc.).
+/// turn of every session. Derived from the runtime `ToolSurface` default, plus
+/// runtime tools that are not part of that surface constant.
 ///
 /// Returning a fresh `HashSet` per call keeps the API safe across threads
 /// without a static — the set is small (~15 entries) so this is cheap.
 pub(crate) fn default_pinned_tool_names() -> std::collections::HashSet<String> {
-    use astra_turn_core::tool_registry_meta::TOOL_CATALOG;
-    let mut out: std::collections::HashSet<String> = TOOL_CATALOG
+    let mut out: std::collections::HashSet<String> = crate::tool_registry::surface::DEFAULT_PINNED
         .iter()
-        .filter(|t| t.pinned)
-        .map(|t| t.name.to_string())
+        .map(|name| (*name).to_string())
         .collect();
-    // Auto-injected via ToolRegistry::upsert_schema (see sse_loop mod.rs +
-    // agentic_loop::lifecycle.rs). These aren't in TOOL_CATALOG but are
-    // structurally part of the static lib — include them so the cache
-    // marker sits at the real static-prefix boundary.
+    // Auto-injected/runtime schemas outside DEFAULT_PINNED. Include them so
+    // the cache marker sits at the real static-prefix boundary when they are
+    // present in the final tool list.
     //
     // `web_search` is a first-class runtime tool (astra-tools crate) that
     // ships with every session but is absent from TOOL_CATALOG. Session
@@ -706,7 +703,7 @@ pub(crate) fn default_pinned_tool_names() -> std::collections::HashSet<String> {
     // pinned set the marker landed on `skill` (idx 19) and web_search
     // (idx 20) fell outside the cached tool prefix, shaving ~500 tokens
     // off every cache hit on the deepseek-anthropic path.
-    for name in ["skill", "send_message", "introspect", "web_search"] {
+    for name in ["send_message", "web_search"] {
         out.insert(name.to_string());
     }
     out
@@ -828,57 +825,43 @@ mod tests {
         assert!(cfg.is_anthropic);
     }
 
-    // ── pinned-tool audit: session d0640d3d tool order ───────────────────
+    // ── pinned-tool audit ────────────────────────────────────────────────
     //
-    // Production capture showed 21 tools in this order — all served stably
-    // by the runtime every turn — with only `skill` (idx 19) carrying
-    // cache_control. `web_search` (idx 20) fell OUT of the cached tool
-    // prefix because it wasn't in `default_pinned_tool_names()`:
-    //   [bash, read_file, write_file, str_replace, list_dir, grep, glob,
-    //    introspect, lsp, git, github, web_fetch, memory, session, mo,
-    //    agent, symbols, powershell, run_script, skill, web_search]
-    //
-    // All of these are first-class, runtime-owned tools that appear in
-    // every request. They must be pinned so the cache marker lands on the
-    // LAST one (web_search), not an interior position.
+    // The cache marker belongs at the end of the pinned/static prefix, not at
+    // the end of the whole tool list. Deferred/dynamic tools may become
+    // visible for a turn, but they should not silently enlarge the static
+    // cache prefix.
     #[test]
-    fn default_pinned_tool_names_covers_all_first_class_runtime_tools() {
+    fn default_pinned_tool_names_tracks_runtime_surface_not_deferred_catalog() {
         let pinned = super::default_pinned_tool_names();
-        // Full runtime tool catalog as observed in live session d0640d3d.
-        // Any divergence here causes a cache hole at the tool tail.
-        let expected = [
-            "bash",
-            "read_file",
-            "write_file",
-            "str_replace",
-            "list_dir",
-            "grep",
-            "glob",
-            "introspect",
+        for name in crate::tool_registry::surface::DEFAULT_PINNED {
+            assert!(
+                pinned.contains(*name),
+                "{name} is part of the runtime default surface and must be cache-pinned"
+            );
+        }
+        for name in ["send_message", "web_search"] {
+            assert!(
+                pinned.contains(name),
+                "{name} is a runtime static-prefix extra and must be cache-pinned"
+            );
+        }
+        for name in [
             "lsp",
-            "git",
             "github",
             "web_fetch",
-            "memory",
             "session",
             "mo",
             "agent",
             "symbols",
             "powershell",
             "run_script",
-            "skill",
-            "web_search",
-        ];
-        let missing: Vec<&str> = expected
-            .iter()
-            .copied()
-            .filter(|n| !pinned.contains(*n))
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "these runtime tools are NOT pinned — marker will fall short of the last \
-             tool and subsequent tools miss cache: {missing:?}",
-        );
+        ] {
+            assert!(
+                !pinned.contains(name),
+                "{name} is deferred/dynamic by default and must not extend the static cache prefix"
+            );
+        }
     }
 
     #[test]

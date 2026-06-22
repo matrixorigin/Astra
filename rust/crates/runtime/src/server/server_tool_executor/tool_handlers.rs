@@ -1,5 +1,6 @@
 use std::sync::atomic::Ordering;
 
+use astra_turn_core::tool::schema::{retain_tool_schemas_by_names, tool_schema_name};
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -24,7 +25,6 @@ use crate::server::tool_plan_gate::{execute_enter_plan_mode, execute_exit_plan_m
 use crate::server::tool_session_state_rollback::{
     self, RollbackSessionStateContext, SessionStateRestoreContext,
 };
-use crate::server::tool_transport::tool_schema_name;
 
 /// Register a tool handler and log an error on failure (duplicate name).
 ///
@@ -150,23 +150,10 @@ impl ToolHandler<ServerToolExecutor> for ToolSearchToolHandler {
     ) -> astra_tools::ToolResult {
         let mut pool = context.capability_filtered_server_tool_schemas();
         pool.extend(context.plugin_schemas_snapshot("plugin_schemas_tool_search"));
-        // The search pool is `visible ∪ activatable`. The activatable set is
-        // exactly the names advertised in this turn's `<deferred_tools>`
-        // manifest: the model has been told they exist, so `select:NAME`
-        // must be able to resolve them, even though they are not in the
-        // current `tools[]`. Without this, the activation flow deadlocks —
-        // the prompt instructs the model to select, but the search pool
-        // hides everything that isn't already visible.
-        if let Some(visible) = context.current_searchable_tool_names() {
-            let activatable = context.current_activatable_tool_names_snapshot();
-            pool.retain(|schema| {
-                schema
-                    .get("function")
-                    .and_then(|function| function.get("name"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| visible.contains(name) || activatable.contains(name))
-            });
-        }
+        let Some(searchable_names) = context.current_searchable_tool_names() else {
+            return tool_result_from_output(astra_tools::tool_search::tool_search(&pool, args));
+        };
+        retain_tool_schemas_by_names(&mut pool, &searchable_names);
         tool_result_from_output(astra_tools::tool_search::tool_search(&pool, args))
     }
 }

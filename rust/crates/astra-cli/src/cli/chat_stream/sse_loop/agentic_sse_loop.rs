@@ -253,6 +253,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
 
     let report = first_selection_report.unwrap_or_else(|| tool_registry::SelectionReport {
         tools_selected: Vec::new(),
+        dynamic_tools_selected: Vec::new(),
         selected_count: 0,
         budget_used: 0,
         budget_total: 0,

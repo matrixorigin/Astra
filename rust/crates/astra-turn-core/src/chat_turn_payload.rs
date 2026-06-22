@@ -344,8 +344,8 @@ mod tests {
     fn attach_filtered_edge_tools_excludes_by_name() {
         let mut p = json!({});
         let schemas = vec![
-            json!({"function": {"name": "bash"}}),
-            json!({"function": {"name": "danger"}}),
+            json!({"type": "function", "function": {"name": "bash"}}),
+            json!({"type": "function", "function": {"name": "danger"}}),
         ];
         let mut r = HashSet::new();
         r.insert("danger".into());

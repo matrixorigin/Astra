@@ -83,7 +83,7 @@ fn bench_pre_filter_dynamic(c: &mut Criterion) {
     for (label, query) in &queries {
         let state = ConversationState::from_message(query, 3);
         group.bench_with_input(BenchmarkId::new(*label, query.len()), query, |b, q| {
-            b.iter(|| pre_filter_dynamic(black_box(&state), black_box(q)))
+            b.iter(|| pre_filter_dynamic(black_box(&state), black_box(q), &Default::default()))
         });
     }
     group.finish();

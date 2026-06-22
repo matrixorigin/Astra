@@ -5,6 +5,7 @@ edition.workspace = true
 description = "Runtime environment bindings, capabilities, and tool surface resolution for Astra."
 
 [dependencies]
+astra-core.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

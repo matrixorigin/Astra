@@ -487,6 +487,7 @@ dependencies = [
 name = "astra-runtime-env"
 version = "0.1.0"
 dependencies = [
+ "astra-core",
  "async-trait",
  "serde",
  "serde_json",

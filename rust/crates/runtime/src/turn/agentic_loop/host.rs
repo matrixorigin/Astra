@@ -284,8 +284,8 @@ pub trait AgenticLoopHost: Send {
     /// The validator uses this to differentiate "unknown tool" denials
     /// (truly hallucinated names) from "not yet activated" denials
     /// (deferred but reachable via `tool_search(query="select:NAME")`).
-    /// Default: empty — hosts that don't render a deferred manifest get
-    /// the legacy "Unknown tool" copy on every miss.
+    /// Default: empty — hosts that don't render a deferred manifest should
+    /// treat every non-admitted name as unknown.
     ///
     /// Returned by value because some hosts compute the set lazily from
     /// shared state (`Arc<ToolExecutor>`) and don't keep a borrowable

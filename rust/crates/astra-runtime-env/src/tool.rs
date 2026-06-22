@@ -236,6 +236,7 @@ impl ToolRegistry {
             control_plane("compress_context"),
             control_plane("rollback_session_state"),
             control_plane("session"),
+            control_plane("skill"),
             control_plane("task"),
             control_plane("task_output"),
             control_plane("task_stop"),
@@ -559,12 +560,7 @@ impl CapabilityResolver {
     }
 }
 
-pub fn tool_schema_name(schema: &Value) -> Option<&str> {
-    schema
-        .get("function")
-        .and_then(|function| function.get("name"))
-        .and_then(Value::as_str)
-}
+pub use astra_core::tool_schema::tool_schema_name;
 
 fn control_plane(name: &str) -> ToolSpec {
     ToolSpec {
@@ -758,6 +754,7 @@ mod tests {
         let binding = RunBinding::cloud_control_plane(&registry);
 
         assert!(binding.tool_surface.contains("ask_user"));
+        assert!(binding.tool_surface.contains("skill"));
         assert!(binding.tool_surface.contains("tool_search"));
         assert!(binding.tool_surface.contains("web_search"));
         for tool in [
@@ -1272,5 +1269,76 @@ mod tests {
         assert!(names.iter().any(|name| name == "tool_search"));
         assert!(!names.iter().any(|name| name == "bash"));
         assert!(!names.iter().any(|name| name == "read_file"));
+    }
+
+    #[test]
+    fn tool_schema_name_rejects_non_function_type() {
+        // Non-function schemas must not leak a name — fail closed.
+        let custom = serde_json::json!({"type": "custom", "function": {"name": "leaked"}});
+        assert!(
+            tool_schema_name(&custom).is_none(),
+            "non-function tool type must not expose a schema name"
+        );
+    }
+
+    #[test]
+    fn tool_schema_name_rejects_missing_type() {
+        let no_type = serde_json::json!({"function": {"name": "leaked"}});
+        assert!(
+            tool_schema_name(&no_type).is_none(),
+            "schema without `type` must not expose a name"
+        );
+    }
+
+    #[test]
+    fn tool_schema_name_rejects_empty_or_whitespace_names() {
+        let empty = serde_json::json!({"type": "function", "function": {"name": ""}});
+        let whitespace = serde_json::json!({"type": "function", "function": {"name": "   "}});
+        assert!(
+            tool_schema_name(&empty).is_none(),
+            "empty name must be rejected"
+        );
+        assert!(
+            tool_schema_name(&whitespace).is_none(),
+            "whitespace-only name must be rejected"
+        );
+    }
+
+    #[test]
+    fn tool_schema_name_rejects_missing_function_or_name() {
+        let no_function = serde_json::json!({"type": "function"});
+        let no_name = serde_json::json!({"type": "function", "function": {}});
+        assert!(tool_schema_name(&no_function).is_none());
+        assert!(tool_schema_name(&no_name).is_none());
+    }
+
+    #[test]
+    fn tool_schema_name_accepts_valid_function_schema() {
+        let valid = serde_json::json!({"type": "function", "function": {"name": "bash"}});
+        assert_eq!(tool_schema_name(&valid), Some("bash"));
+    }
+
+    #[test]
+    fn filter_tool_schemas_fails_closed_for_non_function_and_empty_names() {
+        // Non-function and empty-named schemas must be filtered out by
+        // filter_tool_schemas — they are malformed and must never reach the
+        // runtime tool surface even if their (fake) name is registered.
+        let registry = registry();
+        let binding = RunBinding::local_developer("/repo", &registry);
+        let schemas = vec![
+            serde_json::json!({"type": "function", "function": {"name": "bash"}}),
+            serde_json::json!({"type": "custom", "function": {"name": "bash"}}),
+            serde_json::json!({"type": "function", "function": {"name": ""}}),
+            serde_json::json!({"function": {"name": "bash"}}),
+        ];
+
+        let names: Vec<String> = CapabilityResolver
+            .filter_tool_schemas(&registry, schemas, &binding.capabilities)
+            .into_iter()
+            .filter_map(|schema| tool_schema_name(&schema).map(str::to_string))
+            .collect();
+
+        // Only the single valid `bash` schema should remain — no duplicates.
+        assert_eq!(names, vec!["bash".to_string()]);
     }
 }

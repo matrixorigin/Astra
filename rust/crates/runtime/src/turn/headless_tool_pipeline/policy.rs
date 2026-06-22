@@ -19,7 +19,9 @@ use astra_turn_core::headless_tool_stderr_lines::{
     headless_stderr_cache_hit_line, headless_stderr_unknown_tool_detail,
     headless_stderr_unknown_tool_header,
 };
-use astra_turn_core::tool::deferred_activation::tool_not_admitted_message;
+use astra_turn_core::tool::deferred_activation::{
+    direct_deferred_call_activated_message, tool_not_admitted_message,
+};
 use astra_turn_core::tool_result_semantics::tool_dedup_signature;
 
 const OUTCOME_MEMORY_FAILURE_BLOCK_WINDOW: usize = 2;
@@ -70,8 +72,9 @@ fn emit_blocked_tool_result(
 /// about. If `name` appears in this turn's `<deferred_tools>` manifest, it
 /// has been advertised — denying with the bare "Unknown tool" copy contradicts
 /// the prompt. Surface the activation hint instead. Otherwise the name is
-/// truly hallucinated; preserve the legacy "Unknown tool. Available: …" body
-/// so the model can self-correct.
+/// truly hallucinated; return the unknown-tool body so the model can
+/// self-correct. `tool_search` being visible is not enough evidence that an
+/// arbitrary name is deferred; the manifest is the source of truth.
 fn validator_denial_body(
     name: &str,
     valid_tool_names: &std::collections::HashSet<String>,
@@ -79,14 +82,6 @@ fn validator_denial_body(
 ) -> String {
     if deferred_tool_names.contains(name) {
         tool_not_admitted_message(name, true)
-    } else if deferred_tool_names.is_empty() && valid_tool_names.contains("tool_search") {
-        format!(
-            "Error: Tool '{name}' is not visible in this turn's `tools[]`. \
-             If you expect it to be deferred, first call `tool_search` with \
-             `query=\"select:{name}\"` to fetch the full schema. If \
-             `tool_search` reports it missing, use one of the currently \
-             visible tools instead."
-        )
     } else {
         unknown_local_tool_error_message(name, valid_tool_names)
     }
@@ -535,16 +530,26 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         );
 
         if !self.ctx.valid_tool_names.contains(&execution.name) {
-            let err_msg = validator_denial_body(
-                &execution.name,
-                self.ctx.valid_tool_names,
-                self.ctx.deferred_tool_names,
-            );
-            let is_deferred_not_admitted = self.ctx.deferred_tool_names.contains(&execution.name);
-            let skip_reason = if is_deferred_not_admitted {
-                "tool_not_admitted"
+            let is_deferred = self.ctx.deferred_tool_names.contains(&execution.name);
+            let (err_msg, skip_reason) = if is_deferred {
+                match self.ctx.server_tool_executor {
+                    Some(exec) if exec.has_runtime_binding(&execution.name) => {
+                        exec.record_direct_deferred_call_activation(&execution.name);
+                        (
+                            direct_deferred_call_activated_message(&execution.name),
+                            "direct_deferred_call_activated",
+                        )
+                    }
+                    _ => (
+                        tool_not_admitted_message(&execution.name, true),
+                        "tool_not_admitted",
+                    ),
+                }
             } else {
-                "unknown_tool"
+                (
+                    unknown_local_tool_error_message(&execution.name, self.ctx.valid_tool_names),
+                    "unknown_tool",
+                )
             };
             let args_preview = make_args_preview(&execution.name, &execution.args);
             if !self.ctx.quiet {
@@ -571,7 +576,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             );
             self.ctx.messages.push(tool_msg);
             self.ctx.tool_results.push(err_tr);
-            if is_deferred_not_admitted {
+            if is_deferred {
                 self.ctx
                     .tool_call_records
                     .push(journal_record_tool_not_admitted(
@@ -922,6 +927,17 @@ mod tests {
     fn validator_denial_for_hidden_non_deferred_tool_stays_unknown() {
         let valid = names(["tool_search", "bash"]);
         let deferred = names(["agent"]);
+
+        let body = validator_denial_body("grep", &valid, &deferred);
+
+        assert!(body.contains("Unknown tool"));
+        assert!(!body.contains("query=\"select:grep\""));
+    }
+
+    #[test]
+    fn validator_denial_does_not_invent_deferred_hint_when_manifest_is_empty() {
+        let valid = names(["tool_search", "bash"]);
+        let deferred = HashSet::new();
 
         let body = validator_denial_body("grep", &valid, &deferred);
 

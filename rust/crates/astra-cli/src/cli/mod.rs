@@ -60,6 +60,7 @@ pub mod terminal_region;
 pub mod theme;
 pub mod tool_call_groups;
 pub mod tool_result_status;
+pub(crate) mod tool_surface_injection;
 pub mod turn;
 pub mod ui_adapter;
 pub mod workspace_trust;

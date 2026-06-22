@@ -19,8 +19,10 @@
 //! `memory/project_tool_surface_rewrite.md` for the architectural story.
 
 use astra_config::ToolSurfaceConfig;
+use astra_turn_core::tool::schema::tool_schema_name;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashSet;
 
 /// Default T1 pinned tools — the coding golden path + astra intrinsics +
 /// activation primitives.
@@ -80,6 +82,13 @@ pub struct DeferredEntry {
     pub short_desc: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeferredManifest {
+    pub text: String,
+    pub context_window: usize,
+    pub names: Vec<String>,
+}
+
 /// The resolved tool surface for a session.
 pub struct ToolSurface {
     pinned: Vec<Value>,
@@ -119,8 +128,8 @@ impl ToolSurface {
             .into_iter()
             .chain(plugin_schemas.iter().cloned())
         {
-            if let Some(name) = schema_name(&schema) {
-                by_name.insert(name, schema);
+            if let Some(name) = tool_schema_name(&schema) {
+                by_name.insert(name.to_string(), schema);
             }
         }
 
@@ -161,6 +170,33 @@ impl ToolSurface {
         Self { pinned, deferred }
     }
 
+    /// Build a deferred manifest from the eligible schema pool after the caller
+    /// has already decided the final visible `tools[]` set for this turn.
+    ///
+    /// This keeps the wire contract self-consistent: a tool is either directly
+    /// visible in `tools[]` or advertised as deferred/searchable, never both.
+    pub fn build_excluding_visible(
+        catalog_schemas: Vec<Value>,
+        cfg: &ToolSurfaceConfig,
+        plugin_schemas: &[Value],
+        visible_names: &HashSet<String>,
+    ) -> Self {
+        let catalog_schemas: Vec<Value> = catalog_schemas
+            .into_iter()
+            .filter(|schema| {
+                tool_schema_name(schema).is_none_or(|name| !visible_names.contains(name))
+            })
+            .collect();
+        let plugin_schemas: Vec<Value> = plugin_schemas
+            .iter()
+            .filter(|schema| {
+                tool_schema_name(schema).is_none_or(|name| !visible_names.contains(name))
+            })
+            .cloned()
+            .collect();
+        Self::build(catalog_schemas, cfg, &plugin_schemas)
+    }
+
     /// The byte-stable T1 schemas to feed into `tools[]`.
     ///
     /// Returned by value so callers can annotate `cache_control` without
@@ -186,14 +222,27 @@ impl ToolSurface {
         crate::prompts::build_deferred_tools_section_with_budget(self, context_window)
             .map(|section| section.text)
     }
-}
 
-fn schema_name(schema: &Value) -> Option<String> {
-    schema
-        .get("function")
-        .and_then(|f| f.get("name"))
-        .and_then(Value::as_str)
-        .map(String::from)
+    pub fn deferred_manifest(&self, model: Option<&str>) -> Option<DeferredManifest> {
+        if self.deferred.is_empty() {
+            return None;
+        }
+        let context_window = crate::prompts::budget_for_model(model).model_limit;
+        let context_window_u32 = u32::try_from(context_window).ok();
+        let block = crate::prompts::build_deferred_tools_prompt_block_with_budget(
+            self,
+            context_window_u32,
+        )?;
+        let text = block.section.text;
+        if text.trim().is_empty() || block.names.is_empty() {
+            return None;
+        }
+        Some(DeferredManifest {
+            text,
+            context_window,
+            names: block.names,
+        })
+    }
 }
 
 /// Truncate the schema description to a compact UTF-8 char-boundary summary.

@@ -7,4 +7,5 @@ pub mod health;
 pub mod policy;
 pub mod registry;
 pub mod result;
+pub mod runtime_binding;
 pub mod schema;

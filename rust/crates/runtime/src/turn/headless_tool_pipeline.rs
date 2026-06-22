@@ -55,8 +55,7 @@ pub fn admissible_tool_names_from_visible_and_extras(
     visible_schemas: &[serde_json::Value],
     extras: &[String],
 ) -> HashSet<String> {
-    let visible =
-        astra_turn_core::tool::deferred_activation::tool_names_from_schemas(visible_schemas);
+    let visible = astra_turn_core::tool::schema::tool_names_from_schemas(visible_schemas);
     let extras: HashSet<String> = extras.iter().cloned().collect();
     admissible_tool_names(&visible, &extras)
 }
@@ -1807,7 +1806,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validator_denial_body_with_empty_deferred_set_points_to_tool_search_when_visible() {
+    async fn validator_denial_empty_deferred_set_stays_unknown_with_tool_search_visible() {
         let mut harness = PipelineHarness::new();
         push_unknown_server_tool_call(&mut harness, "agent_fanout");
         begin_recorded_turn(&mut harness, 1);
@@ -1828,12 +1827,12 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert!(
-            body.contains("tool_search") && body.contains("select:agent_fanout"),
-            "empty deferred set with visible tool_search should be recoverable; got: {body}"
+            body.starts_with("Unknown tool"),
+            "empty deferred set means no deferred manifest was advertised; got: {body}"
         );
         assert!(
-            !body.starts_with("Unknown tool"),
-            "empty deferred set with visible tool_search should not dead-end as bare unknown; got: {body}"
+            !body.contains("select:agent_fanout"),
+            "validator must not invent deferred activation guidance without a manifest; got: {body}"
         );
     }
 

@@ -1417,6 +1417,7 @@ mod tests {
     use astra_turn_core::cloud_session_memory_extract::SessionMemoryExtractConfig;
     use serde_json::json;
     use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     struct ProbeCancelHookGuard {
         svc: Arc<MemoryExtractionService>,
@@ -1479,6 +1480,32 @@ mod tests {
             self.purged.lock().unwrap().push(session_id.to_string());
             Ok(0)
         }
+    }
+
+    async fn spawn_json_server_with_status(
+        assert_request: Arc<dyn Fn(&str) + Send + Sync>,
+        status_code: u16,
+        reason_phrase: &str,
+        body: serde_json::Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body_text = body.to_string();
+        let reason_phrase = reason_phrase.to_string();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 32 * 1024];
+            let n = socket.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            assert_request(&request);
+            let response = format!(
+                "HTTP/1.1 {status_code} {reason_phrase}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body_text.len(),
+                body_text
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+        (format!("http://{addr}"), handle)
     }
 
     struct TestCtx {
@@ -2064,16 +2091,30 @@ mod tests {
 
     #[tokio::test]
     async fn selector_cooldown_skips_to_next_healthy_candidate() {
+        let (failing_url, failing_handle) = spawn_json_server_with_status(
+            Arc::new(|request: &str| {
+                assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
+            }),
+            502,
+            "Bad Gateway",
+            json!({
+                "error": {
+                    "message": "selector two unavailable"
+                }
+            }),
+        )
+        .await;
         let first = LlmConnParams {
             base_url: "https://nope.invalid".to_string(),
             api_key: "k".to_string(),
             model_name: "selector-first".to_string(),
             wire_model_name: None,
-            provider: "test".to_string(),
+            provider: "openai".to_string(),
             request_body_overrides: None,
             thinking_capability: None,
         };
         let second = LlmConnParams {
+            base_url: format!("{failing_url}/v1"),
             model_name: "selector-second".to_string(),
             ..first.clone()
         };
@@ -2111,6 +2152,7 @@ mod tests {
             attempted_second,
             "service should skip the cooled-down selector and attempt the next healthy candidate"
         );
+        failing_handle.await.unwrap();
     }
 
     #[test]

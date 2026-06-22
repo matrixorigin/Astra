@@ -175,12 +175,14 @@ fn build_skill_listing_section_with_budget_and_caps(
         .map(|entry| entry.name_only_len)
         .sum::<usize>();
     let mut has_degraded = false;
+    let mut rendered_any = false;
     if total_name_only_len <= char_budget {
         let mut description_budget = char_budget - total_name_only_len;
         for entry in &prepared {
             let description_extra = entry.full_len - entry.name_only_len;
             let with_description = description_extra <= description_budget;
             write_skill_entry(&mut body, entry, with_description);
+            rendered_any = true;
             if with_description {
                 description_budget -= description_extra;
             } else {
@@ -196,6 +198,7 @@ fn build_skill_listing_section_with_budget_and_caps(
             }
             let with_description = listing_chars + entry.full_len <= char_budget;
             write_skill_entry(&mut body, entry, with_description);
+            rendered_any = true;
             if with_description {
                 listing_chars += entry.full_len;
             } else {
@@ -203,6 +206,9 @@ fn build_skill_listing_section_with_budget_and_caps(
                 has_degraded = true;
             }
         }
+    }
+    if !rendered_any {
+        return None;
     }
     body.push_str("</available_skills>\n\n");
     if has_degraded {
@@ -349,11 +355,26 @@ pub fn build_deferred_tools_section(
     build_deferred_tools_section_with_budget(surface, None)
 }
 
+#[derive(Debug, Clone)]
+pub struct DeferredToolsPromptBlock {
+    pub section: PromptSection,
+    pub names: Vec<String>,
+}
+
 /// Build deferred tools listing with explicit budget from context window size.
 pub fn build_deferred_tools_section_with_budget(
     surface: &crate::tool_registry::surface::ToolSurface,
     context_window_tokens: Option<u32>,
 ) -> Option<PromptSection> {
+    build_deferred_tools_prompt_block_with_budget(surface, context_window_tokens)
+        .map(|block| block.section)
+}
+
+/// Build deferred tools listing with the exact names rendered into the block.
+pub fn build_deferred_tools_prompt_block_with_budget(
+    surface: &crate::tool_registry::surface::ToolSurface,
+    context_window_tokens: Option<u32>,
+) -> Option<DeferredToolsPromptBlock> {
     let entries = surface.deferred();
     if entries.is_empty() {
         return None;
@@ -375,6 +396,7 @@ pub fn build_deferred_tools_section_with_budget(
 
     let mut listing_chars = 0usize;
     let mut has_degraded = false;
+    let mut rendered_names = Vec::new();
 
     // entries are already sorted alphabetically by ToolSurface::build()
     for entry in entries {
@@ -396,13 +418,18 @@ pub fn build_deferred_tools_section_with_budget(
             body.push_str(&escaped_desc);
             body.push_str(DESC_CLOSE);
             listing_chars += full_len;
+            rendered_names.push(entry.name.clone());
         } else {
             body.push_str(TOOL_OPEN);
             body.push_str(&escaped_name);
             body.push_str(NAME_CLOSE);
             listing_chars += name_only_len;
             has_degraded = true;
+            rendered_names.push(entry.name.clone());
         }
+    }
+    if rendered_names.is_empty() {
+        return None;
     }
     body.push_str("</deferred_tools>\n\n");
 
@@ -427,7 +454,10 @@ pub fn build_deferred_tools_section_with_budget(
          query to discover what exists.",
     );
 
-    Some(PromptSection::stable(body, CacheScope::Session))
+    Some(DeferredToolsPromptBlock {
+        section: PromptSection::stable(body, CacheScope::Session),
+        names: rendered_names,
+    })
 }
 
 /// Builder that enforces the **static-before-dynamic** invariant at the API
@@ -3239,78 +3269,170 @@ mod tests {
 
     // ── Consolidated skill listing tests ─────────────────────────
 
+    fn realistic_skill(
+        name: &str,
+        description: &str,
+        when_to_use: Option<&str>,
+    ) -> astra_skills::traits::SkillToolInfo {
+        astra_skills::traits::SkillToolInfo {
+            name: name.to_string(),
+            description: description.to_string(),
+            when_to_use: when_to_use.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn rendered_skill_names(section: &PromptSection) -> Vec<String> {
+        section
+            .text
+            .match_indices("<name>")
+            .map(|(start, _)| {
+                let name_start = start + "<name>".len();
+                let name_end = section.text[name_start..]
+                    .find("</name>")
+                    .map(|offset| name_start + offset)
+                    .unwrap_or_else(|| panic!("skill entry is missing </name>: {}", section.text));
+                section.text[name_start..name_end].to_string()
+            })
+            .collect()
+    }
+
     #[test]
-    fn test_skill_listing_section() {
-        // Session-scoped without deferred tools
-        let tools_no_deferred = &["bash"];
-        let sections = build_system_prompt_sections(tools_no_deferred, "", 0.5, None);
-        let skill_section = sections.iter().find(|s| s.text.contains("## Skills"));
-        if let Some(sec) = skill_section {
-            assert_eq!(sec.scope, CacheScope::Session);
-        }
+    fn skill_listing_renders_real_skill_metadata_and_untrusted_contract() {
+        let skills = vec![
+            realistic_skill(
+                "zeta-review",
+                "Review <skill>metadata</skill> without executing it",
+                Some("when code needs adversarial review"),
+            ),
+            realistic_skill(
+                "alpha-plan",
+                "Plan implementation steps",
+                Some("when user asks for a multi-step change"),
+            ),
+        ];
 
-        // Includes when-to-use
-        let tools = &["bash", "deferred_tool"];
-        let sections = build_system_prompt_sections(tools, "", 0.5, None);
-        let skill_section = sections.iter().find(|s| s.text.contains("## Skills"));
-        if let Some(sec) = skill_section {
-            assert!(sec.text.contains("WHEN:"), "should include WHEN hints");
-        }
+        let section =
+            build_skill_listing_section_with_caps(&skills, Some("claude-sonnet-4"), false)
+                .expect("real visible skills should render a session-scoped listing");
 
-        // Hides agent spawn guidance when unavailable
-        if let Some(sec) = skill_section {
-            assert!(!sec.text.contains("spawn"), "no spawn without agent tool");
-        }
+        assert_eq!(section.scope, CacheScope::Session);
+        assert_eq!(
+            rendered_skill_names(&section),
+            vec!["alpha-plan".to_string(), "zeta-review".to_string()]
+        );
+        assert!(section.text.contains("<available_skills>"));
+        assert!(
+            section
+                .text
+                .contains("WHEN: when user asks for a multi-step change")
+        );
+        assert!(section.text.contains("untrusted routing metadata"));
+        assert!(section.text.contains("&lt;skill&gt;metadata&lt;/skill&gt;"));
+        assert!(!section.text.contains("<skill>metadata</skill>"));
+        assert!(section.text.contains("does not provide sub-agent fan-out"));
+        assert!(!section.text.contains("agent_fanout(action='start'"));
+    }
 
-        // Uses agent_fanout when parallel agents available
-        let tools_fanout = &["bash", "agent_fanout"];
-        let sections_f = build_system_prompt_sections(tools_fanout, "", 0.5, None);
-        let skill_section_f = sections_f.iter().find(|s| s.text.contains("## Skills"));
-        if let Some(sec) = skill_section_f {
-            assert!(sec.text.contains("agent_fanout"), "should mention fanout");
-        }
+    #[test]
+    fn skill_listing_mentions_agent_fanout_only_when_available() {
+        let skills = vec![realistic_skill(
+            "review-changes",
+            "Review code changes",
+            Some("when user asks for review"),
+        )];
 
-        // Marks metadata as untrusted routing hints
-        if let Some(sec) = skill_section {
-            assert!(sec.text.contains("untrusted"), "should say untrusted");
-        }
+        let with_fanout =
+            build_skill_listing_section_with_caps(&skills, Some("claude-sonnet-4"), true)
+                .expect("skill listing should render when fanout is available");
+        let without_fanout =
+            build_skill_listing_section_with_caps(&skills, Some("claude-sonnet-4"), false)
+                .expect("skill listing should render when fanout is unavailable");
 
-        // Escapes XML in metadata
-        if let Some(sec) = skill_section {
-            assert!(!sec.text.contains("<skill"), "XML should be escaped");
-        }
+        assert!(with_fanout.text.contains("agent_fanout(action='start'"));
+        assert!(!without_fanout.text.contains("agent_fanout(action='start'"));
+        assert!(
+            without_fanout
+                .text
+                .contains("does not provide sub-agent fan-out")
+        );
+    }
 
-        // Discover skills hint on overflow
-        if let Some(sec) = skill_section {
-            // Skills section should exist
-            assert!(!sec.text.is_empty());
+    #[test]
+    fn skill_listing_is_byte_stable_and_alphabetically_ordered() {
+        let skills = vec![
+            realistic_skill("skill-c", "Description C", None),
+            realistic_skill("skill-a", "Description A", None),
+            realistic_skill("skill-b", "Description B", None),
+        ];
+
+        let first = build_skill_listing_section_with_budget(&skills, Some(200_000))
+            .expect("first skill listing should render");
+        let second = build_skill_listing_section_with_budget(&skills, Some(200_000))
+            .expect("same skill listing should render deterministically");
+
+        assert_eq!(
+            rendered_skill_names(&first),
+            vec![
+                "skill-a".to_string(),
+                "skill-b".to_string(),
+                "skill-c".to_string()
+            ]
+        );
+        assert_eq!(first.text, second.text);
+    }
+
+    #[test]
+    fn skill_listing_budget_degrades_to_rendered_names_before_omitting_rest() {
+        let skills: Vec<_> = (0..6)
+            .map(|i| {
+                realistic_skill(
+                    &format!("skill-{i:03}"),
+                    &format!("{} detailed workflow guidance", "long ".repeat(80)),
+                    Some("when the request needs this specialized workflow"),
+                )
+            })
+            .collect();
+
+        let section = build_skill_listing_section_with_budget(&skills, Some(3_000))
+            .expect("budget should fit at least one name-only skill entry");
+        let rendered_names = rendered_skill_names(&section);
+
+        assert!(
+            rendered_names.len() < skills.len(),
+            "small context should omit some skills instead of overflowing the prompt"
+        );
+        assert!(section.text.contains("listed by name only or omitted"));
+        assert!(section.text.contains("discover_skills"));
+        for name in &rendered_names {
+            assert!(section.text.contains(&format!("<name>{name}</name>")));
+        }
+        for omitted in skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .filter(|name| !rendered_names.iter().any(|rendered| rendered == *name))
+        {
+            assert!(
+                !section.text.contains(&format!("<name>{omitted}</name>")),
+                "omitted skills must not appear in the rendered listing"
+            );
         }
     }
 
     #[test]
-    fn test_skill_listing_budget_and_stability() {
-        // Budget truncates to name-only before omitting
-        let sections = build_system_prompt_sections(&[], "", 0.5, None);
-        let skill_section = sections.iter().find(|s| s.text.contains("## Skills"));
+    fn skill_listing_is_absent_for_empty_catalog_or_too_small_budget() {
+        assert!(build_skill_listing_section_with_budget(&[], Some(200_000)).is_none());
 
-        // Byte-stable across repeated builds
-        let sections1 = build_system_prompt_sections(&["bash"], "", 0.5, None);
-        let sections2 = build_system_prompt_sections(&["bash"], "", 0.5, None);
-        let text1: String = sections1.iter().map(|s| s.text.as_str()).collect();
-        let text2: String = sections2.iter().map(|s| s.text.as_str()).collect();
-        assert_eq!(text1, text2, "skill listing should be byte-stable");
+        let skills = vec![realistic_skill(
+            "review-changes",
+            "Review code changes",
+            Some("when user asks for review"),
+        )];
 
-        // Token budget math per provider context window
-        // (budget scales with context window size)
-        if let Some(sec) = skill_section {
-            let tokens = estimate_section_tokens(&sec.text);
-            assert!(tokens > 0, "skill section should have tokens");
-        }
-
-        // Prefers preserving all names before omitting entries
-        if let Some(sec) = skill_section {
-            assert!(!sec.text.is_empty());
-        }
+        assert!(
+            build_skill_listing_section_with_budget(&skills, Some(1)).is_none(),
+            "builder should fail closed when even a name-only skill cannot fit"
+        );
     }
 
     // ── Consolidated format_skill_description tests ─────────────
@@ -3380,19 +3502,37 @@ mod tests {
 
     // ── Deferred tools budget ────────────────────────────────────────────
 
+    fn realistic_function_schema(name: String, description: String) -> serde_json::Value {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Short user-facing query or selector"
+                        }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }
+            }
+        })
+    }
+
     fn make_deferred_surface(n: usize) -> crate::tool_registry::surface::ToolSurface {
         let schemas: Vec<serde_json::Value> = (0..n)
             .map(|i| {
-                serde_json::json!({
-                    "function": {
-                        "name": format!("tool_{i:03}"),
-                        "description": format!("Description for tool number {i} with some extra text to fill space"),
-                        "parameters": {"type": "object"}
-                    }
-                })
+                realistic_function_schema(
+                    format!("tool_{i:03}"),
+                    format!("Description for tool number {i} with some extra text to fill space"),
+                )
             })
             .collect();
-        // Build with empty pinned list so all go to deferred
+        // Build with empty pinned override list so all non-default tools go to deferred.
         crate::tool_registry::surface::ToolSurface::build(
             schemas,
             &astra_config::ToolSurfaceConfig {
@@ -3402,77 +3542,196 @@ mod tests {
         )
     }
 
+    #[test]
+    fn deferred_prompt_renders_only_valid_function_schemas_from_realistic_surface() {
+        let schemas = vec![
+            realistic_function_schema(
+                "valid_deferred_tool".to_string(),
+                "Visible description from a real function tool schema".to_string(),
+            ),
+            serde_json::json!({
+                "function": {
+                    "name": "legacy_missing_type",
+                    "description": "Old test-only shape must not leak into the prompt",
+                    "parameters": {"type": "object"}
+                }
+            }),
+            serde_json::json!({
+                "type": "custom",
+                "function": {
+                    "name": "custom_not_openai_function",
+                    "description": "Named non-function schemas are not callable tools",
+                    "parameters": {"type": "object"}
+                }
+            }),
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "   ",
+                    "description": "Blank names cannot be activated",
+                    "parameters": {"type": "object"}
+                }
+            }),
+        ];
+        let surface = crate::tool_registry::surface::ToolSurface::build(
+            schemas,
+            &astra_config::ToolSurfaceConfig {
+                pinned_tools: vec![],
+            },
+            &[],
+        );
+
+        let block = build_deferred_tools_prompt_block_with_budget(&surface, Some(16_000))
+            .expect("valid function schema should produce a deferred prompt block");
+
+        assert_eq!(block.names, vec!["valid_deferred_tool".to_string()]);
+        assert!(
+            block
+                .section
+                .text
+                .contains("<name>valid_deferred_tool</name>")
+        );
+        assert!(block.section.text.contains("Visible description"));
+        assert!(!block.section.text.contains("legacy_missing_type"));
+        assert!(!block.section.text.contains("custom_not_openai_function"));
+        assert!(!block.section.text.contains("Blank names"));
+    }
+
+    #[test]
+    fn deferred_prompt_is_absent_when_only_named_invalid_schemas_exist() {
+        let schemas = vec![
+            serde_json::json!({"function": {"name": "legacy_missing_type"}}),
+            serde_json::json!({"type": "custom", "function": {"name": "custom_not_function"}}),
+            serde_json::json!({"type": "function", "function": {"name": ""}}),
+        ];
+        let surface = crate::tool_registry::surface::ToolSurface::build(
+            schemas,
+            &astra_config::ToolSurfaceConfig {
+                pinned_tools: vec![],
+            },
+            &[],
+        );
+
+        assert!(
+            build_deferred_tools_prompt_block_with_budget(&surface, Some(16_000)).is_none(),
+            "malformed schemas must fail closed instead of creating an empty or misleading block"
+        );
+    }
+
     // ── Consolidated deferred section tests ──────────────────────
 
     #[test]
-    fn test_deferred_section_behavior() {
-        // All entries fit within large budget
-        let sections = build_system_prompt_sections(&[], "", 0.5, None);
-        let deferred = sections
+    fn deferred_prompt_enforces_activation_contract_for_realistic_surface() {
+        let surface = make_deferred_surface(2);
+        let block = build_deferred_tools_prompt_block_with_budget(&surface, Some(200_000))
+            .expect("realistic deferred tools should produce a prompt block");
+
+        assert_eq!(block.section.scope, CacheScope::Session);
+        assert_eq!(
+            block.names,
+            vec!["tool_000".to_string(), "tool_001".to_string()]
+        );
+        assert!(block.section.text.contains("<deferred_tools>"));
+        assert!(block.section.text.contains("<name>tool_000</name>"));
+        assert!(block.section.text.contains("<name>tool_001</name>"));
+        assert!(
+            block
+                .section
+                .text
+                .contains("tool_search(query=\"select:NAME\")")
+        );
+        assert!(
+            block
+                .section
+                .text
+                .contains("Do not invoke a tool listed only")
+        );
+        assert!(!block.section.text.contains("CALLABLE directly"));
+    }
+
+    #[test]
+    fn deferred_prompt_is_byte_stable_and_alphabetically_ordered() {
+        let first =
+            build_deferred_tools_prompt_block_with_budget(&make_deferred_surface(3), Some(200_000))
+                .expect("first realistic surface should render");
+        let second =
+            build_deferred_tools_prompt_block_with_budget(&make_deferred_surface(3), Some(200_000))
+                .expect("same realistic surface should render deterministically");
+
+        assert_eq!(
+            first.names,
+            vec![
+                "tool_000".to_string(),
+                "tool_001".to_string(),
+                "tool_002".to_string()
+            ]
+        );
+        assert_eq!(first.names, second.names);
+        assert_eq!(first.section.text, second.section.text);
+        let tool_000 = first
+            .section
+            .text
+            .find("<name>tool_000</name>")
+            .expect("tool_000 should render");
+        let tool_001 = first
+            .section
+            .text
+            .find("<name>tool_001</name>")
+            .expect("tool_001 should render");
+        let tool_002 = first
+            .section
+            .text
+            .find("<name>tool_002</name>")
+            .expect("tool_002 should render");
+        assert!(tool_000 < tool_001);
+        assert!(tool_001 < tool_002);
+    }
+
+    #[test]
+    fn deferred_prompt_budget_degrades_to_rendered_names_before_omitting_rest() {
+        let surface = make_deferred_surface(3);
+        let all_names: Vec<_> = surface
+            .deferred()
             .iter()
-            .find(|s| s.text.contains("## Deferred Tools"));
-        // OK if no deferred tools available — section may be absent
-        if let Some(sec) = deferred {
-            assert_eq!(
-                sec.scope,
-                CacheScope::Session,
-                "deferred should be session-scoped"
+            .map(|entry| entry.name.clone())
+            .collect();
+        let block = build_deferred_tools_prompt_block_with_budget(&surface, Some(800))
+            .expect("budget should fit at least one name-only deferred entry");
+
+        assert!(
+            block.names.len() < all_names.len(),
+            "small context should omit some tools instead of overflowing the prompt"
+        );
+        assert!(
+            block
+                .section
+                .text
+                .contains("listed by name only or omitted")
+        );
+        for name in &block.names {
+            assert!(block.section.text.contains(&format!("<name>{name}</name>")));
+        }
+        for name in all_names.iter().filter(|candidate| {
+            !block
+                .names
+                .iter()
+                .any(|rendered_name| rendered_name == *candidate)
+        }) {
+            assert!(
+                !block.section.text.contains(&format!("<name>{name}</name>")),
+                "omitted deferred tools must not appear in the rendered block"
             );
-        }
-
-        // Preserves alphabetical order
-        let sections_a = build_system_prompt_sections(&["task"], "", 0.5, None);
-        let sections_b = build_system_prompt_sections(&["task"], "", 0.5, None);
-        let text_a: String = sections_a.iter().map(|s| s.text.as_str()).collect();
-        let text_b: String = sections_b.iter().map(|s| s.text.as_str()).collect();
-        assert_eq!(text_a, text_b, "deferred section should be byte-stable");
-
-        // Tool search activation always mentioned
-        if let Some(sec) = deferred {
-            assert!(sec.text.contains("tool_search(query=\"select:NAME\")"));
-        }
-
-        // Deferred entries are not callable until activated.
-        if let Some(sec) = deferred {
-            assert!(sec.text.contains("Do not invoke a tool listed only"));
-            assert!(!sec.text.contains("CALLABLE directly"));
         }
     }
 
     #[test]
-    fn test_deferred_section_budget() {
-        let sections = build_system_prompt_sections(&[], "", 0.5, None);
-        let deferred = sections
-            .iter()
-            .find(|s| s.text.contains("## Deferred Tools"));
+    fn deferred_prompt_is_absent_when_budget_cannot_fit_any_tool_name() {
+        let surface = make_deferred_surface(1);
 
-        // Token budget scales with context window
-        if let Some(sec) = deferred {
-            let tokens = estimate_section_tokens(&sec.text);
-            assert!(tokens > 0 || sec.text.is_empty());
-        }
-
-        // Truncates at budget
-        if let Some(sec) = deferred {
-            assert!(!sec.text.is_empty() || sections.iter().any(|s| s.text.contains("Deferred")));
-        }
-
-        // Degrades to name-only before omitting
-        if let Some(sec) = deferred {
-            assert!(!sec.text.is_empty());
-        }
-
-        // Shows tool_search hint on overflow
-        if let Some(sec) = deferred {
-            assert!(!sec.text.is_empty());
-        }
-
-        // Byte-stable across repeated builds
-        let sections1 = build_system_prompt_sections(&[], "", 0.5, None);
-        let sections2 = build_system_prompt_sections(&[], "", 0.5, None);
-        let text1: String = sections1.iter().map(|s| s.text.as_str()).collect();
-        let text2: String = sections2.iter().map(|s| s.text.as_str()).collect();
-        assert_eq!(text1, text2, "deferred section should be byte-stable");
+        assert!(
+            build_deferred_tools_prompt_block_with_budget(&surface, Some(1)).is_none(),
+            "prompt builder should fail closed when even a name-only entry cannot fit"
+        );
     }
 
     #[test]

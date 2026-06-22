@@ -3,36 +3,28 @@
 use astra_core::ConfidenceInterval;
 use serde_json::{Value, json};
 
-use crate::tool::registry::meta::TOOL_CATALOG;
-use crate::tool::registry::report::SelectionReport;
-
-/// First `max` selected tool names that are not catalog-pinned (dynamic tools), preserving order.
-pub fn top_unpinned_tool_names_from_report(report: &SelectionReport, max: usize) -> Vec<String> {
-    report
-        .tools_selected
-        .iter()
-        .filter(|n| {
-            !TOOL_CATALOG
-                .iter()
-                .any(|t| t.pinned && t.name == n.as_str())
-        })
-        .take(max)
-        .cloned()
-        .collect()
+/// First `max` tool names from the slice, preserving order.
+pub fn top_dynamic_tool_names(names: &[String], max: usize) -> Vec<String> {
+    names.iter().take(max).cloned().collect()
 }
 
 /// Merge selector guidance into an existing `edge_profile` JSON object (mutates in place).
+///
+/// `dynamic_tool_names` is the ordered list of dynamically selected tool names
+/// for this turn. Only the names are needed — budget/cost fields are intentionally
+/// NOT accepted here so the hint path cannot carry stale budget state from a
+/// pre-filtering `SelectionReport`.
 ///
 /// `learned_task_type` is the selector's inferred task archetype for
 /// this turn (e.g. `"code_search"`, `"new_feature"`).
 pub fn apply_selector_hints_to_edge_profile(
     edge_profile: &mut Value,
-    first_selection_report: Option<&SelectionReport>,
+    dynamic_tool_names: Option<&[String]>,
     selection_confidence: ConfidenceInterval,
     learned_task_type: Option<&str>,
 ) {
-    let dynamic_tools = first_selection_report
-        .map(|r| top_unpinned_tool_names_from_report(r, 3))
+    let dynamic_tools = dynamic_tool_names
+        .map(|names| top_dynamic_tool_names(names, 3))
         .unwrap_or_default();
     if selection_confidence.conservatively_exceeds(0.4)
         && !dynamic_tools.is_empty()
@@ -56,30 +48,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn top_unpinned_skips_pinned() {
-        let report = SelectionReport {
-            tools_selected: vec!["read_file".into(), "github_list_prs".into(), "grep".into()],
-            selected_count: 3,
-            budget_used: 0,
-            budget_total: 0,
-        };
-        let names = top_unpinned_tool_names_from_report(&report, 3);
-        assert!(!names.contains(&"read_file".to_string()));
-        assert!(names.contains(&"github_list_prs".to_string()));
+    fn top_dynamic_takes_first_n_preserving_order() {
+        let names: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+        let out = top_dynamic_tool_names(&names, 2);
+        assert_eq!(out, vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]
     fn apply_hints_respects_confidence_threshold() {
-        let report = SelectionReport {
-            tools_selected: vec!["github_list_prs".into()],
-            selected_count: 1,
-            budget_used: 0,
-            budget_total: 0,
-        };
+        let names: Vec<String> = vec!["github_list_prs".into()];
         let mut ep = json!({});
         apply_selector_hints_to_edge_profile(
             &mut ep,
-            Some(&report),
+            Some(&names),
             ConfidenceInterval::exact(0.39),
             None,
         );
@@ -88,12 +69,32 @@ mod tests {
         let mut ep = json!({});
         apply_selector_hints_to_edge_profile(
             &mut ep,
-            Some(&report),
+            Some(&names),
             ConfidenceInterval::exact(0.4),
             None,
         );
         assert!(ep.get("recommended_tools").is_some());
         assert_eq!(ep["selection_confidence"]["point"], 0.4);
+    }
+
+    #[test]
+    fn apply_hints_with_empty_names_is_noop_even_at_high_confidence() {
+        let names: Vec<String> = vec![];
+        let mut ep = json!({});
+        apply_selector_hints_to_edge_profile(
+            &mut ep,
+            Some(&names),
+            ConfidenceInterval::exact(0.9),
+            None,
+        );
+        assert!(ep.get("recommended_tools").is_none());
+    }
+
+    #[test]
+    fn apply_hints_with_none_names_is_noop() {
+        let mut ep = json!({});
+        apply_selector_hints_to_edge_profile(&mut ep, None, ConfidenceInterval::exact(0.9), None);
+        assert!(ep.get("recommended_tools").is_none());
     }
 
     #[test]
@@ -110,17 +111,11 @@ mod tests {
 
     #[test]
     fn apply_hints_requires_confident_lower_bound() {
+        let names: Vec<String> = vec!["github_list_prs".into()];
         let mut ep = json!({});
-        let report = SelectionReport {
-            tools_selected: vec!["github_list_prs".into()],
-            selected_count: 1,
-            budget_used: 0,
-            budget_total: 0,
-        };
-
         apply_selector_hints_to_edge_profile(
             &mut ep,
-            Some(&report),
+            Some(&names),
             ConfidenceInterval::new(0.6, 0.39, 0.9),
             None,
         );

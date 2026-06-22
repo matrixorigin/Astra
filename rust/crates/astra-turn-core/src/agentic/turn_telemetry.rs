@@ -77,6 +77,7 @@ mod tests {
         let mut bp = 0.0;
         let r1 = SelectionReport {
             tools_selected: vec!["a".into()],
+            dynamic_tools_selected: vec!["a".into()],
             selected_count: 1,
             budget_used: 1,
             budget_total: 10,
@@ -86,6 +87,7 @@ mod tests {
         assert!((bp - 0.3).abs() < f64::EPSILON);
         let r2 = SelectionReport {
             tools_selected: vec!["b".into()],
+            dynamic_tools_selected: vec!["b".into()],
             selected_count: 1,
             budget_used: 2,
             budget_total: 10,
@@ -105,6 +107,7 @@ mod tests {
         let mut bp = 0.0;
         let r = SelectionReport {
             tools_selected: vec!["a".into()],
+            dynamic_tools_selected: vec!["a".into()],
             selected_count: 1,
             budget_used: 1,
             budget_total: 10,

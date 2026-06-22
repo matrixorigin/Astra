@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use crate::capability::CapabilitySet;
 use crate::tool::registry::meta::TOOL_CATALOG;
+use crate::tool::schema::tool_schema_name;
 
 /// User-facing execution surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -66,7 +67,7 @@ pub fn resolve_with_diagnostics(
     // collides with a catalog name, the catalog filter remains authoritative
     // and the plugin entry is dropped instead of bypassing capability gates.
     for schema in all_schemas {
-        let Some(name) = schema_name(schema) else {
+        let Some(name) = tool_schema_name(schema) else {
             continue;
         };
         if emitted.contains(name) || TOOL_CATALOG.iter().any(|meta| meta.name == name) {
@@ -86,14 +87,7 @@ pub fn resolve_with_diagnostics(
 fn find_schema<'a>(schemas: &'a [Value], name: &str) -> Option<&'a Value> {
     schemas
         .iter()
-        .find(|schema| schema_name(schema) == Some(name))
-}
-
-fn schema_name(schema: &Value) -> Option<&str> {
-    schema
-        .get("function")
-        .and_then(|function| function.get("name"))
-        .and_then(Value::as_str)
+        .find(|schema| tool_schema_name(schema) == Some(name))
 }
 
 #[cfg(test)]
@@ -116,7 +110,7 @@ mod tests {
     fn names(schemas: &[Value]) -> Vec<String> {
         schemas
             .iter()
-            .filter_map(|schema| schema_name(schema).map(str::to_string))
+            .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
             .collect()
     }
 

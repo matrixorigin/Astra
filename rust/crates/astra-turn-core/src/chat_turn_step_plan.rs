@@ -33,6 +33,7 @@ mod tests {
         let mut rec = StepRecorder::new("sid", "tid");
         let rep = SelectionReport {
             tools_selected: vec!["bash".into()],
+            dynamic_tools_selected: Vec::new(),
             selected_count: 1,
             budget_used: 12,
             budget_total: 100,

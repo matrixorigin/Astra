@@ -4,6 +4,14 @@
 pub struct SelectionReport {
     /// Tool names that were selected for the LLM request.
     pub tools_selected: Vec<String>,
+    /// Tool names selected dynamically by the selector for this turn.
+    ///
+    /// This is derived from the effective runtime tool surface, not from the
+    /// static catalog metadata. Callers must not re-infer dynamic tools from
+    /// global `ToolMeta::pinned`, because user pin/unpin overrides change this
+    /// boundary per registry instance.
+    #[serde(default)]
+    pub dynamic_tools_selected: Vec<String>,
     /// Number of tools selected.
     pub selected_count: u32,
     /// Token budget used by selected dynamic tools.
@@ -202,6 +210,7 @@ mod tests {
     fn feedback_perfect_match() {
         let report = SelectionReport {
             tools_selected: vec!["bash".into(), "grep".into()],
+            dynamic_tools_selected: vec!["grep".into()],
             selected_count: 2,
             budget_used: 50,
             budget_total: 800,
@@ -216,6 +225,7 @@ mod tests {
     fn feedback_partial_use() {
         let report = SelectionReport {
             tools_selected: vec!["bash".into(), "grep".into(), "glob".into()],
+            dynamic_tools_selected: vec!["grep".into(), "glob".into()],
             selected_count: 3,
             budget_used: 75,
             budget_total: 800,
@@ -230,6 +240,7 @@ mod tests {
     fn feedback_llm_used_unselected() {
         let report = SelectionReport {
             tools_selected: vec!["bash".into()],
+            dynamic_tools_selected: Vec::new(),
             selected_count: 1,
             budget_used: 25,
             budget_total: 800,
@@ -243,6 +254,7 @@ mod tests {
     fn feedback_empty_usage() {
         let report = SelectionReport {
             tools_selected: vec!["bash".into()],
+            dynamic_tools_selected: Vec::new(),
             selected_count: 1,
             budget_used: 25,
             budget_total: 800,

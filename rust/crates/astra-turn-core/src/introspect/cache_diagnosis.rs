@@ -485,8 +485,9 @@ fn rule_tool_marker_not_on_tail(rounds: &[RoundSnapshot]) -> Option<CacheFinding
             total = sample.tool_count,
             s = if gap == 1 { "" } else { "s" },
         ),
-        actionable_fix: "Audit `default_pinned_tool_names()` — any runtime tool that ships with \
-             every session should be pinned so the marker reaches the real tail."
+        actionable_fix: "If the trailing schemas are meant to be static every turn, audit \
+             `default_pinned_tool_names()`; deferred or turn-selected tools after the marker \
+             are expected to sit outside the cached prefix."
             .into(),
         triggered_on: vec![(sample.turn, sample.round)],
     })

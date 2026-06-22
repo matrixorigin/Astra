@@ -21,6 +21,8 @@
 
 use crate::tool_registry::surface::{DEFAULT_PINNED, DeferredEntry, ToolSurface};
 use astra_config::ToolSurfaceConfig;
+use astra_turn_core::tool::schema::tool_schema_name;
+use astra_turn_core::tool_registry_meta::TOOL_CATALOG;
 use serde_json::{Value, json};
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
@@ -50,12 +52,7 @@ fn plugin_schema(name: &str, description: &str) -> Value {
 fn names(schemas: &[Value]) -> Vec<String> {
     schemas
         .iter()
-        .filter_map(|s| {
-            s.get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)
-                .map(String::from)
-        })
+        .filter_map(|s| tool_schema_name(s).map(String::from))
         .collect()
 }
 
@@ -72,6 +69,26 @@ fn every_default_pin_has_a_schema_in_the_canonical_pool() {
             "DEFAULT_PINNED contains {pinned}, but the canonical schema pool has no schema for it"
         );
     }
+}
+
+#[test]
+fn catalog_pinned_metadata_matches_runtime_default_surface_for_catalog_tools() {
+    let default_pinned: std::collections::HashSet<&str> = DEFAULT_PINNED.iter().copied().collect();
+    let catalog_default_pinned: std::collections::BTreeSet<&str> = TOOL_CATALOG
+        .iter()
+        .filter(|tool| default_pinned.contains(tool.name))
+        .map(|tool| tool.name)
+        .collect();
+    let catalog_metadata_pinned: std::collections::BTreeSet<&str> = TOOL_CATALOG
+        .iter()
+        .filter(|tool| tool.pinned)
+        .map(|tool| tool.name)
+        .collect();
+
+    assert_eq!(
+        catalog_metadata_pinned, catalog_default_pinned,
+        "catalog pinned metadata must not drift from runtime DEFAULT_PINNED for catalog-backed tools"
+    );
 }
 
 /// The default pinned set is the 14-member core.
@@ -232,6 +249,150 @@ fn deferred_list_contains_every_non_pinned_tool() {
 }
 
 #[test]
+fn deferred_list_excludes_final_visible_tools_even_when_not_default_pinned() {
+    let cfg = ToolSurfaceConfig::default();
+    let visible = std::collections::HashSet::from([
+        "enter_plan_mode".to_string(),
+        "exit_plan_mode".to_string(),
+    ]);
+
+    let surface = ToolSurface::build_excluding_visible(catalog_schemas(), &cfg, &[], &visible);
+    let deferred: std::collections::HashSet<String> = surface
+        .deferred()
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
+
+    assert!(
+        visible.is_disjoint(&deferred),
+        "tools already visible in tools[] must not also be advertised as deferred; visible={visible:?} deferred={deferred:?}"
+    );
+}
+
+#[test]
+fn deferred_manifest_is_atomic_text_budget_and_names() {
+    let cfg = ToolSurfaceConfig::default();
+    let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
+
+    let manifest = surface
+        .deferred_manifest(Some("gpt-4o"))
+        .expect("default surface should have deferred tools");
+
+    assert!(manifest.text.contains("<deferred_tools>"));
+    assert_eq!(
+        manifest.context_window,
+        crate::prompts::budget_for_model(Some("gpt-4o")).model_limit
+    );
+    assert_eq!(
+        manifest.names,
+        surface
+            .deferred()
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>(),
+        "producer must expose the exact names rendered in the deferred prompt block"
+    );
+}
+
+#[test]
+fn deferred_manifest_names_follow_rendered_budget_subset() {
+    let cfg = ToolSurfaceConfig::default();
+    let schemas: Vec<Value> = (0..200)
+        .map(|idx| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": format!("tool_{idx:03}"),
+                    "description": "A deliberately verbose deferred tool description that makes the rendered listing hit the small-model budget quickly.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            })
+        })
+        .collect();
+    let surface = ToolSurface::build(schemas, &cfg, &[]);
+
+    let manifest = surface
+        .deferred_manifest(Some("gpt-3.5-turbo"))
+        .expect("large deferred surface should render a budgeted subset");
+    let all_deferred_names: Vec<String> = surface
+        .deferred()
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
+
+    assert!(
+        manifest.names.len() < all_deferred_names.len(),
+        "test requires budget omission; rendered={} total={}",
+        manifest.names.len(),
+        all_deferred_names.len()
+    );
+    for name in &manifest.names {
+        assert!(
+            manifest.text.contains(&format!("<name>{name}</name>")),
+            "manifest exposed {name}, but the prompt block did not render that name: {}",
+            manifest.text
+        );
+    }
+    let omitted = all_deferred_names
+        .iter()
+        .find(|name| !manifest.names.contains(name))
+        .expect("budgeted manifest should omit at least one name");
+    assert!(
+        !manifest.text.contains(&format!("<name>{omitted}</name>")),
+        "test setup expected {omitted} to be omitted from rendered prompt"
+    );
+}
+
+#[test]
+fn invalid_named_schemas_do_not_enter_pinned_or_deferred_surface() {
+    let cfg = ToolSurfaceConfig {
+        pinned_tools: vec!["missing_type".to_string(), "custom_shape".to_string()],
+    };
+    let surface = ToolSurface::build(
+        vec![
+            plugin_schema("valid_tool", "A valid deferred tool."),
+            json!({"function": {"name": "missing_type", "description": "bad"}}),
+            json!({"type": "custom", "function": {"name": "custom_shape", "description": "bad"}}),
+        ],
+        &cfg,
+        &[],
+    );
+
+    assert!(!names(&surface.pinned_schemas()).contains(&"missing_type".to_string()));
+    assert!(!names(&surface.pinned_schemas()).contains(&"custom_shape".to_string()));
+    assert_eq!(
+        surface
+            .deferred()
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["valid_tool"]
+    );
+}
+
+#[test]
+fn deferred_manifest_none_when_every_tool_is_visible() {
+    let cfg = ToolSurfaceConfig::default();
+    let visible: std::collections::HashSet<String> = catalog_schemas()
+        .iter()
+        .filter_map(|schema| {
+            schema
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        })
+        .collect();
+    let surface = ToolSurface::build_excluding_visible(catalog_schemas(), &cfg, &[], &visible);
+
+    assert!(surface.deferred().is_empty());
+    assert!(
+        surface.deferred_manifest(Some("gpt-4o")).is_none(),
+        "callers must not get names/activatable state when there is no rendered deferred manifest"
+    );
+}
+
+#[test]
 fn deferred_entries_are_name_plus_short_desc_capped() {
     let cfg = ToolSurfaceConfig::default();
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
@@ -356,6 +517,39 @@ fn plugin_is_not_auto_pinned() {
             .iter()
             .any(|n| n == "mcp__db"),
         "plugin must NOT be auto-pinned"
+    );
+}
+
+#[test]
+fn deferred_entries_are_sorted_alphabetically() {
+    // BTreeMap iteration guarantees alphabetical order during build,
+    // but asserting this confirms it doesn't regress.
+    let cfg = ToolSurfaceConfig::default();
+    let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
+    let deferred_names: Vec<&str> = surface
+        .deferred()
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    let mut sorted = deferred_names.clone();
+    sorted.sort();
+    assert_eq!(
+        deferred_names, sorted,
+        "deferred entries must be sorted alphabetically for cache stability"
+    );
+}
+
+#[test]
+fn pinned_schemas_are_sorted_alphabetically() {
+    let cfg = ToolSurfaceConfig::default();
+    let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
+    let pinned_names = names(&surface.pinned_schemas());
+    let mut sorted: Vec<String> = pinned_names.clone().into_iter().collect();
+    sorted.sort();
+    assert_eq!(
+        Vec::from_iter(pinned_names),
+        sorted,
+        "pinned schemas must be sorted alphabetically for cache stability"
     );
 }
 

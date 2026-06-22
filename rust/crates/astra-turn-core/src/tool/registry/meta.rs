@@ -102,7 +102,11 @@ impl RuntimeBindingValidation {
 /// associations. This eliminates the need for embedding models while providing
 /// deterministic, debuggable, zero-latency matching.
 pub static TOOL_CATALOG: &[ToolMeta] = &[
-    // ── Pinned tools (always available) ─────────────────────────────
+    // ── Built-in tools ──────────────────────────────────────────────
+    //
+    // `pinned` must match the runtime default surface for catalog-backed tools.
+    // Non-core tools stay selectable/deferred by default and can still be
+    // promoted into `tools[]` by relevance or explicit user config.
     ToolMeta {
         name: "bash",
         description: "Execute shell commands for builds, tests, installs, git, CLI tasks",
@@ -129,7 +133,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "下载文件",
             "预览文件",
         ],
-        pinned: true,
+        pinned: false,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -406,7 +410,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "文档链接",
             "联动编辑",
         ],
-        pinned: true,
+        pinned: false,
         intents: &[IntentType::CodeRead, IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[Capability::LSPServer],
@@ -455,7 +459,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "merge",
             "review",
         ],
-        pinned: true,
+        pinned: false,
         intents: &[IntentType::GitHub],
         scope: Scope::External,
         requires: &[Capability::GitHubAuth],
@@ -487,17 +491,16 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "获取页面",
             "打开网址",
         ],
-        pinned: true,
+        pinned: false,
         intents: &[IntentType::CodeRead],
         scope: Scope::External,
         requires: &[],
         binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 25,
     },
-    // memory_store is pinned — intrinsic memory capability. The model must
-    // always be able to store memories regardless of query content. Without
-    // this, implicit preferences and background extraction have no way to
-    // persist information.
+    // memory is pinned — intrinsic memory capability. The model must always be
+    // able to store and retrieve memories regardless of query content. Without
+    // this, implicit preferences and background extraction have no stable path.
     ToolMeta {
         name: "memory",
         description: "Memory operations: store, retrieve, purge, correct, profile, search, feedback. Pass action parameter.",
@@ -535,7 +538,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "配置",
             "计划",
         ],
-        pinned: true,
+        pinned: false,
         intents: &[IntentType::Introspect],
         scope: Scope::Local,
         requires: &[],
@@ -627,7 +630,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "数据库",
             "查询",
         ],
-        pinned: true,
+        pinned: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::External,
         requires: &[Capability::Database],
@@ -674,7 +677,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         name: "agent",
         description: "Multi-agent operations: spawn one sub-agent, collect one background result, send messages, or execute a tool chain.",
         triggers: &["agent", "spawn", "chain", "orchestrate", "代理"],
-        pinned: true,
+        pinned: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::External,
         requires: &[Capability::AgentSpawner],
@@ -706,7 +709,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "多视角审查",
             "同时审查",
         ],
-        pinned: true,
+        pinned: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::External,
         requires: &[Capability::AgentSpawner],
@@ -774,7 +777,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "函数列表",
             "类列表",
         ],
-        pinned: true,
+        pinned: false,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -785,7 +788,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         name: "powershell",
         description: "Execute PowerShell commands for Windows shell tasks and cross-platform automation",
         triggers: &["powershell", "pwsh", "ps1", "windows", "PowerShell"],
-        pinned: true,
+        pinned: false,
         intents: &[IntentType::CodeEdit, IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -796,7 +799,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         name: "run_script",
         description: "Execute a structured script via sandbox RPC transport (Unix-only)",
         triggers: &["run_script", "script", "sandbox", "rpc"],
-        pinned: true,
+        pinned: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[],
@@ -1130,7 +1133,8 @@ mod tests {
         assert!(is_pinned_tool("read_file"));
         assert!(is_pinned_tool("str_replace"));
         assert!(is_pinned_tool("memory"));
-        assert!(is_pinned_tool("session"));
+        assert!(!is_pinned_tool("session"));
+        assert!(!is_pinned_tool("web_fetch"));
         assert!(!is_pinned_tool("nonexistent_tool"));
     }
 }

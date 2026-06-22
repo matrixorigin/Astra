@@ -4,7 +4,7 @@
 //! the runtime's [`run_agentic_loop_with_host`]; this module now only exposes
 //! `fetch_chat_turn_sse` for use by [`crate::cli_loop_host::CliAgenticLoopHost`].
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::Arc;
@@ -41,6 +41,7 @@ use astra_runtime::{
     turn::tool_schema_prune::pin_invoked_tool_schemas,
     turn::turn_guard::{TurnGuard, merge_deprioritized_tools_into_restricted},
 };
+use astra_turn_core::tool::schema::tool_schema_name;
 use crossterm::style::Stylize;
 use serde_json::{Value, json};
 
@@ -286,6 +287,7 @@ pub(crate) fn final_visible_tool_schemas_from_payload(payload: &Value) -> Vec<Va
 
 fn selection_report_from_visible_schemas(
     schemas: &[Value],
+    dynamic_tools_selected: Vec<String>,
     budget_used: u32,
     budget_total: u32,
 ) -> tool_registry::SelectionReport {
@@ -296,16 +298,10 @@ fn selection_report_from_visible_schemas(
     tool_registry::SelectionReport {
         selected_count: tools_selected.len() as u32,
         tools_selected,
+        dynamic_tools_selected,
         budget_used,
         budget_total,
     }
-}
-
-fn tool_schema_name(schema: &Value) -> Option<&str> {
-    schema
-        .get("function")
-        .and_then(|function| function.get("name"))
-        .and_then(Value::as_str)
 }
 
 async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
@@ -579,6 +575,23 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         ctx.all_schemas,
     );
 
+    turn_schemas = ctx.executor.runtime_bound_tool_schemas(turn_schemas);
+    let runtime_bound_turn_names =
+        astra_turn_core::tool::schema::tool_names_from_schemas(&turn_schemas);
+    selection_report
+        .tools_selected
+        .retain(|name| runtime_bound_turn_names.contains(name));
+    selection_report
+        .dynamic_tools_selected
+        .retain(|name| runtime_bound_turn_names.contains(name));
+    selection_report.selected_count = selection_report.tools_selected.len() as u32;
+    // NOTE: `budget_used` is intentionally NOT recomputed here. The
+    // `selection_report_from_visible_schemas` call below is the single source
+    // of truth for the final report's budget; any value set on the
+    // intermediate `selection_report.budget_used` would be overwritten and
+    // never consumed. See test
+    // `selection_report_from_visible_schemas_is_single_source_for_budget`.
+
     // Plan-mode tool restrictions are owned by the host
     // (`CliAgenticLoopHost::execute_turn`) using the same
     // turn-scoped add-then-remove pattern as
@@ -588,45 +601,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     // session 19298aea in `cli_loop_host::plan_mode_restriction_names`.
 
     ctx.executor.set_budget_pressure(budget_pressure);
-
-    let surface_schemas: Vec<Value> = ctx
-        .registry
-        .all_tool_schemas()
-        .iter()
-        .filter(|schema| {
-            tool_schema_name(schema)
-                .map(|name| !ctx.restricted_tools.contains(name))
-                .unwrap_or(true)
-        })
-        .cloned()
-        .collect();
-    let tool_surface = tool_registry::surface::ToolSurface::build(
-        surface_schemas,
-        &astra_config::runtime_config::RuntimeConfig::cached().tool_surface,
-        &[],
-    );
-    let activatable_tool_names_ordered: BTreeSet<String> = tool_surface
-        .deferred()
-        .iter()
-        .map(|entry| entry.name.clone())
-        .collect();
-    let deferred_tool_names_for_wire: Vec<String> =
-        activatable_tool_names_ordered.iter().cloned().collect();
-    let activatable_tool_names: HashSet<String> =
-        activatable_tool_names_ordered.into_iter().collect();
-    ctx.executor
-        .set_current_activatable_tool_names(activatable_tool_names);
-    if let Some(deferred_tools_text) = tool_surface.deferred_block_text(requested_model) {
-        let deferred_tools_context_window = prompts::budget_for_model(requested_model).model_limit;
-        merge_edge_profile_extensions(
-            &mut payload,
-            &json!({
-                EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT: deferred_tools_text,
-                EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW: deferred_tools_context_window,
-                EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES: deferred_tool_names_for_wire,
-            }),
-        );
-    }
 
     apply_selector_hints_then_attach_filtered_edge_tools(
         &mut payload,
@@ -640,28 +614,78 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     // capability restrictions, and interaction-mode filtering have all been
     // applied. The guard must mirror what the model actually saw.
     let final_visible_schemas = final_visible_tool_schemas_from_payload(&payload);
-    *ctx.valid_tool_names =
-        astra_turn_core::tool::deferred_activation::tool_names_from_schemas(&final_visible_schemas);
+    let final_visible_tool_names =
+        astra_turn_core::tool::schema::tool_names_from_schemas(&final_visible_schemas);
+    let eligible_surface_schemas: Vec<Value> = ctx
+        .registry
+        .all_tool_schemas()
+        .iter()
+        .filter(|schema| {
+            tool_schema_name(schema)
+                .map(|name| !ctx.restricted_tools.contains(name))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    let eligible_surface_schemas = ctx
+        .executor
+        .runtime_bound_tool_schemas(eligible_surface_schemas);
+    let tool_surface = tool_registry::surface::ToolSurface::build_excluding_visible(
+        eligible_surface_schemas,
+        &astra_config::runtime_config::RuntimeConfig::cached().tool_surface,
+        &[],
+        &final_visible_tool_names,
+    );
+    if let Some(manifest) = tool_surface.deferred_manifest(requested_model) {
+        let activatable_tool_names: HashSet<String> = manifest.names.iter().cloned().collect();
+        ctx.executor
+            .set_current_activatable_tool_names(activatable_tool_names);
+        merge_edge_profile_extensions(
+            &mut payload,
+            &json!({
+                EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT: manifest.text,
+                EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW: manifest.context_window,
+                EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES: manifest.names,
+            }),
+        );
+    } else {
+        ctx.executor
+            .set_current_activatable_tool_names(HashSet::new());
+    }
     ctx.executor
         .set_current_visible_tool_schemas(&final_visible_schemas);
-    // Telemetry truth: recompute budget_used from the ACTUAL final visible
+    // Telemetry truth: recompute dynamic budget from the ACTUAL final visible
     // schemas, not the pre-filtering selection report.  The original
     // `selection_report.budget_used` reflects tools that may have been
-    // stripped by capability/interaction-mode filtering, so reusing it
-    // would produce a budget number inconsistent with `tools_selected`.
+    // stripped by capability/interaction-mode filtering, so reusing it would
+    // produce a budget number inconsistent with `tools_selected`.
     let selected_tool_costs: Vec<(String, u32)> = final_visible_schemas
         .iter()
         .filter_map(|schema| {
             tool_schema_name(schema).map(|name| (name.to_string(), ctx.registry.token_cost(name)))
         })
         .collect();
-    let budget_used_final: u32 = selected_tool_costs.iter().map(|(_, cost)| *cost).sum();
+    let dynamic_tools_selected_final: Vec<String> = selection_report
+        .dynamic_tools_selected
+        .iter()
+        .filter(|name| final_visible_tool_names.contains(name.as_str()))
+        .cloned()
+        .collect();
+    let dynamic_tool_name_set: HashSet<String> =
+        dynamic_tools_selected_final.iter().cloned().collect();
+    let budget_used_final: u32 = selected_tool_costs
+        .iter()
+        .filter(|(name, _)| dynamic_tool_name_set.contains(name))
+        .map(|(_, cost)| *cost)
+        .sum();
     let final_selection_report = selection_report_from_visible_schemas(
         &final_visible_schemas,
+        dynamic_tools_selected_final,
         budget_used_final,
         selection_report.budget_total,
     );
-    let selected_tool_tokens_total: u32 = budget_used_final;
+    let selected_tool_tokens_total: u32 = selected_tool_costs.iter().map(|(_, cost)| *cost).sum();
+    *ctx.valid_tool_names = final_visible_tool_names;
 
     if let Some(collector) = ctx.telem.trace_collector {
         collector.record_tool_selection(
@@ -1342,7 +1366,8 @@ mod tests {
     };
     use astra_runtime::turn::agentic_loop::host::{ASK_USER_TOOL_NAME, TurnInteractionMode};
     use astra_turn_core::chat_history_openai::merge_skill_names_track;
-    use serde_json::json;
+    use astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES;
+    use serde_json::{Value, json};
 
     fn schema(name: &str) -> serde_json::Value {
         json!({
@@ -1567,6 +1592,32 @@ mod tests {
         assert_eq!(names, vec!["read_file"]);
     }
 
+    /// Regression: the final SelectionReport's `budget_used` must be derived
+    /// entirely from the explicit `budget_used` argument, NOT from any stale
+    /// `budget_used` field on a pre-existing report. This contract is what
+    /// permits removing the dead recomputation at the call site (the value
+    /// set on `selection_report.budget_used` was overwritten by
+    /// `budget_used_final` and never consumed).
+    #[test]
+    fn selection_report_from_visible_schemas_is_single_source_for_budget() {
+        let schemas = vec![schema("grep"), schema("read_file")];
+        let dynamic: Vec<String> = vec!["grep".into()];
+
+        let report = super::selection_report_from_visible_schemas(
+            &schemas, dynamic, 42,  // budget_used — arbitrary, must pass through verbatim
+            100, // budget_total
+        );
+
+        assert_eq!(
+            report.tools_selected,
+            vec!["grep".to_string(), "read_file".to_string()]
+        );
+        assert_eq!(report.dynamic_tools_selected, vec!["grep".to_string()]);
+        assert_eq!(report.selected_count, 2);
+        assert_eq!(report.budget_used, 42);
+        assert_eq!(report.budget_total, 100);
+    }
+
     // ── Regression: skill allowed_tools not force-included (session c3dea07a) ──
     //
     // When a skill declares allowed_tools (e.g. review-changes allows grep, glob),
@@ -1589,6 +1640,7 @@ mod tests {
         let mut turn_schemas = vec![schema("bash"), schema("read_file")];
         let mut report = SelectionReport {
             tools_selected: vec!["bash".into(), "read_file".into()],
+            dynamic_tools_selected: Vec::new(),
             selected_count: 2,
             budget_used: 0,
             budget_total: 0,
@@ -1747,6 +1799,21 @@ mod tests {
                 .filter(|name| **name == "exit_plan_mode")
                 .count(),
             1
+        );
+        let deferred_tool_names: HashSet<String> = payload["edge_profile"]
+            [EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            edge_tool_name_set.is_disjoint(&deferred_tool_names),
+            "a tool cannot be both visible in edge_tools and advertised as deferred; visible={edge_tool_name_set:?} deferred={deferred_tool_names:?}"
         );
     }
 
@@ -2247,7 +2314,19 @@ mod tests {
         let search = executor
             .execute("tool_search", &json!({"query": "select:memory"}))
             .await;
-        assert!(search.contains("\"name\":\"memory\""), "{search}");
+        let search_json: Value = serde_json::from_str(&search)
+            .unwrap_or_else(|error| panic!("tool_search must return JSON, got {error}: {search}"));
+        let search_match_names: Vec<&str> = search_json["matches"]
+            .as_array()
+            .expect("tool_search matches must be an array")
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect();
+        assert_eq!(search_match_names, vec!["memory"]);
+        assert!(
+            search_json["matches"][0].get("parameters").is_some(),
+            "tool_search select must return the full callable schema: {search_json}"
+        );
         assert_eq!(
             executor.activated_deferred_tool_names(),
             vec!["memory".to_string()]
@@ -2340,6 +2419,348 @@ mod tests {
             "activated deferred tool must be admitted only after it is injected"
         );
         assert_eq!(valid_tool_names, edge_tool_names);
+        assert_eq!(
+            executor.activated_deferred_tool_names(),
+            vec!["memory".to_string()],
+            "activated tool must remain active after the payload makes it visible and removes it from the deferred manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_chat_turn_payload_clears_stale_activatable_when_no_deferred_manifest() {
+        use crate::edge_tools::ToolExecutor;
+        use astra_pipeline::step_recorder::StepRecorder;
+        use astra_runtime::{
+            tool_registry::ToolRegistry,
+            turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
+        };
+        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use std::{collections::HashSet, sync::Arc, time::Instant};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let all_schemas = vec![schema("tool_search")];
+        let registry = ToolRegistry::new(all_schemas.clone()).with_budget(1);
+        let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
+        executor.set_current_visible_tool_schemas(&[schema("tool_search")]);
+        executor.set_current_activatable_tool_names(HashSet::from(["memory".to_string()]));
+
+        let messages = vec![json!({"role": "user", "content": "no deferred tools"})];
+        let tool_results = Vec::new();
+        let history: Vec<(String, String)> = Vec::new();
+        let recent_tools: Vec<String> = Vec::new();
+        let file_context: Vec<String> = Vec::new();
+        let mut restricted_tools = HashSet::new();
+        let mut valid_tool_names = HashSet::new();
+        let mut widen_selection_pending = false;
+        let mut step_recorder = StepRecorder::new("session-1", "task-1");
+        let turn_guard = TurnGuard::default();
+        let skill_search = astra_core::SkillSearchSettings::default();
+        let mut turn_policy = TurnInteractionPolicy::default();
+        let mut first_memoria_ms = None;
+        let mut first_selection_report = None;
+        let mut first_budget_pressure = 0.0;
+        let mut first_context_assembly_ms = None;
+        let mut all_selected_skills = Vec::new();
+
+        let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            messages: &messages,
+            runtime_volatile_texts: &[],
+            ephemeral_prefix: None,
+            current_session_id: Some("session-1"),
+            model: None,
+            explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
+            project_root: temp_dir.path(),
+            message: "no deferred tools",
+            semantic_query_override: None,
+            history: &history,
+            recent_tools: &recent_tools,
+            executor: executor.clone(),
+            registry: &registry,
+            tool_results: &tool_results,
+            all_schemas: &all_schemas,
+            valid_tool_names: &mut valid_tool_names,
+            turn_guard: &turn_guard,
+            restricted_tools: &mut restricted_tools,
+            widen_selection_pending: &mut widen_selection_pending,
+            step_recorder: &mut step_recorder,
+            file_context: &file_context,
+            assembly_start: Instant::now(),
+            telem: PrepareTurnTelemetry {
+                first_memoria_ms: &mut first_memoria_ms,
+                first_selection_report: &mut first_selection_report,
+                first_budget_pressure: &mut first_budget_pressure,
+                first_context_assembly_ms: &mut first_context_assembly_ms,
+                all_selected_skills: &mut all_selected_skills,
+                initial_skill_selector_shortlist: None,
+                trace_collector: None,
+            },
+            skill_search: &skill_search,
+            is_plan_subtask: false,
+            plan_subtask_id: None,
+            timing_phases: false,
+            prep_ui_phase: None,
+            skill_effort: None,
+            skill_agent_type: None,
+            tool_budget_override: None,
+            interaction_mode: TurnInteractionMode::NonInteractive,
+            turn_policy: &mut turn_policy,
+            skill_allowed_tools: None,
+            previous_confidence_fallback: None,
+            round_index: 0,
+            session_turn: 1,
+            turn_chain_id: None,
+            user_query_event_id: None,
+            denial_pressure: (0, 0),
+            recent_rejections: Vec::new(),
+            observability_hub: None,
+            append_system_prompt: None,
+            plan_mode_active: false,
+        })
+        .await;
+
+        assert!(
+            payload["edge_profile"][EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES]
+                .as_array()
+                .is_none_or(|names| names.is_empty()),
+            "payload without a deferred prompt block must not carry deferred names: {payload}"
+        );
+        assert!(
+            executor
+                .current_activatable_tool_names_snapshot()
+                .is_empty(),
+            "stale activatable names must be cleared when no deferred manifest is rendered"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_chat_turn_payload_does_not_advertise_unbound_deferred_runtime_tool() {
+        use crate::edge_tools::ToolExecutor;
+        use astra_pipeline::step_recorder::StepRecorder;
+        use astra_runtime::{
+            tool_registry::ToolRegistry,
+            turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
+        };
+        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use std::{collections::HashSet, sync::Arc, time::Instant};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let all_schemas = vec![schema("tool_search"), schema("agent_fanout")];
+        let registry = ToolRegistry::new(all_schemas.clone()).with_budget(1);
+        let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
+
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let tool_results = Vec::new();
+        let history: Vec<(String, String)> = Vec::new();
+        let recent_tools: Vec<String> = Vec::new();
+        let file_context: Vec<String> = Vec::new();
+        let mut restricted_tools = HashSet::new();
+        let mut valid_tool_names = HashSet::new();
+        let mut widen_selection_pending = false;
+        let mut step_recorder = StepRecorder::new("session-1", "task-1");
+        let turn_guard = TurnGuard::default();
+        let skill_search = astra_core::SkillSearchSettings::default();
+        let mut turn_policy = TurnInteractionPolicy::default();
+        let mut first_memoria_ms = None;
+        let mut first_selection_report = None;
+        let mut first_budget_pressure = 0.0;
+        let mut first_context_assembly_ms = None;
+        let mut all_selected_skills = Vec::new();
+
+        let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            messages: &messages,
+            runtime_volatile_texts: &[],
+            ephemeral_prefix: None,
+            current_session_id: Some("session-1"),
+            model: None,
+            explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
+            project_root: temp_dir.path(),
+            message: "hello",
+            semantic_query_override: None,
+            history: &history,
+            recent_tools: &recent_tools,
+            executor: executor.clone(),
+            registry: &registry,
+            tool_results: &tool_results,
+            all_schemas: &all_schemas,
+            valid_tool_names: &mut valid_tool_names,
+            turn_guard: &turn_guard,
+            restricted_tools: &mut restricted_tools,
+            widen_selection_pending: &mut widen_selection_pending,
+            step_recorder: &mut step_recorder,
+            file_context: &file_context,
+            assembly_start: Instant::now(),
+            telem: PrepareTurnTelemetry {
+                first_memoria_ms: &mut first_memoria_ms,
+                first_selection_report: &mut first_selection_report,
+                first_budget_pressure: &mut first_budget_pressure,
+                first_context_assembly_ms: &mut first_context_assembly_ms,
+                all_selected_skills: &mut all_selected_skills,
+                initial_skill_selector_shortlist: None,
+                trace_collector: None,
+            },
+            skill_search: &skill_search,
+            is_plan_subtask: false,
+            plan_subtask_id: None,
+            timing_phases: false,
+            prep_ui_phase: None,
+            skill_effort: None,
+            skill_agent_type: None,
+            tool_budget_override: None,
+            interaction_mode: TurnInteractionMode::NonInteractive,
+            turn_policy: &mut turn_policy,
+            skill_allowed_tools: None,
+            previous_confidence_fallback: None,
+            round_index: 0,
+            session_turn: 1,
+            turn_chain_id: None,
+            user_query_event_id: None,
+            denial_pressure: (0, 0),
+            recent_rejections: Vec::new(),
+            observability_hub: None,
+            append_system_prompt: None,
+            plan_mode_active: false,
+        })
+        .await;
+
+        assert!(
+            payload["edge_profile"][EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES]
+                .as_array()
+                .is_none_or(|names| names.is_empty()),
+            "payload must not advertise a deferred runtime tool that local tool_search cannot activate: {payload}"
+        );
+        assert!(
+            executor
+                .current_activatable_tool_names_snapshot()
+                .is_empty(),
+            "executor activatable set must agree with the payload deferred manifest"
+        );
+        let search = executor
+            .execute("tool_search", &json!({"query": "select:agent_fanout"}))
+            .await;
+        let search_json: Value = serde_json::from_str(&search).unwrap();
+        assert!(
+            search_json["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not resolve unbound agent_fanout: {search_json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_chat_turn_payload_does_not_put_unbound_runtime_tool_in_tools_array() {
+        use crate::edge_tools::ToolExecutor;
+        use astra_pipeline::step_recorder::StepRecorder;
+        use astra_runtime::{
+            tool_registry::ToolRegistry,
+            turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
+        };
+        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use std::{collections::HashSet, sync::Arc, time::Instant};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let all_schemas = vec![schema("tool_search"), schema("agent_fanout")];
+        let registry = ToolRegistry::new(all_schemas.clone()).with_budget(1);
+        let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
+        executor.debug_stage_pending_round_tool_boost_for_test(&["agent_fanout"]);
+
+        let messages = vec![json!({"role": "user", "content": "fan out this work"})];
+        let tool_results = Vec::new();
+        let history: Vec<(String, String)> = Vec::new();
+        let recent_tools: Vec<String> = Vec::new();
+        let file_context: Vec<String> = Vec::new();
+        let mut restricted_tools = HashSet::new();
+        let mut valid_tool_names = HashSet::new();
+        let mut widen_selection_pending = false;
+        let mut step_recorder = StepRecorder::new("session-1", "task-1");
+        let turn_guard = TurnGuard::default();
+        let skill_search = astra_core::SkillSearchSettings::default();
+        let mut turn_policy = TurnInteractionPolicy::default();
+        let mut first_memoria_ms = None;
+        let mut first_selection_report = None;
+        let mut first_budget_pressure = 0.0;
+        let mut first_context_assembly_ms = None;
+        let mut all_selected_skills = Vec::new();
+
+        let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            messages: &messages,
+            runtime_volatile_texts: &[],
+            ephemeral_prefix: None,
+            current_session_id: Some("session-1"),
+            model: None,
+            explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
+            project_root: temp_dir.path(),
+            message: "fan out this work",
+            semantic_query_override: None,
+            history: &history,
+            recent_tools: &recent_tools,
+            executor: executor.clone(),
+            registry: &registry,
+            tool_results: &tool_results,
+            all_schemas: &all_schemas,
+            valid_tool_names: &mut valid_tool_names,
+            turn_guard: &turn_guard,
+            restricted_tools: &mut restricted_tools,
+            widen_selection_pending: &mut widen_selection_pending,
+            step_recorder: &mut step_recorder,
+            file_context: &file_context,
+            assembly_start: Instant::now(),
+            telem: PrepareTurnTelemetry {
+                first_memoria_ms: &mut first_memoria_ms,
+                first_selection_report: &mut first_selection_report,
+                first_budget_pressure: &mut first_budget_pressure,
+                first_context_assembly_ms: &mut first_context_assembly_ms,
+                all_selected_skills: &mut all_selected_skills,
+                initial_skill_selector_shortlist: None,
+                trace_collector: None,
+            },
+            skill_search: &skill_search,
+            is_plan_subtask: false,
+            plan_subtask_id: None,
+            timing_phases: false,
+            prep_ui_phase: None,
+            skill_effort: None,
+            skill_agent_type: None,
+            tool_budget_override: None,
+            interaction_mode: TurnInteractionMode::NonInteractive,
+            turn_policy: &mut turn_policy,
+            skill_allowed_tools: None,
+            previous_confidence_fallback: None,
+            round_index: 0,
+            session_turn: 1,
+            turn_chain_id: None,
+            user_query_event_id: None,
+            denial_pressure: (0, 0),
+            recent_rejections: Vec::new(),
+            observability_hub: None,
+            append_system_prompt: None,
+            plan_mode_active: false,
+        })
+        .await;
+
+        let edge_tool_names: HashSet<String> = payload["edge_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|schema| schema["function"]["name"].as_str())
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            !edge_tool_names.contains("agent_fanout"),
+            "tools[] must not advertise a runtime-gated tool without a connected runtime: {payload}"
+        );
+        assert!(
+            !valid_tool_names.contains("agent_fanout"),
+            "validator must mirror the filtered tools[] surface"
+        );
+        let recommended: Vec<String> = payload["edge_profile"]["recommended_tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry["name"].as_str())
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            !recommended.iter().any(|name| name == "agent_fanout"),
+            "edge_profile must not recommend a tool absent from the executable surface: {recommended:?}"
+        );
     }
 
     #[tokio::test]

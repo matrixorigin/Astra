@@ -32,7 +32,7 @@ use crate::server::tool_transport::{
     WorkspaceBindingKind, binding_event_fields,
     capability_filter_edge_provided_tool_schemas_for_binding,
     capability_filtered_server_tool_schemas, projected_tool_end_event_fields,
-    projected_tool_start_event_fields, tool_schema_name,
+    projected_tool_start_event_fields,
 };
 use crate::turn::agentic::headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_loop::host::{
@@ -62,6 +62,7 @@ use astra_turn_core::bridge_rate_limit_cooldown::{
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use astra_turn_core::compaction_types::CompactionTier;
 use astra_turn_core::thinking_config::ThinkingConfig;
+use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_schema_prune::filter_tool_schemas_by_excluded_names;
 
 const MAX_PENDING_PROGRESS_AGENTS: usize = 128;
@@ -817,6 +818,9 @@ pub struct ServerAgenticLoopHost {
     capabilities: astra_turn_core::capability::CapabilitySet,
     edge_profile: Map<String, Value>,
     valid_tools: HashSet<String>,
+    /// Effective names from this turn's deferred manifest after removing
+    /// tools that are already visible in the final wire `tools[]`.
+    current_deferred_tool_names: HashSet<String>,
     /// Names the validator should admit beyond the current visible schemas.
     ///
     /// Covers runtime-surface tools (`skill`, `agent`, `web_search`,
@@ -1283,6 +1287,7 @@ impl ServerAgenticLoopHostBuilder {
             capabilities: self.capabilities,
             edge_profile: self.edge_profile,
             valid_tools,
+            current_deferred_tool_names: HashSet::new(),
             admissible_extras,
             selection_confidence: self.selection_confidence,
             server_side_tools,
@@ -1399,22 +1404,54 @@ impl ServerAgenticLoopHost {
     /// Updates `edge_tools`, `valid_tools`, and `admissible_extras`
     /// so the LLM sees MCP tools and the validator admits them.
     pub fn install_runtime_tool_schemas(&mut self, schemas: Vec<Value>) {
-        let runtime_tools_are_the_only_tool_surface =
-            !schemas.is_empty() && self.edge_tools.is_empty();
-        for schema in &schemas {
-            if let Some(name) = schema
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|v| v.as_str())
-            {
-                self.valid_tools.insert(name.to_string());
-                self.admissible_extras.push(name.to_string());
-            }
-        }
-        self.edge_tools.extend(schemas);
-        if runtime_tools_are_the_only_tool_surface {
+        let edge_tools_were_empty = self.edge_tools.is_empty();
+        let installed_any = schemas
+            .into_iter()
+            .any(|schema| self.install_admissible_tool_schema(schema, true));
+        if edge_tools_were_empty && installed_any {
             self.server_side_tools = true;
         }
+    }
+
+    fn tool_schema_visible_for_current_binding(&self, schema: &Value) -> bool {
+        !capability_filter_edge_provided_tool_schemas_for_binding(
+            vec![schema.clone()],
+            &self.workspace_binding,
+            &self.executor_binding,
+            self.runtime_binding.as_ref(),
+        )
+        .is_empty()
+    }
+
+    fn install_admissible_tool_schema(&mut self, schema: Value, admit_as_extra: bool) -> bool {
+        let Some(name) = tool_schema_name(&schema).map(str::to_string) else {
+            tracing::warn!(
+                "install_admissible_tool_schema: rejected malformed schema (no valid function name)"
+            );
+            return false;
+        };
+        if !self.tool_schema_visible_for_current_binding(&schema) {
+            tracing::warn!(
+                tool_name = %name,
+                "install_admissible_tool_schema: schema rejected — not visible for current binding"
+            );
+            return false;
+        }
+
+        self.valid_tools.insert(name.clone());
+        if admit_as_extra && !self.admissible_extras.iter().any(|extra| extra == &name) {
+            self.admissible_extras.push(name.clone());
+        }
+        if let Some(existing) = self
+            .edge_tools
+            .iter_mut()
+            .find(|tool| tool_schema_name(tool) == Some(name.as_str()))
+        {
+            *existing = schema;
+        } else {
+            self.edge_tools.push(schema);
+        }
+        true
     }
 
     fn read_plan_resume_hint(&self) -> Option<String> {
@@ -2202,9 +2239,16 @@ impl ServerAgenticLoopHost {
                 continue;
             }
 
-            let output = astra_turn_core::tool::deferred_activation::tool_not_admitted_message(
-                &tool_name, false,
-            );
+            let is_deferred = self.current_deferred_tool_names.contains(&tool_name);
+            let output = if is_deferred {
+                astra_turn_core::tool::deferred_activation::direct_deferred_call_activated_message(
+                    &tool_name,
+                )
+            } else {
+                astra_turn_core::tool::deferred_activation::tool_not_admitted_message(
+                    &tool_name, false,
+                )
+            };
             self.emit_event(Value::Object(build_tool_call_end_event(
                 &request_id,
                 json!({
@@ -2563,10 +2607,16 @@ impl ServerAgenticLoopHost {
         state: &AgenticLoopState,
     ) {
         let mut extras = self.admissible_extras.clone();
-        let deferred_tool_names = self.deferred_tool_names_from_edge_profile();
+        let deferred_tool_names = self.deferred_tool_names_for_wire_tools(
+            wire_tools,
+            self.resolved_model_name.as_deref(),
+            state.server_tool_executor.as_deref(),
+        );
+        self.current_deferred_tool_names = deferred_tool_names.clone();
         if let Some(executor) = state.server_tool_executor.as_deref() {
             executor.set_current_activatable_tool_names(deferred_tool_names);
-            executor.set_current_searchable_tool_schemas(wire_tools);
+            self.current_deferred_tool_names = executor.current_activatable_tool_names_snapshot();
+            executor.set_current_visible_tool_schemas(wire_tools);
             extras.extend(executor.activated_deferred_tool_names());
         }
         self.valid_tools = self.admissible_tool_names_for_surface(wire_tools, &extras);
@@ -2588,17 +2638,97 @@ impl ServerAgenticLoopHost {
         }
     }
 
-    fn deferred_tool_names_from_edge_profile(&self) -> HashSet<String> {
-        self.edge_profile
-            .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES)
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(str::to_string)
-            .collect()
+    fn deferred_tool_names_from_edge_profile_for_model(
+        &self,
+        resolved_model_name: Option<&str>,
+    ) -> HashSet<String> {
+        crate::turn::deferred_tools_edge_profile::names_for_model(
+            &self.edge_profile,
+            resolved_model_name,
+        )
+    }
+
+    fn deferred_tool_names_for_wire_tools(
+        &self,
+        wire_tools: &[Value],
+        resolved_model_name: Option<&str>,
+        executor: Option<&crate::server::server_tool_executor::ServerToolExecutor>,
+    ) -> HashSet<String> {
+        let deferred_tool_names =
+            self.deferred_tool_names_from_edge_profile_for_model(resolved_model_name);
+        if deferred_tool_names.is_empty() {
+            return HashSet::new();
+        }
+
+        let visible_tool_names = astra_turn_core::tool::schema::tool_names_from_schemas(wire_tools);
+        if !deferred_tool_names.is_disjoint(&visible_tool_names) {
+            // Fail-closed: a deferred tool appearing in the visible surface
+            // would mean the pre-rendered prompt block lists a tool the model
+            // can already see, which breaks the deferred-activation contract.
+            // The entire manifest is dropped because the block is pre-rendered
+            // by the CLI and cannot be partially re-rendered server-side.
+            let overlap: Vec<&str> = deferred_tool_names
+                .intersection(&visible_tool_names)
+                .map(String::as_str)
+                .collect();
+            tracing::warn!(
+                target: "astra.deferred_tools",
+                overlap = ?overlap,
+                deferred_count = deferred_tool_names.len(),
+                visible_count = visible_tool_names.len(),
+                "deferred manifest dropped: deferred tool(s) appear in visible surface; \
+                 prompt block suppressed to prevent partial-manifest mismatch"
+            );
+            return HashSet::new();
+        }
+
+        if let Some(executor) = executor {
+            let runtime_bound = executor.runtime_bound_tool_names(deferred_tool_names.clone());
+            if runtime_bound != deferred_tool_names {
+                // Fail-closed: runtime binding removed part of the deferred
+                // manifest. The pre-rendered block lists all declared names, so
+                // a partial activatable set would let the model attempt to
+                // activate a tool that tool_search cannot resolve.
+                let removed: Vec<&str> = deferred_tool_names
+                    .difference(&runtime_bound)
+                    .map(String::as_str)
+                    .collect();
+                tracing::warn!(
+                    target: "astra.deferred_tools",
+                    removed = ?removed,
+                    removed_count = removed.len(),
+                    declared_count = deferred_tool_names.len(),
+                    "deferred manifest dropped: runtime binding filtered {} of {} tool(s); \
+                     prompt block suppressed to prevent unresolvable activation attempts",
+                    removed.len(),
+                    deferred_tool_names.len()
+                );
+                return HashSet::new();
+            }
+        }
+        deferred_tool_names
+    }
+
+    fn deferred_tools_block_for_wire_surface(
+        &self,
+        wire_tools: &[Value],
+        state: &AgenticLoopState,
+        model_name: &str,
+    ) -> String {
+        let manifest_names = self.deferred_tool_names_from_edge_profile_for_model(Some(model_name));
+        if manifest_names.is_empty() {
+            return String::new();
+        }
+        let effective_names = self.deferred_tool_names_for_wire_tools(
+            wire_tools,
+            Some(model_name),
+            state.server_tool_executor.as_deref(),
+        );
+        if effective_names != manifest_names {
+            return String::new();
+        }
+        crate::turn::deferred_tools_edge_profile::block_for_model(&self.edge_profile, model_name)
+            .unwrap_or_default()
     }
 
     /// Set the extras list (runtime-injected names + plugin names) so
@@ -2733,6 +2863,8 @@ impl ServerAgenticLoopHost {
             "visible_tool_count": visible_tools.len(),
             "restricted_tool_count": restricted_snapshot.len(),
         }));
+        let deferred_tools_block =
+            self.deferred_tools_block_for_wire_surface(visible_tools, state, model_name);
         let cache_cfg =
             PromptCacheConfig::from_cache_capability(cache_capability, provider, model_name);
         crate::turn::llm::context::assemble_context_pipeline(
@@ -2743,6 +2875,7 @@ impl ServerAgenticLoopHost {
                     visible_tools,
                     &restricted_snapshot,
                 )
+                .with_deferred_tools_block(&deferred_tools_block)
                 .with_selection_trace(selection_trace),
                 runtime_signals: crate::turn::llm::context::RuntimeSignals::new(
                     &self.edge_profile,
@@ -3867,7 +4000,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     }
 
     fn deferred_tool_names(&self) -> HashSet<String> {
-        self.deferred_tool_names_from_edge_profile()
+        self.current_deferred_tool_names.clone()
     }
 
     fn capabilities(&self) -> astra_turn_core::capability::CapabilitySet {
@@ -3950,24 +4083,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     }
 
     fn inject_tool_schema(&mut self, schema: Value) {
-        if let Some(name) = schema
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(Value::as_str)
-        {
-            let name_owned = name.to_string();
-            self.valid_tools.insert(name_owned.clone());
-            if let Some(existing) = self.edge_tools.iter_mut().find(|tool| {
-                tool.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str)
-                    == Some(name_owned.as_str())
-            }) {
-                *existing = schema;
-            } else {
-                self.edge_tools.push(schema);
-            }
-        }
+        self.install_admissible_tool_schema(schema, false);
     }
 }
 
@@ -4630,6 +4746,17 @@ mod tests {
             .collect()
     }
 
+    fn named_schema(tool_name: &str) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": "test schema",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        })
+    }
+
     fn edge_runtime_snapshot() -> ExecutionBindingSnapshot {
         ExecutionBindingSnapshot::new(
             WorkspaceBinding::edge_workspace(
@@ -4645,6 +4772,36 @@ mod tests {
             ),
             astra_runtime_env::RuntimeBinding::host_process("edge-host"),
         )
+    }
+
+    fn deferred_manifest_edge_profile(names: &[&str], model: &str) -> Map<String, Value> {
+        let mut edge_profile = Map::new();
+        let tools_xml = names
+            .iter()
+            .filter(|name| !name.trim().is_empty())
+            .map(|name| format!("<tool><name>{}</name></tool>", name.trim()))
+            .collect::<Vec<_>>()
+            .join("");
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT
+                .to_string(),
+            Value::String(format!("<deferred_tools>{tools_xml}</deferred_tools>")),
+        );
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW
+                .to_string(),
+            Value::Number(
+                crate::prompts::budget_for_model(Some(model))
+                    .model_limit
+                    .into(),
+            ),
+        );
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES
+                .to_string(),
+            json!(names),
+        );
+        edge_profile
     }
 
     fn message_text(message: &Value) -> String {
@@ -5032,7 +5189,7 @@ mod tests {
         );
         let searchable = executor
             .current_searchable_tool_names()
-            .expect("executor searchable names must be synced");
+            .expect("executor search pool names must be synced");
         assert!(searchable.contains("bash"));
         assert!(
             !searchable.contains("read_file"),
@@ -5042,12 +5199,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_host_syncs_deferred_manifest_to_executor_activation() {
-        let mut edge_profile = Map::new();
-        edge_profile.insert(
-            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES
-                .to_string(),
-            json!(["agent_fanout", " "]),
-        );
+        let edge_profile = deferred_manifest_edge_profile(&["github", " "], "gpt-4o");
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -5058,6 +5210,7 @@ mod tests {
         .with_edge_profile(edge_profile)
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
+        host.resolved_model_name = Some("gpt-4o".to_string());
 
         let dir = tempfile::TempDir::new().unwrap();
         let executor = Arc::new(
@@ -5077,24 +5230,525 @@ mod tests {
         assert!(
             executor
                 .current_activatable_tool_names_snapshot()
-                .contains("agent_fanout"),
+                .contains("github"),
             "executor must mirror edge-profile deferred names"
         );
         assert!(
             <ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host)
-                .contains("agent_fanout"),
+                .contains("github"),
             "validator must see the same deferred manifest"
         );
 
         let result = executor
-            .execute_with_metadata("tool_search", &json!({"query": "Select:agent_fanout"}))
+            .execute_with_metadata("tool_search", &json!({"query": "Select:github"}))
             .await;
         let parsed: Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(
             parsed["matches"][0]["name"].as_str(),
-            Some("agent_fanout"),
+            Some("github"),
             "server tool_search must resolve names advertised in the deferred manifest: {}",
             result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn server_host_rejects_deferred_manifest_when_prompt_and_metadata_names_diverge() {
+        let mut edge_profile = deferred_manifest_edge_profile(&["agent_fanout"], "gpt-4o");
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES
+                .to_string(),
+            json!(["agent_fanout", "web_fetch"]),
+        );
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_edge_profile(edge_profile)
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        host.resolved_model_name = Some("gpt-4o".to_string());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let executor = Arc::new(
+            crate::server::server_tool_executor::ServerToolExecutor::new(
+                dir.path().to_path_buf(),
+                "user1".into(),
+                "sess1".into(),
+                None,
+                None,
+            ),
+        );
+        let mut state = create_test_state();
+        state.server_tool_executor = Some(Arc::clone(&executor));
+
+        let _visible = host.visible_turn_tools(&mut state);
+
+        assert!(
+            executor
+                .current_activatable_tool_names_snapshot()
+                .is_empty(),
+            "executor must not activate any deferred tool from an inconsistent manifest"
+        );
+        assert!(
+            <ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host).is_empty(),
+            "validator must consume the same fail-closed deferred manifest as the executor"
+        );
+
+        let selected = executor
+            .execute_with_metadata("tool_search", &json!({"query": "Select:agent_fanout"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&selected.output).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not resolve names from an inconsistent deferred manifest: {}",
+            selected.output
+        );
+
+        let mut prompt_state = create_test_state();
+        let outcome = host
+            .run_turn_pipeline(
+                &mut prompt_state,
+                &sample_edge_tools(),
+                "openai",
+                "gpt-4o",
+                "use agent fanout",
+            )
+            .expect("server context pipeline should assemble without deferred metadata");
+        let text = pipeline_outcome_text(&outcome);
+        assert!(
+            !text.contains("<deferred_tools>"),
+            "prompt must not advertise deferred tools that activation/search will reject: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_host_rejects_deferred_manifest_for_unbound_runtime_tool() {
+        let edge_profile = deferred_manifest_edge_profile(&["agent_fanout"], "gpt-4o");
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_edge_profile(edge_profile)
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        host.resolved_model_name = Some("gpt-4o".to_string());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let executor = Arc::new(
+            crate::server::server_tool_executor::ServerToolExecutor::new(
+                dir.path().to_path_buf(),
+                "user1".into(),
+                "sess1".into(),
+                None,
+                None,
+            ),
+        );
+        let mut state = create_test_state();
+        state.server_tool_executor = Some(Arc::clone(&executor));
+
+        let _visible = host.visible_turn_tools(&mut state);
+
+        assert!(
+            executor
+                .current_activatable_tool_names_snapshot()
+                .is_empty(),
+            "executor must not activate deferred tools whose runtime binding is absent"
+        );
+        assert!(
+            <ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host).is_empty(),
+            "validator must not tell the model to select a tool that tool_search cannot activate"
+        );
+
+        let selected = executor
+            .execute_with_metadata("tool_search", &json!({"query": "Select:agent_fanout"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&selected.output).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not resolve an unbound deferred runtime tool: {}",
+            selected.output
+        );
+
+        let outcome = host
+            .run_turn_pipeline(
+                &mut state,
+                &sample_edge_tools(),
+                "openai",
+                "gpt-4o",
+                "use agent fanout",
+            )
+            .expect("server context pipeline should assemble without unbound deferred tools");
+        let text = pipeline_outcome_text(&outcome);
+        assert!(
+            !text.contains("<deferred_tools>"),
+            "prompt must not advertise deferred tools that tool_search cannot activate: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_host_rejects_deferred_manifest_for_unbound_mcp_tool() {
+        let edge_profile = deferred_manifest_edge_profile(&["mcp__calculator"], "gpt-4o");
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_edge_profile(edge_profile)
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        host.resolved_model_name = Some("gpt-4o".to_string());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let executor = Arc::new(
+            crate::server::server_tool_executor::ServerToolExecutor::new(
+                dir.path().to_path_buf(),
+                "user1".into(),
+                "sess1".into(),
+                None,
+                None,
+            ),
+        );
+        let mut state = create_test_state();
+        state.server_tool_executor = Some(Arc::clone(&executor));
+
+        let _visible = host.visible_turn_tools(&mut state);
+
+        assert!(
+            executor
+                .current_activatable_tool_names_snapshot()
+                .is_empty(),
+            "executor must not activate MCP deferred tools without an MCP runtime binding"
+        );
+        assert!(
+            <ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host).is_empty(),
+            "validator must not advertise MCP deferred tools that tool_search cannot resolve"
+        );
+
+        let selected = executor
+            .execute_with_metadata("tool_search", &json!({"query": "Select:mcp__calculator"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&selected.output).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not resolve an unbound MCP deferred tool: {}",
+            selected.output
+        );
+
+        let outcome = host
+            .run_turn_pipeline(
+                &mut state,
+                &sample_edge_tools(),
+                "openai",
+                "gpt-4o",
+                "use calculator",
+            )
+            .expect("server context pipeline should assemble without unbound MCP deferred tools");
+        let text = pipeline_outcome_text(&outcome);
+        assert!(
+            !text.contains("<deferred_tools>"),
+            "prompt must not advertise MCP deferred tools that tool_search cannot activate: {text}"
+        );
+    }
+
+    #[test]
+    fn server_host_pipeline_renders_deferred_manifest_when_names_are_active() {
+        let edge_profile = deferred_manifest_edge_profile(&["github"], "gpt-4o");
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_edge_profile(edge_profile)
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let mut state = create_test_state();
+
+        let outcome = host
+            .run_turn_pipeline(
+                &mut state,
+                &sample_edge_tools(),
+                "openai",
+                "gpt-4o",
+                "use agent fanout",
+            )
+            .expect("server context pipeline should assemble");
+        let text = pipeline_outcome_text(&outcome);
+
+        assert!(
+            text.contains("<deferred_tools>") && text.contains("github"),
+            "server prompt must include the same deferred manifest that validator/tool_search consume: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_host_ignores_deferred_names_without_renderable_prompt_manifest() {
+        let mut edge_profile = Map::new();
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES
+                .to_string(),
+            json!(["agent_fanout"]),
+        );
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_edge_profile(edge_profile)
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        host.resolved_model_name = Some("gpt-4o".to_string());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let executor = Arc::new(
+            crate::server::server_tool_executor::ServerToolExecutor::new(
+                dir.path().to_path_buf(),
+                "user1".into(),
+                "sess1".into(),
+                None,
+                None,
+            ),
+        );
+        let mut state = create_test_state();
+        state.server_tool_executor = Some(Arc::clone(&executor));
+
+        let _visible = host.visible_turn_tools(&mut state);
+
+        assert!(
+            !executor
+                .current_activatable_tool_names_snapshot()
+                .contains("agent_fanout"),
+            "executor must not activate names that were not actually rendered in the prompt manifest"
+        );
+        assert!(
+            !<ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host)
+                .contains("agent_fanout"),
+            "validator must not emit activation hints for names missing from the rendered prompt manifest"
+        );
+        let result = executor
+            .execute_with_metadata("tool_search", &json!({"query": "Select:agent_fanout"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not resolve a names-only deferred manifest: {}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn server_host_ignores_deferred_names_when_manifest_budget_mismatches_model() {
+        let edge_profile = deferred_manifest_edge_profile(&["agent_fanout"], "gpt-3.5-turbo");
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_edge_profile(edge_profile)
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        host.resolved_model_name = Some("gpt-4o".to_string());
+        let mut state = create_test_state();
+
+        let _visible = host.visible_turn_tools(&mut state);
+
+        assert!(
+            <ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host).is_empty(),
+            "validator must not consume deferred names when bridge/context assembly would drop the prompt block for this model"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_host_rejects_deferred_manifest_when_visible_overlap_would_hide_prompt_block() {
+        let edge_profile = deferred_manifest_edge_profile(&["bash", "github"], "gpt-4o");
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_edge_profile(edge_profile)
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        host.resolved_model_name = Some("gpt-4o".to_string());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let executor = Arc::new(
+            crate::server::server_tool_executor::ServerToolExecutor::new(
+                dir.path().to_path_buf(),
+                "user1".into(),
+                "sess1".into(),
+                None,
+                None,
+            ),
+        );
+        let mut state = create_test_state();
+        state.server_tool_executor = Some(Arc::clone(&executor));
+
+        let _visible = host.visible_turn_tools(&mut state);
+
+        let activatable = executor.current_activatable_tool_names_snapshot();
+        assert!(
+            activatable.is_empty(),
+            "executor must fail closed instead of exposing a subset when visible/deferred overlap would hide the prompt block: {activatable:?}"
+        );
+        let validator_deferred =
+            <ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host);
+        assert!(
+            validator_deferred.is_empty(),
+            "validator must not advertise deferred names when prompt rendering drops the manifest: {validator_deferred:?}"
+        );
+
+        let selected = executor
+            .execute_with_metadata("tool_search", &json!({"query": "Select:github"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&selected.output).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not resolve a partially rejected deferred manifest: {}",
+            selected.output
+        );
+
+        let outcome = host
+            .run_turn_pipeline(
+                &mut state,
+                &sample_edge_tools(),
+                "openai",
+                "gpt-4o",
+                "use github",
+            )
+            .expect("server context pipeline should assemble without a partial deferred manifest");
+        let text = pipeline_outcome_text(&outcome);
+        assert!(
+            !text.contains("<deferred_tools>"),
+            "prompt must not render a manifest whose names cannot be consumed exactly: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_host_rejects_deferred_manifest_when_runtime_filter_would_expose_subset() {
+        let edge_profile = deferred_manifest_edge_profile(&["github", "agent_fanout"], "gpt-4o");
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_edge_profile(edge_profile)
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        host.resolved_model_name = Some("gpt-4o".to_string());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let executor = Arc::new(
+            crate::server::server_tool_executor::ServerToolExecutor::new(
+                dir.path().to_path_buf(),
+                "user1".into(),
+                "sess1".into(),
+                None,
+                None,
+            ),
+        );
+        let mut state = create_test_state();
+        state.server_tool_executor = Some(Arc::clone(&executor));
+
+        let _visible = host.visible_turn_tools(&mut state);
+
+        assert!(
+            executor
+                .current_activatable_tool_names_snapshot()
+                .is_empty(),
+            "executor must fail closed when runtime binding removes only part of the deferred manifest"
+        );
+        assert!(
+            <ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host).is_empty(),
+            "validator must not expose a subset of a prompt manifest that cannot be rendered"
+        );
+
+        let selected = executor
+            .execute_with_metadata("tool_search", &json!({"query": "Select:github"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&selected.output).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not resolve the still-bound subset after partial runtime filtering: {}",
+            selected.output
+        );
+    }
+
+    #[tokio::test]
+    async fn server_host_keeps_activated_deferred_tool_visible_after_partition_flip() {
+        let mut edge_tools = sample_edge_tools();
+        edge_tools.push(json!({
+            "type": "function",
+            "function": {
+                "name": "web_fetch",
+                "description": "Fetch a URL",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }));
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(edge_tools)
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let executor = Arc::new(
+            crate::server::server_tool_executor::ServerToolExecutor::new(
+                dir.path().to_path_buf(),
+                "user1".into(),
+                "sess1".into(),
+                None,
+                None,
+            ),
+        );
+        executor.set_current_visible_tool_schemas(&[
+            json!({"type": "function", "function": {"name": "bash"}}),
+            json!({"type": "function", "function": {"name": "tool_search"}}),
+        ]);
+        executor.set_current_activatable_tool_names(HashSet::from(["web_fetch".to_string()]));
+        let selected = executor
+            .execute_with_metadata("tool_search", &json!({"query": "select:web_fetch"}))
+            .await;
+        let selected: Value = serde_json::from_str(&selected.output).unwrap();
+        assert_eq!(selected["matches"][0]["name"].as_str(), Some("web_fetch"));
+
+        executor.set_current_visible_tool_schemas(&[
+            json!({"type": "function", "function": {"name": "bash"}}),
+            json!({"type": "function", "function": {"name": "tool_search"}}),
+            json!({"type": "function", "function": {"name": "web_fetch"}}),
+        ]);
+        executor.set_current_activatable_tool_names(HashSet::new());
+
+        let mut state = create_test_state();
+        state.server_tool_executor = Some(Arc::clone(&executor));
+        state.restricted_tools.insert("web_fetch".to_string());
+
+        let visible = host.visible_turn_tools(&mut state);
+        let names = schema_names(&visible);
+        assert!(
+            names.contains("web_fetch"),
+            "activated deferred tool must be rescued from restrictions after it moves from deferred manifest to visible tools: {names:?}"
         );
     }
 
@@ -6079,6 +6733,7 @@ mod tests {
             "u-batch".to_string(),
             "s-batch".to_string(),
         )
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
         // Register write_file as a valid tool so the edge ledger delivery path admits it.
         host.install_runtime_tool_schemas(vec![json!({
@@ -6175,6 +6830,7 @@ mod tests {
             "u-edge-meta".to_string(),
             "s-edge-meta".to_string(),
         )
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
         // Register read_file as a valid tool so the edge ledger delivery path admits it.
         host.install_runtime_tool_schemas(vec![json!({
@@ -6241,6 +6897,7 @@ mod tests {
             "u-mixed".to_string(),
             "s-mixed".to_string(),
         )
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
         // Register read_file and write_file as valid tools so the edge ledger delivery path admits them.
         host.install_runtime_tool_schemas(vec![
@@ -7011,7 +7668,7 @@ mod tests {
     // ── inject_tool_schema tests ────────────────────────────────────────────
 
     #[test]
-    fn inject_tool_schema_adds_to_edge_tools_and_valid_tools() {
+    fn inject_tool_schema_adds_registered_runtime_tool_to_edge_tools_and_valid_tools() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -7022,16 +7679,15 @@ mod tests {
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
-        assert!(!host.valid_tool_names().contains("delegate"));
+        assert!(!host.valid_tool_names().contains("skill"));
         let initial_count = host.edge_tools.len();
 
-        use crate::turn::agentic_loop::host::delegate_tool_schema;
-        host.inject_tool_schema(delegate_tool_schema());
+        host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
 
-        assert!(host.valid_tool_names().contains("delegate"));
+        assert!(host.valid_tool_names().contains("skill"));
         assert_eq!(host.edge_tools.len(), initial_count + 1);
         let last = host.edge_tools.last().unwrap();
-        assert_eq!(last["function"]["name"], "delegate");
+        assert_eq!(last["function"]["name"], "skill");
     }
 
     #[test]
@@ -7046,11 +7702,10 @@ mod tests {
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
-        use crate::turn::agentic_loop::host::delegate_tool_schema;
         let initial_count = host.edge_tools.len();
 
-        host.inject_tool_schema(delegate_tool_schema());
-        host.inject_tool_schema(delegate_tool_schema());
+        host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
+        host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
 
         // Only one injection — duplicate is skipped
         assert_eq!(host.edge_tools.len(), initial_count + 1);
@@ -7073,6 +7728,91 @@ mod tests {
 
         // No change — malformed schema ignored
         assert_eq!(host.edge_tools.len(), initial_count);
+    }
+
+    #[test]
+    fn inject_tool_schema_rejects_project_tool_without_runtime_binding() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+
+        let initial_count = host.edge_tools.len();
+        assert!(!schema_names(&host.edge_tools).contains("bash"));
+        assert!(!host.valid_tool_names().contains("bash"));
+
+        host.inject_tool_schema(named_schema("bash"));
+
+        assert_eq!(host.edge_tools.len(), initial_count);
+        assert!(!schema_names(&host.edge_tools).contains("bash"));
+        assert!(!host.valid_tool_names().contains("bash"));
+    }
+
+    #[test]
+    fn inject_tool_schema_rejects_unknown_function_schema() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+
+        let initial_count = host.edge_tools.len();
+
+        host.inject_tool_schema(named_schema("not_registered"));
+
+        assert_eq!(host.edge_tools.len(), initial_count);
+        assert!(!schema_names(&host.edge_tools).contains("not_registered"));
+        assert!(!host.valid_tool_names().contains("not_registered"));
+    }
+
+    #[test]
+    fn install_runtime_tool_schemas_rejects_project_tool_without_runtime_binding() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+
+        let initial_count = host.edge_tools.len();
+
+        host.install_runtime_tool_schemas(vec![named_schema("bash")]);
+
+        assert_eq!(host.edge_tools.len(), initial_count);
+        assert!(!schema_names(&host.edge_tools).contains("bash"));
+        assert!(!host.valid_tool_names().contains("bash"));
+        assert!(!host.admissible_extras.iter().any(|name| name == "bash"));
+    }
+
+    #[test]
+    fn install_runtime_tool_schemas_admits_request_scoped_mcp_without_workspace_runtime() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+
+        host.install_runtime_tool_schemas(vec![named_schema("mcp__github__create_issue")]);
+
+        assert!(schema_names(&host.edge_tools).contains("mcp__github__create_issue"));
+        assert!(
+            host.valid_tool_names()
+                .contains("mcp__github__create_issue")
+        );
+        assert!(
+            host.admissible_extras
+                .iter()
+                .any(|name| name == "mcp__github__create_issue")
+        );
     }
 
     // ── llm_cancel_for_state (aligns server loop with AgenticLoopState cancel fields) ──

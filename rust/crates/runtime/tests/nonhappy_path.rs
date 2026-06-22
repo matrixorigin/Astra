@@ -333,6 +333,7 @@ mod multi_file_edit_regression {
         let mut selected = vec![tool_schema("bash"), tool_schema("read_file")];
         let mut report = SelectionReport {
             tools_selected: vec!["bash".into(), "read_file".into()],
+            dynamic_tools_selected: Vec::new(),
             selected_count: 2,
             budget_used: 0,
             budget_total: 1000,

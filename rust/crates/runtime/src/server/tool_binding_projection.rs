@@ -1,5 +1,7 @@
-use serde_json::Value;
 use std::sync::OnceLock;
+
+use astra_turn_core::tool::schema::tool_schema_name;
+use serde_json::Value;
 
 use super::tool_execution_binding::{
     ExecutorBinding, ExecutorBindingKind, ExecutorStatus, ToolExecutionRequest, ToolPolicySnapshot,
@@ -7,13 +9,6 @@ use super::tool_execution_binding::{
 };
 
 const EDGE_CLIENT_WORKSPACE_SENTINEL_CWD: &str = "__edge_client_provided_workspace__";
-
-pub fn tool_schema_name(schema: &Value) -> Option<&str> {
-    schema
-        .get("function")
-        .and_then(|function| function.get("name"))
-        .and_then(Value::as_str)
-}
 
 pub fn capability_filter_tool_schemas_for_binding(
     schemas: Vec<Value>,
@@ -390,13 +385,19 @@ mod tests {
     #[test]
     fn filters_project_tools_without_workspace_runtime() {
         let names = schema_names(capability_filter_tool_schemas_for_binding(
-            vec![schema("ask_user"), schema("tool_search"), schema("bash")],
+            vec![
+                schema("ask_user"),
+                schema("skill"),
+                schema("tool_search"),
+                schema("bash"),
+            ],
             &no_workspace(),
             &ExecutorBinding::server_local(),
             None,
         ));
 
         assert!(names.contains("ask_user"));
+        assert!(names.contains("skill"));
         assert!(names.contains("tool_search"));
         assert!(!names.contains("bash"));
     }
@@ -407,6 +408,8 @@ mod tests {
             vec![
                 schema("ask_user"),
                 json!({"function": {}}),
+                json!({"type": "custom", "function": {"name": "ask_user"}}),
+                json!({"function": {"name": "ask_user"}}),
                 json!({"function": {"name": "not_registered"}}),
                 json!({"bad": "schema"}),
             ],

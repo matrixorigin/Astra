@@ -43,7 +43,7 @@ mod tests {
         .await;
 
         assert!(
-            result.contains("multi-agent executor was not attached"),
+            result.contains("multi-agent runtime is not connected"),
             "{result}"
         );
         assert!(result.contains("\"status\":\"failed\""), "{result}");
