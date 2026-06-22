@@ -89,13 +89,15 @@ fn auto_mode_sensitive_path_denial_reason(path: &str) -> String {
     match classify_path_sensitivity(path) {
         PathSensitivity::Sensitive => {
             format!(
-                "Sandbox: Path '{}' is blocked as a sensitive credential path and requires explicit opt-in in Auto mode",
+                "Sandbox: Path '{}' is blocked as a sensitive credential path. \
+                 To allow: add an allow rule in .astra/permissions.json or switch to Prompt mode.",
                 path
             )
         }
         PathSensitivity::WriteSensitive => {
             format!(
-                "Sandbox: Path '{}' is blocked as write-sensitive app/runtime state and requires explicit opt-in in Auto mode",
+                "Sandbox: Path '{}' is blocked as write-sensitive app/runtime state. \
+                 To allow: add an allow rule in .astra/permissions.json or switch to Prompt mode.",
                 path
             )
         }
@@ -107,7 +109,8 @@ fn auto_mode_sensitive_path_denial_reason(path: &str) -> String {
         }
         PathSensitivity::Normal => {
             format!(
-                "Sandbox: Path '{}' is blocked in Auto mode without explicit opt-in",
+                "Sandbox: Path '{}' is blocked in Auto mode. \
+                 To allow: add an allow rule in .astra/permissions.json or switch to Prompt mode.",
                 path
             )
         }
