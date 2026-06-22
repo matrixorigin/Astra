@@ -1558,7 +1558,7 @@ mod tests {
     // ends. Same shape as `interaction_scoped_tool_restrictions`.
 
     fn schema(name: &str) -> serde_json::Value {
-        serde_json::json!({"function": {"name": name}})
+        serde_json::json!({"type": "function", "function": {"name": name}})
     }
 
     #[test]

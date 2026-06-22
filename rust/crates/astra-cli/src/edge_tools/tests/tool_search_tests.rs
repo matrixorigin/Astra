@@ -72,6 +72,7 @@ async fn tool_search_missing_or_blank_query_returns_exact_error() {
 #[tokio::test]
 async fn direct_tool_search_fails_closed_without_installed_surface() {
     let executor = executor();
+    executor.clear_current_tool_surface_for_tests();
 
     let parsed: Value =
         serde_json::from_str(&executor.tool_search(&json!({"query": "select:bash"}))).unwrap();

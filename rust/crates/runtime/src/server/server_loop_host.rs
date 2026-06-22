@@ -821,6 +821,11 @@ pub struct ServerAgenticLoopHost {
     /// Effective names from this turn's deferred manifest after removing
     /// tools that are already visible in the final wire `tools[]`.
     current_deferred_tool_names: HashSet<String>,
+    /// Executor whose admission state mirrors the current wire tool surface.
+    /// Used by edge-ledger validation to record direct deferred calls as
+    /// next-round activations instead of returning a misleading hard error.
+    current_server_tool_executor:
+        Option<Arc<crate::server::server_tool_executor::ServerToolExecutor>>,
     /// Names the validator should admit beyond the current visible schemas.
     ///
     /// Covers runtime-surface tools (`skill`, `agent`, `web_search`,
@@ -1288,6 +1293,7 @@ impl ServerAgenticLoopHostBuilder {
             edge_profile: self.edge_profile,
             valid_tools,
             current_deferred_tool_names: HashSet::new(),
+            current_server_tool_executor: None,
             admissible_extras,
             selection_confidence: self.selection_confidence,
             server_side_tools,
@@ -2240,14 +2246,35 @@ impl ServerAgenticLoopHost {
             }
 
             let is_deferred = self.current_deferred_tool_names.contains(&tool_name);
-            let output = if is_deferred {
-                astra_turn_core::tool::deferred_activation::direct_deferred_call_activated_message(
-                    &tool_name,
-                )
-            } else {
-                astra_turn_core::tool::deferred_activation::tool_not_admitted_message(
-                    &tool_name, false,
-                )
+            let output = match astra_turn_core::tool::deferred_activation::classify_direct_deferred_call(
+                &tool_name,
+                is_deferred,
+                |name| {
+                    self.current_server_tool_executor
+                        .as_ref()
+                        .is_some_and(|executor| executor.has_runtime_binding(name))
+                },
+            ) {
+                astra_turn_core::tool::deferred_activation::DirectDeferredCallAdmission::Activate {
+                    name,
+                } => {
+                    if let Some(executor) = self.current_server_tool_executor.as_ref() {
+                        executor.record_direct_deferred_call_activation(&name);
+                    }
+                    astra_turn_core::tool::deferred_activation::direct_deferred_call_activated_message(
+                        &name,
+                    )
+                }
+                astra_turn_core::tool::deferred_activation::DirectDeferredCallAdmission::NotAdmitted => {
+                    astra_turn_core::tool::deferred_activation::tool_not_admitted_message(
+                        &tool_name, true,
+                    )
+                }
+                astra_turn_core::tool::deferred_activation::DirectDeferredCallAdmission::Unknown => {
+                    astra_turn_core::tool::deferred_activation::tool_not_admitted_message(
+                        &tool_name, false,
+                    )
+                }
             };
             self.emit_event(Value::Object(build_tool_call_end_event(
                 &request_id,
@@ -2612,12 +2639,21 @@ impl ServerAgenticLoopHost {
             self.resolved_model_name.as_deref(),
             state.server_tool_executor.as_deref(),
         );
-        self.current_deferred_tool_names = deferred_tool_names.clone();
+        self.current_server_tool_executor = state.server_tool_executor.clone();
         if let Some(executor) = state.server_tool_executor.as_deref() {
             executor.set_current_activatable_tool_names(deferred_tool_names);
+            // Authoritative deferred set: the runtime-filtered snapshot from
+            // the executor (after runtime-binding admission in
+            // set_current_activatable_tool_names). Set once — no intermediate
+            // unfiltered value that could mislead a concurrent reader.
             self.current_deferred_tool_names = executor.current_activatable_tool_names_snapshot();
             executor.set_current_visible_tool_schemas(wire_tools);
             extras.extend(executor.activated_deferred_tool_names());
+        } else {
+            // No executor: deferred_tool_names_for_wire_tools already applied
+            // the runtime-binding filter when it had access to an executor;
+            // without one, the raw declared names are the best available set.
+            self.current_deferred_tool_names = deferred_tool_names;
         }
         self.valid_tools = self.admissible_tool_names_for_surface(wire_tools, &extras);
     }
@@ -2715,16 +2751,27 @@ impl ServerAgenticLoopHost {
         state: &AgenticLoopState,
         model_name: &str,
     ) -> String {
+        let _ = state; // executor not needed for rendering decision
         let manifest_names = self.deferred_tool_names_from_edge_profile_for_model(Some(model_name));
         if manifest_names.is_empty() {
             return String::new();
         }
-        let effective_names = self.deferred_tool_names_for_wire_tools(
-            wire_tools,
-            Some(model_name),
-            state.server_tool_executor.as_deref(),
-        );
-        if effective_names != manifest_names {
+        // Only suppress the block when a deferred tool appears in the visible
+        // surface — that is a contract violation (the pre-rendered block lists
+        // a tool the model can already see). Runtime-binding absence is NOT a
+        // rendering concern: the block is discovery metadata
+        // (CacheScope::Session, part of the cache prefix). Suppressing it on
+        // every transient binding flake (e.g. MCP reconnect) busts the ~30K
+        // token session prefix. The executor separately gates activation via
+        // set_current_activatable_tool_names + tool_search "missing" responses.
+        let visible_tool_names = astra_turn_core::tool::schema::tool_names_from_schemas(wire_tools);
+        if !manifest_names.is_disjoint(&visible_tool_names) {
+            tracing::warn!(
+                target: "astra.deferred_tools",
+                deferred_count = manifest_names.len(),
+                visible_count = visible_tool_names.len(),
+                "deferred prompt block suppressed: deferred tool(s) appear in visible surface"
+            );
             return String::new();
         }
         crate::turn::deferred_tools_edge_profile::block_for_model(&self.edge_profile, model_name)
@@ -5354,15 +5401,14 @@ mod tests {
 
         let _visible = host.visible_turn_tools(&mut state);
 
+        // Activation is gated at the executor level — the model can see the
+        // deferred manifest in the prompt (for cache stability) but cannot
+        // actually activate or execute the unbound tool.
         assert!(
             executor
                 .current_activatable_tool_names_snapshot()
                 .is_empty(),
             "executor must not activate deferred tools whose runtime binding is absent"
-        );
-        assert!(
-            <ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host).is_empty(),
-            "validator must not tell the model to select a tool that tool_search cannot activate"
         );
 
         let selected = executor
@@ -5373,21 +5419,6 @@ mod tests {
             parsed["matches"].as_array().unwrap().is_empty(),
             "tool_search must not resolve an unbound deferred runtime tool: {}",
             selected.output
-        );
-
-        let outcome = host
-            .run_turn_pipeline(
-                &mut state,
-                &sample_edge_tools(),
-                "openai",
-                "gpt-4o",
-                "use agent fanout",
-            )
-            .expect("server context pipeline should assemble without unbound deferred tools");
-        let text = pipeline_outcome_text(&outcome);
-        assert!(
-            !text.contains("<deferred_tools>"),
-            "prompt must not advertise deferred tools that tool_search cannot activate: {text}"
         );
     }
 
@@ -5427,10 +5458,6 @@ mod tests {
                 .is_empty(),
             "executor must not activate MCP deferred tools without an MCP runtime binding"
         );
-        assert!(
-            <ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host).is_empty(),
-            "validator must not advertise MCP deferred tools that tool_search cannot resolve"
-        );
 
         let selected = executor
             .execute_with_metadata("tool_search", &json!({"query": "Select:mcp__calculator"}))
@@ -5440,21 +5467,6 @@ mod tests {
             parsed["matches"].as_array().unwrap().is_empty(),
             "tool_search must not resolve an unbound MCP deferred tool: {}",
             selected.output
-        );
-
-        let outcome = host
-            .run_turn_pipeline(
-                &mut state,
-                &sample_edge_tools(),
-                "openai",
-                "gpt-4o",
-                "use calculator",
-            )
-            .expect("server context pipeline should assemble without unbound MCP deferred tools");
-        let text = pipeline_outcome_text(&outcome);
-        assert!(
-            !text.contains("<deferred_tools>"),
-            "prompt must not advertise MCP deferred tools that tool_search cannot activate: {text}"
         );
     }
 
@@ -5640,6 +5652,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_host_renders_deferred_block_when_runtime_binding_missing_for_cache_stability() {
+        // H3 regression guard: a transient runtime-binding failure (e.g. MCP
+        // server temporarily disconnected) must NOT suppress the pre-rendered
+        // <deferred_tools> prompt block. The block is session-stable
+        // (CacheScope::Session); dropping it on every binding flake would
+        // bust the cache prefix (~30K token miss). The executor separately
+        // gates activation via set_current_activatable_tool_names, and
+        // tool_search(select:NAME) returns "missing" for unbound tools so
+        // the model self-corrects. The prompt block is discovery metadata,
+        // not an execution promise.
+        let edge_profile = deferred_manifest_edge_profile(&["agent_fanout"], "gpt-4o");
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_edge_profile(edge_profile)
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        host.resolved_model_name = Some("gpt-4o".to_string());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let executor = Arc::new(
+            crate::server::server_tool_executor::ServerToolExecutor::new(
+                dir.path().to_path_buf(),
+                "user1".into(),
+                "sess1".into(),
+                None,
+                None,
+            ),
+        );
+        let mut state = create_test_state();
+        state.server_tool_executor = Some(Arc::clone(&executor));
+
+        let _visible = host.visible_turn_tools(&mut state);
+
+        // The prompt block must still be rendered — runtime binding absence
+        // is a per-turn execution concern, not a prompt-rendering concern.
+        let outcome = host
+            .run_turn_pipeline(
+                &mut state,
+                &sample_edge_tools(),
+                "openai",
+                "gpt-4o",
+                "use agent fanout",
+            )
+            .expect("server context pipeline should assemble with deferred manifest");
+        let text = pipeline_outcome_text(&outcome);
+        assert!(
+            text.contains("<deferred_tools>"),
+            "prompt must render the deferred manifest even when runtime binding is absent: {text}"
+        );
+
+        // But the executor must still gate activation — tool_search(select:)
+        // returns "missing" for the unbound tool.
+        let selected = executor
+            .execute_with_metadata("tool_search", &json!({"query": "Select:agent_fanout"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&selected.output).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not resolve an unbound deferred tool: {}",
+            selected.output
+        );
+        assert!(
+            parsed["missing"].as_array().is_some_and(|m| !m.is_empty()),
+            "tool_search must report the unbound tool as missing: {}",
+            selected.output
+        );
+    }
+
+    #[tokio::test]
     async fn server_host_rejects_deferred_manifest_when_runtime_filter_would_expose_subset() {
         let edge_profile = deferred_manifest_edge_profile(&["github", "agent_fanout"], "gpt-4o");
         let mut host = ServerAgenticLoopHostBuilder::new(
@@ -5749,6 +5835,67 @@ mod tests {
         assert!(
             names.contains("web_fetch"),
             "activated deferred tool must be rescued from restrictions after it moves from deferred manifest to visible tools: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_ledger_direct_deferred_call_records_activation_for_next_round() {
+        let edge_profile = deferred_manifest_edge_profile(&["github"], "gpt-4o");
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_edge_profile(edge_profile)
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        host.resolved_model_name = Some("gpt-4o".to_string());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let executor = Arc::new(
+            crate::server::server_tool_executor::ServerToolExecutor::new(
+                dir.path().to_path_buf(),
+                "user1".into(),
+                "sess1".into(),
+                None,
+                None,
+            ),
+        );
+        let mut state = create_test_state();
+        state.server_tool_executor = Some(Arc::clone(&executor));
+        host.sync_valid_tools_to_wire_surface_for_state(&sample_edge_tools(), &state);
+
+        assert!(
+            !host.valid_tool_names().contains("github"),
+            "github must not be directly admitted before deferred activation"
+        );
+        assert!(
+            host.current_deferred_tool_names.contains("github"),
+            "test must advertise github as a deferred tool"
+        );
+
+        let results = host
+            .deliver_edge_tools_via_ledger(&[json!({
+                "id": "gh1",
+                "type": "function",
+                "function": {"name": "github", "arguments": r#"{"query":"repo"}"#}
+            })])
+            .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, "error");
+        assert!(
+            results[0].output.contains("select:github")
+                && results[0].output.contains("not executed"),
+            "direct deferred ledger call must return a non-executing activation hint: {:?}",
+            results[0]
+        );
+        assert_eq!(
+            executor.activated_deferred_tool_names(),
+            vec!["github".to_string()],
+            "ledger path must not merely say activated; it must record activation"
         );
     }
 

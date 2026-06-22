@@ -308,7 +308,7 @@ async fn chain_via_agent_run_chain_tool() {
 
 #[tokio::test]
 async fn run_chain_invalid_format_returns_error() {
-    let executor = test_executor();
+    let executor = test_executor().with_spawn_context(fanout_test_context(test_spawner()));
     let result = executor
         .execute(
             "agent",
@@ -324,7 +324,7 @@ async fn run_chain_invalid_format_returns_error() {
 
 #[tokio::test]
 async fn run_chain_blocks_recursive_child_chain() {
-    let executor = test_executor();
+    let executor = test_executor().with_spawn_context(fanout_test_context(test_spawner()));
     // `run_chain` as a step tool is no longer in TOOL_CATALOG (it's the `agent`
     // tool's action), so validation rejects it before recursion detection kicks in.
     let result = executor

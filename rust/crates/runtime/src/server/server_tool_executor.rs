@@ -591,52 +591,38 @@ impl ServerToolExecutor {
             return Vec::new();
         }
 
-        match self.activated_deferred_tools.read() {
-            Ok(guard) => {
-                let retained =
-                    astra_turn_core::tool::deferred_activation::retained_runtime_bound_activated_deferred_tool_names(
-                        &guard,
-                        visible.as_ref(),
-                        activatable.as_ref(),
-                        |name| self.tool_has_runtime_binding(name),
-                    );
-                // Prune stale entries that are no longer in the visible or
-                // activatable window. This bounds the set's growth across turns
-                // — without this, the set accumulates every deferred tool ever
-                // activated for the entire session.
-                if retained.len() < guard.len() {
-                    let pruned: HashSet<String> = retained.iter().cloned().collect();
-                    tracing::debug!(
-                        before = guard.len(),
-                        after = pruned.len(),
-                        "pruning stale activated_deferred_tools entries"
-                    );
-                    drop(guard);
-                    let mut write_guard = rwlock_write_reset_on_poison(
-                        &self.activated_deferred_tools,
-                        "activated_deferred_tools_prune",
-                    );
-                    *write_guard = pruned;
-                }
-                retained
-            }
-            Err(poisoned) => {
-                tracing::error!(
-                    cache = "activated_deferred_tools",
-                    "RwLock poisoned on read; resetting cached state to default"
-                );
-                drop(poisoned);
-                // Clear poison BEFORE acquiring write lock — if write() panics
-                // (e.g. during reset), the flag would otherwise remain stuck.
-                self.activated_deferred_tools.clear_poison();
-                let mut guard = match self.activated_deferred_tools.write() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner(),
-                };
-                *guard = HashSet::new();
-                Vec::new()
-            }
+        // Atomically compute the retained set and prune stale entries under a
+        // single write lock. A read→drop→write sequence opens a TOCTOU window
+        // in which a concurrent `record_*_activation` extends the set after
+        // `retained` is computed but before the pruned snapshot is written back
+        // — silently dropping the freshly recorded activation. Holding the
+        // write lock across compute+store makes the prune atomic.
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.activated_deferred_tools,
+            "activated_deferred_tools_prune",
+        );
+        let retained =
+            astra_turn_core::tool::deferred_activation::retained_runtime_bound_activated_deferred_tool_names(
+                &guard,
+                visible.as_ref(),
+                activatable.as_ref(),
+                |name| self.tool_has_runtime_binding(name),
+            );
+        // Prune stale entries that are no longer in the visible or
+        // activatable window. This bounds the set's growth across turns
+        // — without this, the set accumulates every deferred tool ever
+        // activated for the entire session. Done under the same write lock
+        // so concurrent activations cannot be lost between compute and store.
+        if retained.len() < guard.len() {
+            let pruned: HashSet<String> = retained.iter().cloned().collect();
+            tracing::debug!(
+                before = guard.len(),
+                after = pruned.len(),
+                "pruning stale activated_deferred_tools entries"
+            );
+            *guard = pruned;
         }
+        retained
     }
 
     fn record_tool_search_activation_output(&self, output: &str) {
@@ -4447,6 +4433,47 @@ esac
             exec.activated_deferred_tool_names(),
             Vec::<String>::new(),
             "stale visible MCP schemas must not retain activation after runtime binding disappears"
+        );
+    }
+
+    #[test]
+    fn server_activated_deferred_prune_retains_valid_activation_alongside_stale_entries() {
+        // Regression guard for the TOCTOU fix: the prune path (triggered when
+        // the activated set contains at least one stale entry) must not drop a
+        // concurrently-recorded activation for a tool that is still in the
+        // visible surface and still runtime-bound. The retained set and the
+        // pruned store must be computed atomically under a single write lock.
+        let (exec, _dir) = test_executor();
+        exec.set_current_visible_tool_schemas(&[
+            json!({"type":"function","function":{"name":"tool_search"}}),
+            json!({"type":"function","function":{"name":"my_plugin_tool"}}),
+        ]);
+        // Seed one stale entry (triggers the prune branch) and one valid
+        // entry that must survive the prune.
+        exec.activated_deferred_tools
+            .write()
+            .unwrap()
+            .insert("stale_gone_tool".to_string());
+        exec.activated_deferred_tools
+            .write()
+            .unwrap()
+            .insert("my_plugin_tool".to_string());
+
+        let retained = exec.activated_deferred_tool_names();
+        assert!(
+            retained.iter().any(|n| n == "my_plugin_tool"),
+            "valid activation must be retained through the prune path: got {retained:?}"
+        );
+        assert!(
+            !retained.iter().any(|n| n == "stale_gone_tool"),
+            "stale entry must be pruned: got {retained:?}"
+        );
+        // The store must reflect the pruned snapshot, not a stale superset.
+        let stored: HashSet<String> = exec.activated_deferred_tools.read().unwrap().clone();
+        assert_eq!(
+            stored,
+            HashSet::from(["my_plugin_tool".to_string()]),
+            "activated_deferred_tools store must equal the retained set after prune"
         );
     }
 

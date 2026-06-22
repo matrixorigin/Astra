@@ -1049,7 +1049,7 @@ impl ToolExecutor {
         let root: PathBuf = project_root.into();
         let preferred_repos = detect_git_remote_repos(&root);
         let sandbox = astra_runtime::tool_sandbox::SandboxPolicy::for_project(&root);
-        Self {
+        let executor = Self {
             project_root: root.clone(),
             cloud_base: None,
             cloud_token: std::sync::Arc::new(std::sync::RwLock::new(None)),
@@ -1142,7 +1142,77 @@ impl ToolExecutor {
             plan_review_request_tx: std::sync::Mutex::new(None),
             pending_permission_mode_change: std::sync::Mutex::new(None),
             pending_round_tool_boost: std::sync::Mutex::new(None),
+        };
+        #[cfg(test)]
+        {
+            executor.install_default_test_visible_surface();
         }
+        executor
+    }
+
+    #[cfg(test)]
+    fn install_default_test_visible_surface(&self) {
+        const LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
+            "adjust_config",
+            "agent",
+            "agent_fanout",
+            "ask_user",
+            "brief",
+            "call_graph",
+            "compress_context",
+            "config",
+            "context_analysis",
+            "dead_code",
+            "delegate",
+            "deprioritize_tool",
+            "diagnose",
+            "enter_plan_mode",
+            "env",
+            "exit_plan_mode",
+            "extract_members",
+            "find_definition",
+            "find_references",
+            "get_agent_info",
+            "hover_info",
+            "introspect",
+            "lsp",
+            "mo_branch",
+            "mo_query",
+            "mo_snapshot",
+            "notebook_edit",
+            "notify",
+            "prioritize_tool",
+            "query_context",
+            "reflect",
+            "rename_symbol",
+            "rollback_database_snapshots",
+            "rollback_session_state",
+            "rollback_turn_actions",
+            "run_build_test",
+            "session",
+            "share_context",
+            "symbol_search",
+            "task",
+            "task_list",
+            "task_output",
+            "task_stop",
+            "type_hierarchy",
+            "web_search",
+        ];
+
+        let mut schemas = all_tool_schemas();
+        schemas.extend(LOCAL_EXECUTOR_TOOL_NAMES.iter().map(|name| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": "test-only local executor surface",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            })
+        }));
+        let schemas = self.runtime_bound_tool_schemas(schemas);
+        self.set_current_visible_tool_schemas(&schemas);
     }
 
     /// Install the per-turn `ask_user` channel so tools can surface a
@@ -1226,6 +1296,10 @@ impl ToolExecutor {
     /// Set the spawn context for agent spawning.
     pub fn with_spawn_context(mut self, ctx: agent_spawning::AgentActionContext) -> Self {
         self.spawn_context = Some(ctx);
+        #[cfg(test)]
+        {
+            self.install_default_test_visible_surface();
+        }
         self
     }
 
@@ -1278,6 +1352,37 @@ impl ToolExecutor {
             "current_activatable_tool_names",
         );
         *guard = Some(names);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_current_tool_surface_for_tests(&self) {
+        {
+            let mut cache = self
+                .last_visible_schemas
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            cache.clear();
+        }
+        {
+            let mut cache = self
+                .last_activatable_names
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *cache = None;
+        }
+        *rwlock_write_reset_on_poison(
+            &self.current_visible_tool_names,
+            "current_visible_tool_names_test_clear",
+        ) = None;
+        *rwlock_write_reset_on_poison(
+            &self.current_activatable_tool_names,
+            "current_activatable_tool_names_test_clear",
+        ) = None;
+        rwlock_write_reset_on_poison(
+            &self.activated_deferred_tools,
+            "activated_deferred_tools_test_clear",
+        )
+        .clear();
     }
 
     /// Snapshot of the names that the model's `<deferred_tools>` manifest
@@ -1542,27 +1647,40 @@ impl ToolExecutor {
         {
             return None;
         }
-        if can_select {
-            // Direct deferred call: the model called a tool advertised in
-            // `<deferred_tools>` without first selecting it via
-            // `tool_search(select:NAME)`. Treat as activation intent —
-            // record the name so the next turn's `tools[]` includes the
-            // full schema, then ask the model to retry. Do NOT execute:
-            // the args are untrusted because the schema was not visible.
-            let mut guard = rwlock_write_reset_on_poison(
-                &self.activated_deferred_tools,
-                "activated_deferred_tools_direct_call",
-            );
-            guard.insert(name.to_string());
-            return Some(EdgeToolRun::error(
-                astra_turn_core::tool::deferred_activation::direct_deferred_call_activated_message(
-                    name,
-                ),
-            ));
+        use astra_turn_core::tool::deferred_activation::{
+            DirectDeferredCallAdmission, classify_direct_deferred_call,
+            direct_deferred_call_activated_message, tool_not_admitted_message,
+        };
+
+        match classify_direct_deferred_call(name, can_select, |tool_name| {
+            self.tool_has_runtime_binding(tool_name)
+        }) {
+            DirectDeferredCallAdmission::Activate {
+                name: activated_name,
+            } => {
+                // Direct deferred call: the model called a tool advertised in
+                // `<deferred_tools>` without first selecting it via
+                // `tool_search(select:NAME)`. Treat as activation intent —
+                // record the name so the next turn's `tools[]` includes the
+                // full schema, then ask the model to retry. Do NOT execute:
+                // the args are untrusted because the schema was not visible.
+                let mut guard = rwlock_write_reset_on_poison(
+                    &self.activated_deferred_tools,
+                    "activated_deferred_tools_direct_call",
+                );
+                guard.insert(activated_name.clone());
+                return Some(EdgeToolRun::error(direct_deferred_call_activated_message(
+                    &activated_name,
+                )));
+            }
+            DirectDeferredCallAdmission::NotAdmitted => {
+                return Some(EdgeToolRun::error(tool_not_admitted_message(name, true)));
+            }
+            DirectDeferredCallAdmission::Unknown => {}
         }
-        Some(EdgeToolRun::error(
-            astra_turn_core::tool::deferred_activation::tool_not_admitted_message(name, can_select),
-        ))
+        Some(EdgeToolRun::error(tool_not_admitted_message(
+            name, can_select,
+        )))
     }
 
     fn record_tool_search_activation_output(&self, output: &str) {
@@ -6420,7 +6538,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferred_tool_requires_tool_search_activation_on_cli_path() {
+    async fn direct_deferred_tool_call_activates_without_executing_on_cli_path() {
         let executor = test_executor();
         executor.set_current_visible_tool_schemas(&[
             serde_json::json!({"type": "function", "function": {"name": "bash"}}),
@@ -6428,10 +6546,22 @@ mod tests {
         ]);
         executor.set_current_activatable_tool_names(HashSet::from(["memory".to_string()]));
 
-        let before = executor.execute("memory", &serde_json::json!({})).await;
+        let before = executor
+            .execute(
+                "memory",
+                &serde_json::json!({"action": "remember", "content": "do not write"}),
+            )
+            .await;
         assert!(
-            before.contains("deferred") && before.contains("select:memory"),
-            "unactivated deferred tool must be blocked with activation guidance; got: {before}"
+            before.contains("called directly")
+                && before.contains("select:memory")
+                && before.contains("not executed"),
+            "direct deferred call must become a non-executing activation hint; got: {before}"
+        );
+        assert_eq!(
+            executor.activated_deferred_tool_names(),
+            vec!["memory".to_string()],
+            "direct deferred call must record activation for the next schema-selection round"
         );
 
         let search = executor

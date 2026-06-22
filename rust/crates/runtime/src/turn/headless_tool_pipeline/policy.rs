@@ -20,6 +20,7 @@ use astra_turn_core::headless_tool_stderr_lines::{
     headless_stderr_unknown_tool_header,
 };
 use astra_turn_core::tool::deferred_activation::{
+    DirectDeferredCallAdmission, classify_direct_deferred_call,
     direct_deferred_call_activated_message, tool_not_admitted_message,
 };
 use astra_turn_core::tool_result_semantics::tool_dedup_signature;
@@ -531,26 +532,33 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         if !self.ctx.valid_tool_names.contains(&execution.name) {
             let is_deferred = self.ctx.deferred_tool_names.contains(&execution.name);
-            let (err_msg, skip_reason) = if is_deferred {
-                match self.ctx.server_tool_executor {
-                    Some(exec) if exec.has_runtime_binding(&execution.name) => {
-                        exec.record_direct_deferred_call_activation(&execution.name);
+            let (err_msg, skip_reason) =
+                match classify_direct_deferred_call(&execution.name, is_deferred, |name| {
+                    self.ctx
+                        .server_tool_executor
+                        .is_some_and(|exec| exec.has_runtime_binding(name))
+                }) {
+                    DirectDeferredCallAdmission::Activate { name } => {
+                        if let Some(exec) = self.ctx.server_tool_executor {
+                            exec.record_direct_deferred_call_activation(&name);
+                        }
                         (
-                            direct_deferred_call_activated_message(&execution.name),
+                            direct_deferred_call_activated_message(&name),
                             "direct_deferred_call_activated",
                         )
                     }
-                    _ => (
+                    DirectDeferredCallAdmission::NotAdmitted => (
                         tool_not_admitted_message(&execution.name, true),
                         "tool_not_admitted",
                     ),
-                }
-            } else {
-                (
-                    unknown_local_tool_error_message(&execution.name, self.ctx.valid_tool_names),
-                    "unknown_tool",
-                )
-            };
+                    DirectDeferredCallAdmission::Unknown => (
+                        unknown_local_tool_error_message(
+                            &execution.name,
+                            self.ctx.valid_tool_names,
+                        ),
+                        "unknown_tool",
+                    ),
+                };
             let args_preview = make_args_preview(&execution.name, &execution.args);
             if !self.ctx.quiet {
                 self.ctx.term.emit_line(
