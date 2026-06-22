@@ -6,9 +6,10 @@
 //! There used to be **two permission deciders**:
 //!
 //! - Flow A in `astra-cli::permission_manager::check_nonblocking_inner`,
-//!   running the full 11-step hard-deny chain (deny → safety → git →
-//!   sensitive paths → sandbox expand → read short-circuit → session
-//!   override → explicit approval → allow rules → mode → fallback).
+//!   running the full hard-deny chain (deny → safety → git →
+//!   execute hard-deny → sensitive paths → sandbox expand → ask rules →
+//!   read short-circuit → session override → explicit approval →
+//!   allow rules → mode → fallback).
 //!
 //! - Flow B in `runtime::turn::permission_gate::check_tool_permission`,
 //!   running only "deny rules → allow rules → mode → mailbox" — *missing*
@@ -32,15 +33,12 @@
 //! - [`DecisionEnvelope`] — what the engine returns (decision + the
 //!   trace of which rule fired + serialized "what would Always save"
 //!   preview + risk tags).
-//! - [`EvaluationStep`] — the 11 fixed ordering slots, written as an
+//! - [`EvaluationStep`] — the fixed ordering slots, written as an
 //!   enum so a pinning test can assert the order is stable.
 //! - [`evaluation_order`] — the constant array that documents the
-//!   order in code (`[Schema, Deny, Safety, Git, Sensitive, Execute,
-//!   SandboxExpand, ReadShortCircuit, SessionOverride, ExplicitApproval,
-//!   AllowRules, Mode]`). Note: `Mode` is the 12th step but treated
-//!   as a fallback after the rule list; the canonical "11 steps" in
-//!   plan v3 §P2 collapses Mode into ε of the list. Spelling them
-//!   out as 12 separate enum variants is clearer for the test.
+//!   order in code (`[Schema, Deny, Safety, Git, Execute, Sensitive,
+//!   SandboxExpand, ToolAllowlist, AskRules, ReadShortCircuit,
+//!   SessionOverride, ExplicitApproval, AllowRules, Mode]`).
 //!
 //! The runtime/sub-agent gate now calls [`evaluate_permission`] so Flow B no
 //! longer owns a second simplified decision chain. The CLI gate still has
@@ -184,8 +182,8 @@ pub enum EvaluationStep {
     DenyRules,
     SafetyMiddleware,
     GitSafety,
-    SensitivePath,
     ExecuteHardDeny,
+    SensitivePath,
     SandboxExpand,
     ToolAllowlist,
     AskRules,
@@ -203,8 +201,8 @@ pub const EVALUATION_ORDER: [EvaluationStep; 14] = [
     EvaluationStep::DenyRules,
     EvaluationStep::SafetyMiddleware,
     EvaluationStep::GitSafety,
-    EvaluationStep::SensitivePath,
     EvaluationStep::ExecuteHardDeny,
+    EvaluationStep::SensitivePath,
     EvaluationStep::SandboxExpand,
     EvaluationStep::ToolAllowlist,
     EvaluationStep::AskRules,
@@ -552,6 +550,48 @@ pub fn evaluate_permission(
     }
     push_skipped(&mut trace, EvaluationStep::GitSafety, git_safety_skip_note);
 
+    if let Some(reason) = execute_hard_deny_reason(tool_name, args) {
+        if ctx.mode() == PermissionMode::Deny {
+            let decision = HardDecision::Deny {
+                reason: "Command hard-denied (deny mode)".to_string(),
+            };
+            push_matched(
+                &mut trace,
+                EvaluationStep::ExecuteHardDeny,
+                &decision,
+                &reason,
+            );
+            return envelope(
+                decision,
+                DecisionSource::ExecuteHardDeny { reason },
+                trace,
+                will_save,
+                risk_tags,
+            );
+        }
+        let decision = HardDecision::Deny {
+            reason: reason.clone(),
+        };
+        push_matched(
+            &mut trace,
+            EvaluationStep::ExecuteHardDeny,
+            &decision,
+            &reason,
+        );
+        return envelope(
+            decision,
+            DecisionSource::ExecuteHardDeny { reason },
+            trace,
+            will_save,
+            risk_tags,
+        );
+    }
+    push_skipped(
+        &mut trace,
+        EvaluationStep::ExecuteHardDeny,
+        "no execute hard deny",
+    );
+
     if let Some(path) = sensitive_path_match(tool_name, args) {
         if ctx.mode() == PermissionMode::Deny {
             let decision = HardDecision::Deny {
@@ -597,48 +637,6 @@ pub fn evaluate_permission(
         &mut trace,
         EvaluationStep::SensitivePath,
         "no sensitive path",
-    );
-
-    if let Some(reason) = execute_hard_deny_reason(tool_name, args) {
-        if ctx.mode() == PermissionMode::Deny {
-            let decision = HardDecision::Deny {
-                reason: "Command hard-denied (deny mode)".to_string(),
-            };
-            push_matched(
-                &mut trace,
-                EvaluationStep::ExecuteHardDeny,
-                &decision,
-                &reason,
-            );
-            return envelope(
-                decision,
-                DecisionSource::ExecuteHardDeny { reason },
-                trace,
-                will_save,
-                risk_tags,
-            );
-        }
-        let decision = HardDecision::Deny {
-            reason: reason.clone(),
-        };
-        push_matched(
-            &mut trace,
-            EvaluationStep::ExecuteHardDeny,
-            &decision,
-            &reason,
-        );
-        return envelope(
-            decision,
-            DecisionSource::ExecuteHardDeny { reason },
-            trace,
-            will_save,
-            risk_tags,
-        );
-    }
-    push_skipped(
-        &mut trace,
-        EvaluationStep::ExecuteHardDeny,
-        "no execute hard deny",
     );
 
     if let Some(inner_tool) = tool_name.strip_prefix("sandbox_expand:") {
@@ -1522,8 +1520,8 @@ mod tests {
                 EvaluationStep::DenyRules,
                 EvaluationStep::SafetyMiddleware,
                 EvaluationStep::GitSafety,
-                EvaluationStep::SensitivePath,
                 EvaluationStep::ExecuteHardDeny,
+                EvaluationStep::SensitivePath,
                 EvaluationStep::SandboxExpand,
                 EvaluationStep::ToolAllowlist,
                 EvaluationStep::AskRules,
@@ -2080,6 +2078,98 @@ mod tests {
             matches!(bash_read.decision, HardDecision::Allow),
             "read-only shell searches of session journals must not require manual approval: {bash_read:?}"
         );
+    }
+
+    #[test]
+    fn evaluate_reading_hidden_home_app_logs_is_allowed_in_auto_mode() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let log_path = "~/.xxx/logs/session.log".to_string();
+
+        let read_file = evaluate_permission(
+            "read_file",
+            &serde_json::json!({"path": log_path.clone()}),
+            &ctx,
+        );
+        assert!(
+            matches!(read_file.decision, HardDecision::Allow),
+            "read-only hidden app logs should not require directory-specific opt-in: {read_file:?}"
+        );
+
+        let bash_read = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": format!("tail -20 {log_path}")}),
+            &ctx,
+        );
+        assert!(
+            matches!(bash_read.decision, HardDecision::Allow),
+            "read-only shell inspection of hidden app logs should be allowed: {bash_read:?}"
+        );
+    }
+
+    #[test]
+    fn evaluate_writing_hidden_home_app_state_requires_approval_in_auto_mode() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let config_path = "~/.yyy/config.toml".to_string();
+
+        let write_file = evaluate_permission(
+            "write_file",
+            &serde_json::json!({"path": config_path.clone(), "content": "mode = 'new'\n"}),
+            &ctx,
+        );
+        assert!(
+            matches!(write_file.decision, HardDecision::NeedExternal { .. }),
+            "hidden home app state writes must remain gated: {write_file:?}"
+        );
+
+        let bash_rm = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": format!("rm -f {config_path}")}),
+            &ctx,
+        );
+        assert!(
+            matches!(bash_rm.decision, HardDecision::NeedExternal { .. }),
+            "destructive shell operations on hidden home app state must remain gated: {bash_rm:?}"
+        );
+    }
+
+    #[test]
+    fn evaluate_reading_hidden_home_secret_requires_approval_in_auto_mode() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let secret_path = "~/.xxx/.env".to_string();
+
+        let read_file = evaluate_permission(
+            "read_file",
+            &serde_json::json!({"path": secret_path.clone()}),
+            &ctx,
+        );
+        assert!(
+            matches!(read_file.decision, HardDecision::NeedExternal { .. }),
+            "hidden app state is readable only until it is credential-shaped: {read_file:?}"
+        );
+        assert!(matches!(
+            read_file.source,
+            DecisionSource::SensitivePath { .. }
+        ));
+
+        let bash_read = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": format!("cat {secret_path}")}),
+            &ctx,
+        );
+        assert!(
+            matches!(bash_read.decision, HardDecision::NeedExternal { .. }),
+            "shell reads of hidden-home credentials must still gate: {bash_read:?}"
+        );
+        assert!(matches!(
+            bash_read.source,
+            DecisionSource::SensitivePath { .. }
+        ));
     }
 
     #[test]

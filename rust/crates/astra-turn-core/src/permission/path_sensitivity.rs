@@ -12,7 +12,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use astra_sandbox::{InternalPathKind, is_dangerous_file_path};
+use astra_sandbox::{InternalPathKind, is_dangerous_file_path, is_sensitive_path};
 use astra_services::SessionArtifactStore;
 use serde_json::Value;
 
@@ -24,13 +24,18 @@ use super::redact::matches_sensitive_path;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathSensitivity {
     Normal,
+    /// Reading this path can expose credentials or system-sensitive state.
     Sensitive,
+    /// Mutating this path can alter persistent shell/git/editor/agent state,
+    /// but read-only inspection is allowed unless the path is also sensitive.
+    WriteSensitive,
     InternalArtifactReadOnly(InternalPathKind),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathAccess {
     Read,
+    List,
     Write,
 }
 
@@ -48,10 +53,67 @@ pub fn classify_path_sensitivity(path: &str) -> PathSensitivity {
     if let Some(kind) = classify_current_session_artifact_path(path) {
         return PathSensitivity::InternalArtifactReadOnly(kind);
     }
-    if is_dangerous_file_path(path) || matches_sensitive_path(path) {
+    if is_read_sensitive_path(path) {
         return PathSensitivity::Sensitive;
     }
+    if is_write_sensitive_path(path) {
+        return PathSensitivity::WriteSensitive;
+    }
     PathSensitivity::Normal
+}
+
+fn is_read_sensitive_path(path: &str) -> bool {
+    let expanded = expand_home_path(path);
+    is_sensitive_path(&expanded)
+        || matches_sensitive_path(path)
+        || matches_sensitive_path(&expanded.to_string_lossy())
+}
+
+fn is_write_sensitive_path(path: &str) -> bool {
+    let expanded = expand_home_path(path);
+    is_read_sensitive_path(path)
+        || is_dangerous_file_path(path)
+        || is_dangerous_file_path(&expanded.to_string_lossy())
+        || is_tilde_hidden_home_app_state_path(path)
+        || is_hidden_home_app_state_path(&expanded)
+}
+
+fn is_tilde_hidden_home_app_state_path(path: &str) -> bool {
+    let Some(relative) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) else {
+        return false;
+    };
+    let first = relative.split(['/', '\\']).next().unwrap_or(relative);
+    first.starts_with('.') && first.len() > 1
+}
+
+fn is_hidden_home_app_state_path(path: &Path) -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    let candidate = normalize_lexical_path(path);
+    let home = normalize_lexical_path(&home);
+    let Ok(relative) = candidate.strip_prefix(&home) else {
+        return false;
+    };
+    let Some(Component::Normal(first)) = relative.components().next() else {
+        return false;
+    };
+    let first = first.to_string_lossy();
+    first.starts_with('.') && first.len() > 1
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn classify_legacy_tool_result_path(path: &str) -> Option<InternalPathKind> {
@@ -72,42 +134,120 @@ fn classify_legacy_tool_result_path(path: &str) -> Option<InternalPathKind> {
 }
 
 fn classify_current_session_artifact_path(path: &str) -> Option<InternalPathKind> {
+    if contains_glob_meta(path) {
+        return None;
+    }
     let sessions_root = astra_services::local_session_artifact_store()
         .sessions_root()
         .canonicalize()
         .ok()?;
     let candidate = canonicalize_existing_or_nearest(&expand_home_path(path))?;
     let relative = candidate.strip_prefix(&sessions_root).ok()?;
-    let mut components = relative.components();
+    classify_session_relative_path(relative, false)
+}
 
-    match (components.next(), components.next(), components.next()) {
-        (Some(Component::Normal(journal_file)), None, None)
-            if is_session_journal_file(journal_file) =>
-        {
+fn classify_current_session_listing_pattern(path: &str) -> Option<InternalPathKind> {
+    if !contains_glob_meta(path) {
+        return None;
+    }
+    let sessions_root = astra_services::local_session_artifact_store()
+        .sessions_root()
+        .canonicalize()
+        .ok()?;
+    let candidate = canonicalize_existing_or_nearest(&expand_home_path(path))?;
+    let relative = candidate.strip_prefix(&sessions_root).ok()?;
+    classify_session_relative_path(relative, true)
+}
+
+fn classify_session_relative_path(
+    relative: &Path,
+    allow_glob_selectors: bool,
+) -> Option<InternalPathKind> {
+    let components = normal_components(relative)?;
+    classify_session_relative_components(&components, allow_glob_selectors)
+}
+
+fn normal_components(path: &Path) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => out.push(value.to_string_lossy().to_string()),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn classify_session_relative_components(
+    components: &[String],
+    allow_glob_selectors: bool,
+) -> Option<InternalPathKind> {
+    match components {
+        [] => Some(InternalPathKind::SessionRoot),
+        [journal_file] if is_session_journal_file_name(journal_file) => {
             Some(InternalPathKind::SessionJournal)
         }
-        (
-            Some(Component::Normal(session_id)),
-            Some(Component::Normal(tool_results)),
-            Some(Component::Normal(_artifact_file)),
-        ) if !session_id.is_empty()
-            && tool_results == "tool-results"
-            && components.all(|component| matches!(component, Component::Normal(_))) =>
+        [session_selector] if is_session_selector(session_selector, allow_glob_selectors) => {
+            Some(InternalPathKind::SessionDirectory)
+        }
+        [session_selector, child]
+            if is_session_selector(session_selector, allow_glob_selectors)
+                && is_session_diagnostic_file(child) =>
         {
-            Some(InternalPathKind::SessionToolResult)
+            Some(InternalPathKind::SessionDiagnostic)
+        }
+        [session_selector, dir] if is_session_selector(session_selector, allow_glob_selectors) => {
+            session_artifact_dir_kind(dir)
+        }
+        [session_selector, dir, rest @ ..]
+            if is_session_selector(session_selector, allow_glob_selectors)
+                && rest
+                    .iter()
+                    .all(|component| allow_glob_selectors || !contains_glob_meta(component)) =>
+        {
+            session_artifact_dir_kind(dir)
         }
         _ => None,
     }
 }
 
-fn is_session_journal_file(file_name: &std::ffi::OsStr) -> bool {
-    let Some(file_name) = file_name.to_str() else {
-        return false;
-    };
+fn is_session_selector(component: &str, allow_glob_selectors: bool) -> bool {
+    astra_services::session_journal::validate_session_id(component).is_ok()
+        || (allow_glob_selectors && contains_glob_meta(component))
+}
+
+fn is_session_diagnostic_file(name: &str) -> bool {
+    matches!(
+        name,
+        "workspace.yaml"
+            | "conversation_log.jsonl"
+            | "step_events.jsonl"
+            | "session-memory.md"
+            | "session-memory.meta.json"
+    ) || (name.starts_with("llm_error_") && name.ends_with(".json"))
+}
+
+fn session_artifact_dir_kind(name: &str) -> Option<InternalPathKind> {
+    match name {
+        "tool-results" => Some(InternalPathKind::SessionToolResult),
+        "step_checkpoints" | "checkpoints" | "file_checkpoints" => {
+            Some(InternalPathKind::SessionDiagnostic)
+        }
+        _ => None,
+    }
+}
+
+fn is_session_journal_file_name(file_name: &str) -> bool {
     let Some(session_id) = file_name.strip_suffix(".jsonl") else {
         return false;
     };
     astra_services::session_journal::validate_session_id(session_id).is_ok()
+}
+
+fn contains_glob_meta(path: &str) -> bool {
+    path.chars()
+        .any(|ch| matches!(ch, '*' | '?' | '[' | ']' | '{' | '}'))
 }
 
 fn expand_home_path(path: &str) -> PathBuf {
@@ -159,12 +299,23 @@ fn canonicalize_existing_or_nearest(path: &Path) -> Option<PathBuf> {
 }
 
 pub fn path_requires_sensitive_gate(path: &str, access: PathAccess) -> Option<SensitivePathMatch> {
-    let sensitivity = classify_path_sensitivity(path);
+    let mut sensitivity = classify_path_sensitivity(path);
+    if matches!(sensitivity, PathSensitivity::WriteSensitive)
+        && matches!(access, PathAccess::List)
+        && let Some(kind) = classify_current_session_listing_pattern(path)
+    {
+        sensitivity = PathSensitivity::InternalArtifactReadOnly(kind);
+    }
     let gated = match (sensitivity, access) {
         (PathSensitivity::Normal, _) => false,
         (PathSensitivity::Sensitive, _) => true,
+        (PathSensitivity::WriteSensitive, PathAccess::Write) => true,
+        (PathSensitivity::WriteSensitive, PathAccess::Read) if contains_glob_meta(path) => true,
+        (PathSensitivity::WriteSensitive, PathAccess::Read | PathAccess::List) => false,
         (PathSensitivity::InternalArtifactReadOnly(_), PathAccess::Write) => true,
-        (PathSensitivity::InternalArtifactReadOnly(_), PathAccess::Read) => false,
+        (PathSensitivity::InternalArtifactReadOnly(_), PathAccess::Read | PathAccess::List) => {
+            false
+        }
     };
     gated.then(|| SensitivePathMatch {
         token: path.to_string(),
@@ -185,7 +336,7 @@ pub fn sensitive_path_match_for_tool_args(
         && !path.is_empty()
     {
         let access = if is_direct_read {
-            PathAccess::Read
+            direct_read_access(tool_name)
         } else {
             PathAccess::Write
         };
@@ -209,6 +360,13 @@ pub fn sensitive_path_match_for_shell_command(command: &str) -> Option<Sensitive
         }
     }
     None
+}
+
+fn direct_read_access(tool_name: &str) -> PathAccess {
+    match tool_name {
+        "list_dir" | "glob" | "Glob" | "GlobTool" => PathAccess::List,
+        _ => PathAccess::Read,
+    }
 }
 
 fn sensitive_path_match_for_shell_segment(segment: &str) -> Option<SensitivePathMatch> {
@@ -236,8 +394,9 @@ fn sensitive_path_match_for_shell_segment(segment: &str) -> Option<SensitivePath
         | "truncate" | "tee" => {
             generic_sensitive_path_match(&tokens, args_start, PathAccess::Write)
         }
-        "cat" | "head" | "tail" | "less" | "more" | "wc" | "stat" | "ls" | "ll" | "tree"
-        | "file" | "du" | "basename" | "dirname" | "realpath" | "readlink" | "test" => {
+        "ls" | "ll" | "tree" => generic_sensitive_path_match(&tokens, args_start, PathAccess::List),
+        "cat" | "head" | "tail" | "less" | "more" | "wc" | "stat" | "file" | "du" | "basename"
+        | "dirname" | "realpath" | "readlink" | "test" => {
             generic_sensitive_path_match(&tokens, args_start, PathAccess::Read)
         }
         "echo" | "printf" | "pwd" | "date" | "true" | "false" | "sleep" | "whoami" | "id"
@@ -741,6 +900,83 @@ mod tests {
     }
 
     #[test]
+    fn session_root_and_diagnostics_are_read_only_auto_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_root = temp.path().join(".astra/sessions");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
+        let session_id = "550e8400-e29b-41d4-a716-446655440000";
+        let session_dir = sessions_root.join(session_id);
+        let checkpoint_dir = session_dir.join("step_checkpoints");
+        let checkpoint = checkpoint_dir.join("000001-heavy.json");
+        std::fs::create_dir_all(&checkpoint_dir).unwrap();
+        std::fs::write(sessions_root.join(format!("{session_id}.jsonl")), "{}\n").unwrap();
+        std::fs::write(session_dir.join("workspace.yaml"), "session_id: test\n").unwrap();
+        std::fs::write(&checkpoint, "{}\n").unwrap();
+
+        assert_eq!(
+            classify_path_sensitivity(&sessions_root.to_string_lossy()),
+            PathSensitivity::InternalArtifactReadOnly(InternalPathKind::SessionRoot)
+        );
+        assert_eq!(
+            classify_path_sensitivity(&session_dir.to_string_lossy()),
+            PathSensitivity::InternalArtifactReadOnly(InternalPathKind::SessionDirectory)
+        );
+        assert_eq!(
+            classify_path_sensitivity(&session_dir.join("workspace.yaml").to_string_lossy()),
+            PathSensitivity::InternalArtifactReadOnly(InternalPathKind::SessionDiagnostic)
+        );
+        assert_eq!(
+            classify_path_sensitivity(&checkpoint.to_string_lossy()),
+            PathSensitivity::InternalArtifactReadOnly(InternalPathKind::SessionDiagnostic)
+        );
+
+        let list_args = serde_json::json!({ "path": sessions_root.to_string_lossy().to_string() });
+        assert_eq!(
+            sensitive_path_match_for_tool_args("list_dir", &list_args),
+            None
+        );
+        assert_eq!(sensitive_path_match_for_tool_args("glob", &list_args), None);
+
+        assert_eq!(
+            sensitive_path_match_for_shell_command(&format!(
+                "ls -lt {} | head -20",
+                sessions_root.display()
+            )),
+            None
+        );
+        assert_eq!(
+            sensitive_path_match_for_shell_command(&format!(
+                "ls -d {}/*/ | tail -10",
+                sessions_root.display()
+            )),
+            None
+        );
+        assert_eq!(
+            sensitive_path_match_for_shell_command(&format!(
+                "ls -lt {}/*-heavy.json | head -3",
+                checkpoint_dir.display()
+            )),
+            None
+        );
+
+        let content_glob = sensitive_path_match_for_shell_command(&format!(
+            "cat {}/*-heavy.json",
+            checkpoint_dir.display()
+        ))
+        .expect("content reads through globs should still gate");
+        assert_eq!(content_glob.access, PathAccess::Read);
+        assert_eq!(content_glob.sensitivity, PathSensitivity::WriteSensitive);
+
+        let write_hit =
+            path_requires_sensitive_gate(&checkpoint.to_string_lossy(), PathAccess::Write)
+                .expect("writes to diagnostics must gate");
+        assert_eq!(
+            write_hit.sensitivity,
+            PathSensitivity::InternalArtifactReadOnly(InternalPathKind::SessionDiagnostic)
+        );
+    }
+
+    #[test]
     fn arbitrary_astra_tool_results_are_not_permission_internal_artifacts() {
         let temp = tempfile::tempdir().unwrap();
         let artifact_path = temp
@@ -752,10 +988,11 @@ mod tests {
 
         assert_eq!(
             classify_path_sensitivity(&artifact_path),
-            PathSensitivity::Sensitive
+            PathSensitivity::WriteSensitive
         );
-        let hit = path_requires_sensitive_gate(&artifact_path, PathAccess::Read).expect("gate");
-        assert_eq!(hit.sensitivity, PathSensitivity::Sensitive);
+        assert!(path_requires_sensitive_gate(&artifact_path, PathAccess::Read).is_none());
+        let hit = path_requires_sensitive_gate(&artifact_path, PathAccess::Write).expect("gate");
+        assert_eq!(hit.sensitivity, PathSensitivity::WriteSensitive);
     }
 
     #[test]
@@ -770,10 +1007,50 @@ mod tests {
 
         assert_eq!(
             classify_path_sensitivity(&journal_path),
-            PathSensitivity::Sensitive
+            PathSensitivity::WriteSensitive
         );
-        let hit = path_requires_sensitive_gate(&journal_path, PathAccess::Read).expect("gate");
-        assert_eq!(hit.sensitivity, PathSensitivity::Sensitive);
+        assert!(path_requires_sensitive_gate(&journal_path, PathAccess::Read).is_none());
+        let hit = path_requires_sensitive_gate(&journal_path, PathAccess::Write).expect("gate");
+        assert_eq!(hit.sensitivity, PathSensitivity::WriteSensitive);
+    }
+
+    #[test]
+    fn hidden_home_app_state_is_readable_but_not_writable_by_default() {
+        let log_path = "~/.xxx/logs/session.log";
+
+        assert_eq!(
+            classify_path_sensitivity(log_path),
+            PathSensitivity::WriteSensitive
+        );
+        assert!(path_requires_sensitive_gate(log_path, PathAccess::Read).is_none());
+        assert!(path_requires_sensitive_gate(log_path, PathAccess::List).is_none());
+        assert!(path_requires_sensitive_gate(log_path, PathAccess::Write).is_some());
+
+        let shell_write = sensitive_path_match_for_shell_command("rm -f ~/.yyy/config.toml")
+            .expect("mutating hidden home app state should gate");
+        assert_eq!(shell_write.sensitivity, PathSensitivity::WriteSensitive);
+        assert_eq!(shell_write.access, PathAccess::Write);
+    }
+
+    #[test]
+    fn credential_files_remain_read_sensitive() {
+        for path in [
+            "~/.ssh/id_rsa",
+            "~/.aws/credentials",
+            "~/.xxx/.env",
+            "~/.yyy/credentials.json",
+            "~/.zzz/token.pem",
+            ".env",
+            "config/secrets.toml",
+        ] {
+            let hit = path_requires_sensitive_gate(path, PathAccess::Read).expect("gate");
+            assert_eq!(hit.sensitivity, PathSensitivity::Sensitive, "{path}");
+        }
+
+        let shell_read = sensitive_path_match_for_shell_command("cat ~/.xxx/.env")
+            .expect("credential-shaped files under hidden app state should still gate");
+        assert_eq!(shell_read.sensitivity, PathSensitivity::Sensitive);
+        assert_eq!(shell_read.access, PathAccess::Read);
     }
 
     #[test]

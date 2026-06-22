@@ -580,6 +580,12 @@ fn check_bash_sensitive_path_boundary(
                 hit.token
             ));
         }
+        PathSensitivity::WriteSensitive => {
+            return Some(format!(
+                "Sandbox: Path '{}' is blocked as write-sensitive app/runtime state",
+                hit.token
+            ));
+        }
         PathSensitivity::InternalArtifactReadOnly(_) => {
             return Some(format!(
                 "Sandbox: Path '{}' is blocked as an internal runtime artifact path",
@@ -5945,8 +5951,11 @@ mod tests {
     fn bash_path_boundary_permissive_allows_ordinary_external_paths() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::permissive("/home/user/project");
-        let result = check_bash_path_boundary(&policy, "cat /etc/passwd");
-        assert!(result.is_none(), "permissive mode should allow everything");
+        let result = check_bash_path_boundary(&policy, "cat /opt/build.log");
+        assert!(
+            result.is_none(),
+            "permissive mode should allow ordinary external paths"
+        );
     }
 
     #[test]
@@ -5990,6 +5999,32 @@ mod tests {
         assert!(
             !result.starts_with(super::SANDBOX_DENIED_PREFIX),
             "sensitive paths are not expandable sandbox boundaries: {result}"
+        );
+    }
+
+    #[test]
+    fn bash_path_boundary_permissive_distinguishes_hidden_app_logs_from_secrets_and_writes() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+
+        let log_read = check_bash_path_boundary(&policy, "tail -20 ~/.xxx/logs/session.log");
+        assert!(
+            log_read.is_none(),
+            "read-only hidden app logs should not be blocked: {log_read:?}"
+        );
+
+        let secret_read = check_bash_path_boundary(&policy, "cat ~/.xxx/.env")
+            .expect("credential-shaped files under hidden app state must still block");
+        assert!(
+            secret_read.contains("sensitive credential path"),
+            "{secret_read}"
+        );
+
+        let hidden_write = check_bash_path_boundary(&policy, "rm -f ~/.yyy/config.toml")
+            .expect("mutating hidden app state must still block");
+        assert!(
+            hidden_write.contains("write-sensitive app/runtime state"),
+            "{hidden_write}"
         );
     }
 
