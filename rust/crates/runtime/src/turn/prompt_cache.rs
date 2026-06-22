@@ -639,7 +639,6 @@ pub(crate) fn section_cache_key(
 /// dynamic tools sitting after it don't invalidate the cached prefix. If no
 /// pinned tools are present (e.g. caller opted into full-dynamic), falls
 /// back to the last tool.
-#[cfg(test)]
 pub(crate) fn annotate_tool_schemas_for_caching(
     tools: &mut [Value],
     cache_cfg: &PromptCacheConfig,
@@ -689,7 +688,6 @@ pub(crate) fn annotate_tool_schemas_for_caching_with_pinned(
 ///
 /// Returning a fresh `HashSet` per call keeps the API safe across threads
 /// without a static — the set is small, so this is cheap.
-#[cfg(test)]
 pub(crate) fn default_pinned_tool_names() -> std::collections::HashSet<String> {
     resolve_pinned_tool_names_for_config(&ToolSurfaceConfig::default())
 }

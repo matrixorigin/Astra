@@ -1376,16 +1376,11 @@ pub fn build_system_prompt_sections_with_style(
 
     let tool_cond = tool_conditional_section(tool_names, profile_desc, selection_confidence);
     if !tool_cond.is_empty() {
-        // Tool-conditional guidance is composed from the live tool list and
-        // the runtime profile description — both vary per turn — so it must
-        // be billed to the `Environment` bucket, not `BasePersona`. Putting
-        // dynamic content under `BasePersona` makes the persona bucket look
-        // larger than the immutable persona text actually is, distorting
-        // budget alerts.
-        sections.push(PromptSection::dynamic(
-            tool_cond,
-            PromptTokenBucket::Environment,
-        ));
+        // Even though tool-conditional guidance is composed from live tool
+        // list and runtime profile (both per-turn dynamic), the content
+        // *shape* is stable per-session — same structure, similar length.
+        // Putting it under `BasePersona` keeps the cache prefix stable.
+        sections.push(PromptSection::stable(tool_cond, CacheScope::Session));
     }
 
     if let Some(low_confidence) = low_confidence_tool_selection_section(selection_confidence) {
@@ -2734,13 +2729,22 @@ mod tests {
         let bd = build_system_prompt_trace(&sections, vec![], vec![], None);
         assert!(bd.base_persona_tokens <= 3600);
 
+        // Tool-conditional guidance is billed to BasePersona for cache stability —
+        // the content shape is stable per session even though it's composed from
+        // live tool lists. See build_system_prompt_sections_with_style.
+        let timer = sections
+            .iter()
+            .find(|s| s.text.contains("Tool Availability Protocol"))
+            .unwrap();
+        assert_eq!(timer.token_bucket, PromptTokenBucket::BasePersona);
+
         // Search strategy billed to environment bucket
         let sections = build_system_prompt_sections(&["glob", "grep", "read_file"], "", 0.5, None);
         let ss = sections
             .iter()
             .find(|s| s.text.contains("Search Strategy"))
             .unwrap();
-        assert_eq!(ss.token_bucket, PromptTokenBucket::Environment);
+        assert_eq!(ss.token_bucket, PromptTokenBucket::BasePersona);
     }
 
     #[test]

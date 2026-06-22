@@ -186,18 +186,24 @@ impl ToolSurface {
     ///
     /// This keeps the wire contract self-consistent: a tool is either directly
     /// visible in `tools[]` or advertised as deferred/searchable, never both.
+    ///
+    /// NOTE: `visible_names` is only used to filter `plugin_schemas` (per-turn
+    /// dynamic tools like MCP). Catalog schemas pass through unfiltered so that
+    /// the deferred block (`<deferred_tools>`) remains stable per session —
+    /// filtering by `visible_names` would make it fluctuate with every
+    /// selector change, breaking `CacheScope::Session`.
     pub fn build_excluding_visible(
         catalog_schemas: Vec<Value>,
         cfg: &ToolSurfaceConfig,
         plugin_schemas: &[Value],
         visible_names: &HashSet<String>,
     ) -> Self {
-        let catalog_schemas: Vec<Value> = catalog_schemas
-            .into_iter()
-            .filter(|schema| {
-                tool_schema_name(schema).is_none_or(|name| !visible_names.contains(name))
-            })
-            .collect();
+        // Catalog schemas are NOT filtered by visible_names — the deferred set
+        // must be stable per session (CacheScope::Session). Selector-chosen
+        // tools may appear in both tools[] and <deferred_tools>; the system
+        // prompt instructs the model to prefer tools[].
+        // let catalog_schemas: Vec<Value> = ...; // intentionally removed
+
         let plugin_schemas: Vec<Value> = plugin_schemas
             .iter()
             .filter(|schema| {

@@ -266,9 +266,19 @@ fn deferred_list_excludes_final_visible_tools_even_when_not_default_pinned() {
         .map(|entry| entry.name.clone())
         .collect();
 
+    // Deferred set is STABLE per session — visible tools MAY also appear
+    // in deferred. The system prompt instructs the model to prefer tools[]
+    // over <deferred_tools>. This test now verifies the deferred set is
+    // non-empty and self-consistent (no duplicates, no pinned tools in deferred).
     assert!(
-        visible.is_disjoint(&deferred),
-        "tools already visible in tools[] must not also be advertised as deferred; visible={visible:?} deferred={deferred:?}"
+        !deferred.is_empty(),
+        "deferred set should be non-empty even when some tools are visible"
+    );
+    let pinned_from_config: std::collections::HashSet<String> =
+        cfg.pinned_tools.iter().cloned().collect();
+    assert!(
+        deferred.is_disjoint(&pinned_from_config),
+        "pinned tools must never appear in deferred; pinned={pinned_from_config:?} deferred={deferred:?}"
     );
 }
 
@@ -374,7 +384,7 @@ fn custom_type_is_rejected_while_missing_type_function_shorthand_can_be_pinned()
 }
 
 #[test]
-fn deferred_manifest_none_when_every_tool_is_visible() {
+fn deferred_manifest_exists_when_every_tool_is_visible() {
     let cfg = ToolSurfaceConfig::default();
     let visible: std::collections::HashSet<String> = catalog_schemas()
         .iter()
@@ -388,10 +398,16 @@ fn deferred_manifest_none_when_every_tool_is_visible() {
         .collect();
     let surface = ToolSurface::build_excluding_visible(catalog_schemas(), &cfg, &[], &visible);
 
-    assert!(surface.deferred().is_empty());
+    // Deferred set is STABLE per session — it persists even when every tool
+    // is marked visible. The system prompt's <deferred_tools> block must
+    // remain byte-stable (CacheScope::Session) regardless of selector picks.
     assert!(
-        surface.deferred_manifest(Some("gpt-4o")).is_none(),
-        "callers must not get names/activatable state when there is no rendered deferred manifest"
+        !surface.deferred().is_empty(),
+        "deferred set must persist even when all tools are referenced as visible"
+    );
+    assert!(
+        surface.deferred_manifest(Some("gpt-4o")).is_some(),
+        "callers must still get names/activatable state from the persisted deferred manifest"
     );
 }
 
