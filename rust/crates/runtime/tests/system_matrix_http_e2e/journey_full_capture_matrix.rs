@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use tempfile::tempdir;
 use tower::util::ServiceExt;
 
-use super::harness::{bootstrap, cleanup_session_data, put_json};
+use super::harness::{bootstrap, cleanup_session_data, put_json, seeded_selected_model};
 
 async fn collect_full_sse_stream(
     app: &axum::Router,
@@ -104,6 +104,7 @@ pub async fn run_stream_session_metadata_enables_full_llm_exchange_journaling() 
     let payload = json!({
         "message": "matrix full capture probe",
         "session_id": &session_id,
+        "selected_model": seeded_selected_model(ctx),
         "context": {
             "test_llm_stream_blocks": [
                 "data: {\"type\":\"text_delta\",\"content\":\"Matrix capture verified.\"}\n\n",

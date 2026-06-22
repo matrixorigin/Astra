@@ -24,7 +24,8 @@ use sqlx::Row;
 use tower::util::ServiceExt;
 
 use super::harness::{
-    bootstrap, cleanup_session_data, get_json, post_json, sse_first_data_json_with_type,
+    bootstrap, cleanup_session_data, get_json, post_json, seeded_selected_model,
+    sse_first_data_json_with_type,
 };
 
 /// Collect the FULL SSE stream body (up to deadline), not just until session_info.
@@ -124,6 +125,7 @@ pub async fn run_stream_session_and_run_status() {
     let payload = json!({
         "message": "phase-b persistence probe",
         "session_id": &session_id,
+        "selected_model": seeded_selected_model(ctx),
         "context": {
             "test_llm_rounds": [{ "full_text": "Persistence verified." }]
         }
@@ -200,6 +202,7 @@ pub async fn run_stream_context_trace_persistence() {
     let payload = json!({
         "message": "context trace persistence test",
         "session_id": &session_id,
+        "selected_model": seeded_selected_model(ctx),
         "context": {
             "test_llm_rounds": [{ "full_text": "Context trace reply." }]
         }
@@ -349,6 +352,7 @@ pub async fn run_stream_multi_turn_persistence() {
     let payload1 = json!({
         "message": "multi-turn message one",
         "session_id": &session_id,
+        "selected_model": seeded_selected_model(ctx),
         "context": {
             "test_llm_rounds": [{ "full_text": "Response one." }]
         }
@@ -389,6 +393,7 @@ pub async fn run_stream_multi_turn_persistence() {
     let payload2 = json!({
         "message": "multi-turn message two",
         "session_id": &session_id,
+        "selected_model": seeded_selected_model(ctx),
         "context": {
             "test_llm_rounds": [{ "full_text": "Response two." }]
         }

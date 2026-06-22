@@ -26,6 +26,9 @@ use astra_services::skills::{
     SkillInfoRecord, SkillListItem, SkillListRecord, SkillPublishRequestData, SkillRecord,
     SkillRegisterRequestData, SkillService, SkillStatusRecord, SkillVersionRecord,
 };
+use astra_services::{
+    ModelCreateRequestData, ModelListItem, ModelRecord, ModelService, ModelUpdateRequestData,
+};
 use async_trait::async_trait;
 use axum::{
     Json, Router,
@@ -45,6 +48,7 @@ use crate::test_support::{
 const SECRET: &str = "web-agent-e2e-secret";
 const TOKEN: &str = "Bearer web-agent-e2e-token";
 const USER_ID: &str = "web-agent-e2e-user";
+const DEFAULT_SELECTED_MODEL: &str = "test-model";
 
 static SECRET_INIT: OnceLock<()> = OnceLock::new();
 
@@ -354,6 +358,76 @@ impl SkillService for TestSkillService {
     }
 }
 
+struct TestModelService;
+
+fn test_model_record(name: String) -> ModelRecord {
+    ModelRecord {
+        model_id: format!("model-{name}"),
+        name,
+        provider: "mock".to_string(),
+        base_url: Some("http://127.0.0.1:1".to_string()),
+        description: None,
+        is_active: true,
+        context_window: 128_000,
+        max_completion_tokens: None,
+        input_modalities: Vec::new(),
+        output_modalities: Vec::new(),
+        supported_parameters: Vec::new(),
+        pricing: Default::default(),
+        architecture: None,
+        tags: Vec::new(),
+        quirks: Default::default(),
+        connectivity: None,
+        thinking_capability: None,
+        thinking_probe: None,
+    }
+}
+
+#[async_trait]
+impl ModelService for TestModelService {
+    async fn create_model(
+        &self,
+        _: String,
+        _: ModelCreateRequestData,
+    ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        unimplemented!()
+    }
+
+    async fn list_models(
+        &self,
+        _: String,
+        _: bool,
+    ) -> Result<Vec<ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
+        unimplemented!()
+    }
+
+    async fn get_model(
+        &self,
+        model_name: String,
+    ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        Ok(test_model_record(model_name))
+    }
+
+    async fn update_model(
+        &self,
+        _: String,
+        _: ModelUpdateRequestData,
+    ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        unimplemented!()
+    }
+
+    async fn delete_model(&self, _: String) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        unimplemented!()
+    }
+
+    async fn check_model(
+        &self,
+        model_name: String,
+    ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        Ok(test_model_record(model_name))
+    }
+}
+
 // ── App builder ──────────────────────────────────────────────────────────────
 
 fn build_test_app() -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>) {
@@ -366,7 +440,8 @@ fn build_test_app() -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>)
     let lifecycle = test_run_lifecycle(
         test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
         ledger.clone(),
-    );
+    )
+    .with_model_service(Arc::new(TestModelService));
 
     let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
     (build_app(state), ledger)
@@ -393,6 +468,7 @@ fn build_test_app_with_hooks() -> (
         test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
         ledger,
     )
+    .with_model_service(Arc::new(TestModelService))
     .with_hook_db_writer(hook_writer.clone())
     .with_observer_worker(observer_worker.clone())
     .with_tool_event_writer(tool_event_writer.clone());
@@ -426,6 +502,7 @@ fn build_test_app_with_hooks_and_skills() -> (
         test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
         ledger,
     )
+    .with_model_service(Arc::new(TestModelService))
     .with_skill_service(Arc::new(TestSkillService))
     .with_hook_db_writer(hook_writer.clone())
     .with_observer_worker(observer_worker.clone())
@@ -442,8 +519,24 @@ fn build_test_app_with_hooks_and_skills() -> (
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+fn normalize_chat_stream_payload(mut payload: Value) -> Value {
+    let Some(object) = payload.as_object_mut() else {
+        return payload;
+    };
+    let legacy_model = object.remove("model");
+    if object.contains_key("selected_model") {
+        return payload;
+    }
+    let model = legacy_model
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| DEFAULT_SELECTED_MODEL.to_string());
+    object.insert("selected_model".to_string(), json!({ "model": model }));
+    payload
+}
+
 /// Send a POST /chat/stream request and collect all SSE events from the stream.
 async fn chat_stream_collect(app: &Router, payload: Value) -> Vec<Value> {
+    let payload = normalize_chat_stream_payload(payload);
     let req = Request::builder()
         .method("POST")
         .uri("/chat/stream")
@@ -467,6 +560,7 @@ async fn chat_stream_collect(app: &Router, payload: Value) -> Vec<Value> {
 /// This is used for tests that need to read events incrementally while posting
 /// tool results concurrently.
 async fn chat_stream_start(app: &Router, payload: Value) -> axum::response::Response {
+    let payload = normalize_chat_stream_payload(payload);
     let req = Request::builder()
         .method("POST")
         .uri("/chat/stream")
@@ -2760,7 +2854,7 @@ async fn empty_message_still_completes() {
 }
 
 #[tokio::test]
-async fn missing_message_field_returns_error() {
+async fn missing_message_field_returns_sse_error() {
     init_env();
     let (app, _) = build_test_app();
 
@@ -2770,15 +2864,23 @@ async fn missing_message_field_returns_error() {
         .header("authorization", TOKEN)
         .header("content-type", "application/json")
         .header("x-mo-bridge-test-secret", SECRET)
-        .body(Body::from(json!({"context": {}}).to_string()))
+        .body(Body::from(
+            json!({
+                "selected_model": { "model": DEFAULT_SELECTED_MODEL },
+                "context": {}
+            })
+            .to_string(),
+        ))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
-    // Should fail validation — either 400 or 422.
+    assert_eq!(resp.status(), StatusCode::OK);
+    let events = read_sse_events_from_body(resp.into_body()).await;
+    let errors = find_events(&events, "error");
     assert!(
-        resp.status() == StatusCode::BAD_REQUEST
-            || resp.status() == StatusCode::UNPROCESSABLE_ENTITY,
-        "expected 400 or 422, got {}",
-        resp.status()
+        errors.iter().any(|event| event["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("missing field `message`"))),
+        "missing message field should return a deserialization SSE error: {events:?}"
     );
 }
 
@@ -4166,6 +4268,7 @@ async fn client_disconnect_run_still_finalizes() {
             "test_llm_rounds": [{ "full_text": "Quick response." }]
         }
     });
+    let payload = normalize_chat_stream_payload(payload);
 
     let resp = app
         .clone()

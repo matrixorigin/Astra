@@ -479,6 +479,18 @@ pub async fn post_json_with_headers(
     (status, json)
 }
 
+pub fn seeded_model_name(ctx: &MatrixE2eCtx) -> String {
+    format!("mock-{}", ctx.suffix)
+}
+
+pub fn selected_model(model: impl Into<String>) -> Value {
+    json!({ "model": model.into() })
+}
+
+pub fn seeded_selected_model(ctx: &MatrixE2eCtx) -> Value {
+    selected_model(seeded_model_name(ctx))
+}
+
 pub async fn cleanup_session_data(pool: &sqlx::MySqlPool, session_id: &str) {
     let _ = sqlx::query("DELETE FROM ctx_decision_audits WHERE session_id = ?")
         .bind(session_id)

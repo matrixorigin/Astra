@@ -21,6 +21,10 @@ fn render_text(pane: &BottomPane, area: Rect) -> String {
 
 fn snapshot_text(pane: &BottomPane, area: Rect) -> String {
     render_text(pane, area)
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn seed_footer(pane: &mut BottomPane) {

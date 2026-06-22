@@ -19,7 +19,7 @@ use astra_services::session_workspace::WORKSPACE_METADATA_ARTIFACT_KIND;
 
 use super::harness::{
     E2E_PASSWORD, E2eAuthMode, bootstrap, bootstrap_trusted_moi, cleanup_session_data, get_json,
-    post_json,
+    post_json, seeded_selected_model, selected_model,
 };
 
 async fn collect_full_sse_stream(
@@ -1066,6 +1066,7 @@ pub async fn run_published_session_artifact_round_trip() {
     let payload = json!({
         "message": "publish llm capture and read it back",
         "session_id": &session_id,
+        "selected_model": seeded_selected_model(ctx),
         "context": {
             "test_llm_rounds": [{ "full_text": "Artifact publish verified." }]
         }
@@ -1185,6 +1186,7 @@ pub async fn run_session_artifact_latest_and_download_routes() {
     let payload = json!({
         "message": "publish llm capture for latest and download routes",
         "session_id": &session_id,
+        "selected_model": seeded_selected_model(ctx),
         "context": {
             "test_llm_rounds": [{ "full_text": "Artifact download verified." }]
         }
@@ -1380,6 +1382,7 @@ pub async fn run_failed_session_artifact_latest_and_download_routes() {
     let payload = json!({
         "message": "publish failed llm capture for latest and download routes",
         "session_id": &session_id,
+        "selected_model": seeded_selected_model(ctx),
         "context": {
             "test_llm_rounds": [{
                 "error": {
@@ -1668,7 +1671,7 @@ pub async fn run_server_loop_block_parse_recovery_session_artifact_latest_and_do
     let payload = json!({
         "message": "trigger a server-loop malformed provider block after progress and recover",
         "session_id": &session_id,
-        "model": model_name
+        "selected_model": selected_model(model_name.clone())
     });
     let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
@@ -1808,7 +1811,7 @@ pub async fn run_server_loop_block_parse_failure_session_artifact_latest_and_dow
     let payload = json!({
         "message": "trigger a server-loop malformed provider block after progress and make fallback fail",
         "session_id": &session_id,
-        "model": model_name
+        "selected_model": selected_model(model_name.clone())
     });
     let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
@@ -1980,7 +1983,7 @@ pub async fn run_server_loop_client_disconnect_session_artifact_latest_and_downl
     let payload = json!({
         "message": "trigger a server-loop transport break after partial output",
         "session_id": &session_id,
-        "model": model_name
+        "selected_model": selected_model(model_name.clone())
     });
     let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
@@ -2127,7 +2130,7 @@ pub async fn run_server_loop_transport_recovery_session_artifact_latest_and_down
     let payload = json!({
         "message": "trigger a server-loop transport break after progress and recover",
         "session_id": &session_id,
-        "model": model_name
+        "selected_model": selected_model(model_name.clone())
     });
     let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
@@ -2265,7 +2268,7 @@ pub async fn run_server_loop_transport_failure_session_artifact_latest_and_downl
     let payload = json!({
         "message": "trigger a server-loop transport break after progress and make fallback fail",
         "session_id": &session_id,
-        "model": model_name
+        "selected_model": selected_model(model_name.clone())
     });
     let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
@@ -2430,7 +2433,7 @@ pub async fn run_server_loop_idle_recovery_session_artifact_latest_and_download_
     let payload = json!({
         "message": "trigger a server-loop idle timeout after progress and recover",
         "session_id": &session_id,
-        "model": model_name
+        "selected_model": selected_model(model_name.clone())
     });
     let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
@@ -2570,7 +2573,7 @@ pub async fn run_server_loop_idle_failure_session_artifact_latest_and_download_r
     let payload = json!({
         "message": "trigger a server-loop idle timeout after progress and make fallback fail",
         "session_id": &session_id,
-        "model": model_name
+        "selected_model": selected_model(model_name.clone())
     });
     let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
@@ -2724,7 +2727,7 @@ pub async fn run_server_loop_rate_limit_failure_session_artifact_latest_and_down
     let payload = json!({
         "message": "trigger repeated server-loop rate limits",
         "session_id": &session_id,
-        "model": model_name
+        "selected_model": selected_model(model_name.clone())
     });
     let (status, body) = stream_chat_full_nonbridge(app, auth, payload.clone()).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
@@ -2877,7 +2880,7 @@ pub async fn run_server_loop_rate_limit_retry_success_session_artifact_latest_an
     let payload = json!({
         "message": "trigger one server-loop rate limit and then recover",
         "session_id": &session_id,
-        "model": model_name
+        "selected_model": selected_model(model_name.clone())
     });
     let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");

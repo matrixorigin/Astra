@@ -7,7 +7,7 @@ use tower::util::ServiceExt;
 
 use super::harness::{
     self, bootstrap, cleanup_task_rows, get_json, post_empty, post_json, post_json_with_headers,
-    put_json,
+    put_json, seeded_selected_model,
 };
 
 pub async fn run_tasks_lease_with_db_assertions() {
@@ -214,7 +214,6 @@ pub async fn run_chat_run_pause_resume_http() {
     let auth = &b.auth_header;
     let app = &ctx.app;
     let session_id = ctx.session_id.clone();
-    let mock_model = format!("mock-{}", ctx.suffix);
 
     let (st_chat, chat_j) = post_json(
         app,
@@ -223,7 +222,7 @@ pub async fn run_chat_run_pause_resume_http() {
         json!({
             "message": "matrix e2e background run",
             "session_id": session_id,
-            "model": mock_model,
+            "selected_model": seeded_selected_model(ctx),
             "context": {
                 "test_llm_rounds": [
                     {

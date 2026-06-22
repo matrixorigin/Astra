@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use super::harness::{
     E2E_PASSWORD, E2eAuthMode, bootstrap, collect_sse_body_text, delete_json, delete_no_content,
-    get_json, grant_astra_admin_role, post_empty, post_json, put_json,
+    get_json, grant_astra_admin_role, post_empty, post_json, put_json, seeded_selected_model,
 };
 use astra_services::session_journal::{JournalEventType, read_journal};
 use axum::{body::Body, http::Request};
@@ -237,6 +237,7 @@ pub async fn run_chat_stream_session_info_smoke() {
     let body = json!({
         "message": "matrix e2e stream smoke",
         "session_id": session_id,
+        "selected_model": seeded_selected_model(ctx),
         "execution_budget": {
             "initial_turns": 1,
             "hard_turn_limit": 1
