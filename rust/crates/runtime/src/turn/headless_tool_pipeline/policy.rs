@@ -21,7 +21,8 @@ use astra_turn_core::headless_tool_stderr_lines::{
 };
 use astra_turn_core::tool::deferred_activation::{
     DirectDeferredCallAdmission, classify_direct_deferred_call,
-    direct_deferred_call_activated_message, tool_not_admitted_message,
+    deferred_tool_not_activatable_message, direct_deferred_call_activated_message,
+    tool_not_admitted_message,
 };
 use astra_turn_core::tool_result_semantics::tool_dedup_signature;
 
@@ -531,34 +532,64 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         );
 
         if !self.ctx.valid_tool_names.contains(&execution.name) {
-            let is_deferred = self.ctx.deferred_tool_names.contains(&execution.name);
-            let (err_msg, skip_reason) =
-                match classify_direct_deferred_call(&execution.name, is_deferred, |name| {
-                    self.ctx
-                        .server_tool_executor
-                        .is_some_and(|exec| exec.has_runtime_binding(name))
-                }) {
-                    DirectDeferredCallAdmission::Activate { name } => {
-                        if let Some(exec) = self.ctx.server_tool_executor {
-                            exec.record_direct_deferred_call_activation(&name);
+            let is_prompt_deferred = self.ctx.deferred_tool_names.contains(&execution.name);
+            let is_activatable_deferred = self.ctx.server_tool_executor.is_some_and(|exec| {
+                exec.current_activatable_tool_names_snapshot()
+                    .contains(&execution.name)
+            });
+            let has_runtime_binding = |name: &str| {
+                self.ctx
+                    .server_tool_executor
+                    .is_some_and(|exec| exec.has_runtime_binding(name))
+            };
+            let (err_msg, skip_reason) = match classify_direct_deferred_call(
+                &execution.name,
+                is_activatable_deferred,
+                has_runtime_binding,
+            ) {
+                DirectDeferredCallAdmission::Activate { name } => {
+                    if let Some(exec) = self.ctx.server_tool_executor {
+                        exec.record_direct_deferred_call_activation(&name);
+                    }
+                    (
+                        direct_deferred_call_activated_message(&name),
+                        "direct_deferred_call_activated",
+                    )
+                }
+                DirectDeferredCallAdmission::NotAdmitted => (
+                    astra_turn_core::tool::runtime_binding::runtime_binding_denial_message(
+                        &execution.name,
+                        execution.args.get("action").and_then(Value::as_str),
+                    ),
+                    "tool_not_admitted",
+                ),
+                DirectDeferredCallAdmission::Unknown => {
+                    if is_prompt_deferred {
+                        if has_runtime_binding(&execution.name) {
+                            (
+                                deferred_tool_not_activatable_message(&execution.name),
+                                "tool_not_admitted",
+                            )
+                        } else {
+                            (
+                                    astra_turn_core::tool::runtime_binding::runtime_binding_denial_message(
+                                        &execution.name,
+                                        execution.args.get("action").and_then(Value::as_str),
+                                    ),
+                                    "tool_not_admitted",
+                                )
                         }
+                    } else {
                         (
-                            direct_deferred_call_activated_message(&name),
-                            "direct_deferred_call_activated",
+                            unknown_local_tool_error_message(
+                                &execution.name,
+                                self.ctx.valid_tool_names,
+                            ),
+                            "unknown_tool",
                         )
                     }
-                    DirectDeferredCallAdmission::NotAdmitted => (
-                        tool_not_admitted_message(&execution.name, true),
-                        "tool_not_admitted",
-                    ),
-                    DirectDeferredCallAdmission::Unknown => (
-                        unknown_local_tool_error_message(
-                            &execution.name,
-                            self.ctx.valid_tool_names,
-                        ),
-                        "unknown_tool",
-                    ),
-                };
+                }
+            };
             let args_preview = make_args_preview(&execution.name, &execution.args);
             if !self.ctx.quiet {
                 self.ctx.term.emit_line(
@@ -584,7 +615,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             );
             self.ctx.messages.push(tool_msg);
             self.ctx.tool_results.push(err_tr);
-            if is_deferred {
+            if is_prompt_deferred {
                 self.ctx
                     .tool_call_records
                     .push(journal_record_tool_not_admitted(

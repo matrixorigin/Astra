@@ -821,7 +821,7 @@ fn attach_subrun_tool_surface(
     effective_model: Option<&str>,
     interaction_mode: TurnInteractionMode,
 ) -> TurnInteractionPolicy {
-    let activated = executor.activated_deferred_tool_names();
+    let activated = executor.take_activated_deferred_tool_names();
     let mut selection_report = empty_selection_report_for_schemas(&schemas_to_use);
     if !activated.is_empty() {
         let refs: Vec<&str> = activated.iter().map(String::as_str).collect();
@@ -1131,8 +1131,8 @@ mod tests {
         );
         assert_eq!(
             executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()],
-            "executor activation must survive the subrun visible/deferred partition flip"
+            Vec::<String>::new(),
+            "subrun surface assembly must consume one-shot activation after making the schema visible"
         );
     }
 

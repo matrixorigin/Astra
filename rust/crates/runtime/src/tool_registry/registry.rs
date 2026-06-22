@@ -227,7 +227,7 @@ impl ToolRegistry {
     ) -> (Vec<Value>, SelectionReport) {
         let state = ConversationState::from_message_with_context(query, turn_count, recent_tools);
 
-        // Conversational short-circuit: skip dynamic ranking for greetings/acks.
+        // Conversational short-circuit: pure greetings/acks need no tools.
         // BUT: if recent_tools is non-empty, the session has active tool context
         // and the next turn likely needs related tools (e.g., memory_retrieve
         // after memory_store). Don't short-circuit in that case.
@@ -238,16 +238,14 @@ impl ToolRegistry {
             && !state.references_history
             && state.recent_tools.is_empty()
         {
-            let schemas = self.pinned_only();
-            let names = Self::selected_names(&schemas);
             let report = SelectionReport {
-                tools_selected: names,
+                tools_selected: Vec::new(),
                 dynamic_tools_selected: Vec::new(),
-                selected_count: schemas.len() as u32,
+                selected_count: 0,
                 budget_used: 0,
                 budget_total: budget,
             };
-            return (schemas, report);
+            return (Vec::new(), report);
         }
 
         let pinned_names = self.pinned_name_set();
@@ -300,16 +298,14 @@ impl ToolRegistry {
             && !state.references_history
             && state.recent_tools.is_empty()
         {
-            let schemas = self.pinned_only();
-            let names = Self::selected_names(&schemas);
             let report = SelectionReport {
-                tools_selected: names,
+                tools_selected: Vec::new(),
                 dynamic_tools_selected: Vec::new(),
-                selected_count: schemas.len() as u32,
+                selected_count: 0,
                 budget_used: 0,
                 budget_total: budget,
             };
-            return (schemas, report);
+            return (Vec::new(), report);
         }
 
         let pinned_names = self.pinned_name_set();
@@ -549,7 +545,7 @@ impl ToolRegistry {
             .cloned()
     }
 
-    /// Return only pinned tools (for conversational queries).
+    /// Return only pinned tools.
     pub fn pinned_only(&self) -> Vec<Value> {
         self.pinned_sorted.as_ref().clone()
     }
@@ -922,7 +918,7 @@ mod tests {
         let registry = ToolRegistry::new(schemas);
         // "hello" is the conversational short-circuit case.
         let (out_schemas, report) = registry.select_with_report_ctx("hello", 0, 800, &[]);
-        assert!(!out_schemas.is_empty());
+        assert!(out_schemas.is_empty());
         assert_eq!(report.selected_count as usize, out_schemas.len());
     }
 
@@ -930,14 +926,16 @@ mod tests {
     fn conversational_without_recent_tools_shortcircuits() {
         let schemas: Vec<Value> = TOOL_CATALOG.iter().map(|t| sample_schema(t.name)).collect();
         let registry = ToolRegistry::new(schemas);
-        // "谢谢" with no recent_tools → should short-circuit to pinned-only.
+        // "谢谢" with no recent_tools → should short-circuit to no tools.
         let (out, report) = registry.select_with_report_ctx("谢谢", 1, 800, &[]);
         assert_eq!(
-            report.selected_count,
-            ToolRegistry::pinned_count() as u32,
-            "conversational + no recent_tools should return only pinned"
+            report.selected_count, 0,
+            "conversational + no recent_tools should return no tools"
         );
-        let _ = out;
+        assert!(
+            out.is_empty(),
+            "pure conversational turns should be tool-free"
+        );
     }
 
     #[test]

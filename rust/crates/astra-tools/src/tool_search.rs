@@ -56,11 +56,9 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
         .filter(|schema| tool_schema_name(schema).is_some())
         .collect();
 
-    // Direct selection mode: select:tool_name or select:a,b,c
-    // Returns the FULL schema (name + full description + parameters) so the
-    // caller can invoke the tool immediately. This is the "deferred tool
-    // activation" pattern — the LLM saw the tool name elsewhere, asked for
-    // its schema, now has everything needed to call it.
+    // Direct selection mode: select:tool_name or select:a,b,c.
+    // Returns compact callable shape and lets the host queue the selected
+    // schema for the next request's tools[].
     if let Some(tool_names) = select_payload(query) {
         let mut requested = Vec::new();
         for name in tool_names
@@ -96,12 +94,14 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
                         "name": tool_name,
                         "description": desc,
                     });
-                    // Include parameters if present so the LLM can call the
-                    // tool without another round-trip.
+                    // Include callable parameter shape, but strip nested
+                    // prose. The full schema will be injected into tools[] on
+                    // the next request; this tool_result should not become a
+                    // long-lived duplicate copy in history.
                     if let Some(params) = func.get("parameters")
                         && let Some(obj) = entry.as_object_mut()
                     {
-                        obj.insert("parameters".to_string(), params.clone());
+                        obj.insert("parameters".to_string(), compact_select_parameters(params));
                     }
                     found.push(entry);
                 }
@@ -248,6 +248,29 @@ fn string_array_field(value: &Value, field: &str) -> Vec<String> {
         .filter_map(Value::as_str)
         .map(ToString::to_string)
         .collect()
+}
+
+fn compact_select_parameters(params: &Value) -> Value {
+    let mut compact = params.clone();
+    strip_nested_descriptions(&mut compact);
+    compact
+}
+
+fn strip_nested_descriptions(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("description");
+            for child in map.values_mut() {
+                strip_nested_descriptions(child);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                strip_nested_descriptions(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -529,12 +552,10 @@ mod tests {
         );
     }
 
-    // ── select: mode must return FULL schema (parameters included) ────────
-    // The LLM needs parameter shapes to call the tool. Previously we only
-    // returned name + truncated description which meant the tool couldn't
-    // actually be invoked after "search" — defeating the whole deferred-
-    // tool workflow. See ClaudeCode's ToolSearch → <functions>{...}</functions>
-    // encoding for the canonical pattern.
+    // ── select: mode must return callable schema shape ───────────────────
+    // The LLM needs parameter shapes to call the tool. Long parameter prose is
+    // stripped because the selected tool is injected into tools[] on the next
+    // request; keeping a duplicate verbose schema in history burns tokens.
 
     fn schemas_with_params() -> Vec<Value> {
         vec![json!({
@@ -565,6 +586,10 @@ mod tests {
         assert!(first.get("parameters").is_some());
         let params = &first["parameters"];
         assert!(params["properties"]["path"]["type"].as_str() == Some("string"));
+        assert!(
+            params["properties"]["path"].get("description").is_none(),
+            "select result should keep callable shape but strip nested prose: {parsed}"
+        );
 
         let result = tool_search(&schemas, &json!({"query": "file"}));
         let parsed: Value = serde_json::from_str(&result).unwrap();

@@ -405,7 +405,14 @@ fn ask_user_schema_advertises_questionnaire_tabs_and_multi_select() {
     let description = ask["function"]["description"]
         .as_str()
         .expect("ask_user description should be a string");
-    assert!(description.contains("retry ask_user immediately"));
+    assert!(
+        description.len() <= 180,
+        "ask_user description must stay compact in the pinned prefix: {description}"
+    );
+    assert!(
+        description.contains("structured questions") && description.contains("multi_select"),
+        "ask_user description should summarize the user-facing questionnaire contract: {description}"
+    );
     let params = &ask["function"]["parameters"];
     assert!(
         params["required"]
@@ -413,7 +420,12 @@ fn ask_user_schema_advertises_questionnaire_tabs_and_multi_select() {
             .unwrap()
             .contains(&"questions".into())
     );
-    let question = &params["properties"]["questions"]["items"];
+    let questions = &params["properties"]["questions"];
+    assert_eq!(questions["type"], "array");
+    assert_eq!(questions["minItems"], 1);
+    assert_eq!(questions["maxItems"], 6);
+    let question = &questions["items"];
+    assert_eq!(question["properties"]["header"]["type"], "string");
     assert_eq!(question["properties"]["multi_select"]["type"], "boolean");
     assert_eq!(question["properties"]["allow_freeform"]["type"], "boolean");
     let choices = &question["properties"]["options"]["items"];

@@ -162,7 +162,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Execute a shell command in the project root. PREFER dedicated tools: git for VCS, glob for file search, grep for content search, read_file for file reading, write_file/str_replace for edits. Use bash only for bespoke scripting, chain pipelines, builds/tests/installs, or actions with no dedicated tool. Shell commands bypass safety validations (no path-traversal or shell-meta guards) — prefer dedicated tools whenever they cover the operation. Identical commands are cached per session; use `force: true` to bypass the cache.",
+                "description": "Execute a shell command. Use for builds, tests, installs, or actions with no dedicated tool. Identical commands are cached; set force=true to bypass.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -218,7 +218,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "str_replace",
-                "description": "Replace text in files (diff channel — for targeted edits, not full rewrites). Supports single replacement, same-file batched `edits`, and multi-file batched `edits` with per-edit `path`. Use exact fields only: single mode uses `path` + `old_str` + `new_str`; batch mode uses top-level `path` + `edits` or `edits[]` entries with their own `path`; do not use aliases such as old/new/original_text/replacements. Use the smallest old_str that uniquely identifies the target — typically 2-4 adjacent lines (≥3 lines preferred when new_str is large). For full-section rewrites or changes >4KB, use `write_file` with the complete file content instead. WARNING: old_str must match exactly (including whitespace); if it matches multiple locations the edit is rejected — add surrounding context lines to disambiguate, or use replace_all=true.",
+                "description": "Targeted text replacement in files. Single mode: path+old_str+new_str. Batch mode: edits[]. Do not use aliases. For large changes (>4KB), use write_file.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -412,22 +412,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "git",
-                "description": "Git operations. Actions: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash, checkout_file, worktree, push.\n\n\
-         ## Diff modes\n\
-         - **Default (no flags)**: worktree vs index — shows UNSTAGED changes only (like `git diff`)\n\
-         - **staged=true**: index vs HEAD — shows `git add`ed changes (like `git diff --staged`)\n\n\
-         ## Status\n\
-         - **Default**: shows `git status --porcelain` (all unstaged + untracked)\n\
-         - **staged=true**: shows staged changes only (like `git diff --staged`)\n\n\
-         ## Push\n\
-         - push requires explicit `remote` and `branch`\n\
-         - `force_with_lease=true` enables `--force-with-lease` (safer than bare --force)\n\
-         - `set_upstream=true` sets upstream tracking (`-u`)\n\n\
-         ## Limits\n\
-         - diff output capped at 40 KB; show output at 16 KB\n\
-         - log / file_history `n` max: 500 (auto-throttled); log_search `n` default 200\n\
-         - commit references and file paths are validated for safety (no shell metacharacters, no path traversal)\n\
-         Use `staged=true` to review changes you have already `git add`ed — the default diff only shows unstaged modifications.",
+                "description": "Git operations: status, diff, log, show, blame, commit, stash, push, and worktree. Pass action as the first parameter.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -556,7 +541,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory",
-                "description": "Memory ops: `remember`(store)/`recall`(search)/`expand`(by id)/`forget`(soft-delete)/`update`(correct); `reflect`(synthesize)/`feedback`(mark quality); `profile`(prefs); `focus`(temp boost). Required: remember→content,recall→query,expand→memory_id,forget/update→reason,feedback→memory_id+signal. `visibility=\"team\"` shares; `agent_type` scopes persona.",
+                "description": "Memory operations: remember, recall, forget, update, reflect, and feedback. Pass action parameter.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -953,9 +938,9 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "name": "tool_search",
                 "description":
                     "Search deferred tools. Use keyword queries to find matches, or \
-                     `query=\"select:NAME\"` / `select:NAME1,NAME2` to fetch full schemas \
-                     for specific deferred tools. After `select:`, invoke the chosen tool \
-                     directly on the next turn.",
+                     `query=\"select:NAME\"` / `select:NAME1,NAME2` to queue selected tools \
+                     for the next request's tools[] and return compact callable shape. Then \
+                     invoke the chosen tool directly.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -994,7 +979,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "ask_user",
-                "description": "Ask the user a structured questionnaire when you need clarification or a decision. In TUI Prompt mode this opens a native tabbed overlay and pauses until the user answers. ALWAYS send a top-level `questions` array; do not send legacy top-level fields like `question` or `choices`. If an ask_user call fails because the payload shape is wrong, fix the questionnaire and retry ask_user immediately — do not continue implementation without the clarification. Prefer 1-6 focused questions in `questions[]`. Each question should have a short header for the tab chip, a clear question, and usually 2-9 options. For a pure freeform question, you may omit options and leave allow_freeform=true. Set multi_select=true when choices are not mutually exclusive. Single-select questions may optionally attach preview text to options; the UI will show a side-by-side preview panel for the focused option. Do not include an Other option because the UI adds freeform input automatically when allow_freeform is true. Put the recommended option first and include '(Recommended)' in its label when applicable. Example: {\"questions\":[{\"header\":\"Scope\",\"question\":\"Which scope should we ship first?\",\"options\":[\"Core flow\",\"Full workflow\"],\"allow_freeform\":true}]}. Use sparingly — only when the next step is genuinely ambiguous.",
+                "description": "Ask the user structured questions when a decision is needed. Supports 1-6 questions, headers, options, multi_select, and allow_freeform. Use for clarifications.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1002,6 +987,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "questions": {
                             "type": "array",
                             "description": "1-6 questions to present in the ask_user questionnaire.",
+                            "minItems": 1,
+                            "maxItems": 6,
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -1028,28 +1015,11 @@ fn all_tool_schemas_core() -> Vec<Value> {
         }),
         // ── Task management (unified tool) ───────────────────────────────
         //
-        // Note on description size (cache-aware):
-        // This tool is pinned (always in the static tool-prefix), so its
-        // description participates in the Anthropic cache breakpoint on
-        // the last pinned tool. Expanding the description costs tokens
-        // only on cache-miss turns (cache_write premium); on steady-state
-        // cache-hit turns the full text is free. Empirically the hit-rate
-        // runs 44–90% in interactive sessions, so a ~450-token expansion
-        // amortises to ~100 effective tokens per turn — materially less
-        // than the cost of the model re-deriving "when to use task" from
-        // a 45-token hint and backtracking.
         json!({
             "type": "function",
             "function": {
                 "name": "task",
-                "description": "Checklist; use proactively for multi-step work, not commands/agents.\n\
-        ## When to Use\n\
-        3+ distinct outcomes/files/phases, approved plans, delegation, or expanding scope.\n\
-        ## When NOT to Use\n\
-        Single edit/command/answer, info, or trivial work.\n\
-        One task per outcome: NOT one umbrella task. Broad work -> 3-7 leaf tasks. Mark first task `in_progress` BEFORE beginning work. Keep exactly ONE task as `in_progress` at a time. Finish `completed`, `failed` + `error_message`, or use `archive` for old history.\n\
-        Field notes: `title` is outcome; `active_form` spinner text; `metadata` null deletes a key; `add_blocks`/`add_blocked_by` work on create/update. `subtasks` create-only; subtask update: `task_id` + `subtask_id` + `new_status` (+ `reason`).\n\
-        <example>Build reimbursements: create backend, API, UI, verify tasks; mark backend in_progress BEFORE beginning work.</example>",
+                "description": "Checklist for multi-step work. Use for 3+ outcomes, files, or phases. Fields: action, title, subtasks, status.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1497,16 +1467,7 @@ mod tests {
     }
 
     #[test]
-    fn task_schema_uses_proactive_imperative_wording() {
-        // The model only auto-decomposes a complex first-turn request
-        // when the task tool's description carries claudecode-style
-        // imperative language: "Use this tool proactively..." plus
-        // worked <example> blocks. Soft "consider using" wording does
-        // not fire reliably on turn 0.
-        //
-        // This test pins the load-bearing phrases so a future "let's
-        // shorten the description" refactor cannot silently regress
-        // the auto-decompose behaviour without tripping the test.
+    fn task_schema_keeps_compact_multi_step_contract() {
         let schemas = all_tool_schemas_with_env(|_| None);
         let task = find_schema(&schemas, "task").expect("task schema must exist");
         let desc = task
@@ -1515,32 +1476,13 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert!(
-            desc.contains("proactively"),
-            "task description must say 'proactively' — soft 'consider' wording does not \
-             trigger turn-0 decomposition. Got: {desc}"
+            desc.len() <= 140,
+            "task description should stay compact in the pinned prefix: {desc}"
         );
         assert!(
-            desc.contains("3 or more distinct steps")
-                || desc.contains("3 or more distinct outcomes")
-                || desc.contains("3+ distinct"),
+            desc.contains("3+ outcomes") && desc.contains("subtasks"),
             "task description must name the explicit '3+ outcomes/steps' threshold so the model has \
              a hard trigger, not a fuzzy heuristic"
-        );
-        assert!(
-            desc.contains("<example>"),
-            "task description must include worked <example> blocks — the model imitates \
-             demonstrated patterns far more reliably than abstract advice"
-        );
-        assert!(
-            desc.contains("BEFORE beginning work") || desc.contains("BEFORE you begin"),
-            "task description must enforce 'mark in_progress BEFORE work' or the spinner \
-             never shows real-time status"
-        );
-        assert!(
-            desc.contains("ONE task as `in_progress`")
-                || desc.contains("one in_progress at a time"),
-            "task description must enforce single-active to prevent the model from \
-             flipping every task to in_progress at once"
         );
     }
 
@@ -1563,26 +1505,41 @@ mod tests {
     }
 
     #[test]
+    fn pinned_high_frequency_descriptions_stay_compact() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        for (name, max_len) in [
+            ("bash", 180usize),
+            ("str_replace", 180),
+            ("git", 140),
+            ("memory", 120),
+            ("ask_user", 180),
+            ("task", 140),
+            ("tool_search", 240),
+        ] {
+            let schema = find_schema(&schemas, name).expect("schema must exist");
+            let desc = schema["function"]["description"].as_str().unwrap_or("");
+            assert!(
+                desc.len() <= max_len,
+                "{name} description regressed to {} chars; max {max_len}: {desc}",
+                desc.len()
+            );
+        }
+    }
+
+    #[test]
     fn task_schema_discourages_single_umbrella_task() {
         let schemas = all_tool_schemas_with_env(|_| None);
         let task = find_schema(&schemas, "task").expect("task schema must exist");
         let desc = task["function"]["description"].as_str().unwrap();
 
-        assert!(
-            desc.contains("umbrella task"),
-            "task schema should explicitly forbid one giant catch-all task: {desc}"
-        );
-        assert!(
-            desc.contains("3-7 leaf tasks") || desc.contains("separate tasks"),
-            "task schema should steer complex work toward multiple actionable tasks: {desc}"
-        );
+        assert!(desc.contains("multi-step work"));
+        assert!(desc.contains("3+ outcomes"));
     }
 
     #[test]
     fn task_schema_exposes_lifecycle_progress_and_dependencies() {
         let schemas = all_tool_schemas_with_env(|_| None);
         let task = find_schema(&schemas, "task").expect("task schema must exist");
-        let desc = task["function"]["description"].as_str().unwrap();
         let properties = &task["function"]["parameters"]["properties"];
         assert_eq!(
             task["function"]["parameters"]["additionalProperties"], false,
@@ -1618,17 +1575,19 @@ mod tests {
                 .contains("Spinner text"),
             "active_form should stay product-facing spinner guidance"
         );
+        let action_enum = properties["action"]["enum"]
+            .as_array()
+            .expect("task action enum");
         assert!(
-            desc.contains("use `archive`")
-                || desc.contains("archive` (single task now")
-                || desc.contains("archive old completed"),
-            "task schema should explicitly teach when to archive finished work: {desc}"
+            action_enum.iter().any(|v| v.as_str() == Some("archive")),
+            "task schema should expose archive as a structured action"
         );
         assert!(
-            desc.contains("`subtasks` create-only")
-                && desc.contains("`task_id` + `subtask_id` + `new_status`")
-                && desc.contains("`subtask_id` + `new_status`"),
-            "task schema should explain that subtasks are create-only and subtask progress uses update fields: {desc}"
+            properties["older_than_days"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Archive completed"),
+            "archive bulk criteria should live on older_than_days, not in the pinned description"
         );
         let subtask_id_desc = properties["subtask_id"]["description"]
             .as_str()
@@ -1784,32 +1743,29 @@ mod tests {
     }
 
     #[test]
-    fn plan_and_task_schemas_use_semantic_guidance_not_lexical_triggers() {
+    fn plan_schema_uses_semantic_guidance_not_lexical_triggers() {
         let schemas = all_tool_schemas_with_env(|_| None);
-        let task = find_schema(&schemas, "task").expect("task schema must exist");
         let enter =
             find_schema(&schemas, "enter_plan_mode").expect("enter_plan_mode schema must exist");
-        let task_desc = task["function"]["description"].as_str().unwrap();
         let plan_desc = enter["function"]["description"].as_str().unwrap();
 
-        for desc in [task_desc, plan_desc] {
-            assert!(
-                desc.contains("## When to Use") && desc.contains("## When NOT to Use"),
-                "tool UX guidance should be semantic and example-driven, not an activation-rule matcher: {desc}"
-            );
-            assert!(
-                !desc.contains("ACTIVATION RULE"),
-                "tool schema must not expose matcher-style activation rules: {desc}"
-            );
-            assert!(
-                !desc.contains("conjunctions like"),
-                "task schema must not teach lexical trigger matching: {desc}"
-            );
-            assert!(
-                !desc.contains("\"what's the best way to\"") && !desc.contains("\"redesign\""),
-                "plan schema must not encode phrase-list triggers: {desc}"
-            );
-        }
+        assert!(
+            plan_desc.contains("## When to Use") && plan_desc.contains("## When NOT to Use"),
+            "plan tool UX guidance should remain semantic and example-driven: {plan_desc}"
+        );
+        assert!(
+            !plan_desc.contains("ACTIVATION RULE"),
+            "plan schema must not expose matcher-style activation rules: {plan_desc}"
+        );
+        assert!(
+            !plan_desc.contains("conjunctions like"),
+            "plan schema must not teach lexical trigger matching: {plan_desc}"
+        );
+        assert!(
+            !plan_desc.contains("\"what's the best way to\"")
+                && !plan_desc.contains("\"redesign\""),
+            "plan schema must not encode phrase-list triggers: {plan_desc}"
+        );
     }
 
     #[test]
@@ -2164,7 +2120,7 @@ mod tests {
             .expect("str_replace schema must include parameters");
 
         assert!(
-            desc.contains("do not use aliases"),
+            desc.contains("Do not use aliases"),
             "str_replace description should steer models away from legacy alias fields: {desc}"
         );
         assert_eq!(

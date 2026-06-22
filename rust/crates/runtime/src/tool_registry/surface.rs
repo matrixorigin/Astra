@@ -8,10 +8,11 @@
 //!   Anthropic/Bedrock prompt cache can hit the whole prefix.
 //! - **T2 deferred** = every other known tool, listed as `name + short_desc`
 //!   in a system-reminder block. The model activates one by calling
-//!   `tool_search(query="select:NAME")` which returns the full schema via a
-//!   tool_result — the tool is never added to `tools[]`.
+//!   `tool_search(query="select:NAME")`. Selecting a deferred tool queues its
+//!   schema for the next request's `tools[]`; the queue is one-shot, so unused
+//!   tools do not become session-long schema tax.
 //!
-//! The default T1 set is the 14-member coding core (see `DEFAULT_PINNED`).
+//! The default T1 set is the 13-member coding core (see `DEFAULT_PINNED`).
 //! Users override via `runtime.tool_surface.pinned_tools` in TOML. A name
 //! prefixed with `-` removes a default (e.g. `"-grep"`).
 //!
@@ -40,8 +41,6 @@ use std::collections::HashSet;
 ///   contradicts that contract.
 /// - `skill`, `tool_search` — the two activation primitives. Needed to
 ///   reach anything in the deferred list.
-/// - `introspect` — runtime diagnostics. Cheap schema, high value when
-///   the model needs to self-check pressure/cache/tool health.
 /// - `task` — session_todos surface. The TUI's task dashboard lights up
 ///   only when the model emits `task.create / update`. Leaving it in
 ///   T2 means the model rarely activates it via `tool_search`, and the
@@ -52,15 +51,14 @@ use std::collections::HashSet;
 ///   in Auto/NonInteractive/Headless turns where no user prompt sink exists.
 ///
 /// Explicitly deferred: `github`, `mo`, `agent`, `web_fetch`,
-/// `lsp`, `notify`, `session`, `symbols`, `powershell`, `run_script`.
-/// Users pin via config as needed.
+/// `introspect`, `lsp`, `notify`, `session`, `symbols`, `powershell`,
+/// `run_script`. Users pin via config as needed.
 pub const DEFAULT_PINNED: &[&str] = &[
     "ask_user",
     "bash",
     "git",
     "glob",
     "grep",
-    "introspect",
     "list_dir",
     "memory",
     "read_file",

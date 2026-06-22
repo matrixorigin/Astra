@@ -1,21 +1,20 @@
-//! P0 end-to-end contract: the deferred activation flow composes correctly
-//! across two turns.
+//! End-to-end contract: the deferred activation flow composes correctly
+//! across two model requests.
 //!
 //! Turn N : LLM sees `<deferred_tools>` listing `github`. Calls
-//!          `tool_search(query="select:github")`. Runtime returns the
-//!          full `github` schema in the tool_result.
-//! Turn N+1: Runtime records the selected name as activated. LLM calls
-//!          `github(action="list_prs", ...)`. `github` is NOT in `tools[]`
-//!          (it's deferred), but validator accepts it via the activated set.
+//!          `tool_search(query="select:github")`. Runtime returns compact
+//!          callable shape and records the selected name.
+//! Turn N+1: Surface assembly consumes that one-shot selection and injects the
+//!          full `github` schema into `tools[]`. The validator admits the tool
+//!          because it is visible in the current request, not because deferred
+//!          activation became a long-lived execution allowlist.
 //!
 //! This test simulates both turns at the public-API level. If either
-//! primitive regresses — `tool_search(select:…)` stops returning a usable
-//! schema, or the validator stops admitting deferred names — this test
-//! fails loudly.
+//! primitive regresses — `tool_search(select:…)` stops returning callable
+//! shape, or the selected schema is not what makes the next turn executable —
+//! this test fails loudly.
 
-use astra_runtime::turn::headless_tool_pipeline::{
-    admissible_tool_names_from_visible, admissible_tool_names_from_visible_and_extras,
-};
+use astra_runtime::turn::headless_tool_pipeline::admissible_tool_names_from_visible;
 use astra_tools::schemas::all_tool_schemas;
 use astra_tools::tool_search::tool_search;
 use astra_turn_core::tool::deferred_activation::activated_tool_names_from_tool_search_output;
@@ -34,10 +33,10 @@ fn pick_schema(schemas: &[Value], name: &str) -> Option<Value> {
 }
 
 #[test]
-fn turn_n_tool_search_select_returns_usable_schema_for_deferred_tool() {
-    // Turn N: LLM asks for the github schema. The full catalog is passed
-    // to `tool_search` (this is what production should do — it's NOT the
-    // per-turn `tools[]`, it's the dispatchable catalog).
+fn turn_n_tool_search_select_returns_callable_shape_for_deferred_tool() {
+    // Turn N: LLM asks for the github schema. Production passes the searchable
+    // surface (visible tools plus currently activatable deferred tools), not a
+    // validator allowlist.
     let schemas = all_tool_schemas();
     let result = tool_search(&schemas, &json!({"query": "select:github"}));
 
@@ -51,19 +50,17 @@ fn turn_n_tool_search_select_returns_usable_schema_for_deferred_tool() {
     let github = &matches[0];
     assert_eq!(github["name"].as_str(), Some("github"));
 
-    // The schema must be usable — parameters must be present so the LLM
-    // can actually invoke it next turn.
+    // The result must be usable recovery guidance — enough shape for the model
+    // to form the next call, without being the authority that admits execution.
     assert!(
         github.get("parameters").is_some(),
-        "select: mode must include full parameters so the next turn can invoke: {github}"
+        "select: mode must include callable parameters so the next turn can invoke: {github}"
     );
 
-    // Description should be the full description, not truncated — the
-    // model explicitly asked for this schema, we owe it the real thing.
     let desc = github["description"].as_str().unwrap_or("");
     assert!(
         !desc.ends_with('…'),
-        "select: mode must not truncate description; got: {desc}"
+        "select: mode must keep a usable description; got: {desc}"
     );
 
     let missing = parsed["missing"].as_array().unwrap();
@@ -71,10 +68,9 @@ fn turn_n_tool_search_select_returns_usable_schema_for_deferred_tool() {
 }
 
 #[test]
-fn turn_n_plus_1_validator_admits_github_even_when_not_in_tools_array() {
-    // Turn N+1: model now calls github. `tools[]` this turn contains only
-    // the pinned set — github is deferred. Without activation, it stays
-    // rejected.
+fn turn_n_plus_1_validator_admits_github_only_after_schema_is_injected() {
+    // Turn N+1 before surface assembly consumes the selection: github is still
+    // absent from tools[], so execution stays rejected.
     let pinned_visible = vec![
         json!({"type": "function", "function": {"name": "bash"}}),
         json!({"type": "function", "function": {"name": "read_file"}}),
@@ -83,11 +79,13 @@ fn turn_n_plus_1_validator_admits_github_even_when_not_in_tools_array() {
     let admitted = admissible_tool_names_from_visible(&pinned_visible);
     assert!(!admitted.contains("github"));
 
-    let admitted =
-        admissible_tool_names_from_visible_and_extras(&pinned_visible, &["github".to_string()]);
+    let schemas = all_tool_schemas();
+    let mut visible_after_activation = pinned_visible;
+    visible_after_activation.push(pick_schema(&schemas, "github").unwrap());
+    let admitted = admissible_tool_names_from_visible(&visible_after_activation);
     assert!(
         admitted.contains("github"),
-        "validator must admit github only after deferred activation; got {admitted:?}"
+        "validator must admit github only after its schema is visible; got {admitted:?}"
     );
     // And the visible tools remain admitted.
     assert!(admitted.contains("bash"));
@@ -96,8 +94,8 @@ fn turn_n_plus_1_validator_admits_github_even_when_not_in_tools_array() {
 
 #[test]
 fn two_turn_flow_composes_end_to_end() {
-    // The combined assertion: turn N produces a schema the model can
-    // invoke, and turn N+1's validator accepts the invocation.
+    // The combined assertion: turn N selects a deferred tool, turn N+1 injects
+    // its schema, and the following turn without use does not retain it.
     let schemas = all_tool_schemas();
 
     // Turn N — ask for web_fetch schema.
@@ -111,7 +109,7 @@ fn two_turn_flow_composes_end_to_end() {
     let activated = activated_tool_names_from_tool_search_output(&t1);
     assert_eq!(activated, vec!["web_fetch".to_string()]);
 
-    // Turn N+1 — validator check. `tools[]` has pinned only, NOT web_fetch.
+    // Turn N+1 before injection: `tools[]` has pinned only, NOT web_fetch.
     let pinned_visible = vec![
         pick_schema(&schemas, "bash").unwrap(),
         pick_schema(&schemas, "read_file").unwrap(),
@@ -119,10 +117,20 @@ fn two_turn_flow_composes_end_to_end() {
     let admitted = admissible_tool_names_from_visible(&pinned_visible);
     assert!(!admitted.contains("web_fetch"));
 
-    let admitted = admissible_tool_names_from_visible_and_extras(&pinned_visible, &activated);
+    let mut injected_visible = pinned_visible.clone();
+    for name in &activated {
+        injected_visible.push(pick_schema(&schemas, name).unwrap());
+    }
+    let admitted = admissible_tool_names_from_visible(&injected_visible);
     assert!(
         admitted.contains("web_fetch"),
-        "turn N+1: web_fetch must be admissible after activation"
+        "turn N+1: web_fetch must be admissible after its schema is injected"
+    );
+
+    let followup_without_invocation = admissible_tool_names_from_visible(&pinned_visible);
+    assert!(
+        !followup_without_invocation.contains("web_fetch"),
+        "unused one-shot activation must not make web_fetch executable forever"
     );
 }
 

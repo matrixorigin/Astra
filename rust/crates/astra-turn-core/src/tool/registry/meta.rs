@@ -334,7 +334,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "状态",
             "健康度",
         ],
-        pinned: true,
+        pinned: false,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -343,8 +343,8 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
     },
     ToolMeta {
         name: "tool_search",
-        description: "Search and activate deferred tools. `select:NAME` returns the full schema \
-             for a deferred tool so the LLM can invoke it on the next turn.",
+        description: "Search and activate deferred tools. `select:NAME` queues the tool schema \
+             for the next request and returns compact callable shape.",
         triggers: &[
             "tool_search",
             "find tool",

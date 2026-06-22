@@ -625,6 +625,39 @@ impl ServerToolExecutor {
         retained
     }
 
+    /// Consume activated deferred tools for the next schema-selection round.
+    ///
+    /// Activation queues a tool to become visible in the next `tools[]`
+    /// payload. After consumption, current visible schemas are authoritative;
+    /// this side set must not become a long-lived execution allowlist.
+    pub fn take_activated_deferred_tool_names(&self) -> Vec<String> {
+        let visible = rwlock_read_clone_or_default(
+            &self.current_visible_tool_names,
+            "current_visible_tool_names_activation_take",
+        );
+        let activatable = rwlock_read_clone_or_default(
+            &self.current_activatable_tool_names,
+            "current_activatable_tool_names_activation_take",
+        );
+        if visible.is_none() && activatable.is_none() {
+            return Vec::new();
+        }
+
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.activated_deferred_tools,
+            "activated_deferred_tools_take",
+        );
+        let retained =
+            astra_turn_core::tool::deferred_activation::retained_runtime_bound_activated_deferred_tool_names(
+                &guard,
+                visible.as_ref(),
+                activatable.as_ref(),
+                |name| self.tool_has_runtime_binding(name),
+            );
+        guard.clear();
+        retained
+    }
+
     fn record_tool_search_activation_output(&self, output: &str) {
         // Gate activation recording against the activatable set (deferred
         // manifest), not the searchable set (visible). The model was told it
@@ -4353,7 +4386,7 @@ esac
     }
 
     #[tokio::test]
-    async fn server_activated_deferred_tool_stays_active_when_next_surface_makes_it_visible() {
+    async fn server_activated_deferred_tool_is_consumed_when_next_surface_makes_it_visible() {
         let (exec, _dir) = test_executor();
         exec.set_current_visible_tool_schemas(&[
             json!({"type": "function", "function": {"name": "bash"}}),
@@ -4379,9 +4412,14 @@ esac
         exec.set_current_activatable_tool_names(HashSet::new());
 
         assert_eq!(
-            exec.activated_deferred_tool_names(),
+            exec.take_activated_deferred_tool_names(),
             vec!["github".to_string()],
-            "activation must survive the visible/deferred partition flip after the selected tool is injected"
+            "schema assembly should consume the selected deferred tool exactly once"
+        );
+        assert_eq!(
+            exec.activated_deferred_tool_names(),
+            Vec::<String>::new(),
+            "consumed activation must not remain as session-long state"
         );
     }
 

@@ -75,12 +75,12 @@ mod tests {
 
     #[test]
     fn catalog_pinned_count_matches_runtime_default_catalog_core() {
-        assert_eq!(ToolRegistry::pinned_count(), 12);
+        assert_eq!(ToolRegistry::pinned_count(), 11);
     }
 
     #[test]
     fn catalog_dynamic_count_matches_unpinned_tools() {
-        assert_eq!(ToolRegistry::dynamic_count(), 22);
+        assert_eq!(ToolRegistry::dynamic_count(), 23);
     }
 
     #[test]
@@ -112,7 +112,9 @@ mod tests {
             "consolidated git tool must be pinned — git ops appear in most coding turns"
         );
         assert!(
-            !pinned.contains(&"web_fetch") && !pinned.contains(&"session"),
+            !pinned.contains(&"web_fetch")
+                && !pinned.contains(&"session")
+                && !pinned.contains(&"introspect"),
             "runtime-deferred tools must not stay catalog-pinned"
         );
     }
@@ -280,17 +282,17 @@ mod tests {
     // ── Budget gate ──
 
     #[test]
-    fn budget_always_includes_pinned() {
+    fn non_conversational_zero_budget_includes_pinned() {
         let registry = ToolRegistry::new(mock_schemas());
-        let result = registry.select_with_budget("你好", 1, 0);
+        let result = registry.select_with_budget("inspect the repository files", 1, 0);
         let names = ToolRegistry::selected_names(&result);
         assert!(
             names.contains(&"bash".to_string()),
-            "bash must always be included"
+            "non-conversational zero-budget query must still include pinned bash"
         );
         assert!(
             names.contains(&"read_file".to_string()),
-            "read_file must always be included"
+            "non-conversational zero-budget query must still include pinned read_file"
         );
         assert_eq!(names.len(), ToolRegistry::pinned_count());
     }
@@ -352,14 +354,14 @@ mod tests {
     }
 
     #[test]
-    fn registry_select_conversational_only_pinned() {
+    fn registry_select_conversational_uses_no_tools() {
         let registry = ToolRegistry::new(mock_schemas());
         let selected = registry.select("你好", 1);
         let names = ToolRegistry::selected_names(&selected);
         assert_eq!(
             names.len(),
-            ToolRegistry::pinned_count(),
-            "conversational query should only have pinned tools, got: {:?}",
+            0,
+            "pure conversational query should not spend schema tokens, got: {:?}",
             names
         );
     }
@@ -610,7 +612,7 @@ mod tests {
             report.budget_used, 0,
             "conversational query should use 0 budget"
         );
-        assert_eq!(report.selected_count as usize, ToolRegistry::pinned_count());
+        assert_eq!(report.selected_count, 0);
     }
 
     // ── Selection feedback ──

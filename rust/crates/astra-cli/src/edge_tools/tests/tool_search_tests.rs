@@ -103,7 +103,7 @@ async fn select_resolves_only_current_visible_tools_with_full_schema() {
     assert_eq!(parsed["total_tools"].as_u64(), Some(2));
     assert!(
         parsed["matches"][0].get("parameters").is_some(),
-        "select mode must return the full callable schema: {parsed}"
+        "select mode must return callable parameter shape: {parsed}"
     );
 }
 
@@ -168,7 +168,7 @@ async fn selecting_visible_tool_does_not_record_deferred_activation() {
 }
 
 #[tokio::test]
-async fn activated_deferred_tool_stays_active_when_next_surface_makes_it_visible() {
+async fn activated_deferred_tool_is_consumed_when_next_surface_makes_it_visible() {
     let executor = executor();
     set_visible(&executor, &["bash", "tool_search"]);
     executor.set_current_activatable_tool_names(HashSet::from(["web_fetch".to_string()]));
@@ -184,9 +184,22 @@ async fn activated_deferred_tool_stays_active_when_next_surface_makes_it_visible
     executor.set_current_activatable_tool_names(HashSet::new());
 
     assert_eq!(
-        executor.activated_deferred_tool_names(),
+        executor.take_activated_deferred_tool_names(),
         strings(&["web_fetch"]),
-        "activation must survive the visible/deferred partition flip after the selected tool is injected"
+        "schema assembly should consume the selected deferred tool exactly once"
+    );
+    assert_eq!(
+        executor.activated_deferred_tool_names(),
+        Vec::<String>::new()
+    );
+
+    set_visible(&executor, &["bash", "tool_search", "web_fetch"]);
+    executor.set_current_activatable_tool_names(HashSet::new());
+
+    assert_eq!(
+        executor.activated_deferred_tool_names(),
+        Vec::<String>::new(),
+        "consumed activation must not become session-long state after the tool is visible"
     );
 }
 

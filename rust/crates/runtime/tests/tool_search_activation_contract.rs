@@ -1,15 +1,16 @@
-//! Phase-4 contract tests: `tool_search` as a first-class pinned tool,
-//! and a validator primitive that admits activated deferred tool calls.
+//! Tool-surface contract tests: `tool_search` is the first-class pinned
+//! activation primitive, while selected deferred tools are queued for the next
+//! request's `tools[]` instead of becoming long-lived validator state.
 //!
 //! Pre-phase-4 state:
 //!   - `tool_search` was hidden inside the `session` meta-tool's `action`
 //!     enum, so the LLM had to call `session(action="tool_search", …)`.
 //!     Hoisting it to a top-level pinned tool gives the deferred
 //!     activation flow an unambiguous entry point.
-//!   - The headless pipeline rejected any tool call whose name wasn't in
-//!     `valid_tool_names`, which is synced from the *visible* `tools[]`.
-//!     The fixed contract admits visible tools plus names explicitly
-//!     activated by `tool_search(select:NAME)`.
+//!   - Some paths treated an activated deferred name as an execution allowlist.
+//!     The fixed contract makes activation a one-shot input to surface
+//!     assembly; execution still depends on the current request's visible
+//!     schema set or an explicit transport/plugin grant.
 //!
 //! `introspect` stays in the catalog — it exposes runtime diagnostics
 //! (token pressure, cache hit rate, tool health, volatile injections,
@@ -87,47 +88,53 @@ fn tool_search_schema_advertises_select_mode() {
 //
 // `introspect` surfaces runtime diagnostics (pressure, cache, health,
 // volatile injections, stall state). `session` does not cover those, so
-// `introspect` is kept as an independent capability.
+// `introspect` remains available, but diagnostic-only usage is deferred by
+// default to keep common turns lean.
 
 #[test]
-fn introspect_still_available_alongside_tool_search() {
+fn introspect_is_available_but_deferred_by_default() {
+    let introspect = TOOL_CATALOG
+        .iter()
+        .find(|t| t.name == "introspect")
+        .expect("introspect must remain in TOOL_CATALOG");
     assert!(
-        TOOL_CATALOG.iter().any(|t| t.name == "introspect"),
-        "introspect must remain in TOOL_CATALOG — it exposes diagnostics session does not"
+        !introspect.pinned,
+        "introspect is diagnostic-only and should not be in every turn's pinned tool prefix"
     );
     let names = schema_names(&all_tool_schemas());
     assert!(
         names.contains(&"introspect".to_string()),
         "introspect schema must still be emitted"
     );
-    // Both live side-by-side.
+    // Both live side-by-side so tool_search can activate diagnostics on demand.
     assert!(names.contains(&"tool_search".to_string()));
 }
 
-// ── 3. Validator admits activated deferred names ────────────────────────────
+// ── 3. Validator extras are explicit grants, not deferred state ─────────────
 //
 // The validator logic lives in runtime/turn/headless_tool_pipeline/policy.rs
-// and gates on `valid_tool_names`. We assert the helper that computes the
-// "admissible set" includes visible names plus explicitly activated names,
-// not the whole catalog.
+// and gates on `valid_tool_names`. The helper may include caller-supplied
+// extras for runtime/plugin transports, but deferred-tool activation should be
+// consumed earlier by surface assembly so the selected schema becomes visible.
 
 #[test]
-fn admissible_tool_names_includes_activated_beyond_visible_tools() {
+fn admissible_tool_names_includes_explicit_runtime_extras_beyond_visible_tools() {
     use astra_runtime::turn::headless_tool_pipeline::admissible_tool_names;
 
     let visible: std::collections::HashSet<String> =
         ["bash".into(), "read_file".into()].into_iter().collect();
-    let activated: std::collections::HashSet<String> = ["web_fetch".into()].into_iter().collect();
+    let extras: std::collections::HashSet<String> = ["mcp__weather".into()].into_iter().collect();
 
-    let admitted = admissible_tool_names(&visible, &activated);
+    let admitted = admissible_tool_names(&visible, &extras);
 
     // Visible names are admitted unconditionally.
     assert!(admitted.contains("bash"));
     assert!(admitted.contains("read_file"));
-    // A selected deferred tool is admitted after explicit activation.
+    // Caller-supplied extras are admitted only when a concrete transport path
+    // has granted them.
     assert!(
-        admitted.contains("web_fetch"),
-        "activated deferred tools must be admitted: got {admitted:?}"
+        admitted.contains("mcp__weather"),
+        "explicit runtime extras must be admitted: got {admitted:?}"
     );
 }
 

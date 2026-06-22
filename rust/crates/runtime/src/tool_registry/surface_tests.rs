@@ -91,7 +91,7 @@ fn catalog_pinned_metadata_matches_runtime_default_surface_for_catalog_tools() {
     );
 }
 
-/// The default pinned set is the 14-member core.
+/// The default pinned set is the 13-member core.
 /// See `DEFAULT_PINNED` comment for rationale per-entry.
 #[test]
 fn pinned_default_members_are_the_core_set() {
@@ -109,8 +109,7 @@ fn pinned_default_members_are_the_core_set() {
         "grep",
         "glob",
         "list_dir",
-        "memory",     // intrinsic per TOOL_CATALOG comment
-        "introspect", // runtime diagnostics
+        "memory", // intrinsic per TOOL_CATALOG comment
         "tool_search",
         "skill",
         "task", // session_todos surface — TUI dashboard depends on it
@@ -130,6 +129,10 @@ fn pinned_default_members_are_the_core_set() {
         "exactly {} default pinned, got {}: {pinned_names:?}",
         expected.len(),
         pinned_names.len()
+    );
+    assert!(
+        !pinned_names.iter().any(|n| n == "introspect"),
+        "introspect is diagnostic-only and must remain deferred by default"
     );
 }
 

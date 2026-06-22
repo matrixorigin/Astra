@@ -538,10 +538,11 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                 ctx.all_schemas,
             );
         }
-        // Keep already-activated deferred tools visible for the remainder of
-        // the turn, preventing schema add→remove→add thrashing that breaks
-        // prompt caching.
-        let activated = ctx.executor.activated_deferred_tool_names();
+        // Make newly activated deferred tools visible exactly once. If the
+        // model actually invokes the tool, invoked-tool pinning keeps it
+        // visible on follow-up rounds; otherwise it does not become a
+        // session-long schema tax.
+        let activated = ctx.executor.take_activated_deferred_tool_names();
         if !activated.is_empty() {
             let refs: Vec<&str> = activated.iter().map(String::as_str).collect();
             astra_turn_core::tool_schema_prune::inject_required_tool_names(
@@ -564,16 +565,23 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             );
         }
     }
-    // Always inject session-control tools regardless of current mode.
-    // Toggling them on/off causes schema changes that break prompt caching
-    // on every transition. They're tiny (< 200 tokens combined) and harmless
-    // when not actively used.
-    astra_turn_core::tool_schema_prune::inject_required_tool_names(
-        &mut turn_schemas,
-        &mut selection_report,
-        CACHE_STABLE_SESSION_TOOLS,
-        ctx.all_schemas,
-    );
+    let no_tool_conversational_turn = turn_schemas.is_empty()
+        && selection_report.tools_selected.is_empty()
+        && selection_report.dynamic_tools_selected.is_empty()
+        && ctx.recent_tools.is_empty()
+        && ctx.tool_results.is_empty()
+        && !ctx.plan_mode_active;
+    if !no_tool_conversational_turn {
+        // Keep session-control tools stable once a turn needs tools. Pure
+        // conversational turns intentionally stay tool-free; spending full
+        // schemas on "hi" is worse UX than a cache-stable but bloated prefix.
+        astra_turn_core::tool_schema_prune::inject_required_tool_names(
+            &mut turn_schemas,
+            &mut selection_report,
+            CACHE_STABLE_SESSION_TOOLS,
+            ctx.all_schemas,
+        );
+    }
 
     turn_schemas = ctx.executor.runtime_bound_tool_schemas(turn_schemas);
     let runtime_bound_turn_names =
@@ -636,7 +644,10 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         &[],
         &final_visible_tool_names,
     );
-    if let Some(manifest) = tool_surface.deferred_manifest(requested_model) {
+    if !final_visible_tool_names.is_empty()
+        && final_visible_tool_names.contains("tool_search")
+        && let Some(manifest) = tool_surface.deferred_manifest(requested_model)
+    {
         let activatable_tool_names: HashSet<String> = manifest.names.iter().cloned().collect();
         ctx.executor
             .set_current_activatable_tool_names(activatable_tool_names);
@@ -1366,7 +1377,9 @@ mod tests {
     };
     use astra_runtime::turn::agentic_loop::host::{ASK_USER_TOOL_NAME, TurnInteractionMode};
     use astra_turn_core::chat_history_openai::merge_skill_names_track;
-    use astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES;
+    use astra_turn_core::chat_turn_edge_profile::{
+        EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT,
+    };
     use serde_json::{Value, json};
 
     fn schema(name: &str) -> serde_json::Value {
@@ -1945,6 +1958,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_chat_turn_payload_for_plain_hi_is_tool_free() {
+        use crate::edge_tools::ToolExecutor;
+        use astra_pipeline::step_recorder::StepRecorder;
+        use astra_runtime::{
+            tool_registry::ToolRegistry,
+            turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
+        };
+        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use std::{collections::HashSet, sync::Arc, time::Instant};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let all_schemas = astra_tools::schemas::all_tool_schemas();
+        let registry = ToolRegistry::new(all_schemas.clone());
+        let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
+        let messages = vec![json!({"role": "user", "content": "hi"})];
+        let tool_results = Vec::new();
+        let history: Vec<(String, String)> = Vec::new();
+        let recent_tools: Vec<String> = Vec::new();
+        let file_context: Vec<String> = Vec::new();
+        let mut restricted_tools = HashSet::new();
+        let mut valid_tool_names = HashSet::new();
+        let mut widen_selection_pending = false;
+        let mut step_recorder = StepRecorder::new("session-hi", "task-hi");
+        let turn_guard = TurnGuard::default();
+        let skill_search = astra_core::SkillSearchSettings::default();
+        let mut turn_policy = TurnInteractionPolicy::default();
+        let mut first_memoria_ms = None;
+        let mut first_selection_report = None;
+        let mut first_budget_pressure = 0.0;
+        let mut first_context_assembly_ms = None;
+        let mut all_selected_skills = Vec::new();
+
+        let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            messages: &messages,
+            runtime_volatile_texts: &[],
+            ephemeral_prefix: None,
+            current_session_id: Some("session-hi"),
+            model: None,
+            explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
+            project_root: temp_dir.path(),
+            message: "hi",
+            semantic_query_override: None,
+            history: &history,
+            recent_tools: &recent_tools,
+            executor: Arc::clone(&executor),
+            registry: &registry,
+            tool_results: &tool_results,
+            all_schemas: &all_schemas,
+            valid_tool_names: &mut valid_tool_names,
+            turn_guard: &turn_guard,
+            restricted_tools: &mut restricted_tools,
+            widen_selection_pending: &mut widen_selection_pending,
+            step_recorder: &mut step_recorder,
+            file_context: &file_context,
+            assembly_start: Instant::now(),
+            telem: PrepareTurnTelemetry {
+                first_memoria_ms: &mut first_memoria_ms,
+                first_selection_report: &mut first_selection_report,
+                first_budget_pressure: &mut first_budget_pressure,
+                first_context_assembly_ms: &mut first_context_assembly_ms,
+                all_selected_skills: &mut all_selected_skills,
+                initial_skill_selector_shortlist: None,
+                trace_collector: None,
+            },
+            skill_search: &skill_search,
+            is_plan_subtask: false,
+            plan_subtask_id: None,
+            timing_phases: false,
+            prep_ui_phase: None,
+            skill_effort: None,
+            skill_agent_type: None,
+            tool_budget_override: None,
+            interaction_mode: TurnInteractionMode::Auto,
+            turn_policy: &mut turn_policy,
+            skill_allowed_tools: None,
+            previous_confidence_fallback: None,
+            round_index: 0,
+            session_turn: 1,
+            turn_chain_id: None,
+            user_query_event_id: None,
+            denial_pressure: (0, 0),
+            recent_rejections: Vec::new(),
+            observability_hub: None,
+            append_system_prompt: None,
+            plan_mode_active: false,
+        })
+        .await;
+
+        let edge_tools = payload["edge_tools"].as_array().unwrap();
+        assert!(
+            edge_tools.is_empty(),
+            "plain greeting must not include full tool schemas: {:?}",
+            edge_tools
+                .iter()
+                .filter_map(|schema| schema["function"]["name"].as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            payload["edge_profile"]
+                .get(EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT)
+                .is_none(),
+            "plain greeting must not advertise deferred tools when tool_search is not visible"
+        );
+        assert!(
+            valid_tool_names.is_empty(),
+            "executor admission must mirror the tool-free payload"
+        );
+        assert_eq!(
+            first_selection_report
+                .as_ref()
+                .map(|report| report.selected_count),
+            Some(0),
+            "selection telemetry must reflect the final no-tool surface"
+        );
+    }
+
+    #[tokio::test]
     async fn prepare_chat_turn_payload_injects_background_controls_when_bash_selected() {
         use crate::edge_tools::ToolExecutor;
         use astra_pipeline::step_recorder::StepRecorder;
@@ -2325,7 +2455,7 @@ mod tests {
         assert_eq!(search_match_names, vec!["memory"]);
         assert!(
             search_json["matches"][0].get("parameters").is_some(),
-            "tool_search select must return the full callable schema: {search_json}"
+            "tool_search select must return callable parameter shape: {search_json}"
         );
         assert_eq!(
             executor.activated_deferred_tool_names(),
@@ -2421,8 +2551,8 @@ mod tests {
         assert_eq!(valid_tool_names, edge_tool_names);
         assert_eq!(
             executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()],
-            "activated tool must remain active after the payload makes it visible and removes it from the deferred manifest"
+            Vec::<String>::new(),
+            "payload assembly must consume one-shot activation after making the schema visible"
         );
     }
 
@@ -2548,7 +2678,8 @@ mod tests {
         let registry = ToolRegistry::new(all_schemas.clone()).with_budget(1);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
 
-        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let messages =
+            vec![json!({"role": "user", "content": "delegate review with parallel agents"})];
         let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
@@ -2574,7 +2705,7 @@ mod tests {
             model: None,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
-            message: "hello",
+            message: "delegate review with parallel agents",
             semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,

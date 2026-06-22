@@ -1,6 +1,6 @@
-//! Deferred execution contract: the validator admits visible tools plus
-//! explicitly activated/injected names. The full catalog is discovery data,
-//! not an execution allowlist.
+//! Execution-surface contract: the validator admits visible tools plus
+//! explicit runtime/plugin grants. The full catalog and deferred manifest are
+//! discovery data, not an execution allowlist.
 
 use astra_runtime::turn::headless_tool_pipeline::{
     admissible_tool_names_from_visible, admissible_tool_names_from_visible_and_extras,
@@ -77,6 +77,8 @@ fn empty_visible_admits_only_explicit_extras() {
     let admitted = admissible_tool_names_from_visible(&[]);
     assert!(admitted.is_empty());
 
-    let admitted = admissible_tool_names_from_visible_and_extras(&[], &["github".to_string()]);
-    assert!(admitted.contains("github"));
+    let admitted =
+        admissible_tool_names_from_visible_and_extras(&[], &["mcp__weather".to_string()]);
+    assert!(admitted.contains("mcp__weather"));
+    assert!(!admitted.contains("github"));
 }

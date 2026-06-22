@@ -1282,15 +1282,55 @@ impl ToolExecutor {
         if visible.is_none() && activatable.is_none() {
             return Vec::new();
         }
-        match self.activated_deferred_tools.read() {
-            Ok(guard) => astra_turn_core::tool::deferred_activation::retained_runtime_bound_activated_deferred_tool_names(
-                    &guard,
-                    visible.as_ref(),
-                    activatable.as_ref(),
-                    |name| self.tool_has_runtime_binding(name),
-                ),
-            Err(_) => Vec::new(),
+
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.activated_deferred_tools,
+            "activated_deferred_tools_prune",
+        );
+        let retained =
+            astra_turn_core::tool::deferred_activation::retained_runtime_bound_activated_deferred_tool_names(
+                &guard,
+                visible.as_ref(),
+                activatable.as_ref(),
+                |name| self.tool_has_runtime_binding(name),
+            );
+        if retained.len() < guard.len() {
+            *guard = retained.iter().cloned().collect();
         }
+        retained
+    }
+
+    /// Consume activated deferred tools for the next schema-selection round.
+    ///
+    /// Activation is a one-shot request to make the tool visible in the next
+    /// `tools[]` payload. Once the payload builder consumes it, execution is
+    /// governed by the visible schema surface, not by this side set.
+    pub fn take_activated_deferred_tool_names(&self) -> Vec<String> {
+        let visible = rwlock_read_clone_or_default(
+            &self.current_visible_tool_names,
+            "current_visible_tool_names_activation_take",
+        );
+        let activatable = rwlock_read_clone_or_default(
+            &self.current_activatable_tool_names,
+            "current_activatable_tool_names_activation_take",
+        );
+        if visible.is_none() && activatable.is_none() {
+            return Vec::new();
+        }
+
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.activated_deferred_tools,
+            "activated_deferred_tools_take",
+        );
+        let retained =
+            astra_turn_core::tool::deferred_activation::retained_runtime_bound_activated_deferred_tool_names(
+                &guard,
+                visible.as_ref(),
+                activatable.as_ref(),
+                |name| self.tool_has_runtime_binding(name),
+            );
+        guard.clear();
+        retained
     }
 
     /// Set the spawn context for agent spawning.
@@ -1626,27 +1666,9 @@ impl ToolExecutor {
             &self.current_activatable_tool_names,
             "current_activatable_tool_names_admission",
         );
-        let activated_contains = rwlock_check_contains_or_default(
-            &self.activated_deferred_tools,
-            "activated_deferred_tools_admission",
-            |names: &HashSet<String>| names.contains(name),
-        );
-        // Binding already passed in Phase 1, so the only remaining question
-        // is admission-set membership. A poisoned activated set is
-        // conservatively treated as "not activated": the worst outcome is a
-        // spuriously denied deferred tool (recoverable via re-activation),
-        // never an executor-less tool admitted to run.
-        let is_activated = activated_contains.unwrap_or(false);
         let can_select = activatable
             .as_ref()
             .is_some_and(|allowed| allowed.contains(name));
-        if is_activated
-            && activatable
-                .as_ref()
-                .is_none_or(|allowed| allowed.contains(name))
-        {
-            return None;
-        }
         use astra_turn_core::tool::deferred_activation::{
             DirectDeferredCallAdmission, classify_direct_deferred_call,
             direct_deferred_call_activated_message, tool_not_admitted_message,
@@ -6580,8 +6602,74 @@ mod tests {
 
         let after = executor.execute("memory", &serde_json::json!({})).await;
         assert!(
-            !after.contains("not available in this turn") && after.contains("missing required"),
-            "activated deferred tool must reach real executor path; got: {after}"
+            after.contains("called directly")
+                && after.contains("select:memory")
+                && after.contains("not executed"),
+            "activation state alone must not bypass current tools[] visibility; got: {after}"
+        );
+        assert_eq!(
+            executor.take_activated_deferred_tool_names(),
+            vec!["memory".to_string()],
+            "schema assembly should consume the selected deferred tool exactly once"
+        );
+        assert_eq!(
+            executor.activated_deferred_tool_names(),
+            Vec::<String>::new()
+        );
+
+        executor.set_current_visible_tool_schemas(&[
+            serde_json::json!({"type": "function", "function": {"name": "bash"}}),
+            serde_json::json!({"type": "function", "function": {"name": "tool_search"}}),
+            serde_json::json!({"type": "function", "function": {"name": "memory"}}),
+        ]);
+        executor.set_current_activatable_tool_names(HashSet::new());
+        let injected = executor.execute("memory", &serde_json::json!({})).await;
+        assert!(
+            injected.contains("missing required"),
+            "visible schema must allow the real executor path; got: {injected}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_direct_deferred_activation_cannot_execute_after_manifest_disappears() {
+        let executor = test_executor();
+        executor.set_current_visible_tool_schemas(&[
+            serde_json::json!({"type": "function", "function": {"name": "bash"}}),
+            serde_json::json!({"type": "function", "function": {"name": "tool_search"}}),
+        ]);
+        executor.set_current_activatable_tool_names(HashSet::from(["memory".to_string()]));
+
+        let activation = executor
+            .execute(
+                "memory",
+                &serde_json::json!({"action": "remember", "content": "stale"}),
+            )
+            .await;
+        assert!(
+            activation.contains("not executed"),
+            "direct call must only activate, got: {activation}"
+        );
+        assert_eq!(
+            executor.activated_deferred_tool_names(),
+            vec!["memory".to_string()]
+        );
+
+        executor.set_current_visible_tool_schemas(&[
+            serde_json::json!({"type": "function", "function": {"name": "bash"}}),
+            serde_json::json!({"type": "function", "function": {"name": "tool_search"}}),
+        ]);
+        executor.set_current_activatable_tool_names(HashSet::new());
+
+        assert_eq!(
+            executor.activated_deferred_tool_names(),
+            Vec::<String>::new(),
+            "stale activation must be pruned once the tool is neither visible nor activatable"
+        );
+        let denied = executor.execute("memory", &serde_json::json!({})).await;
+        assert!(
+            denied.contains("not available in this turn")
+                && denied.contains("visible in this turn's `tools[]`"),
+            "stale activation must not bypass the current surface; got: {denied}"
         );
     }
 

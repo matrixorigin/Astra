@@ -254,6 +254,17 @@ pub fn tool_not_admitted_message(name: &str, deferred_select_allowed: bool) -> S
     }
 }
 
+#[must_use]
+pub fn deferred_tool_not_activatable_message(name: &str) -> String {
+    format!(
+        "Error: Tool '{name}' is listed in this turn's `<deferred_tools>`, \
+         but it is not activatable in the current runtime surface. Do not \
+         retry `{name}` or `tool_search(query=\"select:{name}\")` in this \
+         turn; use visible tools or explain that the deferred capability is \
+         currently unavailable."
+    )
+}
+
 /// Outcome of a direct call to a tool name that is not in the visible
 /// `tools[]` surface but may be advertised in `<deferred_tools>`.
 ///
@@ -261,14 +272,16 @@ pub fn tool_not_admitted_message(name: &str, deferred_select_allowed: bool) -> S
 /// not an executable request. The model has not seen the tool's full schema, so
 /// the supplied arguments cannot be trusted. When the name is advertised in
 /// `<deferred_tools>` and the runtime can execute it, we record the activation
-/// and ask the model to retry next turn once the schema is visible — mirroring
-/// Claude Code's `defer_loading` / `tool_reference` contract locally.
+/// and ask the model to retry on the next model request once the schema is
+/// visible — mirroring Claude Code's `defer_loading` / `tool_reference`
+/// contract locally.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirectDeferredCallAdmission {
     /// The name is in the deferred manifest AND has a runtime binding. Treat
     /// the direct call as an activation intent: record the name so the next
-    /// turn's `tools[]` includes the full schema, then ask the model to retry
-    /// with the schema's exact fields. Do NOT execute the supplied args.
+    /// model request's `tools[]` includes the full schema, then ask the model
+    /// to retry with the schema's exact fields. Do NOT execute the supplied
+    /// args.
     Activate { name: String },
     /// The name is in the deferred manifest but has no runtime binding on this
     /// runtime. Cannot activate; the not-admitted hint lets the model
@@ -310,10 +323,11 @@ pub fn direct_deferred_call_activated_message(name: &str) -> String {
     format!(
         "Tool '{name}' was called directly, but its full schema has not been \
          loaded yet. This call has been treated as a `select:{name}` intent — \
-         the next turn will include the complete schema in `tools[]`. Do NOT \
-         repeat this call with guessed arguments. On the next turn, call \
-         `{name}` again using the schema's exact fields. The arguments from \
-         this attempt were not executed because the schema was not visible."
+         the next model request in this turn will include the complete schema \
+         in `tools[]`. Do NOT repeat this call with guessed arguments. When \
+         `{name}` appears in `tools[]`, call it again using the schema's exact \
+         fields. The arguments from this attempt were not executed because the \
+         schema was not visible."
     )
 }
 
@@ -575,8 +589,21 @@ mod tests {
             "message must state the args were not executed"
         );
         assert!(
-            msg.contains("next turn"),
-            "message must point to the next turn for the full schema"
+            msg.contains("next model request in this turn"),
+            "message must point to the next model request for the full schema"
+        );
+    }
+
+    #[test]
+    fn deferred_tool_not_activatable_message_avoids_search_retry_loop() {
+        let msg = deferred_tool_not_activatable_message("github");
+
+        assert!(msg.contains("<deferred_tools>"), "{msg}");
+        assert!(msg.contains("not activatable"), "{msg}");
+        assert!(msg.contains("Do not retry"), "{msg}");
+        assert!(
+            msg.contains("tool_search(query=\"select:github\")"),
+            "{msg}"
         );
     }
 
