@@ -15,19 +15,14 @@ use serde_json::Value;
 /// `Installed { visible: ∅, activatable: ∅ }` is different: the runtime
 /// deliberately sent a no-tool turn. That turn must not discard previously
 /// activated deferred tools, because no schema-injection opportunity occurred.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ToolSurfaceNames {
+    #[default]
     Uninstalled,
     Installed {
         visible: HashSet<String>,
         activatable: HashSet<String>,
     },
-}
-
-impl Default for ToolSurfaceNames {
-    fn default() -> Self {
-        Self::Uninstalled
-    }
 }
 
 impl ToolSurfaceNames {
