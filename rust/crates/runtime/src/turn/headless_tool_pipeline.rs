@@ -69,8 +69,7 @@ pub fn admissible_tool_names_from_visible_and_extras_strict(
     visible_schemas: &[serde_json::Value],
     extras: &[String],
 ) -> HashSet<String> {
-    let mut out =
-        astra_turn_core::tool::deferred_activation::tool_names_from_schemas(visible_schemas);
+    let mut out = astra_turn_core::tool::schema::tool_names_from_schemas(visible_schemas);
     out.extend(extras.iter().cloned());
     out
 }

@@ -80,7 +80,7 @@ fn render_spawn_agent_output(output: SpawnAgentOutput) -> String {
 }
 
 pub fn render_agent_runtime_binding_error(tool_name: &str, action: &str) -> String {
-    let error = astra_turn_core::tool::runtime_binding::agent_runtime_binding_denial_message(
+    let error = astra_turn_core::tool::runtime_binding::runtime_binding_denial_message(
         tool_name,
         Some(action),
     );

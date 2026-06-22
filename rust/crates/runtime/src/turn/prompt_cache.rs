@@ -640,6 +640,7 @@ pub(crate) fn section_cache_key(
 /// dynamic tools sitting after it don't invalidate the cached prefix. If no
 /// pinned tools are present (e.g. caller opted into full-dynamic), falls
 /// back to the last tool.
+#[cfg(test)]
 pub(crate) fn annotate_tool_schemas_for_caching(
     tools: &mut [Value],
     cache_cfg: &PromptCacheConfig,

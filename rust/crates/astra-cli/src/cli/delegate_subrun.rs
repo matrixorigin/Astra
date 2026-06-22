@@ -22,10 +22,10 @@ use astra_runtime::{
         AgenticLoopState, CancellationState, MessagingState, SkillState, StopHookState,
     },
     turn::chat_turn_heuristics::infer_task_execution_profile,
-    turn::tool_schema_prune::openai_tool_names_from_schemas,
     turn::turn_guard::TurnGuard,
 };
 use astra_services::coordination::AgentResult;
+use astra_turn_core::tool::schema::tool_names_from_schemas;
 
 use super::skill_subrun::{SubRunHost, persist_failed_subrun};
 use crate::edge_tools;
@@ -240,7 +240,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             .resolve_for_model(effective_model.as_deref());
 
         let all_schemas = edge_tools::all_tool_schemas();
-        let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
+        let valid_tool_names = tool_names_from_schemas(&all_schemas);
 
         // Issue #326 P5b: delegate sub-run is headless — strip project
         // allow rules but honour deny + user file.
@@ -1064,8 +1064,7 @@ mod tests {
 
         let coder = registry.get("coder").unwrap();
         let all_schemas = crate::edge_tools::all_tool_schemas();
-        let valid_tool_names =
-            astra_runtime::turn::tool_schema_prune::openai_tool_names_from_schemas(&all_schemas);
+        let valid_tool_names = astra_turn_core::tool::schema::tool_names_from_schemas(&all_schemas);
 
         let restricted = build_restricted_tools(&coder.skill_filter, &valid_tool_names);
 

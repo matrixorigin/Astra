@@ -32,8 +32,8 @@ async fn execute_unknown_tool_returns_error() {
         "unknown tool must return an Error: prefix (plain-text error contract) — got: {result}"
     );
     assert!(
-        result.contains("'nonexistent_tool'"),
-        "error must quote the rejected tool name — got: {result}"
+        result.contains("nonexistent_tool"),
+        "error must name the rejected tool — got: {result}"
     );
     assert!(
         result.contains("not available"),

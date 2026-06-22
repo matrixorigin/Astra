@@ -17,7 +17,17 @@ pub fn runtime_binding_denial_message(name: &str, action: Option<&str>) -> Strin
     if crate::tool::registry::meta::tool_meta(name)
         .is_some_and(|meta| meta.requires.contains(&Capability::AgentSpawner))
     {
-        return agent_runtime_binding_denial_message(name, action);
+        let action = action
+            .filter(|action| !action.is_empty())
+            .map(|action| format!(" action `{action}`"))
+            .unwrap_or_default();
+        return format!(
+            "Tool `{name}`{action} is not available in this turn because \
+             the multi-agent runtime is not connected. Retrying this call or calling \
+             `tool_search` will not attach that runtime. Continue with currently \
+             visible tools, or ask the user to start a session with multi-agent \
+             support if delegation is required."
+        );
     }
 
     format!(
@@ -25,20 +35,6 @@ pub fn runtime_binding_denial_message(name: &str, action: Option<&str>) -> Strin
          capability is not connected. Calling `tool_search(query=\"select:{name}\")` \
          cannot make it executable until that runtime is available. Use currently \
          visible tools or report the missing runtime capability."
-    )
-}
-
-pub fn agent_runtime_binding_denial_message(tool_name: &str, action: Option<&str>) -> String {
-    let action = action
-        .filter(|action| !action.is_empty())
-        .map(|action| format!(" action `{action}`"))
-        .unwrap_or_default();
-    format!(
-        "Tool `{tool_name}`{action} is not available in this turn because \
-         the multi-agent runtime is not connected. Retrying this call or calling \
-         `tool_search` will not attach that runtime. Continue with currently \
-         visible tools, or ask the user to start a session with multi-agent \
-         support if delegation is required."
     )
 }
 

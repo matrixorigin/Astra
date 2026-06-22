@@ -168,7 +168,7 @@ async fn selecting_visible_tool_does_not_record_deferred_activation() {
 }
 
 #[tokio::test]
-async fn activated_deferred_tool_is_consumed_when_next_surface_makes_it_visible() {
+async fn activated_deferred_tool_remains_until_called_after_schema_injection() {
     let executor = executor();
     set_visible(&executor, &["bash", "tool_search"]);
     executor.set_current_activatable_tool_names(HashSet::from(["web_fetch".to_string()]));
@@ -184,22 +184,79 @@ async fn activated_deferred_tool_is_consumed_when_next_surface_makes_it_visible(
     executor.set_current_activatable_tool_names(HashSet::new());
 
     assert_eq!(
-        executor.take_activated_deferred_tool_names(),
+        executor.activated_deferred_tool_names_for_schema_injection(),
         strings(&["web_fetch"]),
-        "schema assembly should consume the selected deferred tool exactly once"
+        "schema assembly should surface the selected deferred tool"
     );
     assert_eq!(
         executor.activated_deferred_tool_names(),
-        Vec::<String>::new()
+        strings(&["web_fetch"]),
+        "schema assembly must not consume activation before the tool is called"
     );
 
     set_visible(&executor, &["bash", "tool_search", "web_fetch"]);
     executor.set_current_activatable_tool_names(HashSet::new());
+    assert_eq!(
+        executor.activated_deferred_tool_names_for_schema_injection(),
+        strings(&["web_fetch"]),
+        "repeated schema assembly must keep the selected tool available"
+    );
 
     assert_eq!(
         executor.activated_deferred_tool_names(),
+        strings(&["web_fetch"]),
+        "activation must remain pending until the tool is actually called"
+    );
+
+    let _ = executor.execute("web_fetch", &json!({})).await;
+    assert_eq!(
+        executor.activated_deferred_tool_names(),
         Vec::<String>::new(),
-        "consumed activation must not become session-long state after the tool is visible"
+        "accepted visible tool calls consume the matching deferred activation"
+    );
+}
+
+#[tokio::test]
+async fn multi_selected_deferred_tools_remain_available_until_each_is_called() {
+    let executor = executor();
+    set_visible(&executor, &["tool_search"]);
+    executor.set_current_activatable_tool_names(HashSet::from([
+        "web_fetch".to_string(),
+        "memory".to_string(),
+    ]));
+
+    let parsed = run_search(&executor, json!({"query": "select:web_fetch,memory"})).await;
+    assert_eq!(match_names(&parsed), strings(&["web_fetch", "memory"]));
+    assert_eq!(
+        executor.activated_deferred_tool_names(),
+        strings(&["memory", "web_fetch"])
+    );
+
+    set_visible(&executor, &["tool_search", "web_fetch", "memory"]);
+    executor.set_current_activatable_tool_names(HashSet::new());
+    assert_eq!(
+        executor.activated_deferred_tool_names_for_schema_injection(),
+        strings(&["memory", "web_fetch"]),
+        "schema assembly should surface every selected deferred tool"
+    );
+
+    let _ = executor.execute("web_fetch", &json!({})).await;
+    assert_eq!(
+        executor.activated_deferred_tool_names(),
+        strings(&["memory"]),
+        "calling one selected tool must not consume unrelated selected tools"
+    );
+    assert_eq!(
+        executor.activated_deferred_tool_names_for_schema_injection(),
+        strings(&["memory"]),
+        "unused selected tools must remain injectable after earlier tools run"
+    );
+
+    let _ = executor.execute("memory", &json!({})).await;
+    assert_eq!(
+        executor.activated_deferred_tool_names(),
+        Vec::<String>::new(),
+        "each selected tool is consumed only by its own accepted visible call"
     );
 }
 

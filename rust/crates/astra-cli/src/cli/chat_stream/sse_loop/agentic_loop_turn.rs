@@ -27,8 +27,8 @@ use astra_runtime::{
     turn::chat_turn_budget_pressure::budget_pressure_for_chat_turn,
     turn::chat_turn_edge_profile::{
         EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW,
-        EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT, detect_active_system_skills_in_message,
-        read_git_branch_abbrev,
+        EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT, EDGE_PROFILE_KEY_PINNED_TOOL_NAMES,
+        detect_active_system_skills_in_message, read_git_branch_abbrev,
     },
     turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
     turn::chat_turn_heuristics::extract_repos_from_memory,
@@ -304,6 +304,23 @@ fn selection_report_from_visible_schemas(
     }
 }
 
+fn runtime_filter_turn_schemas_and_report(
+    executor: &crate::edge_tools::ToolExecutor,
+    turn_schemas: &mut Vec<Value>,
+    selection_report: &mut tool_registry::SelectionReport,
+) {
+    *turn_schemas = executor.runtime_bound_tool_schemas(std::mem::take(turn_schemas));
+    let runtime_bound_turn_names =
+        astra_turn_core::tool::schema::tool_names_from_schemas(turn_schemas.as_slice());
+    selection_report
+        .tools_selected
+        .retain(|name| runtime_bound_turn_names.contains(name));
+    selection_report
+        .dynamic_tools_selected
+        .retain(|name| runtime_bound_turn_names.contains(name));
+    selection_report.selected_count = selection_report.tools_selected.len() as u32;
+}
+
 async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     let timing = ctx.timing_phases;
     let mut mark = Instant::now();
@@ -528,6 +545,17 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             ctx.all_schemas,
         );
     }
+    let conversation_state =
+        astra_turn_core::tool_registry_state::ConversationState::from_message_with_context(
+            ctx.message,
+            ctx.history.len() as u32,
+            ctx.recent_tools,
+        );
+    let low_intent_without_work_signals = conversation_state.is_conversational
+        && !conversation_state.is_fetch
+        && !conversation_state.is_mutate
+        && !conversation_state.is_analytical
+        && !conversation_state.references_history;
     if !ctx.plan_mode_active {
         if let Some(required) = ctx.executor.take_pending_round_tool_boost() {
             let required_refs: Vec<&str> = required.iter().map(String::as_str).collect();
@@ -538,11 +566,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                 ctx.all_schemas,
             );
         }
-        // Make newly activated deferred tools visible exactly once. If the
-        // model actually invokes the tool, invoked-tool pinning keeps it
-        // visible on follow-up rounds; otherwise it does not become a
-        // session-long schema tax.
-        let activated = ctx.executor.take_activated_deferred_tool_names();
+        // Make newly activated deferred tools visible. This is not a TTL:
+        // activation remains pending until the model actually calls that
+        // tool, so `select:a,b,c` does not lose `c` after `a` and `b` run.
+        let activated = ctx
+            .executor
+            .activated_deferred_tool_names_for_schema_injection();
         if !activated.is_empty() {
             let refs: Vec<&str> = activated.iter().map(String::as_str).collect();
             astra_turn_core::tool_schema_prune::inject_required_tool_names(
@@ -565,28 +594,29 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             );
         }
     }
-    let conversation_state =
-        astra_turn_core::tool_registry_state::ConversationState::from_message_with_context(
-            ctx.message,
-            ctx.history.len() as u32,
-            ctx.recent_tools,
-        );
-    let pure_conversational_turn = conversation_state.is_conversational
-        && !conversation_state.is_fetch
-        && !conversation_state.is_mutate
-        && !conversation_state.is_analytical
-        && !conversation_state.references_history;
+    runtime_filter_turn_schemas_and_report(
+        ctx.executor.as_ref(),
+        &mut turn_schemas,
+        &mut selection_report,
+    );
+    // NOTE: `budget_used` is intentionally NOT recomputed here. The
+    // `selection_report_from_visible_schemas` call below is the single source
+    // of truth for the final report's budget; any value set on the
+    // intermediate `selection_report.budget_used` would be overwritten and
+    // never consumed. See test
+    // `selection_report_from_visible_schemas_is_single_source_for_budget`.
+
     let no_tool_conversational_turn = turn_schemas.is_empty()
         && selection_report.tools_selected.is_empty()
         && selection_report.dynamic_tools_selected.is_empty()
         && ctx.recent_tools.is_empty()
         && ctx.tool_results.is_empty()
         && !ctx.plan_mode_active
-        && pure_conversational_turn;
+        && low_intent_without_work_signals;
     if !no_tool_conversational_turn {
         // Keep session-control tools stable once a turn needs tools. Pure
-        // conversational turns intentionally stay tool-free; spending full
-        // schemas on "hi" is worse UX than a cache-stable but bloated prefix.
+        // conversational turns intentionally stay tool-free unless pending
+        // activation or selected work already made a tool surface necessary.
         astra_turn_core::tool_schema_prune::inject_required_tool_names(
             &mut turn_schemas,
             &mut selection_report,
@@ -611,22 +641,11 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         }
     }
 
-    turn_schemas = ctx.executor.runtime_bound_tool_schemas(turn_schemas);
-    let runtime_bound_turn_names =
-        astra_turn_core::tool::schema::tool_names_from_schemas(&turn_schemas);
-    selection_report
-        .tools_selected
-        .retain(|name| runtime_bound_turn_names.contains(name));
-    selection_report
-        .dynamic_tools_selected
-        .retain(|name| runtime_bound_turn_names.contains(name));
-    selection_report.selected_count = selection_report.tools_selected.len() as u32;
-    // NOTE: `budget_used` is intentionally NOT recomputed here. The
-    // `selection_report_from_visible_schemas` call below is the single source
-    // of truth for the final report's budget; any value set on the
-    // intermediate `selection_report.budget_used` would be overwritten and
-    // never consumed. See test
-    // `selection_report_from_visible_schemas_is_single_source_for_budget`.
+    runtime_filter_turn_schemas_and_report(
+        ctx.executor.as_ref(),
+        &mut turn_schemas,
+        &mut selection_report,
+    );
 
     // Plan-mode tool restrictions are owned by the host
     // (`CliAgenticLoopHost::execute_turn`) using the same
@@ -673,6 +692,19 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         &final_visible_tool_names,
     );
     let mut activatable_tool_names = HashSet::new();
+    // Always send pinned tool names so the server can place cache_control
+    // markers at the correct pinned/dynamic boundary. User TOML overrides
+    // can add or remove tools from the default pinned set, so this must be
+    // the resolved runtime set — not a compile-time constant.
+    let pinned_names = ctx.registry.pinned_tool_names_sorted();
+    if !final_visible_tool_names.is_empty() && !pinned_names.is_empty() {
+        merge_edge_profile_extensions(
+            &mut payload,
+            &json!({
+                EDGE_PROFILE_KEY_PINNED_TOOL_NAMES: pinned_names,
+            }),
+        );
+    }
     if !final_visible_tool_names.is_empty()
         && final_visible_tool_names.contains("tool_search")
         && let Some(manifest) = tool_surface.deferred_manifest(requested_model)
@@ -689,11 +721,11 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     }
     ctx.executor
         .set_current_tool_surface(&final_visible_schemas, activatable_tool_names);
-    // Telemetry truth: recompute dynamic budget from the ACTUAL final visible
-    // schemas, not the pre-filtering selection report.  The original
-    // `selection_report.budget_used` reflects tools that may have been
-    // stripped by capability/interaction-mode filtering, so reusing it would
-    // produce a budget number inconsistent with `tools_selected`.
+    // Telemetry truth: recompute token cost from the ACTUAL final visible
+    // schemas. The intermediate selector report is dynamic-budget-only and may
+    // include tools later stripped by capability/interaction-mode filtering.
+    // Final persisted reports must keep `selected_count`, `tools_selected`,
+    // and `budget_used` on the same full-visible-surface basis.
     let selected_tool_costs: Vec<(String, u32)> = final_visible_schemas
         .iter()
         .filter_map(|schema| {
@@ -706,20 +738,13 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         .filter(|name| final_visible_tool_names.contains(name.as_str()))
         .cloned()
         .collect();
-    let dynamic_tool_name_set: HashSet<String> =
-        dynamic_tools_selected_final.iter().cloned().collect();
-    let budget_used_final: u32 = selected_tool_costs
-        .iter()
-        .filter(|(name, _)| dynamic_tool_name_set.contains(name))
-        .map(|(_, cost)| *cost)
-        .sum();
+    let selected_tool_tokens_total: u32 = selected_tool_costs.iter().map(|(_, cost)| *cost).sum();
     let final_selection_report = selection_report_from_visible_schemas(
         &final_visible_schemas,
         dynamic_tools_selected_final,
-        budget_used_final,
+        selected_tool_tokens_total,
         selection_report.budget_total,
     );
-    let selected_tool_tokens_total: u32 = selected_tool_costs.iter().map(|(_, cost)| *cost).sum();
     *ctx.valid_tool_names = final_visible_tool_names;
 
     if let Some(collector) = ctx.telem.trace_collector {
@@ -1403,6 +1428,7 @@ mod tests {
     use astra_turn_core::chat_history_openai::merge_skill_names_track;
     use astra_turn_core::chat_turn_edge_profile::{
         EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT,
+        EDGE_PROFILE_KEY_PINNED_TOOL_NAMES,
     };
     use serde_json::{Value, json};
 
@@ -1632,9 +1658,9 @@ mod tests {
     /// Regression: the final SelectionReport's `budget_used` must be derived
     /// entirely from the explicit `budget_used` argument, NOT from any stale
     /// `budget_used` field on a pre-existing report. This contract is what
-    /// permits removing the dead recomputation at the call site (the value
+    /// permits removing stale intermediate recomputation at the call site (the value
     /// set on `selection_report.budget_used` was overwritten by
-    /// `budget_used_final` and never consumed).
+    /// the final visible-schema token total and never consumed).
     #[test]
     fn selection_report_from_visible_schemas_is_single_source_for_budget() {
         let schemas = vec![schema("grep"), schema("read_file")];
@@ -1805,6 +1831,18 @@ mod tests {
             .iter()
             .map(|name| (*name).to_string())
             .collect();
+        let pinned_names: Vec<String> = payload["edge_profile"][EDGE_PROFILE_KEY_PINNED_TOOL_NAMES]
+            .as_array()
+            .expect("edge_profile must carry resolved pinned tool names on tool turns")
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            pinned_names,
+            registry.pinned_tool_names_sorted(),
+            "CLI must send the resolved pinned set so runtime cache boundaries follow user tool_surface overrides"
+        );
         assert_eq!(
             valid_tool_names, edge_tool_name_set,
             "headless validator must admit exactly the tools sent in edge_tools"
@@ -1819,6 +1857,17 @@ mod tests {
                 .map(|name| (*name).to_string())
                 .collect::<Vec<_>>(),
             "selection telemetry must describe the final visible tools, not raw selector candidates"
+        );
+        let expected_visible_schema_tokens: u32 = edge_tool_names
+            .iter()
+            .map(|name| registry.token_cost(name))
+            .sum();
+        assert_eq!(
+            first_selection_report
+                .as_ref()
+                .map(|report| report.budget_used),
+            Some(expected_visible_schema_tokens),
+            "final selection telemetry budget_used must use the same full visible-tool surface as selected_count"
         );
         // Plan-mode escape hatches must be present exactly once each.
         assert!(edge_tool_names.contains(&"enter_plan_mode"));
@@ -1982,7 +2031,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_chat_turn_payload_for_plain_hi_is_tool_free() {
+    async fn prepare_chat_turn_payload_low_intent_is_tool_free_unless_activation_is_pending() {
         use crate::edge_tools::ToolExecutor;
         use astra_pipeline::step_recorder::StepRecorder;
         use astra_runtime::{
@@ -1996,7 +2045,8 @@ mod tests {
         let all_schemas = astra_tools::schemas::all_tool_schemas();
         let registry = ToolRegistry::new(all_schemas.clone());
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
-        let messages = vec![json!({"role": "user", "content": "hi"})];
+        let low_intent_message = "thanks";
+        let messages = vec![json!({"role": "user", "content": low_intent_message})];
         let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
@@ -2004,7 +2054,7 @@ mod tests {
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
-        let mut step_recorder = StepRecorder::new("session-hi", "task-hi");
+        let mut step_recorder = StepRecorder::new("session-low-intent", "task-low-intent");
         let turn_guard = TurnGuard::default();
         let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -2018,11 +2068,11 @@ mod tests {
             messages: &messages,
             runtime_volatile_texts: &[],
             ephemeral_prefix: None,
-            current_session_id: Some("session-hi"),
+            current_session_id: Some("session-low-intent"),
             model: None,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
-            message: "hi",
+            message: low_intent_message,
             semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
@@ -2073,7 +2123,7 @@ mod tests {
         let edge_tools = payload["edge_tools"].as_array().unwrap();
         assert!(
             edge_tools.is_empty(),
-            "plain greeting must not include full tool schemas: {:?}",
+            "low-intent turns without pending activation should not include full tool schemas: {:?}",
             edge_tools
                 .iter()
                 .filter_map(|schema| schema["function"]["name"].as_str())
@@ -2083,7 +2133,7 @@ mod tests {
             payload["edge_profile"]
                 .get(EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT)
                 .is_none(),
-            "plain greeting must not advertise deferred tools when tool_search is not visible"
+            "low-intent turns without visible tool_search should not advertise deferred tools"
         );
         assert!(
             valid_tool_names.is_empty(),
@@ -2096,6 +2146,120 @@ mod tests {
             Some(0),
             "selection telemetry must reflect the final no-tool surface"
         );
+        assert_eq!(
+            executor.activated_deferred_tool_names(),
+            Vec::<String>::new(),
+            "no activation should be recorded before a select/direct-call intent"
+        );
+
+        executor.set_current_visible_tool_schemas(&[schema("tool_search")]);
+        executor.set_current_activatable_tool_names(HashSet::from(["memory".to_string()]));
+        let selected = executor
+            .execute("tool_search", &json!({"query": "select:memory"}))
+            .await;
+        let selected_json: Value = serde_json::from_str(&selected).unwrap_or_else(|error| {
+            panic!("tool_search select should return JSON, got {error}: {selected}")
+        });
+        assert_eq!(selected_json["matches"][0]["name"].as_str(), Some("memory"));
+        assert_eq!(
+            executor.activated_deferred_tool_names(),
+            vec!["memory".to_string()]
+        );
+
+        let mut restricted_tools = HashSet::new();
+        let mut valid_tool_names = HashSet::new();
+        let mut widen_selection_pending = false;
+        let mut step_recorder =
+            StepRecorder::new("session-pending-activation", "task-pending-activation");
+        let mut turn_policy = TurnInteractionPolicy::default();
+        let mut first_memoria_ms = None;
+        let mut first_selection_report = None;
+        let mut first_budget_pressure = 0.0;
+        let mut first_context_assembly_ms = None;
+        let mut all_selected_skills = Vec::new();
+
+        let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            messages: &messages,
+            runtime_volatile_texts: &[],
+            ephemeral_prefix: None,
+            current_session_id: Some("session-pending-activation"),
+            model: None,
+            explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
+            project_root: temp_dir.path(),
+            message: low_intent_message,
+            semantic_query_override: None,
+            history: &history,
+            recent_tools: &recent_tools,
+            executor: Arc::clone(&executor),
+            registry: &registry,
+            tool_results: &tool_results,
+            all_schemas: &all_schemas,
+            valid_tool_names: &mut valid_tool_names,
+            turn_guard: &turn_guard,
+            restricted_tools: &mut restricted_tools,
+            widen_selection_pending: &mut widen_selection_pending,
+            step_recorder: &mut step_recorder,
+            file_context: &file_context,
+            assembly_start: Instant::now(),
+            telem: PrepareTurnTelemetry {
+                first_memoria_ms: &mut first_memoria_ms,
+                first_selection_report: &mut first_selection_report,
+                first_budget_pressure: &mut first_budget_pressure,
+                first_context_assembly_ms: &mut first_context_assembly_ms,
+                all_selected_skills: &mut all_selected_skills,
+                initial_skill_selector_shortlist: None,
+                trace_collector: None,
+            },
+            skill_search: &skill_search,
+            is_plan_subtask: false,
+            plan_subtask_id: None,
+            timing_phases: false,
+            prep_ui_phase: None,
+            skill_effort: None,
+            skill_agent_type: None,
+            tool_budget_override: None,
+            interaction_mode: TurnInteractionMode::Auto,
+            turn_policy: &mut turn_policy,
+            skill_allowed_tools: None,
+            previous_confidence_fallback: None,
+            round_index: 0,
+            session_turn: 2,
+            turn_chain_id: None,
+            user_query_event_id: None,
+            denial_pressure: (0, 0),
+            recent_rejections: Vec::new(),
+            observability_hub: None,
+            append_system_prompt: None,
+            plan_mode_active: false,
+        })
+        .await;
+
+        let edge_tool_names: Vec<&str> = payload["edge_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|schema| schema["function"]["name"].as_str())
+            .collect();
+        assert!(
+            edge_tool_names.contains(&"memory"),
+            "pending activation must surface the selected schema independent of low-intent text: {edge_tool_names:?}"
+        );
+        assert!(
+            valid_tool_names.contains("memory"),
+            "executor admission must mirror the activated schema visible in the payload"
+        );
+        assert_eq!(
+            executor.activated_deferred_tool_names(),
+            vec!["memory".to_string()],
+            "payload assembly must not consume activation before the tool is called"
+        );
+        let _ = executor.execute("memory", &json!({})).await;
+        assert_eq!(
+            executor.activated_deferred_tool_names(),
+            Vec::<String>::new(),
+            "the accepted visible tool call consumes the matching activation"
+        );
+        executor.clear_current_tool_surface_for_tests();
 
         let cfg = astra_config::ToolSurfaceConfig {
             pinned_tools: astra_runtime::tool_registry::surface::DEFAULT_PINNED
@@ -2669,8 +2833,8 @@ mod tests {
         assert_eq!(valid_tool_names, edge_tool_names);
         assert_eq!(
             executor.activated_deferred_tool_names(),
-            Vec::<String>::new(),
-            "payload assembly must consume one-shot activation after making the schema visible"
+            vec!["memory".to_string()],
+            "payload assembly must not consume activation before the selected tool is called"
         );
     }
 

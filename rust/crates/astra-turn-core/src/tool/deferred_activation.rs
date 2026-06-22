@@ -8,26 +8,92 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
+/// Current tool surface installed by the runtime for admission/search.
+///
+/// `Uninstalled` means no LLM-request surface has been installed yet; callers
+/// must fail closed because they cannot prove the model saw any tool schema.
+/// `Installed { visible: ∅, activatable: ∅ }` is different: the runtime
+/// deliberately sent a no-tool turn. That turn must not discard previously
+/// activated deferred tools, because no schema-injection opportunity occurred.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolSurfaceNames {
+    Uninstalled,
+    Installed {
+        visible: HashSet<String>,
+        activatable: HashSet<String>,
+    },
+}
+
+impl Default for ToolSurfaceNames {
+    fn default() -> Self {
+        Self::Uninstalled
+    }
+}
+
+impl ToolSurfaceNames {
+    #[must_use]
+    pub fn installed(visible: HashSet<String>, activatable: HashSet<String>) -> Self {
+        Self::Installed {
+            visible,
+            activatable,
+        }
+    }
+
+    #[must_use]
+    pub fn visible(&self) -> Option<&HashSet<String>> {
+        match self {
+            Self::Uninstalled => None,
+            Self::Installed { visible, .. } => Some(visible),
+        }
+    }
+
+    #[must_use]
+    pub fn activatable(&self) -> Option<&HashSet<String>> {
+        match self {
+            Self::Uninstalled => None,
+            Self::Installed { activatable, .. } => Some(activatable),
+        }
+    }
+
+    #[must_use]
+    pub fn has_any_tool(&self) -> bool {
+        match self {
+            Self::Uninstalled => false,
+            Self::Installed {
+                visible,
+                activatable,
+            } => !visible.is_empty() || !activatable.is_empty(),
+        }
+    }
+
+    #[must_use]
+    pub fn visible_contains(&self, name: &str) -> bool {
+        self.visible().is_some_and(|visible| visible.contains(name))
+    }
+
+    #[must_use]
+    pub fn activatable_contains(&self, name: &str) -> bool {
+        self.activatable()
+            .is_some_and(|activatable| activatable.contains(name))
+    }
+}
+
 /// Build the per-turn tool-search pool from the tools that are already
 /// visible plus the deferred tools advertised in this turn's prompt.
 ///
 /// `None` means no caller-installed surface exists yet; callers should fail
 /// closed instead of falling back to a global catalog.
 #[must_use]
-pub fn searchable_tool_names(
-    visible: Option<&HashSet<String>>,
-    activatable: Option<&HashSet<String>>,
-) -> Option<HashSet<String>> {
-    match (visible, activatable) {
-        (None, None) => None,
-        (visible, activatable) => {
+pub fn searchable_tool_names(surface: &ToolSurfaceNames) -> Option<HashSet<String>> {
+    match surface {
+        ToolSurfaceNames::Uninstalled => None,
+        ToolSurfaceNames::Installed {
+            visible,
+            activatable,
+        } => {
             let mut names = HashSet::new();
-            if let Some(visible) = visible {
-                names.extend(visible.iter().cloned());
-            }
-            if let Some(activatable) = activatable {
-                names.extend(activatable.iter().cloned());
-            }
+            names.extend(visible.iter().cloned());
+            names.extend(activatable.iter().cloned());
             Some(names)
         }
     }
@@ -53,61 +119,89 @@ where
 /// surface instead of cached or declarative schemas.
 #[must_use]
 pub fn searchable_runtime_bound_tool_names<F>(
-    visible: Option<&HashSet<String>>,
-    activatable: Option<&HashSet<String>>,
+    surface: &ToolSurfaceNames,
     has_runtime_binding: F,
 ) -> Option<HashSet<String>>
 where
     F: Fn(&str) -> bool,
 {
-    let names = searchable_tool_names(visible, activatable)?;
+    let names = searchable_tool_names(surface)?;
     Some(runtime_bound_tool_names(names, has_runtime_binding))
 }
 
-/// Keep only previously activated deferred tools that are still present in the
-/// current surface (`visible ∪ activatable`).
-#[must_use]
-pub fn retained_activated_deferred_tool_names(
-    activated: &HashSet<String>,
-    visible: Option<&HashSet<String>>,
-    activatable: Option<&HashSet<String>>,
-) -> Vec<String> {
-    let Some(searchable) = searchable_tool_names(visible, activatable) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = activated
-        .iter()
-        .filter(|name| searchable.contains(*name))
-        .cloned()
-        .collect();
-    names.sort();
-    names
+/// Record names selected by `tool_search(select:...)` or by the direct
+/// deferred-call recovery path.
+///
+/// Activation is not a time-to-live counter. It remains pending until the
+/// corresponding full schema reaches `tools[]` and the model actually calls
+/// that tool once, or until the installed non-empty surface/runtime binding
+/// proves the activation is stale.
+pub fn refresh_activated_tool_names<I>(activated: &mut HashSet<String>, names: I)
+where
+    I: IntoIterator<Item = String>,
+{
+    for name in names {
+        activated.insert(name);
+    }
 }
 
-/// Keep only previously activated deferred tools that are still present in the
-/// current surface and still executable by this runtime.
+/// Keep pending activated tools that still make sense for the current runtime.
+///
+/// `Uninstalled` fails closed. An installed no-tool surface preserves
+/// runtime-bound activations because no full schema was advertised. A non-empty
+/// surface prunes activations that are neither visible nor activatable.
 #[must_use]
-pub fn retained_runtime_bound_activated_deferred_tool_names<F>(
+pub fn retained_runtime_bound_activated_tool_names<F>(
     activated: &HashSet<String>,
-    visible: Option<&HashSet<String>>,
-    activatable: Option<&HashSet<String>>,
+    surface: &ToolSurfaceNames,
     has_runtime_binding: F,
 ) -> Vec<String>
 where
     F: Fn(&str) -> bool,
 {
-    let Some(searchable) =
-        searchable_runtime_bound_tool_names(visible, activatable, has_runtime_binding)
+    let Some(searchable) = searchable_runtime_bound_tool_names(surface, &has_runtime_binding)
     else {
         return Vec::new();
     };
+    let surface_has_names = surface.has_any_tool();
     let mut names: Vec<String> = activated
         .iter()
-        .filter(|name| searchable.contains(*name))
+        .filter(|name| has_runtime_binding(name))
+        .filter(|name| !surface_has_names || searchable.contains(*name))
         .cloned()
         .collect();
     names.sort();
     names
+}
+
+/// Return activated tool names for schema injection and prune stale entries.
+///
+/// This does not consume activation. A selected deferred tool remains visible
+/// until the model calls it once, which matches the user-facing contract:
+/// `tool_search(select:a,b,c)` makes all three tools available, not just for a
+/// guessed number of follow-up schema-selection rounds.
+pub fn activated_tool_names_for_schema_injection<F>(
+    activated: &mut HashSet<String>,
+    surface: &ToolSurfaceNames,
+    has_runtime_binding: F,
+) -> Vec<String>
+where
+    F: Fn(&str) -> bool,
+{
+    let retained =
+        retained_runtime_bound_activated_tool_names(activated, surface, has_runtime_binding);
+    if matches!(surface, ToolSurfaceNames::Uninstalled) {
+        return retained;
+    }
+    let retained_set: HashSet<&str> = retained.iter().map(String::as_str).collect();
+    activated.retain(|name| retained_set.contains(name.as_str()));
+    retained
+}
+
+/// Consume activation once the tool has actually been called from a visible
+/// schema surface.
+pub fn consume_activated_tool_name(activated: &mut HashSet<String>, name: &str) -> bool {
+    activated.remove(name)
 }
 
 /// Extract activation names from a `tool_search(select:...)` result and keep
@@ -115,13 +209,13 @@ where
 #[must_use]
 pub fn recordable_activated_tool_names<F>(
     output: &str,
-    activatable: Option<&HashSet<String>>,
+    surface: &ToolSurfaceNames,
     has_runtime_binding: F,
 ) -> Vec<String>
 where
     F: Fn(&str) -> bool,
 {
-    let Some(activatable) = activatable else {
+    let Some(activatable) = surface.activatable() else {
         return Vec::new();
     };
     activated_tool_names_from_tool_search_output(output)
@@ -339,7 +433,7 @@ mod tests {
     #[test]
     fn searchable_names_fail_closed_without_installed_surface() {
         assert!(
-            searchable_tool_names(None, None).is_none(),
+            searchable_tool_names(&ToolSurfaceNames::Uninstalled).is_none(),
             "missing per-turn surface must not fall back to a global catalog"
         );
     }
@@ -348,8 +442,9 @@ mod tests {
     fn searchable_names_are_visible_union_activatable() {
         let visible = HashSet::from(["bash".to_string(), "tool_search".to_string()]);
         let activatable = HashSet::from(["web_fetch".to_string()]);
+        let surface = ToolSurfaceNames::installed(visible, activatable);
 
-        let names = searchable_tool_names(Some(&visible), Some(&activatable))
+        let names = searchable_tool_names(&surface)
             .expect("installed surface should produce a search pool");
 
         assert_eq!(
@@ -371,12 +466,11 @@ mod tests {
         ]);
         let activatable =
             HashSet::from(["web_fetch".to_string(), "mcp__stale_deferred".to_string()]);
+        let surface = ToolSurfaceNames::installed(visible, activatable);
 
         let names =
-            searchable_runtime_bound_tool_names(Some(&visible), Some(&activatable), |name| {
-                !name.starts_with("mcp__stale")
-            })
-            .expect("installed surface should produce a search pool");
+            searchable_runtime_bound_tool_names(&surface, |name| !name.starts_with("mcp__stale"))
+                .expect("installed surface should produce a search pool");
 
         assert_eq!(
             names,
@@ -389,36 +483,126 @@ mod tests {
     }
 
     #[test]
-    fn retained_activated_names_are_scoped_to_current_surface() {
-        let activated = HashSet::from(["web_fetch".to_string(), "github".to_string()]);
-        let visible = HashSet::from(["bash".to_string(), "web_fetch".to_string()]);
-        let activatable = HashSet::from(["memory".to_string()]);
+    fn activation_survives_explicit_no_tool_surface_without_consuming() {
+        let mut activated = HashSet::new();
+        refresh_activated_tool_names(&mut activated, ["memory".to_string()]);
+        let visible = HashSet::new();
+        let activatable = HashSet::new();
+        let surface = ToolSurfaceNames::installed(visible, activatable);
 
         assert_eq!(
-            retained_activated_deferred_tool_names(&activated, Some(&visible), Some(&activatable)),
-            vec!["web_fetch".to_string()]
+            retained_runtime_bound_activated_tool_names(&activated, &surface, |_| true),
+            vec!["memory".to_string()],
+            "explicit no-tool surfaces must not invalidate previous activations"
         );
-        assert!(
-            retained_activated_deferred_tool_names(&activated, None, None).is_empty(),
-            "without a current surface no deferred activation may remain visible"
+        assert_eq!(
+            activated_tool_names_for_schema_injection(&mut activated, &surface, |_| true),
+            vec!["memory".to_string()]
+        );
+        assert!(activated.contains("memory"));
+    }
+
+    #[test]
+    fn activation_no_tool_surface_prunes_runtime_unbound_orphans() {
+        let mut activated = HashSet::new();
+        refresh_activated_tool_names(
+            &mut activated,
+            ["memory".to_string(), "mcp__stale".to_string()],
+        );
+        let surface = ToolSurfaceNames::installed(HashSet::new(), HashSet::new());
+
+        assert_eq!(
+            activated_tool_names_for_schema_injection(&mut activated, &surface, |name| {
+                name != "mcp__stale"
+            }),
+            vec!["memory".to_string()],
+            "explicit no-tool surfaces preserve valid activation but still drop unbound orphans"
+        );
+        assert_eq!(activated, HashSet::from(["memory".to_string()]));
+    }
+
+    #[test]
+    fn activation_repeated_schema_injection_does_not_expire_without_tool_call() {
+        let mut activated = HashSet::new();
+        refresh_activated_tool_names(&mut activated, ["memory".to_string()]);
+        let surface =
+            ToolSurfaceNames::installed(HashSet::from(["memory".to_string()]), HashSet::new());
+
+        assert_eq!(
+            activated_tool_names_for_schema_injection(&mut activated, &surface, |_| true),
+            vec!["memory".to_string()]
+        );
+        assert!(activated.contains("memory"));
+        assert_eq!(
+            activated_tool_names_for_schema_injection(&mut activated, &surface, |_| true),
+            vec!["memory".to_string()]
+        );
+        assert!(activated.contains("memory"));
+        assert!(consume_activated_tool_name(&mut activated, "memory"));
+        assert!(activated.is_empty());
+    }
+
+    #[test]
+    fn activation_long_selected_chain_remains_until_each_tool_is_called() {
+        let mut activated = HashSet::new();
+        refresh_activated_tool_names(
+            &mut activated,
+            [
+                "bash".to_string(),
+                "grep".to_string(),
+                "glob".to_string(),
+                "read_file".to_string(),
+            ],
+        );
+        let surface = ToolSurfaceNames::installed(
+            HashSet::from([
+                "bash".to_string(),
+                "grep".to_string(),
+                "glob".to_string(),
+                "read_file".to_string(),
+            ]),
+            HashSet::new(),
+        );
+
+        assert_eq!(
+            activated_tool_names_for_schema_injection(&mut activated, &surface, |_| true),
+            vec![
+                "bash".to_string(),
+                "glob".to_string(),
+                "grep".to_string(),
+                "read_file".to_string()
+            ]
+        );
+        assert!(consume_activated_tool_name(&mut activated, "bash"));
+        assert!(consume_activated_tool_name(&mut activated, "grep"));
+        assert_eq!(
+            activated_tool_names_for_schema_injection(&mut activated, &surface, |_| true),
+            vec!["glob".to_string(), "read_file".to_string()],
+            "unused selected tools must not disappear just because earlier tools were called"
+        );
+        assert!(consume_activated_tool_name(&mut activated, "glob"));
+        assert_eq!(
+            activated_tool_names_for_schema_injection(&mut activated, &surface, |_| true),
+            vec!["read_file".to_string()],
+            "last selected tool must remain available until it is called"
         );
     }
 
     #[test]
-    fn retained_activated_names_require_runtime_binding() {
-        let activated = HashSet::from(["mcp__weather".to_string(), "github".to_string()]);
-        let visible = HashSet::from(["mcp__weather".to_string(), "bash".to_string()]);
-        let activatable = HashSet::from(["github".to_string()]);
+    fn activation_prunes_stale_entries_on_non_empty_surface() {
+        let mut activated = HashSet::new();
+        refresh_activated_tool_names(&mut activated, ["memory".to_string(), "stale".to_string()]);
+        let visible = HashSet::from(["tool_search".to_string()]);
+        let activatable = HashSet::from(["memory".to_string()]);
+        let surface = ToolSurfaceNames::installed(visible, activatable);
 
         assert_eq!(
-            retained_runtime_bound_activated_deferred_tool_names(
-                &activated,
-                Some(&visible),
-                Some(&activatable),
-                |name| name != "mcp__weather"
-            ),
-            vec!["github".to_string()],
-            "stale visible schemas must not retain an activated tool after runtime binding disappears"
+            activated_tool_names_for_schema_injection(&mut activated, &surface, |_| true),
+            vec!["memory".to_string()]
+        );
+        assert!(
+            activated.contains("memory") && !activated.contains("stale"),
+            "non-empty surfaces should prune activations outside visible ∪ activatable"
         );
     }
 
@@ -435,19 +619,23 @@ mod tests {
             "missing": []
         })
         .to_string();
-        let activatable = HashSet::from(["web_fetch".to_string()]);
+        let surface = ToolSurfaceNames::installed(
+            HashSet::from(["bash".to_string()]),
+            HashSet::from(["web_fetch".to_string()]),
+        );
 
         assert_eq!(
-            recordable_activated_tool_names(&out, Some(&activatable), |_| true),
+            recordable_activated_tool_names(&out, &surface, |_| true),
             vec!["web_fetch".to_string()],
             "visible/non-deferred select results must not create deferred activation"
         );
         assert!(
-            recordable_activated_tool_names(&out, None, |_| true).is_empty(),
+            recordable_activated_tool_names(&out, &ToolSurfaceNames::Uninstalled, |_| true)
+                .is_empty(),
             "missing manifest must fail closed"
         );
         assert!(
-            recordable_activated_tool_names(&out, Some(&activatable), |_| false).is_empty(),
+            recordable_activated_tool_names(&out, &surface, |_| false).is_empty(),
             "callers can fail closed for names without runtime binding"
         );
     }

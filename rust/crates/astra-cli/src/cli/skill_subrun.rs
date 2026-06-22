@@ -27,10 +27,11 @@ use astra_runtime::{
         ChatTurnBasePayloadInput, chat_turn_base_payload, merge_edge_profile_extensions,
         set_payload_tool_results_if_non_empty,
     },
-    turn::tool_schema_prune::{inject_required_tool_names, openai_tool_names_from_schemas},
+    turn::tool_schema_prune::inject_required_tool_names,
     turn::turn_guard::TurnGuard,
 };
 use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
+use astra_turn_core::tool::schema::tool_names_from_schemas;
 use serde_json::{Value, json};
 
 use super::effects::ChatTurnPrepLineGuard;
@@ -520,7 +521,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             .resolve_for_model(effective_model.as_deref());
 
         let all_schemas = edge_tools::all_tool_schemas();
-        let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
+        let valid_tool_names = tool_names_from_schemas(&all_schemas);
 
         // Issue #326 P5b: skill subruns are headless — never read
         // project allow rules. Deny rules and the user-level rule
@@ -799,9 +800,7 @@ fn resolve_subrun_schemas(
 fn empty_selection_report_for_schemas(
     schemas: &[Value],
 ) -> astra_runtime::tool_registry::SelectionReport {
-    let mut tools_selected: Vec<String> = openai_tool_names_from_schemas(schemas)
-        .into_iter()
-        .collect();
+    let mut tools_selected: Vec<String> = tool_names_from_schemas(schemas).into_iter().collect();
     tools_selected.sort();
     astra_runtime::tool_registry::SelectionReport {
         selected_count: tools_selected.len() as u32,
@@ -821,7 +820,7 @@ fn attach_subrun_tool_surface(
     effective_model: Option<&str>,
     interaction_mode: TurnInteractionMode,
 ) -> TurnInteractionPolicy {
-    let activated = executor.take_activated_deferred_tool_names();
+    let activated = executor.activated_deferred_tool_names_for_schema_injection();
     let mut selection_report = empty_selection_report_for_schemas(&schemas_to_use);
     if !activated.is_empty() {
         let refs: Vec<&str> = activated.iter().map(String::as_str).collect();
@@ -1130,8 +1129,14 @@ mod tests {
         );
         assert_eq!(
             executor.activated_deferred_tool_names(),
+            vec!["memory".to_string()],
+            "subrun surface assembly must not consume activation before the selected tool is called"
+        );
+        let _ = executor.execute("memory", &json!({})).await;
+        assert_eq!(
+            executor.activated_deferred_tool_names(),
             Vec::<String>::new(),
-            "subrun surface assembly must consume one-shot activation after making the schema visible"
+            "the accepted visible tool call consumes the matching activation"
         );
     }
 

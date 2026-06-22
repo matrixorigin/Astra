@@ -8,9 +8,9 @@
 //!   Anthropic/Bedrock prompt cache can hit the whole prefix.
 //! - **T2 deferred** = every other known tool, listed as `name + short_desc`
 //!   in a system-reminder block. The model activates one by calling
-//!   `tool_search(query="select:NAME")`. Selecting a deferred tool queues its
-//!   schema for the next request's `tools[]`; the queue is one-shot, so unused
-//!   tools do not become session-long schema tax.
+//!   `tool_search(query="select:NAME")`. Selecting a deferred tool makes its
+//!   schema visible in upcoming `tools[]` payloads until the model actually
+//!   calls that tool once.
 //!
 //! The default T1 set is the 13-member coding core (see `DEFAULT_PINNED`).
 //! Users override via `runtime.tool_surface.pinned_tools` in TOML. A name

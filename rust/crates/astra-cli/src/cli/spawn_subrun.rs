@@ -22,10 +22,11 @@ use astra_runtime::{
         StopHookState,
     },
     turn::chat_turn_heuristics::infer_task_execution_profile,
-    turn::tool_schema_prune::openai_tool_names_from_schemas,
     turn::turn_guard::TurnGuard,
 };
-use astra_turn_core::agent_live_event::SharedAgentLiveEventSink;
+use astra_turn_core::{
+    agent_live_event::SharedAgentLiveEventSink, tool::schema::tool_names_from_schemas,
+};
 use serde_json::{Value, json};
 
 use super::chat_stream::StreamEvent;
@@ -435,7 +436,7 @@ impl CliSpawnAgentExecutor {
 impl SpawnAgentExecutor for CliSpawnAgentExecutor {
     async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
         let all_schemas = edge_tools::all_tool_schemas();
-        let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
+        let valid_tool_names = tool_names_from_schemas(&all_schemas);
 
         // Hold a clone for emitting the terminal `AgentTerminated`
         // event after the agentic loop returns. Without this, a

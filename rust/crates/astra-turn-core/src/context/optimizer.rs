@@ -1430,6 +1430,8 @@ mod tests {
                 Just(SectionKind::WorkingMemory),
                 Just(SectionKind::SelfModel),
                 Just(SectionKind::ProjectContext),
+                Just(SectionKind::DeferredTools),
+                Just(SectionKind::AvailableSkills),
                 Just(SectionKind::Memory),
                 Just(SectionKind::Skills),
                 Just(SectionKind::RuntimeIdentity),

@@ -58,6 +58,8 @@ fn bind_section(planned: &PlannedSection, sources: &ContextSources<'_>) -> Bound
         SectionKind::Constraints => bind_constraints(sources),
         SectionKind::SelfModel => bind_self_model(sources),
         SectionKind::ProjectContext => bind_project_context(sources),
+        SectionKind::DeferredTools => bind_deferred_tools(sources),
+        SectionKind::AvailableSkills => bind_available_skills(sources),
         SectionKind::Skills => bind_skills(sources),
         SectionKind::Memory => bind_memory(planned, sources),
         SectionKind::WorkingMemory => bind_working_memory(sources),
@@ -112,41 +114,29 @@ fn bind_self_model(sources: &ContextSources<'_>) -> String {
     sources.session.self_model.clone().unwrap_or_default()
 }
 
-/// Bind project-level session context — cross-session project summaries,
-/// plus (Phase-6) the session-stable `<deferred_tools>` and
-/// `<available_skills>` blocks that let the LLM discover non-pinned
-/// capabilities without busting the cache prefix.
-///
-/// All three blocks are session-scope: stable across a session, cached as
-/// part of the provider prefix. A change to any one flips the cache once
-/// (on registration / skill reload), then stability resumes.
+/// Bind project-level session context — cross-session project summaries.
 fn bind_project_context(sources: &ContextSources<'_>) -> String {
     let ctx = &sources.session.project_context;
-    let deferred = &sources.session.deferred_tools_block;
-    let skills = &sources.session.skill_listing_block;
 
-    let mut out = String::new();
-    if !ctx.is_empty() {
-        out.push_str(
-            "## Cross-Session Project Context\n\
-             Below are summaries of recent sessions in this project. \
-             Use them for continuity — avoid re-asking questions already answered.\n\n",
-        );
-        out.push_str(ctx);
+    if ctx.is_empty() {
+        return String::new();
     }
-    if !deferred.is_empty() {
-        if !out.is_empty() {
-            out.push_str("\n\n");
-        }
-        out.push_str(deferred);
-    }
-    if !skills.is_empty() {
-        if !out.is_empty() {
-            out.push_str("\n\n");
-        }
-        out.push_str(skills);
-    }
-    out
+    format!(
+        "## Cross-Session Project Context\n\
+         Below are summaries of recent sessions in this project. \
+         Use them for continuity — avoid re-asking questions already answered.\n\n\
+         {ctx}"
+    )
+}
+
+/// Bind the session-stable deferred-tools discovery block.
+fn bind_deferred_tools(sources: &ContextSources<'_>) -> String {
+    sources.session.deferred_tools_block.clone()
+}
+
+/// Bind the session-stable available-skills catalog block.
+fn bind_available_skills(sources: &ContextSources<'_>) -> String {
+    sources.session.skill_listing_block.clone()
 }
 
 /// Bind active skills.
@@ -545,20 +535,22 @@ mod tests {
     }
 
     #[test]
-    fn bind_project_context_emits_deferred_tools_block() {
-        // Phase-6: when a deferred-tools listing is present, it rides the
-        // ProjectContext section (session-scope) so the LLM can discover
-        // non-pinned tools via tool_search(select:NAME).
+    fn bind_deferred_tools_returns_manifest_without_project_context_coupling() {
         let mut fixture = test_sources();
-        fixture.session.project_context = String::new();
+        fixture.session.project_context = "prior-session-summary-stub".to_string();
         fixture.session.deferred_tools_block =
             "<deferred_tools>\n  <tool>\n    <name>web_fetch</name>\n    <description>fetch web content</description>\n  </tool>\n</deferred_tools>".to_string();
         let sources = fixture.context();
-        let content = bind_project_context(&sources);
+        let project_context = bind_project_context(&sources);
+        let content = bind_deferred_tools(&sources);
 
         assert!(
+            !project_context.contains("<deferred_tools>"),
+            "ProjectContext must not mix tool discovery into the same cache section"
+        );
+        assert!(
             content.contains("<deferred_tools>"),
-            "deferred_tools block must appear in ProjectContext output; got:\n{content}"
+            "deferred_tools section must preserve the manifest block; got:\n{content}"
         );
         assert!(
             content.contains("<name>web_fetch</name>"),
@@ -567,35 +559,79 @@ mod tests {
     }
 
     #[test]
-    fn bind_project_context_emits_skill_listing_block() {
+    fn bind_available_skills_returns_catalog_without_project_context_coupling() {
         let mut fixture = test_sources();
-        fixture.session.project_context = String::new();
+        fixture.session.project_context = "prior-session-summary-stub".to_string();
         fixture.session.skill_listing_block =
             "<available_skills>\n  <skill>\n    <name>markdown</name>\n    <description>Output Format</description>\n  </skill>\n</available_skills>".to_string();
         let sources = fixture.context();
-        let content = bind_project_context(&sources);
+        let project_context = bind_project_context(&sources);
+        let content = bind_available_skills(&sources);
 
         assert!(
+            !project_context.contains("<available_skills>"),
+            "ProjectContext must not mix skill discovery into the same cache section"
+        );
+        assert!(
             content.contains("<available_skills>"),
-            "skill listing must appear in ProjectContext; got:\n{content}"
+            "available-skills section must preserve the catalog block; got:\n{content}"
         );
     }
 
     #[test]
-    fn bind_project_context_combines_all_three_blocks_in_order() {
+    fn bind_all_keeps_project_deferred_and_skill_catalog_as_ordered_session_sections() {
         let mut fixture = test_sources();
         fixture.session.project_context = "prior-session-summary-stub".to_string();
         fixture.session.deferred_tools_block = "<deferred_tools>x</deferred_tools>".to_string();
         fixture.session.skill_listing_block = "<available_skills>y</available_skills>".to_string();
         let sources = fixture.context();
-        let content = bind_project_context(&sources);
+        let plan_input = crate::context_planner::PlanInput {
+            tokens: &sources.turn.tokens,
+            model_limit: 100_000,
+            recovery: &sources.turn.recovery,
+            latches: sources.latches,
+            stats: sources.stats,
+            provider_policy: &sources.session.provider_policy,
+            has_memory: false,
+            model_id: &sources.session.model_id,
+            query_source: "repl",
+        };
+        let mut plan = plan_turn(&plan_input);
+        plan.sections.retain(|section| {
+            matches!(
+                section.kind,
+                SectionKind::ProjectContext
+                    | SectionKind::DeferredTools
+                    | SectionKind::AvailableSkills
+            )
+        });
+        let bound = bind_all(&plan, &sources);
 
-        let i_ctx = content.find("prior-session-summary-stub").unwrap();
-        let i_def = content.find("<deferred_tools>").unwrap();
-        let i_sk = content.find("<available_skills>").unwrap();
-        assert!(
-            i_ctx < i_def && i_def < i_sk,
-            "expected order: project_context < deferred_tools < skills; got {content}"
+        let kinds: Vec<SectionKind> = bound
+            .sections
+            .iter()
+            .map(|section| section.plan.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                SectionKind::ProjectContext,
+                SectionKind::DeferredTools,
+                SectionKind::AvailableSkills,
+            ],
+            "session-stable discovery blocks must remain independently traceable and ordered"
+        );
+        assert_eq!(
+            bound.sections[0].artifact.text().unwrap(),
+            "## Cross-Session Project Context\nBelow are summaries of recent sessions in this project. Use them for continuity — avoid re-asking questions already answered.\n\nprior-session-summary-stub"
+        );
+        assert_eq!(
+            bound.sections[1].artifact.text().unwrap(),
+            "<deferred_tools>x</deferred_tools>"
+        );
+        assert_eq!(
+            bound.sections[2].artifact.text().unwrap(),
+            "<available_skills>y</available_skills>"
         );
     }
 

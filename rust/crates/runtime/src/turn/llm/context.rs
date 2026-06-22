@@ -1077,8 +1077,13 @@ pub(crate) fn assemble_wire_messages(input: LlmWireAssemblyInput<'_>) -> Vec<Val
 pub(crate) fn annotate_tool_schemas_for_cache(
     tool_schemas: &mut [Value],
     cache_cfg: &PromptCacheConfig,
+    pinned_names: &std::collections::HashSet<String>,
 ) {
-    crate::turn::prompt_cache::annotate_tool_schemas_for_caching(tool_schemas, cache_cfg);
+    crate::turn::prompt_cache::annotate_tool_schemas_for_caching_with_pinned(
+        tool_schemas,
+        cache_cfg,
+        pinned_names,
+    );
 }
 
 pub(crate) fn stabilize_tool_schemas_for_cache(

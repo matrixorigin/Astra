@@ -30,6 +30,17 @@ pub const EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW: &str = "deferred_tools
 /// resolve deferred names without re-parsing the rendered XML.
 pub const EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES: &str = "deferred_tool_names";
 
+/// Protocol key carrying the JSON array of pinned (T1) tool names from the
+/// CLI-side [`ToolSurface`]. The runtime uses this to place cache_control
+/// markers at the correct pinned/dynamic boundary so the Anthropic prompt
+/// cache prefix stays correct when the user overrides the default pinned set
+/// in TOML (`runtime.tool_surface.pinned_tools`).
+///
+/// Without this key, the runtime falls back to a compile-time constant that
+/// does not reflect user overrides, causing cache-prefix drift and ~500+ token
+/// cache misses per turn.
+pub const EDGE_PROFILE_KEY_PINNED_TOOL_NAMES: &str = "pinned_tool_names";
+
 /// `git rev-parse --abbrev-ref HEAD` for edge_profile (best-effort).
 pub fn read_git_branch_abbrev() -> Option<String> {
     std::process::Command::new("git")

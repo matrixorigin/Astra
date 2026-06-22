@@ -14,7 +14,11 @@ pub struct SelectionReport {
     pub dynamic_tools_selected: Vec<String>,
     /// Number of tools selected.
     pub selected_count: u32,
-    /// Token budget used by selected dynamic tools.
+    /// Token cost used by the selected tools in this report.
+    ///
+    /// Final payload reports use the full visible tool surface so this field
+    /// has the same denominator as `selected_count`. Selector-internal reports
+    /// may use the dynamic subset while the surface is still being assembled.
     pub budget_used: u32,
     /// Token budget that was available.
     pub budget_total: u32,

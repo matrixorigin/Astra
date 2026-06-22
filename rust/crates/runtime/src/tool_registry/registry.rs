@@ -129,23 +129,23 @@ impl ToolRegistry {
         index: &std::collections::HashMap<String, usize>,
         surface_cfg: Option<&ToolSurfaceConfig>,
     ) -> Vec<(String, Value)> {
-        if let Some(cfg) = surface_cfg {
-            return super::surface::ToolSurface::build(schemas.to_vec(), cfg, &[])
-                .pinned_schemas()
-                .into_iter()
-                .filter_map(|schema| {
-                    let name = tool_schema_name(&schema).map(str::to_string);
-                    name.map(|name| (name, schema))
+        let default_cfg;
+        let cfg = match surface_cfg {
+            Some(cfg) => cfg,
+            None => {
+                default_cfg = ToolSurfaceConfig::default();
+                &default_cfg
+            }
+        };
+        super::surface::ToolSurface::build(schemas.to_vec(), cfg, &[])
+            .pinned_schemas()
+            .into_iter()
+            .filter_map(|schema| {
+                let name = tool_schema_name(&schema).map(str::to_string);
+                name.and_then(|name| {
+                    index.get(&name)?;
+                    Some((name, schema))
                 })
-                .collect();
-        }
-        TOOL_CATALOG
-            .iter()
-            .filter(|t| t.pinned)
-            .filter_map(|t| {
-                index
-                    .get(t.name)
-                    .map(|&i| (t.name.to_string(), schemas[i].clone()))
             })
             .collect()
     }
@@ -165,6 +165,15 @@ impl ToolRegistry {
     /// and allocation-free per call.
     fn pinned_name_set(&self) -> &std::collections::HashSet<String> {
         &self.pinned_name_cache
+    }
+
+    /// Return the resolved pinned tool names in stable order for cross-crate
+    /// wire metadata. The internal cache remains a set because hot-path
+    /// membership checks should stay O(1).
+    pub fn pinned_tool_names_sorted(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.pinned_name_cache.iter().cloned().collect();
+        names.sort();
+        names
     }
 
     fn dynamic_budget_used_for_names(&self, names: &[String]) -> u32 {
@@ -593,16 +602,6 @@ impl ToolRegistry {
         TOOL_CATALOG.iter().find(|t| t.name == name)
     }
 
-    /// Count of pinned tools.
-    pub fn pinned_count() -> usize {
-        TOOL_CATALOG.iter().filter(|t| t.pinned).count()
-    }
-
-    /// Count of dynamic (selectable) tools.
-    pub fn dynamic_count() -> usize {
-        TOOL_CATALOG.iter().filter(|t| !t.pinned).count()
-    }
-
     /// Register plugin tools from a PluginRegistry.
     ///
     /// Post-Phase-5 contract:
@@ -835,6 +834,15 @@ mod tests {
 
         assert!(pinned_names.iter().any(|name| name == "github"));
         assert!(!pinned_names.iter().any(|name| name == "grep"));
+        assert_eq!(
+            reg.pinned_tool_names_sorted(),
+            {
+                let mut names = pinned_names.clone();
+                names.sort();
+                names
+            },
+            "cross-crate pinned metadata must be stable and reflect runtime overrides"
+        );
     }
 
     #[test]

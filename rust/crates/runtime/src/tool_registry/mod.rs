@@ -74,13 +74,23 @@ mod tests {
     }
 
     #[test]
-    fn catalog_pinned_count_matches_runtime_default_catalog_core() {
-        assert_eq!(ToolRegistry::pinned_count(), 11);
-    }
-
-    #[test]
-    fn catalog_dynamic_count_matches_unpinned_tools() {
-        assert_eq!(ToolRegistry::dynamic_count(), 23);
+    fn catalog_pinned_metadata_matches_default_pinned_catalog_subset() {
+        let catalog_names: std::collections::HashSet<&str> =
+            TOOL_CATALOG.iter().map(|tool| tool.name).collect();
+        let expected: std::collections::HashSet<&str> = surface::DEFAULT_PINNED
+            .iter()
+            .copied()
+            .filter(|name| catalog_names.contains(name))
+            .collect();
+        let actual: std::collections::HashSet<&str> = TOOL_CATALOG
+            .iter()
+            .filter(|tool| tool.pinned)
+            .map(|tool| tool.name)
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "catalog pinned metadata is only a catalog subset mirror; the runtime ToolSurface remains the source of truth"
+        );
     }
 
     #[test]
@@ -294,7 +304,7 @@ mod tests {
             names.contains(&"read_file".to_string()),
             "non-conversational zero-budget query must still include pinned read_file"
         );
-        assert_eq!(names.len(), ToolRegistry::pinned_count());
+        assert_eq!(names.len(), registry.pinned_tool_names_sorted().len());
     }
 
     #[test]
@@ -302,7 +312,7 @@ mod tests {
         let registry = ToolRegistry::new(mock_schemas());
         // Very small budget — should include fewer dynamic tools
         let result = registry.select_with_budget("最新的pr?", 1, 50);
-        let total_dynamic = result.len() - ToolRegistry::pinned_count();
+        let total_dynamic = result.len() - registry.pinned_tool_names_sorted().len();
         assert!(
             total_dynamic <= 2,
             "50 token budget should fit ≤2 dynamic tools, got {}",
@@ -476,7 +486,7 @@ mod tests {
         let registry = ToolRegistry::new(schemas);
         let selected = registry.select_with_budget("matrixorigin memoria 最新的pr?", 1, 0);
         // Pinned tools are budget-exempt, always included
-        assert_eq!(selected.len(), ToolRegistry::pinned_count());
+        assert_eq!(selected.len(), registry.pinned_tool_names_sorted().len());
     }
 
     // ── TF-IDF scoring ──
@@ -787,8 +797,8 @@ mod tests {
             registry.select_with_quality("show me the PRs", 2, 800, &[], Some(&tracker));
 
         // Basic sanity: both should include pinned tools
-        assert!(without.len() >= ToolRegistry::pinned_count());
-        assert!(with.len() >= ToolRegistry::pinned_count());
+        assert!(without.len() >= registry.pinned_tool_names_sorted().len());
+        assert!(with.len() >= registry.pinned_tool_names_sorted().len());
 
         // Report should be well-formed
         assert!(report_without.budget_total == 800);
@@ -933,7 +943,7 @@ mod tests {
         // Use a very small budget — should still include pinned + at most 1 dynamic
         let (schemas, report) = reg.select_with_report("list PRs", 1, 1);
         assert!(
-            schemas.len() >= ToolRegistry::pinned_count(),
+            schemas.len() >= reg.pinned_tool_names_sorted().len(),
             "should always include pinned tools even with tiny budget"
         );
         assert!(report.budget_used <= 1 || report.budget_used == 0);
@@ -944,13 +954,11 @@ mod tests {
         let reg = ToolRegistry::new(mock_schemas());
         let (schemas, _) = reg.select_with_report("hello there", 1, 2000);
         let names = ToolRegistry::selected_names(&schemas);
+        let pinned: std::collections::HashSet<String> =
+            reg.pinned_tool_names_sorted().into_iter().collect();
         let dynamic: Vec<_> = names
             .iter()
-            .filter(|n| {
-                !TOOL_CATALOG
-                    .iter()
-                    .any(|t| t.pinned && t.name == n.as_str())
-            })
+            .filter(|name| !pinned.contains(name.as_str()))
             .collect();
         assert!(
             dynamic.is_empty(),

@@ -143,6 +143,10 @@ pub enum SectionKind {
     SelfModel,
     /// §3 — workspace rules, conventions.
     ProjectContext,
+    /// Session-stable deferred tool discovery manifest.
+    DeferredTools,
+    /// Session-stable available skill catalog.
+    AvailableSkills,
     /// §4 — semantic + episodic recall.
     Memory,
     /// §5 — scratchpad, active plan.
@@ -189,6 +193,8 @@ impl SectionKind {
             Self::Identity,
             Self::SelfModel,
             Self::ProjectContext,
+            Self::DeferredTools,
+            Self::AvailableSkills,
             Self::Memory,
             Self::WorkingMemory,
             Self::History,
@@ -223,6 +229,8 @@ impl SectionKind {
             // Remaining variants participate in the remainder distribution.
             Self::SelfModel
             | Self::ProjectContext
+            | Self::DeferredTools
+            | Self::AvailableSkills
             | Self::WorkingMemory
             | Self::Skills
             | Self::RuntimeIdentity
@@ -237,12 +245,14 @@ impl SectionKind {
             Self::Identity | Self::Constraints => 0,
             Self::SelfModel => 1,
             Self::ProjectContext => 2,
-            Self::Skills => 3,
-            Self::RuntimeIdentity => 4, // session-stable; sits with Session blocks
-            Self::Memory | Self::EmergentMemory => 5,
-            Self::WorkingMemory | Self::EmergentSkills | Self::EmergentSummary => 6,
-            Self::History => 7,
-            Self::RuntimeVolatile => 8, // turn-volatile; latest in the prompt
+            Self::DeferredTools => 3,
+            Self::AvailableSkills => 4,
+            Self::Skills => 5,
+            Self::RuntimeIdentity => 6, // session-stable; sits with Session blocks
+            Self::Memory | Self::EmergentMemory => 7,
+            Self::WorkingMemory | Self::EmergentSkills | Self::EmergentSummary => 8,
+            Self::History => 9,
+            Self::RuntimeVolatile => 10, // turn-volatile; latest in the prompt
         }
     }
 
@@ -269,6 +279,8 @@ impl SectionKind {
             | Self::Constraints
             | Self::SelfModel
             | Self::ProjectContext
+            | Self::DeferredTools
+            | Self::AvailableSkills
             | Self::Skills
             | Self::RuntimeIdentity => false,
             // Mutate per-turn — must sit post-boundary.
@@ -351,6 +363,8 @@ impl SectionArtifact {
             SectionKind::History => Self::HistorySummary(text),
             SectionKind::SelfModel
             | SectionKind::ProjectContext
+            | SectionKind::DeferredTools
+            | SectionKind::AvailableSkills
             | SectionKind::WorkingMemory
             | SectionKind::Skills
             | SectionKind::RuntimeIdentity
