@@ -588,7 +588,8 @@ fn check_bash_sensitive_path_boundary(
         }
         PathSensitivity::InternalArtifactReadOnly(_) => {
             return Some(format!(
-                "Sandbox: Path '{}' is blocked as an internal runtime artifact path",
+                "Sandbox: Path '{}' is blocked as an internal runtime artifact path. \
+                 Use the `read_file` tool instead of bash to read session artifacts.",
                 hit.token
             ));
         }
