@@ -13,13 +13,124 @@ pub fn build_stream_error_event(message: &str, code: &str, retryable: bool) -> M
     ])
 }
 
+/// Configuration for a single error kind: the SSE error code, whether it is retryable,
+/// and the retry-after delay (if any).
+struct ErrorKindConfig {
+    code: &'static str,
+    retryable: bool,
+    retry_after_ms: Option<i64>,
+    /// When set, this fixed message overrides the caller-provided message.
+    fixed_message: Option<&'static str>,
+}
+
+const ERROR_KIND_TABLE: &[(&[&str], ErrorKindConfig)] = &[
+    (
+        &["permission"],
+        ErrorKindConfig {
+            code: "MODEL_NOT_AVAILABLE",
+            retryable: false,
+            retry_after_ms: None,
+            fixed_message: None,
+        },
+    ),
+    (
+        &["budget", "budget_exhausted"],
+        ErrorKindConfig {
+            code: "BUDGET_EXCEEDED",
+            retryable: false,
+            retry_after_ms: None,
+            fixed_message: None,
+        },
+    ),
+    (
+        &["auth"],
+        ErrorKindConfig {
+            code: "AUTH_ERROR",
+            retryable: false,
+            retry_after_ms: None,
+            fixed_message: None,
+        },
+    ),
+    (
+        &["rate_limit"],
+        ErrorKindConfig {
+            code: "LLM_RATE_LIMIT",
+            retryable: true,
+            retry_after_ms: Some(5000),
+            fixed_message: None,
+        },
+    ),
+    (
+        &["timeout", "stream_idle", "tool_timeout"],
+        ErrorKindConfig {
+            code: "LLM_TIMEOUT",
+            retryable: true,
+            retry_after_ms: Some(2000),
+            fixed_message: None,
+        },
+    ),
+    (
+        &["server", "server_error"],
+        ErrorKindConfig {
+            code: "SERVER_ERROR",
+            retryable: true,
+            retry_after_ms: Some(1000),
+            fixed_message: None,
+        },
+    ),
+    (
+        &["transport", "stream_transport", "network"],
+        ErrorKindConfig {
+            code: "LLM_TRANSPORT_ERROR",
+            retryable: true,
+            retry_after_ms: Some(2000),
+            fixed_message: Some("LLM provider connection failed. Please retry."),
+        },
+    ),
+    (
+        &["context_window"],
+        ErrorKindConfig {
+            code: "CONTEXT_WINDOW_EXCEEDED",
+            retryable: false,
+            retry_after_ms: None,
+            fixed_message: None,
+        },
+    ),
+    (
+        &["invalid_request"],
+        ErrorKindConfig {
+            code: "LLM_INVALID_REQUEST",
+            retryable: false,
+            retry_after_ms: None,
+            fixed_message: None,
+        },
+    ),
+];
+
+fn lookup_error_kind(kind: &str) -> ErrorKindConfig {
+    for (aliases, config) in ERROR_KIND_TABLE {
+        if aliases.contains(&kind) {
+            return ErrorKindConfig {
+                fixed_message: config.fixed_message,
+                ..*config
+            };
+        }
+    }
+    ErrorKindConfig {
+        code: "INTERNAL_ERROR",
+        retryable: false,
+        retry_after_ms: None,
+        fixed_message: None,
+    }
+}
+
 pub fn build_runtime_error_event(
     message: Value,
     error_kind: Option<&str>,
     http_status_code: Option<u16>,
     http_detail: Option<Value>,
 ) -> Map<String, Value> {
-    let mut event = if let Some(status_code) = http_status_code {
+    if let Some(status_code) = http_status_code {
         let code = match status_code {
             401 => "AUTH_ERROR",
             403 => "AUTH_ERROR",
@@ -27,76 +138,29 @@ pub fn build_runtime_error_event(
             422 => "VALIDATION_ERROR",
             _ => "INTERNAL_ERROR",
         };
-        let detail = http_detail.unwrap_or(message);
-        Map::from_iter([
-            ("type".to_string(), Value::String("error".to_string())),
-            ("message".to_string(), detail),
-            ("code".to_string(), Value::String(code.to_string())),
-            ("retryable".to_string(), Value::Bool(false)),
-        ])
+        if let Some(detail) = http_detail {
+            // HTTP detail overrides the message with the full response body
+            // so clients can surface structured error information.
+            Map::from_iter([
+                ("type".to_string(), Value::String("error".to_string())),
+                ("message".to_string(), detail),
+                ("code".to_string(), Value::String(code.to_string())),
+                ("retryable".to_string(), Value::Bool(false)),
+            ])
+        } else {
+            build_stream_error_event(message.as_str().unwrap_or_default(), code, false)
+        }
     } else {
-        match error_kind.unwrap_or("internal") {
-            "permission" => build_stream_error_event(
-                message.as_str().unwrap_or_default(),
-                "MODEL_NOT_AVAILABLE",
-                false,
-            ),
-            "budget" | "budget_exhausted" => build_stream_error_event(
-                message.as_str().unwrap_or_default(),
-                "BUDGET_EXCEEDED",
-                false,
-            ),
-            "auth" => {
-                build_stream_error_event(message.as_str().unwrap_or_default(), "AUTH_ERROR", false)
-            }
-            "rate_limit" => build_stream_error_event(
-                message.as_str().unwrap_or_default(),
-                "LLM_RATE_LIMIT",
-                true,
-            ),
-            "timeout" | "stream_idle" | "tool_timeout" => {
-                build_stream_error_event(message.as_str().unwrap_or_default(), "LLM_TIMEOUT", true)
-            }
-            "server" | "server_error" => {
-                build_stream_error_event(message.as_str().unwrap_or_default(), "SERVER_ERROR", true)
-            }
-            "transport" | "stream_transport" | "network" => build_stream_error_event(
-                "LLM provider connection failed. Please retry.",
-                "LLM_TRANSPORT_ERROR",
-                true,
-            ),
-            "context_window" => build_stream_error_event(
-                message.as_str().unwrap_or_default(),
-                "CONTEXT_WINDOW_EXCEEDED",
-                false,
-            ),
-            "invalid_request" => build_stream_error_event(
-                message.as_str().unwrap_or_default(),
-                "LLM_INVALID_REQUEST",
-                false,
-            ),
-            _ => build_stream_error_event(
-                message.as_str().unwrap_or_default(),
-                "INTERNAL_ERROR",
-                false,
-            ),
+        let cfg = lookup_error_kind(error_kind.unwrap_or("internal"));
+        let msg = cfg
+            .fixed_message
+            .unwrap_or_else(|| message.as_str().unwrap_or_default());
+        let mut ev = build_stream_error_event(msg, cfg.code, cfg.retryable);
+        if let Some(retry_after) = cfg.retry_after_ms {
+            ev.insert("retry_after_ms".to_string(), Value::from(retry_after));
         }
-    };
-
-    match error_kind {
-        Some("rate_limit") => {
-            event.insert("retry_after_ms".to_string(), Value::from(5000));
-        }
-        Some("timeout" | "stream_idle" | "tool_timeout")
-        | Some("transport" | "stream_transport" | "network") => {
-            event.insert("retry_after_ms".to_string(), Value::from(2000));
-        }
-        Some("server" | "server_error") => {
-            event.insert("retry_after_ms".to_string(), Value::from(1000));
-        }
-        _ => {}
+        ev
     }
-    event
 }
 
 pub fn build_firewall_warning_event(claims_failed: i64) -> Map<String, Value> {
@@ -297,15 +361,66 @@ pub fn build_tool_request_event(tool_call: &Map<String, Value>) -> Map<String, V
     ])
 }
 
+fn normalized_result_status(result: &Value) -> Option<String> {
+    // Case 1: result is a JSON object with an explicit "status" field
+    if let Some(status) = result
+        .as_object()
+        .and_then(|obj| obj.get("status"))
+        .and_then(Value::as_str)
+    {
+        return Some(status.trim().to_ascii_lowercase());
+    }
+
+    // Case 2: result is a JSON string — try parsing it
+    let text = result.as_str()?.trim();
+    if let Ok(parsed) = serde_json::from_str::<Value>(text)
+        && let Some(obj) = parsed.as_object()
+    {
+        if let Some(status) = obj.get("status").and_then(Value::as_str) {
+            return Some(status.trim().to_ascii_lowercase());
+        }
+        if obj.get("error").is_some() {
+            return Some("failed".to_string());
+        }
+    }
+    None
+}
+
+fn result_status_is_success(status: &str) -> bool {
+    status == "completed"
+}
+
+fn canonical_result_status(status: &str) -> String {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "completed" => "completed".to_string(),
+        "failed" => "failed".to_string(),
+        "skipped" => "skipped".to_string(),
+        _ => "failed".to_string(),
+    }
+}
+
 pub fn build_tool_call_end_event(call_id: &str, result: Value) -> Map<String, Value> {
-    Map::from_iter([
+    let status = normalized_result_status(&result);
+    let mut event = Map::from_iter([
         (
             "type".to_string(),
             Value::String("tool_call_end".to_string()),
         ),
         ("call_id".to_string(), Value::String(call_id.to_string())),
         ("result".to_string(), result),
-    ])
+    ]);
+    if let Some(status) = status {
+        let status = canonical_result_status(&status);
+        event.insert("status".to_string(), Value::String(status.clone()));
+        event.insert(
+            "success".to_string(),
+            Value::Bool(result_status_is_success(&status)),
+        );
+        if status == "skipped" {
+            event.insert("skipped".to_string(), Value::Bool(true));
+        }
+    }
+    event
 }
 
 #[cfg(test)]
@@ -426,6 +541,37 @@ mod tests {
         );
         assert_eq!(ev.get("call_id").and_then(Value::as_str), Some("call_abc"));
         assert_eq!(ev.get("result").and_then(Value::as_str), Some("ok"));
+    }
+
+    #[test]
+    fn tool_call_end_event_projects_status_from_result_body() {
+        let skipped = build_tool_call_end_event(
+            "call_skip",
+            Value::String(r#"{"status":"skipped","message":"Duplicate call skipped"}"#.to_string()),
+        );
+        assert_eq!(
+            skipped.get("status").and_then(Value::as_str),
+            Some("skipped")
+        );
+        assert_eq!(skipped.get("success").and_then(Value::as_bool), Some(false));
+        assert_eq!(skipped.get("skipped").and_then(Value::as_bool), Some(true));
+
+        let denied = build_tool_call_end_event(
+            "call_deny",
+            Value::String(r#"{"error":"user_denied","reason":"policy"}"#.to_string()),
+        );
+        assert_eq!(denied.get("status").and_then(Value::as_str), Some("failed"));
+        assert_eq!(denied.get("success").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn tool_call_end_event_rejects_legacy_success_alias() {
+        let ev = build_tool_call_end_event(
+            "call_alias",
+            Value::String(r#"{"status":"success","message":"old alias"}"#.to_string()),
+        );
+        assert_eq!(ev.get("status").and_then(Value::as_str), Some("failed"));
+        assert_eq!(ev.get("success").and_then(Value::as_bool), Some(false));
     }
 
     // --- edge cases ---

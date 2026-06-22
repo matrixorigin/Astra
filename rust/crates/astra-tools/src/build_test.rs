@@ -9,7 +9,6 @@
 //! Enables automated change→test→fix cycles by providing structured feedback.
 
 #![allow(dead_code)]
-use crate::tool_result_status::tool_result_status_is_success;
 use regex::Regex;
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -1561,7 +1560,8 @@ fn parse_cargo_output(output: &str, exit_code: Option<i32>, truncated: bool) -> 
             .and_then(|m| m.as_str().parse().ok())
             .unwrap_or(0);
 
-        result.passed = tool_result_status_is_success(status);
+        result.passed =
+            status == "ok" && result.tests_failed == 0 && exit_code.map(|c| c == 0).unwrap_or(true);
         result.summary = format!(
             "{} passed, {} failed",
             result.tests_passed, result.tests_failed

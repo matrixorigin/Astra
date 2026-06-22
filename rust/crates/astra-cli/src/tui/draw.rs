@@ -995,7 +995,7 @@ mod task_board_draw_tests {
         widget.handle_event(chat_widget::AppEvent::Wire(WireEvent::ToolCompleted {
             name: "agent".into(),
             description: "Get agent result: reviewer@abc".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 50,
             output_summary: None,
             output: Some(

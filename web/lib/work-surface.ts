@@ -1,4 +1,5 @@
-import type { WorkspaceBinding, ExecutorBinding } from "@astra/sdk";
+import type { WorkspaceBinding, ExecutorBinding, ToolStatus } from "@astra/sdk";
+import { extractEventStatus } from "@astra/sdk";
 import {
   blockedRunMessage,
   runWaitingStatusMessage,
@@ -40,7 +41,7 @@ export type ToolSurfaceItem = {
   tool: string;
   arguments?: string;
   result?: string;
-  status: "running" | "done" | "error" | "cancelled";
+  status: ToolStatus;
   errorKind?: string;
   blocked?: boolean;
   workspace?: WorkspaceBinding;
@@ -610,15 +611,10 @@ function finishToolTransport(
   if (!callId) return state;
   const isFailure =
     event.type === "tool_transport_failed" || event.success === false;
-  const cancelled = eventIsCancelled(event);
   const result = stringifyMaybe(event.error ?? event.result);
   const durationMs = numberField(event, "duration_ms");
   const timestamp = timestampFromEvent(event);
-  const status: ToolSurfaceItem["status"] = cancelled
-    ? "cancelled"
-    : isFailure
-      ? "error"
-      : "done";
+  const status = terminalToolStatus(event, isFailure);
   const tools = capToolSurfaceItems(
     upsertList(state.tools, callId, "callId", (existing) => ({
       ...existing,
@@ -652,11 +648,7 @@ function finishToolCall(
   const callId = stringField(event, "call_id");
   if (!callId) return state;
   const result = stringifyMaybe(event.result);
-  const status: ToolSurfaceItem["status"] = eventIsCancelled(event)
-    ? "cancelled"
-    : event.success === false
-      ? "error"
-      : "done";
+  const status = terminalToolStatus(event, event.success === false);
   const durationMs = numberField(event, "duration_ms");
   const tools = capToolSurfaceItems(
     upsertList(state.tools, callId, "callId", (existing) => ({
@@ -697,6 +689,37 @@ function finishToolCall(
     event,
   );
   return applyAgentWaitingFromToolEvent(next, event);
+}
+
+function terminalToolStatus(
+  event: Record<string, unknown>,
+  isFailure: boolean,
+): ToolSurfaceItem["status"] {
+  // Error conditions take priority (consistent with SDK toolTerminalStatus)
+  if (isFailure) return "error";
+
+  const rawStatus = extractEventStatus(
+    event as Parameters<typeof extractEventStatus>[0],
+  );
+  if (
+    rawStatus === "error" ||
+    rawStatus === "failed" ||
+    rawStatus === "timed_out"
+  ) {
+    return "error";
+  }
+
+  // Cancelled is a user-initiated status (work-surface specific)
+  if (eventIsCancelled(event)) {
+    return "cancelled";
+  }
+
+  // Skipped is a protective dedup status, not an error
+  if (rawStatus === "skipped" || booleanField(event, "skipped") === true) {
+    return "skipped";
+  }
+
+  return "done";
 }
 
 function upsertAgent(

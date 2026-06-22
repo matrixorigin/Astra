@@ -3925,7 +3925,7 @@ mod tests {
             "/remote-skill",
             post(|Json(_body): Json<Value>| async move {
                 Json(serde_json::json!({
-                    "status": "ok"
+                    "status": "completed"
                 }))
             }),
         );

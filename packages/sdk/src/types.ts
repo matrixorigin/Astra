@@ -217,7 +217,9 @@ export type ToolCallEndEvent = {
   type: "tool_call_end";
   call_id: string;
   result?: string;
+  status?: string;
   success?: boolean;
+  skipped?: boolean;
   duration_ms?: number;
   error_kind?: string;
   blocked?: boolean;
@@ -438,7 +440,9 @@ export type ToolTransportCompletedEvent = {
   call_id: string;
   tool?: string;
   result?: unknown;
+  status?: string;
   success?: boolean;
+  skipped?: boolean;
   duration_ms?: number;
 } & ExecutionBindingFields;
 
@@ -447,8 +451,10 @@ export type ToolTransportFailedEvent = {
   call_id: string;
   tool?: string;
   error?: string;
+  status?: string;
   error_kind?: string;
   blocked?: boolean;
+  skipped?: boolean;
   success?: false;
   duration_ms?: number;
 } & ExecutionBindingFields;
@@ -597,12 +603,14 @@ export type ConnectionState =
 
 export type ChatRole = "user" | "assistant" | "system";
 
+export type ToolStatus = "running" | "done" | "error" | "cancelled" | "skipped";
+
 export type ToolCall = {
   callId: string;
   tool: string;
   arguments?: string;
   result?: string;
-  status: "running" | "done" | "error";
+  status: ToolStatus;
   errorKind?: string;
   blocked?: boolean;
   workspace?: WorkspaceBinding;

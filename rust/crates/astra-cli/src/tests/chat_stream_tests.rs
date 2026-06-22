@@ -1,5 +1,5 @@
 use super::spawn_mock;
-use crate::cli::chat_stream::{ChatTurnParams, stream_chat_sse};
+use crate::cli::chat_stream::{ChatTurnParams, DEFAULT_TURN_INDEX, stream_chat_sse};
 use crate::cli::idle_agent_messages::drain_root_mailbox_into_idle_queue;
 use crate::cli::permission_manager::PermissionManager;
 use crate::cli::session::session_state::{ExplainMode, SessionState};
@@ -105,7 +105,7 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
-        turn_index: 0,
+        turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
         consecutive_context_window_errors: 0,
@@ -141,8 +141,8 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
     assert!(
         events
             .iter()
-            .any(|e| e.step_id == "sess-step-adopt-turn-0-step-0"),
-        "expected step_id sess-step-adopt-turn-0-step-0, found: {:?}",
+            .any(|e| e.step_id == "sess-step-adopt-turn-1-step-0"),
+        "expected step_id sess-step-adopt-turn-1-step-0, found: {:?}",
         events.iter().map(|e| &e.step_id).collect::<Vec<_>>()
     );
     assert!(
@@ -225,7 +225,7 @@ async fn stream_chat_sse_simple_text_response() {
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
-        turn_index: 0,
+        turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
         consecutive_context_window_errors: 0,
@@ -338,7 +338,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
-        turn_index: 0,
+        turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
         consecutive_context_window_errors: 0,
@@ -455,7 +455,7 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             bg_task_commands: None,
             bg_task_list_cache: None,
             bash_detach_slot: None,
-            turn_index: 0,
+            turn_index: DEFAULT_TURN_INDEX,
             pipeline_state: None,
             compaction_state: None,
             consecutive_context_window_errors: 0,
@@ -564,7 +564,7 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
-        turn_index: 0,
+        turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
         consecutive_context_window_errors: 0,
@@ -701,7 +701,7 @@ async fn stream_chat_sse_api_error_propagated() {
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
-        turn_index: 0,
+        turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
         consecutive_context_window_errors: 0,
@@ -814,7 +814,7 @@ async fn stream_chat_sse_with_tool_call_loop() {
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
-        turn_index: 0,
+        turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
         consecutive_context_window_errors: 0,
@@ -950,7 +950,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
-        turn_index: 0,
+        turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
         consecutive_context_window_errors: 0,
@@ -1129,7 +1129,7 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
-        turn_index: 0,
+        turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
         consecutive_context_window_errors: 0,
@@ -1291,7 +1291,7 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
-        turn_index: 0,
+        turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
         consecutive_context_window_errors: 0,

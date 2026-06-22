@@ -268,6 +268,36 @@ describe("useAstraChat", () => {
     expect(result.current.toolCalls[0].result).toBe("file1\nfile2");
   });
 
+  test("preserves skipped tool_call_end status", () => {
+    const { client, streamChatMock } = createMockClient();
+    mockStreamEvents(streamChatMock, [
+      {
+        type: "tool_call_start",
+        call_id: "tc-skip",
+        tool: "read_file",
+        arguments: '{"path":"README.md"}',
+      } as StreamEvent,
+      {
+        type: "tool_call_end",
+        call_id: "tc-skip",
+        status: "skipped",
+        skipped: true,
+        success: true,
+        result: "Duplicate call skipped.",
+      } as StreamEvent,
+    ]);
+
+    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+
+    act(() => {
+      result.current.sendMessage("read twice");
+    });
+
+    expect(result.current.toolCalls).toHaveLength(1);
+    expect(result.current.toolCalls[0].status).toBe("skipped");
+    expect(result.current.toolCalls[0].result).toBe("Duplicate call skipped.");
+  });
+
   test("projects raw tool_call and transport lifecycle into one bound tool card", () => {
     const { client, streamChatMock } = createMockClient();
     mockStreamEvents(streamChatMock, [

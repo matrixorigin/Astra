@@ -269,7 +269,11 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
                                     // Cross-pod: also deliver result via dispatch table
                                     // so other pods' turn bridges waiting on wait_result() can see it.
                                     let dispatch_svc = &state.execution.edge_dispatch_service;
-                                    let status = if is_error { "error".to_string() } else { "success".to_string() };
+                                    let status = if is_error {
+                                        "failed".to_string()
+                                    } else {
+                                        "completed".to_string()
+                                    };
                                     let duration = duration_ms.unwrap_or(0);
                                     let tool_result = astra_thin_client::ToolResultRequest::new_with_hash(
                                         request_id.clone(),
@@ -291,11 +295,11 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
                                             // Fallback: use serde_json to build valid JSON safely.
                                             serde_json::to_string(&serde_json::json!({
                                                 "request_id": request_id,
-                                                "status": "error",
+                                                "status": "failed",
                                                 "output": "serialization failed",
                                                 "duration_ms": 0,
                                             }))
-                                            .unwrap_or_else(|_| r#"{"status":"error","output":"serialization failed"}"#.to_string())
+                                            .unwrap_or_else(|_| r#"{"status":"failed","output":"serialization failed"}"#.to_string())
                                         }
                                     };
                                     if let Err(e) = dispatch_svc

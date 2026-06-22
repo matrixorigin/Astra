@@ -1266,6 +1266,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         let mut term_adapter = HostTerminalAdapter(host);
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index,
+            session_turn: session_turn_number(state),
             quiet: headless_quiet,
             api: &state.api,
             token: &state.api_token,

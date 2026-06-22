@@ -984,7 +984,7 @@ async fn execute_mock_tool_turn(
             case_name,
             step.request_id
         );
-        let status = post_tool_result(app, step.request_id, step.result_output, "success").await;
+        let status = post_tool_result(app, step.request_id, step.result_output, "completed").await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -1613,7 +1613,7 @@ async fn edge_tool_delivery_emits_tool_request_and_waits_for_result() {
     wait_for_sse(&mut rx, "tool_request", 5).await;
 
     // Post tool result to the ledger.
-    let status = post_tool_result(&app, "tc-read-1", "hello world", "ok").await;
+    let status = post_tool_result(&app, "tc-read-1", "hello world", "completed").await;
     assert_eq!(status, StatusCode::OK);
 
     // Wait for the stream to complete.
@@ -1689,9 +1689,9 @@ async fn multiple_tool_calls_in_single_round() {
     // Wait for tool_request before posting results for both tool calls.
     wait_for_sse(&mut rx, "tool_request", 5).await;
 
-    let s1 = post_tool_result(&app, "tc-1", "content of a.txt", "ok").await;
+    let s1 = post_tool_result(&app, "tc-1", "content of a.txt", "completed").await;
     assert_eq!(s1, StatusCode::OK);
-    let s2 = post_tool_result(&app, "tc-2", "content of b.txt", "ok").await;
+    let s2 = post_tool_result(&app, "tc-2", "content of b.txt", "completed").await;
     assert_eq!(s2, StatusCode::OK);
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -1780,11 +1780,11 @@ async fn multi_round_tool_execution() {
 
     // Post results as tool_request events are emitted.
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    let st = post_tool_result(&app, "tc-read", "fn main() {}", "ok").await;
+    let st = post_tool_result(&app, "tc-read", "fn main() {}", "completed").await;
     assert_eq!(st, 200, "tc-read POST failed");
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    let st = post_tool_result(&app, "tc-list", "main.rs\nlib.rs\nmod.rs", "ok").await;
+    let st = post_tool_result(&app, "tc-list", "main.rs\nlib.rs\nmod.rs", "completed").await;
     assert_eq!(st, 200, "tc-list POST failed");
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(15), reader)
@@ -2349,7 +2349,7 @@ async fn tool_call_with_error_result_continues() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc-err-1", "status=error: file not found", "error").await;
+    post_tool_result(&app, "tc-err-1", "status=error: file not found", "failed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
@@ -2411,7 +2411,7 @@ async fn tool_requiring_approval_emits_approval_event_and_waits() {
     assert_eq!(st, 200, "approval POST failed");
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    let st = post_tool_result(&app, "tc-approve-1", "written", "ok").await;
+    let st = post_tool_result(&app, "tc-approve-1", "written", "completed").await;
     assert_eq!(st, 200, "tool result POST failed");
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -2518,7 +2518,7 @@ async fn approval_batch_does_not_block_earlier_read_only_request() {
         Some("tc-read-first"),
         "earlier read-only call should execute before later approval-gated block"
     );
-    let st = post_tool_result(&app, "tc-read-first", "read-ok", "ok").await;
+    let st = post_tool_result(&app, "tc-read-first", "read-ok", "completed").await;
     assert_eq!(st, 200, "read-only tool result POST failed");
 
     let st = post_approval_respond(&app, "tc-write-a", "allow").await;
@@ -2528,12 +2528,12 @@ async fn approval_batch_does_not_block_earlier_read_only_request() {
 
     let write_request_a = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(write_request_a["request_id"].as_str(), Some("tc-write-a"));
-    let st = post_tool_result(&app, "tc-write-a", "write-a-ok", "ok").await;
+    let st = post_tool_result(&app, "tc-write-a", "write-a-ok", "completed").await;
     assert_eq!(st, 200, "first write result POST failed");
 
     let write_request_b = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(write_request_b["request_id"].as_str(), Some("tc-write-b"));
-    let st = post_tool_result(&app, "tc-write-b", "write-b-ok", "ok").await;
+    let st = post_tool_result(&app, "tc-write-b", "write-b-ok", "completed").await;
     assert_eq!(st, 200, "second write result POST failed");
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -2730,7 +2730,8 @@ async fn cancel_mid_stream_stops_further_rounds() {
                             cancelled = true;
 
                             // Post tool result to unblock the ledger wait.
-                            post_tool_result(&app, "tc-cancel-1", "file contents", "ok").await;
+                            post_tool_result(&app, "tc-cancel-1", "file contents", "completed")
+                                .await;
                         }
                     }
                 }
@@ -2931,7 +2932,7 @@ async fn tool_call_with_empty_id_gets_auto_assigned() {
 
     // Post tool result using the discovered ID (if available).
     if !auto_id.is_empty() {
-        post_tool_result(&app, auto_id, "content", "ok").await;
+        post_tool_result(&app, auto_id, "content", "completed").await;
     }
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(8), reader).await;
@@ -2947,7 +2948,7 @@ async fn tool_result_for_unknown_request_id_does_not_crash() {
     let (app, _) = build_test_app();
 
     // Post a tool result with an ID that no stream is waiting for.
-    let st = post_tool_result(&app, "nonexistent-id-12345", "output", "ok").await;
+    let st = post_tool_result(&app, "nonexistent-id-12345", "output", "completed").await;
     // Should succeed (ledger accepts it even if nobody consumes it).
     assert_eq!(st, 200);
 }
@@ -3034,7 +3035,7 @@ async fn many_tool_calls_in_single_round() {
     wait_for_sse(&mut rx, "tool_request", 5).await;
     for i in 0..5 {
         let id = format!("tc-many-{i}");
-        post_tool_result(&app, &id, &format!("content of file{i}"), "ok").await;
+        post_tool_result(&app, &id, &format!("content of file{i}"), "completed").await;
     }
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(15), reader)
@@ -3103,7 +3104,7 @@ async fn three_sequential_rounds_all_with_tools() {
         ("tc-r3", "file content here"),
     ] {
         wait_for_sse(&mut rx, "tool_request", 5).await;
-        post_tool_result(&app, id, output, "ok").await;
+        post_tool_result(&app, id, output, "completed").await;
     }
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(15), reader)
@@ -3168,7 +3169,7 @@ async fn tool_call_with_complex_json_arguments() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    let st = post_tool_result(&app, "tc-complex", "file content", "ok").await;
+    let st = post_tool_result(&app, "tc-complex", "file content", "completed").await;
     assert_eq!(st, 200);
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -3217,7 +3218,7 @@ async fn text_then_tool_then_text_interleaved() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc-mixed", "info content", "ok").await;
+    post_tool_result(&app, "tc-mixed", "info content", "completed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
@@ -3270,7 +3271,7 @@ async fn reasoning_tokens_with_tool_calls() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc-think", "file data", "ok").await;
+    post_tool_result(&app, "tc-think", "file data", "completed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
@@ -3324,7 +3325,7 @@ async fn multiple_usage_events_accumulate() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc-usage", "file1\nfile2", "ok").await;
+    post_tool_result(&app, "tc-usage", "file1\nfile2", "completed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
@@ -3428,7 +3429,7 @@ async fn tool_result_with_large_output() {
     // Post a large tool result (~50KB).
     let large_output = "y".repeat(50_000);
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    let st = post_tool_result(&app, "tc-large", &large_output, "ok").await;
+    let st = post_tool_result(&app, "tc-large", &large_output, "completed").await;
     assert_eq!(st, 200);
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -3476,7 +3477,7 @@ async fn approval_allow_session_approves_tool() {
     assert_eq!(st, 200);
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    let st = post_tool_result(&app, "tc-session-approve", "ok", "ok").await;
+    let st = post_tool_result(&app, "tc-session-approve", "ok", "completed").await;
     assert_eq!(st, 200);
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -3643,7 +3644,7 @@ async fn a1_run_status_all_fields_after_tool_round() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    let st = post_tool_result(&app, "tc-a1", "file contents", "ok").await;
+    let st = post_tool_result(&app, "tc-a1", "file contents", "completed").await;
     assert_eq!(st, 200);
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -3708,7 +3709,7 @@ async fn a2_transition_running_to_completed_after_tool_rounds() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc-a2-tool", "file.rs", "ok").await;
+    post_tool_result(&app, "tc-a2-tool", "file.rs", "completed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
@@ -3765,7 +3766,7 @@ async fn a2_transition_running_to_cancelled() {
     assert_eq!(cancel_status, StatusCode::OK);
 
     // Also post the tool result so the stream can terminate.
-    post_tool_result(&app, "tc-a2-cancel", "cancelled", "ok").await;
+    post_tool_result(&app, "tc-a2-cancel", "cancelled", "completed").await;
 
     let _events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
@@ -3941,7 +3942,7 @@ async fn a4_ledger_empty_after_tool_run_completes() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc-a4-ledger", "content", "ok").await;
+    post_tool_result(&app, "tc-a4-ledger", "content", "completed").await;
 
     let _events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
@@ -4008,7 +4009,7 @@ async fn a4_ledger_empty_after_cancelled_run() {
     }
 
     // Post tool result so the stream can finish even if cancel didn't interrupt.
-    post_tool_result(&app, "tc-a4-cancel-ledger", "cancelled", "ok").await;
+    post_tool_result(&app, "tc-a4-cancel-ledger", "cancelled", "completed").await;
 
     let _events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
@@ -4403,7 +4404,7 @@ async fn hook_db_decision_audit_with_tools() {
 
     // Deliver tool results for tc1.
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc1", "file1.txt\nfile2.txt", "success").await;
+    post_tool_result(&app, "tc1", "file1.txt\nfile2.txt", "completed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
@@ -4547,11 +4548,11 @@ async fn hook_db_multiple_tools_selected() {
 
     // Deliver tool results for round 1 (tc1).
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc1", "contents of a.txt", "success").await;
+    post_tool_result(&app, "tc1", "contents of a.txt", "completed").await;
 
     // Deliver tool results for round 2 (tc2).
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc2", "main.rs\nlib.rs", "success").await;
+    post_tool_result(&app, "tc2", "main.rs\nlib.rs", "completed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(15), reader)
         .await
@@ -4901,7 +4902,7 @@ async fn context_meta_exposes_late_round_guidance_signals() {
     ] {
         let request = wait_for_sse(&mut rx, "tool_request", 5).await;
         assert_eq!(request["request_id"].as_str(), Some(id));
-        let status = post_tool_result(&app, id, result, "success").await;
+        let status = post_tool_result(&app, id, result, "completed").await;
         assert_eq!(status, StatusCode::OK);
     }
 
@@ -4987,17 +4988,20 @@ async fn analysis_turn_injects_circuit_breaker_correction_after_repetition_stall
 
     let request = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(request["request_id"].as_str(), Some("tc-analysis-r1"));
-    let status = post_tool_result(&app, "tc-analysis-r1", "src/lib.rs:12:// TODO", "success").await;
+    let status =
+        post_tool_result(&app, "tc-analysis-r1", "src/lib.rs:12:// TODO", "completed").await;
     assert_eq!(status, StatusCode::OK);
 
     let request = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(request["request_id"].as_str(), Some("tc-analysis-r2"));
-    let status = post_tool_result(&app, "tc-analysis-r2", "src/lib.rs:12:// TODO", "success").await;
+    let status =
+        post_tool_result(&app, "tc-analysis-r2", "src/lib.rs:12:// TODO", "completed").await;
     assert_eq!(status, StatusCode::OK);
 
     let request = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(request["request_id"].as_str(), Some("tc-analysis-r3"));
-    let status = post_tool_result(&app, "tc-analysis-r3", "src/lib.rs:12:// TODO", "success").await;
+    let status =
+        post_tool_result(&app, "tc-analysis-r3", "src/lib.rs:12:// TODO", "completed").await;
     assert_eq!(status, StatusCode::OK);
 
     let _events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -5075,14 +5079,14 @@ async fn execution_budget_extends_web_agent_run_when_progress_is_real() {
     let first = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(first["request_id"].as_str(), Some("tc-budget-r1"));
     assert_eq!(
-        post_tool_result(&app, "tc-budget-r1", "module contents", "success").await,
+        post_tool_result(&app, "tc-budget-r1", "module contents", "completed").await,
         StatusCode::OK
     );
 
     let second = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(second["request_id"].as_str(), Some("tc-budget-r2"));
     assert_eq!(
-        post_tool_result(&app, "tc-budget-r2", "src/lib.rs\nsrc/main.rs", "success").await,
+        post_tool_result(&app, "tc-budget-r2", "src/lib.rs\nsrc/main.rs", "completed").await,
         StatusCode::OK
     );
 
@@ -5139,7 +5143,7 @@ async fn execution_budget_hard_limit_stops_web_agent_run_even_with_progress() {
     let first = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(first["request_id"].as_str(), Some("tc-hard-limit-r1"));
     assert_eq!(
-        post_tool_result(&app, "tc-hard-limit-r1", "module contents", "success").await,
+        post_tool_result(&app, "tc-hard-limit-r1", "module contents", "completed").await,
         StatusCode::OK
     );
 
@@ -5150,7 +5154,7 @@ async fn execution_budget_hard_limit_stops_web_agent_run_even_with_progress() {
             &app,
             "tc-hard-limit-r2",
             "src/lib.rs\nsrc/main.rs",
-            "success"
+            "completed"
         )
         .await,
         StatusCode::OK
@@ -5714,7 +5718,7 @@ async fn tool_events_persisted_for_tool_calls() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc1", "file contents", "success").await;
+    post_tool_result(&app, "tc1", "file contents", "completed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
@@ -5769,8 +5773,8 @@ async fn tool_events_multiple_tools_distinct_names() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc1", "contents of a.txt", "success").await;
-    post_tool_result(&app, "tc2", "dir listing", "success").await;
+    post_tool_result(&app, "tc1", "contents of a.txt", "completed").await;
+    post_tool_result(&app, "tc2", "dir listing", "completed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
@@ -5839,7 +5843,7 @@ async fn mock_llm_tool_error_then_recovery_persists_both_events() {
     let req1 = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(req1["request_id"].as_str(), Some("tc-err"));
     assert_eq!(
-        post_tool_result(&app, "tc-err", "ENOENT: /missing", "error").await,
+        post_tool_result(&app, "tc-err", "ENOENT: /missing", "failed").await,
         StatusCode::OK
     );
 
@@ -5847,7 +5851,7 @@ async fn mock_llm_tool_error_then_recovery_persists_both_events() {
     let req2 = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(req2["request_id"].as_str(), Some("tc-ok"));
     assert_eq!(
-        post_tool_result(&app, "tc-ok", "file contents", "success").await,
+        post_tool_result(&app, "tc-ok", "file contents", "completed").await,
         StatusCode::OK
     );
 
@@ -5933,7 +5937,7 @@ async fn mock_llm_same_name_tools_in_one_round_both_reach_persistence() {
         let id = req["request_id"].as_str().expect("id").to_string();
         seen_ids.insert(id.clone());
         assert_eq!(
-            post_tool_result(&app, &id, &format!("contents-{id}"), "success").await,
+            post_tool_result(&app, &id, &format!("contents-{id}"), "completed").await,
             StatusCode::OK
         );
     }

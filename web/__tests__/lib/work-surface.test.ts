@@ -230,6 +230,31 @@ describe('work surface reducer', () => {
     });
   });
 
+  it('keeps skipped tool calls distinct from success and failure', () => {
+    let state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
+      type: 'tool_call_start',
+      call_id: 'call-skip',
+      tool: 'read_file',
+      arguments: { path: 'README.md' },
+    });
+    state = applyWorkSurfaceEvent(state, {
+      type: 'tool_call_end',
+      call_id: 'call-skip',
+      tool: 'read_file',
+      status: 'skipped',
+      skipped: true,
+      success: true,
+      result: 'Duplicate call skipped.',
+    });
+
+    expect(state.tools[0]).toMatchObject({
+      callId: 'call-skip',
+      tool: 'read_file',
+      status: 'skipped',
+      result: 'Duplicate call skipped.',
+    });
+  });
+
   it('projects workspace and executor bindings onto live tool cards', () => {
     let state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
       type: 'workspace_bound',

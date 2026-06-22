@@ -280,6 +280,8 @@ const RESULT_ROUTING_METADATA_FIELDS: &[&str] = &[
     "executor",
     "transport",
     "fallback_policy",
+    "status",
+    "skipped",
     "error_kind",
     "reason",
     "blocked",

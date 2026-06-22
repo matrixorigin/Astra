@@ -917,7 +917,7 @@ describe("AstraClient — thin protocol", () => {
     } as unknown as Response);
     const client = createClient();
     await client.postToolResult(
-      { request_id: "req1", status: "ok", output: "out" },
+      { request_id: "req1", status: "completed", output: "out" },
       { edgeExecutorId: "edge-1" },
     );
     const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];

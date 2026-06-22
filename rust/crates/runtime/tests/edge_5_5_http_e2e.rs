@@ -144,7 +144,7 @@ async fn post_tools_result_populates_ledger_then_take_consumes() {
         "/tools/result",
         json!({
             "request_id": "tc-1",
-            "status": "ok",
+            "status": "completed",
             "output": "out",
             "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash("tc-1", "out"),
         }),
@@ -377,7 +377,7 @@ async fn post_tool_result_rejects_when_ledger_is_full() {
         "/tools/result",
         json!({
             "request_id": "tc-overflow",
-            "status": "ok",
+            "status": "completed",
             "output": "out",
             "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash("tc-overflow", "out"),
         }),
@@ -408,7 +408,7 @@ async fn http_handler_payload_matches_delivery_parser() {
             tokio::time::sleep(Duration::from_millis(20)).await;
             ledger.lock().await.insert(
                 tool_callback_key("e2e-user", "w-chain"),
-                json!({"body": {"request_id": "w-chain", "status": "ok", "output": "ok"}}),
+                json!({"body": {"request_id": "w-chain", "status": "completed", "output": "ok"}}),
             );
         }
     });
@@ -455,11 +455,11 @@ async fn http_handler_payload_supports_batched_approval_delivery() {
             let mut guard = ledger.lock().await;
             guard.insert(
                 tool_callback_key("e2e-user", "w-batch-1"),
-                json!({"body": {"request_id": "w-batch-1", "status": "ok", "output": "ok-1"}}),
+                json!({"body": {"request_id": "w-batch-1", "status": "completed", "output": "ok-1"}}),
             );
             guard.insert(
                 tool_callback_key("e2e-user", "w-batch-2"),
-                json!({"body": {"request_id": "w-batch-2", "status": "ok", "output": "ok-2"}}),
+                json!({"body": {"request_id": "w-batch-2", "status": "completed", "output": "ok-2"}}),
             );
         }
     });

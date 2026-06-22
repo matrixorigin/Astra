@@ -17,6 +17,7 @@ pub(crate) use edge_executor::edge_executor_instance_id;
 pub(crate) use params::AskUserChoice;
 pub(crate) use params::BasicCliChatContext;
 pub(crate) use params::ChatTurnParams;
+pub(crate) use params::DEFAULT_TURN_INDEX;
 pub(crate) use params::{
     ApprovalRequest, ApprovalRequestTx, ApprovalResponse, AskUserAnnotation, AskUserAnswers,
     AskUserPrompt, AskUserQuestion, AskUserQuestionAnswer, AskUserRequest, AskUserRequestTx,

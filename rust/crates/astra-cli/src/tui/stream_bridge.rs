@@ -388,7 +388,7 @@ mod tests {
             kind: AgentLiveEventKind::ToolCompleted {
                 name: "bash".into(),
                 description: "done".into(),
-                status: "success".into(),
+                status: "completed".into(),
                 duration_ms: 1,
                 output_summary: None,
                 output: None,

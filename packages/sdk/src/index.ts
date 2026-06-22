@@ -54,6 +54,7 @@ export type {
   // Chat types
   ChatRole,
   ToolCall,
+  ToolStatus,
   ThinkingBlock,
   PlanSubtask,
   PlanState,
@@ -152,6 +153,9 @@ export {
   projectRunWaitingState,
   type RunWaitingProjection,
 } from "./lifecycle-utils";
+
+export { extractEventStatus } from "./hooks";
+
 export {
   ASTRA_EDGE_ID_HEADER,
   PATH_AUTH_LOGIN,

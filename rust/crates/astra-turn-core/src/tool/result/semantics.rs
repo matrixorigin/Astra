@@ -2,6 +2,7 @@
 //!
 //! Used by CLI `chat_stream` / `stream_render` and available for `bridge_inprocess` or server paths.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 fn json_tool_result_is_error(result_str: &str) -> bool {
@@ -16,21 +17,12 @@ fn json_tool_result_is_error(result_str: &str) -> bool {
             return true;
         }
         if let Some(status) = v.get("status").and_then(|s| s.as_str()) {
-            let normalized = status.trim().to_ascii_lowercase();
-            if matches!(
-                normalized.as_str(),
-                "error"
-                    | "failed"
-                    | "failure"
-                    | "partial_failure"
-                    | "denied"
-                    | "cancelled"
-                    | "canceled"
-                    | "timeout"
-                    | "timed_out"
-            ) {
-                return true;
-            }
+            return match status.trim().to_ascii_lowercase().as_str() {
+                "completed" | "skipped" => false,
+                "failed" | "partial_failure" | "denied" | "cancelled" | "canceled" | "timeout"
+                | "timed_out" => true,
+                _ => true,
+            };
         }
     }
     false
@@ -73,13 +65,16 @@ pub fn tool_output_has_explicit_failure_signal(output: &str) -> bool {
     json_tool_result_is_error(output)
         || first_line_is_tool_failure_banner(output)
         || output.trim_start().starts_with("SANDBOX_DENIED:")
+        || output.trim_start().starts_with("Sandbox:")
+        || output.trim_start().starts_with("Unknown tool:")
 }
 
 /// Determine whether a tool result string indicates an error.
 ///
-/// For structured JSON results (our tools), checks `"ok": false` or a non-null
-/// `"error"` field. For plain-text results, accepts only stable tool failure
-/// contracts plus the legacy `Error:` prefix.
+/// For structured JSON results (our tools), checks `"ok": false`, a non-null
+/// `"error"` field, or canonical `"status"` values. Unknown/legacy JSON
+/// statuses fail closed. For plain-text results, accepts only stable tool
+/// failure contracts plus the legacy `Error:` prefix.
 pub fn is_tool_error(result_str: &str) -> bool {
     if tool_output_has_explicit_failure_signal(result_str) {
         return true;
@@ -89,19 +84,14 @@ pub fn is_tool_error(result_str: &str) -> bool {
 
 /// `status` string for cloud `POST /tools/result` from edge executor output.
 ///
-/// Structured JSON failures, stable tool failure banners, sandbox denials, and
-/// legacy error prefixes imply `"error"`. Everything else is reported as
-/// `"success"`.
+/// Thin wrapper around [`classify_tool_result_status`] that maps the canonical
+/// enum to the canonical wire status strings.
 #[must_use]
 pub fn cloud_tool_result_status_label(output: &str) -> &'static str {
-    if is_tool_error(output)
-        || output.starts_with("Error:")
-        || output.starts_with("Unknown tool:")
-        || output.starts_with("Sandbox:")
-    {
-        "error"
-    } else {
-        "success"
+    match classify_tool_result_status(output) {
+        ToolResultStatus::Failed => "failed",
+        ToolResultStatus::Completed => "completed",
+        ToolResultStatus::Skipped => "skipped",
     }
 }
 
@@ -128,7 +118,7 @@ pub const TOOL_SUCCESS_SENTINEL: &str = "<<<ASTRA_TOOL_OK>>>";
 /// Priority order (stable first):
 /// 1. [`TOOL_SUCCESS_SENTINEL`] substring — the canonical contract.
 /// 2. Structured JSON success (`ok:true` / `success:true` /
-///    `status: ok|success|...`).
+///    `status: completed`).
 /// 3. Legacy prose prefixes (kept for backward compatibility with emitters
 ///    not yet migrated to the sentinel; new mutation emitters MUST use the
 ///    sentinel).
@@ -158,10 +148,7 @@ pub fn tool_output_has_explicit_success_signal(output: &str) -> bool {
         }
         if let Some(status) = v.get("status").and_then(Value::as_str) {
             let status = status.trim().to_ascii_lowercase();
-            if matches!(
-                status.as_str(),
-                "ok" | "success" | "succeeded" | "completed" | "complete" | "passed"
-            ) {
+            if status == "completed" {
                 return true;
             }
         }
@@ -178,6 +165,37 @@ pub fn tool_output_has_explicit_success_signal(output: &str) -> bool {
         || lower.starts_with("deleted successfully")
         || lower.starts_with("saved successfully")
         || lower.starts_with("completed successfully")
+}
+
+/// Canonical tri-state result of a tool execution.
+///
+/// Consumed by `cloud_tool_result_status_label` and by `ToolResultStatusKind`
+/// (parse from status strings).
+/// `Skipped` is set externally by the execution framework, not detected from
+/// output text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultStatus {
+    /// Tool completed its work successfully.
+    Completed,
+    /// Tool execution produced a failure.
+    Failed,
+    /// Execution was skipped (dedup / protective skip — not an error).
+    Skipped,
+}
+
+/// Classify a tool's output text into [`ToolResultStatus`].
+///
+/// Two-way classification (Completed vs Failed). `Skipped` is set by the
+/// execution framework when a tool call is dedup'd or pre-empted and is never
+/// inferred from output text alone.
+#[must_use]
+pub fn classify_tool_result_status(output: &str) -> ToolResultStatus {
+    if is_tool_error(output) {
+        ToolResultStatus::Failed
+    } else {
+        ToolResultStatus::Completed
+    }
 }
 
 /// Classification of tool errors for rollback policy decisions.
@@ -308,7 +326,7 @@ const HARD_ERROR_PATTERNS: &[&str] = &[
 /// - Read-only tools (grep, view, etc.) + timeout → SoftError (no side effects)
 pub fn classify_tool_error(tool: &str, output: &str) -> ToolErrorSeverity {
     // Not an error at all
-    if cloud_tool_result_status_label(output) != "error" {
+    if classify_tool_result_status(output) == ToolResultStatus::Completed {
         return ToolErrorSeverity::Success;
     }
 
@@ -570,13 +588,13 @@ mod tests {
 
     #[test]
     fn cloud_tool_result_status_prefixes() {
-        assert_eq!(cloud_tool_result_status_label("ok"), "success");
-        assert_eq!(cloud_tool_result_status_label("Error: x"), "error");
-        assert_eq!(cloud_tool_result_status_label("Unknown tool: y"), "error");
-        assert_eq!(cloud_tool_result_status_label("Sandbox: z"), "error");
+        assert_eq!(cloud_tool_result_status_label("ok"), "completed");
+        assert_eq!(cloud_tool_result_status_label("Error: x"), "failed");
+        assert_eq!(cloud_tool_result_status_label("Unknown tool: y"), "failed");
+        assert_eq!(cloud_tool_result_status_label("Sandbox: z"), "failed");
         assert_eq!(
             cloud_tool_result_status_label(r#"{"status":"failed","error":"bad args"}"#),
-            "error"
+            "failed"
         );
     }
 
@@ -584,7 +602,7 @@ mod tests {
     fn explicit_failure_signal_detects_structured_tool_banners_only_at_top_level() {
         let output = "❌ STR_REPLACE FAILED — FILE NOT MODIFIED\n\nWHAT: old_str not found.";
         assert!(is_tool_error(output));
-        assert_eq!(cloud_tool_result_status_label(output), "error");
+        assert_eq!(cloud_tool_result_status_label(output), "failed");
         assert_eq!(
             classify_tool_error("str_replace", output),
             ToolErrorSeverity::SoftError
@@ -594,7 +612,7 @@ mod tests {
         assert!(!is_tool_error(quoted_file_content));
         assert_eq!(
             cloud_tool_result_status_label(quoted_file_content),
-            "success"
+            "completed"
         );
     }
 
@@ -602,7 +620,7 @@ mod tests {
     fn explicit_failure_signal_detects_sandbox_denied_prefix() {
         let output = "SANDBOX_DENIED: Path '/tmp/x' is outside workspace";
         assert!(is_tool_error(output));
-        assert_eq!(cloud_tool_result_status_label(output), "error");
+        assert_eq!(cloud_tool_result_status_label(output), "failed");
     }
 
     #[test]
@@ -622,6 +640,17 @@ mod tests {
         assert!(!tool_output_has_explicit_success_signal(
             "Error: str_replace failed: old_str not found"
         ));
+    }
+
+    #[test]
+    fn explicit_success_signal_rejects_legacy_status_aliases() {
+        for status in ["ok", "success", "succeeded", "complete", "passed"] {
+            let body = format!(r#"{{"status":"{status}"}}"#);
+            assert!(
+                !tool_output_has_explicit_success_signal(&body),
+                "legacy status alias {status:?} must not be an explicit success signal"
+            );
+        }
     }
 
     #[test]
@@ -663,9 +692,20 @@ mod tests {
     }
 
     #[test]
-    fn tool_error_error_count_field_is_not_error() {
-        let result = r#"{"error_count":0,"status":"ok"}"#;
+    fn tool_error_error_count_field_with_completed_status_is_not_error() {
+        let result = r#"{"error_count":0,"status":"completed"}"#;
         assert!(!is_tool_error(result));
+    }
+
+    #[test]
+    fn tool_error_rejects_legacy_status_aliases() {
+        for status in ["ok", "success", "succeeded", "complete", "passed"] {
+            let body = format!(r#"{{"status":"{status}","data":[]}}"#);
+            assert!(
+                is_tool_error(&body),
+                "legacy status alias {status:?} must fail closed"
+            );
+        }
     }
 
     #[test]
@@ -751,8 +791,8 @@ mod tests {
     }
 
     #[test]
-    fn is_tool_error_json_status_ok_not_error() {
-        assert!(!is_tool_error(r#"{"status": "ok", "data": []}"#));
+    fn is_tool_error_json_status_completed_not_error() {
+        assert!(!is_tool_error(r#"{"status": "completed", "data": []}"#));
     }
 
     #[test]

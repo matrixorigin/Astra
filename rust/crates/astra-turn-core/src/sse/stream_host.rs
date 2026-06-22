@@ -731,7 +731,7 @@ impl SseStreamHost for NoopSseStreamHost {
             args: args.clone(),
             output: "headless: tool execution not supported".to_string(),
             tool_result_fields: None,
-            status: "error".to_string(),
+            status: "failed".to_string(),
             duration_ms: 0,
         }
     }
@@ -810,7 +810,7 @@ impl SseStreamHost for RecordingSseStreamHost {
             args: args.clone(),
             output,
             tool_result_fields: None,
-            status: "ok".to_string(),
+            status: "completed".to_string(),
             duration_ms: 1,
         }
     }
@@ -949,7 +949,7 @@ mod tests {
         assert_eq!(result.tool_results[0].request_id, "tr-1");
         assert_eq!(result.tool_results[0].tool, "bash");
         assert_eq!(result.tool_results[0].output, "hi\n");
-        assert_eq!(result.tool_results[0].status, "ok");
+        assert_eq!(result.tool_results[0].status, "completed");
     }
 
     #[tokio::test]
@@ -1065,7 +1065,7 @@ mod tests {
                     args: args.clone(),
                     output: "ok".to_string(),
                     tool_result_fields: None,
-                    status: "ok".to_string(),
+                    status: "completed".to_string(),
                     duration_ms: 1,
                 }
             }
@@ -1163,7 +1163,7 @@ mod tests {
                     args: args.clone(),
                     output: "hi".to_string(),
                     tool_result_fields: None,
-                    status: "ok".to_string(),
+                    status: "completed".to_string(),
                     duration_ms: 1,
                 }
             }
@@ -1288,7 +1288,7 @@ mod tests {
         assert!(abort.is_none());
 
         assert_eq!(result.tool_results.len(), 1);
-        assert_eq!(result.tool_results[0].status, "error");
+        assert_eq!(result.tool_results[0].status, "failed");
         assert!(result.tool_results[0].output.contains("not supported"));
 
         assert_eq!(result.approval_results.len(), 1);
@@ -1756,7 +1756,7 @@ mod tests {
                     args: args.clone(),
                     output: "ok".to_string(),
                     tool_result_fields: None,
-                    status: "ok".to_string(),
+                    status: "completed".to_string(),
                     duration_ms: 1,
                 }
             }
@@ -1776,7 +1776,7 @@ mod tests {
                         args: req.args,
                         output: "ok".to_string(),
                         tool_result_fields: None,
-                        status: "ok".to_string(),
+                        status: "completed".to_string(),
                         duration_ms: 1,
                     })
                     .collect()
@@ -1873,7 +1873,7 @@ mod tests {
                     args: args.clone(),
                     output: format!("ok-{tool}"),
                     tool_result_fields: None,
-                    status: "ok".to_string(),
+                    status: "completed".to_string(),
                     duration_ms: 1,
                 }
             }
@@ -2077,7 +2077,7 @@ mod tests {
                     args: args.clone(),
                     output: "ok".to_string(),
                     tool_result_fields: None,
-                    status: "ok".to_string(),
+                    status: "completed".to_string(),
                     duration_ms: 0,
                 }
             }
@@ -2222,7 +2222,7 @@ mod tests {
                     args: args.clone(),
                     output: "ok".to_string(),
                     tool_result_fields: None,
-                    status: "ok".to_string(),
+                    status: "completed".to_string(),
                     duration_ms: 0,
                 }
             }

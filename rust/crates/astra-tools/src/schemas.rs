@@ -1019,7 +1019,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task",
-                "description": "Checklist for multi-step work. Use for 3+ outcomes, files, or phases. Fields: action, title, subtasks, status.",
+                "description": "Checklist for multi-step work. Use subtasks for 3+ outcomes, files, or phases. Update progress with new_status; list with status_filter.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1030,8 +1030,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "title": {"type": "string", "description": "(create/update) Title."},
                         "description": {"type": "string", "description": "(create/update) Done."},
                         "task_id": {"type": "string", "description": "(update/get/stop/adopt/archive) Task id. Single-task archive stays in current session."},
-                        "new_status": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","deleted"], "description": "(update) Status. Only one parent task may be in_progress; `paused` frees that slot; `deleted` removes the task."},
-                        "status_filter": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","archived","all","active"], "description": "(list) `active` = pending + in_progress + paused."},
+                        "new_status": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","deleted"], "description": "(update only) New task/subtask status. Do not send `status`. Only one parent task may be in_progress; `paused` frees that slot; `deleted` removes the task."},
+                        "status_filter": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","archived","all","active"], "description": "(list only) Use `status_filter: \"all\"` to list all tasks; do not send an `all` boolean. `active` = pending + in_progress + paused."},
                         "subtask_id": {"type": "string", "description": "(update) Subtask id; use with task_id + new_status, optional reason."},
                         "active_form": {"type": "string", "description": "(create/update) Spinner text while in_progress."},
                         "owner": {"type": "string", "description": "(create/update) Owner."},
@@ -1633,8 +1633,18 @@ mod tests {
             "task schema should explain task.list active includes paused open work: {status_filter_desc}"
         );
         assert!(
+            status_filter_desc.contains("status_filter")
+                && status_filter_desc.contains("\"all\"")
+                && status_filter_desc.contains("do not send an `all` boolean"),
+            "task schema should steer list-all away from an unsupported all field: {status_filter_desc}"
+        );
+        assert!(
             properties.get("status").is_none(),
             "task schema must not expose the old status field; use new_status/status_filter"
+        );
+        assert!(
+            properties.get("all").is_none(),
+            "task schema must not expose an all boolean; use status_filter='all'"
         );
         assert!(
             properties["new_status"]
@@ -1649,6 +1659,10 @@ mod tests {
         assert!(
             new_status_desc.contains("Only one parent task may be in_progress"),
             "new_status should teach the single in_progress task invariant: {new_status_desc}"
+        );
+        assert!(
+            new_status_desc.contains("Do not send `status`"),
+            "new_status should explicitly reject the old status alias: {new_status_desc}"
         );
         let add_blocked_by_desc = properties["add_blocked_by"]["description"]
             .as_str()

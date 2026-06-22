@@ -1311,23 +1311,20 @@ pub fn normalize_title(title: &str) -> String {
 
 fn normalize_update_status(args: &Value) -> Result<Option<SessionTaskStatusKind>, String> {
     let raw_new_status = args.get("new_status");
-    let raw_status_alias = args.get("status");
-    if let (Some(left), Some(right)) = (raw_new_status, raw_status_alias)
-        && left != right
-    {
+    if args.get("status").is_some() {
         return Err(
-            "fields 'new_status' and 'status' disagree; provide only new_status".to_string(),
+            "field 'status' is not supported for task.update; use 'new_status'".to_string(),
         );
     }
-    let Some(raw_status) = raw_new_status.or(raw_status_alias) else {
+    let Some(raw_status) = raw_new_status else {
         return Ok(None);
     };
     let Some(status) = raw_status.as_str() else {
-        return Err("field 'new_status'/'status' must be a string".to_string());
+        return Err("field 'new_status' must be a string".to_string());
     };
     if !VALID_UPDATE_STATUSES.contains(&status) {
         return Err(format!(
-            "invalid new_status/status '{}' (valid: {})",
+            "invalid new_status '{}' (valid: {})",
             status,
             VALID_UPDATE_STATUSES.join("|")
         ));
@@ -1419,7 +1416,6 @@ fn task_actions_allowing_field(field: &str, current_action: &str) -> Vec<&'stati
                 "action",
                 "task_id",
                 "new_status",
-                "status",
                 "title",
                 "description",
                 "subtask_id",
@@ -2488,7 +2484,6 @@ impl TaskManager {
                 "action",
                 "task_id",
                 "new_status",
-                "status",
                 "title",
                 "description",
                 "subtask_id",
@@ -2662,7 +2657,7 @@ impl TaskManager {
                 || error_message.is_some()
                 || reason.is_some();
             if !has_parent_update {
-                return "Error: task.update requires at least one update field: new_status, status, title, description, active_form, owner, metadata, add_blocks, add_blocked_by, remove_blocks, remove_blocked_by, reason, or error_message".to_string();
+                return "Error: task.update requires at least one update field: new_status, title, description, active_form, owner, metadata, add_blocks, add_blocked_by, remove_blocks, remove_blocked_by, reason, or error_message".to_string();
             }
         }
         let sid = self.sid();
@@ -4824,7 +4819,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_accepts_status_alias_but_keeps_schema_on_new_status() {
+    async fn update_rejects_status_alias_and_keeps_schema_on_new_status() {
         let m = mgr();
         m.create(&json!({"title": "status alias"})).await;
         let invalid = m
@@ -4855,17 +4850,23 @@ mod tests {
                 "reason": "not needed"
             }))
             .await;
-        assert!(!alias.starts_with("Error:"), "{alias}");
+        assert!(
+            alias.starts_with("Error:")
+                && alias.contains("unknown field")
+                && alias.contains("status")
+                && alias.contains("new_status"),
+            "old status alias should be rejected with a new_status hint: {alias}"
+        );
         let task: SessionTask =
             serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await).unwrap();
-        assert_eq!(task.status, SessionTaskStatusKind::Cancelled);
+        assert_eq!(task.status, SessionTaskStatusKind::Pending);
         assert!(
             task.metadata
                 .as_ref()
                 .and_then(|metadata| metadata.get("reason"))
                 .and_then(Value::as_str)
-                == Some("not needed"),
-            "status alias update should preserve reason metadata: {task:?}"
+                .is_none(),
+            "rejected status alias must not preserve reason metadata: {task:?}"
         );
 
         let conflict = m
@@ -4876,8 +4877,10 @@ mod tests {
             }))
             .await;
         assert!(
-            conflict.starts_with("Error:") && conflict.contains("disagree"),
-            "conflicting status fields should fail closed: {conflict}"
+            conflict.starts_with("Error:")
+                && conflict.contains("unknown field")
+                && conflict.contains("status"),
+            "status plus new_status should fail closed on the unsupported status field: {conflict}"
         );
     }
 

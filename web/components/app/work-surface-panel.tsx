@@ -1315,6 +1315,7 @@ function ToolCard({ tool }: { tool: ToolSurfaceItem }) {
   const running = tool.status === "running";
   const failed = tool.status === "error";
   const cancelled = tool.status === "cancelled";
+  const skipped = tool.status === "skipped";
   const finishedAt = tool.finishedAt ?? tool.startedAt;
   return (
     <section className="relative pl-9">
@@ -1325,15 +1326,19 @@ function ToolCard({ tool }: { tool: ToolSurfaceItem }) {
             ? "border-accent text-accent"
             : cancelled
               ? "border-text-muted text-text-muted"
-              : failed
-                ? "border-danger text-danger"
-                : "border-success text-success",
+              : skipped
+                ? "border-border text-text-muted"
+                : failed
+                  ? "border-danger text-danger"
+                  : "border-success text-success",
         )}
       >
         {running ? (
           <span className="size-2 animate-pulse rounded-full bg-accent" />
         ) : cancelled ? (
           <Pause className="size-3" />
+        ) : skipped ? (
+          <Circle className="size-3" />
         ) : failed ? (
           <AlertTriangle className="size-3" />
         ) : (
@@ -1347,9 +1352,11 @@ function ToolCard({ tool }: { tool: ToolSurfaceItem }) {
             ? "border-accent/35 bg-accent/5"
             : cancelled
               ? "border-border/70 bg-surface-muted/35"
-              : failed
-                ? "border-danger/25 bg-danger/5"
-                : "border-border/70",
+              : skipped
+                ? "border-border/70 bg-surface-muted/25"
+                : failed
+                  ? "border-danger/25 bg-danger/5"
+                  : "border-border/70",
         )}
       >
         <div className="flex items-start gap-2">

@@ -546,7 +546,7 @@ mod tests {
             .map(|i| format!("line-{i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        cell.complete("success", 1, Some(output), None);
+        cell.complete("completed", 1, Some(output), None);
 
         let view = TaskDetailView::from_task_cell(&cell);
         let rendered = view
@@ -569,7 +569,7 @@ mod tests {
     #[test]
     fn completed_task_detail_shows_snapshot_hint() {
         let mut cell = TaskCell::new_running("agent-1", "reviewer");
-        cell.complete("success", 300_000, Some("done".into()), None);
+        cell.complete("completed", 300_000, Some("done".into()), None);
         let view = TaskDetailView::from_task_cell(&cell);
         let rendered = view
             .lines
@@ -650,7 +650,7 @@ mod tests {
     fn child_steps_render_as_single_compact_rows() {
         let mut cell = TaskCell::new_running("agent-1", "reviewer");
         cell.push_child_started("a", "Read", "src/main.rs");
-        cell.push_child_completed("a", "success", 20);
+        cell.push_child_completed("a", "completed", 20);
 
         let view = TaskDetailView::from_task_cell(&cell);
         let rendered = view

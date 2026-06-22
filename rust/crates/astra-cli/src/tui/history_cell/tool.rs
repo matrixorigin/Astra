@@ -1072,17 +1072,23 @@ mod tests {
     #[test]
     fn complete_transitions_out_of_running() {
         let mut t = ToolCell::new_running("bash", "ls");
-        t.complete("success", 42, String::new(), Some("3 entries".into()), None);
+        t.complete(
+            "completed",
+            42,
+            String::new(),
+            Some("3 entries".into()),
+            None,
+        );
         assert_eq!(t.status, ToolStatus::Success);
         assert_eq!(t.duration_ms, Some(42));
         assert_eq!(t.output_summary.as_deref(), Some("3 entries"));
     }
 
     #[test]
-    fn complete_treats_ok_as_success() {
+    fn complete_rejects_noncanonical_ok_alias() {
         let mut t = ToolCell::new_running("bash", "ls");
         t.complete("ok", 42, String::new(), Some("3 entries".into()), None);
-        assert_eq!(t.status, ToolStatus::Success);
+        assert_eq!(t.status, ToolStatus::Failed);
     }
 
     #[test]
@@ -1210,7 +1216,7 @@ mod tests {
     fn bash_search_exit_one_with_no_output_renders_no_matches() {
         let mut t = ToolCell::new_running("bash", "$ rg definitely_missing_token src");
         t.complete(
-            "ok",
+            "completed",
             28,
             String::new(),
             Some("1 line captured".into()),
@@ -1230,7 +1236,7 @@ mod tests {
             "$ cd /work/repo && grep -n definitely_missing_token src/main.rs",
         );
         t.complete(
-            "ok",
+            "completed",
             28,
             String::new(),
             Some("[exit code: 1]".into()),
@@ -1314,7 +1320,7 @@ mod tests {
     fn complete_failed_tool_treats_blank_output_as_missing_details() {
         let mut t = ToolCell::new_running("read_file", "Reading: src/main.rs");
         t.complete(
-            "error",
+            "failed",
             19,
             String::new(),
             Some(" \n ".into()),

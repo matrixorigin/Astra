@@ -28,11 +28,11 @@ pub(crate) async fn execute_tool_pure(
     api: &ThinClient,
     token: &str,
     current_session_id: Option<&String>,
-    turn_index: usize,
+    session_turn: u32,
 ) {
     if !execution.is_edge_tool && execution.result_str.starts_with(EDGE_PROTOCOL_ERROR_PREFIX) {
         if let Some(executor) = server_tool_executor {
-            executor.set_turn_index(turn_index.min(u32::MAX as usize) as u32);
+            executor.set_turn_index(session_turn.max(1));
             let mut server_args = execution.args.clone();
             if let Some(obj) = server_args.as_object_mut() {
                 obj.insert(
@@ -133,7 +133,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             self.ctx.api,
             self.ctx.token,
             self.ctx.current_session_id,
-            self.ctx.turn_index,
+            self.ctx.session_turn,
         )
         .await;
 

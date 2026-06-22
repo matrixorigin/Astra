@@ -1,4 +1,4 @@
-use crate::cli::chat_stream::{ChatTurnParams, stream_chat_sse};
+use crate::cli::chat_stream::{ChatTurnParams, DEFAULT_TURN_INDEX, stream_chat_sse};
 use crate::cli::permission_manager::PermissionManager;
 use crate::cli::session::session_state::{ExplainMode, SessionState};
 use crate::cli::surface::task_checkpoint_surface::{
@@ -429,7 +429,7 @@ pub(crate) async fn handle_task_command(
                     bg_task_commands: None,
                     bg_task_list_cache: None,
                     bash_detach_slot: None,
-                    turn_index: 0,
+                    turn_index: DEFAULT_TURN_INDEX,
                     pipeline_state: None,
                     compaction_state: None,
                     consecutive_context_window_errors: 0,

@@ -483,7 +483,7 @@ mod tests {
             args: json!({"command": "echo hello"}),
             output: "hello".into(),
             tool_result_fields: Some(edge_runtime_environment_fields()),
-            status: "ok".into(),
+            status: "completed".into(),
             duration_ms: 5,
         }];
 
@@ -540,7 +540,7 @@ mod tests {
             args: json!({"path": "/tmp/x.txt"}),
             output: "content".into(),
             tool_result_fields: Some(edge_runtime_environment_fields()),
-            status: "ok".into(),
+            status: "completed".into(),
             duration_ms: 5,
         }];
 
@@ -670,6 +670,7 @@ mod tests {
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index: 0,
+            session_turn: 1,
             quiet: true,
             api: &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             token: "",
@@ -747,6 +748,7 @@ mod tests {
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index: 0,
+            session_turn: 1,
             quiet: true,
             api: &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             token: "",
@@ -838,6 +840,7 @@ mod tests {
 
         let _ = run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index: 0,
+            session_turn: 1,
             quiet: true,
             api: &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             token: "",
@@ -943,6 +946,7 @@ mod tests {
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index: 0,
+            session_turn: 1,
             quiet: true,
             api: &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             token: "",
@@ -1068,6 +1072,7 @@ mod tests {
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index: 0,
+            session_turn: 1,
             quiet: true,
             api: &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             token: "",
@@ -1159,7 +1164,7 @@ mod tests {
             args: json!({"pattern": "TODO"}),
             output: "src/main.rs:10: // TODO fix".to_string(),
             tool_result_fields: Some(edge_runtime_environment_fields()),
-            status: "ok".to_string(),
+            status: "completed".to_string(),
             duration_ms: 50,
         }];
 
@@ -1183,6 +1188,7 @@ mod tests {
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index: 0,
+            session_turn: 1,
             quiet: true,
             api: &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             token: "",
@@ -1282,6 +1288,7 @@ mod tests {
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index: 0,
+            session_turn: 1,
             quiet: true,
             api: &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             token: "",
@@ -1407,6 +1414,7 @@ mod tests {
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index: 0,
+            session_turn: 1,
             quiet: true,
             api: &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             token: "",
@@ -1538,6 +1546,7 @@ mod tests {
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index: 0,
+            session_turn: 1,
             quiet: true,
             api: &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             token: "",
@@ -1626,6 +1635,7 @@ mod tests {
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index: 0,
+            session_turn: 1,
             quiet: true,
             api: &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             token: "",

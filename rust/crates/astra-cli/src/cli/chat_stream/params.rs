@@ -8,6 +8,11 @@ use tokio::sync::mpsc;
 
 use crate::{ExplainMode, cli::permission_manager::PermissionManager};
 
+/// Default session turn for newly constructed [`ChatTurnParams`].
+/// The CLI uses a 1-based turn index so journal entries and rollback
+/// scopes are clearly scoped to the user-visible turn.
+pub(crate) const DEFAULT_TURN_INDEX: u32 = 1;
+
 /// Atomic counter pair published by streaming tools (currently
 /// bash) while they run. Consumers read `lines` / `bytes` on a
 /// polling cadence (~200ms) and emit [`StreamEvent::ToolOutput`]
@@ -452,7 +457,8 @@ pub(crate) struct ChatTurnParams<'a> {
     /// executor pulls a fresh handle from this slot per tool call;
     /// the TUI refills between calls.
     pub(crate) bash_detach_slot: Option<astra_tools::detach::DetachShellSlot>,
-    /// Current REPL turn number — used to tag journal entries for undo.
+    /// 1-based session turn currently in progress; used to tag journal entries
+    /// and rollback scopes.
     pub(crate) turn_index: u32,
     /// Pre-loaded CSL messages (from CslManager.load() in chat_turn).
     /// Restored pipeline state from a checkpoint (enables warm-start on resume).
@@ -613,7 +619,7 @@ impl<'a> ChatTurnParams<'a> {
             bg_task_commands: ctx.bg_task_commands.clone(),
             bg_task_list_cache: ctx.bg_task_list_cache.clone(),
             bash_detach_slot: ctx.bash_detach_slot.clone(),
-            turn_index: 0,
+            turn_index: DEFAULT_TURN_INDEX,
             pipeline_state: None,
             compaction_state: None,
             consecutive_context_window_errors: 0,

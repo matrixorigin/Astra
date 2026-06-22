@@ -158,7 +158,7 @@ mod tests {
                 TuiAppEvent::ToolCompleted {
                     name: "bash".into(),
                     description: String::new(),
-                    status: "success".into(),
+                    status: "completed".into(),
                     duration_ms: 12,
                     output_summary: Some("cache ok".into()),
                     output: None,

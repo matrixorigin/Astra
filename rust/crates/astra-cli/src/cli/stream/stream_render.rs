@@ -1,7 +1,6 @@
 use crate::cli::stream::streaming_md;
 use crate::cli::tool_result_status::{
     tool_result_status_icon, tool_result_status_is_failure, tool_result_status_is_skipped,
-    tool_result_status_is_success,
 };
 use crate::cli::{chat_stream, session::session_runtime, terminal_region, theme};
 use astra_runtime::turn::tool_side_effects::tool_call_invalidates_read_cache;
@@ -2119,7 +2118,7 @@ impl<'a> CliSseStreamHost<'a> {
                             } else {
                                 format!("Error: {error}")
                             },
-                            "error",
+                            "failed",
                             active_tx.as_ref().and_then(|active| {
                                 Self::merge_transaction_fields(
                                     None,
@@ -2167,7 +2166,7 @@ impl<'a> CliSseStreamHost<'a> {
                                     "was already aborted",
                                     aborted.rollback.as_ref(),
                                 ),
-                                "error",
+                                "failed",
                                 Self::merge_transaction_fields(
                                     None,
                                     &aborted.id,
@@ -2230,7 +2229,7 @@ impl<'a> CliSseStreamHost<'a> {
                                 "failed before execution",
                                 rollback.as_ref(),
                             ),
-                            "error",
+                            "failed",
                             Self::merge_transaction_fields(
                                 None,
                                 &meta.id,
@@ -2282,7 +2281,7 @@ impl<'a> CliSseStreamHost<'a> {
                                 "failed before execution",
                                 rollback.as_ref(),
                             ),
-                            "error",
+                            "failed",
                             Self::merge_transaction_fields(
                                 None,
                                 &meta.id,
@@ -2688,11 +2687,12 @@ fn sync_incremental_tool_result_state(
     incremental_state: &astra_turn_core::turn_event_sink::IncrementalTurnState,
     result: &EdgeToolExecResult,
 ) {
-    let error = tool_result_status_is_failure(&result.status).then(|| result.output.clone());
+    let is_failure = tool_result_status_is_failure(&result.status);
+    let error = is_failure.then(|| result.output.clone());
     incremental_state.push_tool_record(astra_services::session_journal::ToolCallRecord {
         tool_call_id: Some(result.request_id.clone()),
         name: result.tool.clone(),
-        ok: tool_result_status_is_success(&result.status),
+        ok: !is_failure,
         ms: result.duration_ms,
         error,
         output_bytes: Some(result.output.len().min(u32::MAX as usize) as u32),
@@ -3591,7 +3591,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             denied_output.unwrap_or_else(|| "Permission denied".to_string())
         };
         let status = if !allowed || tool_execution_marked_error {
-            "error"
+            "failed"
         } else {
             cloud_tool_result_status_label(&output)
         }
@@ -3729,7 +3729,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 args: serde_json::Value::Null,
                 output: "Error: no tool result recorded".to_string(),
                 tool_result_fields: None,
-                status: "error".to_string(),
+                status: "failed".to_string(),
                 duration_ms: 0,
             })
     }
@@ -5928,7 +5928,7 @@ fn panic_payload_summary(payload: &(dyn std::any::Any + Send)) -> String {
 
 fn edge_tool_outcome_status(outcome: &crate::edge_tools::ToolExecutionOutcome) -> &'static str {
     if outcome.is_error {
-        "error"
+        "failed"
     } else {
         cloud_tool_result_status_label(&outcome.output)
     }
@@ -7256,7 +7256,7 @@ mod tests {
             .await;
 
         assert_eq!(results.len(), 2);
-        assert!(results.iter().all(|result| result.status == "success"));
+        assert!(results.iter().all(|result| result.status == "completed"));
         assert!(results[0].output.contains("one"), "{}", results[0].output);
         assert!(results[1].output.contains("two"), "{}", results[1].output);
         assert!(results.iter().all(|result| {
@@ -7317,7 +7317,7 @@ mod tests {
             args: serde_json::json!({"command": "echo hi"}),
             output: "hi".to_string(),
             tool_result_fields: None,
-            status: "ok".to_string(),
+            status: "completed".to_string(),
             duration_ms: 7,
         });
 
@@ -7566,7 +7566,7 @@ mod tests {
         let body = astra_thin_client::ToolResultRequest {
             request_id: "req-1".to_string(),
             edge_agent_id: Some("test-agent".to_string()),
-            status: "ok".to_string(),
+            status: "completed".to_string(),
             output: Some("done".to_string()),
             duration_ms: Some(1),
             result_hash: None,
@@ -7644,7 +7644,7 @@ mod tests {
         let body = astra_thin_client::ToolResultRequest {
             request_id: "req-1".to_string(),
             edge_agent_id: Some("test-agent".to_string()),
-            status: "ok".to_string(),
+            status: "completed".to_string(),
             output: Some("done".to_string()),
             duration_ms: Some(1),
             result_hash: None,
@@ -7760,7 +7760,7 @@ mod tests {
         // grep: substring "warning" in a match line is NOT a warning
         let (_, w) = tool_completion_icon(
             "grep",
-            "ok",
+            "completed",
             r#"crates/x/src/lib.rs:42:    tracing::warn!("⚠ WARNING: retry");"#,
             50,
         );
@@ -7769,20 +7769,20 @@ mod tests {
             "grep output must not warn just because a match line contains the substring"
         );
         // glob: no files found is ok
-        assert!(!tool_completion_icon("glob", "ok", "No files found", 50).1);
+        assert!(!tool_completion_icon("glob", "completed", "No files found", 50).1);
         // grep: no matches is ok
-        assert!(!tool_completion_icon("grep", "ok", "No matches found", 50).1);
+        assert!(!tool_completion_icon("grep", "completed", "No matches found", 50).1);
         // grep: empty stdout is ok
         assert!(
-            !tool_completion_icon("grep", "ok", "", 50).1,
+            !tool_completion_icon("grep", "completed", "", 50).1,
             "empty grep result must not be a warning when status is ok"
         );
         // glob: empty stdout is ok
-        assert!(!tool_completion_icon("glob", "ok", "", 50).1);
+        assert!(!tool_completion_icon("glob", "completed", "", 50).1);
         // bash: compiler warning lines are not a completion warning
         let out = "warning: unused variable\n --> src/lib.rs:1:5\n\nwarning: another\n";
         assert!(
-            !tool_completion_icon("bash", "ok", out, 50).1,
+            !tool_completion_icon("bash", "completed", out, 50).1,
             "stdout may contain compiler warning: lines; do not treat as completion warning"
         );
     }
@@ -7793,16 +7793,16 @@ mod tests {
         assert!(
             tool_completion_icon(
                 "read_file",
-                "ok",
+                "completed",
                 "\n\n⚠ WARNING: This file has been read 4+ times this session.",
                 10
             )
             .1
         );
         // read_file empty still warns
-        assert!(tool_completion_icon("read_file", "ok", "", 50).1);
-        // non-ok status is error
-        let (icon, w) = tool_completion_icon("bash", "permission_denied", "Permission denied", 50);
+        assert!(tool_completion_icon("read_file", "completed", "", 50).1);
+        // non-completed status is error
+        let (icon, w) = tool_completion_icon("bash", "failed", "Permission denied", 50);
         assert_eq!(icon, theme::icon_err());
         assert!(!w);
     }
@@ -7928,7 +7928,7 @@ mod tests {
         let mut s = StreamRenderState::with_term_width(80, false, false);
         s.track_output("Draft review text\n");
         assert_eq!(s.lines_written, 1);
-        s.tool_done_inline("bash", &serde_json::json!({}), "success", 100, "done");
+        s.tool_done_inline("bash", &serde_json::json!({}), "completed", 100, "done");
         assert!(
             s.lines_written >= 2,
             "lines_written should account for stderr"
@@ -7939,7 +7939,7 @@ mod tests {
         let mut s2 = StreamRenderState::with_term_width(80, true, false);
         s2.track_output("Intermediate draft\n");
         assert_eq!(s2.lines_written, 1);
-        s2.tool_done(0, "bash", &serde_json::json!({}), "success", 100, "done");
+        s2.tool_done(0, "bash", &serde_json::json!({}), "completed", 100, "done");
         assert!(
             s2.lines_written >= 2,
             "md mode should still track lines_written"
@@ -8370,7 +8370,7 @@ mod tests {
             tool_result_fields: None,
             is_error: true,
         };
-        assert_eq!(edge_tool_outcome_status(&outcome), "error");
+        assert_eq!(edge_tool_outcome_status(&outcome), "failed");
     }
     // ── Skill/MCP output summary tests ──
 
@@ -8382,15 +8382,15 @@ mod tests {
             .format_output_summary(
                 "skill",
                 "Result line 1\nResult line 2\nResult line 3\nLine 4\nLine 5",
-                "ok",
+                "completed",
             )
             .expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Preview);
         assert_eq!(s.text, "5 output lines captured");
         // skill empty
-        assert!(r.format_output_summary("skill", "", "ok").is_none());
+        assert!(r.format_output_summary("skill", "", "completed").is_none());
         assert!(
-            r.format_output_summary("skill", "   \n  \n", "ok")
+            r.format_output_summary("skill", "   \n  \n", "completed")
                 .is_none()
         );
 
@@ -8399,7 +8399,7 @@ mod tests {
             .format_output_summary(
                 "mcp_github_search",
                 "Found 3 repos\nrepo1\nrepo2\nrepo3",
-                "ok",
+                "completed",
             )
             .expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Preview);
@@ -8408,19 +8408,19 @@ mod tests {
             .format_output_summary(
                 "mcp_github_search",
                 r#"[{"name":"repo1","stars":10},{"name":"repo2","stars":5}]"#,
-                "ok",
+                "completed",
             )
             .expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
         assert_eq!(s.text, "json array · 2 items · keys: name, stars");
         assert!(
-            r.format_output_summary("mcp_github_search", "", "ok")
+            r.format_output_summary("mcp_github_search", "", "completed")
                 .is_none()
         );
 
         // bash
         let s = r
-            .format_output_summary("bash", "line 1\nline 2\nline 3\nline 4", "ok")
+            .format_output_summary("bash", "line 1\nline 2\nline 3\nline 4", "completed")
             .expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Preview);
         assert_eq!(s.text, "4 lines captured");
@@ -8445,20 +8445,20 @@ mod tests {
             .format_output_summary(
                 "grep",
                 "src/a.rs:10:foo\nsrc/a.rs:11:foo\nsrc/b.rs:8:foo",
-                "ok",
+                "completed",
             )
             .expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Preview);
         assert_eq!(s.text, "3 matches in 2 file(s)");
         let s = r
-            .format_output_summary("grep", "No matches found", "ok")
+            .format_output_summary("grep", "No matches found", "completed")
             .expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
         assert_eq!(s.text, "no matches");
 
         // glob
         let s = r
-            .format_output_summary("glob", "No files found", "ok")
+            .format_output_summary("glob", "No files found", "completed")
             .expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
         assert_eq!(s.text, "no matches");
@@ -8468,7 +8468,7 @@ mod tests {
             .format_output_summary(
                 "git",
                 "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n",
-                "ok",
+                "completed",
             )
             .expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
@@ -8477,7 +8477,7 @@ mod tests {
         assert!(s.text.contains("src/a.rs"));
 
         // str_replace
-        let s = r.format_output_summary("str_replace", "<<<ASTRA_UNIFIED_DIFF>>>\n--- a/src/hello.py\n+++ b/src/hello.py\n@@ -1,2 +1,3 @@\n-print(\"old\")\n+print(\"new\")\n+print(\"more\")\n<<<END_ASTRA_UNIFIED_DIFF>>>", "ok").expect("summary");
+        let s = r.format_output_summary("str_replace", "<<<ASTRA_UNIFIED_DIFF>>>\n--- a/src/hello.py\n+++ b/src/hello.py\n@@ -1,2 +1,3 @@\n-print(\"old\")\n+print(\"new\")\n+print(\"more\")\n<<<END_ASTRA_UNIFIED_DIFF>>>", "completed").expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Diff);
         assert!(s.text.contains("--- a/src/hello.py"));
         assert!(s.text.contains("+++ b/src/hello.py"));
@@ -8489,8 +8489,8 @@ mod tests {
         let s = r
             .format_output_summary(
                 "custom_tool",
-                r#"{"status":"ok","count":2,"items":["a","b"]}"#,
-                "ok",
+                r#"{"status":"completed","count":2,"items":["a","b"]}"#,
+                "completed",
             )
             .expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
@@ -8505,17 +8505,17 @@ mod tests {
             .format_output_summary(
                 "web_fetch",
                 "# MatrixOne Docs\n\nWelcome to the docs.\nMore details.",
-                "ok",
+                "completed",
             )
             .expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
         assert_eq!(s.text, "MatrixOne Docs · 3 lines");
         // html title
-        let s = r.format_output_summary("web_fetch", "<html><head><title>Release Notes</title></head><body><p>Shipped.</p></body></html>", "ok").expect("summary");
+        let s = r.format_output_summary("web_fetch", "<html><head><title>Release Notes</title></head><body><p>Shipped.</p></body></html>", "completed").expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
         assert_eq!(s.text, "Release Notes · 1 line");
         // structured json title
-        let s = r.format_output_summary("web_fetch", &serde_json::json!({"metadata": {"title": "Structured Docs"}, "content": "# Ignored Heading\n\nBody"}).to_string(), "ok").expect("summary");
+        let s = r.format_output_summary("web_fetch", &serde_json::json!({"metadata": {"title": "Structured Docs"}, "content": "# Ignored Heading\n\nBody"}).to_string(), "completed").expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
         assert_eq!(s.text, "Structured Docs · 2 lines");
     }
@@ -8524,12 +8524,16 @@ mod tests {
     fn mo_query_output_summary() {
         let r = StreamRenderState::new();
         // row and column counts
-        let s = r.format_output_summary("mo_query", "+----+-------+\n| id | name  |\n+----+-------+\n| 1  | alice |\n| 2  | bob   |\n+----+-------+\n", "ok").expect("summary");
+        let s = r.format_output_summary("mo_query", "+----+-------+\n| id | name  |\n+----+-------+\n| 1  | alice |\n| 2  | bob   |\n+----+-------+\n", "completed").expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
         assert_eq!(s.text, "2 rows · cols: id, name");
         // query ok messages
         let s = r
-            .format_output_summary("mo_query", "Query OK, 1 row affected (0.02 sec)", "ok")
+            .format_output_summary(
+                "mo_query",
+                "Query OK, 1 row affected (0.02 sec)",
+                "completed",
+            )
             .expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
         assert_eq!(s.text, "Query OK, 1 row affected (0.02 sec)");
@@ -8675,7 +8679,7 @@ mod tests {
             sig.clone(),
             EdgeToolCacheEntry {
                 output: "file content".to_string(),
-                status: "success".to_string(),
+                status: "completed".to_string(),
                 validation: EdgeToolCacheValidation::FileMtime {
                     path: PathBuf::from("/tmp/foo"),
                     timestamp_ms: 1,
@@ -8684,7 +8688,7 @@ mod tests {
         );
         let hit = cache.output_cache.get(&sig).unwrap();
         assert_eq!(hit.output, "file content");
-        assert_eq!(hit.status, "success");
+        assert_eq!(hit.status, "completed");
 
         // call count increments
         let sig2 = "grep:{\"pattern\":\"foo\"}".to_string();
@@ -8826,7 +8830,7 @@ mod tests {
             .await;
 
         assert_eq!(results.len(), 2);
-        assert_ne!(results[0].status, "error");
+        assert_ne!(results[0].status, "failed");
         let rollback_fields = results[1]
             .tool_result_fields
             .as_ref()
@@ -9299,7 +9303,7 @@ mod tests {
             .await;
 
         assert_eq!(results.len(), 3);
-        assert_eq!(results[2].status, "error");
+        assert_eq!(results[2].status, "failed");
         assert!(
             results[2].output.contains("already aborted"),
             "{}",
@@ -9376,7 +9380,7 @@ mod tests {
             .await;
 
         assert_eq!(results.len(), 1);
-        assert_ne!(results[0].status, "error");
+        assert_ne!(results[0].status, "failed");
 
         let events = boundary_events(session_id);
         assert_eq!(events.len(), 2);
@@ -9469,7 +9473,7 @@ mod tests {
             .await;
 
         assert_eq!(results.len(), 2);
-        assert_eq!(results[1].status, "error");
+        assert_eq!(results[1].status, "failed");
 
         let events = boundary_events(session_id);
         assert_eq!(events.len(), 2);
@@ -9567,7 +9571,7 @@ mod tests {
             .await;
 
         assert_eq!(results.len(), 2);
-        assert_eq!(results[1].status, "error");
+        assert_eq!(results[1].status, "failed");
         let rollback_fields = results[1]
             .tool_result_fields
             .as_ref()
@@ -9674,7 +9678,7 @@ mod tests {
         // The agent sees the error and decides whether to continue.
 
         // Bash error triggers rollback
-        assert_eq!(results[1].status, "error");
+        assert_eq!(results[1].status, "failed");
         let bash_fields = results[1]
             .tool_result_fields
             .as_ref()
@@ -9687,7 +9691,7 @@ mod tests {
 
         // Subsequent tool executes normally (not blocked)
         assert_eq!(
-            results[2].status, "success",
+            results[2].status, "completed",
             "read_file should execute normally after rollback"
         );
         assert!(
@@ -9787,7 +9791,7 @@ mod tests {
             read_sig,
             EdgeToolCacheEntry {
                 output: "v1\n".to_string(),
-                status: "success".to_string(),
+                status: "completed".to_string(),
                 validation: EdgeToolCacheValidation::FileMtime {
                     path: file.clone(),
                     timestamp_ms: path_mtime_ms(&file),
@@ -9823,7 +9827,7 @@ mod tests {
         let result = host
             .execute_tool("cache-read-hit", "read_file", &read_args)
             .await;
-        assert_eq!(result.status, "success");
+        assert_eq!(result.status, "completed");
         assert_eq!(result.output, "v1\n");
 
         let started = event_rx.try_recv().expect("tool started event");
@@ -9846,7 +9850,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(name, "read_file");
-                assert_eq!(status, "success");
+                assert_eq!(status, "completed");
                 assert_eq!(tool_use_id, "cache-read-hit");
                 assert!(output.as_deref().is_some_and(|text| text.contains("v1")));
             }
@@ -9914,7 +9918,7 @@ mod tests {
             read_sig.clone(),
             EdgeToolCacheEntry {
                 output: "v1\n".to_string(),
-                status: "success".to_string(),
+                status: "completed".to_string(),
                 validation: EdgeToolCacheValidation::FileMtime {
                     path: file.clone(),
                     timestamp_ms,
@@ -9930,7 +9934,7 @@ mod tests {
                 &serde_json::json!({"path": "cached.txt", "content": "v2\n"}),
             )
             .await;
-        assert_eq!(write.status, "success", "{}", write.output);
+        assert_eq!(write.status, "completed", "{}", write.output);
         assert!(
             host.tool_cache.output_cache.is_empty(),
             "successful write_file must clear stale read cache"
@@ -10012,7 +10016,7 @@ mod tests {
             read_sig.clone(),
             EdgeToolCacheEntry {
                 output: "alpha\n".to_string(),
-                status: "success".to_string(),
+                status: "completed".to_string(),
                 validation: EdgeToolCacheValidation::FileMtime {
                     path: file.clone(),
                     timestamp_ms,
@@ -10032,7 +10036,7 @@ mod tests {
                 }),
             )
             .await;
-        assert_eq!(replace.status, "success", "{}", replace.output);
+        assert_eq!(replace.status, "completed", "{}", replace.output);
         assert!(
             host.tool_cache.output_cache.is_empty(),
             "successful str_replace must clear stale read cache"
@@ -10260,12 +10264,12 @@ mod tests {
         assert_eq!(results.len(), 3);
         // bash mkdir should have succeeded
         assert_ne!(
-            results[1].status, "error",
+            results[1].status, "failed",
             "bash mkdir should be allowed: {}",
             results[1].output
         );
         // bash "exit 1" should have errored and triggered rollback
-        assert_eq!(results[2].status, "error");
+        assert_eq!(results[2].status, "failed");
         // write_file should be rolled back
         assert!(
             !temp.path().join("turn.txt").exists(),
@@ -10328,7 +10332,7 @@ mod tests {
             )
             .await;
 
-        assert_ne!(result.status, "error");
+        assert_ne!(result.status, "failed");
         let runtime_environment = result
             .tool_result_fields
             .as_ref()
@@ -10394,7 +10398,7 @@ mod tests {
             )
             .await;
 
-        assert_eq!(result.status, "error");
+        assert_eq!(result.status, "failed");
         assert!(
             result.output.contains(
                 "name-based process killing commands (`pkill` / `killall`) are not allowed"
@@ -10412,7 +10416,7 @@ mod tests {
             args: serde_json::json!({"approved": true}),
             output: "Exited plan mode; user approved. Next turn will run in auto mode.".to_string(),
             tool_result_fields: None,
-            status: "ok".to_string(),
+            status: "completed".to_string(),
             duration_ms: 12,
         }];
 
@@ -10431,7 +10435,7 @@ mod tests {
             args: serde_json::json!({"approved": true}),
             output: "host output".to_string(),
             tool_result_fields: None,
-            status: "ok".to_string(),
+            status: "completed".to_string(),
             duration_ms: 8,
         }];
         let merged = merge_edge_tool_rounds(host.clone(), &consumed);
@@ -10515,12 +10519,12 @@ mod tests {
 
         assert_eq!(results.len(), 3);
         // write_file should succeed
-        assert_ne!(results[0].status, "error", "{}", results[0].output);
+        assert_ne!(results[0].status, "failed", "{}", results[0].output);
         // read_file(missing) should error
-        assert_eq!(results[1].status, "error");
+        assert_eq!(results[1].status, "failed");
         // read_file(keep) should still execute (no rollback triggered)
         assert_ne!(
-            results[2].status, "error",
+            results[2].status, "failed",
             "read-only error should not abort turn: {}",
             results[2].output
         );
@@ -10592,7 +10596,7 @@ mod tests {
             }])
             .await;
         assert_eq!(results.len(), 1);
-        assert_ne!(results[0].status, "error");
+        assert_ne!(results[0].status, "failed");
 
         host.on_stream_complete();
 
@@ -10682,7 +10686,7 @@ mod tests {
             .await;
 
         assert_eq!(results.len(), 2);
-        assert_eq!(results[1].status, "error");
+        assert_eq!(results[1].status, "failed");
 
         let events = boundary_events(session_id);
         assert_eq!(events.len(), 2);
@@ -10783,7 +10787,7 @@ mod tests {
             .await;
 
         assert_eq!(results.len(), 2);
-        assert_eq!(results[1].status, "error");
+        assert_eq!(results[1].status, "failed");
         assert!(
             results[1]
                 .output
@@ -10862,7 +10866,7 @@ mod tests {
             .await;
 
         assert_eq!(results.len(), 1);
-        assert_ne!(results[0].status, "error");
+        assert_ne!(results[0].status, "failed");
         assert!(
             results[0]
                 .output
@@ -10991,7 +10995,7 @@ mod tests {
                 args: serde_json::json!({"path": "lib.rs"}),
                 output: "pub fn main() {}".into(),
                 tool_result_fields: None,
-                status: "ok".into(),
+                status: "completed".into(),
                 duration_ms: 42,
             },
         );
@@ -11028,5 +11032,25 @@ mod tests {
             Some("Permission denied")
         );
         assert_eq!(snap.tools_used, vec!["bash"]);
+
+        // skipped status is protective deduplication, not a failed tool call
+        let state = IncrementalTurnState::default();
+        sync_incremental_tool_result_state(
+            &state,
+            &EdgeToolExecResult {
+                request_id: "req-skip".into(),
+                tool: "read_file".into(),
+                args: serde_json::json!({"path": "lib.rs"}),
+                output: "Duplicate call skipped.".into(),
+                tool_result_fields: None,
+                status: "skipped".into(),
+                duration_ms: 0,
+            },
+        );
+        let snap = state.snapshot();
+        assert_eq!(snap.tool_call_records.len(), 1);
+        assert!(snap.tool_call_records[0].ok);
+        assert!(snap.tool_call_records[0].error.is_none());
+        assert_eq!(snap.tools_used, vec!["read_file"]);
     }
 }

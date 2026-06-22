@@ -134,8 +134,8 @@ impl TaskCell {
     }
 
     /// Terminal transition for the parent task. `status_str` follows
-    /// the same shared tool-result convention as ToolCell:
-    /// `"ok"` / `"success"` = green, anything else = failed.
+    /// the shared canonical tool-result convention:
+    /// `"completed"` = green, anything else except `"skipped"` = failed.
     pub fn complete(
         &mut self,
         status_str: &str,
@@ -480,7 +480,7 @@ mod tests {
     #[test]
     fn complete_transitions_out_of_running() {
         let mut t = TaskCell::new_running("tu_parent", "do work");
-        t.complete("success", 1234, Some("done".into()), None);
+        t.complete("completed", 1234, Some("done".into()), None);
         assert!(!t.is_live());
         assert_eq!(t.status, TaskStatus::Completed);
         assert_eq!(t.duration_ms, Some(1234));
@@ -489,7 +489,7 @@ mod tests {
     #[test]
     fn failure_sets_status_failed_and_preserves_error() {
         let mut t = TaskCell::new_running("tu_parent", "risky op");
-        t.complete("error", 10, None, Some("boom".into()));
+        t.complete("failed", 10, None, Some("boom".into()));
         assert_eq!(t.status, TaskStatus::Failed);
         assert_eq!(t.error.as_deref(), Some("boom"));
     }
@@ -511,7 +511,7 @@ mod tests {
     fn finalize_get_agent_result_renders_as_interrupted_not_failed() {
         let mut t = TaskCell::new_running("tu_parent", "Get agent result: reviewer@abc");
         t.push_child_started("child-1", "bash", "git diff");
-        t.push_child_completed("child-1", "success", 20);
+        t.push_child_completed("child-1", "completed", 20);
 
         t.finalize();
 
@@ -542,23 +542,23 @@ mod tests {
     fn push_child_completed_flips_status_and_duration() {
         let mut t = TaskCell::new_running("tu_parent", "wrap");
         t.push_child_started("tu_a", "bash", "ls");
-        t.push_child_completed("tu_a", "success", 55);
+        t.push_child_completed("tu_a", "completed", 55);
         assert_eq!(t.children[0].status, ChildStatus::Success);
         assert_eq!(t.children[0].duration_ms, Some(55));
     }
 
     #[test]
-    fn push_child_completed_treats_ok_as_success() {
+    fn push_child_completed_rejects_noncanonical_ok_alias() {
         let mut t = TaskCell::new_running("tu_parent", "wrap");
         t.push_child_started("tu_a", "bash", "ls");
         t.push_child_completed("tu_a", "ok", 55);
-        assert_eq!(t.children[0].status, ChildStatus::Success);
+        assert_eq!(t.children[0].status, ChildStatus::Failed);
     }
 
     #[test]
     fn push_child_completed_is_noop_for_unknown_id() {
         let mut t = TaskCell::new_running("tu_parent", "wrap");
-        t.push_child_completed("tu_missing", "success", 1);
+        t.push_child_completed("tu_missing", "completed", 1);
         assert!(
             t.children.is_empty(),
             "no child should appear from a stray completed event"
@@ -598,7 +598,7 @@ mod tests {
     #[test]
     fn completed_header_shows_task_done_and_duration() {
         let mut t = TaskCell::new_running("tu_parent", "do work");
-        t.complete("success", 2500, Some("3 files changed".into()), None);
+        t.complete("completed", 2500, Some("3 files changed".into()), None);
         let out = render(&t, 80, 4);
         assert!(
             out.contains("Task · do work · done"),
@@ -609,16 +609,16 @@ mod tests {
     }
 
     #[test]
-    fn complete_treats_ok_as_completed() {
+    fn complete_rejects_noncanonical_ok_alias() {
         let mut t = TaskCell::new_running("tu_parent", "do work");
         t.complete("ok", 2500, Some("3 files changed".into()), None);
-        assert_eq!(t.status, TaskStatus::Completed);
+        assert_eq!(t.status, TaskStatus::Failed);
     }
 
     #[test]
     fn failed_header_shows_task_failed_and_error_line() {
         let mut t = TaskCell::new_running("tu_parent", "risky");
-        t.complete("error", 100, None, Some("timeout".into()));
+        t.complete("failed", 100, None, Some("timeout".into()));
         let out = render(&t, 80, 3);
         assert!(
             out.contains("Task · risky · failed"),
@@ -633,7 +633,7 @@ mod tests {
         let mut t = TaskCell::new_running("tu_parent", "wrap");
         t.push_child_started("tu_a", "bash", "ls");
         t.push_child_started("tu_b", "read_file", "src/main.rs");
-        t.push_child_completed("tu_a", "success", 20);
+        t.push_child_completed("tu_a", "completed", 20);
         let out = render(&t, 80, 5);
         assert!(out.contains("├"), "missing mid-connector: {out}");
         assert!(out.contains("Bash ls · 20ms"), "missing first child: {out}");
@@ -647,14 +647,14 @@ mod tests {
     fn collapsed_summary_uses_steps_language() {
         let mut t = TaskCell::new_running("tu_parent", "wrap");
         t.push_child_started("a", "bash", "ls");
-        t.push_child_completed("a", "success", 20);
+        t.push_child_completed("a", "completed", 20);
         t.push_child_started("b", "read_file", "src/main.rs");
-        t.push_child_completed("b", "success", 20);
+        t.push_child_completed("b", "completed", 20);
         t.push_child_started("c", "grep", "TODO");
-        t.push_child_completed("c", "success", 20);
+        t.push_child_completed("c", "completed", 20);
         t.push_child_started("d", "write_file", "notes.md");
-        t.push_child_completed("d", "success", 20);
-        t.complete("success", 100, None, None);
+        t.push_child_completed("d", "completed", 20);
+        t.complete("completed", 100, None, None);
 
         let out = render(&t, 80, 4);
         assert!(out.contains("4 steps · all done"), "{out}");
@@ -665,8 +665,8 @@ mod tests {
     fn completed_task_uses_last_branch_connector() {
         let mut t = TaskCell::new_running("tu_parent", "wrap");
         t.push_child_started("tu_a", "bash", "ls");
-        t.push_child_completed("tu_a", "success", 20);
-        t.complete("success", 30, None, None);
+        t.push_child_completed("tu_a", "completed", 20);
+        t.complete("completed", 30, None, None);
         let out = render(&t, 80, 3);
         assert!(
             out.contains("└"),

@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use crate::relevance_score::Scoreable;
 
 const KEYWORD_DESCRIPTION_MAX_CHARS: usize = 180;
+const TOOL_RESULT_STATUS_COMPLETED: &str = "completed";
 
 struct ToolSchemaAdapter<'a>(&'a Value);
 
@@ -130,10 +131,11 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
             }
         }
 
-        let status = select_status(valid_schemas.len(), found.len(), missing.len());
+        let outcome = select_outcome(valid_schemas.len(), found.len(), missing.len());
         let mut result = json!({
             "mode": "select",
-            "status": status,
+            "status": TOOL_RESULT_STATUS_COMPLETED,
+            "selection_status": outcome,
             "query": query,
             "requested": requested,
             "resolved": resolved,
@@ -142,8 +144,8 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
             "ambiguous": ambiguous,
             "total_tools": valid_schemas.len()
         });
-        let message = select_message(status, &result);
-        add_tool_search_guidance(&mut result, status, message);
+        let message = select_message(outcome, &result);
+        add_tool_search_guidance(&mut result, outcome, message);
         return result.to_string();
     }
 
@@ -174,15 +176,16 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
         })
         .collect();
 
-    let status = keyword_status(valid_schemas.len(), matches.len());
+    let outcome = keyword_outcome(valid_schemas.len(), matches.len());
     let mut result = json!({
         "mode": "keyword",
-        "status": status,
+        "status": TOOL_RESULT_STATUS_COMPLETED,
+        "search_status": outcome,
         "query": query,
         "matches": matches,
         "total_tools": valid_schemas.len()
     });
-    add_tool_search_guidance(&mut result, status, keyword_message(status, query));
+    add_tool_search_guidance(&mut result, outcome, keyword_message(outcome, query));
     result.to_string()
 }
 
@@ -243,7 +246,7 @@ fn resolve_select_tool<'a>(schemas: &'a [&'a Value], requested: &str) -> SelectR
     }
 }
 
-fn select_status(total_tools: usize, found: usize, missing: usize) -> &'static str {
+fn select_outcome(total_tools: usize, found: usize, missing: usize) -> &'static str {
     if total_tools == 0 {
         "empty_surface"
     } else if missing == 0 {
@@ -255,7 +258,7 @@ fn select_status(total_tools: usize, found: usize, missing: usize) -> &'static s
     }
 }
 
-fn keyword_status(total_tools: usize, matches: usize) -> &'static str {
+fn keyword_outcome(total_tools: usize, matches: usize) -> &'static str {
     if total_tools == 0 {
         "empty_surface"
     } else if matches == 0 {
@@ -265,8 +268,8 @@ fn keyword_status(total_tools: usize, matches: usize) -> &'static str {
     }
 }
 
-fn add_tool_search_guidance(result: &mut Value, status: &str, message: Option<String>) {
-    if status == "ok" {
+fn add_tool_search_guidance(result: &mut Value, outcome: &str, message: Option<String>) {
+    if outcome == "ok" {
         return;
     }
     let Some(object) = result.as_object_mut() else {
@@ -500,7 +503,8 @@ mod tests {
             strings(&["nonexistent"])
         );
         assert_eq!(field_strings(&parsed, "missing"), strings(&["nonexistent"]));
-        assert_eq!(parsed["status"].as_str(), Some("not_found"));
+        assert_eq!(parsed["status"].as_str(), Some("completed"));
+        assert_eq!(parsed["selection_status"].as_str(), Some("not_found"));
         assert!(
             parsed["message"]
                 .as_str()
@@ -554,7 +558,8 @@ mod tests {
         let result = tool_search(&schemas, &json!({"query": "select:github_list"}));
         let parsed = parse_result(&result);
 
-        assert_eq!(parsed["status"].as_str(), Some("ok"));
+        assert_eq!(parsed["status"].as_str(), Some("completed"));
+        assert_eq!(parsed["selection_status"].as_str(), Some("ok"));
         assert_eq!(
             field_strings(&parsed, "requested"),
             strings(&["github_list"])
@@ -593,7 +598,8 @@ mod tests {
         let result = tool_search(&schemas, &json!({"query": "select:read"}));
         let parsed = parse_result(&result);
 
-        assert_eq!(parsed["status"].as_str(), Some("not_found"));
+        assert_eq!(parsed["status"].as_str(), Some("completed"));
+        assert_eq!(parsed["selection_status"].as_str(), Some("not_found"));
         assert_eq!(match_names(&parsed), Vec::<String>::new());
         assert_eq!(field_strings(&parsed, "missing"), strings(&["read"]));
         let candidates = parsed["ambiguous"][0]["candidates"]
@@ -654,7 +660,8 @@ mod tests {
         );
         assert_eq!(match_names(&parsed), strings(&["bash"]));
         assert_eq!(field_strings(&parsed, "missing"), strings(&["grep"]));
-        assert_eq!(parsed["status"].as_str(), Some("partial"));
+        assert_eq!(parsed["status"].as_str(), Some("completed"));
+        assert_eq!(parsed["selection_status"].as_str(), Some("partial"));
     }
 
     #[test]
@@ -686,7 +693,8 @@ mod tests {
     fn empty_search_pool_explains_that_search_cannot_create_tools() {
         let selected = parse_result(&tool_search(&[], &json!({"query": "select:bash"})));
         assert_eq!(selected["mode"].as_str(), Some("select"));
-        assert_eq!(selected["status"].as_str(), Some("empty_surface"));
+        assert_eq!(selected["status"].as_str(), Some("completed"));
+        assert_eq!(selected["selection_status"].as_str(), Some("empty_surface"));
         assert_eq!(selected["total_tools"].as_u64(), Some(0));
         assert_eq!(field_strings(&selected, "requested"), strings(&["bash"]));
         assert_eq!(field_strings(&selected, "missing"), strings(&["bash"]));
@@ -703,7 +711,8 @@ mod tests {
 
         let keyword = parse_result(&tool_search(&[], &json!({"query": "filesystem"})));
         assert_eq!(keyword["mode"].as_str(), Some("keyword"));
-        assert_eq!(keyword["status"].as_str(), Some("empty_surface"));
+        assert_eq!(keyword["status"].as_str(), Some("completed"));
+        assert_eq!(keyword["search_status"].as_str(), Some("empty_surface"));
         assert_eq!(keyword["total_tools"].as_u64(), Some(0));
         assert!(match_names(&keyword).is_empty());
         assert!(

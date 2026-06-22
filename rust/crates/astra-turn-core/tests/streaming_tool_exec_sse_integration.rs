@@ -58,7 +58,7 @@ impl SseStreamHost for SpeculatingHost {
             args: args.clone(),
             output: String::new(),
             tool_result_fields: None,
-            status: "ok".to_string(),
+            status: "completed".to_string(),
             duration_ms: 0,
         }
     }
@@ -321,7 +321,7 @@ async fn complex_speculation_off_is_serial() {
                 args: args.clone(),
                 output: String::new(),
                 tool_result_fields: None,
-                status: "ok".to_string(),
+                status: "completed".to_string(),
                 duration_ms: 0,
             }
         }

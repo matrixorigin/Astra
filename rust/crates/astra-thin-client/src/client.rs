@@ -2102,7 +2102,7 @@ mod tests {
         let body = ToolResultRequest {
             request_id: "tr-1".into(),
             edge_agent_id: Some("edge-abc".into()),
-            status: "success".into(),
+            status: "completed".into(),
             output: Some("out".into()),
             duration_ms: Some(12),
             result_hash: None,

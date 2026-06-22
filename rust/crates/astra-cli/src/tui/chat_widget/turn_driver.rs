@@ -79,7 +79,7 @@ fn canonical_turn_commits_every_cell_kind_in_order() {
     w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
         name: "bash".into(),
         description: String::new(),
-        status: "success".into(),
+        status: "completed".into(),
         duration_ms: 42,
         output_summary: Some("3 entries".into()),
         output: None,
@@ -140,7 +140,7 @@ fn canonical_turn_snapshots_full_scrollback() {
     w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
         name: "bash".into(),
         description: String::new(),
-        status: "success".into(),
+        status: "completed".into(),
         duration_ms: 42,
         output_summary: Some("3 entries".into()),
         output: None,
@@ -215,7 +215,7 @@ fn two_back_to_back_tools_both_commit() {
         w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
             name: format!("t{i}"),
             description: String::new(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: dur,
             output_summary: None,
             output: None,

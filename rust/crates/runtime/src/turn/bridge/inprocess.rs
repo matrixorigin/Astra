@@ -7906,7 +7906,7 @@ mod tests {
         let tool_results = vec![json!({
             "request_id": "call-1",
             "name": "bash",
-            "status": "ok",
+            "status": "completed",
             "output": "hello\n",
             "duration_ms": 50
         })];
@@ -7932,7 +7932,7 @@ mod tests {
         let tool_results = vec![json!({
             "request_id": "call-1",
             "name": "agent_fanout",
-            "status": "success",
+            "status": "completed",
             "output": "{\"status\":\"failed\",\"error\":\"Invalid input: unknown field `slot_id`\"}",
             "duration_ms": 50
         })];
@@ -7965,7 +7965,7 @@ mod tests {
         let tool_results = vec![json!({
             "request_id": "call-1",
             "name": "bash",
-            "status": "ok",
+            "status": "completed",
             "output": {},
             "duration_ms": 50
         })];
@@ -8010,7 +8010,7 @@ mod tests {
         let tool_results = vec![json!({
             "request_id": "call-1",
             "name": "bash",
-            "status": "ok",
+            "status": "completed",
             "output": {"stdout": "hello", "exit": 0},
             "duration_ms": 50
         })];
@@ -8048,7 +8048,7 @@ mod tests {
         let tool_results = vec![json!({
             "request_id": "call-1",
             "name": "bash",
-            "status": "ok",
+            "status": "completed",
             "output": [{"type": "text", "text": "hello"}],
             "duration_ms": 50
         })];
@@ -8088,7 +8088,7 @@ mod tests {
         let tool_results = vec![json!({
             "request_id": "call-1",
             "name": "bash",
-            "status": "ok",
+            "status": "completed",
             "output": null,
             "duration_ms": 50
         })];
@@ -8121,7 +8121,7 @@ mod tests {
         let tool_results = vec![json!({
             "request_id": "call-1",
             "name": "bash",
-            "status": "ok",
+            "status": "completed",
             "output": null,
             "duration_ms": 50
         })];
@@ -8148,7 +8148,7 @@ mod tests {
         let tool_results = vec![json!({
             "request_id": "call-1",
             "name": "bash",
-            "status": "ok",
+            "status": "completed",
             "duration_ms": 50
         })];
         let records = build_bridge_tool_call_records(

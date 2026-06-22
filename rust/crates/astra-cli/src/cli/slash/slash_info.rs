@@ -1,6 +1,6 @@
 use crate::cli::surface::health_status_surface::api_probe_is_healthy;
 use crate::cli::{
-    chat_stream::{ChatTurnParams, stream_chat_sse},
+    chat_stream::{ChatTurnParams, DEFAULT_TURN_INDEX, stream_chat_sse},
     cli_config::cli_utils::truncate_str,
     durable_bridge,
     permission_manager::PermissionManager,
@@ -1311,7 +1311,7 @@ pub(crate) async fn handle_info_command(
                 bg_task_commands: None,
                 bg_task_list_cache: None,
                 bash_detach_slot: None,
-                turn_index: 0,
+                turn_index: DEFAULT_TURN_INDEX,
                 pipeline_state: None,
                 compaction_state: None,
                 consecutive_context_window_errors: 0,

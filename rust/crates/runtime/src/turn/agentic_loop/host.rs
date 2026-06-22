@@ -2674,7 +2674,7 @@ pub(crate) mod tests {
             args: json!({}),
             output: output.to_string(),
             tool_result_fields: Some(edge_runtime_environment_fields()),
-            status: "ok".to_string(),
+            status: "completed".to_string(),
             duration_ms: 10,
         }
     }
@@ -2691,7 +2691,7 @@ pub(crate) mod tests {
                 "<bash_detached>The bash command was promoted to background task {task_id}.</bash_detached>"
             ),
             tool_result_fields: Some(fields),
-            status: "ok".to_string(),
+            status: "completed".to_string(),
             duration_ms: 10,
         }
     }
@@ -2724,7 +2724,7 @@ pub(crate) mod tests {
             })
             .to_string(),
             tool_result_fields: Some(edge_runtime_environment_fields()),
-            status: "ok".to_string(),
+            status: "completed".to_string(),
             duration_ms: 10,
         }
     }
@@ -2736,7 +2736,7 @@ pub(crate) mod tests {
             args,
             output: output.to_string(),
             tool_result_fields: Some(edge_runtime_environment_fields()),
-            status: "ok".to_string(),
+            status: "completed".to_string(),
             duration_ms: 10,
         }
     }

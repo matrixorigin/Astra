@@ -1,5 +1,5 @@
 use crate::cli::{
-    chat_stream::{ChatTurnParams, stream_chat_sse},
+    chat_stream::{ChatTurnParams, DEFAULT_TURN_INDEX, stream_chat_sse},
     cli_config::cli_utils::{
         compact_or_raw, map_thin_err, persist_profile_last_session_or_warn, prefix_chars,
         print_json_or_raw, urlencoding,
@@ -123,7 +123,7 @@ impl<'a> CompactCtx<'a> {
             bg_task_commands: None,
             bg_task_list_cache: None,
             bash_detach_slot: None,
-            turn_index: 0,
+            turn_index: DEFAULT_TURN_INDEX,
             pipeline_state: None,
             compaction_state: None,
             consecutive_context_window_errors: 0,

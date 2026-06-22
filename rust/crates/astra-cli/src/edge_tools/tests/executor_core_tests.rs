@@ -148,7 +148,7 @@ async fn execute_with_metadata_marks_structured_str_replace_failure_as_error() {
     );
     assert_eq!(
         astra_turn_core::tool_result_semantics::cloud_tool_result_status_label(&outcome.output),
-        "error"
+        "failed"
     );
 }
 
@@ -195,7 +195,7 @@ async fn agent_action_delegate_is_rejected_with_redirect_to_spawn() {
     );
     // End-to-end UX assertion: the Error: prefix must classify through
     // tool_result_semantics::is_tool_error → cloud_tool_result_status_label
-    // → "error", so the TUI renders the red `•` failure banner instead
+    // → "failed", so the TUI renders the red `•` failure banner instead
     // of the green success banner. This is the load-bearing wire that
     // makes the failure visible to the human.
     assert!(
@@ -205,9 +205,9 @@ async fn agent_action_delegate_is_rejected_with_redirect_to_spawn() {
     );
     assert_eq!(
         astra_turn_core::tool_result_semantics::cloud_tool_result_status_label(&result),
-        "error",
-        "the new error must produce status='error' for cloud reporting; \
-         status='success' would re-poison the model's belief that the \
+        "failed",
+        "the new error must produce status='failed' for cloud reporting; \
+         status='completed' would re-poison the model's belief that the \
          delegation succeeded. Got: {result}"
     );
 }

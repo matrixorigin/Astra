@@ -481,7 +481,7 @@ pub fn tool_content_from_ledger_entry(entry: &Value) -> String {
     // posted `output: {}` or `output: null`), `as_str()` returns None
     // and we'd silently emit an empty body here. Detect that case and
     // fall back to the object's JSON form so the model sees SOMETHING
-    // useful instead of `{"status":"ok"}`. Also logs so future
+    // useful instead of `{"status":"completed"}`. Also logs so future
     // regressions of this kind surface in the session's tracing.
     let output = if let Some(s) = body.get("output").and_then(Value::as_str) {
         s.to_string()
@@ -505,7 +505,7 @@ pub fn tool_content_from_ledger_entry(entry: &Value) -> String {
     };
     if output.is_empty() {
         serde_json::to_string(&json!({"status": status})).unwrap_or_else(|_| status.to_string())
-    } else if matches!(status, "ok" | "success" | "completed") {
+    } else if status == "completed" {
         output
     } else {
         format!("status={status}\n{output}")
@@ -832,7 +832,7 @@ mod tests {
     fn tool_content_prefers_output_on_success_status() {
         let entry = json!({
             "kind": "tool_result",
-            "body": {"status": "ok", "output": "hello"}
+            "body": {"status": "completed", "output": "hello"}
         });
         assert_eq!(tool_content_from_ledger_entry(&entry), "hello");
     }
@@ -840,9 +840,12 @@ mod tests {
     #[test]
     fn tool_content_wraps_non_success_with_status() {
         let entry = json!({
-            "body": {"status": "error", "output": "boom"}
+            "body": {"status": "failed", "output": "boom"}
         });
-        assert_eq!(tool_content_from_ledger_entry(&entry), "status=error\nboom");
+        assert_eq!(
+            tool_content_from_ledger_entry(&entry),
+            "status=failed\nboom"
+        );
     }
 
     #[test]
@@ -851,7 +854,7 @@ mod tests {
             "kind": "tool_result",
             "user_id": "u1",
             "edge_id": "e1",
-            "body": {"request_id": "c1", "status": "ok", "output": "done"}
+            "body": {"request_id": "c1", "status": "completed", "output": "done"}
         });
         assert_eq!(tool_content_from_ledger_entry(&entry), "done");
     }
@@ -861,13 +864,13 @@ mod tests {
         // Regression guard: some posters may send `output` as a JSON
         // object or number instead of a string (e.g. the bash tool
         // serializing a structured result body). `as_str()` returns
-        // None and the old code silently collapsed to `{"status":"ok"}`
+        // None and the old code silently collapsed to `{"status":"completed"}`
         // — the model then sees the tool as having produced nothing.
         // Recover by stringifying the object so the content is at least
         // readable.
         let entry = json!({
             "kind": "tool_result",
-            "body": {"status": "ok", "output": {"stdout": "hello"}}
+            "body": {"status": "completed", "output": {"stdout": "hello"}}
         });
         let got = tool_content_from_ledger_entry(&entry);
         assert!(
@@ -875,7 +878,7 @@ mod tests {
             "non-string output must be preserved as JSON, got: {got}"
         );
         assert_ne!(
-            got, r#"{"status":"ok"}"#,
+            got, r#"{"status":"completed"}"#,
             "empty-body fallback would hide real output"
         );
     }
@@ -887,9 +890,12 @@ mod tests {
         // emitting the literal string "null".
         let entry = json!({
             "kind": "tool_result",
-            "body": {"status": "ok", "output": null}
+            "body": {"status": "completed", "output": null}
         });
-        assert_eq!(tool_content_from_ledger_entry(&entry), r#"{"status":"ok"}"#);
+        assert_eq!(
+            tool_content_from_ledger_entry(&entry),
+            r#"{"status":"completed"}"#
+        );
     }
 
     #[test]

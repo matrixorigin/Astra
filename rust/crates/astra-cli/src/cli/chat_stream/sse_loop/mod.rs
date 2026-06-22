@@ -228,6 +228,7 @@ pub(crate) async fn stream_chat_sse(
 
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let file_context = detect_project_languages(&project_root);
+    let current_session_turn = p.turn_index;
     let mut executor = {
         let ex =
             edge_tools::ToolExecutor::new(&project_root).with_cloud(p.api.api_origin(), p.token);
@@ -298,9 +299,10 @@ pub(crate) async fn stream_chat_sse(
         } else {
             ex
         };
-        // Set turn index so journal entries are tagged for undo
+        // Set the 1-based session turn so journal entries are scoped to the
+        // user-visible turn currently in progress.
         ex.journal_turn_index
-            .store(p.turn_index, std::sync::atomic::Ordering::Release);
+            .store(current_session_turn, std::sync::atomic::Ordering::Release);
         let ex = if let Some(ref mgr) = p.mcp_manager {
             ex.with_mcp_manager(mgr.clone())
         } else {
@@ -589,7 +591,7 @@ pub(crate) async fn stream_chat_sse(
         ask_user_request_tx: p.ask_user_request_tx,
         plan_review_request_tx: p.plan_review_request_tx,
         root_send_message_context,
-        chat_turn_index: p.turn_index,
+        chat_turn_index: current_session_turn,
         tool_cache: crate::cli::stream::stream_render::EdgeToolCache::new(
             resolved_tool_policy.max_identical_tool_calls,
         ),
@@ -868,10 +870,7 @@ pub(crate) async fn stream_chat_sse(
         approval_overrides: initial_approval_overrides,
         confidence_trend: Default::default(),
         last_confidence_diagnosis: None,
-        // turn_index is 0-based (pre-increment); turn events are written
-        // after state.turn += 1, so add 1 here to keep llm_round.turn
-        // consistent with the turn event's turn number.
-        session_turn: p.turn_index + 1,
+        session_turn: current_session_turn,
         bridge_turn_chain_id: Some(uuid::Uuid::now_v7().to_string()),
         bridge_user_query_event_id: Some(uuid::Uuid::now_v7().to_string()),
         turn_event_buffer: None,

@@ -259,7 +259,7 @@ mod tests {
         let json = event_to_json(&StreamEvent::ToolCompleted {
             name: "read_file".into(),
             description: "src/main.rs".into(),
-            status: "ok".into(),
+            status: "completed".into(),
             duration_ms: 42,
             output_summary: Some("150 lines".into()),
             output: None,
@@ -326,7 +326,7 @@ mod tests {
             StreamEvent::ToolCompleted {
                 name: "t".into(),
                 description: "d".into(),
-                status: "ok".into(),
+                status: "completed".into(),
                 duration_ms: 0,
                 output_summary: None,
                 output: None,
@@ -403,7 +403,7 @@ mod tests {
         let json = event_to_json(&StreamEvent::ToolCompleted {
             name: "bash".into(),
             description: "ls".into(),
-            status: "ok".into(),
+            status: "completed".into(),
             duration_ms: 5,
             output_summary: None,
             output: None,
@@ -453,7 +453,7 @@ mod tests {
                 kind: astra_turn_core::agent_live_event::AgentLiveEventKind::ToolCompleted {
                     name: "bash".into(),
                     description: "cargo test".into(),
-                    status: "success".into(),
+                    status: "completed".into(),
                     duration_ms: 42,
                     output_summary: Some("ok".into()),
                     output: None,

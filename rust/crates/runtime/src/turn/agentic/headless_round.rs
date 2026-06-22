@@ -30,7 +30,10 @@ use crate::orchestration::PermissionSyncHandle;
 
 /// Typed execution context for one headless tool round.
 pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
+    /// Internal agentic step index (0-based) for cache and loop accounting.
     pub turn_index: usize,
+    /// User-visible session turn currently in progress (1-based).
+    pub session_turn: u32,
     pub quiet: bool,
     pub api: &'a ThinClient,
     pub token: &'a str,
@@ -173,6 +176,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
 ) {
     let HeadlessToolRoundCtx {
         turn_index,
+        session_turn,
         quiet,
         api,
         token,
@@ -232,6 +236,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
     let mut pipeline = HeadlessToolExecutionPipeline::new(
         HeadlessToolExecutionCtx {
             turn_index,
+            session_turn,
             quiet,
             api,
             token,

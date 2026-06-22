@@ -281,7 +281,7 @@ impl ToolExecutor {
             self.record_adjust_config_rollback(path_owned, old_value, session_snapshot);
         }
         json!({
-            "status": "ok",
+            "status": "completed",
             "path": path,
             "old": old_value.unwrap_or(Value::Null),
             "new": new_value.unwrap_or(Value::Null),
@@ -345,7 +345,7 @@ impl ToolExecutor {
             );
         }
         json!({
-            "status": "ok",
+            "status": "completed",
             "prioritized_tool": tool,
             "previous_pinned_tools": original_pinned,
             "previous_deprioritized_tools": original_deprioritized,
@@ -406,7 +406,7 @@ impl ToolExecutor {
             );
         }
         json!({
-            "status": "ok",
+            "status": "completed",
             "deprioritized_tool": tool,
             "previous_pinned_tools": original_pinned,
             "previous_deprioritized_tools": original_deprioritized,
@@ -457,7 +457,7 @@ impl ToolExecutor {
         self.record_compression_rollback(turn, session_snapshot);
 
         json!({
-            "status": "ok",
+            "status": "completed",
             "turn": turn,
             "reason": reason,
             "previous_compression_count": previous_compression_count,

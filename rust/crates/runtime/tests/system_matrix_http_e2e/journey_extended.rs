@@ -316,7 +316,7 @@ pub async fn run_edge_callback_http_boundary_failures() {
         None,
         json!({
             "request_id": format!("tool-unauth-{}", ctx.suffix),
-            "status": "ok",
+            "status": "completed",
             "output": "ignored",
             "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
                 &format!("tool-unauth-{}", ctx.suffix),
@@ -352,7 +352,7 @@ pub async fn run_edge_callback_http_boundary_failures() {
         "/tools/result",
         Some(auth.as_str()),
         json!({
-            "status": "ok",
+            "status": "completed",
             "output": "missing request id"
         }),
     )
@@ -463,7 +463,7 @@ pub async fn run_duplicate_tool_result_is_idempotent() {
                     Some(b.auth_header.as_str()),
                     json!({
                         "request_id": "tc-dup-tool-1",
-                        "status": "ok",
+                        "status": "completed",
                         "output": tool_output,
                         "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
                             "tc-dup-tool-1",
@@ -642,7 +642,7 @@ pub async fn run_chat_turn_partial_batch_failure() {
                 Some(b.auth_header.as_str()),
                 json!({
                     "request_id": "tc-partial-1",
-                    "status": "ok",
+                    "status": "completed",
                     "output": ok_output,
                     "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
                         "tc-partial-1",
@@ -665,7 +665,7 @@ pub async fn run_chat_turn_partial_batch_failure() {
                 Some(b.auth_header.as_str()),
                 json!({
                     "request_id": "tc-partial-2",
-                    "status": "error",
+                    "status": "failed",
                     "output": err_output,
                     "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
                         "tc-partial-2",
@@ -812,7 +812,7 @@ pub async fn run_chat_turn_out_of_order_tool_results() {
                     Some(b.auth_header.as_str()),
                     json!({
                         "request_id": "tc-race-2",
-                        "status": "ok",
+                        "status": "completed",
                         "output": second_output,
                         "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
                             "tc-race-2",
@@ -828,7 +828,7 @@ pub async fn run_chat_turn_out_of_order_tool_results() {
                         Some(b.auth_header.as_str()),
                         json!({
                             "request_id": "tc-race-1",
-                            "status": "ok",
+                            "status": "completed",
                             "output": first_output,
                             "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
                                 "tc-race-1",
@@ -1154,7 +1154,7 @@ pub async fn run_same_session_waiting_turn_overlap_isolated() {
                 Some(b.auth_header.as_str()),
                 json!({
                     "request_id": "tc-overlap-wait-1",
-                    "status": "ok",
+                    "status": "completed",
                     "output": tool_output,
                     "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
                         "tc-overlap-wait-1",

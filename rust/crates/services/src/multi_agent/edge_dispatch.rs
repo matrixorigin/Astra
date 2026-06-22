@@ -296,7 +296,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         let output = format!("edge dispatch {reason}");
         let result_json = serde_json::json!({
             "request_id": request_id,
-            "status": "error",
+            "status": "failed",
             "output": output,
             "duration_ms": 0,
         })
@@ -374,7 +374,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         let secs = older_than.as_secs() as i64;
         let expired_result_json = serde_json::json!({
             "request_id": null,
-            "status": "error",
+            "status": "failed",
             "output": "edge dispatch expired",
             "duration_ms": 0,
         })

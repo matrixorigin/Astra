@@ -6,9 +6,8 @@ use super::host::AgenticLoopState;
 
 pub(crate) fn edge_tool_status_exit_code(status: &str) -> Option<i32> {
     match status.trim().to_ascii_lowercase().as_str() {
-        "ok" | "success" | "succeeded" | "completed" | "complete" | "passed" => Some(0),
-        "error" | "failed" | "failure" | "partial_failure" | "denied" | "cancelled"
-        | "canceled" | "timeout" | "timed_out" => Some(1),
+        "completed" | "skipped" => Some(0),
+        "failed" | "partial_failure" | "denied" | "cancelled" | "timeout" | "timed_out" => Some(1),
         _ => None,
     }
 }
@@ -115,10 +114,13 @@ mod tests {
 
     #[test]
     fn edge_tool_status_exit_code_maps_common_statuses() {
-        assert_eq!(edge_tool_status_exit_code("ok"), Some(0));
         assert_eq!(edge_tool_status_exit_code("completed"), Some(0));
-        assert_eq!(edge_tool_status_exit_code("error"), Some(1));
+        assert_eq!(edge_tool_status_exit_code("skipped"), Some(0));
+        assert_eq!(edge_tool_status_exit_code("failed"), Some(1));
         assert_eq!(edge_tool_status_exit_code("partial_failure"), Some(1));
+        assert_eq!(edge_tool_status_exit_code("ok"), None);
+        assert_eq!(edge_tool_status_exit_code("success"), None);
+        assert_eq!(edge_tool_status_exit_code("error"), None);
         assert_eq!(edge_tool_status_exit_code("unknown"), None);
     }
 

@@ -759,7 +759,7 @@ pub async fn run_saas_edge_tool_result_success_path() {
                 Some(auth.as_str()),
                 json!({
                     "request_id": "tc-saas-tool-ok",
-                    "status": "ok",
+                    "status": "completed",
                     "output": tool_output,
                     "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
                         "tc-saas-tool-ok",

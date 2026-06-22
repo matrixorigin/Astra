@@ -2331,7 +2331,7 @@ impl ServerAgenticLoopHost {
             self.emit_event(Value::Object(build_tool_call_end_event(
                 &request_id,
                 json!({
-                    "status": "error",
+                    "status": "failed",
                     "output": output,
                 }),
             )));
@@ -2348,7 +2348,7 @@ impl ServerAgenticLoopHost {
                         &args,
                         None,
                     )),
-                    status: "error".to_string(),
+                    status: "failed".to_string(),
                     duration_ms: 0,
                 },
             );
@@ -2429,7 +2429,7 @@ impl ServerAgenticLoopHost {
                                 tool: tool_name,
                                 args,
                                 output: "Tool execution denied or timed out".to_string(),
-                                status: "error".to_string(),
+                                status: "failed".to_string(),
                                 duration_ms: 0,
                             },
                         );
@@ -4327,8 +4327,19 @@ fn live_tool_completed_fields(
     let status = event
         .get("status")
         .and_then(Value::as_str)
-        .unwrap_or(if failed { "error" } else { "ok" })
-        .to_string();
+        .map(|status| match status.trim().to_ascii_lowercase().as_str() {
+            "completed" | "skipped" => status.trim().to_ascii_lowercase(),
+            "failed" | "partial_failure" | "denied" | "cancelled" | "canceled" | "timeout"
+            | "timed_out" => "failed".to_string(),
+            _ => "failed".to_string(),
+        })
+        .unwrap_or_else(|| {
+            if failed {
+                "failed".to_string()
+            } else {
+                "completed".to_string()
+            }
+        });
     let name = event
         .get("tool_name")
         .or_else(|| event.get("tool"))
@@ -6119,7 +6130,7 @@ mod tests {
             .await;
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].status, "error");
+        assert_eq!(results[0].status, "failed");
         assert!(
             results[0].output.contains("select:github")
                 && results[0].output.contains("not executed"),
@@ -7156,11 +7167,11 @@ mod tests {
             let mut guard = ledger.lock().await;
             guard.insert(
                 tool_callback_key("u-batch", "w1"),
-                json!({"body": {"request_id": "w1", "status": "ok", "output": "wrote-a"}}),
+                json!({"body": {"request_id": "w1", "status": "completed", "output": "wrote-a"}}),
             );
             guard.insert(
                 tool_callback_key("u-batch", "w2"),
-                json!({"body": {"request_id": "w2", "status": "ok", "output": "wrote-b"}}),
+                json!({"body": {"request_id": "w2", "status": "completed", "output": "wrote-b"}}),
             );
         });
 
@@ -7199,8 +7210,8 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].request_id, "w1");
         assert_eq!(results[1].request_id, "w2");
-        assert_eq!(results[0].status, "ok");
-        assert_eq!(results[1].status, "ok");
+        assert_eq!(results[0].status, "completed");
+        assert_eq!(results[1].status, "completed");
     }
 
     #[tokio::test]
@@ -7242,7 +7253,7 @@ mod tests {
         }));
         host.edge_callback_ledger.lock().await.insert(
             tool_callback_key("u-edge-meta", "r1"),
-            json!({"body": {"request_id": "r1", "status": "ok", "output": "read-a"}}),
+            json!({"body": {"request_id": "r1", "status": "completed", "output": "read-a"}}),
         );
         let tool_calls = vec![json!({
             "id": "r1",
@@ -7253,7 +7264,7 @@ mod tests {
         let results = host.deliver_edge_tools_via_ledger(&tool_calls).await;
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].status, "ok");
+        assert_eq!(results[0].status, "completed");
         let end = host
             .emitted_events
             .iter()
@@ -7327,7 +7338,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
                 tool_callback_key("u-mixed", "r1"),
-                json!({"body": {"request_id": "r1", "status": "ok", "output": "read-a"}}),
+                json!({"body": {"request_id": "r1", "status": "completed", "output": "read-a"}}),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
@@ -7337,12 +7348,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
                 tool_callback_key("u-mixed", "w1"),
-                json!({"body": {"request_id": "w1", "status": "ok", "output": "wrote-b"}}),
+                json!({"body": {"request_id": "w1", "status": "completed", "output": "wrote-b"}}),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
                 tool_callback_key("u-mixed", "r2"),
-                json!({"body": {"request_id": "r2", "status": "ok", "output": "read-c"}}),
+                json!({"body": {"request_id": "r2", "status": "completed", "output": "read-c"}}),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
@@ -7352,7 +7363,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
                 tool_callback_key("u-mixed", "w2"),
-                json!({"body": {"request_id": "w2", "status": "ok", "output": "wrote-d"}}),
+                json!({"body": {"request_id": "w2", "status": "completed", "output": "wrote-d"}}),
             );
         });
 
@@ -8022,7 +8033,7 @@ mod tests {
             args: json!({"command": "echo hello"}),
             output: "hello\n".to_string(),
             tool_result_fields: None,
-            status: "ok".to_string(),
+            status: "completed".to_string(),
             duration_ms: 10,
         }];
 
@@ -9234,7 +9245,7 @@ mod tests {
             completed,
             AgentLiveEventKind::ToolCompleted { name, status, output, tool_use_id, .. }
                 if name == "bash"
-                    && status == "ok"
+                    && status == "completed"
                     && output.as_deref() == Some("ok")
                     && tool_use_id == "call-1"
         ));
@@ -9262,7 +9273,7 @@ mod tests {
                 tool_use_id,
                 ..
             } if name == "bash"
-                && status == "error"
+                && status == "failed"
                 && duration_ms == 42
                 && output.as_deref() == Some("edge transport disconnected")
                 && tool_use_id == "call-2"

@@ -2998,6 +2998,8 @@ fn copy_execution_boundary_fields(
         "transport",
         "fallback_policy",
         "route",
+        "status",
+        "skipped",
         "success",
         "duration_ms",
         "error_kind",
@@ -3743,6 +3745,33 @@ mod tests {
         assert_eq!(out["executor"]["executor_id"], "edge-1");
         assert_eq!(out["transport"], "edge_ws");
         assert_eq!(out["fallback_policy"], "disabled");
+    }
+
+    #[test]
+    fn tool_result_preserves_skipped_terminal_status_for_clients() {
+        let out = transform_run_event_for_client(make_event(
+            "tool_result",
+            json!({
+                "tool_call_id": "c-skip",
+                "name": "read_file",
+                "output": "Duplicate read_file call skipped.",
+                "status": "skipped",
+                "skipped": true,
+                "success": true,
+                "duration_ms": 0,
+                "workspace": {"kind": "edge_workspace", "cwd": "/repo"},
+                "executor": {"kind": "edge_agent", "executor_id": "edge-1", "transport": "edge_ws"},
+                "transport": "edge_ws"
+            }),
+        ));
+        assert_eq!(out["type"], "tool_call_end");
+        assert_eq!(out["call_id"], "c-skip");
+        assert_eq!(out["tool"], "read_file");
+        assert_eq!(out["status"], "skipped");
+        assert_eq!(out["skipped"], true);
+        assert_eq!(out["success"], true);
+        assert_eq!(out["result"], "Duplicate read_file call skipped.");
+        assert_eq!(out["executor"]["kind"], "edge_agent");
     }
 
     #[test]

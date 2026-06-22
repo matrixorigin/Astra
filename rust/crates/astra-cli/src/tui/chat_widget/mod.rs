@@ -99,8 +99,8 @@ pub(crate) enum WireEvent {
         fanout_title: Option<String>,
     },
 
-    /// Tool finished. `status` mirrors the string we receive on
-    /// the wire ("success" / anything-else = failure).
+    /// Tool finished. `status` mirrors the canonical string we receive on
+    /// the wire (`"completed"`, `"failed"`, or `"skipped"`).
     ToolCompleted {
         name: String,
         description: String,
@@ -1493,7 +1493,7 @@ impl ChatWidget {
                 } => {
                     use astra_turn_core::agent_live_event::AgentLiveTermination;
                     let status_str = match termination {
-                        AgentLiveTermination::Completed => "success",
+                        AgentLiveTermination::Completed => "completed",
                         AgentLiveTermination::Failed => "failed",
                         AgentLiveTermination::Cancelled => "cancelled",
                     };
@@ -1937,7 +1937,7 @@ fn complete_agent_cell(
     let result =
         crate::tui::agent_control_status::agent_control_result_output_summary(parsed, raw_output);
     let elapsed = cell.started_at.elapsed().as_millis() as u64;
-    cell.complete("success", elapsed.max(duration_ms), result, None);
+    cell.complete("completed", elapsed.max(duration_ms), result, None);
 }
 
 const MAX_AGENT_LIVE_OUTPUT_CHARS: usize = 100_000;
@@ -2199,7 +2199,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(tool_completed(
             "bash",
             "",
-            "success",
+            "completed",
             42,
             Some("3 entries"),
         )));
@@ -2301,7 +2301,11 @@ mod tests {
         // sometimes replay events out of order.
         let mut w = fresh();
         w.handle_event(AppEvent::Wire(tool_completed(
-            "bash", "echo hi", "success", 10, None,
+            "bash",
+            "echo hi",
+            "completed",
+            10,
+            None,
         )));
         assert_eq!(w.history.len(), 1);
     }
@@ -2408,7 +2412,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(child_completed(
             "tu_parent",
             "tu_child",
-            "success",
+            "completed",
             50,
         )));
         let tc = w
@@ -2452,10 +2456,14 @@ mod tests {
         w.handle_event(AppEvent::Wire(child_completed(
             "tu_parent",
             "tu_child",
-            "success",
+            "completed",
             10,
         )));
-        w.handle_event(AppEvent::Wire(task_completed("tu_parent", "success", 100)));
+        w.handle_event(AppEvent::Wire(task_completed(
+            "tu_parent",
+            "completed",
+            100,
+        )));
         assert!(w.active_cell.is_none(), "task completion commits the cell");
         assert_eq!(w.history.len(), 1);
         let tc = w.history[0]
@@ -2546,7 +2554,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(task_started("tu_1", "first")));
         w.handle_event(AppEvent::Wire(task_started("tu_2", "second")));
         // Completing tu_1 leaves only tu_2 pending.
-        w.handle_event(AppEvent::Wire(task_completed("tu_1", "success", 50)));
+        w.handle_event(AppEvent::Wire(task_completed("tu_1", "completed", 50)));
         assert_eq!(w.in_flight_task_ids(), &["tu_2".to_string()]);
     }
 
@@ -2580,7 +2588,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
             action: "spawn".into(),
             label: "reviewer-A".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 10,
             output: Some(r#"{"status":"cancelled","agent_id":"reviewer-A@abc"}"#.into()),
             tool_use_id: "spawn-tu-1".into(),
@@ -2607,12 +2615,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_completed_agent_result_clears_cancelled_tracking() {
+    fn completed_agent_result_clears_cancelled_tracking() {
         let mut w = fresh();
         w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
             action: "spawn".into(),
             label: "reviewer-A".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 10,
             output: Some(r#"{"status":"cancelled","agent_id":"reviewer-A@abc"}"#.into()),
             tool_use_id: "spawn-tu-legacy".into(),
@@ -2623,7 +2631,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
             action: "get_result".into(),
             label: "reviewer-A".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 42,
             output: Some(r#"{"agent_id":"reviewer-A@abc","result":"done"}"#.into()),
             tool_use_id: "result-tu-legacy".into(),
@@ -3190,7 +3198,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
             name: "agent".into(),
             description: "A".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 100,
             output_summary: Some("done".into()),
             output: None,
@@ -3231,7 +3239,7 @@ mod tests {
             w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
                 name: "agent".into(),
                 description: id.into(),
-                status: "success".into(),
+                status: "completed".into(),
                 duration_ms: 50,
                 output_summary: None,
                 output: None,
@@ -3342,7 +3350,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
             action: "spawn".into(),
             label: "reviewer-A".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 10,
             output: Some(r#"{"status":"completed","agent_id":"reviewer-A@abc"}"#.into()),
             tool_use_id: "spawn-tu-1".into(),
@@ -3480,7 +3488,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
             name: "agent".into(),
             description: "agent-A".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 100,
             output_summary: Some("done".into()),
             output: None,
@@ -3515,7 +3523,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
             action: "spawn".into(),
             label: "reviewer-A".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 10,
             output: Some(r#"{"status":"cancelled","agent_id":"reviewer-A@late"}"#.into()),
             tool_use_id: "spawn-tu-late".into(),
@@ -3592,7 +3600,7 @@ mod tests {
             w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
                 name: "agent".into(),
                 description: format!("review {id}"),
-                status: "success".into(),
+                status: "completed".into(),
                 duration_ms: 12_000,
                 output_summary: Some(format!("done-{id}")),
                 output: None,
@@ -3646,7 +3654,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
             name: "agent".into(),
             description: "live-only check".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 1_000,
             output_summary: None,
             output: None,
@@ -3675,7 +3683,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
             name: "agent".into(),
             description: "find me".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 250,
             output_summary: Some("done".into()),
             output: None,
@@ -3709,7 +3717,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
             name: "agent".into(),
             description: "old completed".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 500,
             output_summary: None,
             output: None,
@@ -3743,7 +3751,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
             name: "agent".into(),
             description: "Spawn agent: arch-reviewer (code-review)".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 0,
             output_summary: Some("json object".into()),
             output: Some(
@@ -3776,7 +3784,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
             name: "agent".into(),
             description: "Spawn agent: ux-reviewer (code-review)".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 0,
             output_summary: None,
             output: Some(
@@ -3789,7 +3797,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
             name: "agent".into(),
             description: "Get agent result: ux-reviewer@def67890".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 123,
             output_summary: None,
             output: Some(
@@ -3816,7 +3824,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
             name: "agent".into(),
             description: "Get agent result: reviewer@abc12345".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 77,
             output_summary: None,
             output: Some(
@@ -3849,7 +3857,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
             name: "agent".into(),
             description: "Get agent result: reviewer@abc12345".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 120_000,
             output_summary: None,
             output: Some(
@@ -3883,7 +3891,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
             name: "agent".into(),
             description: "Get agent result: reviewer@abc12345".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 120_000,
             output_summary: None,
             output: Some(
@@ -3906,7 +3914,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
             name: "agent".into(),
             description: "Get agent result: reviewer@abc12345".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 77,
             output_summary: None,
             output: Some(
@@ -3939,7 +3947,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
             name: "agent".into(),
             description: "Get agent result: reviewer@abc12345".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 77,
             output_summary: None,
             output: Some(
@@ -3988,7 +3996,7 @@ mod tests {
             kind: AgentLiveEventKind::ToolCompleted {
                 name: "bash".into(),
                 description: "Run checks".into(),
-                status: "success".into(),
+                status: "completed".into(),
                 duration_ms: 42,
                 output_summary: Some("ok".into()),
                 output: None,
@@ -4017,7 +4025,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
             name: "agent".into(),
             description: "Spawn agent: broken-reviewer (code-review)".into(),
-            status: "error".into(),
+            status: "failed".into(),
             duration_ms: 10,
             output_summary: None,
             output: Some(r#"{"error":"spawn failed"}"#.into()),
@@ -4113,7 +4121,7 @@ mod tests {
             kind: AgentLiveEventKind::ToolCompleted {
                 name: "bash".into(),
                 description: "cargo test".into(),
-                status: "success".into(),
+                status: "completed".into(),
                 duration_ms: 25,
                 output_summary: None,
                 output: None,
@@ -4153,7 +4161,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
             action: "spawn".into(),
             label: "reviewer-A".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 30,
             output: Some(
                 r#"{"status":"completed","agent_id":"reviewer-A@abc12345","result":"done"}"#.into(),
@@ -4258,7 +4266,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
             action: "spawn".into(),
             label: "auth reviewer".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 25,
             output: Some(r#"{"status":"completed","agent_id":"auth@abc12345"}"#.into()),
             tool_use_id: "spawn-tu-fanout".into(),
@@ -4303,7 +4311,7 @@ mod tests {
         w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
             action: "spawn".into(),
             label: "storage reviewer".into(),
-            status: "success".into(),
+            status: "completed".into(),
             duration_ms: 25,
             output: Some(r#"{"status":"completed","agent_id":"storage@abc12345"}"#.into()),
             tool_use_id: "spawn-tu-fanout".into(),

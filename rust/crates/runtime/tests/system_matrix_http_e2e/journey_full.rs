@@ -94,7 +94,7 @@ async fn run_tool_backed_chat_turn(
                 Some(auth_header),
                 json!({
                     "request_id": "ctx-trace-tool-1",
-                    "status": "ok",
+                    "status": "completed",
                     "output": "# README\nfrom tool-backed matrix e2e\n",
                     "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
                         "ctx-trace-tool-1",
@@ -784,7 +784,7 @@ pub async fn run_product_matrix_full_journey(
         Some(auth_header.as_str()),
         json!({
             "request_id": "matrix-tool-req-1",
-            "status": "ok",
+            "status": "completed",
             "output": "done",
             "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
                 "matrix-tool-req-1",

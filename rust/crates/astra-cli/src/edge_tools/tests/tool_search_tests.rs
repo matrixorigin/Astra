@@ -78,7 +78,8 @@ async fn direct_tool_search_fails_closed_without_installed_surface() {
         serde_json::from_str(&executor.tool_search(&json!({"query": "select:bash"}))).unwrap();
 
     assert_eq!(parsed["mode"].as_str(), Some("select"));
-    assert_eq!(parsed["status"].as_str(), Some("empty_surface"));
+    assert_eq!(parsed["status"].as_str(), Some("completed"));
+    assert_eq!(parsed["selection_status"].as_str(), Some("empty_surface"));
     assert_eq!(parsed["total_tools"].as_u64(), Some(0));
     assert!(match_names(&parsed).is_empty());
     assert_eq!(field_strings(&parsed, "missing"), strings(&["bash"]));

@@ -381,8 +381,11 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
         )
         .await;
     assert!(
-        !update_status_field.starts_with("Error:") && update_status_field.contains("\"paused\""),
-        "task.update should normalize status as a recovery alias: {update_status_field}"
+        update_status_field.starts_with("Error:")
+            && update_status_field.contains("unknown field")
+            && update_status_field.contains("status")
+            && update_status_field.contains("new_status"),
+        "task.update should reject the old status alias with an actionable hint: {update_status_field}"
     );
 
     let list_status_field = exe

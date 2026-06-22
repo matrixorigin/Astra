@@ -440,7 +440,8 @@ fn normalize_empty_output(output: String, tool_name: &str) -> String {
 }
 
 fn cli_tool_output_is_error(output: &str) -> bool {
-    astra_turn_core::tool_result_semantics::cloud_tool_result_status_label(output) == "error"
+    astra_turn_core::tool_result_semantics::classify_tool_result_status(output)
+        == astra_turn_core::tool_result_semantics::ToolResultStatus::Failed
 }
 
 pub(crate) use astra_tools::git_gix::ToolExecutionOutcome;

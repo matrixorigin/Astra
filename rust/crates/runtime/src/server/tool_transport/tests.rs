@@ -354,7 +354,7 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
         let result = astra_thin_client::ToolResultRequest::new_with_hash(
             request_id.to_string(),
             Some("edge-selected".to_string()),
-            "success".to_string(),
+            "completed".to_string(),
             "ledger-result".to_string(),
             12,
         );
@@ -594,6 +594,47 @@ fn route_boundary_builds_events_and_attaches_binding_metadata() {
     assert_eq!(end_event["type"], "tool_call_end");
     assert_eq!(end_event["result"], "ok");
     assert_eq!(end_event["executor"]["kind"], "server_local");
+}
+
+#[test]
+fn route_boundary_preserves_skipped_terminal_status_from_tool_metadata() {
+    let service = ToolExecutionService::new_for_test();
+    let mut request = request(
+        "read_file",
+        WorkspaceBinding::server_sandbox("/tmp/astra-workspace"),
+        ExecutorBinding::server_local(),
+    );
+    request.args = serde_json::json!({
+        "_tool_call_id": "call-skip",
+        "_run_id": "run-1",
+        "path": "README.md"
+    });
+    let boundary = service.route_boundary(request);
+
+    let mut result = astra_tools::ToolResult::text("Duplicate read skipped.".to_string());
+    result.metadata = Some(serde_json::Map::from_iter([
+        ("status".to_string(), Value::String("skipped".to_string())),
+        ("skipped".to_string(), Value::Bool(true)),
+    ]));
+    boundary.attach_binding_metadata(&mut result, service.tool_registry());
+
+    let transport_event = boundary
+        .transport_finished_event(&result, 0)
+        .expect("transport completed event");
+    assert_eq!(transport_event["type"], "tool_transport_completed");
+    assert_eq!(transport_event["status"], "skipped");
+    assert_eq!(transport_event["skipped"], true);
+    assert_eq!(transport_event["success"], true);
+
+    let end_event = boundary
+        .tool_call_end_event(&result, 0)
+        .expect("tool call end event");
+    assert_eq!(end_event["type"], "tool_call_end");
+    assert_eq!(end_event["call_id"], "call-skip");
+    assert_eq!(end_event["status"], "skipped");
+    assert_eq!(end_event["skipped"], true);
+    assert_eq!(end_event["success"], true);
+    assert_eq!(end_event["result"], "Duplicate read skipped.");
 }
 
 #[test]

@@ -541,7 +541,7 @@ impl MemoriaClient {
             bucket.push(hint);
         }
         json!({
-            "status": "ok",
+            "status": "completed",
             "focus_type": focus_type,
             "value": value,
             "boost": boost,
@@ -998,7 +998,7 @@ impl MemoriaClient {
             .and_then(Value::as_u64)
             .unwrap_or(0);
         json!({
-            "status": "ok",
+            "status": "completed",
             "deleted_count": deleted,
             "message": Self::purge_success_message(deleted, filter),
         })
@@ -1386,23 +1386,23 @@ impl MemoriaClient {
         match op {
             "recall" => json!([]),
             "remember" => json!({
-                "status": "ok",
+                "status": "completed",
                 "message": "memory stored",
                 "content": args.get("content").and_then(Value::as_str).unwrap_or(""),
             }),
             "forget" => json!({
-                "status": "ok",
+                "status": "completed",
                 "message": "memory purge completed",
             }),
             "update" => json!({
-                "status": "ok",
+                "status": "completed",
                 "message": "memory updated",
             }),
             "feedback" => json!({
-                "status": "ok",
+                "status": "completed",
                 "message": "memory feedback recorded",
             }),
-            _ => json!({"status": "ok"}),
+            _ => json!({"status": "completed"}),
         }
     }
 
@@ -2619,7 +2619,7 @@ mod tests {
             "remember",
             &json!({"content": "prefers smoke tests"}),
         );
-        assert_eq!(value["status"], "ok");
+        assert_eq!(value["status"], "completed");
         assert_eq!(value["message"], "memory stored");
         assert_eq!(value["content"], "prefers smoke tests");
     }
@@ -3030,7 +3030,7 @@ mod memoria_http_client_tests {
         use super::*;
         let raw = json!({"deleted_count": 3});
         let enriched = MemoriaClient::purge_result_to_agent_response(&raw, "topic:NEPTUNE");
-        assert_eq!(enriched["status"], "ok");
+        assert_eq!(enriched["status"], "completed");
         assert_eq!(enriched["deleted_count"], 3);
         assert!(enriched["message"].as_str().unwrap().contains("3"));
     }
@@ -3423,7 +3423,7 @@ mod memoria_http_client_tests {
                 "boost": 2.0,
             }),
         );
-        assert!(response.contains("\"status\":\"ok\""));
+        assert!(response.contains("\"status\":\"completed\""));
 
         let mut payload = json!({"query": "review", "top_k": 5});
         c2.apply_focus_hints(session_id, &mut payload);

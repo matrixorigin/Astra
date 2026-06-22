@@ -184,7 +184,10 @@ pub(crate) struct ExecutedExecution {
 }
 
 pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
+    /// Internal agentic step index (0-based) for cache and dedup accounting.
     pub turn_index: usize,
+    /// User-visible session turn currently in progress (1-based).
+    pub session_turn: u32,
     pub quiet: bool,
     pub api: &'a ThinClient,
     pub token: &'a str,
@@ -348,7 +351,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         );
 
         if let Some(emitter) = self.ctx.progress_emitter {
-            emitter.tool_executing(&execution.name, self.ctx.turn_index as u32);
+            emitter.tool_executing(&execution.name, self.ctx.session_turn);
         }
     }
 
@@ -413,7 +416,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let api = self.ctx.api;
         let token = self.ctx.token;
         let session_id = self.ctx.current_session_id;
-        let turn_index = self.ctx.turn_index;
+        let session_turn = self.ctx.session_turn;
 
         let started_at: Vec<Instant> = executions
             .iter()
@@ -426,7 +429,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let futs: Vec<_> = executions
             .iter_mut()
             .map(|(exec, _)| {
-                execute_tool_pure(exec, server_executor, api, token, session_id, turn_index)
+                execute_tool_pure(exec, server_executor, api, token, session_id, session_turn)
             })
             .collect();
         futures_util::future::join_all(futs).await;
@@ -590,7 +593,7 @@ mod tests {
                     args: json!({ "pattern": "headless" }),
                     output: "found result".to_string(),
                     tool_result_fields: Some(edge_runtime_environment_fields()),
-                    status: "ok".to_string(),
+                    status: "completed".to_string(),
                     duration_ms: 12,
                 }],
                 by_sig: HashMap::new(),
@@ -627,9 +630,26 @@ mod tests {
                 &'a crate::server::server_tool_executor::ServerToolExecutor,
             >,
         ) -> HeadlessToolExecutionPipeline<'a, EdgeToolExecResult> {
+            let session_turn = turn_index.saturating_add(1).min(u32::MAX as usize) as u32;
+            self.pipeline_with_server_executor_for_session_turn(
+                turn_index,
+                session_turn.max(1),
+                server_tool_executor,
+            )
+        }
+
+        fn pipeline_with_server_executor_for_session_turn<'a>(
+            &'a mut self,
+            turn_index: usize,
+            session_turn: u32,
+            server_tool_executor: Option<
+                &'a crate::server::server_tool_executor::ServerToolExecutor,
+            >,
+        ) -> HeadlessToolExecutionPipeline<'a, EdgeToolExecResult> {
             HeadlessToolExecutionPipeline::new(
                 HeadlessToolExecutionCtx {
                     turn_index,
+                    session_turn,
                     quiet: true,
                     api: &self.api,
                     token: "",
@@ -742,7 +762,7 @@ mod tests {
             args: json!({ "pattern": "pipeline" }),
             output: "second result".to_string(),
             tool_result_fields: Some(edge_runtime_environment_fields()),
-            status: "ok".to_string(),
+            status: "completed".to_string(),
             duration_ms: 7,
         });
         begin_recorded_turn(&mut harness, 2);
@@ -1396,7 +1416,7 @@ mod tests {
                 .to_string();
         harness.edge_tool_round[0].status = "error".to_string();
         let mut fields = edge_runtime_environment_fields();
-        fields.insert("status".to_string(), Value::String("error".to_string()));
+        fields.insert("status".to_string(), Value::String("failed".to_string()));
         harness.edge_tool_round[0].tool_result_fields = Some(fields);
         harness.valid_tool_names = HashSet::from(["str_replace".to_string()]);
 
@@ -1442,7 +1462,8 @@ mod tests {
             None,
             None,
         );
-        let mut pipeline = harness.pipeline_with_server_executor(7, Some(&server_exec));
+        let mut pipeline =
+            harness.pipeline_with_server_executor_for_session_turn(3, 7, Some(&server_exec));
         let args = json!({"path": "turn.txt", "content": "hello"});
         let permitted = PermittedExecution {
             execution: HeadlessResolvedExecution {

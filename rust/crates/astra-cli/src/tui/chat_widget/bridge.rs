@@ -193,7 +193,7 @@ mod tests {
             TuiAppEvent::ToolCompleted {
                 name: "bash".into(),
                 description: String::new(),
-                status: "success".into(),
+                status: "completed".into(),
                 duration_ms: 42,
                 output_summary: Some("ok".into()),
                 output: None,
@@ -207,7 +207,7 @@ mod tests {
                 status,
                 duration_ms: 42,
                 ..
-            })) => assert_eq!(status, "success"),
+            })) => assert_eq!(status, "completed"),
             other => panic!("unexpected tool completed event: {other:?}"),
         }
     }

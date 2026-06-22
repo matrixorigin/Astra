@@ -5791,7 +5791,13 @@ mod tests {
     #[test]
     fn render_history_batch_lines_gives_tool_blocks_more_air() {
         let mut tool = history_cell::tool::ToolCell::new_running("bash", "ls /tmp");
-        tool.complete("success", 42, String::new(), Some("3 entries".into()), None);
+        tool.complete(
+            "completed",
+            42,
+            String::new(),
+            Some("3 entries".into()),
+            None,
+        );
         let cells: Vec<Arc<dyn history_cell::HistoryCell>> = vec![Arc::new(tool)];
         let lines = render_history_batch_lines(&cells, 80);
 

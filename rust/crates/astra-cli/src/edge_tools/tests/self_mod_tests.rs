@@ -63,7 +63,7 @@ async fn adjust_config_applies_bounded_change() {
         )
         .await;
     let parsed: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(parsed["status"], "ok");
+    assert_eq!(parsed["status"], "completed");
     let guard = session.read().unwrap();
     assert_eq!(guard.config.memory.retrieval_top_k, 6);
 }
@@ -95,8 +95,8 @@ async fn tool_priority_updates_self_model_snapshot() {
         .await;
     let parsed1: Value = serde_json::from_str(&out1).unwrap();
     let parsed2: Value = serde_json::from_str(&out2).unwrap();
-    assert_eq!(parsed1["status"], "ok");
-    assert_eq!(parsed2["status"], "ok");
+    assert_eq!(parsed1["status"], "completed");
+    assert_eq!(parsed2["status"], "completed");
     assert_eq!(parsed1["previous_pinned_tools"], json!([]));
     assert_eq!(parsed1["previous_deprioritized_tools"], json!([]));
     assert_eq!(parsed2["previous_pinned_tools"], json!(["bash"]));
@@ -136,8 +136,8 @@ async fn self_mod_persists_config_and_tool_preferences() {
 
     let parsed_prioritize: Value = serde_json::from_str(&prioritize_out).unwrap();
     let parsed_adjust: Value = serde_json::from_str(&adjust_out).unwrap();
-    assert_eq!(parsed_prioritize["status"], "ok");
-    assert_eq!(parsed_adjust["status"], "ok");
+    assert_eq!(parsed_prioritize["status"], "completed");
+    assert_eq!(parsed_adjust["status"], "completed");
 
     let ws = session_workspace::read_workspace(&session_id).unwrap();
     assert!(ws.pinned_tools.contains(&"bash".to_string()));

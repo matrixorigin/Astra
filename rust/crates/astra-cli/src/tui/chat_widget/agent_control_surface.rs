@@ -145,9 +145,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_result_without_status_is_completed_and_clears_cancelled() {
+    fn result_without_status_is_completed_when_outer_status_is_completed() {
         let parsed = parse(r#"{"agent_id":"reviewer@abc","result":"done"}"#);
-        let surface = AgentControlSurface::from_wire("get_result", "success", Some(&parsed));
+        let surface = AgentControlSurface::from_wire("get_result", "completed", Some(&parsed));
         assert_eq!(surface.outcome(), AgentControlOutcome::Completed);
         assert!(surface.is_terminal());
         assert_eq!(
@@ -157,16 +157,19 @@ mod tests {
     }
 
     #[test]
-    fn legacy_result_without_status_treats_ok_outer_status_as_completed() {
+    fn result_without_status_fails_closed_when_outer_status_is_alias() {
         let parsed = parse(r#"{"agent_id":"reviewer@abc","result":"done"}"#);
         let surface = AgentControlSurface::from_wire("get_result", "ok", Some(&parsed));
-        assert_eq!(surface.outcome(), AgentControlOutcome::Completed);
+        assert_eq!(
+            surface.outcome(),
+            AgentControlOutcome::Failed(AgentControlFailureKind::ToolFailed)
+        );
         assert!(surface.is_terminal());
     }
 
     #[test]
     fn tool_failure_without_status_is_failed_and_clears_cancelled() {
-        let surface = AgentControlSurface::from_wire("spawn", "error", None);
+        let surface = AgentControlSurface::from_wire("spawn", "failed", None);
         assert_eq!(
             surface.outcome(),
             AgentControlOutcome::Failed(AgentControlFailureKind::ToolFailed)
@@ -182,9 +185,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_success_get_result_does_not_complete_agent() {
+    fn empty_completed_get_result_does_not_complete_agent() {
         let parsed = parse(r#"{"agent_id":"reviewer@abc"}"#);
-        let surface = AgentControlSurface::from_wire("get_result", "success", Some(&parsed));
+        let surface = AgentControlSurface::from_wire("get_result", "completed", Some(&parsed));
         assert_eq!(surface.outcome(), AgentControlOutcome::NoChange);
         assert!(!surface.is_terminal());
         assert_eq!(
@@ -196,7 +199,7 @@ mod tests {
     #[test]
     fn unknown_wire_status_fails_closed() {
         let parsed = parse(r#"{"status":"mystery","agent_id":"reviewer@abc"}"#);
-        let surface = AgentControlSurface::from_wire("get_result", "success", Some(&parsed));
+        let surface = AgentControlSurface::from_wire("get_result", "completed", Some(&parsed));
         assert_eq!(
             surface.outcome(),
             AgentControlOutcome::Failed(AgentControlFailureKind::AgentFailed)
@@ -207,7 +210,7 @@ mod tests {
     #[test]
     fn cancelled_status_sets_cancelled_tracking() {
         let parsed = parse(r#"{"status":"cancelled","agent_id":"reviewer@abc"}"#);
-        let surface = AgentControlSurface::from_wire("spawn", "success", Some(&parsed));
+        let surface = AgentControlSurface::from_wire("spawn", "completed", Some(&parsed));
         assert_eq!(surface.outcome(), AgentControlOutcome::Cancelled);
         assert_eq!(surface.cancelled_state_update(), CancelledStateUpdate::Set);
         assert!(surface.is_terminal());
@@ -218,7 +221,7 @@ mod tests {
         let parsed = parse(
             r#"{"status":"still_running","agent_id":"reviewer@abc","current_status":"running","waited_secs":120,"hint":"call again"}"#,
         );
-        let surface = AgentControlSurface::from_wire("get_result", "success", Some(&parsed));
+        let surface = AgentControlSurface::from_wire("get_result", "completed", Some(&parsed));
         assert_eq!(surface.outcome(), AgentControlOutcome::Running);
         assert_eq!(
             surface.running_preview().as_deref(),
@@ -235,7 +238,7 @@ mod tests {
         let parsed = parse(
             r#"{"status":"interrupted","agent_id":"reviewer@abc","finish_reason":"budget_exhausted"}"#,
         );
-        let surface = AgentControlSurface::from_wire("get_result", "success", Some(&parsed));
+        let surface = AgentControlSurface::from_wire("get_result", "completed", Some(&parsed));
         assert_eq!(
             surface.outcome(),
             AgentControlOutcome::Failed(AgentControlFailureKind::Interrupted)
@@ -256,7 +259,7 @@ mod tests {
         let parsed = parse(
             r#"{"status":"interrupted","agent_id":"reviewer@abc","finish_reason":"budget_exhausted","result":"partial findings"}"#,
         );
-        let surface = AgentControlSurface::from_wire("spawn", "success", Some(&parsed));
+        let surface = AgentControlSurface::from_wire("spawn", "completed", Some(&parsed));
         assert_eq!(
             surface.outcome(),
             AgentControlOutcome::Failed(AgentControlFailureKind::Interrupted)

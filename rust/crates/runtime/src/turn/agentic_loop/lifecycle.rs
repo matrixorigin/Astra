@@ -1443,10 +1443,9 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
 
     state.remaining_turns = state.remaining_turns.saturating_sub(1);
     maybe_emit_turn_budget_self_pacing_hint(state);
-    state.step_recorder.begin_turn_with_context(
-        session_turn_number(state).saturating_sub(1),
-        turn_index as u32,
-    );
+    state
+        .step_recorder
+        .begin_turn_with_context(session_turn_number(state), turn_index as u32);
 
     if let Some(ref mut adapter) = state.tactical_adapter {
         adapter.reset_turn();
