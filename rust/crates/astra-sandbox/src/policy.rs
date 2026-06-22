@@ -208,6 +208,12 @@ const SENSITIVE_CRED_FILE_NAMES: &[&str] = &[
     "id_ed25519_sk",
     "id_dsa",
     ".env",
+    ".pgpass",
+    ".my.cnf",
+    "htpasswd",
+    "token.json",
+    "access_token",
+    ".terraformrc",
 ];
 
 /// Device files under `/dev` that are universally safe — they are sinks or
