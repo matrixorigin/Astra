@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn prefilter_greeting_returns_empty() {
         let state = ConversationState::from_message("hi", 1);
-        let ranked = pre_filter_dynamic(&state, "hi", &Default::default());
+        let ranked = pre_filter_dynamic(&state, "hi", &DynamicFilter::new());
         assert!(
             ranked.is_empty(),
             "pure greeting should skip dynamic tools, got {} tools",
@@ -883,8 +883,11 @@ mod tests {
         let state = ConversationState::from_message("list open PRs in matrixone", 3);
 
         // Without calibrator
-        let results_uncalibrated =
-            scoring::pre_filter_dynamic(&state, "list open PRs in matrixone", &Default::default());
+        let results_uncalibrated = scoring::pre_filter_dynamic(
+            &state,
+            "list open PRs in matrixone",
+            &DynamicFilter::new(),
+        );
 
         // With calibrator that has high correction rate for "github"
         let cal = ConfidenceCalibrator::new(0.7);
@@ -1014,7 +1017,8 @@ mod tests {
     #[test]
     fn prefilter_all_tools_have_nonnegative_scores() {
         let state = ConversationState::from_message("analyze everything", 1);
-        let ranked = scoring::pre_filter_dynamic(&state, "analyze everything", &Default::default());
+        let ranked =
+            scoring::pre_filter_dynamic(&state, "analyze everything", &DynamicFilter::new());
         for (idx, score) in &ranked {
             assert!(
                 *score >= 0.0,

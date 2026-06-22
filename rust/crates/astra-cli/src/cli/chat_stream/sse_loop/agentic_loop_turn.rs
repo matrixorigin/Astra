@@ -565,12 +565,24 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             );
         }
     }
+    let conversation_state =
+        astra_turn_core::tool_registry_state::ConversationState::from_message_with_context(
+            ctx.message,
+            ctx.history.len() as u32,
+            ctx.recent_tools,
+        );
+    let pure_conversational_turn = conversation_state.is_conversational
+        && !conversation_state.is_fetch
+        && !conversation_state.is_mutate
+        && !conversation_state.is_analytical
+        && !conversation_state.references_history;
     let no_tool_conversational_turn = turn_schemas.is_empty()
         && selection_report.tools_selected.is_empty()
         && selection_report.dynamic_tools_selected.is_empty()
         && ctx.recent_tools.is_empty()
         && ctx.tool_results.is_empty()
-        && !ctx.plan_mode_active;
+        && !ctx.plan_mode_active
+        && pure_conversational_turn;
     if !no_tool_conversational_turn {
         // Keep session-control tools stable once a turn needs tools. Pure
         // conversational turns intentionally stay tool-free; spending full
@@ -581,6 +593,22 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             CACHE_STABLE_SESSION_TOOLS,
             ctx.all_schemas,
         );
+        let has_tool_search = turn_schemas
+            .iter()
+            .filter_map(tool_schema_name)
+            .any(|name| name == "tool_search");
+        if !has_tool_search {
+            // Deferred discovery must never be stranded behind its own
+            // deferred surface. Even when a custom pinned config removes every
+            // core tool, a non-conversational turn still needs the activation
+            // primitive or the model has no recovery path.
+            astra_turn_core::tool_schema_prune::inject_required_tool_names(
+                &mut turn_schemas,
+                &mut selection_report,
+                &["tool_search"],
+                ctx.all_schemas,
+            );
+        }
     }
 
     turn_schemas = ctx.executor.runtime_bound_tool_schemas(turn_schemas);
@@ -644,13 +672,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         &[],
         &final_visible_tool_names,
     );
+    let mut activatable_tool_names = HashSet::new();
     if !final_visible_tool_names.is_empty()
         && final_visible_tool_names.contains("tool_search")
         && let Some(manifest) = tool_surface.deferred_manifest(requested_model)
     {
-        let activatable_tool_names: HashSet<String> = manifest.names.iter().cloned().collect();
-        ctx.executor
-            .set_current_activatable_tool_names(activatable_tool_names);
+        activatable_tool_names = manifest.names.iter().cloned().collect();
         merge_edge_profile_extensions(
             &mut payload,
             &json!({
@@ -659,12 +686,9 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                 EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES: manifest.names,
             }),
         );
-    } else {
-        ctx.executor
-            .set_current_activatable_tool_names(HashSet::new());
     }
     ctx.executor
-        .set_current_visible_tool_schemas(&final_visible_schemas);
+        .set_current_tool_surface(&final_visible_schemas, activatable_tool_names);
     // Telemetry truth: recompute dynamic budget from the ACTUAL final visible
     // schemas, not the pre-filtering selection report.  The original
     // `selection_report.budget_used` reflects tools that may have been
@@ -2071,6 +2095,100 @@ mod tests {
                 .map(|report| report.selected_count),
             Some(0),
             "selection telemetry must reflect the final no-tool surface"
+        );
+
+        let cfg = astra_config::ToolSurfaceConfig {
+            pinned_tools: astra_runtime::tool_registry::surface::DEFAULT_PINNED
+                .iter()
+                .map(|name| format!("-{name}"))
+                .collect(),
+        };
+        let registry =
+            ToolRegistry::new_with_tool_surface(all_schemas.clone(), &cfg).with_budget(0);
+        let messages = vec![json!({"role": "user", "content": "inspect the repository"})];
+        let mut restricted_tools = HashSet::new();
+        let mut valid_tool_names = HashSet::new();
+        let mut widen_selection_pending = false;
+        let mut step_recorder = StepRecorder::new("session-empty", "task-empty");
+        let mut turn_policy = TurnInteractionPolicy::default();
+        let mut first_memoria_ms = None;
+        let mut first_selection_report = None;
+        let mut first_budget_pressure = 0.0;
+        let mut first_context_assembly_ms = None;
+        let mut all_selected_skills = Vec::new();
+
+        let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            messages: &messages,
+            runtime_volatile_texts: &[],
+            ephemeral_prefix: None,
+            current_session_id: Some("session-empty"),
+            model: None,
+            explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
+            project_root: temp_dir.path(),
+            message: "inspect the repository",
+            semantic_query_override: None,
+            history: &history,
+            recent_tools: &recent_tools,
+            executor: Arc::clone(&executor),
+            registry: &registry,
+            tool_results: &tool_results,
+            all_schemas: &all_schemas,
+            valid_tool_names: &mut valid_tool_names,
+            turn_guard: &turn_guard,
+            restricted_tools: &mut restricted_tools,
+            widen_selection_pending: &mut widen_selection_pending,
+            step_recorder: &mut step_recorder,
+            file_context: &file_context,
+            assembly_start: Instant::now(),
+            telem: PrepareTurnTelemetry {
+                first_memoria_ms: &mut first_memoria_ms,
+                first_selection_report: &mut first_selection_report,
+                first_budget_pressure: &mut first_budget_pressure,
+                first_context_assembly_ms: &mut first_context_assembly_ms,
+                all_selected_skills: &mut all_selected_skills,
+                initial_skill_selector_shortlist: None,
+                trace_collector: None,
+            },
+            skill_search: &skill_search,
+            is_plan_subtask: false,
+            plan_subtask_id: None,
+            timing_phases: false,
+            prep_ui_phase: None,
+            skill_effort: None,
+            skill_agent_type: None,
+            tool_budget_override: Some(0),
+            interaction_mode: TurnInteractionMode::Auto,
+            turn_policy: &mut turn_policy,
+            skill_allowed_tools: None,
+            previous_confidence_fallback: None,
+            round_index: 0,
+            session_turn: 1,
+            turn_chain_id: None,
+            user_query_event_id: None,
+            denial_pressure: (0, 0),
+            recent_rejections: Vec::new(),
+            observability_hub: None,
+            append_system_prompt: None,
+            plan_mode_active: false,
+        })
+        .await;
+
+        let edge_tool_names: Vec<&str> = payload["edge_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|schema| schema["function"]["name"].as_str())
+            .collect();
+        assert!(
+            edge_tool_names.contains(&"tool_search"),
+            "non-conversational turns must keep deferred discovery reachable even when custom surface/budget selected no tools: {edge_tool_names:?}"
+        );
+        assert!(
+            payload["edge_profile"]
+                .get(EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT)
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("<deferred_tools>")),
+            "tool_search visibility must be paired with a deferred manifest"
         );
     }
 

@@ -868,8 +868,11 @@ fn attach_subrun_tool_surface(
         &[],
         &final_visible_tool_names,
     );
-    if let Some(manifest) = tool_surface.deferred_manifest(effective_model) {
-        let activatable_tool_names: HashSet<String> = manifest.names.iter().cloned().collect();
+    let mut activatable_tool_names = HashSet::new();
+    if final_visible_tool_names.contains("tool_search")
+        && let Some(manifest) = tool_surface.deferred_manifest(effective_model)
+    {
+        activatable_tool_names = manifest.names.iter().cloned().collect();
         merge_edge_profile_extensions(
             payload,
             &json!({
@@ -881,15 +884,11 @@ fn attach_subrun_tool_surface(
                     manifest.names,
             }),
         );
-        executor.set_current_activatable_tool_names(activatable_tool_names);
-    } else {
-        executor.set_current_activatable_tool_names(HashSet::new());
     }
-    // Mirror the deferred manifest onto the executor so a deferred-tool call
-    // inside the sub-run gets the activation hint instead of a bare unknown-tool
-    // denial. Install this before visible schemas so activation snapshots see a
-    // consistent visible ∪ activatable surface during the transition.
-    executor.set_current_visible_tool_schemas(&final_visible_schemas);
+    // Mirror exactly what the sub-run request exposes. Visible and
+    // activatable names are written together so tool_search/direct-call
+    // recovery never observes a mixed surface.
+    executor.set_current_tool_surface(&final_visible_schemas, activatable_tool_names);
     turn_policy_from_payload_edge_tools(payload, interaction_mode)
 }
 

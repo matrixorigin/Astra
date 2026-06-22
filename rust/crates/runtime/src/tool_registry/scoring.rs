@@ -513,8 +513,10 @@ pub struct DynamicFilter<'a> {
     outcome_bias: Option<&'a HashMap<String, f64>>,
 }
 
-impl Default for DynamicFilter<'_> {
-    fn default() -> Self {
+impl<'a> DynamicFilter<'a> {
+    /// Create a new filter with all defaults (no pinned exclusion, no quality
+    /// tracking, no pressure). Equivalent to the old bare `pre_filter_dynamic`.
+    pub fn new() -> Self {
         Self {
             pinned_names: None,
             quality_tracker: None,
@@ -525,14 +527,6 @@ impl Default for DynamicFilter<'_> {
             file_context: None,
             outcome_bias: None,
         }
-    }
-}
-
-impl<'a> DynamicFilter<'a> {
-    /// Create a new filter with all defaults (no pinned exclusion, no quality
-    /// tracking, no pressure). Equivalent to the old bare `pre_filter_dynamic`.
-    pub fn new() -> Self {
-        Self::default()
     }
 
     /// Exclude pinned tools from dynamic selection. When set, tools whose
@@ -584,6 +578,12 @@ impl<'a> DynamicFilter<'a> {
     pub fn outcome_bias(mut self, bias: &'a HashMap<String, f64>) -> Self {
         self.outcome_bias = Some(bias);
         self
+    }
+}
+
+impl Default for DynamicFilter<'_> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1142,7 +1142,7 @@ mod tests {
     #[test]
     fn pre_filter_empty_query() {
         let state = state_at_turn(1);
-        let results = pre_filter_dynamic(&state, "", &Default::default());
+        let results = pre_filter_dynamic(&state, "", &DynamicFilter::new());
         // Empty query may still return tools due to cold-start logic
         // Just verify it doesn't panic
         let _ = results;
@@ -1221,7 +1221,7 @@ mod tests {
     #[test]
     fn pre_filter_punctuation_only_query() {
         let state = state_at_turn(1);
-        let results = pre_filter_dynamic(&state, "!!!???", &Default::default());
+        let results = pre_filter_dynamic(&state, "!!!???", &DynamicFilter::new());
         // Should not panic — may return empty or few results
         for (_, score) in &results {
             assert!(*score >= 0.0);
@@ -1236,7 +1236,7 @@ mod tests {
         // in every tool re-split the full haystack.
         let state = state_at_turn(1);
         let long_query = "read ".repeat(2000);
-        let results = pre_filter_dynamic(&state, &long_query, &Default::default());
+        let results = pre_filter_dynamic(&state, &long_query, &DynamicFilter::new());
         for (_, score) in &results {
             assert!(*score >= 0.0 && *score <= 10.0);
         }
@@ -1267,7 +1267,7 @@ mod tests {
         let state = state_at_turn(1);
         // "查询代码 " = 13 bytes (3×3-byte CJK + 1×ASCII space).
         let long_cjk = "查询代码 ".repeat(2000);
-        let results = pre_filter_dynamic(&state, &long_cjk, &Default::default());
+        let results = pre_filter_dynamic(&state, &long_cjk, &DynamicFilter::new());
         for (_, score) in &results {
             assert!(*score >= 0.0 && *score <= 10.0);
         }
@@ -1279,7 +1279,7 @@ mod tests {
             is_conversational: true,
             ..Default::default()
         };
-        let results = pre_filter_dynamic(&state, "hello how are you", &Default::default());
+        let results = pre_filter_dynamic(&state, "hello how are you", &DynamicFilter::new());
         assert!(
             results.is_empty(),
             "conversational queries should return empty dynamic tools"

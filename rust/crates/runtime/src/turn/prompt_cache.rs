@@ -111,6 +111,8 @@ use crate::prompts;
 use astra_turn_core::microcompact::{PromptCacheProtocol, ProviderCacheStrategy};
 use astra_turn_core::pipeline_config::ProviderCachePolicy;
 
+const RUNTIME_STATIC_PREFIX_EXTRAS: &[&str] = &["send_message", "web_search"];
+
 // ── PromptCacheConfig ────────────────────────────────────────────────────────
 
 /// Configuration for provider-specific prompt caching.
@@ -703,7 +705,7 @@ pub(crate) fn default_pinned_tool_names() -> std::collections::HashSet<String> {
     // pinned set the marker landed on `skill` (idx 19) and web_search
     // (idx 20) fell outside the cached tool prefix, shaving ~500 tokens
     // off every cache hit on the deepseek-anthropic path.
-    for name in ["send_message", "web_search"] {
+    for name in RUNTIME_STATIC_PREFIX_EXTRAS {
         out.insert(name.to_string());
     }
     out
@@ -840,9 +842,9 @@ mod tests {
                 "{name} is part of the runtime default surface and must be cache-pinned"
             );
         }
-        for name in ["send_message", "web_search"] {
+        for name in RUNTIME_STATIC_PREFIX_EXTRAS {
             assert!(
-                pinned.contains(name),
+                pinned.contains(*name),
                 "{name} is a runtime static-prefix extra and must be cache-pinned"
             );
         }

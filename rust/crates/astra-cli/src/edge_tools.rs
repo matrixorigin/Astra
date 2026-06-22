@@ -16,9 +16,7 @@ use std::{
 use astra_runtime::tool_sandbox::{
     SandboxPolicy, sandbox_command, validate_path, wrap_command_with_limits,
 };
-use astra_turn_core::sync_utils::{
-    rwlock_check_contains_or_default, rwlock_read_clone_or_default, rwlock_write_reset_on_poison,
-};
+use astra_turn_core::sync_utils::{rwlock_read_clone_or_default, rwlock_write_reset_on_poison};
 
 /// Prefix returned by tool execution when the sandbox blocks a path.
 /// The agentic loop / permission manager can detect this to prompt the user
@@ -57,6 +55,17 @@ pub enum SandboxExpansionError {
     /// `--add-dir` took effect, but the sandbox was never updated.
     #[error("no sandbox policy installed; cannot expand path")]
     NoSandboxPolicy,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CurrentToolSurfaceNames {
+    /// Tool names advertised in the current LLM request's `tools[]`.
+    /// `None` means no caller-installed turn surface exists, so execution
+    /// fails closed because this node cannot prove the model saw the tool.
+    visible: Option<HashSet<String>>,
+    /// Tool names listed in the current turn's `<deferred_tools>` block and
+    /// therefore eligible for `tool_search(select:NAME)` activation.
+    activatable: Option<HashSet<String>>,
 }
 use crossterm::style::Stylize;
 use reqwest::Client;
@@ -991,25 +1000,15 @@ pub struct ToolExecutor {
     /// activation can reach plugin tools. Populated by the TUI after
     /// `PluginRegistry::register` loads the user's skill manifests.
     plugin_schemas: std::sync::RwLock<Vec<Value>>,
-    /// Tool names advertised in the current LLM request's `tools[]`.
-    /// `None` means the caller has not installed a per-turn surface yet;
-    /// execution fails closed because this node cannot prove the model saw
-    /// the tool in the current request.
-    current_visible_tool_names: std::sync::RwLock<Option<HashSet<String>>>,
-    /// Tool names listed in this turn's `<deferred_tools>` block and therefore
-    /// eligible for `tool_search(select:NAME)` activation.
-    current_activatable_tool_names: std::sync::RwLock<Option<HashSet<String>>>,
+    /// Atomic snapshot of the current visible/deferred execution surface.
+    ///
+    /// Visible and activatable names are read together by admission and
+    /// activation paths. Keeping them behind one lock prevents impossible
+    /// mixed snapshots such as "new activatable names with old visible names".
+    current_tool_surface: std::sync::RwLock<CurrentToolSurfaceNames>,
     /// Deferred tool names whose full schema has been fetched via
     /// `tool_search(query="select:NAME")` in this session.
     activated_deferred_tools: std::sync::RwLock<HashSet<String>>,
-    /// Poison-resilience cache: last schemas passed to
-    /// `set_current_visible_tool_schemas`. Used to rebuild
-    /// `current_visible_tool_names` after lock poison recovery.
-    last_visible_schemas: std::sync::Mutex<Vec<Value>>,
-    /// Poison-resilience cache: last names passed to
-    /// `set_current_activatable_tool_names`. Used to rebuild
-    /// `current_activatable_tool_names` after lock poison recovery.
-    last_activatable_names: std::sync::Mutex<Option<HashSet<String>>>,
     /// Cached plan-mode authoring flag keyed by the session it was
     /// computed for. Mirrors the server-side write guard so a CLI run
     /// that talks to the same plan store cannot bypass plan mode by
@@ -1067,11 +1066,8 @@ impl ToolExecutor {
             .build()
             .unwrap_or_else(|_| Client::new()),
             plugin_schemas: std::sync::RwLock::new(Vec::new()),
-            current_visible_tool_names: std::sync::RwLock::new(None),
-            current_activatable_tool_names: std::sync::RwLock::new(None),
+            current_tool_surface: std::sync::RwLock::new(CurrentToolSurfaceNames::default()),
             activated_deferred_tools: std::sync::RwLock::new(HashSet::new()),
-            last_visible_schemas: std::sync::Mutex::new(Vec::new()),
-            last_activatable_names: std::sync::Mutex::new(None),
             sandbox_policy: std::sync::RwLock::new(Some(sandbox)),
             preferred_repos: std::sync::Mutex::new(preferred_repos),
             budget_pressure: std::sync::Mutex::new(0.0),
@@ -1267,19 +1263,13 @@ impl ToolExecutor {
             .and_then(|mut g| g.take())
     }
 
-    /// Names of deferred tools that have been activated via `tool_search`
-    /// this turn. These should stay visible until the turn ends to prevent
-    /// schema thrashing (add→remove→add cache breaks).
+    /// Names of deferred tools currently queued for one-shot schema injection.
+    /// Stale entries are pruned against the current visible/activatable
+    /// surface so this side set cannot become a long-lived allowlist.
     pub fn activated_deferred_tool_names(&self) -> Vec<String> {
-        let visible = rwlock_read_clone_or_default(
-            &self.current_visible_tool_names,
-            "current_visible_tool_names_activation_retention",
-        );
-        let activatable = rwlock_read_clone_or_default(
-            &self.current_activatable_tool_names,
-            "current_activatable_tool_names_activation_retention",
-        );
-        if visible.is_none() && activatable.is_none() {
+        let surface =
+            self.current_tool_surface_snapshot("current_tool_surface_activation_retention");
+        if surface.visible.is_none() && surface.activatable.is_none() {
             return Vec::new();
         }
 
@@ -1290,8 +1280,8 @@ impl ToolExecutor {
         let retained =
             astra_turn_core::tool::deferred_activation::retained_runtime_bound_activated_deferred_tool_names(
                 &guard,
-                visible.as_ref(),
-                activatable.as_ref(),
+                surface.visible.as_ref(),
+                surface.activatable.as_ref(),
                 |name| self.tool_has_runtime_binding(name),
             );
         if retained.len() < guard.len() {
@@ -1306,15 +1296,8 @@ impl ToolExecutor {
     /// `tools[]` payload. Once the payload builder consumes it, execution is
     /// governed by the visible schema surface, not by this side set.
     pub fn take_activated_deferred_tool_names(&self) -> Vec<String> {
-        let visible = rwlock_read_clone_or_default(
-            &self.current_visible_tool_names,
-            "current_visible_tool_names_activation_take",
-        );
-        let activatable = rwlock_read_clone_or_default(
-            &self.current_activatable_tool_names,
-            "current_activatable_tool_names_activation_take",
-        );
-        if visible.is_none() && activatable.is_none() {
+        let surface = self.current_tool_surface_snapshot("current_tool_surface_activation_take");
+        if surface.visible.is_none() && surface.activatable.is_none() {
             return Vec::new();
         }
 
@@ -1325,8 +1308,8 @@ impl ToolExecutor {
         let retained =
             astra_turn_core::tool::deferred_activation::retained_runtime_bound_activated_deferred_tool_names(
                 &guard,
-                visible.as_ref(),
-                activatable.as_ref(),
+                surface.visible.as_ref(),
+                surface.activatable.as_ref(),
                 |name| self.tool_has_runtime_binding(name),
             );
         guard.clear();
@@ -1355,69 +1338,50 @@ impl ToolExecutor {
     }
 
     /// Install the visible `tools[]` names for the current LLM request.
-    ///
-    /// Deferred tools are executable only when they are visible here or have
-    /// been activated with `tool_search(select:NAME)`.
     pub fn set_current_visible_tool_schemas(&self, schemas: &[Value]) {
-        // Cache schemas for poison-resilience repair.
-        {
-            let mut cache = self
-                .last_visible_schemas
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *cache = schemas.to_vec();
-        }
         let names = astra_turn_core::tool::schema::tool_names_from_schemas(schemas);
-        let mut guard = rwlock_write_reset_on_poison(
-            &self.current_visible_tool_names,
-            "current_visible_tool_names",
-        );
-        *guard = Some(names);
+        let mut guard =
+            rwlock_write_reset_on_poison(&self.current_tool_surface, "current_tool_surface");
+        guard.visible = Some(names);
     }
 
     /// Install the names that this turn's deferred manifest allows
     /// `tool_search(select:NAME)` to activate.
     pub fn set_current_activatable_tool_names(&self, names: HashSet<String>) {
         let names = self.runtime_bound_tool_names(names);
-        // Cache names for poison-resilience repair.
-        {
-            let mut cache = self
-                .last_activatable_names
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *cache = Some(names.clone());
-        }
-        let mut guard = rwlock_write_reset_on_poison(
-            &self.current_activatable_tool_names,
-            "current_activatable_tool_names",
-        );
-        *guard = Some(names);
+        let mut guard =
+            rwlock_write_reset_on_poison(&self.current_tool_surface, "current_tool_surface");
+        guard.activatable = Some(names);
+    }
+
+    /// Install the exact current surface in one write.
+    ///
+    /// Use this when both visible and activatable names are derived from the
+    /// same payload assembly pass. It prevents readers from observing a
+    /// half-updated surface between two setter calls.
+    pub fn set_current_tool_surface(
+        &self,
+        visible_schemas: &[Value],
+        activatable_names: HashSet<String>,
+    ) {
+        let visible = Some(astra_turn_core::tool::schema::tool_names_from_schemas(
+            visible_schemas,
+        ));
+        let activatable = Some(self.runtime_bound_tool_names(activatable_names));
+        let mut guard =
+            rwlock_write_reset_on_poison(&self.current_tool_surface, "current_tool_surface");
+        *guard = CurrentToolSurfaceNames {
+            visible,
+            activatable,
+        };
     }
 
     #[cfg(test)]
     pub(crate) fn clear_current_tool_surface_for_tests(&self) {
-        {
-            let mut cache = self
-                .last_visible_schemas
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            cache.clear();
-        }
-        {
-            let mut cache = self
-                .last_activatable_names
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *cache = None;
-        }
         *rwlock_write_reset_on_poison(
-            &self.current_visible_tool_names,
-            "current_visible_tool_names_test_clear",
-        ) = None;
-        *rwlock_write_reset_on_poison(
-            &self.current_activatable_tool_names,
-            "current_activatable_tool_names_test_clear",
-        ) = None;
+            &self.current_tool_surface,
+            "current_tool_surface_test_clear",
+        ) = CurrentToolSurfaceNames::default();
         rwlock_write_reset_on_poison(
             &self.activated_deferred_tools,
             "activated_deferred_tools_test_clear",
@@ -1429,28 +1393,23 @@ impl ToolExecutor {
     /// currently advertises. Used by the host to keep its validator-side
     /// `deferred_tool_names` set in lockstep with what the prompt rendered.
     pub fn current_activatable_tool_names_snapshot(&self) -> HashSet<String> {
-        rwlock_read_clone_or_default(
-            &self.current_activatable_tool_names,
-            "current_activatable_tool_names_snapshot",
-        )
-        .unwrap_or_default()
+        self.current_tool_surface_snapshot("current_tool_surface_snapshot")
+            .activatable
+            .unwrap_or_default()
     }
 
     fn current_searchable_tool_names(&self) -> Option<HashSet<String>> {
-        let visible = rwlock_read_clone_or_default(
-            &self.current_visible_tool_names,
-            "current_visible_tool_names_search_pool",
-        );
-        let activatable = rwlock_read_clone_or_default(
-            &self.current_activatable_tool_names,
-            "current_activatable_tool_names_search_pool",
-        );
+        let surface = self.current_tool_surface_snapshot("current_tool_surface_search_pool");
 
         astra_turn_core::tool::deferred_activation::searchable_runtime_bound_tool_names(
-            visible.as_ref(),
-            activatable.as_ref(),
+            surface.visible.as_ref(),
+            surface.activatable.as_ref(),
             |name| self.tool_has_runtime_binding(name),
         )
+    }
+
+    fn current_tool_surface_snapshot(&self, label: &str) -> CurrentToolSurfaceNames {
+        rwlock_read_clone_or_default(&self.current_tool_surface, label)
     }
 
     fn runtime_bound_tool_names(&self, names: HashSet<String>) -> HashSet<String> {
@@ -1523,61 +1482,6 @@ impl ToolExecutor {
         }
     }
 
-    /// Repair admission-state locks from poison-recovery caches.
-    ///
-    /// When a lock is poisoned, `rwlock_check_contains_or_default` and
-    /// `rwlock_read_clone_or_default` reset the guarded value to `T::default()`,
-    /// which for `current_visible_tool_names` is `None` (denying all tools).
-    /// This method rebuilds the visible and activatable tool name sets from
-    /// the caches populated during `set_current_visible_tool_schemas` and
-    /// `set_current_activatable_tool_names`, limiting the blast radius of a
-    /// single-thread panic to one missed admission check rather than the
-    /// remainder of the session.
-    fn repair_admission_state_if_poisoned(&self) {
-        // Rebuild current_visible_tool_names from cached schemas.
-        //
-        // Lock ordering matters: acquire the target write lock BEFORE reading
-        // the source cache, so a concurrent `set_current_visible_tool_schemas`
-        // (which writes both the cache and `current_visible_tool_names` under
-        // the same write lock) cannot land between our cache read and target
-        // write. Otherwise repair could compute names from a stale cache and
-        // clobber a fresh value just installed by the setter.
-        {
-            let mut guard = self.current_visible_tool_names.write().unwrap_or_else(|e| {
-                tracing::error!("current_visible_tool_names lock poisoned; recovering...");
-                self.current_visible_tool_names.clear_poison();
-                e.into_inner()
-            });
-            let schemas = self
-                .last_visible_schemas
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if !schemas.is_empty() {
-                let names = astra_turn_core::tool::schema::tool_names_from_schemas(&schemas);
-                *guard = Some(names);
-            }
-        }
-        // Rebuild current_activatable_tool_names from cached names.
-        // Same lock ordering rationale as above.
-        {
-            let mut guard = self
-                .current_activatable_tool_names
-                .write()
-                .unwrap_or_else(|e| {
-                    tracing::error!("current_activatable_tool_names lock poisoned; recovering...");
-                    self.current_activatable_tool_names.clear_poison();
-                    e.into_inner()
-                });
-            let names = self
-                .last_activatable_names
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(ref names) = *names {
-                *guard = Some(names.clone());
-            }
-        }
-    }
-
     fn tool_can_validate_without_runtime_binding(&self, name: &str, args: &Value) -> bool {
         let action = args.get("action").and_then(Value::as_str);
         astra_turn_core::tool::registry::meta::tool_allows_validation_without_runtime_binding(
@@ -1620,25 +1524,13 @@ impl ToolExecutor {
         //
         // An executor is bound; now confirm the tool was actually
         // advertised / activated in this session.
-        let visible_contains = rwlock_check_contains_or_default(
-            &self.current_visible_tool_names,
-            "current_visible_tool_names_admission",
-            |names: &Option<HashSet<String>>| names.as_ref().is_some_and(|n| n.contains(name)),
-        );
-
-        match visible_contains {
-            // Visible and binding passed → admit.
-            Some(true) => return None,
-            // Poison on the visible set: self-heal by rebuilding from caches,
-            // then fall through to the deferred-activation check. The rebuild
-            // cannot widen the binding gate — Phase 1 already passed — so the
-            // worst outcome is a spuriously denied deferred tool.
-            None => {
-                self.repair_admission_state_if_poisoned();
-            }
-            // Explicitly not present in the visible set: continue to
-            // deferred-activation path below.
-            Some(false) => {}
+        let surface = self.current_tool_surface_snapshot("current_tool_surface_admission");
+        if surface
+            .visible
+            .as_ref()
+            .is_some_and(|visible| visible.contains(name))
+        {
+            return None;
         }
 
         // If no visible-set restriction is configured, deny (fail-closed).
@@ -1646,11 +1538,7 @@ impl ToolExecutor {
         // crash recovery before `set_current_visible_tool_schemas` ran), we
         // cannot confirm the tool was ever advertised in this session. Admitting
         // would widen the gate past what Phase 1 (binding) alone guarantees.
-        let visible_set = rwlock_read_clone_or_default(
-            &self.current_visible_tool_names,
-            "current_visible_tool_names_fallback",
-        );
-        match visible_set.as_ref() {
+        match surface.visible.as_ref() {
             Some(_) => {}
             None => {
                 return Some(EdgeToolRun::classified_error(
@@ -1662,11 +1550,8 @@ impl ToolExecutor {
             }
         };
 
-        let activatable = rwlock_read_clone_or_default(
-            &self.current_activatable_tool_names,
-            "current_activatable_tool_names_admission",
-        );
-        let can_select = activatable
+        let can_select = surface
+            .activatable
             .as_ref()
             .is_some_and(|allowed| allowed.contains(name));
         use astra_turn_core::tool::deferred_activation::{
@@ -1706,10 +1591,9 @@ impl ToolExecutor {
     }
 
     fn record_tool_search_activation_output(&self, output: &str) {
-        let allowed = rwlock_read_clone_or_default(
-            &self.current_activatable_tool_names,
-            "current_activatable_tool_names_activation",
-        );
+        let allowed = self
+            .current_tool_surface_snapshot("current_tool_surface_activation")
+            .activatable;
         let names = astra_turn_core::tool::deferred_activation::recordable_activated_tool_names(
             output,
             allowed.as_ref(),

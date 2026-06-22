@@ -1885,7 +1885,7 @@ impl ServerAgenticLoopHost {
             None => PromptCacheConfig::default(),
         };
 
-        let edge_tools_snapshot = self.edge_tools.clone();
+        let edge_tools_snapshot = self.runtime_bound_turn_tools(self.edge_tools.clone(), state);
         // Use the same pipeline path as `execute_turn` so mock-replay exercises
         // exactly what a real turn would send. The previous implementation had
         let (provider_name, model_name_for_pipeline) = match &self.mock_provider {
@@ -2627,6 +2627,21 @@ impl ServerAgenticLoopHost {
         filter_tool_schemas_by_excluded_names(self.edge_tools.clone(), restricted_tools)
     }
 
+    fn runtime_bound_turn_tools(&self, tools: Vec<Value>, state: &AgenticLoopState) -> Vec<Value> {
+        match state.server_tool_executor.as_deref() {
+            Some(executor) => executor.runtime_bound_tool_schemas(tools),
+            None => tools,
+        }
+    }
+
+    fn filtered_runtime_bound_turn_tools(
+        &self,
+        restricted_tools: &HashSet<String>,
+        state: &AgenticLoopState,
+    ) -> Vec<Value> {
+        self.runtime_bound_turn_tools(self.filtered_turn_tools(restricted_tools), state)
+    }
+
     fn runtime_allowlist_restrictions(&self, state: &AgenticLoopState) -> HashSet<String> {
         let disabled: HashSet<String> = self
             .disabled_tools
@@ -2660,26 +2675,16 @@ impl ServerAgenticLoopHost {
         state: &AgenticLoopState,
     ) {
         let extras = self.admissible_extras.clone();
-        let prompt_deferred_tool_names = self.prompt_deferred_tool_names_for_wire_tools(
-            wire_tools,
-            self.resolved_model_name.as_deref(),
-        );
         let activatable_deferred_tool_names = self.deferred_tool_names_for_wire_tools(
             wire_tools,
             self.resolved_model_name.as_deref(),
             state.server_tool_executor.as_deref(),
         );
         self.current_server_tool_executor = state.server_tool_executor.clone();
-        self.current_deferred_tool_names = prompt_deferred_tool_names;
+        self.current_deferred_tool_names = activatable_deferred_tool_names.clone();
         if let Some(executor) = state.server_tool_executor.as_deref() {
-            executor.set_current_activatable_tool_names(activatable_deferred_tool_names);
-            // Authoritative deferred set: the runtime-filtered snapshot from
-            // the executor (after runtime-binding admission in
-            // set_current_activatable_tool_names). Set once — no intermediate
-            // unfiltered value that could mislead a concurrent reader.
             self.current_activatable_deferred_tool_names =
-                executor.current_activatable_tool_names_snapshot();
-            executor.set_current_visible_tool_schemas(wire_tools);
+                executor.set_current_tool_surface(wire_tools, activatable_deferred_tool_names);
         } else {
             self.current_activatable_deferred_tool_names = HashSet::new();
         }
@@ -2793,27 +2798,12 @@ impl ServerAgenticLoopHost {
         state: &AgenticLoopState,
         model_name: &str,
     ) -> String {
-        let _ = state; // executor not needed for rendering decision
-        let manifest_names = self.deferred_tool_names_from_edge_profile_for_model(Some(model_name));
+        let manifest_names = self.deferred_tool_names_for_wire_tools(
+            wire_tools,
+            Some(model_name),
+            state.server_tool_executor.as_deref(),
+        );
         if manifest_names.is_empty() {
-            return String::new();
-        }
-        // Only suppress the block when a deferred tool appears in the visible
-        // surface — that is a contract violation (the pre-rendered block lists
-        // a tool the model can already see). Runtime-binding absence is NOT a
-        // rendering concern: the block is discovery metadata
-        // (CacheScope::Session, part of the cache prefix). Suppressing it on
-        // every transient binding flake (e.g. MCP reconnect) busts the ~30K
-        // token session prefix. The executor separately gates activation via
-        // set_current_activatable_tool_names + tool_search "missing" responses.
-        let visible_tool_names = astra_turn_core::tool::schema::tool_names_from_schemas(wire_tools);
-        if !manifest_names.is_disjoint(&visible_tool_names) {
-            tracing::warn!(
-                target: "astra.deferred_tools",
-                deferred_count = manifest_names.len(),
-                visible_count = visible_tool_names.len(),
-                "deferred prompt block suppressed: deferred tool(s) appear in visible surface"
-            );
             return String::new();
         }
         crate::turn::deferred_tools_edge_profile::block_for_model(&self.edge_profile, model_name)
@@ -2881,7 +2871,7 @@ impl ServerAgenticLoopHost {
     #[cfg(test)]
     fn visible_turn_tools(&mut self, state: &mut AgenticLoopState) -> Vec<Value> {
         let effective_restricted = self.compute_effective_restricted(state, true);
-        let visible = self.filtered_turn_tools(&effective_restricted);
+        let visible = self.filtered_runtime_bound_turn_tools(&effective_restricted, state);
         self.sync_valid_tools_to_wire_surface_for_state(&visible, state);
         visible
     }
@@ -3330,7 +3320,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .to_string();
 
         let effective_restricted = self.compute_effective_restricted(state, true);
-        let visible_tools = self.filtered_turn_tools(&effective_restricted);
+        let visible_tools = self.filtered_runtime_bound_turn_tools(&effective_restricted, state);
 
         // Latch prompt cache config from provider info (once per turn is fine;
         // provider doesn't change within a turn).
@@ -3990,7 +3980,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .to_string();
 
         let effective_restricted = self.compute_effective_restricted(state, false);
-        let visible_tools = self.filtered_turn_tools(&effective_restricted);
+        let visible_tools = self.filtered_runtime_bound_turn_tools(&effective_restricted, state);
         // We only need the system messages here — the inline summary call
         // reuses the main turn's system prefix, not its tools.
         let system_messages = match self.run_turn_pipeline(
@@ -5445,9 +5435,9 @@ mod tests {
 
         let _visible = host.visible_turn_tools(&mut state);
 
-        // Activation is gated at the executor level — the model can see the
-        // deferred manifest in the prompt (for cache stability) but cannot
-        // actually activate or execute the unbound tool.
+        // Activation is gated at the executor level, and the prompt block is
+        // suppressed for unavailable runtime capabilities so the model is not
+        // invited into a select/retry loop.
         assert!(
             executor
                 .current_activatable_tool_names_snapshot()
@@ -5696,16 +5686,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_host_renders_deferred_block_when_runtime_binding_missing_for_cache_stability() {
-        // H3 regression guard: a transient runtime-binding failure (e.g. MCP
-        // server temporarily disconnected) must NOT suppress the pre-rendered
-        // <deferred_tools> prompt block. The block is session-stable
-        // (CacheScope::Session); dropping it on every binding flake would
-        // bust the cache prefix (~30K token miss). The executor separately
-        // gates activation via set_current_activatable_tool_names, and
-        // tool_search(select:NAME) returns "missing" for unbound tools so
-        // the model self-corrects. The prompt block is discovery metadata,
-        // not an execution promise.
+    async fn server_host_suppresses_deferred_block_when_runtime_binding_missing() {
+        // User-facing contract: do not advertise a deferred tool that cannot
+        // be activated in this runtime. A stable cache prefix is less valuable
+        // than avoiding a tool_search/select retry loop for an unavailable
+        // capability.
         let edge_profile = deferred_manifest_edge_profile(&["agent_fanout"], "gpt-4o");
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -5734,8 +5719,6 @@ mod tests {
 
         let _visible = host.visible_turn_tools(&mut state);
 
-        // The prompt block must still be rendered — runtime binding absence
-        // is a per-turn execution concern, not a prompt-rendering concern.
         let outcome = host
             .run_turn_pipeline(
                 &mut state,
@@ -5744,15 +5727,18 @@ mod tests {
                 "gpt-4o",
                 "use agent fanout",
             )
-            .expect("server context pipeline should assemble with deferred manifest");
+            .expect("server context pipeline should assemble without unavailable deferred tools");
         let text = pipeline_outcome_text(&outcome);
         assert!(
-            text.contains("<deferred_tools>"),
-            "prompt must render the deferred manifest even when runtime binding is absent: {text}"
+            !text.contains("<deferred_tools>"),
+            "prompt must not advertise a deferred tool whose runtime binding is absent: {text}"
         );
 
-        // But the executor must still gate activation — tool_search(select:)
-        // returns "missing" for the unbound tool.
+        assert!(
+            <ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host).is_empty(),
+            "validator-side deferred set must mirror the suppressed prompt block"
+        );
+
         let selected = executor
             .execute_with_metadata("tool_search", &json!({"query": "Select:agent_fanout"}))
             .await;
@@ -5782,13 +5768,13 @@ mod tests {
         assert!(
             direct_results[0]
                 .output
-                .contains("multi-agent runtime is not connected"),
-            "direct prompt-deferred call must report missing runtime: {:?}",
+                .contains("not available in this turn"),
+            "direct call to an unadvertised unavailable tool must fail closed: {:?}",
             direct_results[0]
         );
         assert!(
             !direct_results[0].output.contains("select:agent_fanout"),
-            "runtime-binding denial must not claim select can attach the runtime: {:?}",
+            "denial must not claim select can attach the runtime: {:?}",
             direct_results[0]
         );
     }
@@ -5830,9 +5816,8 @@ mod tests {
             "executor must fail closed when runtime binding removes only part of the deferred manifest"
         );
         assert!(
-            <ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host)
-                == HashSet::from(["github".to_string(), "agent_fanout".to_string()]),
-            "validator should know the prompt-advertised names so direct calls are not treated as hallucinations"
+            <ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host).is_empty(),
+            "validator must mirror the suppressed prompt block when runtime filtering would expose a subset"
         );
 
         let selected = executor
@@ -5854,9 +5839,11 @@ mod tests {
             .await;
         assert_eq!(direct_results.len(), 1);
         assert!(
-            direct_results[0].output.contains("not activatable")
-                && direct_results[0].output.contains("Do not retry"),
-            "direct call to a fail-closed prompt-deferred tool must avoid a select retry loop: {:?}",
+            direct_results[0]
+                .output
+                .contains("not available in this turn")
+                && !direct_results[0].output.contains("select:github"),
+            "direct call after prompt suppression must fail closed without a select retry loop: {:?}",
             direct_results[0]
         );
     }
@@ -7701,6 +7688,58 @@ mod tests {
         assert!(visible_names.contains("read_file"));
         assert!(!visible_names.contains("bash"));
         assert_eq!(visible_names.len(), 1);
+    }
+
+    #[test]
+    fn visible_turn_tools_filters_unbound_runtime_tool_before_wire_surface() {
+        let edge_tools = vec![
+            named_schema("bash"),
+            named_schema("tool_search"),
+            named_schema("agent_fanout"),
+        ];
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_edge_tools(edge_tools)
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let executor = Arc::new(
+            crate::server::server_tool_executor::ServerToolExecutor::new(
+                dir.path().to_path_buf(),
+                "u".into(),
+                "s".into(),
+                None,
+                None,
+            ),
+        );
+        let mut state = create_test_state();
+        state.server_tool_executor = Some(Arc::clone(&executor));
+
+        let visible = host.visible_turn_tools(&mut state);
+        let visible_names = schema_names(&visible);
+
+        assert!(visible_names.contains("bash"));
+        assert!(visible_names.contains("tool_search"));
+        assert!(
+            !visible_names.contains("agent_fanout"),
+            "tools[] must not expose runtime-gated tools when the server has no binding"
+        );
+        assert!(
+            !host.valid_tool_names().contains("agent_fanout"),
+            "validator admission must mirror the filtered wire surface"
+        );
+        let searchable = executor
+            .current_searchable_tool_names()
+            .expect("tool_search surface should be configured");
+        assert!(
+            !searchable.contains("agent_fanout"),
+            "tool_search must not resolve a schema that cannot execute on this runtime"
+        );
     }
 
     #[test]
