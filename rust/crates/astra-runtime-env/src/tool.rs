@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -361,12 +361,16 @@ impl CapabilityResolver {
         schemas: Vec<Value>,
         capabilities: &EffectiveCapabilitySet,
     ) -> Vec<Value> {
+        let mut seen = HashSet::new();
         schemas
             .into_iter()
             .filter(|schema| {
                 let Some(tool_name) = tool_schema_name(schema) else {
                     return false;
                 };
+                if !seen.insert(tool_name.to_string()) {
+                    return false;
+                }
                 self.check_tool_call(registry, tool_name, &Value::Null, capabilities)
                     .is_ok()
             })
@@ -1320,10 +1324,10 @@ mod tests {
     }
 
     #[test]
-    fn filter_tool_schemas_fails_closed_for_non_function_and_empty_names() {
-        // Non-function and empty-named schemas must be filtered out by
-        // filter_tool_schemas — they are malformed and must never reach the
-        // runtime tool surface even if their (fake) name is registered.
+    fn filter_tool_schemas_fails_closed_for_non_function_empty_and_duplicate_names() {
+        // Non-function and empty-named schemas fail closed. Missing top-level
+        // `type` is valid provider shorthand, but a tool may only appear once
+        // in the runtime surface.
         let registry = registry();
         let binding = RunBinding::local_developer("/repo", &registry);
         let schemas = vec![
@@ -1341,5 +1345,20 @@ mod tests {
 
         // Only the single valid `bash` schema should remain — no duplicates.
         assert_eq!(names, vec!["bash".to_string()]);
+    }
+
+    #[test]
+    fn filter_tool_schemas_accepts_missing_type_when_not_duplicate() {
+        let registry = registry();
+        let binding = RunBinding::local_developer("/repo", &registry);
+        let schemas = vec![serde_json::json!({"function": {"name": "read_file"}})];
+
+        let names: Vec<String> = CapabilityResolver
+            .filter_tool_schemas(&registry, schemas, &binding.capabilities)
+            .into_iter()
+            .filter_map(|schema| tool_schema_name(&schema).map(str::to_string))
+            .collect();
+
+        assert_eq!(names, vec!["read_file".to_string()]);
     }
 }
