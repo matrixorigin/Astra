@@ -42,7 +42,17 @@ use std::{
 /// applies (caller renders the bare reason).
 pub(crate) fn safe_alternative_for(reason: &str) -> Option<&'static str> {
     let lower = reason.to_lowercase();
-    if lower.contains("sensitive path") {
+    if lower.contains("credential") || lower.contains("sensitive credential") {
+        Some(
+            "Use environment variables or a secrets manager instead of reading credential files directly. \
+             If you need to configure a tool, use its CLI command (e.g., `aws configure`, `gcloud auth login`) instead.",
+        )
+    } else if lower.contains("internal artifact") || lower.contains("session artifact") {
+        Some(
+            "Session artifacts are managed by the runtime. Use the appropriate tool (read_file, list_dir) \
+             to inspect workspace files instead of reading internal session state directly.",
+        )
+    } else if lower.contains("sensitive path") {
         Some(
             "Write to a workspace-local path instead (e.g. under the current project tree), \
              or set allow_sensitive_path_writes=true in .astra/permissions.json to opt in.",
@@ -78,19 +88,29 @@ pub(crate) fn safe_alternative_for(reason: &str) -> Option<&'static str> {
 fn auto_mode_sensitive_path_denial_reason(path: &str) -> String {
     match classify_path_sensitivity(path) {
         PathSensitivity::Sensitive => {
-            "Sensitive path is credential/system-sensitive and requires explicit opt-in in Auto mode"
-                .to_string()
+            format!(
+                "Sandbox: Path '{}' is blocked as a sensitive credential path and requires explicit opt-in in Auto mode",
+                path
+            )
         }
         PathSensitivity::WriteSensitive => {
-            "Sensitive path is write-sensitive app/runtime state and requires explicit opt-in in Auto mode"
-                .to_string()
+            format!(
+                "Sandbox: Path '{}' is blocked as write-sensitive app/runtime state and requires explicit opt-in in Auto mode",
+                path
+            )
         }
         PathSensitivity::InternalArtifactReadOnly(_) => {
-            "Sensitive path is an internal read-only session artifact and requires explicit approval to modify"
-                .to_string()
+            format!(
+                "Sandbox: Path '{}' is blocked as an internal runtime artifact path and requires explicit approval to modify",
+                path
+            )
         }
-        PathSensitivity::Normal => "Sensitive path is blocked in Auto mode without explicit opt-in"
-            .to_string(),
+        PathSensitivity::Normal => {
+            format!(
+                "Sandbox: Path '{}' is blocked in Auto mode without explicit opt-in",
+                path
+            )
+        }
     }
 }
 
