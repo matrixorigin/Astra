@@ -1279,12 +1279,10 @@ impl ToolExecutor {
         // Use set-based comparison, not length comparison: same-count with
         // different names (e.g., {a,b} → {c,d}) must also trigger pruning.
         let retained_set: HashSet<&str> = retained.iter().map(String::as_str).collect();
+        let before = guard.len();
         guard.retain(|name| retained_set.contains(name.as_str()));
-        tracing::debug!(
-            before = guard.len(),
-            after = guard.len(),
-            "pruned CLI activated_deferred_tools entries"
-        );
+        let after = guard.len();
+        tracing::debug!(before, after, "pruned CLI activated_deferred_tools entries");
         retained
     }
 
@@ -1498,10 +1496,10 @@ impl ToolExecutor {
         use astra_turn_core::capability::Capability;
         match capability {
             Capability::AgentSpawner => self.spawn_context.is_some(),
-            // Future executor-gated capabilities must opt into denial only
-            // when this executor genuinely lacks the binding. Otherwise a new
-            // capability would silently hide unrelated tools on older nodes.
-            _ => true,
+            // Fail-closed: unknown executor-gated capabilities are denied.
+            // If a new executor-gated variant is added here, it MUST get an
+            // explicit match arm — the wildcard is a safety net, not a policy.
+            _ => false,
         }
     }
 
@@ -4475,7 +4473,6 @@ impl ToolExecutor {
         if let Some(denied) = self.tool_admission_denial(name, args) {
             return denied.into_outcome();
         }
-        self.consume_activated_deferred_tool_if_called(name);
         if let Some(outcome) = self.execute_blocking_shell_tool(name, args, cancel_token) {
             return outcome;
         }
@@ -4494,6 +4491,11 @@ impl ToolExecutor {
         args: &Value,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> Option<ToolExecutionOutcome> {
+        // Deferred activation must be consumed exactly once per tool call.
+        // The other public entry points (execute_with_metadata, execute) also
+        // call consume, but they do NOT call this function — so this is the
+        // only consume site for shell-tool paths.
+        self.consume_activated_deferred_tool_if_called(name);
         if name == "bash" {
             let output = self.finalize_tool_output(self.bash_with_cancel(args, cancel_token), name);
             self.record_output_size(output.len());
@@ -4574,6 +4576,7 @@ impl ToolExecutor {
     }
 
     pub async fn execute(&self, name: &str, args: &Value) -> String {
+        self.consume_activated_deferred_tool_if_called(name);
         self.execute_run(name, args).await.output
     }
 
@@ -4581,7 +4584,6 @@ impl ToolExecutor {
         if let Some(error) = self.tool_admission_denial(name, args) {
             return error;
         }
-        self.consume_activated_deferred_tool_if_called(name);
         let output = self.execute_raw(name, args).await;
         // Structural error propagation: `execute_raw` returns a plain String,
         // discarding any structured error kind at the source. Recover it here
