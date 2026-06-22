@@ -308,7 +308,9 @@ fn runtime_filter_turn_schemas_and_report(
     executor: &crate::edge_tools::ToolExecutor,
     turn_schemas: &mut Vec<Value>,
     selection_report: &mut tool_registry::SelectionReport,
-) {
+) -> bool {
+    let had_tools_before =
+        !turn_schemas.is_empty() || selection_report_has_selected_tools(selection_report);
     *turn_schemas = executor.runtime_bound_tool_schemas(std::mem::take(turn_schemas));
     let runtime_bound_turn_names =
         astra_turn_core::tool::schema::tool_names_from_schemas(turn_schemas.as_slice());
@@ -319,6 +321,48 @@ fn runtime_filter_turn_schemas_and_report(
         .dynamic_tools_selected
         .retain(|name| runtime_bound_turn_names.contains(name));
     selection_report.selected_count = selection_report.tools_selected.len() as u32;
+    had_tools_before
+}
+
+fn selection_report_has_selected_tools(report: &tool_registry::SelectionReport) -> bool {
+    !report.tools_selected.is_empty()
+        || !report.dynamic_tools_selected.is_empty()
+        || report.selected_count > 0
+}
+
+/// Priority-ordered check chain: first true signal wins. Returns
+/// `(should_inject_tools, reason)` where `reason` is for `tracing::trace!`
+/// observability only — never branched on by downstream code.
+fn tool_surface_should_inject(
+    turn_schemas: &[Value],
+    selection_report: &tool_registry::SelectionReport,
+    had_tools_before_runtime_filter: bool,
+    has_recent_tools: bool,
+    has_tool_results: bool,
+    plan_mode_active: bool,
+) -> (bool, &'static str) {
+    if !turn_schemas.is_empty() {
+        return (true, "visible_tool_candidates");
+    }
+    if selection_report_has_selected_tools(selection_report) {
+        return (true, "selection_report_names");
+    }
+    if had_tools_before_runtime_filter {
+        return (true, "had_tools_before_runtime_filter");
+    }
+    if has_recent_tools {
+        return (true, "recent_tool_context");
+    }
+    if has_tool_results {
+        return (true, "tool_results_followup");
+    }
+    if plan_mode_active {
+        return (true, "plan_mode_active");
+    }
+    if selection_report.budget_total == 0 {
+        return (true, "budget_starved_selection");
+    }
+    (false, "")
 }
 
 async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
@@ -545,17 +589,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             ctx.all_schemas,
         );
     }
-    let conversation_state =
-        astra_turn_core::tool_registry_state::ConversationState::from_message_with_context(
-            ctx.message,
-            ctx.history.len() as u32,
-            ctx.recent_tools,
-        );
-    let low_intent_without_work_signals = conversation_state.is_conversational
-        && !conversation_state.is_fetch
-        && !conversation_state.is_mutate
-        && !conversation_state.is_analytical
-        && !conversation_state.references_history;
     if !ctx.plan_mode_active {
         if let Some(required) = ctx.executor.take_pending_round_tool_boost() {
             let required_refs: Vec<&str> = required.iter().map(String::as_str).collect();
@@ -594,7 +627,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             );
         }
     }
-    runtime_filter_turn_schemas_and_report(
+    let had_tools_before_runtime_filter = runtime_filter_turn_schemas_and_report(
         ctx.executor.as_ref(),
         &mut turn_schemas,
         &mut selection_report,
@@ -606,17 +639,25 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     // never consumed. See test
     // `selection_report_from_visible_schemas_is_single_source_for_budget`.
 
-    let no_tool_conversational_turn = turn_schemas.is_empty()
-        && selection_report.tools_selected.is_empty()
-        && selection_report.dynamic_tools_selected.is_empty()
-        && ctx.recent_tools.is_empty()
-        && ctx.tool_results.is_empty()
-        && !ctx.plan_mode_active
-        && low_intent_without_work_signals;
-    if !no_tool_conversational_turn {
-        // Keep session-control tools stable once a turn needs tools. Pure
-        // conversational turns intentionally stay tool-free unless pending
-        // activation or selected work already made a tool surface necessary.
+    let (inject_tools, surface_reason) = tool_surface_should_inject(
+        &turn_schemas,
+        &selection_report,
+        had_tools_before_runtime_filter,
+        !ctx.recent_tools.is_empty(),
+        !ctx.tool_results.is_empty(),
+        ctx.plan_mode_active,
+    );
+    tracing::trace!(
+        target: "astra.tool_surface",
+        reason = surface_reason,
+        inject_tools,
+        "chat turn tool surface decision"
+    );
+    if inject_tools {
+        // Keep session-control tools stable once a turn needs tools. An
+        // explicit empty selector surface stays tool-free unless pending
+        // activation, prior context, or structural selection pressure requires
+        // a recovery-capable tool surface.
         astra_turn_core::tool_schema_prune::inject_required_tool_names(
             &mut turn_schemas,
             &mut selection_report,
@@ -629,9 +670,9 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             .any(|name| name == "tool_search");
         if !has_tool_search {
             // Deferred discovery must never be stranded behind its own
-            // deferred surface. Even when a custom pinned config removes every
-            // core tool, a non-conversational turn still needs the activation
-            // primitive or the model has no recovery path.
+            // deferred surface. Once the structural decision says this is a
+            // tool-bearing turn, the activation primitive must be visible or
+            // the model has no recovery path.
             astra_turn_core::tool_schema_prune::inject_required_tool_names(
                 &mut turn_schemas,
                 &mut selection_report,
@@ -641,7 +682,11 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         }
     }
 
-    runtime_filter_turn_schemas_and_report(
+    // Runtime-filter after tool injection to keep schemas consistent with
+    // executor capabilities. The return value is intentionally discarded: this
+    // second pass only cleans up the tool surface, it does not feed the
+    // had_tools_before snapshot.
+    let _had_tools_before = runtime_filter_turn_schemas_and_report(
         ctx.executor.as_ref(),
         &mut turn_schemas,
         &mut selection_report,
@@ -1681,6 +1726,210 @@ mod tests {
         assert_eq!(report.budget_total, 100);
     }
 
+    // ── Tool surface decision: structural signals, not text-based ────────
+    //
+    // The decision is driven by the tool pipeline state (visible schemas,
+    // selection report, context signals) — never by NLP inference on the
+    // user message text. This keeps the tool surface deterministic and
+    // prompt-cache-friendly.
+
+    /// Helper: empty report with the given budget_total.
+    fn empty_report(budget_total: u32) -> astra_runtime::tool_registry::SelectionReport {
+        astra_runtime::tool_registry::SelectionReport {
+            tools_selected: Vec::new(),
+            dynamic_tools_selected: Vec::new(),
+            selected_count: 0,
+            budget_used: 0,
+            budget_total,
+        }
+    }
+
+    #[test]
+    fn tool_surface_decision_signals_and_priority() {
+        // Table-driven: each row tests one signal in isolation, then the
+        // priority chain verifies that higher signals beat lower ones when
+        // multiple are simultaneously true.
+
+        // ── Individual signals (only one true, others false) ──
+        assert_eq!(
+            super::tool_surface_should_inject(&[], &empty_report(100), false, false, false, false),
+            (false, ""),
+            "no signals → tool-free"
+        );
+        assert_eq!(
+            super::tool_surface_should_inject(
+                &[schema("bash")],
+                &empty_report(100),
+                false,
+                false,
+                false,
+                false
+            ),
+            (true, "visible_tool_candidates"),
+        );
+        {
+            let mut r = empty_report(100);
+            r.tools_selected = vec!["git".into()];
+            r.selected_count = 1;
+            assert_eq!(
+                super::tool_surface_should_inject(&[], &r, false, false, false, false),
+                (true, "selection_report_names"),
+            );
+        }
+        assert_eq!(
+            super::tool_surface_should_inject(&[], &empty_report(100), true, false, false, false),
+            (true, "had_tools_before_runtime_filter"),
+        );
+        assert_eq!(
+            super::tool_surface_should_inject(&[], &empty_report(100), false, true, false, false),
+            (true, "recent_tool_context"),
+        );
+        assert_eq!(
+            super::tool_surface_should_inject(&[], &empty_report(100), false, false, true, false),
+            (true, "tool_results_followup"),
+        );
+        assert_eq!(
+            super::tool_surface_should_inject(&[], &empty_report(100), false, false, false, true),
+            (true, "plan_mode_active"),
+        );
+        assert_eq!(
+            super::tool_surface_should_inject(&[], &empty_report(0), false, false, false, false),
+            (true, "budget_starved_selection"),
+            "budget_total == 0 with no prior candidates → structurally starved"
+        );
+
+        // ── Priority: higher signals beat lower when multiple are true ──
+        let report_with_tools = {
+            let mut r = empty_report(0);
+            r.tools_selected = vec!["git".into()];
+            r.selected_count = 1;
+            r
+        };
+        struct PriorityCase {
+            schemas: Vec<Value>,
+            report: astra_runtime::tool_registry::SelectionReport,
+            had_tools_before_runtime_filter: bool,
+            recent_tool_context: bool,
+            tool_results_followup: bool,
+            plan_mode_active: bool,
+            expected_reason: &'static str,
+            desc: &'static str,
+        }
+
+        let cases = [
+            PriorityCase {
+                schemas: vec![schema("bash")],
+                report: report_with_tools.clone(),
+                had_tools_before_runtime_filter: true,
+                recent_tool_context: true,
+                tool_results_followup: true,
+                plan_mode_active: true,
+                expected_reason: "visible_tool_candidates",
+                desc: "turn_schemas beats all",
+            },
+            PriorityCase {
+                schemas: Vec::new(),
+                report: report_with_tools,
+                had_tools_before_runtime_filter: true,
+                recent_tool_context: true,
+                tool_results_followup: true,
+                plan_mode_active: true,
+                expected_reason: "selection_report_names",
+                desc: "selection report beats signals below",
+            },
+            PriorityCase {
+                schemas: Vec::new(),
+                report: empty_report(0),
+                had_tools_before_runtime_filter: true,
+                recent_tool_context: true,
+                tool_results_followup: true,
+                plan_mode_active: true,
+                expected_reason: "had_tools_before_runtime_filter",
+                desc: "pre-filter snapshot beats context signals",
+            },
+            PriorityCase {
+                schemas: Vec::new(),
+                report: empty_report(0),
+                had_tools_before_runtime_filter: false,
+                recent_tool_context: true,
+                tool_results_followup: true,
+                plan_mode_active: true,
+                expected_reason: "recent_tool_context",
+                desc: "recent tools beats results + plan",
+            },
+            PriorityCase {
+                schemas: Vec::new(),
+                report: empty_report(0),
+                had_tools_before_runtime_filter: false,
+                recent_tool_context: false,
+                tool_results_followup: true,
+                plan_mode_active: true,
+                expected_reason: "tool_results_followup",
+                desc: "tool results beats plan mode",
+            },
+            PriorityCase {
+                schemas: Vec::new(),
+                report: empty_report(0),
+                had_tools_before_runtime_filter: false,
+                recent_tool_context: false,
+                tool_results_followup: false,
+                plan_mode_active: true,
+                expected_reason: "plan_mode_active",
+                desc: "plan mode beats budget starved",
+            },
+        ];
+        for case in cases {
+            assert_eq!(
+                super::tool_surface_should_inject(
+                    &case.schemas,
+                    &case.report,
+                    case.had_tools_before_runtime_filter,
+                    case.recent_tool_context,
+                    case.tool_results_followup,
+                    case.plan_mode_active
+                ),
+                (true, case.expected_reason),
+                "{}",
+                case.desc
+            );
+        }
+    }
+
+    #[test]
+    fn tool_surface_decision_edge_cases() {
+        // dynamic_tools_selected alone makes the turn tool-bearing
+        let dyn_report = astra_runtime::tool_registry::SelectionReport {
+            tools_selected: Vec::new(),
+            dynamic_tools_selected: vec!["tool_search".into()],
+            selected_count: 0,
+            budget_used: 0,
+            budget_total: 100,
+        };
+        assert_eq!(
+            super::tool_surface_should_inject(&[], &dyn_report, false, false, false, false),
+            (true, "selection_report_names"),
+        );
+
+        // selected_count > 0 with empty vecs
+        let count_only = astra_runtime::tool_registry::SelectionReport {
+            selected_count: 3,
+            budget_total: 100,
+            ..empty_report(100)
+        };
+        assert_eq!(
+            super::tool_surface_should_inject(&[], &count_only, false, false, false, false),
+            (true, "selection_report_names"),
+        );
+
+        // budget_total == 0 but HadToolsBeforeRuntimeFilter is already set →
+        // the pre-filter signal wins (priority), not BudgetStarved
+        assert_eq!(
+            super::tool_surface_should_inject(&[], &empty_report(0), true, false, false, false),
+            (true, "had_tools_before_runtime_filter"),
+            "pre-filter snapshot beats budget starved in priority order"
+        );
+    }
+
     // ── Regression: skill allowed_tools not force-included (session c3dea07a) ──
     //
     // When a skill declares allowed_tools (e.g. review-changes allows grep, glob),
@@ -2031,7 +2280,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_chat_turn_payload_low_intent_is_tool_free_unless_activation_is_pending() {
+    async fn prepare_chat_turn_payload_empty_selector_surface_preserves_activation() {
         use crate::edge_tools::ToolExecutor;
         use astra_pipeline::step_recorder::StepRecorder;
         use astra_runtime::{
@@ -2044,9 +2293,11 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let all_schemas = astra_tools::schemas::all_tool_schemas();
         let registry = ToolRegistry::new(all_schemas.clone());
+        let empty_schemas: Vec<Value> = Vec::new();
+        let empty_registry = ToolRegistry::new(empty_schemas.clone());
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
-        let low_intent_message = "thanks";
-        let messages = vec![json!({"role": "user", "content": low_intent_message})];
+        let selector_empty_message = "selector empty surface";
+        let messages = vec![json!({"role": "user", "content": selector_empty_message})];
         let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
@@ -2054,7 +2305,7 @@ mod tests {
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
-        let mut step_recorder = StepRecorder::new("session-low-intent", "task-low-intent");
+        let mut step_recorder = StepRecorder::new("session-empty-selector", "task-empty-selector");
         let turn_guard = TurnGuard::default();
         let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -2068,18 +2319,18 @@ mod tests {
             messages: &messages,
             runtime_volatile_texts: &[],
             ephemeral_prefix: None,
-            current_session_id: Some("session-low-intent"),
+            current_session_id: Some("session-empty-selector"),
             model: None,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
-            message: low_intent_message,
+            message: selector_empty_message,
             semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
             executor: Arc::clone(&executor),
-            registry: &registry,
+            registry: &empty_registry,
             tool_results: &tool_results,
-            all_schemas: &all_schemas,
+            all_schemas: &empty_schemas,
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
@@ -2123,7 +2374,7 @@ mod tests {
         let edge_tools = payload["edge_tools"].as_array().unwrap();
         assert!(
             edge_tools.is_empty(),
-            "low-intent turns without pending activation should not include full tool schemas: {:?}",
+            "an explicitly empty selector surface without pending context should not include full tool schemas: {:?}",
             edge_tools
                 .iter()
                 .filter_map(|schema| schema["function"]["name"].as_str())
@@ -2133,7 +2384,7 @@ mod tests {
             payload["edge_profile"]
                 .get(EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT)
                 .is_none(),
-            "low-intent turns without visible tool_search should not advertise deferred tools"
+            "tool-free turns without visible tool_search should not advertise deferred tools"
         );
         assert!(
             valid_tool_names.is_empty(),
@@ -2186,7 +2437,7 @@ mod tests {
             model: None,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
-            message: low_intent_message,
+            message: selector_empty_message,
             semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
@@ -2242,7 +2493,7 @@ mod tests {
             .collect();
         assert!(
             edge_tool_names.contains(&"memory"),
-            "pending activation must surface the selected schema independent of low-intent text: {edge_tool_names:?}"
+            "pending activation must surface the selected schema independent of the otherwise empty selector surface: {edge_tool_names:?}"
         );
         assert!(
             valid_tool_names.contains("memory"),
@@ -2345,7 +2596,7 @@ mod tests {
             .collect();
         assert!(
             edge_tool_names.contains(&"tool_search"),
-            "non-conversational turns must keep deferred discovery reachable even when custom surface/budget selected no tools: {edge_tool_names:?}"
+            "budget-starved turns must keep deferred discovery reachable even when custom surface/budget selected no tools: {edge_tool_names:?}"
         );
         assert!(
             payload["edge_profile"]

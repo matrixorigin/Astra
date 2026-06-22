@@ -691,20 +691,36 @@ pub(crate) fn annotate_tool_schemas_for_caching_with_pinned(
 /// without a static — the set is small, so this is cheap.
 #[cfg(test)]
 pub(crate) fn default_pinned_tool_names() -> std::collections::HashSet<String> {
-    cache_static_prefix_tool_names_for_config(&ToolSurfaceConfig::default())
+    resolve_pinned_tool_names_for_config(&ToolSurfaceConfig::default())
 }
 
 /// Runtime-configured pinned tool names for fallback paths that do not receive
-/// edge metadata. CLI/Edge should normally send the resolved names explicitly;
-/// server-side-tools and tests use this to keep cache markers aligned with TOML
-/// overrides.
+/// edge metadata.
+///
+/// CLI/Edge should normally send the resolved names explicitly; server-side-tools
+/// and tests use this to keep cache markers aligned with TOML overrides.
+///
+/// **Hidden dependency**: reads `RuntimeConfig::cached().tool_surface` — a
+/// process-wide singleton. Callers that already hold a `ToolSurfaceConfig`
+/// should use [`resolve_pinned_tool_names_for_config`] directly instead.
 pub(crate) fn runtime_pinned_tool_names() -> std::collections::HashSet<String> {
-    cache_static_prefix_tool_names_for_config(
+    resolve_pinned_tool_names_for_config(
         &astra_config::runtime_config::RuntimeConfig::cached().tool_surface,
     )
 }
 
-pub(crate) fn cache_static_prefix_tool_names_for_config(
+/// Resolve the pinned tool name set for a given surface config by building the
+/// full [`ToolSurface`] and extracting pinned names.
+///
+/// This is the single source of truth for "which tools are cache-pinned under
+/// this config?". All callers that need cache markers or edge metadata should
+/// route through this (or the two convenience wrappers above) rather than
+/// rebuilding DEFAULT_PINNED + TOML override rules locally.
+///
+/// **Cold path**: this rebuilds `all_tool_schemas()` + `ToolSurface::build()`
+/// (O(tool count)). Expected call frequency is O(1) per session. The per-turn
+/// annotation path receives the pre-computed `HashSet` directly and is O(1).
+pub(crate) fn resolve_pinned_tool_names_for_config(
     cfg: &ToolSurfaceConfig,
 ) -> std::collections::HashSet<String> {
     let mut schemas = astra_tools::schemas::all_tool_schemas();
@@ -871,7 +887,7 @@ mod tests {
         let cfg = ToolSurfaceConfig {
             pinned_tools: vec!["github".into(), "-grep".into()],
         };
-        let pinned = cache_static_prefix_tool_names_for_config(&cfg);
+        let pinned = resolve_pinned_tool_names_for_config(&cfg);
 
         assert!(
             pinned.contains("github"),
@@ -2089,10 +2105,6 @@ mod cache_stability_regression {
             "grep",
             "glob",
             "git",
-            "git",
-            "memory",
-            "memory",
-            "memory",
             "memory",
         ] {
             assert!(
@@ -2102,12 +2114,11 @@ mod cache_stability_regression {
         }
         // Runtime-injected, not in TOOL_CATALOG, but structurally part of the
         // resolved default surface when skills are available.
-        for name in ["skill"] {
-            assert!(
-                pinned.contains(name),
-                "{name} is auto-pinned at runtime; default set must mirror that"
-            );
-        }
+        let name = "skill";
+        assert!(
+            pinned.contains(name),
+            "{name} is auto-pinned at runtime; default set must mirror that"
+        );
     }
 
     /// `default_pinned_tool_names()` must return the same set across calls —

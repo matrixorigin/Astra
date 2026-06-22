@@ -12,7 +12,7 @@
 //!   schema visible in upcoming `tools[]` payloads until the model actually
 //!   calls that tool once.
 //!
-//! The default T1 set is the 13-member coding core (see `DEFAULT_PINNED`).
+//! The default T1 set is the coding core (see `DEFAULT_PINNED`).
 //! Users override via `runtime.tool_surface.pinned_tools` in TOML. A name
 //! prefixed with `-` removes a default (e.g. `"-grep"`).
 //!
