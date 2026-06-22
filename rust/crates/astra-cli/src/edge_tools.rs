@@ -6003,7 +6003,8 @@ mod tests {
                 }),
             )
             .await;
-        assert!(started.contains("\"status\":\"completed\""), "{started}");
+        let started_value: serde_json::Value = serde_json::from_str(&started).unwrap();
+        assert_eq!(started_value["status"], "completed", "{started}");
 
         let result = executor
             .task_output(&serde_json::json!({

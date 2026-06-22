@@ -246,6 +246,9 @@ pub fn activated_tool_names_from_tool_search_output(output: &str) -> Vec<String>
         return Vec::new();
     }
 
+    let activation_candidates =
+        resolved_tool_names_from_output(&value).unwrap_or_else(|| output_requested.clone());
+
     let mut names = Vec::new();
     let Some(matches) = value.get("matches").and_then(Value::as_array) else {
         return names;
@@ -259,13 +262,16 @@ pub fn activated_tool_names_from_tool_search_output(output: &str) -> Vec<String>
         else {
             continue;
         };
-        if !requested
+        if !activation_candidates
             .iter()
-            .any(|requested| requested.eq_ignore_ascii_case(name))
+            .any(|candidate| candidate.eq_ignore_ascii_case(name))
         {
             continue;
         }
-        if !names.iter().any(|existing| existing == name) {
+        if !names
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(name))
+        {
             names.push(name.to_string());
         }
     }
@@ -301,6 +307,23 @@ fn requested_tool_names_from_select_query(query: &str) -> Vec<String> {
 fn requested_tool_names_from_output(value: &Value) -> Option<Vec<String>> {
     let mut names = Vec::new();
     for name in value.get("requested")?.as_array()? {
+        let name = name.as_str()?.trim();
+        if name.is_empty() {
+            return None;
+        }
+        if !names
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(name))
+        {
+            names.push(name.to_string());
+        }
+    }
+    Some(names)
+}
+
+fn resolved_tool_names_from_output(value: &Value) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for name in value.get("resolved")?.as_array()? {
         let name = name.as_str()?.trim();
         if name.is_empty() {
             return None;
@@ -668,6 +691,32 @@ mod tests {
         assert_eq!(
             activated_tool_names_from_tool_search_output(&out),
             vec!["github".to_string()]
+        );
+    }
+
+    #[test]
+    fn select_unique_prefix_activates_resolved_canonical_name() {
+        let out = json!({
+            "mode": "select",
+            "query": "select:github_list",
+            "requested": ["github_list"],
+            "resolved": ["github_list_prs"],
+            "matches": [
+                {
+                    "name": "github_list_prs",
+                    "description": "full",
+                    "matched_by": "unique_prefix",
+                    "requested": "github_list",
+                    "parameters": {"type": "object"}
+                }
+            ],
+            "missing": []
+        })
+        .to_string();
+
+        assert_eq!(
+            activated_tool_names_from_tool_search_output(&out),
+            vec!["github_list_prs".to_string()]
         );
     }
 

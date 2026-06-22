@@ -1282,11 +1282,12 @@ mod tests {
     }
 
     #[test]
-    fn tool_schema_name_rejects_missing_type() {
-        let no_type = serde_json::json!({"function": {"name": "leaked"}});
-        assert!(
-            tool_schema_name(&no_type).is_none(),
-            "schema without `type` must not expose a name"
+    fn tool_schema_name_accepts_missing_type_function_schema() {
+        let no_type = serde_json::json!({"function": {"name": "read_file"}});
+        assert_eq!(
+            tool_schema_name(&no_type),
+            Some("read_file"),
+            "provider shorthand without `type` should still expose a function schema name"
         );
     }
 

@@ -4660,7 +4660,10 @@ impl ToolExecutor {
                 };
 
                 // Apply offset for pagination
-                let lines: Vec<&str> = text.lines().collect();
+                let lines: Vec<String> = text
+                    .lines()
+                    .map(astra_tools::shell_ops::compact_grep_output_line)
+                    .collect();
                 let lines = if offset > 0 {
                     if offset >= lines.len() {
                         return format!(
@@ -7711,6 +7714,36 @@ mod tests {
         assert!(
             result.contains("Results limited to"),
             "should note truncation, got: {result}"
+        );
+    }
+
+    #[test]
+    fn grep_compacts_single_line_json_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = super::ToolExecutor::new(dir.path());
+        let content = serde_json::json!({
+            "status": "completed",
+            "results": [{"summary": "needle"}],
+            "padding": "x".repeat(6_000)
+        })
+        .to_string();
+        std::fs::write(dir.path().join("artifact.json"), content).unwrap();
+
+        let result = executor.grep(&serde_json::json!({
+            "pattern": "needle",
+            "path": "artifact.json",
+            "head_limit": 0
+        }));
+
+        assert!(result.contains("artifact.json:1:"), "{result}");
+        assert!(
+            result.contains("grep line truncated"),
+            "single-line JSON grep match should not return the full line: {result}"
+        );
+        assert!(
+            result.len() < 3_000,
+            "compacted grep output should stay small, got {} chars",
+            result.len()
         );
     }
 

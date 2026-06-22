@@ -123,7 +123,7 @@ mod tests {
     }
 
     #[test]
-    fn install_injected_tool_schema_rejects_malformed_schema() {
+    fn install_injected_tool_schema_accepts_missing_type_function_shorthand() {
         let (_dir, executor) = test_executor();
         let mut all_schemas = Vec::new();
         let mut valid_tool_names = HashSet::new();
@@ -131,6 +131,25 @@ mod tests {
         let accepted = install_injected_tool_schema(
             &executor,
             json!({"function": {"name": "skill"}}),
+            &mut all_schemas,
+            &mut valid_tool_names,
+            None,
+        );
+
+        assert!(accepted);
+        assert_eq!(all_schemas.len(), 1);
+        assert!(valid_tool_names.contains("skill"));
+    }
+
+    #[test]
+    fn install_injected_tool_schema_rejects_non_function_schema() {
+        let (_dir, executor) = test_executor();
+        let mut all_schemas = Vec::new();
+        let mut valid_tool_names = HashSet::new();
+
+        let accepted = install_injected_tool_schema(
+            &executor,
+            json!({"type": "custom", "function": {"name": "skill"}}),
             &mut all_schemas,
             &mut valid_tool_names,
             None,

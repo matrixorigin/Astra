@@ -5707,7 +5707,7 @@ mod tests {
     }
 
     #[test]
-    fn server_host_ignores_deferred_names_when_manifest_budget_mismatches_model() {
+    fn server_host_keeps_deferred_names_when_manifest_budget_mismatches_model() {
         let edge_profile = deferred_manifest_edge_profile(&["agent_fanout"], "gpt-3.5-turbo");
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -5725,8 +5725,9 @@ mod tests {
         let _visible = host.visible_turn_tools(&mut state);
 
         assert!(
-            <ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host).is_empty(),
-            "validator must not consume deferred names when bridge/context assembly would drop the prompt block for this model"
+            <ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host)
+                .contains("agent_fanout"),
+            "budget mismatch must not silently drop a valid deferred manifest; rendering uses the smaller budget and keeps activation/search consistent"
         );
     }
 

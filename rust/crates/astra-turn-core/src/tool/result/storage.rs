@@ -8,6 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
+use serde_json::Value;
+
 /// Maximum length of the human-readable portion of a sanitized filename.
 /// Full filename has an 8-char hex hash suffix to prevent collisions when
 /// different `tool_call_id`s sanitize to the same string.
@@ -56,6 +58,17 @@ const PERSISTED_TAG_CLOSE: &str = "</persisted-output>";
 /// Subdirectory under the session folder for tool result files.
 const TOOL_RESULTS_SUBDIR: &str = "tool-results";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistedFormat {
+    PlainText,
+    PrettyJson,
+}
+
+struct PersistedContent {
+    text: String,
+    format: PersistedFormat,
+}
+
 /// FNV-1a 64-bit hash — stable and deterministic across processes and Rust versions.
 fn fnv1a_64(data: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -101,7 +114,8 @@ pub fn maybe_persist_tool_result(
     let safe_id = safe_filename_stem(tool_call_id);
     let file_path = dir.join(format!("{safe_id}.txt"));
 
-    if let Err(e) = std::fs::write(&file_path, content) {
+    let persisted = persistable_content(content);
+    if let Err(e) = std::fs::write(&file_path, persisted.text.as_str()) {
         tracing::warn!(
             path = %file_path.display(),
             error = %e,
@@ -110,7 +124,9 @@ pub fn maybe_persist_tool_result(
         return None;
     }
 
-    Some(build_replacement(tool_name, content, &file_path))
+    Some(build_replacement(
+        tool_name, content, &persisted, &file_path,
+    ))
 }
 
 /// Persist a tool result to disk unconditionally (no size threshold).
@@ -170,9 +186,31 @@ pub fn tool_results_dir(session_dir: &Path) -> PathBuf {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn build_replacement(tool_name: &str, content: &str, file_path: &Path) -> String {
-    let total_chars = content.chars().count();
-    let preview: String = content.chars().take(PREVIEW_CHARS).collect();
+fn persistable_content(content: &str) -> PersistedContent {
+    if content.lines().count() <= 1
+        && let Ok(value) = serde_json::from_str::<Value>(content)
+        && let Ok(pretty) = serde_json::to_string_pretty(&value)
+    {
+        return PersistedContent {
+            text: pretty,
+            format: PersistedFormat::PrettyJson,
+        };
+    }
+    PersistedContent {
+        text: content.to_string(),
+        format: PersistedFormat::PlainText,
+    }
+}
+
+fn build_replacement(
+    tool_name: &str,
+    original_content: &str,
+    persisted: &PersistedContent,
+    file_path: &Path,
+) -> String {
+    let total_chars = original_content.chars().count();
+    let stored_chars = persisted.text.chars().count();
+    let preview: String = persisted.text.chars().take(PREVIEW_CHARS).collect();
 
     // Try to cut at a newline for cleaner preview
     let preview = if let Some(nl_pos) = preview.rfind('\n') {
@@ -184,11 +222,18 @@ fn build_replacement(tool_name: &str, content: &str, file_path: &Path) -> String
     } else {
         &preview
     };
+    let format_note = match persisted.format {
+        PersistedFormat::PlainText => String::new(),
+        PersistedFormat::PrettyJson => format!(
+            "Stored as pretty JSON for readable line ranges ({stored_chars} chars on disk; semantic JSON unchanged).\n         "
+        ),
+    };
 
     format!(
         "{PERSISTED_TAG_OPEN}\n\
          Tool `{tool_name}` produced {total_chars} chars of output (persisted to disk).\n\
          File: {path}\n\
+         {format_note}\
          \n\
          Preview (first ~{prev_len} chars):\n\
          {preview}\n\
@@ -266,6 +311,47 @@ mod tests {
 
         let recovered = read_persisted_result(&dir, "call-99").unwrap();
         assert_eq!(recovered, content);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn large_single_line_json_is_persisted_as_pretty_json() {
+        let dir = std::env::temp_dir().join("trs_pretty_json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let rows: Vec<_> = (0..1500)
+            .map(|idx| serde_json::json!({"slot_index": idx, "summary": format!("review {idx}")}))
+            .collect();
+        let content = serde_json::json!({
+            "status": "completed",
+            "results": rows
+        })
+        .to_string();
+        assert!(
+            content.chars().count() > PERSIST_THRESHOLD_CHARS,
+            "test setup must cross persistence threshold"
+        );
+
+        let replacement =
+            maybe_persist_tool_result(&dir, "call-json", "agent_fanout", &content).unwrap();
+        let recovered = read_persisted_result(&dir, "call-json").unwrap();
+
+        assert!(
+            replacement.contains("Stored as pretty JSON"),
+            "{replacement}"
+        );
+        assert!(replacement.contains("\"results\""), "{replacement}");
+        assert!(
+            recovered.lines().count() > 100,
+            "persisted JSON must be readable by line range, got {} lines",
+            recovered.lines().count()
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&recovered).unwrap(),
+            serde_json::from_str::<Value>(&content).unwrap()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

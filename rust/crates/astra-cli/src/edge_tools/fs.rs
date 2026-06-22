@@ -9,8 +9,8 @@ use super::{
 use astra_runtime::tool_sandbox::validate_path;
 use astra_sandbox::is_internal_safe_path;
 use astra_tools::fs_ops::{
-    check_anchor_vs_replacement_size, read_to_string_lossy, str_replace_fail,
-    validate_read_file_args,
+    check_anchor_vs_replacement_size, normalize_read_file_line_range, read_to_string_lossy,
+    render_single_line_json_range_recovery, str_replace_fail, validate_read_file_args,
 };
 use astra_turn_core::tool_result_sanitize::READ_FILE_MODEL_RESULT_CHARS;
 use astra_turn_core::tool_result_semantics::TOOL_SUCCESS_SENTINEL;
@@ -543,10 +543,28 @@ impl ToolExecutor {
             );
         }
 
-        let start = start_raw.map(|n| n as usize);
-        let end = end_raw.map(|n| n as usize);
-
         let is_ranged = has_range;
+        let normalized_range = is_ranged.then(|| {
+            normalize_read_file_line_range(
+                start_raw.map(|n| n as usize),
+                end_raw.map(|n| n as usize),
+                content.lines().count(),
+            )
+        });
+        if let Some(range) = normalized_range.as_ref() {
+            let total_lines = content.lines().count();
+            if range.start_line > total_lines
+                && let Some(recovered) = render_single_line_json_range_recovery(
+                    &content,
+                    range.start_line,
+                    range.end_line,
+                    total_lines,
+                    self.read_file_model_output_limit(),
+                )
+            {
+                return recovered;
+            }
+        }
 
         // Dedup: if file was fully read earlier in this turn and hasn't
         // changed, return a stub. Later turns may need the content again after
@@ -593,15 +611,28 @@ impl ToolExecutor {
                 if expanded.chars().count() <= self.read_file_model_output_limit() {
                     // Upgrade to full read — future reads will hit can_dedup_read.
                     self.record_read_cached(&path, false, ReadDedupKey::Full, content.clone());
-                    return expanded;
+                    return if let Some(note) = normalized_range
+                        .as_ref()
+                        .and_then(|range| range.note.as_ref())
+                    {
+                        format!("{note}\n{expanded}")
+                    } else {
+                        expanded
+                    };
                 }
             }
         }
 
         let request_key = if is_ranged {
             ReadDedupKey::Range {
-                start_line: start_raw,
-                end_line: end_raw,
+                start_line: normalized_range
+                    .as_ref()
+                    .map(|range| range.start_line as u64)
+                    .or(start_raw),
+                end_line: normalized_range
+                    .as_ref()
+                    .map(|range| range.end_line as u64)
+                    .or(end_raw),
             }
         } else {
             ReadDedupKey::Full
@@ -671,8 +702,22 @@ impl ToolExecutor {
         }
 
         let lines: Vec<&str> = content.lines().collect();
-        let s = start.unwrap_or(1).saturating_sub(1).min(lines.len());
-        let e = end.unwrap_or(lines.len()).min(lines.len());
+        let Some(range) = normalized_range else {
+            return "(internal error: ranged read without normalized range)".to_string();
+        };
+        let s = range.start_line.saturating_sub(1).min(lines.len());
+        let e = range.end_line.min(lines.len());
+        if s >= lines.len()
+            && let Some(recovered) = render_single_line_json_range_recovery(
+                &content,
+                range.start_line,
+                range.end_line,
+                lines.len(),
+                self.read_file_model_output_limit(),
+            )
+        {
+            return recovered;
+        }
         if s >= e {
             return format!(
                 "(empty range: start_line {} >= end_line {} or file has only {} lines)",
@@ -730,6 +775,9 @@ impl ToolExecutor {
                 ReadCoverage::None
             };
             dedup_eligible = false;
+        }
+        if let Some(note) = range.note.as_ref() {
+            result = format!("{note}\n{result}");
         }
         self.record_read_cached_with_coverage(
             &path,
@@ -3629,14 +3677,41 @@ type Handler interface {
             "start_line": 3,
             "end_line": 1
         }));
-        assert!(
-            result.contains("start_line must be <= end_line"),
-            "{result}"
-        );
-        assert!(result.contains("No file was read"), "{result}");
+        assert!(result.contains("normalized reversed range"), "{result}");
         assert!(result.contains("start_line=1"), "{result}");
         assert!(result.contains("end_line=3"), "{result}");
-        assert!(!result.contains("1\ta"), "{result}");
+        assert!(result.contains("1\ta"), "{result}");
+        assert!(result.contains("2\tb"), "{result}");
+        assert!(result.contains("3\tc"), "{result}");
+    }
+
+    #[test]
+    fn read_file_recovers_bad_range_on_single_line_json_tool_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = serde_json::json!({
+            "status": "completed",
+            "results": [
+                {"slot_index": 0, "result": {"summary": "first review"}},
+                {"slot_index": 1, "result": {"summary": "second review"}}
+            ]
+        })
+        .to_string();
+        std::fs::write(dir.path().join("fanout-result.txt"), payload).unwrap();
+        let executor = test_executor_in(dir.path());
+
+        let result = executor.read_file(&serde_json::json!({
+            "path": "fanout-result.txt",
+            "start_line": 2782,
+            "end_line": 300
+        }));
+
+        assert!(
+            result.contains("one physical line containing valid JSON"),
+            "{result}"
+        );
+        assert!(result.contains("\"results\""), "{result}");
+        assert!(result.contains("first review"), "{result}");
+        assert!(result.contains("second review"), "{result}");
     }
 
     #[test]

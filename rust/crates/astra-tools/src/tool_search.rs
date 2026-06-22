@@ -77,14 +77,21 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
             return "Error: 'select:' requires at least one tool name".to_string();
         }
         let mut found = Vec::new();
+        let mut resolved = Vec::new();
         let mut missing = Vec::new();
+        let mut ambiguous = Vec::new();
 
         for name in &requested {
-            if let Some(tool) = valid_schemas
-                .iter()
-                .find(|t| tool_schema_name(t).is_some_and(|n| n.eq_ignore_ascii_case(name)))
-            {
-                if let Some(func) = tool.get("function") {
+            match resolve_select_tool(&valid_schemas, name) {
+                SelectResolution::Found {
+                    schema: tool,
+                    canonical_name,
+                    matched_by_prefix,
+                } => {
+                    let Some(func) = tool.get("function") else {
+                        missing.push(name.clone());
+                        continue;
+                    };
                     let tool_name = func.get("name").and_then(Value::as_str).unwrap_or("");
                     let desc = func
                         .get("description")
@@ -103,10 +110,23 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
                     {
                         obj.insert("parameters".to_string(), compact_select_parameters(params));
                     }
+                    if matched_by_prefix && let Some(obj) = entry.as_object_mut() {
+                        obj.insert("requested".to_string(), json!(name));
+                        obj.insert("matched_by".to_string(), json!("unique_prefix"));
+                    }
+                    resolved.push(canonical_name.to_string());
                     found.push(entry);
                 }
-            } else {
-                missing.push(name.clone());
+                SelectResolution::Ambiguous { candidates } => {
+                    ambiguous.push(json!({
+                        "requested": name,
+                        "candidates": candidates,
+                    }));
+                    missing.push(name.clone());
+                }
+                SelectResolution::Missing => {
+                    missing.push(name.clone());
+                }
             }
         }
 
@@ -116,8 +136,10 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
             "status": status,
             "query": query,
             "requested": requested,
+            "resolved": resolved,
             "matches": found,
             "missing": missing,
+            "ambiguous": ambiguous,
             "total_tools": valid_schemas.len()
         });
         let message = select_message(status, &result);
@@ -174,6 +196,53 @@ fn select_payload(query: &str) -> Option<&str> {
         .then(|| &query[SELECT_PREFIX.len()..])
 }
 
+enum SelectResolution<'a> {
+    Found {
+        schema: &'a Value,
+        canonical_name: &'a str,
+        matched_by_prefix: bool,
+    },
+    Ambiguous {
+        candidates: Vec<String>,
+    },
+    Missing,
+}
+
+fn resolve_select_tool<'a>(schemas: &'a [&'a Value], requested: &str) -> SelectResolution<'a> {
+    if let Some(schema) = schemas.iter().copied().find(|schema| {
+        tool_schema_name(schema).is_some_and(|name| name.eq_ignore_ascii_case(requested))
+    }) {
+        return SelectResolution::Found {
+            schema,
+            canonical_name: tool_schema_name(schema).expect("valid schema has name"),
+            matched_by_prefix: false,
+        };
+    }
+
+    let requested_lower = requested.to_ascii_lowercase();
+    let mut prefix_matches: Vec<(&'a Value, &'a str)> = schemas
+        .iter()
+        .copied()
+        .filter_map(|schema| tool_schema_name(schema).map(|name| (schema, name)))
+        .filter(|(_, name)| name.to_ascii_lowercase().starts_with(&requested_lower))
+        .collect();
+    prefix_matches.sort_by_key(|(_, name)| *name);
+    match prefix_matches.as_slice() {
+        [(schema, name)] => SelectResolution::Found {
+            schema,
+            canonical_name: name,
+            matched_by_prefix: true,
+        },
+        [] => SelectResolution::Missing,
+        matches => SelectResolution::Ambiguous {
+            candidates: matches
+                .iter()
+                .map(|(_, name)| (*name).to_string())
+                .collect(),
+        },
+    }
+}
+
 fn select_status(total_tools: usize, found: usize, missing: usize) -> &'static str {
     if total_tools == 0 {
         "empty_surface"
@@ -210,10 +279,34 @@ fn add_tool_search_guidance(result: &mut Value, status: &str, message: Option<St
 
 fn select_message(status: &str, result: &Value) -> Option<String> {
     let missing = string_array_field(result, "missing");
+    let ambiguous = result
+        .get("ambiguous")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let requested = entry.get("requested")?.as_str()?;
+                    let candidates = entry
+                        .get("candidates")?
+                        .as_array()?
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>();
+                    (!candidates.is_empty())
+                        .then(|| format!("{requested} could mean {}", candidates.join(", ")))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     match status {
         "empty_surface" => Some(format!(
             "No tools are searchable in this turn. Requested tools are not available: {}.",
             missing.join(", ")
+        )),
+        "not_found" if !ambiguous.is_empty() => Some(format!(
+            "Requested tool name is ambiguous: {}. Retry select: with an exact tool name.",
+            ambiguous.join("; ")
         )),
         "not_found" => Some(format!(
             "Requested tools are not available in this turn: {}.",
@@ -382,6 +475,7 @@ mod tests {
         assert_eq!(parsed["mode"].as_str(), Some("select"));
         assert_eq!(parsed["query"].as_str(), Some("select:bash"));
         assert_eq!(field_strings(&parsed, "requested"), strings(&["bash"]));
+        assert_eq!(field_strings(&parsed, "resolved"), strings(&["bash"]));
         assert!(field_strings(&parsed, "missing").is_empty());
         assert_eq!(match_names(&parsed), strings(&["bash"]));
         assert_eq!(parsed["total_tools"].as_u64(), Some(schemas.len() as u64));
@@ -455,6 +549,69 @@ mod tests {
     }
 
     #[test]
+    fn select_mode_unique_prefix_resolves_canonical_tool_name() {
+        let schemas = sample_schemas();
+        let result = tool_search(&schemas, &json!({"query": "select:github_list"}));
+        let parsed = parse_result(&result);
+
+        assert_eq!(parsed["status"].as_str(), Some("ok"));
+        assert_eq!(
+            field_strings(&parsed, "requested"),
+            strings(&["github_list"])
+        );
+        assert_eq!(
+            field_strings(&parsed, "resolved"),
+            strings(&["github_list_prs"])
+        );
+        assert_eq!(match_names(&parsed), strings(&["github_list_prs"]));
+        assert_eq!(
+            parsed["matches"][0]["matched_by"].as_str(),
+            Some("unique_prefix")
+        );
+        assert_eq!(
+            parsed["matches"][0]["requested"].as_str(),
+            Some("github_list")
+        );
+        assert!(field_strings(&parsed, "missing").is_empty());
+    }
+
+    #[test]
+    fn select_mode_ambiguous_prefix_does_not_guess() {
+        let schemas = vec![
+            json!({
+                "type": "function",
+                "function": {"name": "read_file", "description": "Read file"}
+            }),
+            json!({
+                "type": "function",
+                "function": {"name": "read_metadata", "description": "Read metadata"}
+            }),
+        ];
+        let result = tool_search(&schemas, &json!({"query": "select:"}));
+        assert_eq!(result, "Error: 'select:' requires at least one tool name");
+
+        let result = tool_search(&schemas, &json!({"query": "select:read"}));
+        let parsed = parse_result(&result);
+
+        assert_eq!(parsed["status"].as_str(), Some("not_found"));
+        assert_eq!(match_names(&parsed), Vec::<String>::new());
+        assert_eq!(field_strings(&parsed, "missing"), strings(&["read"]));
+        let candidates = parsed["ambiguous"][0]["candidates"]
+            .as_array()
+            .expect("ambiguous candidates must be present")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(candidates, vec!["read_file", "read_metadata"]);
+        assert!(
+            parsed["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Retry select: with an exact tool name")),
+            "{parsed}"
+        );
+    }
+
+    #[test]
     fn invalid_named_schemas_are_not_searchable_or_counted() {
         let schemas = vec![
             json!({
@@ -462,7 +619,7 @@ mod tests {
                 "function": {"name": "read_file", "description": "Read file"}
             }),
             json!({"type": "custom", "function": {"name": "custom_shape", "description": "bad"}}),
-            json!({"function": {"name": "missing_type", "description": "bad"}}),
+            json!({"function": {"name": "missing_type", "description": "provider shorthand"}}),
             json!({"type": "function", "function": {"name": "", "description": "bad"}}),
         ];
 
@@ -470,16 +627,19 @@ mod tests {
             &schemas,
             &json!({"query": "select:custom_shape,missing_type,read_file"}),
         ));
-        assert_eq!(match_names(&selected), strings(&["read_file"]));
+        assert_eq!(
+            match_names(&selected),
+            strings(&["missing_type", "read_file"])
+        );
         assert_eq!(
             field_strings(&selected, "missing"),
-            strings(&["custom_shape", "missing_type"])
+            strings(&["custom_shape"])
         );
-        assert_eq!(selected["total_tools"].as_u64(), Some(1));
+        assert_eq!(selected["total_tools"].as_u64(), Some(2));
 
         let keyword = parse_result(&tool_search(&schemas, &json!({"query": "bad read"})));
         assert_eq!(match_names(&keyword), strings(&["read_file"]));
-        assert_eq!(keyword["total_tools"].as_u64(), Some(1));
+        assert_eq!(keyword["total_tools"].as_u64(), Some(2));
     }
 
     #[test]

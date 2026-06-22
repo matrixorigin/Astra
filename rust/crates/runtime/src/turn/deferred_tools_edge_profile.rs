@@ -223,11 +223,7 @@ fn filter_block_to_names(block: &str, names: &HashSet<String>) -> Option<String>
     }
     rendered.push_str(rest);
 
-    if kept == 0 {
-        None
-    } else {
-        Some(rendered)
-    }
+    if kept == 0 { None } else { Some(rendered) }
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 
 use astra_text_utils::text_tokenize::tokenize;
 use astra_turn_core::routing_metrics::{ConfidenceCalibrator, DisambiguationAction};
-use astra_turn_core::tool_registry_meta::{IntentType, Scope, ToolMeta, TOOL_CATALOG};
+use astra_turn_core::tool_registry_meta::{IntentType, Scope, TOOL_CATALOG, ToolMeta};
 use astra_turn_core::tool_registry_report::ToolQualityTracker;
 use astra_turn_core::tool_registry_state::ConversationState;
 
@@ -221,11 +221,7 @@ fn file_context_tool_boost(tool_name: &str, file_context: &[String]) -> f64 {
         "docker" => matches!(tool_name, "bash" | "read_file" | "write_file"),
         _ => false,
     });
-    if boost {
-        0.05
-    } else {
-        0.0
-    }
+    if boost { 0.05 } else { 0.0 }
 }
 
 fn explicit_lsp_signal(query_lower: &str) -> bool {

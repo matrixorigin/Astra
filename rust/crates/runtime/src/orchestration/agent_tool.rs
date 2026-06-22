@@ -987,6 +987,7 @@ async fn render_agent_fanout_results(
         "group_id": group_id,
         "title": updated.title,
         "target_count": updated.target_count,
+        "delivery_contract": "Results are in results[].result. When this output is persisted, read the persisted JSON without line ranges or parse it structurally, then present the substantive findings instead of only reporting the artifact path.",
         "results": results,
     });
     let obj = response.as_object_mut().unwrap();
@@ -1032,7 +1033,7 @@ async fn render_agent_fanout_results(
         ),
         );
     }
-    response.to_string()
+    serde_json::to_string_pretty(&response).unwrap_or_else(|_| response.to_string())
 }
 
 async fn handle_agent_fanout_stop_slot_action(
@@ -2494,7 +2495,8 @@ mod tests {
             Some(&ctx),
         )
         .await;
-        assert!(start.contains("\"status\":\"completed\""), "{start}");
+        let start_value: Value = serde_json::from_str(&start).unwrap();
+        assert_eq!(start_value["status"], "completed");
 
         let result = handle_agent_fanout_tool(
             &json!({
@@ -2511,6 +2513,16 @@ mod tests {
         assert_eq!(value["results"].as_array().unwrap().len(), 1);
         assert_eq!(value["results"][0]["result"]["status"], "completed");
         assert_eq!(value["completed"], 1);
+        assert!(
+            value["delivery_contract"]
+                .as_str()
+                .is_some_and(|text| text.contains("results[].result")),
+            "{result}"
+        );
+        assert!(
+            result.contains('\n'),
+            "fanout aggregate results must be readable when persisted: {result}"
+        );
     }
 
     #[tokio::test]
@@ -2706,7 +2718,8 @@ mod tests {
             Some(&ctx),
         )
         .await;
-        assert!(start.contains("\"status\":\"completed\""), "{start}");
+        let start_value: Value = serde_json::from_str(&start).unwrap();
+        assert_eq!(start_value["status"], "completed");
 
         let result = handle_agent_fanout_tool(
             &json!({

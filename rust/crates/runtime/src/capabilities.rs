@@ -558,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_surface_rejects_named_non_function_schemas() {
+    fn tool_surface_rejects_custom_type_but_accepts_missing_type_function_shorthand() {
         let resolved =
             resolve_tool_schemas(ToolCatalogRequest::new(CapabilitySurface::Web).with_source(
                 ToolCapabilitySource::ServerBuiltin,
@@ -571,8 +571,8 @@ mod tests {
 
         assert_eq!(
             names(resolved),
-            vec!["server".to_string()],
-            "surface resolution must admit only valid OpenAI function tool schemas"
+            vec!["server".to_string(), "missing_type".to_string()],
+            "surface resolution must reject explicit non-function schemas while accepting function shorthand without a redundant top-level type"
         );
     }
 

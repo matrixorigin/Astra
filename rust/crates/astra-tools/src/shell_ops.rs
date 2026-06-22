@@ -22,6 +22,7 @@ use crate::exit_semantics::{ExitSemantics, classify_command_result, classify_exi
 use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
 const GREP_TIMEOUT: Duration = Duration::from_secs(20);
+const GREP_MAX_RENDERED_LINE_CHARS: usize = 1_200;
 
 pub use crate::detach::render_bash_detached_marker;
 
@@ -1338,7 +1339,7 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
 
     let mut lines: Vec<String> = filtered
         .lines()
-        .map(|line| normalize_grep_output_line(line, output_mode))
+        .map(|line| compact_grep_output_line(&normalize_grep_output_line(line, output_mode)))
         .collect();
     let mut grep_paths = lines
         .iter()
@@ -2128,6 +2129,16 @@ fn normalize_grep_output_line(line: &str, output_mode: SearchOutputMode) -> Stri
             line.strip_prefix("./").unwrap_or(line).to_string()
         }
     }
+}
+
+pub fn compact_grep_output_line(line: &str) -> String {
+    if line.chars().count() <= GREP_MAX_RENDERED_LINE_CHARS {
+        return line.to_string();
+    }
+    let prefix: String = line.chars().take(GREP_MAX_RENDERED_LINE_CHARS).collect();
+    format!(
+        "{prefix}\n[grep line truncated at {GREP_MAX_RENDERED_LINE_CHARS} chars — use read_file with a targeted range or parse structured JSON instead of returning the whole matching line]"
+    )
 }
 
 fn load_search_ignore_rules(workspace_root: &Path) -> Result<Vec<SearchIgnoreRule>, String> {
@@ -3744,6 +3755,23 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&script, permissions).unwrap();
         script
+    }
+
+    #[test]
+    fn grep_compacts_single_line_json_matches_before_output_limit() {
+        let long_json_line = format!("artifact.json:1:{}", "{\"key\":\"value\"}".repeat(200));
+
+        let compacted = compact_grep_output_line(&long_json_line);
+
+        assert!(compacted.starts_with("artifact.json:1:"), "{compacted}");
+        assert!(
+            compacted.contains("grep line truncated"),
+            "long single-line matches must not be returned in full: {compacted}"
+        );
+        assert!(
+            compacted.len() < long_json_line.len(),
+            "compaction must reduce token pressure"
+        );
     }
 
     #[tokio::test]

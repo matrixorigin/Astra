@@ -3543,7 +3543,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_prompt_renders_only_valid_function_schemas_from_realistic_surface() {
+    fn deferred_prompt_renders_valid_function_schemas_including_missing_type_shorthand() {
         let schemas = vec![
             realistic_function_schema(
                 "valid_deferred_tool".to_string(),
@@ -3552,7 +3552,7 @@ mod tests {
             serde_json::json!({
                 "function": {
                     "name": "legacy_missing_type",
-                    "description": "Old test-only shape must not leak into the prompt",
+                    "description": "Provider shorthand without redundant top-level type",
                     "parameters": {"type": "object"}
                 }
             }),
@@ -3584,7 +3584,13 @@ mod tests {
         let block = build_deferred_tools_prompt_block_with_budget(&surface, Some(16_000))
             .expect("valid function schema should produce a deferred prompt block");
 
-        assert_eq!(block.names, vec!["valid_deferred_tool".to_string()]);
+        assert_eq!(
+            block.names,
+            vec![
+                "legacy_missing_type".to_string(),
+                "valid_deferred_tool".to_string()
+            ]
+        );
         assert!(
             block
                 .section
@@ -3592,7 +3598,13 @@ mod tests {
                 .contains("<name>valid_deferred_tool</name>")
         );
         assert!(block.section.text.contains("Visible description"));
-        assert!(!block.section.text.contains("legacy_missing_type"));
+        assert!(block.section.text.contains("legacy_missing_type"));
+        assert!(
+            block
+                .section
+                .text
+                .contains("Provider shorthand without redundant top-level type")
+        );
         assert!(!block.section.text.contains("custom_not_openai_function"));
         assert!(!block.section.text.contains("Blank names"));
     }
@@ -3600,7 +3612,6 @@ mod tests {
     #[test]
     fn deferred_prompt_is_absent_when_only_named_invalid_schemas_exist() {
         let schemas = vec![
-            serde_json::json!({"function": {"name": "legacy_missing_type"}}),
             serde_json::json!({"type": "custom", "function": {"name": "custom_not_function"}}),
             serde_json::json!({"type": "function", "function": {"name": ""}}),
         ];

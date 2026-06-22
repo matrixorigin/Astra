@@ -179,13 +179,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read file contents. Use exact fields only: path, start_line, end_line, outline. Do not use limit/offset/length. For the first N lines, use start_line=1 and end_line=N. For a range, start_line/end_line are inclusive line numbers and start_line must be <= end_line. Set outline=true for function/class signatures only.",
+                "description": "Read file contents. Use exact fields only: path, start_line, end_line, outline. Do not use limit/offset/length. For the first N lines, use start_line=1 and end_line=N. For a range, start_line/end_line are inclusive line numbers; prefer start_line <= end_line. If a read-only reversed range is sent, the tool normalizes it and explains the resolved range. Set outline=true for function/class signatures only.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
-                        "start_line": {"type": "integer", "minimum": 1, "description": "First line to read (1-based). Must be <= end_line when end_line is provided."},
+                        "start_line": {"type": "integer", "minimum": 1, "description": "First line to read (1-based). Prefer <= end_line when end_line is provided."},
                         "end_line": {"type": "integer", "minimum": 1, "description": "Last line to read (inclusive). Use this instead of limit/count."},
                         "outline": {"type": "boolean", "description": "Return only function/class/struct signatures with line numbers"}
                     },

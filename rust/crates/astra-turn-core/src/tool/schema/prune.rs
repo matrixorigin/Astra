@@ -326,8 +326,9 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_restrictions_rejects_non_function_schemas() {
-        // Fail-closed: malformed schemas must not leak into the restricted set.
+    fn plan_mode_restrictions_rejects_non_function_schemas_but_accepts_function_shorthand() {
+        // Fail-closed for explicit non-function and malformed names; accept the
+        // provider shorthand `{function:{name}}` as a real function tool.
         let schemas = vec![
             json!({"type": "custom", "function": {"name": "custom_shape"}}),
             json!({"function": {"name": "missing_type"}}),
@@ -338,13 +339,13 @@ mod tests {
         ];
         let restricted = plan_mode_restrictions(&schemas, |_| false);
         assert!(
-            restricted.is_empty(),
-            "malformed schemas must not leak through plan mode restrictions"
+            restricted.contains("missing_type") && restricted.len() == 1,
+            "only valid function shorthand should enter plan-mode restrictions: {restricted:?}"
         );
     }
 
     #[test]
-    fn filter_excluded_names_drops_malformed_schemas() {
+    fn filter_excluded_names_drops_malformed_schemas_and_keeps_function_shorthand() {
         // Fail-closed: malformed schemas are dropped even when not in excluded.
         let tools = vec![
             json!({"type": "custom", "function": {"name": "custom_shape"}}),
@@ -358,8 +359,12 @@ mod tests {
         let mut ex = HashSet::new();
         ex.insert("nonexistent".to_string());
         let out = filter_tool_schemas_by_excluded_names(tools, &ex);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0]["function"]["name"], "keep");
+        assert_eq!(
+            out.iter()
+                .filter_map(crate::tool::schema::tool_schema_name)
+                .collect::<Vec<_>>(),
+            vec!["missing_type", "keep"]
+        );
     }
 
     fn make_tool_schema(name: &str, desc: &str, optional_param: bool) -> Value {

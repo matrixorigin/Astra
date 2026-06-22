@@ -347,7 +347,7 @@ fn deferred_manifest_names_follow_rendered_budget_subset() {
 }
 
 #[test]
-fn invalid_named_schemas_do_not_enter_pinned_or_deferred_surface() {
+fn custom_type_is_rejected_while_missing_type_function_shorthand_can_be_pinned() {
     let cfg = ToolSurfaceConfig {
         pinned_tools: vec!["missing_type".to_string(), "custom_shape".to_string()],
     };
@@ -361,7 +361,7 @@ fn invalid_named_schemas_do_not_enter_pinned_or_deferred_surface() {
         &[],
     );
 
-    assert!(!names(&surface.pinned_schemas()).contains(&"missing_type".to_string()));
+    assert!(names(&surface.pinned_schemas()).contains(&"missing_type".to_string()));
     assert!(!names(&surface.pinned_schemas()).contains(&"custom_shape".to_string()));
     assert_eq!(
         surface

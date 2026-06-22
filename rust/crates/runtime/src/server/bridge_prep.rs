@@ -138,10 +138,10 @@ impl ChatTurnRequestBody {
 /// Extract tool name from an OpenAI-format tool definition.
 ///
 /// Delegates to the single-source admission contract
-/// (`astra_turn_core::tool::schema::tool_schema_name`) so that only
-/// `type: "function"` schemas with a non-empty name are admitted. Non-function
-/// tool types (custom MCP shapes, future reserved types) and malformed entries
-/// fail closed and return `None`.
+/// (`astra_turn_core::tool::schema::tool_schema_name`) so explicit
+/// non-function tool types (custom MCP shapes, future reserved types) and
+/// malformed entries fail closed, while provider shorthand
+/// `{function:{name:...}}` schemas are still admitted.
 fn extract_tool_name(tool: &serde_json::Value) -> Option<&str> {
     astra_turn_core::tool::schema::tool_schema_name(tool)
 }
@@ -1428,12 +1428,12 @@ mod tests {
     /// even when `function.name` is present and valid. This is the core
     /// guarantee of the single-source admission contract (`tool_schema_name`).
     #[test]
-    fn extract_tool_name_rejects_non_function_type_with_valid_name() {
+    fn extract_tool_name_rejects_custom_type_and_accepts_missing_type_function_shorthand() {
         let custom_with_name = json!({"type": "custom", "function": {"name": "leaked"}});
         assert_eq!(extract_tool_name(&custom_with_name), None);
 
         let missing_type_with_name = json!({"function": {"name": "leaked"}});
-        assert_eq!(extract_tool_name(&missing_type_with_name), None);
+        assert_eq!(extract_tool_name(&missing_type_with_name), Some("leaked"));
     }
 
     // ── sync_opt_field_with_cache ───────────────────────────────────

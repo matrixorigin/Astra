@@ -10,10 +10,11 @@
 //! - capability resolution
 //! - tool-search result admission
 //!
-//! The rule is fail-closed: anything that is not an unambiguously named
-//! `type: "function"` schema is rejected. This prevents non-function tool
-//! types (custom MCP shapes, future reserved types) and malformed/empty names
-//! from leaking into the runtime tool surface.
+//! The rule is fail-closed for explicit non-function tool types while accepting
+//! the common shorthand shape `{ "function": { "name": ... } }` when `type` is
+//! omitted. This prevents custom/future tool types from leaking into the
+//! runtime tool surface without silently dropping otherwise valid function
+//! schemas from provider or edge surfaces that omit the redundant type field.
 
 use std::collections::HashSet;
 
@@ -22,12 +23,14 @@ use serde_json::Value;
 /// Extract a valid function-tool name from an OpenAI-style tool schema.
 ///
 /// Returns `None` (fail-closed) when:
-/// - `type` is missing or not exactly `"function"`
+/// - `type` is present and not exactly `"function"`
 /// - `function.name` is missing or not a string
 /// - the name is empty or whitespace-only
 #[must_use]
 pub fn tool_schema_name(schema: &Value) -> Option<&str> {
-    if schema.get("type").and_then(Value::as_str) != Some("function") {
+    if let Some(schema_type) = schema.get("type").and_then(Value::as_str)
+        && schema_type != "function"
+    {
         return None;
     }
     schema
@@ -74,7 +77,11 @@ mod tests {
 
         assert_eq!(
             names,
-            HashSet::from(["bash".to_string(), "read_file".to_string()])
+            HashSet::from([
+                "bash".to_string(),
+                "read_file".to_string(),
+                "missing_type".to_string()
+            ])
         );
     }
 
@@ -85,9 +92,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_type() {
-        let no_type = json!({"function": {"name": "leaked"}});
-        assert!(tool_schema_name(&no_type).is_none());
+    fn accepts_missing_type_function_schema() {
+        let no_type = json!({"function": {"name": "read_file"}});
+        assert_eq!(tool_schema_name(&no_type), Some("read_file"));
     }
 
     #[test]
@@ -139,7 +146,11 @@ mod tests {
                 .iter()
                 .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
                 .collect::<Vec<_>>(),
-            vec!["bash".to_string(), "web_fetch".to_string()]
+            vec![
+                "bash".to_string(),
+                "web_fetch".to_string(),
+                "missing_type".to_string()
+            ]
         );
     }
 

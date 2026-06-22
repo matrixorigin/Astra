@@ -2,11 +2,11 @@ use serde_json::Value;
 
 use astra_config::ToolSurfaceConfig;
 
-use super::scoring::{pre_filter_dynamic, FilterOptions, DEFAULT_TOOL_BUDGET_TOKENS};
+use super::scoring::{DEFAULT_TOOL_BUDGET_TOKENS, FilterOptions, pre_filter_dynamic};
 use crate::pipeline::routing::{RoutingDecision, ToolFilter};
 use astra_turn_core::routing_metrics::ConfidenceCalibrator;
 use astra_turn_core::tool::schema::tool_schema_name;
-use astra_turn_core::tool_registry_meta::{ToolMeta, TOOL_CATALOG};
+use astra_turn_core::tool_registry_meta::{TOOL_CATALOG, ToolMeta};
 use astra_turn_core::tool_registry_report::{SelectionReport, ToolQualityTracker};
 use astra_turn_core::tool_registry_state::ConversationState;
 
@@ -747,39 +747,42 @@ mod tests {
     }
 
     #[test]
-    fn registry_drops_named_non_function_schemas_at_construction() {
+    fn registry_drops_custom_type_but_accepts_function_shorthand_at_construction() {
         let reg = ToolRegistry::new(vec![
             sample_schema("bash"),
             json!({"type": "custom", "function": {"name": "custom_shape"}}),
             json!({"function": {"name": "missing_type"}}),
         ]);
 
-        assert_eq!(reg.total_tool_count(), 1);
-        assert_eq!(reg.all_schema_names(), vec!["bash".to_string()]);
+        assert_eq!(reg.total_tool_count(), 2);
+        assert_eq!(
+            reg.all_schema_names(),
+            vec!["bash".to_string(), "missing_type".to_string()]
+        );
         assert!(reg.schema_by_name("custom_shape").is_none());
-        assert!(reg.schema_by_name("missing_type").is_none());
+        assert!(reg.schema_by_name("missing_type").is_some());
     }
 
     #[test]
-    fn inject_schema_ignores_malformed() {
+    fn inject_schema_ignores_malformed_and_accepts_function_shorthand() {
         let mut reg = ToolRegistry::new(vec![sample_schema("bash")]);
         reg.inject_schema(json!({"broken": true}));
         reg.inject_schema(json!({"type": "custom", "function": {"name": "custom_shape"}}));
         reg.inject_schema(json!({"function": {"name": "missing_type"}}));
-        assert_eq!(reg.total_tool_count(), 1);
+        assert_eq!(reg.total_tool_count(), 2);
         assert!(reg.schema_by_name("custom_shape").is_none());
-        assert!(reg.schema_by_name("missing_type").is_none());
+        assert!(reg.schema_by_name("missing_type").is_some());
     }
 
     #[test]
-    fn upsert_schema_ignores_named_non_function_schema() {
+    fn upsert_schema_ignores_custom_type_and_accepts_function_shorthand() {
         let mut reg = ToolRegistry::new(vec![sample_schema("bash")]);
         reg.upsert_schema(json!({"type": "custom", "function": {"name": "custom_shape"}}));
         reg.upsert_schema(json!({"function": {"name": "missing_type"}}));
 
-        assert_eq!(reg.total_tool_count(), 1);
+        assert_eq!(reg.total_tool_count(), 2);
         assert!(reg.schema_by_name("custom_shape").is_none());
-        assert!(reg.schema_by_name("missing_type").is_none());
+        assert!(reg.schema_by_name("missing_type").is_some());
     }
 
     #[test]
