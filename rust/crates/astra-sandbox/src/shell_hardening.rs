@@ -388,9 +388,30 @@ fn is_secret_like_read_path(path: &str) -> bool {
         || normalized == ".config/gcloud"
         || normalized.starts_with(".config/gcloud/")
         || normalized.contains("/.config/gcloud/")
+        || normalized == ".config/npm"
+        || normalized.starts_with(".config/npm/")
+        || normalized.contains("/.config/npm/")
+        || normalized == ".config/pip"
+        || normalized.starts_with(".config/pip/")
+        || normalized.contains("/.config/pip/")
+        || normalized == ".config/yarn"
+        || normalized.starts_with(".config/yarn/")
+        || normalized.contains("/.config/yarn/")
         || normalized == ".docker"
         || normalized.starts_with(".docker/")
         || normalized.contains("/.docker/")
+        || normalized == ".git-credentials"
+        || normalized.starts_with(".git-credentials/")
+        || normalized.contains("/.git-credentials/")
+        || normalized == ".netrc"
+        || normalized.starts_with(".netrc/")
+        || normalized.contains("/.netrc/")
+        || normalized == ".local/share/keyrings"
+        || normalized.starts_with(".local/share/keyrings/")
+        || normalized.contains("/.local/share/keyrings/")
+        || normalized == ".pki"
+        || normalized.starts_with(".pki/")
+        || normalized.contains("/.pki/")
         || file_name == ".env"
         || file_name.starts_with(".env.")
         || file_name == ".npmrc"
@@ -407,8 +428,20 @@ fn is_secret_like_read_path(path: &str) -> bool {
         || file_name == "id_ecdsa"
         || file_name == "id_ed25519_sk"
         || file_name == "id_dsa"
+        || file_name == ".pgpass"
+        || file_name == ".my.cnf"
+        || file_name == "htpasswd"
+        || file_name == "token.json"
+        || file_name == "access_token"
+        || file_name == ".terraformrc"
+        || file_name == "config.json"
+        || file_name == "auth.json"
+        || file_name == ".docker-config.json"
         || file_name.ends_with(".pem")
         || file_name.ends_with(".key")
+        || file_name.ends_with(".p12")
+        || file_name.ends_with(".pfx")
+        || file_name.ends_with(".jks")
 }
 
 /// Normalize path by resolving `.` and `..` components lexically (no I/O).
