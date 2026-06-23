@@ -823,6 +823,7 @@ fn build_bridge_tool_call_records(
 fn record_full_llm_request_event(
     turn_event_buffer: &mut Option<TurnEventBuffer>,
     full_llm_capture: bool,
+    user_id: &str,
     session_id: &str,
     turn: u32,
     trace: &BridgeTraceCorrelation,
@@ -843,6 +844,7 @@ fn record_full_llm_request_event(
     let round = buf.current_round();
     let prompt_request_plan =
         astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+            user_id,
             session_id,
             turn,
             round,
@@ -2658,6 +2660,7 @@ impl InProcessChatTurnBridge {
                     record_full_llm_request_event(
                         buf,
                         full_llm_capture,
+                        &user_id,
                         &session_id,
                         trace_turn,
                         &trace_correlation,
@@ -2767,6 +2770,7 @@ impl InProcessChatTurnBridge {
                     capture_request(&mut turn_event_buffer, &llm_messages, attempt_in_round);
                     if let Ok(prompt_request_plan) =
                         astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+                            user_id: &user_id,
                             session_id: &session_id,
                             turn: trace_turn,
                             round: turn_event_buffer
@@ -2852,6 +2856,7 @@ impl InProcessChatTurnBridge {
                     capture_request(&mut turn_event_buffer, &llm_messages, attempt_in_round);
                     if let Ok(prompt_request_plan) =
                         astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+                            user_id: &user_id,
                             session_id: &session_id,
                             turn: trace_turn,
                             round: turn_event_buffer
@@ -3136,6 +3141,7 @@ impl InProcessChatTurnBridge {
                             record_full_llm_request_event(
                                 &mut turn_event_buffer,
                                 full_llm_capture,
+                                &user_id,
                                 &session_id,
                                 trace_turn,
                                 &trace_correlation,
@@ -3149,6 +3155,7 @@ impl InProcessChatTurnBridge {
                             );
                             if let Ok(prompt_request_plan) =
                                 astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+                                    user_id: &user_id,
                                     session_id: &session_id,
                                     turn: trace_turn,
                                     round: turn_event_buffer
@@ -7733,6 +7740,7 @@ mod tests {
         record_full_llm_request_event(
             &mut turn_event_buffer,
             true,
+            "root",
             &session_id,
             7,
             &trace,

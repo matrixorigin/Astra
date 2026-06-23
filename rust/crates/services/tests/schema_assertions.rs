@@ -352,6 +352,46 @@ async fn phase1_run_durability_schema_contract() {
         retry_scope_column.is_some(),
         "agent_runs must declare a retry_scope column for the application-level validator to bind to"
     );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "prompt_request_records",
+            "uq_prompt_request_owner_attempt"
+        )
+        .await,
+        [
+            "user_id",
+            "session_id",
+            "turn",
+            "round",
+            "source",
+            "attempt"
+        ],
+        "prompt request idempotency must be owner-bound, not session-global"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "agent_runs",
+            "idx_agent_runs_user_session_status_updated"
+        )
+        .await,
+        ["user_id", "session_id", "status", "updated_at"],
+        "active-run lookup must use owner/session/status ordering"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "agent_run_events",
+            "idx_agent_run_events_owner_session_run_idx"
+        )
+        .await,
+        ["user_id", "session_id", "run_id", "event_idx"],
+        "reasoning event replay must use owner/session/run/event ordering"
+    );
 
     let batch_columns = column_names(&pool, &schema, "session_tool_output_batches").await;
     for expected in [
@@ -417,6 +457,42 @@ async fn phase2_web_hydration_schema_contract() {
         transcript_pk,
         ["session_id", "item_seq"],
         "session_transcript_items must page by stable (session_id,item_seq) primary key"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "prompt_request_records",
+            "idx_prompt_requests_owner_session_created"
+        )
+        .await,
+        [
+            "user_id",
+            "session_id",
+            "created_at",
+            "turn",
+            "round",
+            "attempt"
+        ],
+        "session prompt observability must use owner/session recency index"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "prompt_request_records",
+            "idx_prompt_requests_owner_run_created"
+        )
+        .await,
+        [
+            "user_id",
+            "run_id",
+            "created_at",
+            "turn",
+            "round",
+            "attempt"
+        ],
+        "run prompt observability must use owner/run recency index"
     );
 
     let revision_columns = column_names(&pool, &schema, "session_state_revisions").await;
@@ -495,6 +571,34 @@ async fn phase3_context_manifest_schema_contract() {
             "context_manifests missing {expected}"
         );
     }
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "context_manifests",
+            "idx_ctx_manifest_owner_session_created"
+        )
+        .await,
+        ["user_id", "session_id", "created_at", "manifest_id"],
+        "latest context manifest lookup must use owner/session recency index"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "context_manifests",
+            "idx_ctx_manifest_owner_session_run_created"
+        )
+        .await,
+        [
+            "user_id",
+            "session_id",
+            "run_id",
+            "created_at",
+            "manifest_id"
+        ],
+        "run-specific context manifest lookup must use owner/session/run recency index"
+    );
 
     let items = column_names(&pool, &schema, "context_manifest_items").await;
     for expected in ["render_mode", "included", "raw_ref", "budget_tokens"] {
@@ -567,6 +671,17 @@ async fn phase4_state_projection_schema_contract() {
         unique_key_columns(&pool, &schema, "session_state_items", "uq_state_current").await,
         ["session_id", "scope", "category", "item_key"],
         "state current projection must upsert by semantic key"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "session_state_items",
+            "idx_state_owner_session_status_category"
+        )
+        .await,
+        ["user_id", "session_id", "status", "category"],
+        "state summary lookup must use owner/session/status/category index"
     );
     assert_eq!(
         index_columns(

@@ -890,6 +890,10 @@ pub async fn ensure_core_schema(
             "idx_agent_runs_model_gateway",
             "ALTER TABLE agent_runs ADD INDEX idx_agent_runs_model_gateway (selected_model_gateway, created_at)",
         ),
+        (
+            "idx_agent_runs_user_session_status_updated",
+            "ALTER TABLE agent_runs ADD INDEX idx_agent_runs_user_session_status_updated (user_id, session_id, status, updated_at)",
+        ),
     ] {
         add_index_if_missing(&pool, &settings.database, "agent_runs", index, ddl).await?;
     }
@@ -915,11 +919,20 @@ pub async fn ensure_core_schema(
             UNIQUE KEY uq_run_event_idempotency (run_id, idempotency_key),
             INDEX idx_agent_run_events_run_created (run_id, created_at),
             INDEX idx_agent_run_events_session_created (session_id, created_at),
+            INDEX idx_agent_run_events_owner_session_run_idx (user_id, session_id, run_id, event_idx),
             INDEX idx_agent_run_events_user_created (user_id, created_at),
             INDEX idx_agent_run_events_event_id (event_id)
         )",
     )
     .execute(&pool)
+    .await?;
+    add_index_if_missing(
+        &pool,
+        &settings.database,
+        "agent_run_events",
+        "idx_agent_run_events_owner_session_run_idx",
+        "ALTER TABLE agent_run_events ADD INDEX idx_agent_run_events_owner_session_run_idx (user_id, session_id, run_id, event_idx)",
+    )
     .await?;
 
     query(
@@ -1148,13 +1161,45 @@ pub async fn ensure_core_schema(
             request_hash VARCHAR(64) NOT NULL,
             summary_json LONGTEXT NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_prompt_request_attempt (session_id, turn, round, source, attempt),
+            UNIQUE KEY uq_prompt_request_owner_attempt (user_id, session_id, turn, round, source, attempt),
+            INDEX idx_prompt_requests_owner_session_created (user_id, session_id, created_at, turn, round, attempt),
+            INDEX idx_prompt_requests_owner_run_created (user_id, run_id, created_at, turn, round, attempt),
             INDEX idx_prompt_requests_session_created (session_id, created_at),
             INDEX idx_prompt_requests_run_created (run_id, created_at)
         )",
     )
     .execute(&pool)
     .await?;
+    drop_index_if_exists(
+        &pool,
+        &settings.database,
+        "prompt_request_records",
+        "uq_prompt_request_attempt",
+    )
+    .await?;
+    for (index, ddl) in [
+        (
+            "uq_prompt_request_owner_attempt",
+            "ALTER TABLE prompt_request_records ADD UNIQUE KEY uq_prompt_request_owner_attempt (user_id, session_id, turn, round, source, attempt)",
+        ),
+        (
+            "idx_prompt_requests_owner_session_created",
+            "ALTER TABLE prompt_request_records ADD INDEX idx_prompt_requests_owner_session_created (user_id, session_id, created_at, turn, round, attempt)",
+        ),
+        (
+            "idx_prompt_requests_owner_run_created",
+            "ALTER TABLE prompt_request_records ADD INDEX idx_prompt_requests_owner_run_created (user_id, run_id, created_at, turn, round, attempt)",
+        ),
+    ] {
+        add_index_if_missing(
+            &pool,
+            &settings.database,
+            "prompt_request_records",
+            index,
+            ddl,
+        )
+        .await?;
+    }
 
     query(
         "CREATE TABLE IF NOT EXISTS prompt_deltas (
@@ -1294,6 +1339,8 @@ pub async fn ensure_core_schema(
             request_id VARCHAR(128) NULL,
             trace_id VARCHAR(128) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_ctx_manifest_owner_session_created (user_id, session_id, created_at, manifest_id),
+            INDEX idx_ctx_manifest_owner_session_run_created (user_id, session_id, run_id, created_at, manifest_id),
             INDEX idx_ctx_manifest_session_turn (session_id, turn_id),
             INDEX idx_ctx_manifest_run (run_id),
             INDEX idx_ctx_manifest_user_created (user_id, created_at)
@@ -1301,6 +1348,18 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
+    for (index, ddl) in [
+        (
+            "idx_ctx_manifest_owner_session_created",
+            "ALTER TABLE context_manifests ADD INDEX idx_ctx_manifest_owner_session_created (user_id, session_id, created_at, manifest_id)",
+        ),
+        (
+            "idx_ctx_manifest_owner_session_run_created",
+            "ALTER TABLE context_manifests ADD INDEX idx_ctx_manifest_owner_session_run_created (user_id, session_id, run_id, created_at, manifest_id)",
+        ),
+    ] {
+        add_index_if_missing(&pool, &settings.database, "context_manifests", index, ddl).await?;
+    }
 
     query(
         "CREATE TABLE IF NOT EXISTS context_manifest_items (
@@ -1501,6 +1560,7 @@ pub async fn ensure_core_schema(
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             CONSTRAINT chk_session_state_items_scope CHECK (scope IN ('session', 'user', 'project', 'workspace')),
             UNIQUE KEY uq_state_current (session_id, scope, category, item_key),
+            INDEX idx_state_owner_session_status_category (user_id, session_id, status, category),
             INDEX idx_state_session_category (session_id, category, status, priority),
             INDEX idx_state_user_category (user_id, category, status, updated_at),
             INDEX idx_state_user_scope_category (user_id, scope, category, status, priority),
@@ -1510,6 +1570,14 @@ pub async fn ensure_core_schema(
         )",
     )
     .execute(&pool)
+    .await?;
+    add_index_if_missing(
+        &pool,
+        &settings.database,
+        "session_state_items",
+        "idx_state_owner_session_status_category",
+        "ALTER TABLE session_state_items ADD INDEX idx_state_owner_session_status_category (user_id, session_id, status, category)",
+    )
     .await?;
 
     query(

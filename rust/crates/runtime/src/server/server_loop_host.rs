@@ -183,6 +183,7 @@ fn estimate_tool_schema_tokens(tools: &[Value]) -> u64 {
 fn record_full_llm_request_event(
     state: &mut AgenticLoopState,
     full_llm_capture: bool,
+    user_id: &str,
     session_id: &str,
     source: &str,
     model: &str,
@@ -201,6 +202,7 @@ fn record_full_llm_request_event(
     let round = buf.current_round();
     let prompt_request_plan =
         astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+            user_id,
             session_id,
             turn: state.session_turn,
             round,
@@ -3538,6 +3540,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             let prompt_request_plan =
                 astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
                     session_id: &self.session_id,
+                    user_id: &self.user_id,
                     turn: state.session_turn,
                     round: prompt_round,
                     attempt: attempt_in_round,
@@ -3550,6 +3553,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             record_full_llm_request_event(
                 state,
                 self.full_llm_capture,
+                &self.user_id,
                 &self.session_id,
                 "server_loop_host",
                 &llm_cfg.model_name,

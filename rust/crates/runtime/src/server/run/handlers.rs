@@ -280,17 +280,18 @@ pub(crate) async fn get_run_projection_handler(
     Query(query): Query<RunProjectionQuery>,
 ) -> Result<Json<RunProjectionResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id.clone();
     let mut projection = state
         .execution
         .run_lifecycle_service
-        .get_run_projection(run_id.clone(), user.user_id, query.recent_limit)
+        .get_run_projection(run_id.clone(), user_id.clone(), query.recent_limit)
         .await?;
     projection.recent_events =
         transform_stream_run_events_for_client(&run_id, projection.recent_events);
     let projection_lag_events =
         (projection.run_event_high_watermark - projection.projection_event_idx).max(0);
     let (observability_available, prompt_request_count, latest_prompt_request) =
-        load_run_prompt_observability(&state, &run_id).await?;
+        load_run_prompt_observability(&state, &user_id, &run_id).await?;
     let has_durable_projection = projection.run_event_high_watermark
         == projection.projection_event_idx
         || projection.projection_event_idx >= 0;
@@ -308,6 +309,7 @@ pub(crate) async fn get_run_projection_handler(
 
 async fn load_run_prompt_observability(
     state: &AppState,
+    user_id: &str,
     run_id: &str,
 ) -> Result<
     (bool, u32, Option<PromptRequestObservabilityResponse>),
@@ -316,18 +318,19 @@ async fn load_run_prompt_observability(
     let Some(shared_pool) = state.shared_pool.as_ref() else {
         return Ok((false, 0, None));
     };
-    let prompt_request_count = astra_services::count_prompt_requests_for_run(shared_pool, run_id)
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse::new(format!(
-                    "Failed to load run prompt request observability: {error}"
-                ))),
-            )
-        })?;
+    let prompt_request_count =
+        astra_services::count_prompt_requests_for_run(shared_pool, user_id, run_id)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse::new(format!(
+                        "Failed to load run prompt request observability: {error}"
+                    ))),
+                )
+            })?;
     let latest_prompt_request =
-        astra_services::load_latest_prompt_observability_for_run(shared_pool, run_id)
+        astra_services::load_latest_prompt_observability_for_run(shared_pool, user_id, run_id)
             .await
             .map_err(|error| {
                 (

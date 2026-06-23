@@ -779,6 +779,109 @@ async fn session_artifact_store_is_owner_bound_on_reads_and_writes() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn prompt_observability_is_owner_bound_for_session_and_run() {
+    let (shared, _settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let owner_user_id = Uuid::new_v4().to_string();
+    let other_user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let run_id = Uuid::new_v4().to_string();
+    cleanup_restore_fixture(&pool, std::slice::from_ref(&session_id)).await;
+    let _ = sqlx::query("DELETE FROM prompt_request_records WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+
+    for (user_id, request_id, created_at, marker) in [
+        (
+            &owner_user_id,
+            Uuid::new_v4().to_string(),
+            "2026-10-02 10:00:00.000000",
+            "owner",
+        ),
+        (
+            &other_user_id,
+            Uuid::new_v4().to_string(),
+            "2026-10-02 11:00:00.000000",
+            "other",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO prompt_request_records \
+             (request_id, session_id, user_id, run_id, turn, round, attempt, source, model, provider, \
+              max_output_tokens, message_count, tool_count, previous_request_id, request_hash, summary_json, created_at) \
+             VALUES (?, ?, ?, ?, ?, 0, 0, 'turn', 'gpt-5.4', 'test', NULL, ?, ?, NULL, ?, ?, ?)",
+        )
+        .bind(request_id)
+        .bind(&session_id)
+        .bind(user_id)
+        .bind(&run_id)
+        .bind(1_i64)
+        .bind(if marker == "owner" { 3_i64 } else { 30_i64 })
+        .bind(if marker == "owner" { 2_i64 } else { 20_i64 })
+        .bind(format!("hash-{marker}"))
+        .bind(
+            serde_json::json!({
+                "marker": marker,
+                "delta_counts": {
+                    "reuse": 1,
+                    "append": if marker == "owner" { 2 } else { 20 },
+                    "replace": 0,
+                    "drop": 0
+                }
+            })
+            .to_string(),
+        )
+        .bind(created_at)
+        .execute(&pool)
+        .await
+        .expect("insert prompt request record");
+    }
+
+    assert_eq!(
+        astra_services::count_prompt_requests_for_session(&shared, &owner_user_id, &session_id)
+            .await
+            .expect("owner session prompt count"),
+        1,
+        "owner session prompt count must not include another user's row"
+    );
+    assert_eq!(
+        astra_services::count_prompt_requests_for_run(&shared, &owner_user_id, &run_id)
+            .await
+            .expect("owner run prompt count"),
+        1,
+        "owner run prompt count must not include another user's row"
+    );
+    let latest_session = astra_services::load_latest_prompt_observability_for_session(
+        &shared,
+        &owner_user_id,
+        &session_id,
+    )
+    .await
+    .expect("owner latest session prompt")
+    .expect("owner latest session prompt exists");
+    assert_eq!(latest_session.request_hash, "hash-owner");
+    assert_eq!(latest_session.message_count, 3);
+    assert_eq!(latest_session.delta_counts.append, 2);
+
+    let latest_run =
+        astra_services::load_latest_prompt_observability_for_run(&shared, &owner_user_id, &run_id)
+            .await
+            .expect("owner latest run prompt")
+            .expect("owner latest run prompt exists");
+    assert_eq!(latest_run.request_hash, "hash-owner");
+    assert_eq!(latest_run.tool_count, 2);
+
+    let _ = sqlx::query("DELETE FROM prompt_request_records WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    cleanup_restore_fixture(&pool, &[session_id]).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
