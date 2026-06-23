@@ -31,13 +31,14 @@ use astra_services::session_workspace::{
 use astra_services::{
     AdminAuditFilter, AdminAuditReader, ContextService, DatabaseAdminAuditReader,
     DatabaseContextService, DatabaseDecisionService, DatabaseEventService,
-    DatabaseMarketplaceStatsService, DatabaseReplayService, DatabaseSessionArtifactStore,
-    DatabaseSessionService, DatabaseSkillService, DecisionCreateRequestData, DecisionListFilter,
-    DecisionService, DurableTaskLifecycle, EventCreateRequestData, EventListFilter, EventService,
-    MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET, MAX_MARKETPLACE_SEARCH_OFFSET,
-    MarketplaceStatsService, MatrixOneDurableTaskLifecycle, MatrixOneSyncService, ReplayService,
-    SessionArtifactJsonStore, SessionArtifactStore, SessionListFilter, SessionService,
-    SkillSearchQuery, SkillService, SnapshotCreateRequestData,
+    DatabaseIntrospectionService, DatabaseMarketplaceStatsService, DatabaseReflectService,
+    DatabaseReplayService, DatabaseSessionArtifactStore, DatabaseSessionService,
+    DatabaseSkillService, DecisionCreateRequestData, DecisionListFilter, DecisionService,
+    DurableTaskLifecycle, EventCreateRequestData, EventListFilter, EventService,
+    IntrospectionService, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET, MAX_MARKETPLACE_SEARCH_OFFSET,
+    MarketplaceStatsService, MatrixOneDurableTaskLifecycle, MatrixOneSyncService, ReflectService,
+    ReplayService, SessionArtifactJsonStore, SessionArtifactStore, SessionListFilter,
+    SessionService, SkillSearchQuery, SkillService, SnapshotCreateRequestData,
 };
 use sqlx::Row;
 use std::collections::HashSet;
@@ -3162,6 +3163,291 @@ async fn session_owned_services_reject_non_owner_side_effects_on_live_matrixone(
     );
 
     cleanup_agent_sessions_and_events(&pool, &[session_id], &[], &[]).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matrixone() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let owner_user_id = Uuid::new_v4().to_string();
+    let other_user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let owner_query_event_id = Uuid::new_v4().to_string();
+    let owner_llm_event_id = Uuid::new_v4().to_string();
+    let other_query_event_id = Uuid::new_v4().to_string();
+    let other_llm_event_id = Uuid::new_v4().to_string();
+    let owner_context_id = Uuid::new_v4().to_string();
+    let other_context_id = Uuid::new_v4().to_string();
+    let owner_decision_id = Uuid::new_v4().to_string();
+    let other_decision_id = Uuid::new_v4().to_string();
+
+    let _ = sqlx::query("DELETE FROM ctx_decision_audits WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM ctx_snapshots WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    cleanup_agent_sessions_and_events(
+        &pool,
+        std::slice::from_ref(&session_id),
+        &[
+            owner_query_event_id.clone(),
+            owner_llm_event_id.clone(),
+            other_query_event_id.clone(),
+            other_llm_event_id.clone(),
+        ],
+        &[owner_decision_id.clone(), other_decision_id.clone()],
+    )
+    .await;
+
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'mixed-owner-derived-it', 'active', 2)",
+    )
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .execute(&pool)
+    .await
+    .expect("insert owner session");
+
+    for (event_id, user_id, event_type, content, skill_name, token_usage, created_at) in [
+        (
+            &owner_query_event_id,
+            &owner_user_id,
+            "user_query",
+            "owner original intent",
+            "owner_skill",
+            None,
+            "2026-06-01 10:00:00.000000",
+        ),
+        (
+            &owner_llm_event_id,
+            &owner_user_id,
+            "llm_response",
+            "owner current focus",
+            "owner_skill",
+            Some(
+                serde_json::json!({"input_tokens": 100, "output_tokens": 10, "total_tokens": 110}),
+            ),
+            "2026-06-01 10:01:00.000000",
+        ),
+        (
+            &other_query_event_id,
+            &other_user_id,
+            "user_query",
+            "other secret intent",
+            "other_skill",
+            None,
+            "2026-06-01 10:02:00.000000",
+        ),
+        (
+            &other_llm_event_id,
+            &other_user_id,
+            "llm_response",
+            "other secret focus",
+            "other_skill",
+            Some(
+                serde_json::json!({"input_tokens": 900, "output_tokens": 90, "total_tokens": 990}),
+            ),
+            "2026-06-01 10:03:00.000000",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO agent_events \
+             (event_id, session_id, user_id, event_type, content, skill_name, token_usage, causal_chain_id, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, CAST(? AS JSON), '', ?)",
+        )
+        .bind(event_id)
+        .bind(&session_id)
+        .bind(user_id)
+        .bind(event_type)
+        .bind(content)
+        .bind(skill_name)
+        .bind(token_usage.map(|value| value.to_string()).unwrap_or_else(|| "{}".into()))
+        .bind(created_at)
+        .execute(&pool)
+        .await
+        .expect("insert mixed owner event");
+    }
+
+    for (
+        context_id,
+        event_id,
+        llm_response_id,
+        token_budget,
+        total_tokens,
+        relevance,
+        created_at,
+    ) in [
+        (
+            &owner_context_id,
+            &owner_query_event_id,
+            &owner_llm_event_id,
+            1000_i32,
+            100_i64,
+            serde_json::json!({"selected_events": [0.95]}),
+            "2026-06-01 10:01:30.000000",
+        ),
+        (
+            &other_context_id,
+            &other_query_event_id,
+            &other_llm_event_id,
+            9000_i32,
+            900_i64,
+            serde_json::json!({"selected_events": [0.05]}),
+            "2026-06-01 10:03:30.000000",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO ctx_snapshots \
+             (context_capture_id, session_id, event_id, llm_response_id, token_budget, total_tokens, relevance_scores, task_type, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, CAST(? AS JSON), 'it', ?)",
+        )
+        .bind(context_id)
+        .bind(&session_id)
+        .bind(event_id)
+        .bind(llm_response_id)
+        .bind(token_budget)
+        .bind(total_tokens)
+        .bind(relevance.to_string())
+        .bind(created_at)
+        .execute(&pool)
+        .await
+        .expect("insert mixed owner snapshot");
+    }
+
+    for (decision_id, event_id, context_id, decision_type, output, model, created_at) in [
+        (
+            &owner_decision_id,
+            &owner_query_event_id,
+            &owner_context_id,
+            "owner_decision",
+            serde_json::json!({"visible": "owner"}),
+            "owner-model",
+            "2026-06-01 10:01:40.000000",
+        ),
+        (
+            &other_decision_id,
+            &other_query_event_id,
+            &other_context_id,
+            "other_decision",
+            serde_json::json!({"secret": "other"}),
+            "other-model",
+            "2026-06-01 10:03:40.000000",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO ctx_decision_audits \
+             (decision_id, session_id, event_id, context_capture_id, decision_type, decision_output, model_params, model_used, created_at) \
+             VALUES (?, ?, ?, ?, ?, CAST(? AS JSON), CAST('{}' AS JSON), ?, ?)",
+        )
+        .bind(decision_id)
+        .bind(&session_id)
+        .bind(event_id)
+        .bind(context_id)
+        .bind(decision_type)
+        .bind(output.to_string())
+        .bind(model)
+        .bind(created_at)
+        .execute(&pool)
+        .await
+        .expect("insert mixed owner decision");
+    }
+
+    let reflect = DatabaseReflectService::new(settings.clone()).with_pool(shared.clone());
+    let report = reflect
+        .build_evidence(&owner_user_id, &session_id, "auto", 10, "what happened?")
+        .await
+        .expect("owner reflect report");
+    assert_eq!(report.overview.total_events, 2);
+    assert_eq!(report.overview.total_decisions, 1);
+    assert!(
+        report
+            .overview
+            .top_skills
+            .iter()
+            .any(|(skill, _)| skill == "owner_skill")
+    );
+    assert!(
+        !report
+            .overview
+            .top_skills
+            .iter()
+            .any(|(skill, _)| skill == "other_skill")
+    );
+    let graph = report
+        .evidence_graph
+        .expect("owner decision should build evidence graph");
+    let graph_json = serde_json::to_string(&graph).expect("serialize graph");
+    assert!(graph_json.contains(&owner_decision_id));
+    assert!(!graph_json.contains(&other_decision_id));
+    assert!(!graph_json.contains("other secret"));
+
+    let introspection =
+        DatabaseIntrospectionService::new(settings.clone()).with_pool(shared.clone());
+    let snapshot = introspection
+        .get_context_snapshot(&owner_user_id, &session_id, None, false, false, 2000)
+        .await
+        .expect("owner context snapshot");
+    assert_eq!(snapshot["snapshot_id"], owner_context_id);
+    assert_eq!(snapshot["total_turns"], 1);
+    assert_eq!(snapshot["context_managed_tokens"], 100);
+    assert_eq!(snapshot["llm_prompt_tokens"], 100);
+    assert_eq!(snapshot["llm_total_tokens"], 110);
+
+    let trend = introspection
+        .get_context_trend(&owner_user_id, &session_id, 10, 128000)
+        .await
+        .expect("owner context trend");
+    assert_eq!(trend["turns_sampled"], 1);
+    assert_eq!(trend["current_tokens"]["input_tokens"], 100);
+
+    let retrieval = introspection
+        .get_retrieval_quality(&owner_user_id, &session_id, 10)
+        .await
+        .expect("owner retrieval quality");
+    assert_eq!(retrieval["turns_sampled"], 1);
+
+    let trace = introspection
+        .get_decision_trace(&owner_user_id, &session_id, 10)
+        .await
+        .expect("owner decision trace");
+    let decisions = trace["decisions"].as_array().expect("decisions array");
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0]["decision_id"], owner_decision_id);
+    assert_ne!(decisions[0]["decision_id"], other_decision_id);
+
+    let drift = introspection
+        .get_drift_check(&owner_user_id, &session_id)
+        .await
+        .expect("owner drift check");
+    assert_eq!(drift["original_intent_preview"], "owner original intent");
+    assert_eq!(drift["current_focus_preview"], "owner current focus");
+
+    let _ = sqlx::query("DELETE FROM ctx_decision_audits WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM ctx_snapshots WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    cleanup_agent_sessions_and_events(
+        &pool,
+        &[session_id],
+        &[
+            owner_query_event_id,
+            owner_llm_event_id,
+            other_query_event_id,
+            other_llm_event_id,
+        ],
+        &[owner_decision_id, other_decision_id],
+    )
+    .await;
 }
 
 #[tokio::test]

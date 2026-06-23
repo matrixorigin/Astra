@@ -792,6 +792,7 @@ impl DatabaseReflectService {
     async fn build_recent_evidence_graph(
         &self,
         pool: &sqlx::Pool<sqlx::MySql>,
+        user_id: &str,
         session_id: &str,
         focus: &str,
         last_n: i32,
@@ -802,13 +803,17 @@ impl DatabaseReflectService {
 
         let decision_limit = i64::from(last_n.clamp(1, 50));
         let decision_rows = query(
-            "SELECT decision_id, event_id, decision_type, \
-               IFNULL(CAST(decision_output AS CHAR), '{}') AS decision_output_json, \
-               DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-             FROM ctx_decision_audits \
-             WHERE session_id = ? \
-             ORDER BY created_at DESC LIMIT ?",
+            "SELECT d.decision_id, d.event_id, d.decision_type, \
+               IFNULL(CAST(d.decision_output AS CHAR), '{}') AS decision_output_json, \
+               DATE_FORMAT(d.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+             FROM ctx_decision_audits d \
+             JOIN agent_sessions s ON s.session_id = d.session_id AND s.user_id = ? \
+             JOIN agent_events e ON e.event_id = d.event_id AND e.session_id = d.session_id AND e.user_id = ? \
+             WHERE d.session_id = ? \
+             ORDER BY d.created_at DESC LIMIT ?",
         )
+        .bind(user_id)
+        .bind(user_id)
         .bind(session_id)
         .bind(decision_limit)
         .fetch_all(pool)
@@ -843,10 +848,11 @@ impl DatabaseReflectService {
                skill_name, parent_event_id, causal_chain_id, \
                DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
              FROM agent_events \
-             WHERE session_id = ? \
+             WHERE session_id = ? AND user_id = ? \
              ORDER BY created_at DESC LIMIT ?",
         )
         .bind(session_id)
+        .bind(user_id)
         .bind(event_limit)
         .fetch_all(pool)
         .await
@@ -959,9 +965,10 @@ impl ReflectService for DatabaseReflectService {
                     OR event_type LIKE '%error%' OR event_type LIKE '%fail%' THEN 1 ELSE 0 END) AS error_count, \
                CAST(MIN(created_at) AS CHAR) AS first_event, \
                CAST(MAX(created_at) AS CHAR) AS last_event \
-             FROM agent_events WHERE session_id = ?",
+             FROM agent_events WHERE session_id = ? AND user_id = ?",
         )
         .bind(session_id)
+        .bind(user_id)
         .fetch_one(&pool)
         .await
         .map_err(|e| internal_error(format!("overview query: {e}")))?;
@@ -985,10 +992,11 @@ impl ReflectService for DatabaseReflectService {
         // Top event types
         let event_type_rows = query(
             "SELECT event_type, COUNT(*) AS cnt \
-             FROM agent_events WHERE session_id = ? \
+             FROM agent_events WHERE session_id = ? AND user_id = ? \
              GROUP BY event_type ORDER BY cnt DESC LIMIT 5",
         )
         .bind(session_id)
+        .bind(user_id)
         .fetch_all(&pool)
         .await
         .map_err(|e| internal_error(format!("event types query: {e}")))?;
@@ -1005,10 +1013,11 @@ impl ReflectService for DatabaseReflectService {
         // Top skills
         let skill_rows = query(
             "SELECT skill_name, COUNT(*) AS cnt \
-             FROM agent_events WHERE session_id = ? AND skill_name IS NOT NULL \
+             FROM agent_events WHERE session_id = ? AND user_id = ? AND skill_name IS NOT NULL \
              GROUP BY skill_name ORDER BY cnt DESC LIMIT 5",
         )
         .bind(session_id)
+        .bind(user_id)
         .fetch_all(&pool)
         .await
         .map_err(|e| internal_error(format!("skills query: {e}")))?;
@@ -1024,11 +1033,16 @@ impl ReflectService for DatabaseReflectService {
 
         // Decision aggregation
         let decision_rows = query(
-            "SELECT decision_type, COUNT(*) AS cnt, \
-               COUNT(DISTINCT model_used) AS models_used \
-             FROM ctx_decision_audits WHERE session_id = ? \
-             GROUP BY decision_type ORDER BY cnt DESC LIMIT 5",
+            "SELECT d.decision_type, COUNT(*) AS cnt, \
+               COUNT(DISTINCT d.model_used) AS models_used \
+             FROM ctx_decision_audits d \
+             JOIN agent_sessions s ON s.session_id = d.session_id AND s.user_id = ? \
+             JOIN agent_events e ON e.event_id = d.event_id AND e.session_id = d.session_id AND e.user_id = ? \
+             WHERE d.session_id = ? \
+             GROUP BY d.decision_type ORDER BY cnt DESC LIMIT 5",
         )
+        .bind(user_id)
+        .bind(user_id)
         .bind(session_id)
         .fetch_all(&pool)
         .await
@@ -1054,12 +1068,13 @@ impl ReflectService for DatabaseReflectService {
                 "SELECT IFNULL(skill_name, 'unknown') AS skill_name, event_type, COUNT(*) AS fail_count, \
                    SUBSTRING(COALESCE(MIN(content), ''), 1, 100) AS sample_error \
                  FROM agent_events \
-                 WHERE session_id = ? AND (event_type IN ('error', 'tool_error', 'stall_detected') \
+                 WHERE session_id = ? AND user_id = ? AND (event_type IN ('error', 'tool_error', 'stall_detected') \
                    OR event_type LIKE '%error%' OR event_type LIKE '%fail%') \
                  GROUP BY skill_name, event_type \
                  ORDER BY fail_count DESC LIMIT 10",
             )
             .bind(session_id)
+            .bind(user_id)
             .fetch_all(&pool)
             .await
             .map_err(|e| internal_error(format!("error patterns query: {e}")))?;
@@ -1084,11 +1099,12 @@ impl ReflectService for DatabaseReflectService {
                 "SELECT IFNULL(skill_name, 'unknown') AS skill_name, event_type, \
                    SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 300) AS content \
                  FROM agent_events \
-                 WHERE session_id = ? AND (event_type IN ('error', 'tool_error', 'stall_detected') \
+                 WHERE session_id = ? AND user_id = ? AND (event_type IN ('error', 'tool_error', 'stall_detected') \
                    OR event_type LIKE '%error%' OR event_type LIKE '%fail%') \
                  ORDER BY created_at DESC LIMIT 30",
             )
             .bind(session_id)
+            .bind(user_id)
             .fetch_all(&pool)
             .await
             .map_err(|e| internal_error(format!("raw errors query: {e}")))?;
@@ -1130,7 +1146,7 @@ impl ReflectService for DatabaseReflectService {
         let prompt_preview =
             render_reflection_prompt_preview(session_id, focus, question, &reflection_context);
         let evidence_graph = self
-            .build_recent_evidence_graph(&pool, session_id, focus, last_n)
+            .build_recent_evidence_graph(&pool, user_id, session_id, focus, last_n)
             .await?;
 
         Ok(ReflectReport {
@@ -1558,22 +1574,25 @@ mod tests {
         let queries = [
             // event types
             "SELECT event_type, COUNT(*) AS cnt \
-             FROM agent_events WHERE session_id = ? \
+             FROM agent_events WHERE session_id = ? AND user_id = ? \
              GROUP BY event_type ORDER BY cnt DESC LIMIT 5",
             // skills
             "SELECT skill_name, COUNT(*) AS cnt \
-             FROM agent_events WHERE session_id = ? AND skill_name IS NOT NULL \
+             FROM agent_events WHERE session_id = ? AND user_id = ? AND skill_name IS NOT NULL \
              GROUP BY skill_name ORDER BY cnt DESC LIMIT 5",
             // decisions
-            "SELECT decision_type, COUNT(*) AS cnt, \
-               COUNT(DISTINCT model_used) AS models_used \
-             FROM ctx_decision_audits WHERE session_id = ? \
-             GROUP BY decision_type ORDER BY cnt DESC LIMIT 5",
+            "SELECT d.decision_type, COUNT(*) AS cnt, \
+               COUNT(DISTINCT d.model_used) AS models_used \
+             FROM ctx_decision_audits d \
+             JOIN agent_sessions s ON s.session_id = d.session_id AND s.user_id = ? \
+             JOIN agent_events e ON e.event_id = d.event_id AND e.session_id = d.session_id AND e.user_id = ? \
+             WHERE d.session_id = ? \
+             GROUP BY d.decision_type ORDER BY cnt DESC LIMIT 5",
             // error patterns
             "SELECT IFNULL(skill_name, 'unknown') AS skill_name, event_type, COUNT(*) AS fail_count, \
                SUBSTRING(COALESCE(MIN(content), ''), 1, 100) AS sample_error \
              FROM agent_events \
-             WHERE session_id = ? AND (event_type IN ('error', 'tool_error', 'stall_detected') \
+             WHERE session_id = ? AND user_id = ? AND (event_type IN ('error', 'tool_error', 'stall_detected') \
                OR event_type LIKE '%error%' OR event_type LIKE '%fail%') \
              GROUP BY skill_name, event_type \
              ORDER BY fail_count DESC LIMIT 10",

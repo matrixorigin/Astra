@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use axum::http::StatusCode;
 use serde_json::Value;
-use sqlx::{Row, query};
+use sqlx::{MySql, QueryBuilder, Row, query};
 
 use astra_core::{MatrixOneSettings, SharedPool, error_response, internal_error};
 
@@ -262,30 +262,75 @@ impl IntrospectionService for DatabaseIntrospectionService {
             .await?;
         let turns = turns.clamp(1, MAX_INTROSPECTION_USAGE_ROWS);
 
-        let rows = query(
-            "SELECT IFNULL(CAST(e.token_usage AS CHAR), '{}') AS token_usage \
-             FROM ctx_snapshots s \
-             JOIN agent_events e ON e.event_id = s.llm_response_id \
-             WHERE s.session_id = ? AND s.llm_response_id IS NOT NULL AND e.token_usage IS NOT NULL \
-             ORDER BY s.created_at DESC, s.context_capture_id DESC LIMIT ?",
+        let response_id_rows = query(
+            "SELECT cs.llm_response_id AS response_event_id \
+             FROM ctx_snapshots cs \
+             JOIN agent_sessions s ON s.session_id = cs.session_id AND s.user_id = ? \
+             JOIN agent_events e \
+               ON e.event_id = cs.event_id \
+              AND e.session_id = cs.session_id \
+              AND e.user_id = ? \
+             WHERE cs.session_id = ? \
+               AND cs.llm_response_id IS NOT NULL \
+             ORDER BY cs.created_at DESC, cs.context_capture_id DESC LIMIT ?",
         )
+        .bind(user_id)
+        .bind(user_id)
         .bind(session_id)
         .bind(turns)
         .fetch_all(&pool)
         .await
         .map_err(internal_error)?;
 
-        if rows.is_empty() {
+        let response_event_ids: Vec<String> = response_id_rows
+            .iter()
+            .filter_map(|row| row.try_get::<Option<String>, _>("response_event_id").ok()?)
+            .collect();
+
+        if response_event_ids.is_empty() {
             return Ok(serde_json::json!({"turns_sampled": 0, "trend": "no_data"}));
         }
 
-        let usages: Vec<Value> = rows
+        let mut usage_query = QueryBuilder::<MySql>::new(
+            "SELECT event_id, IFNULL(CAST(token_usage AS CHAR), '{}') AS token_usage \
+             FROM agent_events WHERE session_id = ",
+        );
+        usage_query.push_bind(session_id);
+        usage_query.push(" AND user_id = ");
+        usage_query.push_bind(user_id);
+        usage_query.push(" AND token_usage IS NOT NULL AND event_id IN (");
+        let mut separated = usage_query.separated(", ");
+        for event_id in &response_event_ids {
+            separated.push_bind(event_id);
+        }
+        separated.push_unseparated(")");
+
+        let usage_rows = usage_query
+            .build()
+            .fetch_all(&pool)
+            .await
+            .map_err(internal_error)?;
+        let usage_by_event_id = usage_rows
             .iter()
-            .filter_map(|r| {
-                let raw: String = r.try_get("token_usage").ok()?;
-                parse_token_usage(&raw)
+            .filter_map(|row| {
+                let event_id: String = row.try_get("event_id").ok()?;
+                let token_usage: String = row.try_get("token_usage").ok()?;
+                Some((event_id, token_usage))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+
+        let usages: Vec<Value> = response_event_ids
+            .iter()
+            .filter_map(|response_event_id| {
+                usage_by_event_id
+                    .get(response_event_id)
+                    .and_then(|raw| parse_token_usage(raw))
             })
             .collect();
+
+        if usages.is_empty() {
+            return Ok(serde_json::json!({"turns_sampled": 0, "trend": "no_data"}));
+        }
 
         let prompt_history: Vec<i64> = usages
             .iter()
@@ -315,7 +360,7 @@ impl IntrospectionService for DatabaseIntrospectionService {
         let current_prompt = billable_input_from_canonical(&current).unwrap_or(0);
 
         Ok(serde_json::json!({
-            "turns_sampled": rows.len(),
+            "turns_sampled": usages.len(),
             "trend": trend,
             "current_tokens": {
                 "input_tokens": current.get("input_tokens"),
@@ -345,14 +390,24 @@ impl IntrospectionService for DatabaseIntrospectionService {
         self.verify_session_owner(&pool, session_id, user_id)
             .await?;
 
-        let total_turns: i64 =
-            query("SELECT COUNT(*) AS cnt FROM ctx_snapshots WHERE session_id = ?")
-                .bind(session_id)
-                .fetch_one(&pool)
-                .await
-                .map_err(internal_error)?
-                .try_get("cnt")
-                .unwrap_or(0);
+        let total_turns: i64 = query(
+            "SELECT COUNT(*) AS cnt \
+             FROM ctx_snapshots cs \
+             JOIN agent_sessions s ON s.session_id = cs.session_id AND s.user_id = ? \
+             JOIN agent_events e \
+               ON e.event_id = cs.event_id \
+              AND e.session_id = cs.session_id \
+              AND e.user_id = ? \
+             WHERE cs.session_id = ?",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(internal_error)?
+        .try_get("cnt")
+        .unwrap_or(0);
 
         if total_turns == 0 {
             return Err(error_response(
@@ -374,24 +429,31 @@ impl IntrospectionService for DatabaseIntrospectionService {
         };
 
         let content_cols = if detail || raw {
-            ", selected_events, code_context, skill_definitions, documentation"
+            ", cs.selected_events, cs.code_context, cs.skill_definitions, cs.documentation"
         } else {
             ""
         };
 
         let sql = format!(
-            "SELECT context_capture_id, \
-                    IFNULL(CAST(token_budget AS CHAR), '{{}}') AS token_budget, \
-                    total_tokens, assembly_time_ms, \
-                    IFNULL(CAST(relevance_scores AS CHAR), '{{}}') AS relevance_scores, \
-                    task_type, llm_response_id{content_cols} \
-             FROM ctx_snapshots \
-             WHERE session_id = ? \
-             ORDER BY created_at ASC, context_capture_id ASC \
+            "SELECT cs.context_capture_id, \
+                    IFNULL(CAST(cs.token_budget AS CHAR), '{{}}') AS token_budget, \
+                    cs.total_tokens, cs.assembly_time_ms, \
+                    IFNULL(CAST(cs.relevance_scores AS CHAR), '{{}}') AS relevance_scores, \
+                    cs.task_type, cs.llm_response_id{content_cols} \
+             FROM ctx_snapshots cs \
+             JOIN agent_sessions s ON s.session_id = cs.session_id AND s.user_id = ? \
+             JOIN agent_events e \
+               ON e.event_id = cs.event_id \
+              AND e.session_id = cs.session_id \
+              AND e.user_id = ? \
+             WHERE cs.session_id = ? \
+             ORDER BY cs.created_at ASC, cs.context_capture_id ASC \
              LIMIT 1 OFFSET ?"
         );
 
         let row = query(&sql)
+            .bind(user_id)
+            .bind(user_id)
             .bind(session_id)
             .bind(actual_turn - 1)
             .fetch_one(&pool)
@@ -423,10 +485,11 @@ impl IntrospectionService for DatabaseIntrospectionService {
             let trend_rows = query(
                 "SELECT event_id, IFNULL(CAST(token_usage AS CHAR), '{}') AS token_usage \
                  FROM agent_events \
-                 WHERE session_id = ? AND event_type = 'llm_response' AND token_usage IS NOT NULL \
+                 WHERE session_id = ? AND user_id = ? AND event_type = 'llm_response' AND token_usage IS NOT NULL \
                   ORDER BY created_at ASC LIMIT ?",
             )
             .bind(session_id)
+            .bind(user_id)
             .bind(trend_limit)
             .fetch_all(&pool)
             .await
@@ -566,9 +629,17 @@ impl IntrospectionService for DatabaseIntrospectionService {
         let turns = turns.clamp(1, MAX_INTROSPECTION_USAGE_ROWS);
 
         let rows = query(
-            "SELECT IFNULL(CAST(relevance_scores AS CHAR), '{}') AS relevance_scores \
-             FROM ctx_snapshots WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
+            "SELECT IFNULL(CAST(cs.relevance_scores AS CHAR), '{}') AS relevance_scores \
+             FROM ctx_snapshots cs \
+             JOIN agent_sessions s ON s.session_id = cs.session_id AND s.user_id = ? \
+             JOIN agent_events e \
+               ON e.event_id = cs.event_id \
+              AND e.session_id = cs.session_id \
+              AND e.user_id = ? \
+             WHERE cs.session_id = ? ORDER BY cs.created_at DESC LIMIT ?",
         )
+        .bind(user_id)
+        .bind(user_id)
         .bind(session_id)
         .bind(turns)
         .fetch_all(&pool)
@@ -634,13 +705,17 @@ impl IntrospectionService for DatabaseIntrospectionService {
         let last_n = last_n.clamp(1, 200);
 
         let rows = query(
-            "SELECT decision_id, event_id, decision_type, model_used, \
-                    IFNULL(CAST(decision_output AS CHAR), '{}') AS output_json, \
-                    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-             FROM ctx_decision_audits \
-             WHERE session_id = ? \
-             ORDER BY created_at DESC LIMIT ?",
+            "SELECT d.decision_id, d.event_id, d.decision_type, d.model_used, \
+                    IFNULL(CAST(d.decision_output AS CHAR), '{}') AS output_json, \
+                    DATE_FORMAT(d.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+             FROM ctx_decision_audits d \
+             JOIN agent_sessions s ON s.session_id = d.session_id AND s.user_id = ? \
+             JOIN agent_events e ON e.event_id = d.event_id AND e.session_id = d.session_id AND e.user_id = ? \
+             WHERE d.session_id = ? \
+             ORDER BY d.created_at DESC LIMIT ?",
         )
+        .bind(user_id)
+        .bind(user_id)
         .bind(session_id)
         .bind(i64::from(last_n))
         .fetch_all(&pool)
@@ -863,10 +938,11 @@ impl IntrospectionService for DatabaseIntrospectionService {
         let first = query(
             "SELECT SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 240) AS preview \
              FROM agent_events \
-             WHERE session_id = ? AND (event_type = 'user_query' OR event_type = 'user_message') \
+             WHERE session_id = ? AND user_id = ? AND (event_type = 'user_query' OR event_type = 'user_message') \
              ORDER BY created_at ASC LIMIT 1",
         )
         .bind(session_id)
+        .bind(user_id)
         .fetch_optional(&pool)
         .await
         .map_err(internal_error)?;
@@ -880,10 +956,11 @@ impl IntrospectionService for DatabaseIntrospectionService {
         let last = query(
             "SELECT SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 240) AS preview \
              FROM agent_events \
-             WHERE session_id = ? \
+             WHERE session_id = ? AND user_id = ? \
              ORDER BY created_at DESC LIMIT 1",
         )
         .bind(session_id)
+        .bind(user_id)
         .fetch_optional(&pool)
         .await
         .map_err(internal_error)?;
