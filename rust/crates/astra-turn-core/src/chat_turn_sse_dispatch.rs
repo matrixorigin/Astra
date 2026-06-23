@@ -62,6 +62,7 @@ pub struct ChatTurnSseAccum {
     pub cache_creation_tokens: u64,
     pub has_usage: bool,
     pub error_message: Option<String>,
+    pub error_kind: Option<astra_core::ErrorKind>,
     /// System prompt token estimate from runtime (via `context_meta` SSE event).
     pub system_prompt_tokens: Option<u32>,
     /// Detailed system prompt breakdown from runtime (via `context_meta` SSE event).
@@ -418,6 +419,16 @@ fn apply_one_event(
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown error");
             accum.error_message = Some(format!("Error: {msg}"));
+            accum.error_kind = event
+                .get("error_kind")
+                .and_then(|v| v.as_str())
+                .and_then(astra_core::ErrorKind::parse_tag)
+                .or_else(|| {
+                    event
+                        .get("code")
+                        .and_then(|v| v.as_str())
+                        .and_then(astra_core::ErrorKind::parse_tag)
+                });
         }
         "context_meta" => {
             if let Some(t) = event.get("system_prompt_tokens").and_then(|v| v.as_u64()) {
@@ -870,11 +881,15 @@ mod tests {
     fn error_captured() {
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(
-            &sse("error", ",\"message\":\"rate limited\""),
+            &sse(
+                "error",
+                ",\"message\":\"rate limited\",\"error_kind\":\"rate_limit\"",
+            ),
             &mut a,
             &mut vec![],
         );
         assert_eq!(a.error_message.as_deref(), Some("Error: rate limited"));
+        assert_eq!(a.error_kind, Some(astra_core::ErrorKind::RateLimit));
     }
 
     #[test]

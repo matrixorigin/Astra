@@ -1509,7 +1509,12 @@ impl InProcessChatTurnBridge {
                         m.fallback_chain,
                     ),
                     Err(e) => {
-                        yield render_sse_map(&build_stream_error_event(&e, "MODEL_NOT_AVAILABLE", false));
+                        let error_code = if requested_model_override.is_none() {
+                            astra_core::ErrorKind::MissingModelSelection.as_str()
+                        } else {
+                            "MODEL_NOT_AVAILABLE"
+                        };
+                        yield render_sse_map(&build_stream_error_event(&e, error_code, false));
                         mark_disconnect_capture_finalized(&disconnect_capture_state);
                         return;
                     }

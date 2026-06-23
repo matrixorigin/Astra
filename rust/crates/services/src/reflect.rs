@@ -446,6 +446,7 @@ fn severity_for(kind: astra_core::ErrorKind, count: i64) -> &'static str {
         // Stall ramps with repetition
         (K::Stall, n) if n >= 3 => "warning",
         (K::Stall, _) => "info",
+        (K::MissingModelSelection, _) => "warning",
         // Generic count-based escalation
         (_, n) if n >= 5 => "critical",
         (_, n) if n >= 3 => "warning",
@@ -497,6 +498,9 @@ fn summary_for(kind: astra_core::ErrorKind, tool: &str, count: i64) -> String {
         K::Stall => {
             format!("Agent stall detected — {count} stall events, agent may be looping or stuck")
         }
+        K::MissingModelSelection => format!(
+            "Missing model selection ({tool}): choose a concrete model before starting a turn — {count} occurrences"
+        ),
         K::Cancelled => format!("Cancelled operations ({tool}): {count} occurrences"),
         K::Unknown => format!("Unclassified errors ({tool}): {count} occurrences"),
     }

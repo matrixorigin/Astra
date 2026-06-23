@@ -702,9 +702,8 @@ const RESOLVE_COLS: &str = "\
     IFNULL(CAST(pricing AS CHAR), '{}') AS pricing_json, \
     IFNULL(CAST(tags AS CHAR), '[]') AS tags_json, \
     thinking_capability";
-const REQUIRED_MODEL_SELECTION_ERROR: &str = "\
-Model selection is required. Pass a concrete selected_model.model or set a CLI \
-default_model; refusing to choose the first active model.";
+const REQUIRED_MODEL_SELECTION_ERROR: &str =
+    astra_core::model_override::MISSING_MODEL_SELECTION_MESSAGE;
 
 /// Require an explicitly wired pool reference.
 async fn require_pool(

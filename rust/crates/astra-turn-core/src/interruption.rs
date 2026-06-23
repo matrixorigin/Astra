@@ -869,6 +869,7 @@ mod tests {
             astra_core::ErrorKind::ToolInvalidArgs,
             astra_core::ErrorKind::ResourceLimit,
             astra_core::ErrorKind::ToolRoundsExhausted,
+            astra_core::ErrorKind::MissingModelSelection,
         ];
         for ek in none_cases {
             assert!(

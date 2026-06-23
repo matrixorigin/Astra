@@ -67,6 +67,9 @@ pub enum ErrorKind {
     /// infinite replan. Not a transport or tool error — the remedy is rewind
     /// or model switch.
     Stall,
+    /// No concrete model was selected by the caller. The runtime must not
+    /// choose an arbitrary active model as a fallback.
+    MissingModelSelection,
 
     // ── Client-side ──────────────────────────────────
     /// User Ctrl-C, cancel token, or API cancellation.
@@ -100,6 +103,7 @@ impl ErrorKind {
             Self::ResourceLimit => "resource_limit",
             Self::DatabaseError => "database_error",
             Self::Stall => "stall",
+            Self::MissingModelSelection => "missing_model_selection",
             Self::Cancelled => "cancelled",
             Self::Unknown => "unknown",
         }
@@ -221,6 +225,10 @@ impl ErrorKind {
                  Do NOT repeat the last action. Try a different tool, widen the \
                  context, or hand control back to the user."
             }
+            Self::MissingModelSelection => {
+                "No concrete model was selected. Do NOT choose a fallback model. \
+                 Ask the user to select a model or set a CLI default_model."
+            }
             Self::Cancelled => "Operation was cancelled by the user.",
             Self::Unknown => "An unexpected error occurred. Check the error output and adjust.",
         }
@@ -306,6 +314,10 @@ impl ErrorKind {
                 "Agent is stuck in a loop. Try `/rewind` to go back, or switch to \
                  a different model with `/model`. Break complex tasks into smaller steps."
             }
+            Self::MissingModelSelection => {
+                "Select a concrete model with `/model set <name>`, pass `--model <name>`, \
+                 or run `astra config set default_model <name>`."
+            }
             Self::Cancelled => {
                 "User cancelled — no action needed unless cancellations are unexpected."
             }
@@ -346,6 +358,7 @@ impl ErrorKind {
             "resource_limit" => Some(Self::ResourceLimit),
             "database_error" => Some(Self::DatabaseError),
             "stall" => Some(Self::Stall),
+            "missing_model_selection" => Some(Self::MissingModelSelection),
             "cancelled" => Some(Self::Cancelled),
             "unknown" => Some(Self::Unknown),
             _ => None,
@@ -476,6 +489,13 @@ pub fn classify_tool_output(error_str: &str) -> ErrorKind {
     // the legacy marker. New runtime code should not rely on this path.
     if lower.contains(TOOL_BINDING_SENTINEL) {
         return ErrorKind::ToolBinding;
+    }
+
+    if lower.contains("model selection is required")
+        || lower.contains("missing model selection")
+        || lower.contains("no concrete model was selected")
+    {
+        return ErrorKind::MissingModelSelection;
     }
 
     // Resource limit — never retry, block the tool
@@ -781,6 +801,7 @@ mod tests {
         ErrorKind::ResourceLimit,
         ErrorKind::DatabaseError,
         ErrorKind::Stall,
+        ErrorKind::MissingModelSelection,
         ErrorKind::Cancelled,
         ErrorKind::Unknown,
     ];
@@ -844,6 +865,7 @@ mod tests {
             ErrorKind::ResourceLimit,
             ErrorKind::ToolTimeout,
             ErrorKind::ToolBinding,
+            ErrorKind::MissingModelSelection,
         ] {
             assert!(!kind.is_retryable(), "{kind:?} must NOT be retryable");
         }
@@ -1037,6 +1059,10 @@ mod tests {
             (
                 "something completely unexpected happened",
                 ErrorKind::Unknown,
+            ),
+            (
+                "Model selection is required. Select a concrete model with `/model set <name>`.",
+                ErrorKind::MissingModelSelection,
             ),
             ("", ErrorKind::Unknown),
             ("   \n\t  ", ErrorKind::Unknown),

@@ -184,6 +184,11 @@ pub(crate) async fn stream_chat_sse(
 ) -> Result<StreamResult, crate::TurnFailure> {
     let start = Instant::now();
     p.model = normalize_turn_model(p.model);
+    let Some(selected_model) = require_selected_turn_model(p.model, p.session_id, p.turn_index)
+    else {
+        return Err(missing_model_selection_turn_failure(p.session_id));
+    };
+    p.model = Some(selected_model);
     let root_agent_id = p.root_agent_id.unwrap_or("main");
     p.perm_manager.clear_turn_overrides();
 
@@ -1092,6 +1097,34 @@ fn normalize_turn_model(model: Option<&str>) -> Option<&str> {
     astra_core::model_override::normalize_model_override(model)
 }
 
+fn require_selected_turn_model<'a>(
+    model: Option<&'a str>,
+    session_id: Option<&str>,
+    turn_index: u32,
+) -> Option<&'a str> {
+    let Some(model) = model else {
+        tracing::warn!(
+            target: "astra_cli::model_selection",
+            reason = "missing_model_selection",
+            session_id = ?session_id,
+            turn_index,
+            "missing concrete model selection; refusing to start turn before opening SSE stream"
+        );
+        return None;
+    };
+    Some(model)
+}
+
+fn missing_model_selection_turn_failure(session_id: Option<&str>) -> crate::TurnFailure {
+    crate::TurnFailure {
+        error: astra_core::model_override::missing_model_selection_error().to_string(),
+        partial: crate::PartialTurnData {
+            session_id: session_id.map(str::to_string),
+            ..Default::default()
+        },
+    }
+}
+
 fn load_turn_messages(
     pre_loaded_messages: Option<Vec<serde_json::Value>>,
     history: &[(String, String)],
@@ -1108,9 +1141,9 @@ fn load_turn_messages(
 mod tests {
     use super::{
         circuit_breaker_config_from_tool_selection, detect_turn_hook_sets,
-        extend_restricted_with_blocked_tools, normalize_turn_model,
-        refresh_root_permission_context, restored_compaction_effectiveness,
-        root_permission_context_handle,
+        extend_restricted_with_blocked_tools, missing_model_selection_turn_failure,
+        normalize_turn_model, refresh_root_permission_context, require_selected_turn_model,
+        restored_compaction_effectiveness, root_permission_context_handle,
     };
     use crate::cli::permission_manager::{PermissionManager, PermissionMode};
     use astra_runtime::observability::ObservabilityHub;
@@ -1135,6 +1168,26 @@ mod tests {
         assert_eq!(cfg.max_introspect_emissions, 3);
         assert_eq!(cfg.half_open_patience, 2);
         assert_eq!(cfg.absolute_max_rounds, 200);
+    }
+
+    #[test]
+    fn missing_model_selection_preflight_is_classified_and_session_scoped() {
+        assert!(
+            require_selected_turn_model(None, Some("sess-missing-model"), 3).is_none(),
+            "missing model must fail before opening the SSE stream"
+        );
+        let failure = missing_model_selection_turn_failure(Some("sess-missing-model"));
+
+        let classified = astra_core::ClassifiedError::from(failure.error.clone());
+        assert_eq!(
+            classified.kind,
+            astra_core::ErrorKind::MissingModelSelection
+        );
+        assert_eq!(
+            failure.partial.session_id.as_deref(),
+            Some("sess-missing-model")
+        );
+        assert!(failure.error.contains("default_model"), "{}", failure.error);
     }
 
     #[tokio::test]

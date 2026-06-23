@@ -3,6 +3,10 @@
 /// `default` is a symbolic request to let the serving API choose its configured
 /// default model. It is not a concrete model name and must not be persisted or
 /// sent as a model override.
+pub const MISSING_MODEL_SELECTION_MESSAGE: &str = "\
+Model selection is required. Select a concrete model with `/model set <name>`, \
+pass `--model <name>`, or run `astra config set default_model <name>`.";
+
 pub fn normalize_model_override(model: Option<&str>) -> Option<&str> {
     let model = model?.trim();
     if model.is_empty()
@@ -17,6 +21,13 @@ pub fn normalize_model_override(model: Option<&str>) -> Option<&str> {
 
 pub fn normalize_model_override_owned(model: Option<String>) -> Option<String> {
     normalize_model_override(model.as_deref()).map(str::to_string)
+}
+
+pub fn missing_model_selection_error() -> crate::ClassifiedError {
+    crate::ClassifiedError::new(
+        crate::ErrorKind::MissingModelSelection,
+        MISSING_MODEL_SELECTION_MESSAGE,
+    )
 }
 
 #[cfg(test)]
@@ -39,5 +50,13 @@ mod tests {
             normalize_model_override_owned(Some(" gpt-5.5 ".to_string())),
             Some("gpt-5.5".to_string())
         );
+    }
+
+    #[test]
+    fn missing_model_selection_error_is_classified() {
+        let err = missing_model_selection_error();
+
+        assert_eq!(err.kind, crate::ErrorKind::MissingModelSelection);
+        assert!(err.message.contains("default_model"));
     }
 }

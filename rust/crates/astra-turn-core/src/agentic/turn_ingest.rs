@@ -80,7 +80,7 @@ pub fn agentic_turn_stream_snapshot_from_sse_accum<'a>(
     accum: &'a ChatTurnSseAccum,
     ttft_ms: Option<u64>,
 ) -> AgenticTurnStreamSnapshot<'a> {
-    agentic_turn_stream_snapshot_with_kind(accum, ttft_ms, None)
+    agentic_turn_stream_snapshot_with_kind(accum, ttft_ms, accum.error_kind)
 }
 
 /// Build snapshot with an optional pre-classified error kind.
@@ -437,6 +437,7 @@ mod tests {
             cache_creation_tokens: 0,
             has_usage: true,
             error_message: Some("e".into()),
+            error_kind: Some(astra_core::ErrorKind::MissingModelSelection),
             ..Default::default()
         };
         let snap = agentic_turn_stream_snapshot_from_sse_accum(&accum, Some(99));
@@ -449,6 +450,10 @@ mod tests {
         assert_eq!(snap.completion_tokens, 4);
         assert!(snap.has_usage);
         assert_eq!(snap.error_message.as_deref(), Some("e"));
+        assert_eq!(
+            snap.error_kind,
+            Some(astra_core::ErrorKind::MissingModelSelection)
+        );
     }
 
     #[test]

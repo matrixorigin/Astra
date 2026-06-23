@@ -782,11 +782,12 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 circuit_breaker: None,
             });
 
+        let error_kind = turn_result.core.error_kind;
         Ok(HostTurnResult {
             accum: turn_result.core,
             ttft_ms: turn_result.ttft_ms,
             edge_tool_round: turn_result.edge_tool_round,
-            error_kind: None,
+            error_kind,
         })
     }
 

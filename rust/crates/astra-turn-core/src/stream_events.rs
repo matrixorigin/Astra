@@ -5,12 +5,19 @@ use astra_thin_client::ApprovalKind;
 use crate::tool::args::repair::try_repair_tool_args;
 
 pub fn build_stream_error_event(message: &str, code: &str, retryable: bool) -> Map<String, Value> {
-    Map::from_iter([
+    let mut event = Map::from_iter([
         ("type".to_string(), Value::String("error".to_string())),
         ("message".to_string(), Value::String(message.to_string())),
         ("code".to_string(), Value::String(code.to_string())),
         ("retryable".to_string(), Value::Bool(retryable)),
-    ])
+    ]);
+    if let Some(kind) = astra_core::ErrorKind::parse_tag(code) {
+        event.insert(
+            "error_kind".to_string(),
+            Value::String(kind.as_str().to_string()),
+        );
+    }
+    event
 }
 
 /// Configuration for a single error kind: the SSE error code, whether it is retryable,
@@ -586,6 +593,16 @@ mod tests {
             Some("INTERNAL_ERROR")
         );
         assert_eq!(ev.get("retryable").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn stream_error_event_includes_structured_error_kind_for_known_code() {
+        let ev = build_stream_error_event("select a model", "missing_model_selection", false);
+
+        assert_eq!(
+            ev.get("error_kind").and_then(Value::as_str),
+            Some("missing_model_selection")
+        );
     }
 
     #[test]
