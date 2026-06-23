@@ -13,6 +13,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # Compiled target artifacts are only safe to share within one workflow run.
+  # Branch-level target caches can leave Cargo fingerprints without the rlibs
+  # they point at, which surfaces as spurious E0463 "can't find crate" errors.
+  RUST_TEST_TARGET_CACHE_KEY: ci-test-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
   # ── Stage 1: compile once, cache for all downstream jobs ───────────
@@ -23,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/rust-setup
         with:
-          shared-key: ci-test
+          shared-key: ${{ env.RUST_TEST_TARGET_CACHE_KEY }}
           save-cache: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       # Compile all test binaries (default + bridge-e2e-hooks) without running
       - name: Compile test binaries
@@ -68,7 +72,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/rust-setup
         with:
-          shared-key: ci-test
+          shared-key: ${{ env.RUST_TEST_TARGET_CACHE_KEY }}
       - name: Prebuild mock MCP server
         if: matrix.segment == 'non-edge'
         run: cargo build --manifest-path rust/Cargo.toml -p astra-cli --bin mock_mcp_server
@@ -92,7 +96,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/rust-setup
         with:
-          shared-key: ci-test
+          shared-key: ${{ env.RUST_TEST_TARGET_CACHE_KEY }}
       - name: Test astra-runtime
         run: >-
           cargo nextest run --manifest-path rust/Cargo.toml -p astra-runtime
@@ -126,7 +130,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/rust-setup
         with:
-          shared-key: ci-test
+          shared-key: ${{ env.RUST_TEST_TARGET_CACHE_KEY }}
       - name: Test astra-turn-core + astra-services + astra-plan
         run: >-
           cargo nextest run --manifest-path rust/Cargo.toml
@@ -143,7 +147,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/rust-setup
         with:
-          shared-key: ci-test
+          shared-key: ${{ env.RUST_TEST_TARGET_CACHE_KEY }}
       - name: Test core crates
         run: >-
           cargo nextest run --manifest-path rust/Cargo.toml
@@ -198,7 +202,7 @@ jobs:
         run: make dev-deps-up
       - uses: ./.github/actions/rust-setup
         with:
-          shared-key: ci-test
+          shared-key: ${{ env.RUST_TEST_TARGET_CACHE_KEY }}
       - name: Wait for dependencies
         run: make dev-deps-wait
       - name: Run online tests
