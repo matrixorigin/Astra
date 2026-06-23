@@ -265,12 +265,12 @@ impl IntrospectionService for DatabaseIntrospectionService {
         let response_id_rows = query(
             "SELECT cs.llm_response_id AS response_event_id \
              FROM ctx_snapshots cs \
-             JOIN agent_sessions s ON s.session_id = cs.session_id AND s.user_id = ? \
              JOIN agent_events e \
                ON e.event_id = cs.event_id \
               AND e.session_id = cs.session_id \
               AND e.user_id = ? \
-             WHERE cs.session_id = ? \
+             WHERE cs.user_id = ? \
+               AND cs.session_id = ? \
                AND cs.llm_response_id IS NOT NULL \
              ORDER BY cs.created_at DESC, cs.context_capture_id DESC LIMIT ?",
         )
@@ -393,12 +393,12 @@ impl IntrospectionService for DatabaseIntrospectionService {
         let total_turns: i64 = query(
             "SELECT COUNT(*) AS cnt \
              FROM ctx_snapshots cs \
-             JOIN agent_sessions s ON s.session_id = cs.session_id AND s.user_id = ? \
              JOIN agent_events e \
                ON e.event_id = cs.event_id \
               AND e.session_id = cs.session_id \
               AND e.user_id = ? \
-             WHERE cs.session_id = ?",
+             WHERE cs.user_id = ? \
+               AND cs.session_id = ?",
         )
         .bind(user_id)
         .bind(user_id)
@@ -441,12 +441,12 @@ impl IntrospectionService for DatabaseIntrospectionService {
                     IFNULL(CAST(cs.relevance_scores AS CHAR), '{{}}') AS relevance_scores, \
                     cs.task_type, cs.llm_response_id{content_cols} \
              FROM ctx_snapshots cs \
-             JOIN agent_sessions s ON s.session_id = cs.session_id AND s.user_id = ? \
              JOIN agent_events e \
                ON e.event_id = cs.event_id \
               AND e.session_id = cs.session_id \
               AND e.user_id = ? \
-             WHERE cs.session_id = ? \
+             WHERE cs.user_id = ? \
+             AND cs.session_id = ? \
              ORDER BY cs.created_at ASC, cs.context_capture_id ASC \
              LIMIT 1 OFFSET ?"
         );
@@ -631,12 +631,11 @@ impl IntrospectionService for DatabaseIntrospectionService {
         let rows = query(
             "SELECT IFNULL(CAST(cs.relevance_scores AS CHAR), '{}') AS relevance_scores \
              FROM ctx_snapshots cs \
-             JOIN agent_sessions s ON s.session_id = cs.session_id AND s.user_id = ? \
              JOIN agent_events e \
                ON e.event_id = cs.event_id \
               AND e.session_id = cs.session_id \
               AND e.user_id = ? \
-             WHERE cs.session_id = ? ORDER BY cs.created_at DESC LIMIT ?",
+             WHERE cs.user_id = ? AND cs.session_id = ? ORDER BY cs.created_at DESC LIMIT ?",
         )
         .bind(user_id)
         .bind(user_id)
@@ -709,9 +708,8 @@ impl IntrospectionService for DatabaseIntrospectionService {
                     IFNULL(CAST(d.decision_output AS CHAR), '{}') AS output_json, \
                     DATE_FORMAT(d.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
              FROM ctx_decision_audits d \
-             JOIN agent_sessions s ON s.session_id = d.session_id AND s.user_id = ? \
              JOIN agent_events e ON e.event_id = d.event_id AND e.session_id = d.session_id AND e.user_id = ? \
-             WHERE d.session_id = ? \
+             WHERE d.user_id = ? AND d.session_id = ? \
              ORDER BY d.created_at DESC LIMIT ?",
         )
         .bind(user_id)

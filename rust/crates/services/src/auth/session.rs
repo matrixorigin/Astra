@@ -552,6 +552,14 @@ async fn ensure_session_delete_owner_consistency(
             "SELECT COUNT(*) AS c FROM transcript_pages WHERE session_id = ? AND user_id <> ?",
         ),
         (
+            "ctx_snapshots",
+            "SELECT COUNT(*) AS c FROM ctx_snapshots WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "ctx_decision_audits",
+            "SELECT COUNT(*) AS c FROM ctx_decision_audits WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
             "prompt_request_records",
             "SELECT COUNT(*) AS c FROM prompt_request_records WHERE session_id = ? AND user_id <> ?",
         ),
@@ -791,6 +799,14 @@ async fn hard_delete_session_rows(
             "DELETE FROM transcript_pages WHERE session_id = ? AND user_id = ?",
         ),
         (
+            "ctx_snapshots",
+            "DELETE FROM ctx_snapshots WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "ctx_decision_audits",
+            "DELETE FROM ctx_decision_audits WHERE session_id = ? AND user_id = ?",
+        ),
+        (
             "prompt_request_records",
             "DELETE FROM prompt_request_records WHERE session_id = ? AND user_id = ?",
         ),
@@ -865,14 +881,6 @@ async fn hard_delete_session_rows(
     }
 
     for (label, statement) in [
-        (
-            "ctx_snapshots",
-            "DELETE FROM ctx_snapshots WHERE session_id = ?",
-        ),
-        (
-            "ctx_decision_audits",
-            "DELETE FROM ctx_decision_audits WHERE session_id = ?",
-        ),
         (
             "session_todo_counters",
             "DELETE FROM session_todo_counters WHERE session_id = ?",

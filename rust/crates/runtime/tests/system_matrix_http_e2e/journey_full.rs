@@ -604,13 +604,18 @@ pub async fn run_product_matrix_full_journey(
         .expect("context_capture_id")
         .to_string();
 
-    let snap_row =
-        sqlx::query("SELECT session_id, event_id FROM ctx_snapshots WHERE context_capture_id = ?")
-            .bind(&context_capture_id)
-            .fetch_optional(pool)
-            .await
-            .expect("ctx_snapshots");
+    let snap_row = sqlx::query(
+        "SELECT user_id, session_id, event_id FROM ctx_snapshots WHERE context_capture_id = ?",
+    )
+    .bind(&context_capture_id)
+    .fetch_optional(pool)
+    .await
+    .expect("ctx_snapshots");
     let snap_row = snap_row.expect("ctx_snapshots row");
+    assert_eq!(
+        snap_row.try_get::<String, _>("user_id").ok().as_deref(),
+        Some(ctx.user_id.as_str())
+    );
     assert_eq!(
         snap_row.try_get::<String, _>("session_id").ok().as_deref(),
         Some(session_id.as_str())
@@ -650,13 +655,17 @@ pub async fn run_product_matrix_full_journey(
         .to_string();
 
     let dec_row = sqlx::query(
-        "SELECT session_id, decision_type FROM ctx_decision_audits WHERE decision_id = ?",
+        "SELECT user_id, session_id, decision_type FROM ctx_decision_audits WHERE decision_id = ?",
     )
     .bind(&decision_id)
     .fetch_optional(pool)
     .await
     .expect("ctx_decision_audits");
     let dec_row = dec_row.expect("decision row");
+    assert_eq!(
+        dec_row.try_get::<String, _>("user_id").ok().as_deref(),
+        Some(ctx.user_id.as_str())
+    );
     assert_eq!(
         dec_row.try_get::<String, _>("session_id").ok().as_deref(),
         Some(session_id.as_str())

@@ -1674,6 +1674,7 @@ async fn persist_server_loop_hook_events(
 
     let decision_audit = Some(TurnDecisionAuditRecord {
         decision_id: Uuid::now_v7().to_string(),
+        user_id: user_id.to_string(),
         session_id: session_id.to_string(),
         event_id: event_id.clone(),
         decision_type: if tool_call_names.is_empty() {

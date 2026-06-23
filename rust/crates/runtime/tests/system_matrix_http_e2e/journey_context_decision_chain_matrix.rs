@@ -43,13 +43,15 @@ pub async fn run_context_decision_chain_db() {
         .as_str()
         .expect("context_capture_id");
 
-    let snap =
-        sqlx::query("SELECT session_id, event_id FROM ctx_snapshots WHERE context_capture_id = ?")
-            .bind(capture_id)
-            .fetch_optional(&ctx.pool)
-            .await
-            .expect("ctx_snapshots")
-            .expect("ctx_snapshots row");
+    let snap = sqlx::query(
+        "SELECT user_id, session_id, event_id FROM ctx_snapshots WHERE context_capture_id = ?",
+    )
+    .bind(capture_id)
+    .fetch_optional(&ctx.pool)
+    .await
+    .expect("ctx_snapshots")
+    .expect("ctx_snapshots row");
+    assert_eq!(snap.get::<String, _>("user_id"), ctx.user_id);
     assert_eq!(snap.get::<String, _>("session_id"), session_id);
     assert_eq!(snap.get::<String, _>("event_id"), event_id);
 
@@ -71,13 +73,14 @@ pub async fn run_context_decision_chain_db() {
     let decision_id = dec_j["decision_id"].as_str().expect("decision_id");
 
     let dec_row = sqlx::query(
-        "SELECT session_id, decision_type, context_capture_id FROM ctx_decision_audits WHERE decision_id = ?",
+        "SELECT user_id, session_id, decision_type, context_capture_id FROM ctx_decision_audits WHERE decision_id = ?",
     )
     .bind(decision_id)
     .fetch_optional(&ctx.pool)
     .await
     .expect("ctx_decision_audits")
     .expect("decision row");
+    assert_eq!(dec_row.get::<String, _>("user_id"), ctx.user_id);
     assert_eq!(dec_row.get::<String, _>("session_id"), session_id);
     assert_eq!(
         dec_row.get::<String, _>("decision_type"),

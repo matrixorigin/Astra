@@ -201,10 +201,11 @@ pub(crate) async fn insert_turn_decision_audit(
 ) -> Result<(), sqlx::Error> {
     query(
         "INSERT INTO ctx_decision_audits \
-         (decision_id, session_id, event_id, decision_type, decision_output, model_used, context_capture_id, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, NOW())",
+         (decision_id, user_id, session_id, event_id, decision_type, decision_output, model_used, context_capture_id, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())",
     )
     .bind(&record.decision_id)
+    .bind(&record.user_id)
     .bind(&record.session_id)
     .bind(&record.event_id)
     .bind(&record.decision_type)
@@ -249,11 +250,12 @@ pub(crate) async fn update_snapshot_llm_ids(
         let rows_affected = query(
             "UPDATE ctx_snapshots \
              SET llm_request_id = ?, llm_response_id = COALESCE(?, llm_response_id) \
-             WHERE context_capture_id = ?",
+             WHERE context_capture_id = ? AND user_id = ?",
         )
         .bind(&plan.llm_request_id)
         .bind(&plan.llm_response_id)
         .bind(&plan.context_capture_id)
+        .bind(&plan.user_id)
         .execute(pool)
         .await?
         .rows_affected();

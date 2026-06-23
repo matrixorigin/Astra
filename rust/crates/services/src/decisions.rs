@@ -7,7 +7,7 @@ use uuid::Uuid;
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
 use crate::pagination::clamp_api_list_pagination;
-use crate::storage::agent_session_exists_for_user;
+use crate::storage::{agent_event_exists_for_user_session, agent_session_exists_for_user};
 
 // ── Data types ───────────────────────────────────────────────────────────────
 
@@ -161,6 +161,38 @@ impl DecisionService for DatabaseDecisionService {
                 format!("Session {} not found", request.session_id),
             ));
         }
+        if !agent_event_exists_for_user_session(
+            &pool,
+            &request.event_id,
+            &request.session_id,
+            &user_id,
+        )
+        .await
+        .map_err(internal_error)?
+        {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                format!("Event {} not found", request.event_id),
+            ));
+        }
+        if !request.context_capture_id.trim().is_empty() {
+            let row = query(
+                "SELECT 1 AS owned FROM ctx_snapshots \
+                 WHERE context_capture_id = ? AND session_id = ? AND user_id = ? LIMIT 1",
+            )
+            .bind(&request.context_capture_id)
+            .bind(&request.session_id)
+            .bind(&user_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(internal_error)?;
+            if row.is_none() {
+                return Err(error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("Snapshot {} not found", request.context_capture_id),
+                ));
+            }
+        }
 
         let decision_id = Uuid::new_v4().to_string();
         let output_str = request.decision_output.to_string();
@@ -172,11 +204,12 @@ impl DecisionService for DatabaseDecisionService {
 
         query(
             "INSERT INTO ctx_decision_audits \
-             (decision_id, session_id, event_id, context_capture_id, decision_type, \
+             (decision_id, user_id, session_id, event_id, context_capture_id, decision_type, \
               decision_output, model_params, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, NOW())",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())",
         )
         .bind(&decision_id)
+        .bind(&user_id)
         .bind(&request.session_id)
         .bind(&request.event_id)
         .bind(&request.context_capture_id)
@@ -188,11 +221,12 @@ impl DecisionService for DatabaseDecisionService {
         .map_err(internal_error)?;
 
         let select_sql = format!(
-            "SELECT {} FROM ctx_decision_audits WHERE decision_id = ?",
+            "SELECT {} FROM ctx_decision_audits WHERE decision_id = ? AND user_id = ?",
             DECISION_SELECT_COLS
         );
         let row = query(&select_sql)
             .bind(&decision_id)
+            .bind(&user_id)
             .fetch_one(&pool)
             .await
             .map_err(internal_error)?;
@@ -210,8 +244,7 @@ impl DecisionService for DatabaseDecisionService {
 
         let mut count_qb = QueryBuilder::<MySql>::new(
             "SELECT COUNT(d.decision_id) AS total FROM ctx_decision_audits d \
-             JOIN agent_sessions s ON d.session_id = s.session_id \
-             WHERE s.user_id = ",
+             WHERE d.user_id = ",
         );
         count_qb.push_bind(&filter.user_id);
         if let Some(sid) = &filter.session_id {
@@ -235,8 +268,7 @@ impl DecisionService for DatabaseDecisionService {
              IFNULL(CAST(d.model_params AS CHAR), '{}') AS model_params_json, \
              DATE_FORMAT(d.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
              FROM ctx_decision_audits d \
-             JOIN agent_sessions s ON d.session_id = s.session_id \
-             WHERE s.user_id = ".to_string(),
+             WHERE d.user_id = ".to_string(),
         );
         list_qb.push_bind(&filter.user_id);
         if let Some(sid) = &filter.session_id {
@@ -282,8 +314,7 @@ impl DecisionService for DatabaseDecisionService {
              IFNULL(CAST(d.model_params AS CHAR), '{}') AS model_params_json, \
              DATE_FORMAT(d.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
              FROM ctx_decision_audits d \
-             JOIN agent_sessions s ON d.session_id = s.session_id \
-             WHERE d.decision_id = ? AND s.user_id = ?".to_string();
+             WHERE d.decision_id = ? AND d.user_id = ?".to_string();
         let row = query(&sql)
             .bind(&decision_id)
             .bind(&user_id)
@@ -313,9 +344,10 @@ impl DecisionService for DatabaseDecisionService {
              DATE_FORMAT(d.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at, \
              IFNULL(CAST(cs.context_data AS CHAR), '{}') AS context_json \
              FROM ctx_decision_audits d \
-             JOIN agent_sessions s ON d.session_id = s.session_id \
-             LEFT JOIN ctx_snapshots cs ON d.context_capture_id = cs.context_capture_id \
-             WHERE d.decision_id = ? AND s.user_id = ?".to_string();
+             LEFT JOIN ctx_snapshots cs \
+               ON d.context_capture_id = cs.context_capture_id \
+              AND cs.user_id = d.user_id \
+             WHERE d.decision_id = ? AND d.user_id = ?".to_string();
         let row = query(&sql)
             .bind(&decision_id)
             .bind(&user_id)

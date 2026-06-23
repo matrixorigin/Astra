@@ -217,6 +217,7 @@ fn build_hook_db_persist_from_payload(
     let _turn_number = valid_turn_number(hook_payload.get("turn_count"));
     let decision_audit = Some(TurnDecisionAuditRecord {
         decision_id: Uuid::now_v7().to_string(),
+        user_id: user_id.clone(),
         session_id: session_id.clone(),
         event_id: parent_event_id.clone(),
         decision_type: if tool_call_names.is_empty() {

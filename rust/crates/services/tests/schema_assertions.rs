@@ -476,6 +476,42 @@ async fn phase2_web_hydration_schema_contract() {
         ["user_id", "session_id", "end_item_seq"],
         "transcript page lookups must use owner/session/end index"
     );
+    let ctx_snapshot_columns = column_names(&pool, &schema, "ctx_snapshots").await;
+    assert!(
+        ctx_snapshot_columns
+            .iter()
+            .any(|column| column == "user_id"),
+        "ctx_snapshots must carry physical owner scope"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "ctx_snapshots",
+            "idx_ctx_snapshots_owner_session_created"
+        )
+        .await,
+        ["user_id", "session_id", "created_at"],
+        "context snapshot lookups must use owner/session recency index"
+    );
+    let ctx_decision_columns = column_names(&pool, &schema, "ctx_decision_audits").await;
+    assert!(
+        ctx_decision_columns
+            .iter()
+            .any(|column| column == "user_id"),
+        "ctx_decision_audits must carry physical owner scope"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "ctx_decision_audits",
+            "idx_ctx_decisions_owner_session_type_created"
+        )
+        .await,
+        ["user_id", "session_id", "decision_type", "created_at"],
+        "decision audit lookups must use owner/session/type recency index"
+    );
     assert_eq!(
         index_columns(
             &pool,

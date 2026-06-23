@@ -696,6 +696,7 @@ mod tests {
             .persist(TurnHookDbPersistPlan {
                 decision_audit: Some(TurnDecisionAuditRecord {
                     decision_id: "d1".into(),
+                    user_id: "u".into(),
                     event_id: "e2".into(),
                     session_id: "s".into(),
                     decision_type: "tool_selection".into(),

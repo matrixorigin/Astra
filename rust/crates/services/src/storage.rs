@@ -137,6 +137,27 @@ where
     Ok(row.is_some())
 }
 
+pub async fn agent_event_exists_for_user_session<'e, E>(
+    executor: E,
+    event_id: &str,
+    session_id: &str,
+    user_id: &str,
+) -> Result<bool, sqlx::Error>
+where
+    E: Executor<'e, Database = MySql>,
+{
+    let row = query(
+        "SELECT 1 AS owned FROM agent_events \
+         WHERE event_id = ? AND session_id = ? AND user_id = ? LIMIT 1",
+    )
+    .bind(event_id)
+    .bind(session_id)
+    .bind(user_id)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row.is_some())
+}
+
 pub async fn upsert_agent_session_event_count<'e, E>(
     executor: E,
     session_id: &str,
@@ -1967,6 +1988,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS ctx_snapshots (
             context_capture_id VARCHAR(64) PRIMARY KEY,
+            user_id VARCHAR(64) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
             event_id VARCHAR(64) NOT NULL,
             context_data JSON NULL,
@@ -1979,6 +2001,8 @@ pub async fn ensure_core_schema(
             token_usage JSON NULL,
             task_type VARCHAR(64) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_ctx_snapshots_owner_session_created (user_id, session_id, created_at),
+            INDEX idx_ctx_snapshots_owner_event_id (user_id, event_id),
             INDEX idx_ctx_snapshots_session_created (session_id, created_at),
             INDEX idx_ctx_snapshots_event_id (event_id)
         )",
@@ -1989,6 +2013,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS ctx_decision_audits (
             decision_id VARCHAR(64) PRIMARY KEY,
+            user_id VARCHAR(64) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
             event_id VARCHAR(64) NULL,
             context_capture_id VARCHAR(64) NULL,
@@ -1997,6 +2022,9 @@ pub async fn ensure_core_schema(
             model_params JSON NULL,
             model_used VARCHAR(128) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_ctx_decisions_owner_session_type_created (user_id, session_id, decision_type, created_at),
+            INDEX idx_ctx_decisions_owner_event_id (user_id, event_id),
+            INDEX idx_ctx_decisions_owner_context_capture_id (user_id, context_capture_id),
             INDEX idx_ctx_decisions_session_type_created (session_id, decision_type, created_at),
             INDEX idx_ctx_decisions_event_id (event_id),
             INDEX idx_ctx_decisions_context_capture_id (context_capture_id)
@@ -2004,6 +2032,50 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
+
+    for (table, column, ddl) in [
+        (
+            "ctx_snapshots",
+            "user_id",
+            "ALTER TABLE ctx_snapshots ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT ''",
+        ),
+        (
+            "ctx_decision_audits",
+            "user_id",
+            "ALTER TABLE ctx_decision_audits ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT ''",
+        ),
+    ] {
+        add_column_if_missing(&pool, &settings.database, table, column, ddl).await?;
+    }
+    for (table, index, ddl) in [
+        (
+            "ctx_snapshots",
+            "idx_ctx_snapshots_owner_session_created",
+            "ALTER TABLE ctx_snapshots ADD INDEX idx_ctx_snapshots_owner_session_created (user_id, session_id, created_at)",
+        ),
+        (
+            "ctx_snapshots",
+            "idx_ctx_snapshots_owner_event_id",
+            "ALTER TABLE ctx_snapshots ADD INDEX idx_ctx_snapshots_owner_event_id (user_id, event_id)",
+        ),
+        (
+            "ctx_decision_audits",
+            "idx_ctx_decisions_owner_session_type_created",
+            "ALTER TABLE ctx_decision_audits ADD INDEX idx_ctx_decisions_owner_session_type_created (user_id, session_id, decision_type, created_at)",
+        ),
+        (
+            "ctx_decision_audits",
+            "idx_ctx_decisions_owner_event_id",
+            "ALTER TABLE ctx_decision_audits ADD INDEX idx_ctx_decisions_owner_event_id (user_id, event_id)",
+        ),
+        (
+            "ctx_decision_audits",
+            "idx_ctx_decisions_owner_context_capture_id",
+            "ALTER TABLE ctx_decision_audits ADD INDEX idx_ctx_decisions_owner_context_capture_id (user_id, context_capture_id)",
+        ),
+    ] {
+        add_index_if_missing(&pool, &settings.database, table, index, ddl).await?;
+    }
 
     query(
         "CREATE TABLE IF NOT EXISTS skill_selection_events (

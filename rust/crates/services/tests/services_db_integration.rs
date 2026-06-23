@@ -362,10 +362,11 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
 
     sqlx::query(
         "INSERT INTO ctx_decision_audits \
-         (decision_id, session_id, event_id, context_capture_id, decision_type, decision_output, model_params) \
-         VALUES (?, ?, ?, 'cc', 'it_dec', CAST('{}' AS JSON), CAST('{}' AS JSON))",
+         (decision_id, user_id, session_id, event_id, context_capture_id, decision_type, decision_output, model_params) \
+         VALUES (?, ?, ?, ?, 'cc', 'it_dec', CAST('{}' AS JSON), CAST('{}' AS JSON))",
     )
     .bind(&decision_id)
+    .bind(&user_id)
     .bind(&session_id)
     .bind(&decision_event_id)
     .execute(&pool)
@@ -3526,6 +3527,189 @@ async fn session_owned_services_reject_non_owner_side_effects_on_live_matrixone(
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn context_and_decision_writes_require_owner_bound_references_on_live_matrixone() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let owner_user_id = Uuid::new_v4().to_string();
+    let other_user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let owner_event_id = Uuid::new_v4().to_string();
+    let other_event_id = Uuid::new_v4().to_string();
+    let other_context_id = Uuid::new_v4().to_string();
+
+    let _ = sqlx::query("DELETE FROM ctx_decision_audits WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM ctx_snapshots WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    cleanup_agent_sessions_and_events(
+        &pool,
+        std::slice::from_ref(&session_id),
+        &[owner_event_id.clone(), other_event_id.clone()],
+        &[],
+    )
+    .await;
+
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'ctx-ref-integrity-it', 'active', 2)",
+    )
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .execute(&pool)
+    .await
+    .expect("insert owner session");
+
+    for (event_id, user_id, event_type) in [
+        (&owner_event_id, &owner_user_id, "owner_event"),
+        (&other_event_id, &other_user_id, "other_event"),
+    ] {
+        sqlx::query(
+            "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, causal_chain_id) \
+             VALUES (?, ?, ?, ?, '{}', '')",
+        )
+        .bind(event_id)
+        .bind(&session_id)
+        .bind(user_id)
+        .bind(event_type)
+        .execute(&pool)
+        .await
+        .expect("insert event");
+    }
+
+    let context_service = DatabaseContextService::new(settings.clone()).with_pool(shared.clone());
+    let wrong_event_result = context_service
+        .create_snapshot(
+            owner_user_id.clone(),
+            SnapshotCreateRequestData {
+                session_id: session_id.clone(),
+                event_id: other_event_id.clone(),
+                context_data: serde_json::json!({"wrong": "event-owner"}),
+            },
+        )
+        .await;
+    assert_eq!(
+        wrong_event_result
+            .expect_err("owner snapshot cannot reference another owner's event")
+            .0,
+        axum::http::StatusCode::NOT_FOUND
+    );
+
+    let snapshot = context_service
+        .create_snapshot(
+            owner_user_id.clone(),
+            SnapshotCreateRequestData {
+                session_id: session_id.clone(),
+                event_id: owner_event_id.clone(),
+                context_data: serde_json::json!({"owner": true}),
+            },
+        )
+        .await
+        .expect("owner snapshot can reference owner event");
+
+    sqlx::query(
+        "INSERT INTO ctx_snapshots \
+         (context_capture_id, user_id, session_id, event_id, context_data) \
+         VALUES (?, ?, ?, ?, CAST('{\"secret\":\"other\"}' AS JSON))",
+    )
+    .bind(&other_context_id)
+    .bind(&other_user_id)
+    .bind(&session_id)
+    .bind(&other_event_id)
+    .execute(&pool)
+    .await
+    .expect("insert other-owner snapshot");
+
+    let decision_service = DatabaseDecisionService::new(settings.clone()).with_pool(shared.clone());
+    let wrong_context_result = decision_service
+        .record_decision(
+            owner_user_id.clone(),
+            DecisionCreateRequestData {
+                session_id: session_id.clone(),
+                event_id: owner_event_id.clone(),
+                context_capture_id: other_context_id.clone(),
+                decision_type: "wrong_context_owner".into(),
+                decision_output: serde_json::json!({"allowed": false}),
+                model_params: None,
+            },
+        )
+        .await;
+    assert_eq!(
+        wrong_context_result
+            .expect_err("owner decision cannot reference another owner's context")
+            .0,
+        axum::http::StatusCode::NOT_FOUND
+    );
+
+    let wrong_event_result = decision_service
+        .record_decision(
+            owner_user_id.clone(),
+            DecisionCreateRequestData {
+                session_id: session_id.clone(),
+                event_id: other_event_id.clone(),
+                context_capture_id: snapshot.context_capture_id.clone(),
+                decision_type: "wrong_event_owner".into(),
+                decision_output: serde_json::json!({"allowed": false}),
+                model_params: None,
+            },
+        )
+        .await;
+    assert_eq!(
+        wrong_event_result
+            .expect_err("owner decision cannot reference another owner's event")
+            .0,
+        axum::http::StatusCode::NOT_FOUND
+    );
+
+    let decision = decision_service
+        .record_decision(
+            owner_user_id.clone(),
+            DecisionCreateRequestData {
+                session_id: session_id.clone(),
+                event_id: owner_event_id.clone(),
+                context_capture_id: snapshot.context_capture_id.clone(),
+                decision_type: "owner_reference_integrity".into(),
+                decision_output: serde_json::json!({"allowed": true}),
+                model_params: None,
+            },
+        )
+        .await
+        .expect("owner decision can reference owner event and context");
+
+    let owner_decisions = sqlx::query(
+        "SELECT COUNT(*) AS c FROM ctx_decision_audits WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count owner decisions")
+    .try_get::<i64, _>("c")
+    .expect("decode owner decision count");
+    assert_eq!(
+        owner_decisions, 1,
+        "rejected decision references must not write stray owner rows"
+    );
+    assert_eq!(decision.context_capture_id, snapshot.context_capture_id);
+
+    let _ = sqlx::query("DELETE FROM ctx_decision_audits WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM ctx_snapshots WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    cleanup_agent_sessions_and_events(&pool, &[session_id], &[owner_event_id, other_event_id], &[])
+        .await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matrixone() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -3635,6 +3819,7 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
 
     for (
         context_id,
+        user_id,
         event_id,
         llm_response_id,
         token_budget,
@@ -3644,6 +3829,7 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
     ) in [
         (
             &owner_context_id,
+            &owner_user_id,
             &owner_query_event_id,
             &owner_llm_event_id,
             1000_i32,
@@ -3653,6 +3839,7 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         ),
         (
             &other_context_id,
+            &other_user_id,
             &other_query_event_id,
             &other_llm_event_id,
             9000_i32,
@@ -3663,10 +3850,11 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
     ] {
         sqlx::query(
             "INSERT INTO ctx_snapshots \
-             (context_capture_id, session_id, event_id, llm_response_id, token_budget, total_tokens, relevance_scores, task_type, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, CAST(? AS JSON), 'it', ?)",
+             (context_capture_id, user_id, session_id, event_id, llm_response_id, token_budget, total_tokens, relevance_scores, task_type, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), 'it', ?)",
         )
         .bind(context_id)
+        .bind(user_id)
         .bind(&session_id)
         .bind(event_id)
         .bind(llm_response_id)
@@ -3679,9 +3867,10 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         .expect("insert mixed owner snapshot");
     }
 
-    for (decision_id, event_id, context_id, decision_type, output, model, created_at) in [
+    for (decision_id, user_id, event_id, context_id, decision_type, output, model, created_at) in [
         (
             &owner_decision_id,
+            &owner_user_id,
             &owner_query_event_id,
             &owner_context_id,
             "owner_decision",
@@ -3691,6 +3880,7 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         ),
         (
             &other_decision_id,
+            &other_user_id,
             &other_query_event_id,
             &other_context_id,
             "other_decision",
@@ -3701,10 +3891,11 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
     ] {
         sqlx::query(
             "INSERT INTO ctx_decision_audits \
-             (decision_id, session_id, event_id, context_capture_id, decision_type, decision_output, model_params, model_used, created_at) \
-             VALUES (?, ?, ?, ?, ?, CAST(? AS JSON), CAST('{}' AS JSON), ?, ?)",
+             (decision_id, user_id, session_id, event_id, context_capture_id, decision_type, decision_output, model_params, model_used, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, CAST(? AS JSON), CAST('{}' AS JSON), ?, ?)",
         )
         .bind(decision_id)
+        .bind(user_id)
         .bind(&session_id)
         .bind(event_id)
         .bind(context_id)
@@ -3904,8 +4095,19 @@ async fn session_delete_removes_owner_scoped_transcript_pages_and_todo_counter_o
 
     let owner_user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
+    let context_capture_id = Uuid::new_v4().to_string();
+    let decision_id = Uuid::new_v4().to_string();
+    let event_id = Uuid::new_v4().to_string();
 
     let _ = sqlx::query("DELETE FROM transcript_pages WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM ctx_decision_audits WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM ctx_snapshots WHERE session_id = ?")
         .bind(&session_id)
         .execute(&pool)
         .await;
@@ -3939,6 +4141,31 @@ async fn session_delete_removes_owner_scoped_transcript_pages_and_todo_counter_o
         .execute(&pool)
         .await
         .expect("insert todo counter");
+    sqlx::query(
+        "INSERT INTO ctx_snapshots \
+         (context_capture_id, user_id, session_id, event_id, context_data) \
+         VALUES (?, ?, ?, ?, CAST('{\"owner\":true}' AS JSON))",
+    )
+    .bind(&context_capture_id)
+    .bind(&owner_user_id)
+    .bind(&session_id)
+    .bind(&event_id)
+    .execute(&pool)
+    .await
+    .expect("insert owner context snapshot");
+    sqlx::query(
+        "INSERT INTO ctx_decision_audits \
+         (decision_id, user_id, session_id, event_id, context_capture_id, decision_type, decision_output) \
+         VALUES (?, ?, ?, ?, ?, 'owner_delete_it', CAST('{\"owner\":true}' AS JSON))",
+    )
+    .bind(&decision_id)
+    .bind(&owner_user_id)
+    .bind(&session_id)
+    .bind(&event_id)
+    .bind(&context_capture_id)
+    .execute(&pool)
+    .await
+    .expect("insert owner decision audit");
 
     let session_service = DatabaseSessionService::new(settings).with_pool(shared);
     session_service
@@ -3954,6 +4181,14 @@ async fn session_delete_removes_owner_scoped_transcript_pages_and_todo_counter_o
         (
             "transcript_pages",
             "SELECT COUNT(*) AS c FROM transcript_pages WHERE session_id = ?",
+        ),
+        (
+            "ctx_snapshots",
+            "SELECT COUNT(*) AS c FROM ctx_snapshots WHERE session_id = ?",
+        ),
+        (
+            "ctx_decision_audits",
+            "SELECT COUNT(*) AS c FROM ctx_decision_audits WHERE session_id = ?",
         ),
         (
             "session_todo_counters",
@@ -4045,6 +4280,114 @@ async fn session_delete_blocks_mixed_owner_transcript_pages_on_live_matrixone() 
     );
 
     let _ = sqlx::query("DELETE FROM transcript_pages WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    cleanup_agent_sessions_and_events(&pool, &[session_id], &[], &[]).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_delete_blocks_mixed_owner_context_decision_rows_on_live_matrixone() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let owner_user_id = Uuid::new_v4().to_string();
+    let other_user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let context_capture_id = Uuid::new_v4().to_string();
+    let decision_id = Uuid::new_v4().to_string();
+    let event_id = Uuid::new_v4().to_string();
+
+    let _ = sqlx::query("DELETE FROM ctx_decision_audits WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM ctx_snapshots WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    cleanup_agent_sessions_and_events(&pool, std::slice::from_ref(&session_id), &[], &[]).await;
+
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'mixed-ctx-delete-it', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .execute(&pool)
+    .await
+    .expect("insert owner session");
+    sqlx::query(
+        "INSERT INTO ctx_snapshots \
+         (context_capture_id, user_id, session_id, event_id, context_data) \
+         VALUES (?, ?, ?, ?, CAST('{\"secret\":\"other\"}' AS JSON))",
+    )
+    .bind(&context_capture_id)
+    .bind(&other_user_id)
+    .bind(&session_id)
+    .bind(&event_id)
+    .execute(&pool)
+    .await
+    .expect("insert stray context snapshot");
+    sqlx::query(
+        "INSERT INTO ctx_decision_audits \
+         (decision_id, user_id, session_id, event_id, context_capture_id, decision_type, decision_output) \
+         VALUES (?, ?, ?, ?, ?, 'stray_decision', CAST('{\"secret\":\"other\"}' AS JSON))",
+    )
+    .bind(&decision_id)
+    .bind(&other_user_id)
+    .bind(&session_id)
+    .bind(&event_id)
+    .bind(&context_capture_id)
+    .execute(&pool)
+    .await
+    .expect("insert stray decision audit");
+
+    let session_service = DatabaseSessionService::new(settings).with_pool(shared);
+    let delete_result = session_service
+        .delete_session(session_id.clone(), owner_user_id.clone())
+        .await;
+    assert_eq!(
+        delete_result
+            .expect_err("mixed-owner context/decision delete must fail closed")
+            .0,
+        axum::http::StatusCode::CONFLICT
+    );
+
+    for (label, sql, expected_user_id) in [
+        (
+            "ctx_snapshots",
+            "SELECT COUNT(*) AS c FROM ctx_snapshots WHERE session_id = ? AND user_id = ?",
+            &other_user_id,
+        ),
+        (
+            "ctx_decision_audits",
+            "SELECT COUNT(*) AS c FROM ctx_decision_audits WHERE session_id = ? AND user_id = ?",
+            &other_user_id,
+        ),
+        (
+            "agent_sessions",
+            "SELECT COUNT(*) AS c FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+            &owner_user_id,
+        ),
+    ] {
+        let remaining = sqlx::query(sql)
+            .bind(&session_id)
+            .bind(expected_user_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("count remaining {label}: {error}"))
+            .try_get::<i64, _>("c")
+            .expect("decode remaining count");
+        assert_eq!(remaining, 1, "blocked delete must keep {label}");
+    }
+
+    let _ = sqlx::query("DELETE FROM ctx_decision_audits WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM ctx_snapshots WHERE session_id = ?")
         .bind(&session_id)
         .execute(&pool)
         .await;
