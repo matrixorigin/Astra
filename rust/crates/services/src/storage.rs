@@ -2529,6 +2529,8 @@ pub async fn ensure_core_schema(
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             CONSTRAINT chk_session_artifacts_access_scope CHECK (access_scope IN ('private', 'delegation', 'delegation_direct', 'same_root_tree', 'user')),
             CONSTRAINT chk_session_artifacts_status CHECK (status IN ('active', 'expiring', 'expired')),
+            INDEX idx_session_artifacts_owner_kind_order (user_id, session_id, artifact_kind, created_at, artifact_id),
+            INDEX idx_session_artifacts_owner_session_order (user_id, session_id, created_at, artifact_id),
             INDEX idx_session_artifacts_session_kind_created (session_id, artifact_kind, created_at),
             INDEX idx_session_artifacts_session_source_created (session_id, source, created_at),
             INDEX idx_session_artifacts_user_created (user_id, created_at),
@@ -2559,11 +2561,23 @@ pub async fn ensure_core_schema(
         }
     }
 
-    for (table, index, ddl) in [(
-        "agent_sessions",
-        "idx_sessions_project",
-        "ALTER TABLE agent_sessions ADD INDEX idx_sessions_project (user_id, project_id, updated_at)",
-    )] {
+    for (table, index, ddl) in [
+        (
+            "agent_sessions",
+            "idx_sessions_project",
+            "ALTER TABLE agent_sessions ADD INDEX idx_sessions_project (user_id, project_id, updated_at)",
+        ),
+        (
+            "session_artifacts",
+            "idx_session_artifacts_owner_kind_order",
+            "ALTER TABLE session_artifacts ADD INDEX idx_session_artifacts_owner_kind_order (user_id, session_id, artifact_kind, created_at, artifact_id)",
+        ),
+        (
+            "session_artifacts",
+            "idx_session_artifacts_owner_session_order",
+            "ALTER TABLE session_artifacts ADD INDEX idx_session_artifacts_owner_session_order (user_id, session_id, created_at, artifact_id)",
+        ),
+    ] {
         if let Err(e) = add_index_if_missing(&pool, &settings.database, table, index, ddl).await {
             tracing::debug!("phase4 additive index migration skipped: {table}.{index}: {e}");
         }

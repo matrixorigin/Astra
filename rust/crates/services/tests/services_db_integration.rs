@@ -37,8 +37,8 @@ use astra_services::{
     DurableTaskLifecycle, EventCreateRequestData, EventListFilter, EventService,
     IntrospectionService, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET, MAX_MARKETPLACE_SEARCH_OFFSET,
     MarketplaceStatsService, MatrixOneDurableTaskLifecycle, MatrixOneSyncService, ReflectService,
-    ReplayService, SessionArtifactJsonStore, SessionArtifactStore, SessionListFilter,
-    SessionService, SkillSearchQuery, SkillService, SnapshotCreateRequestData,
+    ReplayService, SessionArtifactJsonStore, SessionArtifactStore, SessionArtifactStoreError,
+    SessionListFilter, SessionService, SkillSearchQuery, SkillService, SnapshotCreateRequestData,
 };
 use sqlx::Row;
 use std::collections::HashSet;
@@ -603,7 +603,7 @@ async fn session_artifact_latest_and_list_use_stable_tiebreaker_for_tied_timesta
 
     let store = DatabaseSessionArtifactStore::new(settings).with_pool(shared);
     let latest = store
-        .load_latest_json_artifact(&session_id, "llm_capture")
+        .load_latest_json_artifact(&user_id, &session_id, "llm_capture")
         .await
         .expect("load latest artifact")
         .expect("latest artifact row");
@@ -618,7 +618,7 @@ async fn session_artifact_latest_and_list_use_stable_tiebreaker_for_tied_timesta
     );
 
     let listed = store
-        .list_json_artifacts(&session_id, Some("llm_capture"), 10)
+        .list_json_artifacts(&user_id, &session_id, Some("llm_capture"), 10)
         .await
         .expect("list session artifacts");
     assert_eq!(listed.len(), 2);
@@ -629,6 +629,152 @@ async fn session_artifact_latest_and_list_use_stable_tiebreaker_for_tied_timesta
     assert_eq!(listed[1].artifact_id, older_id);
 
     cleanup_restore_fixture(&pool, &[session_id]).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_artifact_store_is_owner_bound_on_reads_and_writes() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let owner_user_id = Uuid::new_v4().to_string();
+    let other_user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let other_owner_session_id = Uuid::new_v4().to_string();
+    cleanup_restore_fixture(&pool, &[session_id.clone(), other_owner_session_id.clone()]).await;
+
+    for (sid, title) in [
+        (&session_id, "artifact-owner-session"),
+        (&other_owner_session_id, "artifact-other-session"),
+    ] {
+        sqlx::query(
+            "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+             VALUES (?, ?, ?, 'active', 0)",
+        )
+        .bind(sid)
+        .bind(&owner_user_id)
+        .bind(title)
+        .execute(&pool)
+        .await
+        .expect("insert owner session");
+    }
+
+    let store = DatabaseSessionArtifactStore::new(settings).with_pool(shared);
+    let artifact = store
+        .persist_json_artifact(astra_services::SessionArtifactJsonRecord {
+            artifact_id: Uuid::now_v7().to_string(),
+            session_id: session_id.clone(),
+            user_id: owner_user_id.clone(),
+            artifact_kind: "llm_capture".into(),
+            source: Some("owner-bound-test".into()),
+            turn: Some(1),
+            round: Some(0),
+            content: serde_json::json!({"owner": true, "payload": "visible only to owner"}),
+            metadata: Some(serde_json::json!({"scope": "owner"})),
+        })
+        .await
+        .expect("owner can persist artifact");
+
+    assert!(
+        store
+            .load_json_artifact(&owner_user_id, &session_id, &artifact.artifact_id)
+            .await
+            .expect("owner load by id")
+            .is_some(),
+        "owner can load artifact by id in the owning session"
+    );
+    assert_eq!(
+        store
+            .load_latest_json_artifact(&owner_user_id, &session_id, "llm_capture")
+            .await
+            .expect("owner latest")
+            .map(|artifact| artifact.artifact_id),
+        Some(artifact.artifact_id.clone()),
+        "owner latest query returns the artifact"
+    );
+    assert_eq!(
+        store
+            .list_json_artifacts(&owner_user_id, &session_id, Some("llm_capture"), 10)
+            .await
+            .expect("owner list")
+            .len(),
+        1,
+        "owner list sees exactly the session artifact"
+    );
+
+    assert!(
+        store
+            .load_json_artifact(&other_user_id, &session_id, &artifact.artifact_id)
+            .await
+            .expect("non-owner load by id")
+            .is_none(),
+        "non-owner cannot infer artifact existence by id"
+    );
+    assert!(
+        store
+            .load_latest_json_artifact(&other_user_id, &session_id, "llm_capture")
+            .await
+            .expect("non-owner latest")
+            .is_none(),
+        "non-owner latest query is indistinguishable from not found"
+    );
+    assert!(
+        store
+            .list_json_artifacts(&other_user_id, &session_id, None, 10)
+            .await
+            .expect("non-owner list")
+            .is_empty(),
+        "non-owner list does not leak another user's artifacts"
+    );
+    assert!(
+        store
+            .load_json_artifact(
+                &owner_user_id,
+                &other_owner_session_id,
+                &artifact.artifact_id
+            )
+            .await
+            .expect("owner wrong-session load")
+            .is_none(),
+        "artifact_id alone cannot cross the session boundary"
+    );
+
+    let non_owner_write = store
+        .persist_json_artifact(astra_services::SessionArtifactJsonRecord {
+            artifact_id: Uuid::now_v7().to_string(),
+            session_id: session_id.clone(),
+            user_id: other_user_id.clone(),
+            artifact_kind: "llm_capture".into(),
+            source: Some("owner-bound-test".into()),
+            turn: Some(2),
+            round: Some(0),
+            content: serde_json::json!({"owner": false, "payload": "must not persist"}),
+            metadata: None,
+        })
+        .await;
+    assert!(
+        matches!(
+            non_owner_write,
+            Err(SessionArtifactStoreError::SessionNotOwned { .. })
+        ),
+        "store write path must reject artifacts for sessions not owned by record.user_id"
+    );
+
+    let artifact_count: i64 = sqlx::query(
+        "SELECT COUNT(*) AS c FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture'",
+    )
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count artifacts after rejected non-owner write")
+    .try_get("c")
+    .expect("artifact count");
+    assert_eq!(
+        artifact_count, 1,
+        "rejected non-owner write must not mutate session_artifacts"
+    );
+
+    cleanup_restore_fixture(&pool, &[session_id, other_owner_session_id]).await;
 }
 
 #[tokio::test]

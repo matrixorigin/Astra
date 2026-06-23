@@ -637,6 +637,34 @@ async fn phase4_state_projection_schema_contract() {
             &pool,
             &schema,
             "session_artifacts",
+            "idx_session_artifacts_owner_kind_order"
+        )
+        .await,
+        [
+            "user_id",
+            "session_id",
+            "artifact_kind",
+            "created_at",
+            "artifact_id"
+        ],
+        "owner-bound artifact latest/list-by-kind reads must use user/session/kind ordering"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "session_artifacts",
+            "idx_session_artifacts_owner_session_order"
+        )
+        .await,
+        ["user_id", "session_id", "created_at", "artifact_id"],
+        "owner-bound artifact preview reads must use user/session ordering"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "session_artifacts",
             "idx_artifacts_root_scope"
         )
         .await,

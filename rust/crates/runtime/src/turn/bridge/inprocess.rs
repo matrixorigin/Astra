@@ -5050,6 +5050,8 @@ mod tests {
 
         async fn load_json_artifact(
             &self,
+            _user_id: &str,
+            _session_id: &str,
             _artifact_id: &str,
         ) -> Result<Option<StoredSessionArtifact>, astra_services::SessionArtifactStoreError>
         {
@@ -5058,6 +5060,7 @@ mod tests {
 
         async fn load_latest_json_artifact(
             &self,
+            _user_id: &str,
             _session_id: &str,
             _artifact_kind: &str,
         ) -> Result<Option<StoredSessionArtifact>, astra_services::SessionArtifactStoreError>
@@ -5067,6 +5070,7 @@ mod tests {
 
         async fn list_json_artifacts(
             &self,
+            _user_id: &str,
             _session_id: &str,
             _artifact_kind: Option<&str>,
             _limit: usize,

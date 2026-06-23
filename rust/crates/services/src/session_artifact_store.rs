@@ -52,6 +52,10 @@ pub enum SessionArtifactStoreError {
     /// The `round` counter exceeded `i32::MAX`.
     #[error("round {0} exceeds i32::MAX and cannot be persisted")]
     RoundOverflow(u32),
+
+    /// A write attempted to attach an artifact to a session the user does not own.
+    #[error("session {session_id} is not owned by user {user_id}")]
+    SessionNotOwned { session_id: String, user_id: String },
 }
 
 pub trait SessionArtifactStore {
@@ -115,17 +119,21 @@ pub trait SessionArtifactJsonStore: Send + Sync {
 
     async fn load_json_artifact(
         &self,
+        user_id: &str,
+        session_id: &str,
         artifact_id: &str,
     ) -> Result<Option<StoredSessionArtifact>, SessionArtifactStoreError>;
 
     async fn load_latest_json_artifact(
         &self,
+        user_id: &str,
         session_id: &str,
         artifact_kind: &str,
     ) -> Result<Option<StoredSessionArtifact>, SessionArtifactStoreError>;
 
     async fn list_json_artifacts(
         &self,
+        user_id: &str,
         session_id: &str,
         artifact_kind: Option<&str>,
         limit: usize,
@@ -157,6 +165,21 @@ impl DatabaseSessionArtifactStore {
             "DatabaseSessionArtifactStore",
             &self.matrixone,
         )
+    }
+
+    async fn require_owned_session(
+        &self,
+        pool: &sqlx::Pool<sqlx::MySql>,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<(), SessionArtifactStoreError> {
+        if crate::storage::agent_session_exists_for_user(pool, session_id, user_id).await? {
+            return Ok(());
+        }
+        Err(SessionArtifactStoreError::SessionNotOwned {
+            session_id: session_id.to_string(),
+            user_id: user_id.to_string(),
+        })
     }
 }
 
@@ -247,6 +270,8 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         }
 
         let pool = self.get_pool().await?;
+        self.require_owned_session(&pool, &record.user_id, &record.session_id)
+            .await?;
         let content_json = serde_json::to_string(&record.content)?;
         let metadata_json = record
             .metadata
@@ -281,9 +306,12 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
                     CAST(retention_until AS CHAR) AS retention_until, status, \
                     referenced_by_manifest_count, referenced_by_state_items_count, \
                     referenced_by_citation_count, CAST(created_at AS CHAR) AS created_at \
-             FROM session_artifacts WHERE artifact_id = ?",
+             FROM session_artifacts \
+             WHERE artifact_id = ? AND session_id = ? AND user_id = ?",
         )
         .bind(&record.artifact_id)
+        .bind(&record.session_id)
+        .bind(&record.user_id)
         .fetch_one(&pool)
         .await?;
 
@@ -292,8 +320,11 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
 
     async fn load_json_artifact(
         &self,
+        user_id: &str,
+        session_id: &str,
         artifact_id: &str,
     ) -> Result<Option<StoredSessionArtifact>, SessionArtifactStoreError> {
+        validate_session_id(session_id)?;
         if artifact_id.trim().is_empty() {
             return Err(SessionArtifactStoreError::InvalidArtifactId(
                 artifact_id.to_string(),
@@ -306,9 +337,12 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
                     CAST(retention_until AS CHAR) AS retention_until, status, \
                     referenced_by_manifest_count, referenced_by_state_items_count, \
                     referenced_by_citation_count, CAST(created_at AS CHAR) AS created_at \
-             FROM session_artifacts WHERE artifact_id = ?",
+             FROM session_artifacts \
+             WHERE artifact_id = ? AND session_id = ? AND user_id = ?",
         )
         .bind(artifact_id)
+        .bind(session_id)
+        .bind(user_id)
         .fetch_optional(&pool)
         .await?;
 
@@ -317,6 +351,7 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
 
     async fn load_latest_json_artifact(
         &self,
+        user_id: &str,
         session_id: &str,
         artifact_kind: &str,
     ) -> Result<Option<StoredSessionArtifact>, SessionArtifactStoreError> {
@@ -329,9 +364,10 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
                      referenced_by_manifest_count, referenced_by_state_items_count, \
                      referenced_by_citation_count, CAST(created_at AS CHAR) AS created_at \
               FROM session_artifacts \
-              WHERE session_id = ? AND artifact_kind = ? \
+              WHERE user_id = ? AND session_id = ? AND artifact_kind = ? \
               ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
         )
+        .bind(user_id)
         .bind(session_id)
         .bind(artifact_kind)
         .fetch_optional(&pool)
@@ -346,6 +382,7 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
 
     async fn list_json_artifacts(
         &self,
+        user_id: &str,
         session_id: &str,
         artifact_kind: Option<&str>,
         limit: usize,
@@ -361,9 +398,10 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
                         referenced_by_manifest_count, referenced_by_state_items_count, \
                         referenced_by_citation_count, CAST(created_at AS CHAR) AS created_at \
                  FROM session_artifacts \
-                 WHERE session_id = ? AND artifact_kind = ? \
+                 WHERE user_id = ? AND session_id = ? AND artifact_kind = ? \
                  ORDER BY created_at DESC, artifact_id DESC LIMIT ?",
             )
+            .bind(user_id)
             .bind(session_id)
             .bind(kind)
             .bind(capped_limit)
@@ -377,9 +415,10 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
                         referenced_by_manifest_count, referenced_by_state_items_count, \
                         referenced_by_citation_count, CAST(created_at AS CHAR) AS created_at \
                  FROM session_artifacts \
-                 WHERE session_id = ? \
+                 WHERE user_id = ? AND session_id = ? \
                  ORDER BY created_at DESC, artifact_id DESC LIMIT ?",
             )
+            .bind(user_id)
             .bind(session_id)
             .bind(capped_limit)
             .fetch_all(&pool)

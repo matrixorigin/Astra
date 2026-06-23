@@ -469,7 +469,8 @@ pub(crate) async fn get_session_state_handler(
     let transcript_replay_required = cold_start && transcript_high_watermark > 0;
     let run_event_replay_required = cold_start && run_event_high_watermark > 0;
     let replay_required = transcript_replay_required || run_event_replay_required;
-    let workspace_authority = load_workspace_authority(&state, &session.session_id).await?;
+    let workspace_authority =
+        load_workspace_authority(&state, &session.user_id, &session.session_id).await?;
     let latest_context_manifest = load_latest_context_manifest(
         pool,
         &session.session_id,
@@ -477,7 +478,8 @@ pub(crate) async fn get_session_state_handler(
     )
     .await?;
     let state_summary = load_state_summary(pool, &session.session_id).await?;
-    let artifact_previews = load_artifact_previews(&state, &session.session_id).await?;
+    let artifact_previews =
+        load_artifact_previews(&state, &session.user_id, &session.session_id).await?;
     let projection_observability = load_session_projection_observability(
         pool,
         &session.session_id,
@@ -758,10 +760,11 @@ fn workspace_authority_from_artifact(
 
 async fn load_workspace_authority(
     state: &AppState,
+    user_id: &str,
     session_id: &str,
 ) -> Result<Option<WorkspaceAuthorityResponse>, (StatusCode, Json<ErrorResponse>)> {
     let artifact = session_artifact_store(state)?
-        .load_latest_json_artifact(session_id, WORKSPACE_METADATA_ARTIFACT_KIND)
+        .load_latest_json_artifact(user_id, session_id, WORKSPACE_METADATA_ARTIFACT_KIND)
         .await
         .map_err(internal_error)?;
     artifact
@@ -798,10 +801,11 @@ async fn load_state_summary(
 
 async fn load_artifact_previews(
     state: &AppState,
+    user_id: &str,
     session_id: &str,
 ) -> Result<Vec<ArtifactPreviewResponse>, (StatusCode, Json<ErrorResponse>)> {
     let artifacts = session_artifact_store(state)?
-        .list_json_artifacts(session_id, None, 8)
+        .list_json_artifacts(user_id, session_id, None, 8)
         .await
         .map_err(internal_error)?;
     Ok(artifacts
@@ -1337,13 +1341,15 @@ pub(crate) async fn list_session_artifacts_handler(
     Query(query): Query<SessionArtifactListQuery>,
 ) -> Result<Json<SessionArtifactListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id.clone();
     let _ = state
         .session_service
-        .get_session(session_id.clone(), user.user_id)
+        .get_session(session_id.clone(), user_id.clone())
         .await?;
     let artifact_store = session_artifact_store(&state)?;
     let artifacts = artifact_store
         .list_json_artifacts(
+            &user_id,
             &session_id,
             query.artifact_kind.as_deref(),
             query.limit as usize,
@@ -1366,13 +1372,14 @@ pub(crate) async fn get_latest_session_artifact_handler(
     headers: HeaderMap,
 ) -> Result<Json<SessionArtifactResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id.clone();
     let _ = state
         .session_service
-        .get_session(session_id.clone(), user.user_id)
+        .get_session(session_id.clone(), user_id.clone())
         .await?;
     let artifact_store = session_artifact_store(&state)?;
     let artifact = artifact_store
-        .load_latest_json_artifact(&session_id, &artifact_kind)
+        .load_latest_json_artifact(&user_id, &session_id, &artifact_kind)
         .await
         .map_err(internal_artifact_error)?
         .ok_or_else(session_artifact_not_found)?;
@@ -1385,16 +1392,16 @@ pub(crate) async fn get_session_artifact_handler(
     headers: HeaderMap,
 ) -> Result<Json<SessionArtifactResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id.clone();
     let _ = state
         .session_service
-        .get_session(session_id.clone(), user.user_id)
+        .get_session(session_id.clone(), user_id.clone())
         .await?;
     let artifact_store = session_artifact_store(&state)?;
     let artifact = artifact_store
-        .load_json_artifact(&artifact_id)
+        .load_json_artifact(&user_id, &session_id, &artifact_id)
         .await
         .map_err(internal_artifact_error)?
-        .filter(|artifact| artifact.session_id == session_id)
         .ok_or_else(session_artifact_not_found)?;
     Ok(Json(session_artifact_response(artifact)))
 }
