@@ -8,9 +8,10 @@
 //!     Hoisting it to a top-level pinned tool gives the deferred
 //!     activation flow an unambiguous entry point.
 //!   - Some paths treated an activated deferred name as an execution allowlist.
-//!     The fixed contract makes activation a one-shot input to surface
-//!     assembly; execution still depends on the current request's visible
-//!     schema set or an explicit transport/plugin grant.
+//!     The fixed contract makes activation pending schema-injection state
+//!     retained until the selected tool is actually called or becomes stale;
+//!     execution still depends on the current request's visible schema set or
+//!     an explicit transport/plugin grant.
 //!
 //! `introspect` stays in the catalog — it exposes runtime diagnostics
 //! (token pressure, cache hit rate, tool health, volatile injections,

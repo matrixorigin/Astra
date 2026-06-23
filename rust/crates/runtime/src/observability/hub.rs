@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use astra_services::session_journal::{JournalEvent, JournalWriter};
 use astra_services::session_workspace::{
     ContextTraceBudgetSignal, ContextTraceHistorySignal, ContextTraceMemorySignal,
-    ContextTraceSignal, ContextTraceTimingSignal, ContextTraceToolSelection,
+    ContextTraceSignal, ContextTraceTimingSignal, ContextTraceToolSurface,
 };
 use serde::{Deserialize, Serialize};
 
@@ -15,7 +15,7 @@ use astra_learning::auto_tuning::{
     AutoTuningEngine, DelegationOutcomeTracker, FeedbackSignal, SignalType,
 };
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
-use astra_turn_core::decision_explainer::{DecisionExplanation, DriftDetector, FocusDriftAnalysis};
+use astra_turn_core::decision_explainer::{DriftDetector, FocusDriftAnalysis};
 
 use super::types::*;
 
@@ -442,22 +442,17 @@ pub fn latest_context_trace_signal(session: &ObservabilitySession) -> Option<Con
     let trace = session.context_traces.last()?;
     let timing = session.turn_timings.last().cloned();
 
-    let tool_selection = (!trace.tools.selection_strategy.is_empty()
-        || !trace.tools.tools_selected.is_empty()
-        || trace.tools.tools_available > 0)
-        .then(|| ContextTraceToolSelection {
+    let tool_surface = (!trace.tools.visible_tools.is_empty() || trace.tools.tools_available > 0)
+        .then(|| ContextTraceToolSurface {
             tools_available: trace.tools.tools_available,
-            selected_tools: trace
+            visible_tools: trace
                 .tools
-                .tools_selected
+                .visible_tools
                 .iter()
                 .map(|tool| tool.tool_name.clone())
                 .collect(),
-            selection_scope: "latest_round".to_string(),
-            rejected_tools: trace.tools.tools_rejected.len(),
-            strategy: trace.tools.selection_strategy.clone(),
-            confidence: trace.tools.selection_confidence,
-            latency_ms: trace.tools.selection_latency_ms,
+            surface_scope: "latest_round".to_string(),
+            latency_ms: trace.tools.surface_latency_ms,
         });
     let memory = (!trace.memory.query.trim().is_empty()
         || !trace.memory.memories_selected.is_empty()
@@ -506,7 +501,7 @@ pub fn latest_context_trace_signal(session: &ObservabilitySession) -> Option<Con
     Some(ContextTraceSignal {
         turn_id: trace.turn_id.clone(),
         captured_at: Some(chrono::DateTime::<chrono::Utc>::from(trace.timestamp).to_rfc3339()),
-        tool_selection,
+        tool_surface,
         memory,
         history,
         budget,
@@ -520,11 +515,6 @@ pub fn latest_context_trace_signal(session: &ObservabilitySession) -> Option<Con
             })
             .collect(),
     })
-}
-
-/// Hook called after tool selection decision.
-pub fn on_tool_selection(session: &mut ObservabilitySession, explanation: DecisionExplanation) {
-    session.record_decision(explanation);
 }
 
 /// Hook called after tool execution.

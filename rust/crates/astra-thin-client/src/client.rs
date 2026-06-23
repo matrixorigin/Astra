@@ -98,7 +98,7 @@ impl ThinClient {
         })
     }
 
-    /// Shared `reqwest::Client` (TLS / proxy policy aligned with thin API). For optional in-library LLM tool selection and ad-hoc calls to other origins (e.g. Memoria health).
+    /// Shared `reqwest::Client` (TLS / proxy policy aligned with thin API). For optional in-library LLM tool surface and ad-hoc calls to other origins (e.g. Memoria health).
     pub fn http_client(&self) -> &Client {
         &self.http
     }

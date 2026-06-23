@@ -1088,7 +1088,7 @@ fn apply_user_correction_reanchor(state: &mut AgenticLoopState) -> bool {
     state.turn_guard.begin_fresh_user_turn();
     state.restricted_tools.clear();
     state.boosted_tools.clear();
-    state.widen_selection_pending = true;
+    state.widen_surface_pending = true;
 
     if let Some(session) = state.pipeline_session.as_mut() {
         session
@@ -1677,9 +1677,6 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         state.skills.listing_message = if full.is_empty() {
             None
         } else {
-            if state.telemetry.initial_skill_selector_shortlist.is_none() {
-                state.telemetry.initial_skill_selector_shortlist = Some(());
-            }
             let agent_spawn_available = host
                 .capabilities()
                 .has(astra_turn_core::capability::Capability::AgentSpawner);
@@ -3417,7 +3414,7 @@ mod tests {
             "stale auto-reflection boosts belong to the previous episode"
         );
         assert!(
-            state.widen_selection_pending,
+            state.widen_surface_pending,
             "the next assembly should expose the full tool catalogue once"
         );
     }

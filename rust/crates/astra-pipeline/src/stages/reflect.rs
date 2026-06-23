@@ -103,10 +103,10 @@ pub fn compute_strategy_delta(state: &TurnState, category: FailureCategory) -> S
                     delta.block_tools.push(tool.clone());
                 }
             }
-            delta.widen_selection = true;
+            delta.widen_surface = true;
         }
         FailureCategory::Stall => {
-            delta.widen_selection = true;
+            delta.widen_surface = true;
             delta.inject_context = Some(
                 "You've been repeating similar actions without progress. \
                  Try a fundamentally different approach or different tools."
@@ -147,7 +147,7 @@ fn apply_strategy_delta(state: &mut TurnState, delta: &StrategyDelta) {
     for tool in &delta.block_tools {
         state.blocked_tools.insert(tool.clone());
     }
-    // inject_context and widen_selection are read by the Plan stage
+    // inject_context and widen_surface are read by the Plan stage
     // from the latest reflection's strategy_delta
 }
 
@@ -266,7 +266,7 @@ mod tests {
         let refl = &state.reflections[0];
         assert!(refl.what_happened.contains("github_api"));
         assert!(!refl.strategy_delta.block_tools.is_empty());
-        assert!(refl.strategy_delta.widen_selection);
+        assert!(refl.strategy_delta.widen_surface);
         assert!(state.blocked_tools.contains("github_api"));
     }
 
@@ -287,7 +287,7 @@ mod tests {
 
         assert_eq!(action, StageAction::Transition(AgentPhase::Plan));
         let refl = &state.reflections[0];
-        assert!(refl.strategy_delta.widen_selection);
+        assert!(refl.strategy_delta.widen_surface);
         assert!(refl.strategy_delta.inject_context.is_some());
     }
 
@@ -488,7 +488,7 @@ mod tests {
 
         let delta = compute_strategy_delta(&state, FailureCategory::ToolFailures);
         assert!(delta.block_tools.contains(&"bad_tool".to_string()));
-        assert!(delta.widen_selection);
+        assert!(delta.widen_surface);
     }
 
     #[test]

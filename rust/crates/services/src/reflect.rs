@@ -314,8 +314,8 @@ pub struct TurnAnalysisReport {
     pub diagnosis: String,
     /// Specific recommendations from the LLM.
     pub recommendations: Vec<String>,
-    /// Tool selection quality assessment.
-    pub tool_selection_quality: Option<String>,
+    /// Tool surface quality assessment.
+    pub tool_surface_quality: Option<String>,
     /// Data sources used for the analysis.
     pub data_sources: Vec<String>,
 }
@@ -796,7 +796,7 @@ impl DatabaseReflectService {
         focus: &str,
         last_n: i32,
     ) -> ServiceResult<Option<EvidenceGraph>> {
-        if !matches!(focus, "auto" | "tool_selection") {
+        if !matches!(focus, "auto" | "tool_surface") {
             return Ok(None);
         }
 
@@ -1060,7 +1060,7 @@ impl ReflectService for DatabaseReflectService {
             .collect();
 
         // Error patterns (aggregated, for insights)
-        let error_patterns = if matches!(focus, "auto" | "skill_failure" | "tool_selection") {
+        let error_patterns = if matches!(focus, "auto" | "skill_failure" | "tool_surface") {
             let ep_rows = query(
                 "SELECT IFNULL(skill_name, 'unknown') AS skill_name, event_type, COUNT(*) AS fail_count, \
                    SUBSTRING(COALESCE(MIN(content), ''), 1, 100) AS sample_error \
@@ -1464,7 +1464,7 @@ mod tests {
                 nodes: vec![EvidenceGraphNode {
                     id: "decision:d1".into(),
                     kind: EvidenceGraphNodeKind::Decision,
-                    label: "tool_selection".into(),
+                    label: "tool_surface".into(),
                     summary: Some("picked bash".into()),
                     anchor: Some("evt-1".into()),
                     created_at: Some("2026-04-12T10:00:00".into()),
@@ -1483,7 +1483,7 @@ mod tests {
         let decisions = vec![EvidenceDecision {
             decision_id: "d1".into(),
             event_id: "evt-user".into(),
-            decision_type: "tool_selection".into(),
+            decision_type: "tool_surface".into(),
             decision_output: serde_json::json!({"tool_calls":["bash"]}),
             created_at: "2026-04-12T10:00:01".into(),
         }];

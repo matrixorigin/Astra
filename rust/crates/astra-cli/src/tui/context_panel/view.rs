@@ -829,26 +829,10 @@ fn append_tools_expanded(out: &mut Vec<Line<'static>>, tools: &[ToolItem], selec
                 Style::default().add_modifier(Modifier::DIM),
             ),
         ]));
-        // Score + top-ranked factors.
-        out.push(Line::from(vec![Span::styled(
-            format!("        score {:.2}", t.score),
-            Style::default().fg(Color::DarkGray),
-        )]));
-        for (name, weight) in t.factors.iter().take(3) {
-            out.push(Line::from(vec![
-                Span::raw("        · "),
-                Span::raw(name.clone()),
-                Span::styled(
-                    format!("   {weight:+.2}"),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
-        }
     }
 }
 
-/// Drill view for a single selected tool — all selection factors,
-/// not just the top 3.
+/// Drill view for a single visible tool.
 fn render_tool_drill(out: &mut Vec<Line<'static>>, tools: &[ToolItem], selected_item: usize) {
     let Some(t) = tools.get(selected_item) else {
         return;
@@ -869,38 +853,7 @@ fn render_tool_drill(out: &mut Vec<Line<'static>>, tools: &[ToolItem], selected_
     out.push(Line::from(vec![
         Span::raw("        "),
         Span::raw(format!("{} tokens", fmt_tokens(t.tokens))),
-        Span::styled(
-            format!("   score {:.2}", t.score),
-            Style::default().fg(Color::DarkGray),
-        ),
     ]));
-    if t.factors.is_empty() {
-        out.push(Line::from(vec![
-            Span::raw("        "),
-            Span::styled(
-                "(no selection factors recorded)".to_string(),
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-        ]));
-    } else {
-        out.push(Line::from(vec![
-            Span::raw("        "),
-            Span::styled(
-                format!("selection factors ({})", t.factors.len()),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ]));
-        for (name, weight) in &t.factors {
-            out.push(Line::from(vec![
-                Span::raw("          · "),
-                Span::raw(name.clone()),
-                Span::styled(
-                    format!("   {weight:+.3}"),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
-        }
-    }
 }
 
 /// Drill view for a single selected history turn — render the
@@ -1986,7 +1939,7 @@ mod tests {
         Alternative, CompressionMethod, ContextAssemblyTrace, DecisionExplanation, DecisionType,
         MemoryInjection, MemoryRejection, MemorySelection, MemorySource, PromptContextSignals,
         PromptGuidanceSignals, RejectionReason, SkillInjection, SystemPromptBreakdown,
-        TokenBudgetTrace, ToolSelected, TurnCompression, TurnRetention,
+        TokenBudgetTrace, TurnCompression, TurnRetention, VisibleTool,
     };
 
     fn trace(
@@ -2195,18 +2148,14 @@ mod tests {
     #[test]
     fn snapshot_with_nested_sections_80x26() {
         let mut t = trace(100_000, 4_000, 20_000, 2_000, 6_000, 500);
-        t.tools.tools_selected = vec![
-            ToolSelected {
+        t.tools.visible_tools = vec![
+            VisibleTool {
                 tool_name: "read_file".into(),
-                score: 0.9,
                 tokens: 1_200,
-                selection_factors: Vec::new(),
             },
-            ToolSelected {
+            VisibleTool {
                 tool_name: "write_file".into(),
-                score: 0.8,
                 tokens: 900,
-                selection_factors: Vec::new(),
             },
         ];
         t.memory.memories_selected = vec![MemorySelection {
@@ -2260,12 +2209,10 @@ mod tests {
         // Huge breakdown with lots of tools: clamped at MAX so the
         // overlay never swallows the composer.
         let mut t = trace(100_000, 1_000, 1_000, 500, 500, 0);
-        t.tools.tools_selected = (0..30)
-            .map(|i| ToolSelected {
+        t.tools.visible_tools = (0..30)
+            .map(|i| VisibleTool {
                 tool_name: format!("t{i}"),
-                score: 0.5,
                 tokens: 10,
-                selection_factors: Vec::new(),
             })
             .collect();
         let huge = ContextBreakdown::from_trace(&t);
@@ -2817,11 +2764,9 @@ mod tests {
     fn focused_section_heading_has_focus_marker() {
         // The ▶ marker appears only on the focused section heading.
         let mut t = trace(100_000, 2_000, 0, 0, 1_000, 0);
-        t.tools.tools_selected = vec![ToolSelected {
+        t.tools.visible_tools = vec![VisibleTool {
             tool_name: "bash".into(),
-            score: 0.9,
             tokens: 100,
-            selection_factors: Vec::new(),
         }];
         let b = ContextBreakdown::from_trace(&t);
         let state = ViewState::collapsed(Some(Section::Tools));
@@ -2995,21 +2940,11 @@ mod tests {
     }
 
     #[test]
-    fn tool_drill_lists_all_factors_not_just_top_three() {
+    fn tool_drill_lists_tool_tokens() {
         let mut t = trace(100_000, 1_000, 0, 0, 2_000, 0);
-        t.tools.tools_selected = vec![ToolSelected {
+        t.tools.visible_tools = vec![VisibleTool {
             tool_name: "bash".into(),
-            score: 0.9,
             tokens: 200,
-            selection_factors: (0..6)
-                .map(
-                    |i| astra_turn_core::context_assembly_trace::SelectionFactor {
-                        factor_name: format!("factor_{i}"),
-                        weight: 0.1 * (i as f64),
-                        contribution: 0.05 * (i as f64),
-                    },
-                )
-                .collect(),
         }];
         let b = ContextBreakdown::from_trace(&t);
         let state = ViewState {
@@ -3023,11 +2958,8 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect::<Vec<_>>()
             .join(" ");
-        // Only the first three factors get captured upstream in the
-        // model (intentional cap on the data). Still verify the
-        // drill renders all of whatever's in the model.
-        assert!(text.contains("factor_0"));
-        assert!(text.contains("factor_2"));
+        assert!(text.contains("bash"));
+        assert!(text.contains("200 tokens"));
     }
 
     #[test]
@@ -3048,11 +2980,9 @@ mod tests {
             tokens: 100,
             source: MemorySource::Memoria,
         }];
-        t.tools.tools_selected = vec![ToolSelected {
+        t.tools.visible_tools = vec![VisibleTool {
             tool_name: "bash".into(),
-            score: 0.5,
             tokens: 200,
-            selection_factors: Vec::new(),
         }];
         let b = ContextBreakdown::from_trace(&t);
         assert_eq!(section_item_count(&b, Section::History), 1);
@@ -3065,11 +2995,9 @@ mod tests {
     #[test]
     fn expanded_section_heading_has_expand_marker() {
         let mut t = trace(100_000, 2_000, 0, 0, 1_000, 0);
-        t.tools.tools_selected = vec![ToolSelected {
+        t.tools.visible_tools = vec![VisibleTool {
             tool_name: "bash".into(),
-            score: 0.9,
             tokens: 100,
-            selection_factors: Vec::new(),
         }];
         let b = ContextBreakdown::from_trace(&t);
         let state = ViewState {
@@ -3089,11 +3017,9 @@ mod tests {
     #[test]
     fn expanded_selectable_section_hints_include_tab_navigation() {
         let mut t = trace(100_000, 2_000, 0, 0, 1_000, 0);
-        t.tools.tools_selected = vec![ToolSelected {
+        t.tools.visible_tools = vec![VisibleTool {
             tool_name: "bash".into(),
-            score: 0.9,
             tokens: 100,
-            selection_factors: Vec::new(),
         }];
         let b = ContextBreakdown::from_trace(&t);
         let state = ViewState {
@@ -3153,11 +3079,9 @@ mod tests {
     #[test]
     fn line_count_matches_build_lines_len() {
         let mut t = trace(100_000, 2_000, 8_000, 0, 1_000, 500);
-        t.tools.tools_selected = vec![ToolSelected {
+        t.tools.visible_tools = vec![VisibleTool {
             tool_name: "x".into(),
-            score: 0.5,
             tokens: 100,
-            selection_factors: Vec::new(),
         }];
         let b = ContextBreakdown::from_trace(&t);
         assert_eq!(line_count(&b, 80) as usize, build_lines(&b, 80).len());

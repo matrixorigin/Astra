@@ -98,7 +98,7 @@ This is the index. Each document is the **single source of truth** for its domai
 |----------|-------|
 | [Memory Architecture](memory/README.md) | Cognitive architecture: episodic/semantic/procedural memory, context engineering, attention budget, compaction, memory lifecycle |
 | [Trust and Safety](trust-and-safety.md) | Decision audit, hallucination firewall, uncertainty quantification, regression gate, observability, guardrails |
-| [Skills and Tools](skills-and-tools.md) | Skill system: Skill-as-Package (stateful architecture, schema, install lifecycle, credential management, configuration center), selection pipeline (retrieve → audit → feedback), MCP compatibility, tool design, progressive disclosure, marketplace |
+| [Skills and Tools](skills-and-tools.md) | Skill system: Skill-as-Package (stateful architecture, schema, install lifecycle, credential management, configuration center), deterministic tool surface, deferred activation, MCP compatibility, progressive disclosure, marketplace |
 | [Agents and Orchestration](agents-and-orchestration.md) | ChatLoop, PAOR planning, multi-agent delegation, streaming, sub-agent architecture |
 | [Data Versioning](data-versioning.md) | Git for Data: time travel, sandbox, branching, cost-aware branching, training data pipeline |
 | [Evaluation and Evolution](evaluation-and-evolution.md) | Quality scoring, replay gating, prompt auto-evolution, implicit feedback mining, self-improving agents, meta-learning closed loop |
@@ -116,7 +116,6 @@ This is the index. Each document is the **single source of truth** for its domai
 | [Prompt Lifecycle](prompt-lifecycle.md) | Prompt assembly pipeline, unified prompt path, edge-cloud tool merging, prompt versioning via time travel, prompt A/B testing via branching, self-model section |
 | [Context Window Management](context-window-management.md) | Context as managed resource: procedural memory at point of use, history sliding window, exploration guardrails, zone-based token budgets |
 | [Token-Efficient Hierarchical LLM Routing](token-efficient-llm-routing.md) | Hierarchical Confidence Cascade: Tier 0 regex → Tier 1 cheapest LLM → Tier 2 main, intent-based context pruning, 45-60% cost reduction |
-| [Tool / Skill Selection: TF-IDF + Embedding Hybrid](tool-skill-selection-embedding-hybrid.md) | Planned: cascade rerank to cut tool/skill schema tokens; runtime-config + rate limits; TF-IDF fallback; closed-loop / per-user guardrails |
 | [Tool Result Quality Firewall](tool-result-quality-firewall.md) | Pre-LLM tool result quality assessment: schema-driven completeness checks, structural inference, quality annotation injection, trust pipeline integration |
 
 ### Supporting Documents (Implementation)

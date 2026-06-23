@@ -1,12 +1,11 @@
 # Skills and Tools
 
 > **Status**: Core Design — single source of truth for skill/tool/MCP architecture
-> **Last Updated**: 2026-07-10
-> **Supersedes**: `skills-and-tools-v1-python.md` (pre-Rust migration, archived for reference)
+> **Last Updated**: 2026-06-23
 > **Implementation**: Rust — `rust/crates/runtime/src/skills/`, `rust/crates/runtime/src/tool_registry/`
 >
 > 🟢 **Implemented**: UnifiedSkillRegistry, SKILL.md parser, 16 bundled skills, local/MCP providers,
-> ToolRegistry with pinned/dynamic split, token budget system, file watcher hot-reload,
+> ToolRegistry with deterministic pinned/deferred surface, explicit deferred activation, surface reporting, file watcher hot-reload,
 > CLI commands (/skill list|info|search|new|dev|test|doctor|validate|config|system),
 > non-blocking permission checks, skill tool schema injection.
 >
@@ -24,7 +23,7 @@ Skills and Tools are orthogonal systems that serve different purposes:
 | Aspect       | Tool                              | Skill                                |
 |--------------|-----------------------------------|--------------------------------------|
 | **What**     | JSON schema for LLM function call | AI instruction set (SKILL.md)        |
-| **Selection**| Token budget, pinning, TF-IDF     | Metadata budget, path activation     |
+| **Selection**| Pinned surface + deferred activation | Metadata budget, path activation     |
 | **Injection**| `tools` array in API request      | System prompt text (or sub-agent)    |
 | **Execution**| Tool call → handler → result      | Inline expand or fork sub-agent      |
 | **Budget**   | Schema JSON tokens                | Metadata tokens + instruction tokens |
@@ -417,7 +416,7 @@ pub enum PinState {
 
 ---
 
-## 5. Tool Selection Pipeline [IMPLEMENTED]
+## 5. Tool Surface Pipeline [IMPLEMENTED]
 
 ### 5.1 ToolRegistry Architecture
 
@@ -425,29 +424,28 @@ pub enum PinState {
 // rust/crates/runtime/src/tool_registry/registry.rs
 pub struct ToolRegistry {
     all_schemas: Vec<Value>,                // All tool JSON schemas
-    budget_tokens: u32,                     // Token budget for dynamic tools
+    budget_tokens: u32,                     // Report/compatibility budget
     measured_costs: HashMap<String, u32>,   // Real token costs per tool
     schema_index: HashMap<String, usize>,   // O(1) name→index lookup
     pinned_schemas: Vec<(String, Value)>,   // Always-included (budget-exempt)
-    plugin_tool_names: Vec<String>,         // Dynamically registered tools
 }
 ```
 
-### 5.2 Tool Selection Layers
+### 5.2 Tool Surface Layers
 
 1. **Pinned Tools** — Always included, no budget cost (bash, read_file, write_file, etc.)
-2. **Injected Tools** — Runtime-injected (e.g., `skill` tool), pinned by default
-3. **Dynamic Tools** — Ranked by TF-IDF + intent signals, selected within budget
+2. **Deferred Tools** — Advertised compactly and activated explicitly with `tool_search(select:NAME)`
+3. **Injected Tools** — Runtime-injected schemas are pinned by default; unpinned injected schemas remain lookupable but do not enter `tools[]`
 
-### 5.3 Selection Methods (Progressive Quality)
+### 5.3 Surface Methods
 
 | Method                | Use Case              | Features                              |
 |-----------------------|-----------------------|---------------------------------------|
-| `select()`            | Basic selection       | TF-IDF + intent                       |
-| `select_with_report()`| With telemetry       | + SelectionReport                     |
-| `select_with_quality()`| Quality-aware       | + ToolQualityTracker                  |
-| `select_calibrated()` | Full pipeline         | + confidence calibration + boost      |
-| `select_routed()`     | With routing decision | Uses RoutingDecision from pipeline    |
+| `build_surface()` | Basic surface build | Pinned-only surface; conversational turns may return no tools |
+| `build_surface_with_report()` | Telemetry | Pinned-only surface + `ToolSurfaceReport` |
+| `build_surface_with_report_ctx()` | Recent-tool context | Preserves conversational short-circuit behavior |
+| `build_routed_surface()` | Pipeline-integrated surface | Returns the pinned-only surface after routing has decided the turn is tool-bearing |
+| `schema_by_name()`    | Activation/execution lookup | Resolves full schemas for explicitly selected deferred tools |
 
 ### 5.4 Skill Tool Integration
 
@@ -795,7 +793,6 @@ Both come from same MCP server but enter different systems.
 ## 15. References
 
 - [Claude Code skill system](~/claudecode) — reference implementation for CC compatibility
-- [skills-and-tools-v1-python.md](skills-and-tools-v1-python.md) — archived Python-era design (conceptual reference)
 - [skill-system-review-2026-03-31.md](../../plans/skill-system-review-2026-03-31.md) — authoritative audit
 - [tool-discovery-claude-code.md](tool-discovery-claude-code.md) — CC tool selection gap analysis
 - [context-window-management.md](context-window-management.md) — context budget architecture

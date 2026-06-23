@@ -71,7 +71,7 @@ use astra_turn_core::guardrails::turn_guard::TurnGuard;
 use astra_turn_core::guardrails::verdict_audit::AgenticVerdictAuditEvent;
 use astra_turn_core::headless_tool_body_preview::HeadlessStderrStyle;
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
-use astra_turn_core::tool_registry_report::SelectionReport;
+use astra_turn_core::tool_registry_report::ToolSurfaceReport;
 use tokio_util::sync::CancellationToken;
 
 /// Anchors journal wall-clock timestamps to a single process-local epoch so
@@ -153,7 +153,7 @@ pub use astra_turn_core::interaction_types::{
 /// Post-turn cognitive processing (ingest, stall detection, tool round,
 /// post-tool policy) runs entirely in the runtime.
 ///
-/// **CLI host**: builds payload with selector/memory/skills, POSTs to cloud API,
+/// **CLI host**: builds payload with tool surface, memory, and skills, POSTs to cloud API,
 /// consumes SSE with terminal rendering, executes tools locally.
 ///
 /// **Headless host**: receives payload from client, calls LLM directly,
@@ -163,7 +163,7 @@ pub trait AgenticLoopHost: Send {
     /// Execute one LLM turn: prepare payload → POST → consume SSE.
     ///
     /// The host is responsible for all CLI/server-specific logic:
-    /// - Building the JSON payload (selector, memory, skills, edge profile)
+    /// - Building the JSON payload (tool surface, memory, skills, edge profile)
     /// - POSTing to the LLM API (cloud or direct)
     /// - Consuming the SSE stream (via `SseStreamHost` methods on `self`)
     ///
@@ -183,7 +183,7 @@ pub trait AgenticLoopHost: Send {
         None
     }
 
-    /// Whether the host already injects round budget guidance into the system
+    /// Whether the host already injects tool round guidance into the system
     /// prompt during `execute_turn`.  When true, the agentic loop skips its
     /// own user-message guidance injection to avoid double injection.
     fn injects_round_guidance(&self) -> bool {
@@ -538,7 +538,7 @@ pub struct TelemetryState {
     /// All tool names used across all turns.
     pub all_tools_used: HashSet<String>,
     /// Selection report from the first turn's tool surface assembly.
-    pub first_selection_report: Option<SelectionReport>,
+    pub first_surface_report: Option<ToolSurfaceReport>,
     /// Budget pressure value from the first turn.
     pub first_budget_pressure: f64,
     /// Context assembly duration from the first turn (ms).
@@ -547,10 +547,8 @@ pub struct TelemetryState {
     pub first_memoria_ms: Option<u64>,
     /// All skill names selected across all turns.
     pub all_selected_skills: Vec<String>,
-    /// Marker that the full skill listing was initialized for the current outer turn.
-    pub initial_skill_selector_shortlist: Option<()>,
     /// Optional observability session for context tracing, drift detection, and auto-tuning.
-    /// When set, hooks are called at turn start/end, tool selection, etc.
+    /// When set, hooks are called at turn start/end, tool surface, etc.
     pub observability_session:
         Option<std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>>,
     /// Shared observability hub for profile/experiment management.
@@ -563,7 +561,7 @@ pub struct TelemetryState {
     /// Runtime promotion verdicts captured for later audit/report persistence.
     pub promotion_events: Vec<RuntimePromotionEventData>,
     /// Optional turn trace collector for detailed context assembly observability.
-    /// When set, records system prompt, history, memory, and tool selection traces.
+    /// When set, records system prompt, history, memory, and tool surface traces.
     /// Created at turn start, finalized at turn end.
     pub turn_trace_collector: Option<crate::turn::turn_trace_collector::TurnTraceCollector>,
     /// Number of turns completed in this loop invocation (for tuning cycle trigger).
@@ -618,16 +616,14 @@ pub struct StallTrackingState {
     /// when the model has produced a long streak of consecutive single-tool
     /// rounds despite the soft prompt-layer nudge. One-shot per turn.
     pub forced_parallel_batching: bool,
-    /// Whether the round-budget convergence guard injected its phase-1
-    /// corrective this loop. Phase-1 fires when `state.llm_rounds_completed`
-    /// crosses the effective round-budget hard limit; it tells the model
-    /// to produce a final answer next round and (in the runtime) restricts
-    /// all tools so the next round must be text-only. One-shot per turn.
-    pub forced_round_budget_phase1: bool,
-    /// Whether the round-budget guard escalated to phase-2 (hard abort).
-    /// Set when phase-1 fired and the model still attempted tool calls on
-    /// the very next round. One-shot per turn.
-    pub forced_round_budget_phase2: bool,
+    /// Whether the circuit breaker injected the tool-round hard-stop
+    /// corrective this loop. It tells the model to produce a final answer
+    /// next round and restricts all tools so the next round must be text-only.
+    /// One-shot per turn.
+    pub forced_tool_round_hard_stop: bool,
+    /// Whether the circuit breaker escalated to a hard abort after the
+    /// hard-stop corrective was ignored. One-shot per turn.
+    pub forced_tool_round_abort: bool,
     /// Monotonic count of circuit-breaker introspection (self-check) prompts
     /// injected this turn. Used for post-turn telemetry so operators can see
     /// how often the breaker nudged the model on long read-only sessions.
@@ -645,7 +641,7 @@ pub struct StallTrackingState {
     /// corrective this turn. Without this one-shot, a model that responds
     /// with text-only completions while the task board still has unfinished
     /// work would keep re-triggering the gate every BreakLoop round —
-    /// burning the global round budget instead of letting the terminal
+    /// burning the global tool round instead of letting the terminal
     /// guard rewrite the answer with a structured interruption record.
     /// One-shot per turn; reset in `reset_per_turn_corrective_state`.
     pub forced_task_board_completion_gate: bool,
@@ -674,7 +670,7 @@ pub struct StallTrackingState {
     /// Whether the exploration-family corrective escalated to a stronger
     /// convergence directive after the model spent a later round attempting
     /// ONLY tools from the already-restricted family. One-shot per turn.
-    pub forced_exploration_family_phase2: bool,
+    pub forced_exploration_family_lockout: bool,
     /// Dominant exploratory family currently under runtime correction. Used
     /// to detect whether later blocked rounds are simply retrying the same
     /// low-yield path instead of switching families or synthesizing.
@@ -683,7 +679,7 @@ pub struct StallTrackingState {
     /// Limits nudge frequency (at most one per stall type per session).
     pub nudge_count: u32,
     /// Anomaly-based circuit breaker for the agentic loop.
-    /// Replaces the old countdown-based round budget phase1/phase2 logic.
+    /// Owns tool-round hard-stop and abort decisions.
     pub circuit_breaker: astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker,
     /// Rolling-stats guardrail auto-tuner for the auto-reflection signal
     /// threshold. Observes per-turn outcomes and adjusts the threshold by
@@ -1188,10 +1184,10 @@ pub struct AgenticLoopState {
     pub agentic_turn_budget: astra_turn_core::chat_turn_heuristics::AgenticTurnBudget,
     /// Current agentic loop turn index (0-based, updated each iteration).
     /// Used by the CLI to inject `round_index` into the bridge payload so the
-    /// system prompt can include round budget directives.
+    /// system prompt can include tool round directives.
     pub current_round_index: u32,
     /// Actual number of LLM calls completed in this turn (not inflated by
-    /// progressive penalty).  Used for round budget guidance injection.
+    /// progressive penalty).  Used for tool round guidance injection.
     pub llm_rounds_completed: u32,
     /// Number of history messages that were visible to the most recent LLM
     /// request. Microcompact uses this to avoid rewriting older, already-sent
@@ -1206,10 +1202,10 @@ pub struct AgenticLoopState {
     /// cleared; the bridge prunes it naturally when a later diagnosis drops the
     /// tool from its recommendation.
     pub boosted_tools: HashSet<String>,
-    /// One-shot flag set by pipeline `widen_selection` strategy. The flag is
+    /// One-shot flag set by pipeline `widen_surface` strategy. The flag is
     /// consumed (reset to false) on the next authoritative tool-visibility
     /// assembly; soft health diagnostics no longer hide tools from the schema.
-    pub widen_selection_pending: bool,
+    pub widen_surface_pending: bool,
     pub step_recorder: StepRecorder,
 
     // ── Dedup + caching ──
@@ -1398,13 +1394,6 @@ pub struct AgenticLoopState {
     /// Optional step signal collector for within-turn outcome tracking.
     pub step_signal_collector: Option<astra_turn_core::liquid_step_signals::StepSignalCollector>,
 
-    // ── Tool selection budget override ──
-    /// Scenario-driven override for the tool selection token budget.
-    /// When `Some(n)` with n > 0, the host should use this instead of the
-    /// registry's default budget (800 tokens) when building the selection context.
-    /// Set by `apply_adaptive_execution_profile` from `config.tool_selection.tool_budget_tokens`.
-    pub tool_budget_override: Option<u32>,
-
     /// Recent tactical adaptations applied while liquid tactical tuning runs.
     pub recent_tactical_actions: Vec<String>,
 
@@ -1427,7 +1416,7 @@ pub struct AgenticLoopState {
     // ── Session-memory extraction (LLM-backed L1) ──
     /// Coordinator for background session-memory extraction. When `Some`,
     /// `finalize_and_render` calls `svc.maybe_spawn(req)` after each
-    /// turn; the service owns LLM selector resolution, selector
+    /// turn; the service owns background model resolution, extraction
     /// cooldown, in-flight dedup, the event stream, the UX broker,
     /// AND the per-session debounce state. When `None` (tests, sub-runs
     /// that opt out), no extraction happens and no events are emitted.
@@ -1452,7 +1441,7 @@ pub struct AgenticLoopState {
         std::sync::Mutex<astra_turn_core::cloud_session_memory_extract::SessionMemoryState>,
     >,
 
-    /// Resolved selector-model params used by the background memory
+    /// Resolved background-model params used by the memory
     /// extraction runner (see `turn::memory_extraction_runner`). Shared
     /// with `memory_relevance` and lesson synthesis — same "cheap
     /// background LLM" resolved once per session via
@@ -1469,9 +1458,9 @@ pub struct AgenticLoopState {
     pub approval_overrides: Option<astra_turn_core::approval_fingerprint::FingerprintedOverrides>,
 
     // ── Confidence tracking ──
-    /// Tracks selector confidence trends across turns to detect floor loops.
+    /// Tracks tool-surface confidence trends across turns to detect floor loops.
     pub confidence_trend: astra_turn_core::confidence_contract::ConfidenceTrendTracker,
-    /// Last diagnosis computed after tool selection (for telemetry and fallback).
+    /// Last diagnosis computed after tool surface (for telemetry and fallback).
     pub last_confidence_diagnosis:
         Option<astra_turn_core::confidence_contract::ConfidenceDiagnosis>,
 
@@ -2037,15 +2026,15 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             );
         }
 
-        // Trace: tool_selection
+        // Trace: tool_surface
         if let Some(ref mut buf) = state.turn_event_buffer {
             let tool_count = turn_result.accum.tool_calls.len();
             let mut attrs = std::collections::HashMap::new();
             attrs.insert("tool_count".into(), tool_count.to_string());
             record_trace_span(
                 buf,
-                format!("select_{}", turn_index),
-                "tool_selection",
+                format!("surface_{}", turn_index),
+                "tool_surface",
                 llm_wall_start,
                 Some(format!("llm_{}", turn_index)),
                 Some(&attrs),
@@ -2374,12 +2363,12 @@ pub fn make_test_loop_state() -> AgenticLoopState {
 
 /// **Test-only.** Like [`make_test_loop_state`], but resolves workflow-guard
 /// thresholds (`max_identical_tool_calls`, `max_tools_per_turn`) through
-/// [`astra_config::runtime_config::ToolSelectionConfig::resolve_for_model`], so a
+/// [`astra_config::runtime_config::ToolPolicyConfig::resolve_for_model`], so a
 /// request carrying a specific model id sees that model's profile.
 #[cfg(any(test, feature = "bridge-e2e-hooks"))]
 pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
     let policy = astra_config::runtime_config::RuntimeConfig::load()
-        .tool_selection
+        .tool_policy
         .resolve_for_model(model);
     AgenticLoopState {
         messages: Vec::new(),
@@ -2414,7 +2403,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         turn_guard: TurnGuard::new(),
         restricted_tools: HashSet::new(),
         boosted_tools: HashSet::new(),
-        widen_selection_pending: false,
+        widen_surface_pending: false,
         step_recorder: StepRecorder::new("test-user", "test-session", "test-task"),
         idempotency_cache: InMemoryIdempotencyCache::new(),
         semantic_dedup: SemanticDedup::new(0.95),
@@ -2472,7 +2461,6 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         permission_handler: None,
         tactical_adapter: None,
         step_signal_collector: None,
-        tool_budget_override: None,
         recent_tactical_actions: Vec::new(),
         server_tool_executor: None,
         interruption: None,
@@ -2883,7 +2871,7 @@ pub(crate) mod tests {
 
     pub(crate) fn make_state() -> AgenticLoopState {
         let tool_policy =
-            astra_config::runtime_config::ToolSelectionConfig::default().resolve_for_model(None);
+            astra_config::runtime_config::ToolPolicyConfig::default().resolve_for_model(None);
 
         AgenticLoopState {
             messages: Vec::new(),
@@ -2918,7 +2906,7 @@ pub(crate) mod tests {
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
             boosted_tools: HashSet::new(),
-            widen_selection_pending: false,
+            widen_surface_pending: false,
             step_recorder: StepRecorder::new("test-user", "test-session", "test-task"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.95),
@@ -2976,7 +2964,6 @@ pub(crate) mod tests {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
@@ -6183,7 +6170,7 @@ pub(crate) mod tests {
             ),
         ])
         .with_valid_tools(&["bash", "read_file"])
-        // Auto mode suppresses the circuit breaker's phase1 correction so
+        // Auto mode suppresses the circuit breaker's hard-stop correction so
         // the hybrid's abort path is observed in isolation. In production
         // a concurrent circuit-breaker trip is also a valid termination
         // signal; the hybrid just provides a narrower reason.
@@ -8841,15 +8828,12 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let mut state = make_state();
         state.telemetry.observability_session = Some(session.clone());
         state.max_turn_input_tokens = 100_000;
-        state.tool_budget_override = Some(1000);
-
         {
             let mut guard = session.write().unwrap();
             guard.config.verification.strictness = 0.5;
             guard.config.verification.max_strictness = 0.9;
             guard.config.compression.compression_threshold = 0.8;
             guard.config.context_window.compression_threshold_min = 0.5;
-            guard.config.tool_selection.tool_budget_tokens = 1000;
             guard.config.token_budget.max_turn_input_tokens = 100_000;
         }
 
@@ -8876,7 +8860,6 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let guard = session.read().unwrap();
         assert!(guard.config.verification.strictness > 0.5);
         assert!(state.turn_guard.health.is_deprioritized("bash"));
-        assert_eq!(state.tool_budget_override, Some(850));
         assert!(guard.config.compression.compression_threshold < 0.8);
         assert!(guard.config.token_budget.max_turn_input_tokens < 100_000);
         assert_eq!(
@@ -8887,7 +8870,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
     }
 
     #[test]
-    fn tactical_budget_mutations_survive_next_adaptive_profile_application() {
+    fn tactical_turn_budget_mutations_survive_next_adaptive_profile_application() {
         use astra_turn_core::liquid_tactical::TacticalAction;
 
         let hub = make_hub();
@@ -8903,7 +8886,6 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 guard.record_query("fix the failing bug in the parser");
             }
             guard.config.context_window.adaptive = true;
-            guard.config.tool_selection.tool_budget_tokens = 1100;
             guard.config.token_budget.max_turn_input_tokens = 100_000;
             guard.config.compression.compression_threshold = 0.8;
             guard.config.context_window.compression_threshold_min = 0.5;
@@ -8922,26 +8904,15 @@ print(json.dumps({'context': 'user said: ' + msg}))
             ],
         );
 
-        let lowered_tool_budget = state.tool_budget_override.expect("tool budget override");
         let lowered_turn_budget = state.max_turn_input_tokens;
-        assert!(lowered_tool_budget < 1100);
         assert!(lowered_turn_budget < 100_000);
 
         apply_adaptive_execution_profile_with_intent(&mut state, None);
 
         let guard = session.read().unwrap();
         assert_eq!(
-            state.tool_budget_override,
-            Some(lowered_tool_budget),
-            "scenario profile should not wipe tactical tool budget reductions"
-        );
-        assert_eq!(
             state.max_turn_input_tokens, lowered_turn_budget,
             "scenario profile should not wipe tactical turn budget reductions"
-        );
-        assert_eq!(
-            guard.config.tool_selection.tool_budget_tokens, lowered_tool_budget,
-            "session config should retain tactical tool budget reductions across turns"
         );
         assert_eq!(
             guard.config.token_budget.max_turn_input_tokens, lowered_turn_budget as u32,

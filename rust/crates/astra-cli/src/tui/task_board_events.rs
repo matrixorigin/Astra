@@ -6,7 +6,7 @@
 //! something was removed — so the renderer can flash a "just
 //! happened" highlight on the affected row for a short TTL.
 //!
-//! This mirrors the feedback claude-code gets from its task-state
+//! This mirrors the feedback reference-agent gets from its task-state
 //! reducer but keeps it server-local: no dedicated event bus, just a
 //! pure `diff(prev, new) -> Vec<TaskBoardEvent>` call in the observer
 //! after each fetch plus a small ring buffer of recent events.

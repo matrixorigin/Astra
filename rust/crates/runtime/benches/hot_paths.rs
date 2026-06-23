@@ -9,11 +9,149 @@ use astra_runtime::bridge::sse_events::{find_sse_frame_end, parse_sse_json_frame
 use astra_runtime::prompts::{estimate_str_tokens, estimate_tokens};
 use astra_runtime::text_tokenize::{build_tf, tokenize};
 use astra_runtime::tool_registry::ConversationState;
-use astra_runtime::tool_registry::TOOL_CATALOG;
-use astra_runtime::tool_registry::scoring::pre_filter_dynamic;
-use astra_runtime::tool_registry::tool_pool::{
-    SearchableToolMeta, ToolDenyPredicate, ToolPool, ToolSearchConfig, ToolSource, select_two_phase,
-};
+
+// ── Tool Surface: build_pinned_surface (hot path, every turn) ──────
+
+fn bench_build_pinned_surface(c: &mut Criterion) {
+    let catalog = astra_tools::schemas::all_tool_schemas();
+    let cfg = astra_config::ToolSurfaceConfig::default();
+
+    let mut group = c.benchmark_group("build_pinned_surface");
+    group.bench_function("default_13_pinned", |b| {
+        b.iter(|| {
+            astra_runtime::tool_registry::surface::ToolSurface::build(
+                black_box(catalog.clone()),
+                black_box(&cfg),
+                black_box(&[]),
+            )
+        })
+    });
+    group.finish();
+}
+
+// ── Tool Surface: default_pinned_names (LazyLock derivation) ──────
+
+fn bench_default_pinned_names(c: &mut Criterion) {
+    let mut group = c.benchmark_group("default_pinned_names");
+    group.bench_function("cached_access", |b| {
+        b.iter(|| astra_runtime::tool_registry::surface::default_pinned_names())
+    });
+    group.finish();
+}
+
+// ── Schema Prune: inject_required_tool_names (O(n+m) HashMap path) ─
+
+fn bench_inject_required_tool_names(c: &mut Criterion) {
+    let all_schemas: Vec<serde_json::Value> = astra_tools::schemas::all_tool_schemas();
+    let required: &[&str] = &["bash", "skill", "tool_search", "task", "memory"];
+    let surface = vec![
+        all_schemas
+            .iter()
+            .find(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    == Some("read_file")
+            })
+            .cloned()
+            .unwrap(),
+        all_schemas
+            .iter()
+            .find(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    == Some("write_file")
+            })
+            .cloned()
+            .unwrap(),
+    ];
+    use astra_turn_core::tool_registry_report::ToolSurfaceReport;
+    let report = ToolSurfaceReport {
+        visible_count: surface.len() as u32,
+        visible_tools: surface
+            .iter()
+            .filter_map(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(String::from)
+            })
+            .collect(),
+        budget_used: 0,
+        budget_total: 800,
+    };
+
+    let mut group = c.benchmark_group("inject_required_tool_names");
+    group.bench_function("5_required_into_2_visible", |b| {
+        b.iter(|| {
+            let mut s = black_box(surface.clone());
+            let mut r = black_box(report.clone());
+            astra_turn_core::tool_schema_prune::inject_required_tool_names(
+                black_box(&mut s),
+                black_box(&mut r),
+                black_box(required),
+                black_box(&all_schemas),
+            )
+        })
+    });
+    group.finish();
+}
+
+// ── Schema Prune: pin_invoked_tool_schemas (O(n+m) HashMap path) ──
+
+fn bench_pin_invoked_tool_schemas(c: &mut Criterion) {
+    let all_schemas: Vec<serde_json::Value> = astra_tools::schemas::all_tool_schemas();
+    let tool_results: Vec<serde_json::Value> = vec![
+        json!({"name": "web_fetch", "tool_call_id": "c1", "content": "ok"}),
+        json!({"name": "github", "tool_call_id": "c2", "content": "{}"}),
+        json!({"name": "mo_query", "tool_call_id": "c3", "content": "ok"}),
+        json!({"name": "str_replace", "tool_call_id": "c4", "content": "ok"}),
+        json!({"name": "bash", "tool_call_id": "c5", "content": "ok"}),
+    ];
+    let surface = vec![
+        all_schemas
+            .iter()
+            .find(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    == Some("read_file")
+            })
+            .cloned()
+            .unwrap(),
+    ];
+    use astra_turn_core::tool_registry_report::ToolSurfaceReport;
+    let report = ToolSurfaceReport {
+        visible_count: surface.len() as u32,
+        visible_tools: surface
+            .iter()
+            .filter_map(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(String::from)
+            })
+            .collect(),
+        budget_used: 0,
+        budget_total: 800,
+    };
+
+    let mut group = c.benchmark_group("pin_invoked_tool_schemas");
+    group.bench_function("5_results_1_visible", |b| {
+        b.iter(|| {
+            let mut s = black_box(surface.clone());
+            let mut r = black_box(report.clone());
+            astra_turn_core::tool_schema_prune::pin_invoked_tool_schemas(
+                black_box(&mut s),
+                black_box(&mut r),
+                black_box(&tool_results),
+                black_box(&all_schemas),
+            )
+        })
+    });
+    group.finish();
+}
 
 // ── Token Estimation ───────────────────────────────────────────────
 
@@ -64,117 +202,6 @@ fn bench_estimate_tokens_messages(c: &mut Criterion) {
         &large_msgs,
         |b, msgs| b.iter(|| estimate_tokens(black_box(msgs), 0, 0)),
     );
-    group.finish();
-}
-
-// ── Tool Selection Pipeline ────────────────────────────────────────
-
-fn bench_pre_filter_dynamic(c: &mut Criterion) {
-    let queries = [
-        ("github_fetch", "list open PRs in matrixorigin/matrixone"),
-        ("git_local", "show me the last 5 commits"),
-        ("analytical_cn", "分析一下之前的决策"),
-        ("vague_0sig", "我关注matrixorigin"),
-        ("memory_action_store", "记住我喜欢用 Rust"),
-        ("code_write", "create a new file called main.rs"),
-    ];
-
-    let mut group = c.benchmark_group("pre_filter_dynamic");
-    for (label, query) in &queries {
-        let state = ConversationState::from_message(query, 3);
-        group.bench_with_input(BenchmarkId::new(*label, query.len()), query, |b, q| {
-            b.iter(|| pre_filter_dynamic(black_box(&state), black_box(q), &Default::default()))
-        });
-    }
-    group.finish();
-}
-
-// ── Two-phase ToolPool selection ─────────────────────────────────────
-
-struct DenyNone;
-impl ToolDenyPredicate for DenyNone {
-    fn denied(&self, _tool_name: &str) -> bool {
-        false
-    }
-}
-
-#[derive(Clone)]
-struct MapStore {
-    map: std::collections::HashMap<String, serde_json::Value>,
-}
-
-impl astra_runtime::tool_registry::tool_pool::ToolSchemaStore for MapStore {
-    fn schema_by_name(&self, name: &str) -> Option<serde_json::Value> {
-        self.map.get(name).cloned()
-    }
-}
-
-fn build_synthetic_pool(n: usize) -> ToolPool<MapStore> {
-    // Include built-in catalog entries first (so pinned tools exist).
-    let mut index: Vec<SearchableToolMeta> = TOOL_CATALOG
-        .iter()
-        .map(SearchableToolMeta::from_catalog)
-        .collect();
-
-    // Add synthetic tools to simulate huge MCP/plugin pools.
-    // Deterministic pseudo-random text without depending on rand crate.
-    for i in 0..n {
-        index.push(SearchableToolMeta {
-            name: format!("mcp__synthetic_tool_{i}"),
-            short: format!("Synthetic tool {i} for searching logs, prs, diffs, memory, code"),
-            intents: vec!["search", "inspect"],
-            estimated_schema_tokens: 40,
-            pinned: false,
-            source: ToolSource::Mcp,
-        });
-    }
-
-    let mut map = std::collections::HashMap::new();
-    // Provide minimal schemas for all tools in the index.
-    for m in &index {
-        map.insert(
-            m.name.clone(),
-            json!({
-                "type":"function",
-                "function": {
-                    "name": m.name,
-                    "description": m.short,
-                    "parameters": {"type":"object","properties":{}}
-                }
-            }),
-        );
-    }
-
-    ToolPool {
-        index,
-        store: MapStore { map },
-    }
-}
-
-fn bench_two_phase_tool_pool(c: &mut Criterion) {
-    let sizes = [0usize, 1_000, 10_000];
-    let terms = [
-        "matrixorigin".to_string(),
-        "latest".to_string(),
-        "pr".to_string(),
-    ];
-    let cfg = ToolSearchConfig {
-        max_candidates: 24,
-        budget_tokens: 1200,
-        max_prior_discovered: 0,
-    };
-
-    let mut group = c.benchmark_group("tool_pool_two_phase");
-    for n in sizes {
-        let pool = build_synthetic_pool(n);
-        group.bench_with_input(BenchmarkId::new("index_size", n), &pool, |b, p| {
-            b.iter(|| {
-                let out =
-                    select_two_phase(black_box(p), black_box(&DenyNone), black_box(&terms), cfg);
-                black_box(out.len())
-            })
-        });
-    }
     group.finish();
 }
 
@@ -309,10 +336,12 @@ criterion_group!(
     bench_estimate_tokens_messages,
     bench_tokenize,
     bench_build_tf,
-    bench_pre_filter_dynamic,
-    bench_two_phase_tool_pool,
     bench_sse_frame_end,
     bench_parse_sse_json_frame,
     bench_conversation_state,
+    bench_build_pinned_surface,
+    bench_default_pinned_names,
+    bench_inject_required_tool_names,
+    bench_pin_invoked_tool_schemas,
 );
 criterion_main!(benches);

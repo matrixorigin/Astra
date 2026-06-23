@@ -1,6 +1,6 @@
-//! Explicit low-confidence fallback behavior for tool selection.
+//! Explicit low-confidence fallback behavior for tool surface.
 //!
-//! When the selector's routing confidence falls below a defined threshold,
+//! When tool-surface routing confidence falls below a defined threshold,
 //! the runtime should take explicit action rather than silently widening
 //! the tool set. This module defines the fallback contract and emits
 //! enough telemetry to diagnose confidence-floor loops from real sessions.
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfidenceTier {
-    /// Confidence ≥ 0.6: high certainty, proceed with selected tools.
+    /// Confidence ≥ 0.6: high certainty, proceed with the routed surface.
     High,
     /// 0.4 ≤ confidence < 0.6: moderate, proceed but log for calibration.
     Moderate,
@@ -48,18 +48,16 @@ impl ConfidenceTier {
     }
 }
 
-/// What the selector should do when confidence is low.
+/// What tool-surface routing should do when confidence is low.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfidenceFallback {
     /// Proceed normally (high/moderate confidence).
     Proceed,
     /// Widen the tool set to include more candidates.
-    Broaden,
-    /// Escalate to LLM-based selection.
-    EscalateToLlm,
-    /// Inject an advisory into the system prompt asking the LLM to clarify.
-    InjectClarificationAdvisory,
+    BroadenSurface,
+    /// Ask for clarification instead of guessing with an oversized surface.
+    RequireClarification,
 }
 
 /// Determine the appropriate fallback action for a given confidence tier.
@@ -68,8 +66,8 @@ pub fn fallback_for_tier(tier: ConfidenceTier) -> ConfidenceFallback {
     match tier {
         ConfidenceTier::High => ConfidenceFallback::Proceed,
         ConfidenceTier::Moderate => ConfidenceFallback::Proceed,
-        ConfidenceTier::Low => ConfidenceFallback::Broaden,
-        ConfidenceTier::VeryLow => ConfidenceFallback::EscalateToLlm,
+        ConfidenceTier::Low => ConfidenceFallback::BroadenSurface,
+        ConfidenceTier::VeryLow => ConfidenceFallback::RequireClarification,
     }
 }
 
@@ -106,7 +104,7 @@ pub enum LowConfidenceReason {
 }
 
 impl ConfidenceDiagnosis {
-    /// Build a diagnosis from selector context.
+    /// Build a diagnosis from routing context.
     pub fn diagnose(
         confidence: f64,
         signal_count: usize,
@@ -167,9 +165,9 @@ impl ConfidenceDiagnosis {
 
 /// Tracks confidence trends across turns to detect confidence-floor loops.
 ///
-/// A confidence-floor loop occurs when the selector is stuck at the minimum
+/// A confidence-floor loop occurs when routing is stuck at the minimum
 /// confidence for multiple consecutive turns, indicating that the routing
-/// signals are not improving and the tool selection strategy is ineffective.
+/// signals are not improving and the tool surface strategy is ineffective.
 #[derive(Debug, Default)]
 pub struct ConfidenceTrendTracker {
     /// Per-turn confidence scores.
@@ -253,11 +251,11 @@ mod tests {
         );
         assert_eq!(
             fallback_for_tier(ConfidenceTier::Low),
-            ConfidenceFallback::Broaden
+            ConfidenceFallback::BroadenSurface
         );
         assert_eq!(
             fallback_for_tier(ConfidenceTier::VeryLow),
-            ConfidenceFallback::EscalateToLlm
+            ConfidenceFallback::RequireClarification
         );
     }
 

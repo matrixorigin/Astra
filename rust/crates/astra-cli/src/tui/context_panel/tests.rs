@@ -7,7 +7,7 @@ use astra_turn_core::context_assembly_trace::{
     Alternative, CompressionMethod, ContextAssemblyTrace, DecisionExplanation, DecisionType,
     HistorySelectionTrace, MemoryInjection, MemoryRejection, MemorySelection, MemorySource,
     PromptContextSignals, PromptGuidanceSignals, RejectionReason, SkillInjection,
-    SystemPromptBreakdown, TokenBudgetTrace, ToolSelected, TurnCompression, TurnRetention,
+    SystemPromptBreakdown, TokenBudgetTrace, TurnCompression, TurnRetention, VisibleTool,
 };
 
 fn trace(max: u32, sys: u32, hist: u32, mem: u32, tools: u32, user: u32) -> ContextAssemblyTrace {
@@ -181,24 +181,18 @@ fn free_space_zero_when_over_budget() {
 #[test]
 fn tools_sorted_by_trace_order_and_zero_filtered() {
     let mut t = trace(100_000, 1_000, 1_000, 0, 300, 0);
-    t.tools.tools_selected = vec![
-        ToolSelected {
+    t.tools.visible_tools = vec![
+        VisibleTool {
             tool_name: "alpha".into(),
-            score: 0.9,
             tokens: 120,
-            selection_factors: Vec::new(),
         },
-        ToolSelected {
+        VisibleTool {
             tool_name: "zero".into(),
-            score: 0.5,
             tokens: 0,
-            selection_factors: Vec::new(),
         },
-        ToolSelected {
+        VisibleTool {
             tool_name: "bravo".into(),
-            score: 0.8,
             tokens: 180,
-            selection_factors: Vec::new(),
         },
     ];
     let b = ContextBreakdown::from_trace(&t);
@@ -444,8 +438,8 @@ fn prompt_signals_empty_when_no_flags_set() {
 fn decisions_populated_from_explanations() {
     let mut t = trace(100_000, 1_000, 0, 0, 0, 0);
     t.explanations = vec![DecisionExplanation {
-        decision_type: DecisionType::ToolSelection {
-            tools: vec!["bash".into(), "read_file".into()],
+        decision_type: DecisionType::ToolSurface {
+            visible_tools: vec!["bash".into(), "read_file".into()],
         },
         reasoning: "Query mentioned files and shell commands.".into(),
         alternatives_considered: vec![Alternative {
@@ -458,7 +452,7 @@ fn decisions_populated_from_explanations() {
     let b = ContextBreakdown::from_trace(&t);
     assert_eq!(b.decisions.len(), 1);
     let d = &b.decisions[0];
-    assert!(d.label.contains("Tool selection"));
+    assert!(d.label.contains("Tool surface"));
     assert!(d.label.contains("bash"));
     assert!((d.confidence - 0.82).abs() < 0.001);
     assert_eq!(d.alternatives.len(), 1);

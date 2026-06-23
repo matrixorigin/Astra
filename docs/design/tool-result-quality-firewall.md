@@ -942,11 +942,11 @@ quality_event = {
 |------|---------|---------------|-------|
 | Per-turn assessment | Session cache (in-memory) | Consumed by Hallucination Firewall in same turn, then discarded | None needed |
 | Persistent event | `conversation_events` (event_type = `tool_result_quality`) | Written async via EventPipeline (fire-and-forget, batched) | Composite: `(event_type, created_at)` — already exists |
-| Analytics | `tool_quality_dashboard` view | Queried by SLO monitor, governance, CLI | View over indexed columns |
+| Analytics | Existing event queries | Queried by SLO monitor, governance, CLI | Filter on indexed event columns |
 
 **Key performance decisions:**
 
-1. **No full table scan.** The analytics view filters on `event_type = 'tool_result_quality'` which hits the existing composite index on `(event_type, created_at)`. The `created_at > NOW() - INTERVAL 7 DAY` clause further limits the scan range. At 10K tool calls/day × 7 days = 70K rows scanned — trivial for MatrixOne's AP engine.
+1. **No full table scan.** Analytics queries filter on `event_type = 'tool_result_quality'`, which hits the existing composite index on `(event_type, created_at)`. The `created_at > NOW() - INTERVAL 7 DAY` clause further limits the scan range. At 10K tool calls/day × 7 days = 70K rows scanned — trivial for MatrixOne's AP engine.
 
 2. **Async write path.** Quality events are `durable` tier (not `critical`) — they go through the async EventPipeline with batched INSERT. Zero hot-path latency impact.
 
@@ -961,16 +961,15 @@ quality_event = {
 | 1K (current) | 1K | 7K rows | <10ms |
 | 10K | 10K | 70K rows | <50ms |
 | 100K | 100K | 700K rows | <200ms (AP engine) |
-| 1M+ | Consider dedicated `tool_quality_events` table | — | Partition by day |
+| 1M+ | Keep the event-tier contract and evaluate archival/partitioning | — | No dedicated quality table by default |
 
-At 100K+ daily tool calls, consider migrating quality events to a dedicated table with day-based partitioning. Below that threshold, `conversation_events` with existing indexes is sufficient.
+At 100K+ daily tool calls, keep the write path on the existing event tier and evaluate archival or partitioning before adding new storage shapes.
 
 ### 8.3 Analytics View
 
 ```sql
 -- Which skills produce the most degraded results?
 -- Uses composite index on (event_type, created_at) — no full table scan
-CREATE VIEW tool_quality_dashboard AS
 SELECT
     JSON_EXTRACT(metadata, '$.tool_name') AS tool_name,
     COUNT(*) AS total_calls,
@@ -988,8 +987,8 @@ GROUP BY JSON_EXTRACT(metadata, '$.tool_name');
 ```python
 # Alert when a skill's quality degrades
 alerts = {
-    "tool_quality_degraded": {
-        "condition": "avg_quality < 0.5 for any skill over 24h window",
+    "tool_result_quality_degraded": {
+        "condition": "avg_quality < 0.5 for any tool result family over 24h window",
         "action": "Alert skill owner + log to SLO monitor",
     },
     "quality_annotation_ignored": {
@@ -1061,7 +1060,7 @@ No schema changes needed. Works with all existing skills.
 
 ### Phase 4: Observability (Week 4) — Operational
 
-- [x] Create `tool_quality_dashboard` analytics view
+- [x] Define quality analytics on existing event queries; no dedicated dashboard view/table
 - [ ] Add quality degradation alerts — deferred to Phase 5 (needs alerting infrastructure)
 - [x] Add "annotation ignored" detection
 - [ ] Dashboard for skill quality trends — deferred to Phase 5 (needs frontend)

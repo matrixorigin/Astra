@@ -72,9 +72,9 @@ pub fn tool_output_has_explicit_failure_signal(output: &str) -> bool {
 /// Determine whether a tool result string indicates an error.
 ///
 /// For structured JSON results (our tools), checks `"ok": false`, a non-null
-/// `"error"` field, or canonical `"status"` values. Unknown/legacy JSON
+/// `"error"` field, or canonical `"status"` values. Unknown JSON
 /// statuses fail closed. For plain-text results, accepts only stable tool
-/// failure contracts plus the legacy `Error:` prefix.
+/// failure contracts plus the `Error:` prefix used by current tools.
 pub fn is_tool_error(result_str: &str) -> bool {
     if tool_output_has_explicit_failure_signal(result_str) {
         return true;
@@ -119,9 +119,6 @@ pub const TOOL_SUCCESS_SENTINEL: &str = "<<<ASTRA_TOOL_OK>>>";
 /// 1. [`TOOL_SUCCESS_SENTINEL`] substring — the canonical contract.
 /// 2. Structured JSON success (`ok:true` / `success:true` /
 ///    `status: completed`).
-/// 3. Legacy prose prefixes (kept for backward compatibility with emitters
-///    not yet migrated to the sentinel; new mutation emitters MUST use the
-///    sentinel).
 ///
 /// This is deliberately narrower than "not an error". It exists for transport
 /// reconciliation: if edge metadata says failure but the body says a mutation
@@ -154,17 +151,7 @@ pub fn tool_output_has_explicit_success_signal(output: &str) -> bool {
         }
     }
 
-    // 3. Legacy prose prefixes. DO NOT extend this list; emit the sentinel
-    //    instead. These are kept only so emitters not yet migrated keep
-    //    working.
-    let lower = trimmed.to_ascii_lowercase();
-    lower.starts_with("replaced successfully")
-        || (lower.starts_with("applied ") && lower.contains(" edit(s) successfully"))
-        || lower.starts_with("created successfully")
-        || lower.starts_with("updated successfully")
-        || lower.starts_with("deleted successfully")
-        || lower.starts_with("saved successfully")
-        || lower.starts_with("completed successfully")
+    false
 }
 
 /// Canonical tri-state result of a tool execution.
@@ -237,8 +224,8 @@ const SOFT_ERROR_PATTERNS: &[&str] = &[
     // The canonical structured banner emitted by both
     // `astra-tools::fs_ops::str_replace_fail` and
     // `astra-cli::edge_tools::fs::str_replace_fail` is the primary
-    // sentinel; the legacy substrings below are kept for backward
-    // compatibility with older error strings still in flight.
+    // sentinel; the substrings below cover the current human-readable
+    // details that follow it.
     // Catch-all sentinel for any future str_replace failure variant. The specific
     // patterns above (old_str not found / must be unique / identical / no change)
     // already cover all current paths via short-circuit OR; this entry exists so
@@ -625,11 +612,11 @@ mod tests {
 
     #[test]
     fn explicit_success_signal_detects_str_replace_bodies() {
-        assert!(tool_output_has_explicit_success_signal(
+        let body =
+            format!("Replaced successfully\n<<<ASTRA_UNIFIED_DIFF>>>\n{TOOL_SUCCESS_SENTINEL}");
+        assert!(tool_output_has_explicit_success_signal(&body));
+        assert!(!tool_output_has_explicit_success_signal(
             "Replaced successfully\n<<<ASTRA_UNIFIED_DIFF>>>"
-        ));
-        assert!(tool_output_has_explicit_success_signal(
-            "Applied 3 edit(s) successfully\n\n<<<ASTRA_UNIFIED_DIFF>>>"
         ));
         assert!(tool_output_has_explicit_success_signal(
             r#"{"ok":true,"status":"completed"}"#
@@ -643,12 +630,12 @@ mod tests {
     }
 
     #[test]
-    fn explicit_success_signal_rejects_legacy_status_aliases() {
+    fn explicit_success_signal_rejects_noncanonical_status_aliases() {
         for status in ["ok", "success", "succeeded", "complete", "passed"] {
             let body = format!(r#"{{"status":"{status}"}}"#);
             assert!(
                 !tool_output_has_explicit_success_signal(&body),
-                "legacy status alias {status:?} must not be an explicit success signal"
+                "noncanonical status alias {status:?} must not be an explicit success signal"
             );
         }
     }
@@ -698,12 +685,12 @@ mod tests {
     }
 
     #[test]
-    fn tool_error_rejects_legacy_status_aliases() {
+    fn tool_error_rejects_noncanonical_status_aliases() {
         for status in ["ok", "success", "succeeded", "complete", "passed"] {
             let body = format!(r#"{{"status":"{status}","data":[]}}"#);
             assert!(
                 is_tool_error(&body),
-                "legacy status alias {status:?} must fail closed"
+                "noncanonical status alias {status:?} must fail closed"
             );
         }
     }

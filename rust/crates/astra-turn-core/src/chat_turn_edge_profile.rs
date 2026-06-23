@@ -66,7 +66,7 @@ fn retrieval_top_k_from_env() -> u32 {
         .unwrap_or(5) // default same as RuntimeConfig
 }
 
-/// Static `edge_profile` object before optional `active_skills` / selector hints / skills text.
+/// Static `edge_profile` object before optional `active_skills` / skill context.
 pub fn build_base_edge_profile_value(
     cwd: &str,
     git_branch: Option<String>,

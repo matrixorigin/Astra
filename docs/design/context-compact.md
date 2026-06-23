@@ -28,4 +28,4 @@ This document compares **interactive context control** with Claude Code (CC) and
 
 ## Related: large tool catalogs
 
-- Claude Code **`ToolSearchTool`** vs astra（runtime **`ToolPool`** / 两阶段 vs **CLI 未暴露搜索工具**）：见 [tool-discovery-claude-code.md](./tool-discovery-claude-code.md)。
+- Claude Code **`ToolSearchTool`** vs astra（`tool_search` + deferred activation）：见 [tool-discovery-claude-code.md](./tool-discovery-claude-code.md)。

@@ -5,9 +5,9 @@ pub fn build_explain_event(
     total_ms: i64,
     prompt_tokens: Option<i64>,
     completion_tokens: Option<i64>,
-    tools_selected: usize,
+    tool_calls: usize,
     tools_available: usize,
-    tool_selection: Option<Value>,
+    first_tool_call: Option<Value>,
     steps: Vec<Value>,
     memory: Option<Value>,
     routing: Option<Value>,
@@ -28,13 +28,12 @@ pub fn build_explain_event(
                 .map(|value| json!(value))
                 .unwrap_or(Value::Null),
         ),
-        ("tools_selected".to_string(), json!(tools_selected)),
+        ("tool_calls".to_string(), json!(tool_calls)),
         ("tools_available".to_string(), json!(tools_available)),
         (
-            "tool_selection".to_string(),
-            tool_selection.unwrap_or(Value::Null),
+            "first_tool_call".to_string(),
+            first_tool_call.unwrap_or(Value::Null),
         ),
-        ("tool_selection_fallback".to_string(), Value::Null),
         ("steps".to_string(), Value::Array(steps)),
     ]);
     if let Some(memory) = memory {
@@ -63,8 +62,7 @@ mod tests {
         assert_eq!(event["total_ms"].as_i64().unwrap(), 0);
         assert!(event["prompt_tokens"].is_null());
         assert!(event["completion_tokens"].is_null());
-        assert!(event["tool_selection"].is_null());
-        assert!(event["tool_selection_fallback"].is_null());
+        assert!(event["first_tool_call"].is_null());
         assert!(event["steps"].as_array().unwrap().is_empty());
         assert!(event.get("memory").is_none());
         assert!(event.get("routing").is_none());
@@ -88,7 +86,7 @@ mod tests {
         assert_eq!(event["total_ms"].as_i64().unwrap(), 150);
         assert_eq!(event["prompt_tokens"].as_i64().unwrap(), 1000);
         assert_eq!(event["completion_tokens"].as_i64().unwrap(), 500);
-        assert_eq!(event["tools_selected"].as_u64().unwrap(), 5);
+        assert_eq!(event["tool_calls"].as_u64().unwrap(), 5);
         assert_eq!(event["tools_available"].as_u64().unwrap(), 20);
     }
 

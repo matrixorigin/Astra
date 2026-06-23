@@ -3287,7 +3287,7 @@ impl AgenticRunLifecycleService {
             harness_sink_arc.as_ref(),
         );
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_selection
+            .tool_policy
             .resolve_for_model(request.model.as_deref());
         let restricted_tools: std::collections::HashSet<String> =
             load_deployment_disabled_tools().into_iter().collect();
@@ -3325,13 +3325,13 @@ impl AgenticRunLifecycleService {
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             boosted_tools: std::collections::HashSet::new(),
-            widen_selection_pending: false,
+            widen_surface_pending: false,
             step_recorder: StepRecorder::new(user_id, session_id, run_id),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
             call_counts: HashMap::new(),
             // Per-model workflow-guard policy (see
-            // `ToolSelectionConfig::resolve_for_model`). Built-in profiles
+            // `ToolPolicyConfig::resolve_for_model`). Built-in profiles
             // give stronger models (opus/sonnet-4) more rope than haiku.
             // Security guards (shell_obfuscation, destructive_sql) are
             // unaffected and stay uniform across models.
@@ -3410,7 +3410,6 @@ impl AgenticRunLifecycleService {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
@@ -7173,7 +7172,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         // Sub-agent / delegation path: model comes from the agent profile
         // override, not a request field.
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_selection
+            .tool_policy
             .resolve_for_model(config.agent_profile.model_override.as_deref());
         let restricted_tools: std::collections::HashSet<String> =
             load_deployment_disabled_tools().into_iter().collect();
@@ -7216,7 +7215,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             turn_guard: TurnGuard::new(),
             restricted_tools,
             boosted_tools: std::collections::HashSet::new(),
-            widen_selection_pending: false,
+            widen_surface_pending: false,
             step_recorder: StepRecorder::new(&config.user_id, &config.session_id, &config.run_id),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
@@ -7305,7 +7304,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
@@ -8766,7 +8764,7 @@ mod tests {
                 tool_calls_completed: 7,
                 turns_completed: 15,
                 remaining_turns: 0,
-                error_detail: Some("Round budget hard-limit reached".to_string()),
+                error_detail: Some("Circuit breaker hard-stop reached".to_string()),
                 stall_signal: None,
                 resume_restricted_tools: vec![],
             },
@@ -8774,7 +8772,7 @@ mod tests {
 
         let event = build_run_turn_complete_event_with_interruption(
             7,
-            "[Round budget hard-limit reached]",
+            "[Circuit breaker hard-stop reached]",
             Some(&interruption),
         );
 
@@ -8789,7 +8787,10 @@ mod tests {
         );
         assert_eq!(event["execution_state"]["tool_calls_completed"], 7);
         assert_eq!(event["execution_state"]["remaining_turns"], 0);
-        assert_eq!(event["assistant_text"], "[Round budget hard-limit reached]");
+        assert_eq!(
+            event["assistant_text"],
+            "[Circuit breaker hard-stop reached]"
+        );
     }
 
     #[test]
@@ -11129,7 +11130,7 @@ mod tests {
             None,
             None,
         );
-        state.final_text = "[Round budget hard-limit reached]".to_string();
+        state.final_text = "[Circuit breaker hard-stop reached]".to_string();
         state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
             astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
             astra_turn_core::interruption::ResumeAction::ContinueImmediately,
@@ -11138,7 +11139,7 @@ mod tests {
                 tool_calls_completed: 5,
                 turns_completed: 15,
                 remaining_turns: 0,
-                error_detail: Some("Round budget hard-limit reached".to_string()),
+                error_detail: Some("Circuit breaker hard-stop reached".to_string()),
                 stall_signal: None,
                 resume_restricted_tools: vec![],
             },

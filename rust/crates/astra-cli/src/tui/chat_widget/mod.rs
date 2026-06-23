@@ -1750,7 +1750,7 @@ impl ChatWidget {
             if let Some(ms) = item.get("total_ms").and_then(|v| v.as_i64()) {
                 line.push_str(&format!("⏱ {:.1}s", ms as f64 / 1000.0));
             }
-            if let Some(selected) = item.get("tools_selected").and_then(|v| v.as_u64()) {
+            if let Some(selected) = item.get("visible_tools").and_then(|v| v.as_u64()) {
                 if let Some(available) = item.get("tools_available").and_then(|v| v.as_u64()) {
                     if !line.is_empty() {
                         line.push_str(" | ");
@@ -3094,7 +3094,7 @@ mod tests {
     // recently-started one. These tests pin the desired post-rework
     // contract.
 
-    /// Two parallel agent spawn calls (claudecode pattern: single
+    /// Two parallel agent spawn calls (reference-agent pattern: single
     /// assistant turn, multiple Agent tool uses) must produce TWO
     /// live TaskCells, not one + one-committed-to-scrollback.
     #[test]

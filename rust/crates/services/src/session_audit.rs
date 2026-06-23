@@ -148,7 +148,7 @@ pub struct TurnDetail {
     pub ttft_ms: Option<u64>,
     pub context_ms: Option<u64>,
     pub budget_pressure: Option<f64>,
-    pub tools_selected: Vec<String>,
+    pub visible_tools: Vec<String>,
     pub tools_used: Vec<String>,
     pub model: Option<String>,
     pub has_error: bool,
@@ -1123,8 +1123,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
 
         let tool_calls = extract_tool_calls_from_metadata(&meta);
 
-        let tools_selected: Vec<String> = meta
-            .get("tools_selected")
+        let visible_tools: Vec<String> = meta
+            .get("visible_tools")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
         let tools_used: Vec<String> = meta
@@ -1187,7 +1187,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
             ttft_ms: meta.get("ttft_ms").and_then(|v| v.as_u64()),
             context_ms: meta.get("context_ms").and_then(|v| v.as_u64()),
             budget_pressure: meta.get("budget_pressure").and_then(|v| v.as_f64()),
-            tools_selected,
+            visible_tools,
             tools_used,
             model,
             has_error: meta.get("error").map(|v| !v.is_null()).unwrap_or(false),

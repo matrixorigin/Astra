@@ -218,8 +218,8 @@ pub(crate) fn append_one_shot_journal_events(
             result.completion_tokens,
             turn_start.elapsed().as_millis() as u64,
         )
-        .with_tool_selection(
-            result.tools_selected.clone(),
+        .with_tool_surface(
+            result.visible_tools.clone(),
             result.selected_skills.clone(),
             result.tools_used.clone(),
             result.budget_used,

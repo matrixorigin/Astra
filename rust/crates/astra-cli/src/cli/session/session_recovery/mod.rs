@@ -246,14 +246,10 @@ mod tests {
         obs.context_traces
             .push(astra_turn_core::context_assembly_trace::ContextAssemblyTrace {
                 turn_id: "turn-3".into(),
-                tools: astra_turn_core::context_assembly_trace::ToolSelectionTrace {
-                    selection_strategy: "code-intel".into(),
-                    selection_confidence: 0.92,
-                    tools_selected: vec![astra_turn_core::context_assembly_trace::ToolSelected {
+                tools: astra_turn_core::context_assembly_trace::ToolSurfaceTrace {
+                    visible_tools: vec![astra_turn_core::context_assembly_trace::VisibleTool {
                         tool_name: "lsp".into(),
-                        score: 1.0,
                         tokens: 0,
-                        selection_factors: Vec::new(),
                     }],
                     ..Default::default()
                 },
@@ -293,11 +289,11 @@ mod tests {
                 explanations: vec![astra_turn_core::context_assembly_trace::DecisionExplanation {
                     decision_type:
                         astra_turn_core::context_assembly_trace::DecisionType::StrategyChoice {
-                            strategy: "code-intel".into(),
+                            strategy: "symbol_context".into(),
                         },
                     reasoning: "Need symbol-aware context.".into(),
                     alternatives_considered: Vec::new(),
-                    confidence: 0.9,
+                    confidence: 0.8,
                 }],
                 ..Default::default()
             });
@@ -310,16 +306,16 @@ mod tests {
         assert_eq!(trace.turn_id, "turn-3");
         assert_eq!(
             trace
-                .tool_selection
+                .tool_surface
                 .as_ref()
-                .map(|selection| selection.selected_tools.clone()),
+                .map(|selection| selection.visible_tools.clone()),
             Some(vec!["lsp".to_string()])
         );
         assert_eq!(
             trace
-                .tool_selection
+                .tool_surface
                 .as_ref()
-                .map(|selection| selection.selection_scope.as_str()),
+                .map(|selection| selection.surface_scope.as_str()),
             Some("latest_round")
         );
         assert_eq!(

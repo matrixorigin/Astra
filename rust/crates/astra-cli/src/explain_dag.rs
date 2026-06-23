@@ -20,14 +20,11 @@ pub(crate) struct ExplainTurnMeta<'a> {
     pub(crate) routing_domain_hint: Option<String>,
     pub(crate) assistant_output: Option<&'a str>,
     pub(crate) tool_call_records: &'a [ToolCallRecord],
-    pub(crate) selection_strategy: Option<String>,
-    pub(crate) selection_confidence: Option<f64>,
-    pub(crate) selected_tools: Vec<String>,
+    pub(crate) visible_tools: Vec<String>,
 }
 
 impl<'a> ExplainTurnMeta<'a> {
     pub(crate) fn from_journal_event(event: &'a JournalEvent) -> Self {
-        let selection = event.selection_trace.as_ref();
         Self {
             turn_label: event.turn.map(|turn| format!("turn-{turn}")),
             duration_ms: event.duration_ms,
@@ -45,11 +42,7 @@ impl<'a> ExplainTurnMeta<'a> {
             routing_domain_hint: event.routing_domain_hint.clone(),
             assistant_output: event.assistant_output.as_deref(),
             tool_call_records: event.tool_calls.as_deref().unwrap_or(&[]),
-            selection_strategy: selection.map(|trace| trace.strategy.clone()),
-            selection_confidence: selection.map(|trace| trace.confidence),
-            selected_tools: selection
-                .map(|trace| trace.final_tools.clone())
-                .unwrap_or_default(),
+            visible_tools: event.visible_tools.clone().unwrap_or_default(),
         }
     }
 }
@@ -172,7 +165,9 @@ fn explain_value_u64(value: &serde_json::Value, key: &str) -> Option<u64> {
 
 fn decision_label(decision_type: &DecisionType) -> String {
     match decision_type {
-        DecisionType::ToolSelection { tools } => format!("tool selection ({} tools)", tools.len()),
+        DecisionType::ToolSurface { visible_tools } => {
+            format!("tool surface ({} tools)", visible_tools.len())
+        }
         DecisionType::HistoryCompression { turns_affected } => {
             format!("history compression ({} turns)", turns_affected.len())
         }
@@ -210,34 +205,26 @@ fn render_context_section(
         trace.token_budget.tool_schema_tokens,
         trace.token_budget.user_message_tokens
     )]);
-    let selected_tools: Vec<String> = trace
+    let visible_tools: Vec<String> = trace
         .tools
-        .tools_selected
+        .visible_tools
         .iter()
         .map(|tool| tool.tool_name.clone())
         .collect();
-    if !selected_tools.is_empty() || !trace.tools.selection_strategy.is_empty() {
+    if !visible_tools.is_empty() || trace.tools.tools_available > 0 {
         children.push(vec![format!(
-            "tool_selection strategy={} conf={:.2} selected={}/{} [{}]",
-            if trace.tools.selection_strategy.is_empty() {
-                "-".to_string()
-            } else {
-                trace.tools.selection_strategy.clone()
-            },
-            trace.tools.selection_confidence,
-            selected_tools.len(),
+            "tool_surface selected={}/{} [{}]",
+            visible_tools.len(),
             trace.tools.tools_available,
-            shorten_joined(&selected_tools, if verbose { 10 } else { 6 })
+            shorten_joined(&visible_tools, if verbose { 10 } else { 6 })
         )]);
     } else if let Some(meta) = meta
-        && (!meta.selected_tools.is_empty() || meta.selection_strategy.is_some())
+        && !meta.visible_tools.is_empty()
     {
         children.push(vec![format!(
-            "tool_selection strategy={} conf={:.2} selected={} [{}]",
-            meta.selection_strategy.as_deref().unwrap_or("-"),
-            meta.selection_confidence.unwrap_or(0.0),
-            meta.selected_tools.len(),
-            shorten_joined(&meta.selected_tools, if verbose { 10 } else { 6 })
+            "tool_surface selected={} [{}]",
+            meta.visible_tools.len(),
+            shorten_joined(&meta.visible_tools, if verbose { 10 } else { 6 })
         )]);
     }
     children.push(vec![format!(
@@ -629,8 +616,8 @@ pub(crate) fn render_explain_dag(
 #[cfg(test)]
 mod tests {
     use super::{ExplainTurnMeta, context_trace_from_json, render_explain_dag};
+    use astra_services::session_journal::JournalEvent;
     use astra_services::session_journal::ToolCallRecord;
-    use astra_services::session_journal::{JournalEvent, SelectionTrace};
     use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 
     #[test]
@@ -646,15 +633,12 @@ mod tests {
         trace.token_budget.history_tokens = 7;
         trace.token_budget.tool_schema_tokens = 3708;
         trace.tools.tools_available = 27;
-        trace.tools.selection_strategy = "registry".into();
         trace
             .tools
-            .tools_selected
-            .push(astra_turn_core::context_assembly_trace::ToolSelected {
+            .visible_tools
+            .push(astra_turn_core::context_assembly_trace::VisibleTool {
                 tool_name: "bash".into(),
-                score: 1.0,
                 tokens: 243,
-                selection_factors: Vec::new(),
             });
 
         let tool_calls = vec![
@@ -698,9 +682,7 @@ mod tests {
             routing_domain_hint: None,
             assistant_output: Some("done"),
             tool_call_records: &tool_calls,
-            selection_strategy: None,
-            selection_confidence: None,
-            selected_tools: Vec::new(),
+            visible_tools: Vec::new(),
         };
         let explain_items = vec![serde_json::json!({
             "total_ms": 2930,
@@ -749,21 +731,13 @@ mod tests {
                 }]);
         event.cache_read_tokens = Some(144);
         event.cache_creation_tokens = None;
-        event.selection_trace = Some(SelectionTrace {
-            candidate_scores: None,
-            boost_terms: None,
-            learned_context_summary: None,
-            final_tools: vec!["bash".into()],
-            confidence: 0.91,
-            strategy: "registry".into(),
-        });
+        event.visible_tools = Some(vec!["bash".into()]);
 
         let meta = ExplainTurnMeta::from_journal_event(&event);
         let text = render_explain_dag(None, Some(&meta), &[], false).expect("text");
 
         assert_eq!(meta.turn_label.as_deref(), Some("turn-3"));
-        assert_eq!(meta.selection_strategy.as_deref(), Some("registry"));
-        assert_eq!(meta.selected_tools, vec!["bash".to_string()]);
+        assert_eq!(meta.visible_tools, vec!["bash".to_string()]);
         assert!(text.contains("tokens fresh_in=21 cache_read=144 cache_write=? out=8"));
         assert!(
             text.contains("llm ms=? fresh_in=21 cache_read=144 cache_write=? out=8 tool_calls=1")

@@ -7,7 +7,7 @@
 //!   1. The 4-breakpoint Anthropic budget is respected across
 //!      system + tools + messages combined.
 //!   2. Long message histories still fit the budget — message-level markers
-//!      stay capped at Claude Code's single-tail breakpoint, leaving room
+//!      stay capped at the reference agent's single-tail breakpoint, leaving room
 //!      for system + tools.
 //!   3. Model change within the anthropic family does not churn the
 //!      cacheable prefix (same tools + same provider family → same hash,
@@ -140,7 +140,7 @@ async fn anthropic_total_cache_breakpoints_respect_four_budget() {
 
 // ── J-2: long message history still fits the budget ─────────────────────────
 //
-// Claude Code semantics keep exactly one message-level breakpoint per
+// reference-agent semantics keep exactly one message-level breakpoint per
 // Anthropic/Bedrock request regardless of history length. Long histories
 // must not accidentally reintroduce a second "historical" marker.
 #[tokio::test(flavor = "multi_thread")]
@@ -175,7 +175,7 @@ async fn long_message_history_emits_single_message_breakpoint() {
     let msg_bps: usize = c.messages.iter().map(count_cache_control).sum();
     assert_eq!(
         msg_bps, 1,
-        "Claude Code semantics require exactly one message breakpoint, got {msg_bps}"
+        "reference-agent semantics require exactly one message breakpoint, got {msg_bps}"
     );
 }
 

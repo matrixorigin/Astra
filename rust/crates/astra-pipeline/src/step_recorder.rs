@@ -12,8 +12,8 @@
 //! // Before main loop:
 //! recorder.begin_turn(turn_number);
 //!
-//! // After tool selection (PLAN phase):
-//! recorder.record_plan(selected_tools, confidence, budget_pressure);
+//! // After tool surface (PLAN phase):
+//! recorder.record_plan(visible_tools, budget_pressure, budget_tokens);
 //!
 //! // Before each tool execution:
 //! recorder.begin_tool(tool_name, &args);
@@ -400,11 +400,10 @@ impl StepRecorder {
         }
     }
 
-    /// Record tool selection completion (PLAN phase).
+    /// Record tool surface completion (PLAN phase).
     pub fn record_plan(
         &mut self,
-        selected_tools: &[String],
-        confidence: f64,
+        visible_tools: &[String],
         budget_pressure: f64,
         budget_tokens: u64,
     ) {
@@ -412,8 +411,7 @@ impl StepRecorder {
         self.emit_with_payload(
             StepEventType::StepStarted,
             serde_json::json!({
-                "selected_tools": selected_tools,
-                "confidence": confidence,
+                "visible_tools": visible_tools,
                 "budget_pressure": budget_pressure,
             }),
         );
@@ -421,14 +419,12 @@ impl StepRecorder {
         if let Some(ref mut step) = self.current_step {
             step.execution.payload = StepPayload::Plan {
                 intent_signals: vec![],
-                intent_confidence: confidence,
-                available_tool_count: selected_tools.len(),
+                available_tool_count: visible_tools.len(),
                 budget_tokens,
                 restricted_tools: vec![],
             };
             step.execution.result = Some(StepResult::Plan {
-                selected_tools: selected_tools.to_vec(),
-                confidence,
+                visible_tools: visible_tools.to_vec(),
             });
         }
     }
@@ -1581,7 +1577,7 @@ mod tests {
     fn recorder_plan_phase_transition() {
         let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
         rec.begin_turn(0);
-        rec.record_plan(&["github_list_prs".into(), "grep".into()], 0.85, 0.3, 4000);
+        rec.record_plan(&["github_list_prs".into(), "grep".into()], 0.3, 4000);
 
         let step = rec.current_step().unwrap();
         assert_eq!(step.execution.cursor.phase, StepAction::Plan);
@@ -2010,7 +2006,7 @@ mod tests {
     fn recorder_multi_turn_phase_log() {
         let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
         rec.begin_turn(0);
-        rec.record_plan(&["grep".into()], 0.9, 0.0, 4000);
+        rec.record_plan(&["grep".into()], 0.0, 4000);
         rec.begin_act(1);
         rec.record_verdict("Healthy", false, false, false, 0);
         rec.end_turn(false);
@@ -2067,7 +2063,7 @@ mod tests {
 
         let mut rec = StepRecorder::new(TEST_USER_ID, "ephemeral", "task-1");
         rec.begin_turn(0);
-        rec.record_plan(&["bash".into()], 0.9, 0.0, 4000);
+        rec.record_plan(&["bash".into()], 0.0, 4000);
         rec.attach_persistence("sess-adopted");
         rec.end_turn(true);
 
@@ -2106,7 +2102,7 @@ mod tests {
         rec.attach_persistence("../invalid-session-id");
         let events_after_failed_attach = rec.events().len();
 
-        rec.record_plan(&["bash".into()], 0.9, 0.0, 4000);
+        rec.record_plan(&["bash".into()], 0.0, 4000);
 
         assert!(rec.persistence_error().is_some());
         assert_eq!(
@@ -2210,7 +2206,7 @@ mod tests {
     fn regression_step_events_jsonl_satisfies_trace_invariants() {
         let mut rec = StepRecorder::new(TEST_USER_ID, "sess-regression", "task-1");
         rec.begin_turn(3);
-        rec.record_plan(&["read_file".into()], 0.8, 0.2, 4000);
+        rec.record_plan(&["read_file".into()], 0.2, 4000);
         rec.begin_act(1);
         rec.begin_tool_with_key_and_args_preview(
             "read_file",

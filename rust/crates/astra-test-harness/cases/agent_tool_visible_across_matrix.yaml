@@ -1,10 +1,10 @@
-name: selector_spawn_agent_visible_across_matrix
+name: agent_tool_visible_across_matrix
 description: |
   **What**: Run agent across three different model families (DeepSeek, Anthropic, MiniMax) and verify all can discover and use it.
-  **Tests**: Cross-model tool selector visibility — `agent` (formerly spawn_agent) must be surfaced by the tfidf selector regardless of model family.
-  **Why**: G3 regression for a bug where spawn_agent had no TOOL_CATALOG entry, making it invisible to some models; the fix must work across all families.
-  **Pass means**: All three model families discovered the agent tool and used it, proving the selector fix is universal.
-  **Fail means**: Tool selector regression — `agent` is hidden from one or more model families (TOOL_CATALOG or selector bug).
+  **Tests**: Cross-model tool surface visibility — `agent` (formerly spawn_agent) must be visible regardless of model family.
+  **Why**: G3 regression for a bug where spawn_agent had no surface entry, making it invisible to some models; the fix must work across all families.
+  **Pass means**: All three model families discovered the agent tool and used it, proving the surface contract is universal.
+  **Fail means**: Tool surface regression — `agent` is hidden from one or more model families.
 prompt: |
   You have a `spawn_agent` tool. Call it with:
     agent_id: "child-G3"

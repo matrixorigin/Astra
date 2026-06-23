@@ -12,6 +12,6 @@ pub mod user_profile;
 
 // Re-exports for ergonomic cross-crate use.
 pub use runtime_config::{
-    EffectiveToolPolicy, ModelPolicyProfile, RuntimeConfig, SafetyConfig, ToolSelectionConfig,
+    EffectiveToolPolicy, ModelPolicyProfile, RuntimeConfig, SafetyConfig, ToolPolicyConfig,
     ToolSurfaceConfig, TrustModeSerde,
 };

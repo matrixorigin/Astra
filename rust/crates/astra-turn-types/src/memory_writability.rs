@@ -14,7 +14,7 @@
 //! content overlap on commands like "继续啊", "修复", "hi" — all of
 //! which were legitimate user inputs, just without any durable signal.
 //!
-//! Claude Code addresses this by making memory a **curated disk
+//! the reference agent addresses this by making memory a **curated disk
 //! directory**: each memory is a file with frontmatter, Claude picks a
 //! `type` (user / feedback / project / reference) at write-time, and a
 //! system-prompt section spells out **what NOT to save** (code patterns,

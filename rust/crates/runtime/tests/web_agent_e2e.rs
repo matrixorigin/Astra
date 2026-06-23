@@ -1101,8 +1101,8 @@ async fn run_mock_tool_scenario(case: MockToolScenario) {
     let plan = plans.last().expect("tool hook plan");
     let audit = plan.decision_audit.as_ref().expect("tool decision audit");
     assert_eq!(
-        audit.decision_type, "tool_selection",
-        "{}: tool case should persist tool_selection",
+        audit.decision_type, "tool_surface",
+        "{}: tool case should persist tool_surface",
         case.name
     );
     let skill = plan.skill_selection.as_ref().expect("tool skill selection");
@@ -4379,7 +4379,7 @@ async fn hook_db_decision_audit_text_only() {
     assert!(!requests[0].messages.is_empty());
 }
 
-/// Tool-call response produces a "tool_selection" decision audit with skill selection.
+/// Tool-call response produces a "tool_surface" decision audit with skill selection.
 #[tokio::test]
 async fn hook_db_decision_audit_with_tools() {
     let (app, hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
@@ -4429,7 +4429,7 @@ async fn hook_db_decision_audit_with_tools() {
         .decision_audit
         .as_ref()
         .expect("decision_audit present");
-    assert_eq!(audit.decision_type, "tool_selection");
+    assert_eq!(audit.decision_type, "tool_surface");
     let tool_calls = audit.decision_output["tool_calls"].as_array().unwrap();
     assert!(tool_calls.iter().any(|t| t.as_str() == Some("list_dir")));
 
@@ -4514,7 +4514,7 @@ async fn observer_fired_with_correct_metadata() {
 
 /// Multiple tool calls across rounds produce a skill selection with all tool names.
 #[tokio::test]
-async fn hook_db_multiple_tools_selected() {
+async fn hook_db_multiple_visible_tools() {
     let (app, hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
 
     // Two rounds of approval-free tools (read_file, list_dir) + final text.
@@ -4574,7 +4574,7 @@ async fn hook_db_multiple_tools_selected() {
     let plans = hook_writer.plans.lock().await;
     assert_eq!(plans.len(), 1);
     let audit = plans[0].decision_audit.as_ref().expect("decision_audit");
-    assert_eq!(audit.decision_type, "tool_selection");
+    assert_eq!(audit.decision_type, "tool_surface");
 
     let skill = plans[0].skill_selection.as_ref().expect("skill_selection");
     // All unique tool names should be captured.
@@ -4925,16 +4925,6 @@ async fn context_meta_exposes_late_round_guidance_signals() {
             .unwrap_or(0)
             > 0,
         "context_meta should expose prompt token estimates"
-    );
-    assert_eq!(
-        late_round_context["system_prompt_breakdown"]["guidance_signals"]["round_budget_warning"]
-            .as_bool(),
-        Some(false)
-    );
-    assert_eq!(
-        late_round_context["system_prompt_breakdown"]["guidance_signals"]["synthesize_or_batch"]
-            .as_bool(),
-        Some(false)
     );
     assert!(
         late_round_context["system_prompt_breakdown"]["guidance_signals"]["parallel_feedback"]

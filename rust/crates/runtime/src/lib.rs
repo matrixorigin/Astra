@@ -333,7 +333,7 @@ pub use astra_turn_core::{
     tail_persist::build_turn_hook_args,
     task::classify_task,
     tool_args_repair::try_repair_tool_args,
-    tool_selection::{plan_tool_subset_for_result_turn, resolve_preferred_tool_status},
+    tool_surface_subset::{plan_tool_subset_for_result_turn, resolve_preferred_tool_status},
     turn_metrics::build_tool_result_quality_event_payload,
     turn_metrics::count_persisted_turn_events,
     view::{

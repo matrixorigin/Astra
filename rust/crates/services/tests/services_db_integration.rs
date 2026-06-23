@@ -26,7 +26,7 @@ use astra_services::session_restore::{
     persist_remote_composite_snapshot_index, pull_step_checkpoint_from_cloud,
 };
 use astra_services::session_workspace::{
-    ContextTraceSignal, ContextTraceToolSelection, WORKSPACE_METADATA_ARTIFACT_KIND,
+    ContextTraceSignal, ContextTraceToolSurface, WORKSPACE_METADATA_ARTIFACT_KIND,
     WorkspaceMetadata, persist_remote_workspace,
 };
 use astra_services::{
@@ -1589,7 +1589,7 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
     let turn_metadata = serde_json::json!({
         "turn": 1,
         "assistant_output": "assistant reply",
-        "tools_selected": ["bash", "rg"],
+        "visible_tools": ["bash", "rg"],
         "tools_used": ["bash"],
         "duration_ms": 987,
         "ttft_ms": 42,
@@ -1678,7 +1678,7 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
     assert_eq!(detail.context_ms, Some(18));
     assert_eq!(detail.budget_pressure, Some(0.25));
     assert_eq!(
-        detail.tools_selected,
+        detail.visible_tools,
         vec!["bash".to_string(), "rg".to_string()]
     );
     assert_eq!(detail.tools_used, vec!["bash".to_string()]);
@@ -2046,13 +2046,10 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
     let trace_a = ContextTraceSignal {
         turn_id: "turn-a".into(),
         captured_at: Some("2026-09-01T10:02:30Z".into()),
-        tool_selection: Some(ContextTraceToolSelection {
+        tool_surface: Some(ContextTraceToolSurface {
             tools_available: 8,
-            selected_tools: vec!["view".into()],
-            selection_scope: "latest_round".into(),
-            rejected_tools: 1,
-            strategy: "selector".into(),
-            confidence: 0.92,
+            visible_tools: vec!["view".into()],
+            surface_scope: "latest_round".into(),
             latency_ms: 11,
         }),
         memory: None,
@@ -2064,13 +2061,10 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
     let trace_b = ContextTraceSignal {
         turn_id: "turn-b".into(),
         captured_at: Some("2026-09-02T08:00:30Z".into()),
-        tool_selection: Some(ContextTraceToolSelection {
+        tool_surface: Some(ContextTraceToolSurface {
             tools_available: 6,
-            selected_tools: vec!["grep".into(), "view".into()],
-            selection_scope: "latest_round".into(),
-            rejected_tools: 0,
-            strategy: "fallback".into(),
-            confidence: 0.88,
+            visible_tools: vec!["grep".into(), "view".into()],
+            surface_scope: "latest_round".into(),
             latency_ms: 9,
         }),
         memory: None,
@@ -2313,13 +2307,10 @@ async fn session_sync_log_async_audit_flusher_writes_per_type_on_live_matrixone(
         let trace = ContextTraceSignal {
             turn_id: format!("turn-{idx}"),
             captured_at: Some(format!("2026-09-03T10:{:02}:00Z", idx % 60)),
-            tool_selection: Some(ContextTraceToolSelection {
+            tool_surface: Some(ContextTraceToolSurface {
                 tools_available: 8,
-                selected_tools: vec!["view".into()],
-                selection_scope: "latest_round".into(),
-                rejected_tools: 0,
-                strategy: "prune-test".into(),
-                confidence: 0.9,
+                visible_tools: vec!["view".into()],
+                surface_scope: "latest_round".into(),
                 latency_ms: 7,
             }),
             memory: None,
@@ -2427,13 +2418,10 @@ async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matr
     older_workspace.last_context_trace = Some(ContextTraceSignal {
         turn_id: "turn-remote-workspace-old".into(),
         captured_at: Some("2026-09-07T10:00:00Z".into()),
-        tool_selection: Some(ContextTraceToolSelection {
+        tool_surface: Some(ContextTraceToolSurface {
             tools_available: 12,
-            selected_tools: vec!["bash".into()],
-            selection_scope: "latest_round".into(),
-            rejected_tools: 0,
-            strategy: "artifact-restore".into(),
-            confidence: 0.98,
+            visible_tools: vec!["bash".into(), "rg".into()],
+            surface_scope: "latest_round".into(),
             latency_ms: 4,
         }),
         memory: None,
@@ -2866,13 +2854,10 @@ async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
     let trace = ContextTraceSignal {
         turn_id: "turn-missing-row".into(),
         captured_at: Some("2026-09-06T09:00:00Z".into()),
-        tool_selection: Some(ContextTraceToolSelection {
+        tool_surface: Some(ContextTraceToolSurface {
             tools_available: 8,
-            selected_tools: vec!["rg".into(), "view".into()],
-            selection_scope: "latest_round".into(),
-            rejected_tools: 1,
-            strategy: "lazy-create".into(),
-            confidence: 0.95,
+            visible_tools: vec!["rg".into(), "view".into()],
+            surface_scope: "latest_round".into(),
             latency_ms: 5,
         }),
         memory: None,

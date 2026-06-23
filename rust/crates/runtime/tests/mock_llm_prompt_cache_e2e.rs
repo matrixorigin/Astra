@@ -518,14 +518,14 @@ async fn interleaved_tool_and_text_rounds_preserve_event_order_and_history() {
     assert!(g[1].messages.len() < g[2].messages.len());
 }
 
-// ── pc-single-tail-breakpoint: Claude Code message marker semantics ─────────
+// ── pc-single-tail-breakpoint: the reference agent message marker semantics ─────────
 //
 // Captured production traffic (~/.astra/sessions/<sid>/llm_capture_*.json)
 // showed `cache_read` pinned at ~10 688 tokens for ~60 consecutive rounds —
 // the exact size of `system + tools`. Message history contributed zero cache
 // hits despite conversations spanning tens of thousands of tokens.
 //
-// Claude Code's Anthropic/Bedrock contract is stricter: exactly one
+// the reference agent's Anthropic/Bedrock contract is stricter: exactly one
 // message-level `cache_control` marker on the last non-system message.
 // Historical messages must remain byte-stable across rounds because they
 // are never rewritten to carry an older marker.

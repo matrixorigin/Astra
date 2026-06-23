@@ -151,9 +151,9 @@ async fn persist_latest_context_trace_signal(state: &mut AgenticLoopState) {
             );
         }
         if let Some(tool_name) = signal
-            .tool_selection
+            .tool_surface
             .as_ref()
-            .and_then(|selection| selection.selected_tools.first())
+            .and_then(|surface| surface.visible_tools.first())
         {
             metadata_obj.insert("tool_name".to_string(), serde_json::json!(tool_name));
         }
@@ -801,15 +801,15 @@ fn reset_per_turn_corrective_state(state: &mut AgenticLoopState) {
     state.stall.forced_execution_retry = false;
     state.stall.forced_execution_escalation = false;
     state.stall.forced_parallel_batching = false;
-    state.stall.forced_round_budget_phase1 = false;
-    state.stall.forced_round_budget_phase2 = false;
+    state.stall.forced_tool_round_hard_stop = false;
+    state.stall.forced_tool_round_abort = false;
     state.stall.forced_completion_soft_stop = false;
     state.stall.forced_task_board_completion_gate = false;
     state.stall.forced_redundant_reads_corrective = false;
     state.stall.forced_cache_waste_corrective = false;
     state.stall.forced_search_fanout_corrective = false;
     state.stall.forced_exploration_family_corrective = false;
-    state.stall.forced_exploration_family_phase2 = false;
+    state.stall.forced_exploration_family_lockout = false;
     state.stall.exploration_family_corrective_family = None;
     // Clear tool restrictions injected by exploration-family correctives so
     // they don't leak into the next user turn.
@@ -1111,7 +1111,7 @@ mod tests {
             }),
             serde_json::json!({
                 "role": "user",
-                "content": format!("{}\nold round budget", crate::turn::agentic_loop::execution_phase::ROUND_BUDGET_PHASE1_MARKER),
+                "content": format!("{}\nold tool round", crate::turn::agentic_loop::execution_phase::TOOL_ROUND_HARD_STOP_MARKER),
             }),
             serde_json::json!({
                 "role": "user",
@@ -1138,8 +1138,8 @@ mod tests {
             serde_json::json!({
                 "role": "user",
                 "content": format!(
-                    "{}\nold exploration family phase2",
-                    crate::turn::agentic_loop::execution_phase::EXPLORATION_FAMILY_PHASE2_MARKER
+                    "{}\nold exploration family lockout",
+                    crate::turn::agentic_loop::execution_phase::EXPLORATION_FAMILY_LOCKOUT_MARKER
                 ),
             }),
         ]);
@@ -1147,13 +1147,13 @@ mod tests {
         state.stall.forced_execution_retry = true;
         state.stall.forced_execution_escalation = true;
         state.stall.forced_parallel_batching = true;
-        state.stall.forced_round_budget_phase1 = true;
-        state.stall.forced_round_budget_phase2 = true;
+        state.stall.forced_tool_round_hard_stop = true;
+        state.stall.forced_tool_round_abort = true;
         state.stall.forced_redundant_reads_corrective = true;
         state.stall.forced_cache_waste_corrective = true;
         state.stall.forced_search_fanout_corrective = true;
         state.stall.forced_exploration_family_corrective = true;
-        state.stall.forced_exploration_family_phase2 = true;
+        state.stall.forced_exploration_family_lockout = true;
         state.stall.exploration_family_corrective_family = Some("diff".into());
         state.restricted_tools.insert("git_diff".into());
         state.restricted_tools.insert("git_log".into());
@@ -1190,13 +1190,13 @@ mod tests {
         assert!(!state.stall.forced_execution_retry);
         assert!(!state.stall.forced_execution_escalation);
         assert!(!state.stall.forced_parallel_batching);
-        assert!(!state.stall.forced_round_budget_phase1);
-        assert!(!state.stall.forced_round_budget_phase2);
+        assert!(!state.stall.forced_tool_round_hard_stop);
+        assert!(!state.stall.forced_tool_round_abort);
         assert!(!state.stall.forced_redundant_reads_corrective);
         assert!(!state.stall.forced_cache_waste_corrective);
         assert!(!state.stall.forced_search_fanout_corrective);
         assert!(!state.stall.forced_exploration_family_corrective);
-        assert!(!state.stall.forced_exploration_family_phase2);
+        assert!(!state.stall.forced_exploration_family_lockout);
         assert!(state.stall.exploration_family_corrective_family.is_none());
         assert!(
             state.restricted_tools.is_empty(),
@@ -2298,15 +2298,15 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // E2E: round budget guidance injection
-    // Verifies that the agentic loop injects round budget warning/limit
+    // E2E: tool round guidance injection
+    // Verifies that the agentic loop injects tool round warning/limit
     // messages into state.messages at the correct round thresholds.
     // Regression: CLI path was missing this entirely (found in session analysis).
     // ═══════════════════════════════════════════════════════════════════════
 
     #[tokio::test]
-    async fn round_budget_guidance_injected_at_threshold() {
-        // With the circuit breaker refactor, round budget directives are no
+    async fn tool_round_guidance_not_reintroduced_at_threshold() {
+        // With the circuit breaker refactor, tool round directives are no
         // longer injected. The parallel-batching nudge may still fire if the
         // model produces single-tool rounds. This test verifies the loop
         // completes normally without budget pressure.
@@ -2340,23 +2340,23 @@ mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
 
-        // Round budget directives are no longer injected (circuit breaker
-        // handles stalls). Verify no "Round Budget" messages appear.
-        let budget_found = state.messages.iter().any(|m| {
+        // Tool round hard-stop directives are no longer injected (circuit breaker
+        // handles stalls). Verify no "Tool Round" messages appear.
+        let tool_round_guidance_found = state.messages.iter().any(|m| {
             m.get("role").and_then(|r| r.as_str()) == Some("user")
                 && m.get("content")
                     .and_then(|c| c.as_str())
-                    .map(|s| s.contains("Round Budget"))
+                    .map(|s| s.contains("Tool Round"))
                     .unwrap_or(false)
         });
         assert!(
-            !budget_found,
-            "round budget directives should no longer be injected (circuit breaker replaces them)",
+            !tool_round_guidance_found,
+            "tool round directives should no longer be injected (circuit breaker replaces them)",
         );
     }
 
     #[tokio::test]
-    async fn round_budget_guidance_uses_llm_round_count_not_step_index() {
+    async fn tool_round_guidance_uses_llm_round_count_not_step_index() {
         // Regression: guidance was using turn_index (step counter, inflated by
         // progressive penalty) instead of llm_rounds_completed (actual LLM calls).
         // With progressive penalty, step 10 = only 4th LLM call, but the old code
@@ -2383,7 +2383,7 @@ mod tests {
         let guidance_found = state.messages.iter().any(|m| {
             m.get("content")
                 .and_then(|c| c.as_str())
-                .map(|s| s.contains("Round Budget") || s.contains("Synthesize"))
+                .map(|s| s.contains("Tool Round") || s.contains("Synthesize"))
                 .unwrap_or(false)
         });
         assert!(
@@ -2397,7 +2397,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn round_budget_not_injected_before_threshold() {
+    async fn tool_round_guidance_not_injected_before_threshold() {
         // 2 tool rounds + final text = should NOT trigger guidance (threshold=3).
         let mut host = MockHost::new(vec![
             edge_tool_result(
@@ -2417,12 +2417,12 @@ mod tests {
         let guidance_found = state.messages.iter().any(|m| {
             m.get("content")
                 .and_then(|c| c.as_str())
-                .map(|s| s.contains("Round Budget") || s.contains("Synthesize"))
+                .map(|s| s.contains("Tool Round") || s.contains("Synthesize"))
                 .unwrap_or(false)
         });
         assert!(
             !guidance_found,
-            "round budget guidance must NOT be injected before threshold"
+            "tool round guidance must NOT be injected before threshold"
         );
     }
 
@@ -2477,17 +2477,16 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Regression: round budget guidance is ephemeral — only one copy lives
+    // Regression: tool round guidance is ephemeral — only one copy lives
     // in state.messages at any time. Prior guidance must be stripped before
     // the next one is appended, otherwise every late-round call accumulates
-    // a duplicate "Round Budget" user-message that wastes tokens.
+    // a duplicate "Tool Round" user-message that wastes tokens.
     // ═══════════════════════════════════════════════════════════════════════
 
     #[tokio::test]
-    async fn round_budget_guidance_is_ephemeral_not_accumulated() {
-        // Simulate 5 tool rounds (>> ROUND_BUDGET_THRESHOLD) so multiple
-        // injections occur. After the loop finishes, state.messages must
-        // contain AT MOST one "Round Budget" user message.
+    async fn tool_round_guidance_is_ephemeral_not_accumulated() {
+        // Simulate multiple tool rounds. The retired tool-round directive
+        // must not reappear or accumulate in state.messages.
         let mut results = Vec::new();
         for _ in 0..5 {
             results.push(edge_tool_result(
@@ -2510,14 +2509,14 @@ mod tests {
             .filter(|m| {
                 m.get("role").and_then(|r| r.as_str()) == Some("user")
                     && m.get("content").and_then(|c| c.as_str()).is_some_and(|s| {
-                        s.contains("## ⚡ Round Budget") || s.contains("## ⚠ Round Budget")
+                        s.contains("## ⚡ Tool Round") || s.contains("## ⚠ Tool Round")
                     })
             })
             .count();
 
         assert!(
             guidance_count <= 1,
-            "round-budget guidance must be ephemeral (at most 1 copy in state.messages); \
+            "tool-round guidance must be ephemeral (at most 1 copy in state.messages); \
              found {guidance_count} copies"
         );
     }

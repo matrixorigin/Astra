@@ -1,8 +1,7 @@
-//! Lightweight types for surfacing tool-selection strategy changes.
+//! Lightweight types for surfacing tool-surface strategy changes.
 //!
-//! The old rule-based pipeline bridge was retired, but the runtime still keeps
-//! stable summary structs for reporting blocked/boosted/widened tool-selection
-//! changes into observability and self-model rendering.
+//! Runtime-facing summaries report blocked/boosted/widened tool-surface changes
+//! into observability and self-model rendering.
 
 /// Summary of what the strategy-delta application actually changed in the
 /// runtime state — used for logging / tests.
@@ -12,8 +11,8 @@ pub struct StrategyApplication {
     pub newly_blocked: Vec<String>,
     /// Tools already present (no-op inserts).
     pub already_blocked: Vec<String>,
-    /// Whether `widen_selection` was requested by the strategy (and thus the
-    /// one-shot `state.widen_selection_pending` flag was set).
+    /// Whether `widen_surface` was requested by the strategy (and thus the
+    /// one-shot `state.widen_surface_pending` flag was set).
     pub widen_requested: bool,
     /// Tools newly added to `state.boosted_tools`.
     pub newly_boosted: Vec<String>,
@@ -21,7 +20,7 @@ pub struct StrategyApplication {
     pub already_boosted: Vec<String>,
     /// Optional rich before/after snapshot of the affected skill surfaces.
     /// `None` on noop; populated when the application produced at least one
-    /// newly-boosted/blocked entry or toggled widen_selection. P3.1.
+    /// newly-boosted/blocked entry or toggled widen_surface. P3.1.
     pub diff_entry: Option<SkillDiffEntry>,
 }
 
@@ -29,8 +28,7 @@ pub struct StrategyApplication {
 /// application materially changed. Lightweight, stable-ordered, JSON-ready.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SkillDiffEntry {
-    /// Logical subsystem whose configuration changed. Current only value is
-    /// `"pipeline.tool_selection"` but kept as `String` for forward-compat.
+    /// Logical subsystem whose configuration changed.
     pub skill: String,
     pub before: DiffSnapshot,
     pub after: DiffSnapshot,
@@ -100,7 +98,7 @@ impl StrategyApplication {
             parts.push(format!("already_boosted={:?}", self.already_boosted));
         }
         if self.widen_requested {
-            parts.push("widen_selection=true".to_string());
+            parts.push("widen_surface=true".to_string());
         }
         if parts.is_empty() {
             "noop".to_string()
@@ -130,7 +128,7 @@ mod tests {
         assert!(s.contains("blocked=[\"a\"]"), "summary: {s}");
         assert!(s.contains("boosted=[\"grep\", \"read\"]"), "summary: {s}");
         assert!(s.contains("already_boosted=[\"ls\"]"), "summary: {s}");
-        assert!(s.contains("widen_selection=true"), "summary: {s}");
+        assert!(s.contains("widen_surface=true"), "summary: {s}");
 
         let noop = StrategyApplication::default();
         assert!(noop.is_noop());
@@ -140,7 +138,7 @@ mod tests {
     #[test]
     fn skill_diff_entry_summary_line_renders_additions() {
         let entry = SkillDiffEntry {
-            skill: "pipeline.tool_selection".to_string(),
+            skill: "pipeline.tool_surface_policy".to_string(),
             before: DiffSnapshot {
                 blocked_tools: vec!["old".to_string()],
                 boosted_tools: vec![],
@@ -154,7 +152,10 @@ mod tests {
             reason: "auto-reflection".to_string(),
         };
         let line = entry.summary_line();
-        assert!(line.contains("pipeline.tool_selection"), "line: {line}");
+        assert!(
+            line.contains("pipeline.tool_surface_policy"),
+            "line: {line}"
+        );
         assert!(line.contains("auto-reflection"), "line: {line}");
         assert!(line.contains("+blocked=[\"flaky_http\"]"), "line: {line}");
         assert!(line.contains("+boosted=[\"grep\"]"), "line: {line}");
@@ -164,7 +165,7 @@ mod tests {
     #[test]
     fn skill_diff_entry_summary_line_noop_is_marked() {
         let entry = SkillDiffEntry {
-            skill: "pipeline.tool_selection".to_string(),
+            skill: "pipeline.tool_surface_policy".to_string(),
             before: DiffSnapshot::default(),
             after: DiffSnapshot::default(),
             reason: "auto-reflection".to_string(),

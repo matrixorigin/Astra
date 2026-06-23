@@ -49,7 +49,7 @@ pub(super) async fn decision_trace_handler(
         .build_evidence(
             &user.user_id,
             &session_id,
-            "tool_selection",
+            "tool_surface",
             params.last_n,
             &params.question,
         )

@@ -91,7 +91,7 @@ post-capability pool plus plugin schemas, not a legacy static allowlist.
 - visible tools,
 - catalog tools dropped because required capabilities are missing,
 - plugin/MCP tools that passed through,
-- the actual emitted tool count when a turn selection report is available.
+- the actual emitted tool count when a tool surface report is available.
 
 ## Guardrail tests
 

@@ -1,9 +1,6 @@
-//! Cross-session persistence for per-tool health and quality.
+//! Cross-session persistence for per-tool health.
 //!
-//! Stored at `~/.astra/learning/<profile>.json`. The file was historically a
-//! multi-module "learning snapshot" (entities, patterns, calibration). Those
-//! modules have been deleted. Only the tool-health and tool-quality slices
-//! remain.
+//! Stored at `~/.astra/learning/<profile>.json` as a tool-health snapshot.
 //!
 //! Local sync metadata (last-synced baseline for delta push) lives in a
 //! separate file `<profile>.sync.json` so the user-facing learning state is
@@ -14,10 +11,8 @@
 //! - One file per profile (user isolation).
 //! - Merge-on-load (timestamp wins) — safe for concurrent sessions.
 //! - Atomic write (write to tmp, rename) — no corruption on crash.
-//! - Forward-compatible: unknown JSON keys are silently ignored, so legacy
-//!   snapshots with `entities` / `patterns` / `calibration` fields still load.
+//! - Unknown JSON keys are ignored.
 
-pub use crate::tool::registry::report::{ToolQualityEntry, ToolQualityPersistEntry};
 pub use astra_pipeline::ToolHealthEntry;
 
 use serde::{Deserialize, Serialize};
@@ -27,11 +22,10 @@ use std::path::{Path, PathBuf};
 
 /// Complete persisted state for one profile.
 ///
-/// Unknown legacy fields (`entities`, `patterns`, `calibration`) are accepted
-/// on read via serde default-on-missing but never written.
+/// Unknown fields are ignored on read and never written.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LearningSnapshot {
-    /// Format version. Bumped when persistence layout changes incompatibly.
+    /// Format version. Bumped when the persistence layout has a breaking change.
     pub version: u32,
     /// Epoch seconds when this snapshot was exported.
     #[serde(default)]
@@ -39,9 +33,6 @@ pub struct LearningSnapshot {
     /// Persistent tool health data (cross-session error budgets).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_health: Vec<ToolHealthEntry>,
-    /// Per-tool quality / use tracking carried across sessions.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_quality: Vec<ToolQualityPersistEntry>,
 }
 
 /// Local-only sync bookkeeping — "what was last pushed to cloud" — kept out
@@ -124,10 +115,7 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String>
 // ─── High-level Operations ───────────────────────────────────────────────────
 
 /// Build a snapshot from current runtime state.
-pub fn build_snapshot(
-    tool_health: &[ToolHealthEntry],
-    tool_quality: &[ToolQualityPersistEntry],
-) -> LearningSnapshot {
+pub fn build_snapshot(tool_health: &[ToolHealthEntry]) -> LearningSnapshot {
     let now_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -136,18 +124,13 @@ pub fn build_snapshot(
         version: 1,
         snapshot_epoch: now_epoch,
         tool_health: tool_health.to_vec(),
-        tool_quality: tool_quality.to_vec(),
     }
 }
 
 /// Save a snapshot for a profile. Skips the write if the snapshot is empty.
-pub fn save_learning_state(
-    profile: &str,
-    tool_health: &[ToolHealthEntry],
-    tool_quality: &[ToolQualityPersistEntry],
-) -> Result<(), String> {
-    let snapshot = build_snapshot(tool_health, tool_quality);
-    if snapshot.tool_health.is_empty() && snapshot.tool_quality.is_empty() {
+pub fn save_learning_state(profile: &str, tool_health: &[ToolHealthEntry]) -> Result<(), String> {
+    let snapshot = build_snapshot(tool_health);
+    if snapshot.tool_health.is_empty() {
         return Ok(());
     }
     save_snapshot(profile, &snapshot)
@@ -156,12 +139,6 @@ pub fn save_learning_state(
 pub fn load_tool_health(profile: &str) -> Vec<ToolHealthEntry> {
     load_snapshot(profile)
         .map(|s| s.tool_health)
-        .unwrap_or_default()
-}
-
-pub fn load_tool_quality(profile: &str) -> Vec<ToolQualityPersistEntry> {
-    load_snapshot(profile)
-        .map(|s| s.tool_quality)
         .unwrap_or_default()
 }
 
@@ -319,28 +296,15 @@ mod tests {
 
     #[test]
     fn snapshot_with_health_roundtrip() {
-        let snapshot = build_snapshot(
-            &[sample_health("bash", 10, 2, 1000)],
-            &[ToolQualityPersistEntry {
-                name: "bash".into(),
-                entry: ToolQualityEntry {
-                    selections: 5,
-                    uses: 4,
-                    quality_sum: 3.0,
-                },
-            }],
-        );
+        let snapshot = build_snapshot(&[sample_health("bash", 10, 2, 1000)]);
         let json = serde_json::to_string(&snapshot).unwrap();
         let loaded: LearningSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.tool_health.len(), 1);
-        assert_eq!(loaded.tool_quality.len(), 1);
     }
 
     #[test]
-    fn legacy_fields_are_ignored_on_load() {
-        // A legacy snapshot may include entities/patterns/calibration. Those
-        // fields no longer exist on LearningSnapshot but must not fail parsing.
-        let legacy = r#"{
+    fn unknown_fields_are_ignored_on_load() {
+        let snapshot = r#"{
             "version": 1,
             "snapshot_epoch": 42,
             "entities": [{"name":"x"}],
@@ -354,7 +318,7 @@ mod tests {
                 "last_updated_epoch": 99
             }]
         }"#;
-        let loaded: LearningSnapshot = serde_json::from_str(legacy).unwrap();
+        let loaded: LearningSnapshot = serde_json::from_str(snapshot).unwrap();
         assert_eq!(loaded.tool_health.len(), 1);
         assert_eq!(loaded.tool_health[0].name, "bash");
     }
@@ -402,7 +366,7 @@ mod tests {
     fn save_and_load_snapshot_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("profile.json");
-        let snapshot = build_snapshot(&[sample_health("bash", 1, 0, 42)], &[]);
+        let snapshot = build_snapshot(&[sample_health("bash", 1, 0, 42)]);
         save_snapshot_to(&path, &snapshot).unwrap();
         let loaded = load_snapshot_from(&path).unwrap();
         assert_eq!(loaded.tool_health[0].name, "bash");
@@ -416,7 +380,7 @@ mod tests {
         let original_home = std::env::var_os("HOME");
         // SAFETY: test code, single-threaded env manipulation.
         unsafe { std::env::set_var("HOME", tmp.path()) };
-        let res = save_learning_state("profile-empty", &[], &[]);
+        let res = save_learning_state("profile-empty", &[]);
         if let Some(h) = original_home {
             unsafe { std::env::set_var("HOME", h) };
         } else {

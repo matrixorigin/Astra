@@ -53,7 +53,7 @@ pub(crate) enum ActiveView {
 
 /// Single live agent's render data inside `ViewportFrame.multi_agent`.
 ///
-/// Compact per-agent row (claudecode/Kiro-style): `{status_icon}
+/// Compact per-agent row (reference-agent/Kiro-style): `{status_icon}
 /// {name}  {child_count} steps · {elapsed}`. The whole strip renders
 /// inside ONE `LiveFramedCell` with a single gradient gutter so the
 /// user sees N agents as a tidy panel, not N stacked frames.
@@ -131,7 +131,7 @@ pub(crate) fn multi_agent_strip_header(cells: &[MultiAgentEntry]) -> String {
 /// [`active_viewport`]. The task board is its OWN slot — not an
 /// `ActiveView` variant — so a streaming active cell (tool /
 /// assistant) no longer replaces the board mid-frame. Matches
-/// claude-code's Ink `<Static>` / panel split.
+/// reference-agent's Ink `<Static>` / panel split.
 ///
 /// `active` priority (inside the single active-cell slot):
 ///   1. `active_cell` present → `Active` with lines + kind so the
@@ -463,7 +463,7 @@ pub(crate) fn do_draw(
         }
     };
 
-    // Multi-agent strip: claudecode/Kiro-style compact panel. ONE
+    // Multi-agent strip: reference-agent/Kiro-style compact panel. ONE
     // gradient-gutter frame containing a header and one short row
     // per live agent. Renders as e.g.:
     //
@@ -568,7 +568,7 @@ pub(crate) fn do_draw(
     //   bottom pane / composer     (weight=0)
     //
     // Earlier iterations stacked the board ABOVE the active cell to
-    // mirror claude-code's "static panels on top". That broke down for
+    // mirror reference-agent's "static panels on top". That broke down for
     // long agentic turns: streaming text kept pushing the board further
     // from the composer until it was off-screen entirely. Bottom-anchor
     // keeps the board adjacent to the composer — the user's eye only
@@ -1072,7 +1072,7 @@ mod task_board_draw_tests {
 
 #[cfg(test)]
 mod multi_agent_strip_tests {
-    //! Pin the compact per-agent row format (claudecode/Kiro-style).
+    //! Pin the compact per-agent row format (reference-agent/Kiro-style).
     //!
     //! Each row fits in one line and surfaces label, step count, and
     //! elapsed time, plus a status icon that distinguishes live

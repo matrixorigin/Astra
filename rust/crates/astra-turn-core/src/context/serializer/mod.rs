@@ -220,7 +220,7 @@ fn block_index_for_marker(
 /// Places a single `cache_control` marker on the last Session-scoped
 /// block (falling back to the last Global block if no Session block
 /// exists). We intentionally emit at most one marker here to leave the
-/// remaining breakpoint budget for the tool marker plus Claude Code's
+/// remaining breakpoint budget for the tool marker plus the reference agent's
 /// single tail marker in `annotate_last_message_cache_breakpoint`.
 /// Anthropic caps requests at 4 `cache_control` entries (system + tool +
 /// message comfortably fit), and the message marker must always remain

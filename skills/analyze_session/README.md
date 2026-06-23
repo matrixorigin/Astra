@@ -25,8 +25,8 @@ tool selection, token usage, error handling, compaction, and stall recovery.
 | Dimension | What It Checks |
 |-----------|---------------|
 | **Context** | Token growth curve, compaction events, budget pressure tiers, stale reasoning, tool schema bloat |
-| **Tools** | Selection accuracy (tools_selected vs tools_used), selector strategy (tfidf/llm), missed parallelism, bash misuse |
-| **Tokens** | Per-turn prompt/completion, TTFT, context build time, selector overhead |
+| **Tools** | Tool surface utilization (visible_tools vs tools_used), activated deferred tools, missed parallelism, bash misuse |
+| **Tokens** | Per-turn prompt/completion, TTFT, context build time, deferred activation overhead |
 | **Errors** | Error cascades, stall detection (sig_stall/name_stall/divergence), TurnGuardVerdict events, tool failure rates |
 | **Flow** | Plan subtask tracking, delegation fan-out/aggregate, turn productivity classification |
 | **Debug** | Root cause diagnosis: stall patterns, turn guard escalation, error cascades, tool health degradation, correction effectiveness, latency bottlenecks |
@@ -62,9 +62,9 @@ A structured diagnostic report with:
 - 📛 **No compaction**: budget_pressure=0 but tokens >80k
 - 📛 **Aggressive compaction loop**: budget_pressure ≥0.9 for 3+ consecutive turns
 - 📛 **Stale reasoning**: old reasoning_content surviving (strip_stale_reasoning failure)
-- 📛 **Tool schema bloat**: >30 tools in tools_selected (each ~500 tokens)
-- 📛 **Selector miss**: LLM tried tool not in tools_selected
-- 📛 **Strategy mismatch**: tfidf for novel task where LLM selection needed
+- 📛 **Tool schema bloat**: >30 visible tools (each ~500 tokens)
+- 📛 **Surface miss**: LLM tried a tool not in the visible surface
+- 📛 **Activation miss**: deferred tool was needed but `tool_search` did not activate it
 - 📛 **Skill injection waste**: skill injected but never referenced in output
 - 📛 **Stall ignored**: StallDetected event followed by same tool pattern
 - 📛 **Slow context build**: context_ms >2000ms

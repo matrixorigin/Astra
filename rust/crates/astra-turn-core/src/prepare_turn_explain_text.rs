@@ -1,8 +1,6 @@
-//! Plain-text lines for `--explain` stderr during `/chat` payload prep (CLI applies styling).
+//! Plain-text lines for `--explain` stderr during `/chat` payload prep.
 
 use std::collections::HashSet;
-
-use serde_json::Value;
 
 /// `Some` when there are restricted tools (names sorted for stable output).
 #[must_use]
@@ -19,41 +17,9 @@ pub fn restricted_tools_explain_text(restricted_tools: &HashSet<String>) -> Opti
     ))
 }
 
-/// `Some` when `edge_profile.recommended_tools` is a non-empty JSON array of strings.
-#[must_use]
-pub fn selector_guidance_explain_text(
-    payload: &Value,
-    selection_confidence: f64,
-) -> Option<String> {
-    let recommended = payload["edge_profile"]["recommended_tools"].as_array()?;
-    let names: Vec<&str> = recommended.iter().filter_map(|v| v.as_str()).collect();
-    if names.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "  ├─ guidance: {} (confidence: {:.2})",
-        names.join(", "),
-        selection_confidence
-    ))
-}
-
-/// Pair of optional stderr lines for `--explain` (restricted list, then selector guidance).
-#[must_use]
-pub fn explain_stderr_payload_line_pair(
-    restricted_tools: &HashSet<String>,
-    payload: &Value,
-    selection_confidence: f64,
-) -> (Option<String>, Option<String>) {
-    (
-        restricted_tools_explain_text(restricted_tools),
-        selector_guidance_explain_text(payload, selection_confidence),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn restricted_text_sorts_names() {
@@ -65,25 +31,7 @@ mod tests {
     }
 
     #[test]
-    fn guidance_none_without_recommended() {
-        assert!(selector_guidance_explain_text(&json!({}), 0.5).is_none());
-    }
-
-    #[test]
-    fn guidance_some_with_tools() {
-        let p = json!({"edge_profile":{"recommended_tools":["read_file","bash"]}});
-        let t = selector_guidance_explain_text(&p, 0.88).expect("line");
-        assert!(t.contains("read_file, bash"));
-        assert!(t.contains("0.88"));
-    }
-
-    #[test]
-    fn line_pair_matches_individual_helpers() {
-        let mut s = HashSet::new();
-        s.insert("x".into());
-        let p = json!({"edge_profile":{"recommended_tools":["a"]}});
-        let (r, g) = explain_stderr_payload_line_pair(&s, &p, 0.5);
-        assert_eq!(r, restricted_tools_explain_text(&s));
-        assert_eq!(g, selector_guidance_explain_text(&p, 0.5));
+    fn restricted_text_is_none_without_restrictions() {
+        assert!(restricted_tools_explain_text(&HashSet::new()).is_none());
     }
 }

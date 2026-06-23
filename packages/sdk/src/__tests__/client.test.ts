@@ -694,7 +694,7 @@ describe("AstraClient — Session lifecycle and reflect", () => {
   test("getSessionDecisionTrace", async () => {
     globalThis.fetch = mockFetch(200, {
       session_id: "sx",
-      focus: "tool_selection",
+      focus: "tool_surface",
       overview: {},
       diagnoses: [],
       insights: [],

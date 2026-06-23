@@ -151,7 +151,7 @@ impl ToolHandler<ServerToolExecutor> for ToolSearchToolHandler {
         let mut pool = context.capability_filtered_server_tool_schemas();
         pool.extend(context.plugin_schemas_snapshot("plugin_schemas_tool_search"));
         let Some(searchable_names) = context.current_searchable_tool_names() else {
-            return tool_result_from_output(astra_tools::tool_search::tool_search(&pool, args));
+            return tool_result_from_output(astra_tools::tool_search::tool_search(&[], args));
         };
         retain_tool_schemas_by_names(&mut pool, &searchable_names);
         tool_result_from_output(astra_tools::tool_search::tool_search(&pool, args))

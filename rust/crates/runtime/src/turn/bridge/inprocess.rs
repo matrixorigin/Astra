@@ -1009,9 +1009,7 @@ fn flush_turn_event_buffer_or_warn(
 }
 
 // ── Bridge observability — delegated to turn::bridge_observability ────────────
-use super::observability::{
-    build_legacy_context_trace_signal, persist_legacy_bridge_trace_and_quality,
-};
+use super::observability::{build_context_trace_signal, persist_legacy_bridge_trace_and_quality};
 
 // ── LLM streaming — delegated to turn::bridge_llm_stream ─────────────────────
 use super::llm_stream::call_llm_stream_with_request_overrides;
@@ -1314,10 +1312,6 @@ impl InProcessChatTurnBridge {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let selection_confidence = payload
-            .get("selection_confidence")
-            .and_then(Value::as_f64)
-            .unwrap_or(1.0); // Default: high confidence
         let edge_profile = payload
             .get("edge_profile")
             .and_then(Value::as_object)
@@ -1927,10 +1921,7 @@ impl InProcessChatTurnBridge {
                 .and_then(|m| m.get("content").and_then(Value::as_str))
                 .unwrap_or("");
 
-            let task_type = edge_profile
-                .get("selection_task_type")
-                .and_then(Value::as_str)
-                .or_else(|| prompts::detect_task_type(user_content_for_signal));
+            let task_type = prompts::detect_task_type(user_content_for_signal);
             // ── Self-awareness section (injected by CLI via edge_profile) ──
             let self_awareness_hint = edge_profile
                 .get("self_awareness_text")
@@ -2052,14 +2043,8 @@ impl InProcessChatTurnBridge {
             // ── Memoria client (shared across P1 anchor + compaction + P3 write) ──
             let memoria_client_shared = memoria_client_owned.clone();
 
-            // ── Round budget directive: encourage synthesis after several rounds ──
-            let tool_cfg = astra_config::runtime_config::RuntimeConfig::load().tool_selection;
-            let (tool_round_guidance, guidance_signals) = prompts::tool_round_guidance_trace_with(
-                &messages,
-                round_index,
-                tool_cfg.effective_round_budget_warning(),
-                tool_cfg.effective_round_budget_limit(),
-            );
+            let (tool_round_guidance, guidance_signals) =
+                prompts::tool_round_guidance_trace(&messages, round_index);
 
             // Split bridge-composed signals into session-stable (RuntimeIdentity
             // scope → cached behind the Session→None marker) and turn-volatile
@@ -2071,7 +2056,7 @@ impl InProcessChatTurnBridge {
             // VOLATILE (change each turn by design):
             //   environment_volatile (git branch dirty/diff/recent commits),
             //   feedback_rules_hint (accumulates on each user correction),
-            //   skill_hint (active skill/tool selection),
+            //   skill_hint (active skill/tool surface),
             //   self_awareness_hint (turn/token/outcome signals),
             //   typed memory_entries (per-turn retrieval, routed through the
             //     Memory section),
@@ -2262,12 +2247,11 @@ impl InProcessChatTurnBridge {
             // `ToolSurfaceConfig` honours the user's `runtime.tool_surface`
             // TOML: pinned_tools additive over defaults; `-name` removes a
             // default. Loaded via the same `RuntimeConfig::load()` path as
-            // `tool_selection` above (line 1451) for consistency.
+            // `tool_surface` above (line 1451) for consistency.
             let deferred_block_str = deferred_tools_block_for_bridge_model(
                 &edge_profile,
                 &model_name,
             );
-            let bridge_selection_trace = edge_profile.get("recommended_tools").cloned();
             let bridge_restricted_snapshot = HashSet::new();
             let initial_session_memory_entry = if let Some(memoria) = memoria_client_shared.as_ref()
             {
@@ -2291,8 +2275,7 @@ impl InProcessChatTurnBridge {
                             &edge_tools,
                             &bridge_restricted_snapshot,
                         )
-                        .with_deferred_tools_block(&deferred_block_str)
-                        .with_selection_trace(bridge_selection_trace.clone()),
+                        .with_deferred_tools_block(&deferred_block_str),
                     runtime_signals: crate::turn::llm::context::BridgeRuntimeSignals::new(
                                         &stable_sections,
                                         &effective_dynamic_sections,
@@ -2301,7 +2284,6 @@ impl InProcessChatTurnBridge {
                                         edge_profile
                                             .get("system_prompt_override")
                                             .and_then(Value::as_str),
-                                        selection_confidence,
                                         task_type,
                                     ),
                     session: crate::turn::llm::context::BridgeSessionContextInput::new(
@@ -2433,8 +2415,7 @@ impl InProcessChatTurnBridge {
                                             &edge_tools,
                                             &bridge_restricted_snapshot,
                                         )
-                                        .with_deferred_tools_block(&deferred_block_str)
-                                        .with_selection_trace(bridge_selection_trace.clone()),
+                                        .with_deferred_tools_block(&deferred_block_str),
                                     runtime_signals:
                                         crate::turn::llm::context::BridgeRuntimeSignals::new(
                                             &stable_sections,
@@ -2444,7 +2425,6 @@ impl InProcessChatTurnBridge {
                                             edge_profile
                                                 .get("system_prompt_override")
                                                 .and_then(Value::as_str),
-                                            selection_confidence,
                                             task_type,
                                         ),
                                     session:
@@ -4358,12 +4338,11 @@ impl InProcessChatTurnBridge {
                         .and_then(Value::as_u64)
                 })
                 .sum();
-            let trace_signal = build_legacy_context_trace_signal(
+            let trace_signal = build_context_trace_signal(
                 trace_turn,
                 format!("turn-{trace_turn}"),
                 edge_tools.len(),
                 recent_tools_for_quality.clone(),
-                selection_confidence,
                 last_measured_prompt,
                 budget.model_limit,
                 tool_execution_ms,
@@ -4429,7 +4408,7 @@ impl InProcessChatTurnBridge {
             }
 
             if explain {
-                let tool_selection = all_round_tool_calls
+                let first_tool_call = all_round_tool_calls
                     .first()
                     .and_then(Value::as_object)
                     .and_then(|tool_call| tool_call.get("function"))
@@ -4503,7 +4482,7 @@ impl InProcessChatTurnBridge {
                     Some(final_usage.output_tokens as i64),
                     all_round_tool_calls.len(),
                     edge_tools.len(),
-                    tool_selection,
+                    first_tool_call,
                     llm_steps,
                     memory,
                     routing,
@@ -5306,22 +5285,24 @@ mod tests {
     }
 
     #[test]
-    fn build_legacy_context_trace_signal_keeps_only_known_timing_values() {
-        let signal = build_legacy_context_trace_signal(
+    fn build_context_trace_signal_keeps_only_known_timing_values() {
+        let signal = build_context_trace_signal(
             3,
             "turn-3".to_string(),
             5,
             vec!["read_file".to_string(), "grep".to_string()],
-            0.82,
             Some(1200),
             8000,
             450,
             1500,
         );
 
-        let tool_selection = signal.tool_selection.as_ref().expect("tool selection");
-        assert_eq!(tool_selection.strategy, "inprocess_bridge");
-        assert_eq!(tool_selection.confidence, 0.82);
+        let tool_surface = signal.tool_surface.as_ref().expect("tool surface");
+        assert_eq!(
+            tool_surface.visible_tools,
+            vec!["read_file".to_string(), "grep".to_string()]
+        );
+        assert_eq!(tool_surface.tools_available, 5);
 
         let timing = signal.timing.as_ref().expect("timing");
         assert_eq!(timing.turn, 3);
@@ -5472,7 +5453,6 @@ mod tests {
             crate::turn::prompt_cache::assemble_system_message_via_pipeline(
                 &["bash", "read_file"],
                 &dynamic_sections,
-                0.8,
                 Some("implementation"),
                 &PromptCacheConfig::latch("openai", "gpt-4"),
                 "test-session",
@@ -5498,9 +5478,8 @@ mod tests {
         assert!(breakdown.environment_tokens > 0);
         assert!(breakdown.user_preferences_tokens > 0);
         // guidance_signals default to false — guard against accidental default changes
-        assert!(!breakdown.guidance_signals.round_budget_warning);
-        assert!(!breakdown.guidance_signals.synthesize_or_batch);
         assert!(!breakdown.guidance_signals.parallel_feedback);
+        assert!(!breakdown.guidance_signals.parallel_batching_nudge);
     }
 
     #[test]
@@ -5509,24 +5488,21 @@ mod tests {
         use astra_turn_core::context_assembly_trace::{PromptGuidanceSignals, PromptTraceSignals};
 
         let section = PromptSection {
-            text: "round budget warning".to_string(),
+            text: "parallel feedback".to_string(),
             scope: CacheScope::None,
             token_bucket: PromptTokenBucket::Environment,
             trace_signals: PromptTraceSignals {
                 guidance_signals: PromptGuidanceSignals {
-                    round_budget_warning: true,
-                    synthesize_or_batch: true,
-                    parallel_feedback: false,
-                    parallel_batching_nudge: false,
+                    parallel_feedback: true,
+                    parallel_batching_nudge: true,
                 },
                 ..Default::default()
             },
         };
         let breakdown = prompts::build_system_prompt_trace(&[section], vec![], vec![], None);
         assert!(!breakdown.context_signals.active_output_skills);
-        assert!(breakdown.guidance_signals.round_budget_warning);
-        assert!(breakdown.guidance_signals.synthesize_or_batch);
-        assert!(!breakdown.guidance_signals.parallel_feedback);
+        assert!(breakdown.guidance_signals.parallel_feedback);
+        assert!(breakdown.guidance_signals.parallel_batching_nudge);
     }
     #[test]
     fn annotate_tool_schemas_for_caching_adds_cache_control() {

@@ -449,7 +449,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     let suppress_nudges = host.turn_interaction_mode().suppresses_loop_nudges();
     state.refresh_task_board_snapshot().await;
 
-    // Inject round budget guidance so the model knows to batch or synthesize.
+    // Inject tool round guidance so the model knows to batch or synthesize.
     // Use llm_rounds_completed (actual LLM call count) not turn_index (step
     // counter inflated by progressive penalty).
     // Skip when the host already injects guidance (e.g. server path injects
@@ -459,19 +459,21 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // injecting a fresh one so the message vec (and any downstream REPL-history
     // replay that keys off it) does not accumulate one guidance block per
     // LLM round. Detection uses the stable headings produced by
-    // `round_budget_directive`.
-    fn is_ephemeral_round_budget_msg(m: &serde_json::Value) -> bool {
+    // `tool_round_guidance`.
+    fn is_ephemeral_tool_round_guidance_msg(m: &serde_json::Value) -> bool {
         if m.get("role").and_then(|r| r.as_str()) != Some("user") {
             return false;
         }
         m.get("content")
             .and_then(|c| c.as_str())
-            .is_some_and(|s| s.contains("## ⚡ Round Budget") || s.contains("## ⚠ Round Budget"))
+            .is_some_and(|s| s.contains("## ⚡ Tool Round") || s.contains("## ⚠ Tool Round"))
     }
 
     if !host.injects_round_guidance() {
         // Drop any stale guidance message(s) from prior rounds before this call.
-        state.messages.retain(|m| !is_ephemeral_round_budget_msg(m));
+        state
+            .messages
+            .retain(|m| !is_ephemeral_tool_round_guidance_msg(m));
         if !suppress_nudges {
             let guidance =
                 crate::prompts::tool_round_guidance(&state.messages, state.llm_rounds_completed);
@@ -518,7 +520,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     }
 
     // Load runtime config once per round for all mid-loop guards below.
-    let tool_cfg = &astra_config::runtime_config::RuntimeConfig::load().tool_selection;
+    let tool_cfg = &astra_config::runtime_config::RuntimeConfig::load().tool_policy;
     let resolved_tool_policy =
         tool_cfg.resolve_for_model(state.context_manifest_model_name.as_deref());
     let parallel_batching_force_threshold =
@@ -599,7 +601,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 state.stall.circuit_breaker.correction_injected();
             }
             astra_turn_core::loop_circuit_breaker::BreakerAction::InjectCorrection => {
-                state.stall.forced_round_budget_phase1 = true;
+                state.stall.forced_tool_round_hard_stop = true;
                 state.stall.circuit_breaker.correction_injected();
                 // Physical tool lockout for the upcoming round.
                 //
@@ -608,14 +610,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 // so the model sometimes ignored the instruction and kept
                 // calling tools (observed: session 36500dd9 round 13 kept
                 // using bash/read_file despite the message). Adding every
-                // valid tool to `restricted_tools` flips the phase1 promise
+                // valid tool to `restricted_tools` flips the hard-stop promise
                 // from aspirational to enforced: the payload builder filters
                 // these out before the next request is built, so the
                 // model physically cannot emit another tool call this round.
                 for name in host.valid_tool_names() {
                     state.restricted_tools.insert(name.clone());
                 }
-                let msg = round_budget_phase1_message(state.llm_rounds_completed, &state.message);
+                let msg = tool_round_hard_stop_message(state.llm_rounds_completed, &state.message);
                 state.push_volatile(super::host::VolatileKind::BudgetAdvisory, msg);
                 tracing::warn!(
                     target: "astra::loop_guard",
@@ -634,7 +636,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 }
             }
             astra_turn_core::loop_circuit_breaker::BreakerAction::Abort => {
-                state.stall.forced_round_budget_phase2 = true;
+                state.stall.forced_tool_round_abort = true;
                 let diagnosis = interruption_diagnosis_summary(state);
                 // Rich, contextual abort message: includes the diagnosis,
                 // the most recent preserved tool calls, and a concrete
@@ -748,16 +750,16 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
 
     if !suppress_nudges
         && !pipeline_corrective_fired
-        && !state.stall.forced_round_budget_phase1
+        && !state.stall.forced_tool_round_hard_stop
         && !state.stall.forced_completion_soft_stop
-        && let Some((family, blocked_tools)) = exploration_family_phase2_candidate(state)
+        && let Some((family, blocked_tools)) = exploration_family_lockout_candidate(state)
     {
-        state.stall.forced_exploration_family_phase2 = true;
-        let msg = exploration_family_phase2_message(&family, &blocked_tools, &state.message);
+        state.stall.forced_exploration_family_lockout = true;
+        let msg = exploration_family_lockout_message(&family, &blocked_tools, &state.message);
         state.push_volatile(super::host::VolatileKind::Corrective, msg);
         tracing::warn!(
             target: "astra::loop_guard",
-            tier = "exploration_family_phase2",
+            tier = "exploration_family_lockout",
             round = state.llm_rounds_completed,
             family = family,
             blocked_tools = ?blocked_tools,
@@ -777,14 +779,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // Redundant-reads mid-loop corrective. Detects the model re-reading
     // overlapping line ranges of the same file with no intervening edit;
     // injects a one-shot corrective telling it to use existing context
-    // rather than re-reading. Lives below round-budget phase-1 because
-    // phase-1 is the harder finalization push — if both would fire on the
-    // same round we prefer phase-1's narrower "stop calling tools" message.
+    // rather than re-reading. Lives below the tool-round hard-stop because
+    // hard-stop is the stronger finalization push — if both would fire on the
+    // same round we prefer its narrower "stop calling tools" message.
     if !suppress_nudges
         && !pipeline_corrective_fired
-        && !state.stall.forced_round_budget_phase1
+        && !state.stall.forced_tool_round_hard_stop
         && !state.stall.forced_completion_soft_stop
-        && !state.stall.forced_exploration_family_phase2
+        && !state.stall.forced_exploration_family_lockout
         && should_inject_redundant_reads_corrective(state, redundant_reads_threshold)
     {
         let count = astra_turn_core::evaluation::count_redundant_overlapping_reads(
@@ -812,9 +814,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     }
     if !suppress_nudges
         && !pipeline_corrective_fired
-        && !state.stall.forced_round_budget_phase1
+        && !state.stall.forced_tool_round_hard_stop
         && !state.stall.forced_completion_soft_stop
-        && !state.stall.forced_exploration_family_phase2
+        && !state.stall.forced_exploration_family_lockout
         && !state.stall.forced_redundant_reads_corrective
         && should_inject_cache_waste_corrective(state, cache_waste_threshold)
     {
@@ -844,9 +846,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     }
     if !suppress_nudges
         && !pipeline_corrective_fired
-        && !state.stall.forced_round_budget_phase1
+        && !state.stall.forced_tool_round_hard_stop
         && !state.stall.forced_completion_soft_stop
-        && !state.stall.forced_exploration_family_phase2
+        && !state.stall.forced_exploration_family_lockout
         && !state.stall.forced_redundant_reads_corrective
         && !state.stall.forced_cache_waste_corrective
         && should_inject_search_fanout_corrective(state, search_fanout_threshold)
@@ -878,9 +880,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     }
     if !suppress_nudges
         && !pipeline_corrective_fired
-        && !state.stall.forced_round_budget_phase1
+        && !state.stall.forced_tool_round_hard_stop
         && !state.stall.forced_completion_soft_stop
-        && !state.stall.forced_exploration_family_phase2
+        && !state.stall.forced_exploration_family_lockout
         && !state.stall.forced_redundant_reads_corrective
         && !state.stall.forced_cache_waste_corrective
         && !state.stall.forced_search_fanout_corrective
@@ -1498,13 +1500,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         AgenticIngestIterationControl::ProceedWithToolCalls => {}
     }
 
-    // Circuit breaker post-LLM check: if the correction was injected (phase1)
+    // Circuit breaker post-LLM check: if the hard-stop correction was injected
     // but the model still emitted tool calls, escalate to abort. We do NOT
     // call observe() again — the breaker observes exactly once per completed
     // round (in the pre-LLM block). Here we just check: correction was given,
     // model ignored it → abort.
-    if state.stall.forced_round_budget_phase1 && !state.stall.forced_round_budget_phase2 {
-        state.stall.forced_round_budget_phase2 = true;
+    if state.stall.forced_tool_round_hard_stop && !state.stall.forced_tool_round_abort {
+        state.stall.forced_tool_round_abort = true;
         let abort_detail = circuit_breaker_abort_detail(state);
         state.final_text.clear();
         state.final_text_streamed = false;
@@ -1515,9 +1517,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         ));
         tracing::warn!(
             target: "astra::loop_guard",
-            tier = "circuit_breaker_phase2_abort",
+            tier = "circuit_breaker_hard_stop_abort",
             round = state.llm_rounds_completed,
-            "circuit breaker phase2 abort (model ignored correction)"
+            "circuit breaker hard-stop abort (model ignored correction)"
         );
         if !prep.quiet {
             host.emit_headless_line(
@@ -1539,8 +1541,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     if should_wrap_up_for_cumulative_budget(host, state, prep.quiet) {
         return Ok(TurnExecutionControl::ContinueLoop);
     }
-
-    record_tool_selection(state, &turn_result, turn_index);
 
     Ok(TurnExecutionControl::Proceed(Box::new(
         TurnExecutionPhase {
@@ -1576,7 +1576,7 @@ fn execution_retry_reason(state: &AgenticLoopState) -> Option<ExecutionRetryReas
     if state.stall.forced_parallel_batching {
         return None;
     }
-    if state.stall.forced_round_budget_phase1
+    if state.stall.forced_tool_round_hard_stop
         || state.stall.forced_redundant_reads_corrective
         || state.stall.forced_cache_waste_corrective
         || state.stall.forced_search_fanout_corrective
@@ -2046,13 +2046,13 @@ pub(crate) fn is_execution_corrective_message(m: &serde_json::Value) -> bool {
     is_execution_retry_correction(m)
         || is_execution_escalation(m)
         || is_parallel_batching_force(m)
-        || is_round_budget_phase1(m)
+        || is_tool_round_hard_stop(m)
         || is_completion_soft_stop(m)
         || is_redundant_reads_corrective(m)
         || is_cache_waste_corrective(m)
         || is_search_fanout_corrective(m)
         || is_exploration_family_corrective(m)
-        || is_exploration_family_phase2(m)
+        || is_exploration_family_lockout(m)
 }
 
 /// Third-tier guard for the parallel-batching layer. The prompt-side soft
@@ -2070,7 +2070,7 @@ pub(crate) const PARALLEL_BATCHING_FORCE_MARKER: &str = "## ⤴ Parallel Batchin
 /// Trailing single-tool-round streak length at which the soft prompt nudge
 /// (=6) escalates into a forced corrective injection.
 /// Default for the threshold; the actual value used at runtime flows through
-/// `ToolSelectionConfig::effective_parallel_batching_force_streak` (and
+/// `ToolPolicyConfig::effective_parallel_batching_force_streak` (and
 /// per-model overrides via `ModelPolicyProfile`).
 /// Must match `effective_parallel_batching_force_streak`'s zero-default.
 #[cfg(test)]
@@ -2096,12 +2096,12 @@ pub(crate) fn should_force_parallel_batching(state: &AgenticLoopState, threshold
         return false;
     }
     // Same invariant for the new cascade guards.
-    if state.stall.forced_round_budget_phase1
+    if state.stall.forced_tool_round_hard_stop
         || state.stall.forced_redundant_reads_corrective
         || state.stall.forced_cache_waste_corrective
         || state.stall.forced_search_fanout_corrective
         || state.stall.forced_exploration_family_corrective
-        || state.stall.forced_exploration_family_phase2
+        || state.stall.forced_exploration_family_lockout
     {
         return false;
     }
@@ -2125,10 +2125,10 @@ pub(crate) fn parallel_batching_force_message(streak: usize, original_query: &st
     )
 }
 
-// ─── Round-budget convergence guard (two-phase) ─────────────────────────
+// ─── Tool-round convergence guard (two-phase) ───────────────────────────
 //
-// Phase 1 fires when the loop has completed >= effective round-budget hard
-// limit but the model is still calling tools. The runtime injects a hard
+// Phase 1 fires when the loop has completed too many LLM rounds and the
+// model is still calling tools. The runtime injects a hard
 // corrective `user` message AND restricts all tools for the upcoming round,
 // so the model is forced into a text-only finalization. The corrective
 // wording is explicitly anti-hallucination: it tells the model to enumerate
@@ -2136,21 +2136,21 @@ pub(crate) fn parallel_batching_force_message(streak: usize, original_query: &st
 //
 // Phase 2 is the safety net: if the model still produces tool calls after
 // phase 1 (i.e. ignores both the corrective AND attempts tools that were
-// runtime-restricted), `should_abort_for_round_budget_phase2` returns true
+// runtime-restricted), `should_abort_for_tool_round_abort` returns true
 // and the caller aborts the loop — analogous to a hard max-turns error,
 // but reached only after one extra grace round, which avoids the
 // overkill of an immediate hard cap on weaker models.
 
-pub(crate) const ROUND_BUDGET_PHASE1_MARKER: &str = "## ⤴ Round Budget Reached";
+pub(crate) const TOOL_ROUND_HARD_STOP_MARKER: &str = "## ⤴ Tool Round Hard Stop";
 pub(crate) const COMPLETION_SOFT_STOP_MARKER: &str = "## ✓ Task Appears Complete";
 
-pub(crate) fn is_round_budget_phase1(m: &serde_json::Value) -> bool {
+pub(crate) fn is_tool_round_hard_stop(m: &serde_json::Value) -> bool {
     if m.get("role").and_then(|r| r.as_str()) != Some("user") {
         return false;
     }
     m.get("content")
         .and_then(|c| c.as_str())
-        .is_some_and(|s| s.starts_with(ROUND_BUDGET_PHASE1_MARKER))
+        .is_some_and(|s| s.starts_with(TOOL_ROUND_HARD_STOP_MARKER))
 }
 
 pub(crate) fn is_completion_soft_stop(m: &serde_json::Value) -> bool {
@@ -2248,11 +2248,11 @@ pub(crate) fn completion_soft_stop_message(round_index: u32, original_query: &st
     )
 }
 
-pub(crate) fn round_budget_phase1_message(round_index: u32, original_query: &str) -> String {
+pub(crate) fn tool_round_hard_stop_message(round_index: u32, original_query: &str) -> String {
     format!(
-        "{ROUND_BUDGET_PHASE1_MARKER}\n\
+        "{TOOL_ROUND_HARD_STOP_MARKER}\n\
          Runtime correction: this turn has used {round_index} tool rounds and \
-         is past the configured hard limit.\n\n\
+         is past the circuit-breaker hard-stop threshold.\n\n\
          Tool access for the next round has been restricted by the runtime. \
          Any tool calls you emit WILL BE DROPPED before execution — the runtime will \
          not invoke them and you will not receive results. Your next message must \
@@ -2284,10 +2284,10 @@ pub(crate) const REDUNDANT_READS_MARKER: &str = "## ⤴ Redundant Reads Detected
 pub(crate) const CACHE_WASTE_MARKER: &str = "## ⤴ Repeated Cached Tool Calls Detected";
 pub(crate) const SEARCH_FANOUT_MARKER: &str = "## ⤴ Search Fanout Detected";
 pub(crate) const EXPLORATION_FAMILY_MARKER: &str = "## ⤴ Exploration Family Churn Detected";
-pub(crate) const EXPLORATION_FAMILY_PHASE2_MARKER: &str =
+pub(crate) const EXPLORATION_FAMILY_LOCKOUT_MARKER: &str =
     "## ⤴ Exploration Family Convergence Required";
 /// Default cache-waste midloop threshold. Used in tests; production code
-/// reads from `ToolSelectionConfig::effective_cache_waste_midloop_threshold()`.
+/// reads from `ToolPolicyConfig::effective_cache_waste_midloop_threshold()`.
 #[cfg(test)]
 pub(crate) const CACHE_WASTE_MIDLOOP_THRESHOLD: usize = 3;
 
@@ -2298,7 +2298,7 @@ pub(crate) const CACHE_WASTE_MIDLOOP_THRESHOLD: usize = 3;
 /// borderline turns.
 /// Default for the redundant-reads mid-loop threshold; the actual value used
 /// at runtime flows through
-/// `ToolSelectionConfig::effective_redundant_reads_midloop_threshold`. Must
+/// `ToolPolicyConfig::effective_redundant_reads_midloop_threshold`. Must
 /// match that accessor's zero-default.
 #[cfg(test)]
 pub(crate) const REDUNDANT_READS_MIDLOOP_THRESHOLD: usize = 4;
@@ -2354,13 +2354,13 @@ pub(crate) fn is_exploration_family_corrective(m: &serde_json::Value) -> bool {
         .is_some_and(|s| s.starts_with(EXPLORATION_FAMILY_MARKER))
 }
 
-pub(crate) fn is_exploration_family_phase2(m: &serde_json::Value) -> bool {
+pub(crate) fn is_exploration_family_lockout(m: &serde_json::Value) -> bool {
     if m.get("role").and_then(|r| r.as_str()) != Some("user") {
         return false;
     }
     m.get("content")
         .and_then(|c| c.as_str())
-        .is_some_and(|s| s.starts_with(EXPLORATION_FAMILY_PHASE2_MARKER))
+        .is_some_and(|s| s.starts_with(EXPLORATION_FAMILY_LOCKOUT_MARKER))
 }
 
 fn restricted_tools_for_exploration_family(family: &str) -> &'static [&'static str] {
@@ -2430,11 +2430,11 @@ fn latest_non_synthetic_round_records(
     Some((last_round, records))
 }
 
-pub(crate) fn exploration_family_phase2_candidate(
+pub(crate) fn exploration_family_lockout_candidate(
     state: &AgenticLoopState,
 ) -> Option<(String, Vec<String>)> {
     if !state.stall.forced_exploration_family_corrective
-        || state.stall.forced_exploration_family_phase2
+        || state.stall.forced_exploration_family_lockout
     {
         return None;
     }
@@ -2557,14 +2557,14 @@ pub(crate) fn exploration_family_corrective_message(
     )
 }
 
-pub(crate) fn exploration_family_phase2_message(
+pub(crate) fn exploration_family_lockout_message(
     family: &str,
     blocked_tools: &[String],
     original_query: &str,
 ) -> String {
     let blocked_list = blocked_tools.join(", ");
     format!(
-        "{EXPLORATION_FAMILY_PHASE2_MARKER}\n\
+        "{EXPLORATION_FAMILY_LOCKOUT_MARKER}\n\
          Runtime correction: after the earlier {family}-family restriction, your most recent tool round still attempted ONLY restricted tools [{blocked_list}]. \
          That produced zero new evidence, so this turn must now converge instead of retrying the same path.\n\n\
          REQUIRED next-step behavior:\n\
@@ -2903,66 +2903,6 @@ fn should_wrap_up_for_cumulative_budget<H: AgenticLoopHost>(
     );
     try_write_heavy_checkpoint(state);
     true
-}
-
-fn record_tool_selection(
-    state: &mut AgenticLoopState,
-    turn_result: &HostTurnResult,
-    turn_index: usize,
-) {
-    if let Some(session) = &state.telemetry.observability_session {
-        let selected_tools: Vec<String> = turn_result
-            .edge_tool_round
-            .iter()
-            .map(|r| r.tool.clone())
-            .collect();
-        if !selected_tools.is_empty() {
-            let explanation = astra_turn_core::decision_explainer::DecisionExplanation {
-                id: format!(
-                    "tool-sel-{}-{}",
-                    state.current_session_id.as_deref().unwrap_or("?"),
-                    turn_index
-                ),
-                timestamp: std::time::SystemTime::now(),
-                decision_type: astra_turn_core::decision_explainer::DecisionType::ToolSelection {
-                    selected_tools: selected_tools.clone(),
-                    total_available: state.telemetry.all_tools_used.len() as u32,
-                },
-                inputs: vec![astra_turn_core::decision_explainer::ExplainableInput {
-                    name: "user_query".to_string(),
-                    value: state.message.clone(),
-                    influence: 1.0,
-                    explanation: Some("Primary input driving tool selection".to_string()),
-                }],
-                reasoning: format!(
-                    "LLM selected {} tool(s) for this turn",
-                    selected_tools.len()
-                ),
-                alternatives: vec![],
-                confidence: 0.8,
-            };
-            let mut session_guard = astra_core::sync_poison::recover_rwlock_write(session);
-            crate::observability::on_tool_selection(&mut session_guard, explanation);
-        }
-    }
-
-    if let Some(ref collector) = state.telemetry.turn_trace_collector
-        && !collector.has_tool_trace()
-    {
-        let selected_tools: Vec<String> = turn_result
-            .edge_tool_round
-            .iter()
-            .map(|r| r.tool.clone())
-            .collect();
-        collector.record_tool_selection(
-            &selected_tools,
-            "llm",
-            0.0,
-            &[],
-            state.telemetry.all_tools_used.len() as u32,
-            0,
-        );
-    }
 }
 
 #[cfg(test)]
@@ -3693,13 +3633,13 @@ mod tests {
     }
 
     #[test]
-    fn execution_retry_suppressed_when_round_budget_corrective_already_fired() {
+    fn execution_retry_suppressed_when_tool_round_hard_stop_already_fired() {
         let mut state = make_state();
         state.message = "implement the feature".into();
         state.final_text = "I'll implement that for you.".into();
         state.total_tool_calls = 0;
         state.task_profile.mutates_workspace = true;
-        state.stall.forced_round_budget_phase1 = true;
+        state.stall.forced_tool_round_hard_stop = true;
         assert_eq!(execution_retry_reason(&state), None);
     }
 
@@ -3963,7 +3903,7 @@ mod tests {
 
     /// Regression: the unfinished-task-board mid-loop gate must be one-shot
     /// per turn so a model that ignores the corrective doesn't churn the
-    /// global round budget. After the gate fires once, the next text-only
+    /// global tool round. After the gate fires once, the next text-only
     /// completion should fall through to terminal rendering, where
     /// `ensure_terminal_text` rewrites the answer with structured stop +
     /// remaining-task context (covered by the finalization tests).
@@ -4491,12 +4431,12 @@ mod tests {
     #[test]
     fn parallel_batching_suppressed_when_cascade_guard_already_fired() {
         let flags: Vec<Box<dyn Fn(&mut AgenticLoopState)>> = vec![
-            Box::new(|s| s.stall.forced_round_budget_phase1 = true),
+            Box::new(|s| s.stall.forced_tool_round_hard_stop = true),
             Box::new(|s| s.stall.forced_redundant_reads_corrective = true),
             Box::new(|s| s.stall.forced_cache_waste_corrective = true),
             Box::new(|s| s.stall.forced_search_fanout_corrective = true),
             Box::new(|s| s.stall.forced_exploration_family_corrective = true),
-            Box::new(|s| s.stall.forced_exploration_family_phase2 = true),
+            Box::new(|s| s.stall.forced_exploration_family_lockout = true),
         ];
         for set_flag in &flags {
             let mut state = make_state();
@@ -4643,23 +4583,21 @@ mod tests {
     }
 
     #[test]
-    fn parallel_batching_force_keeps_resolved_threshold_in_round_budget_warning_zone() {
+    fn parallel_batching_force_does_not_fire_before_resolved_threshold() {
         let below_force_threshold = PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD - 1;
         let mut state = make_state();
         state.message = "explore the codebase".into();
         for _ in 0..below_force_threshold {
             push_single_tool_round(&mut state);
         }
-        // Before the warning zone, this must NOT fire.
-        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD - 1;
+        state.llm_rounds_completed = 0;
         assert!(!should_force_parallel_batching(
             &state,
             PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
         ));
 
-        // The warning zone must not make the hard corrective more aggressive;
-        // it already has soft budget guidance for pacing.
-        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD;
+        // Round count must not make the hard corrective more aggressive.
+        state.llm_rounds_completed = 12;
         assert!(!should_force_parallel_batching(
             &state,
             PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
@@ -4667,13 +4605,13 @@ mod tests {
     }
 
     #[test]
-    fn parallel_batching_force_warning_zone_still_fires_at_resolved_threshold() {
+    fn parallel_batching_force_fires_at_resolved_threshold() {
         let mut state = make_state();
         state.message = "explore the codebase".into();
         for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD {
             push_single_tool_round(&mut state);
         }
-        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD + 2;
+        state.llm_rounds_completed = 12;
         assert!(should_force_parallel_batching(
             &state,
             PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
@@ -4690,7 +4628,7 @@ mod tests {
     /// failure-mode escalation.
     #[test]
     fn parallel_batching_force_default_above_nudge_threshold() {
-        let cfg = astra_config::runtime_config::ToolSelectionConfig::default();
+        let cfg = astra_config::runtime_config::ToolPolicyConfig::default();
         let resolved = cfg.effective_parallel_batching_force_streak() as usize;
         assert!(
             resolved > crate::prompts::PARALLEL_BATCHING_NUDGE_THRESHOLD,
@@ -4716,7 +4654,7 @@ mod tests {
     /// floors drift apart across crates.
     #[test]
     fn parallel_batching_force_per_model_above_nudge_threshold() {
-        let cfg = astra_config::runtime_config::ToolSelectionConfig::default();
+        let cfg = astra_config::runtime_config::ToolPolicyConfig::default();
         for model in &[
             "claude-opus-4-7",
             "claude-sonnet-4-6",
@@ -4751,7 +4689,7 @@ mod tests {
         // Configure a user profile well above the global default and nudge
         // threshold, so a default-length streak should NOT fire under this
         // profile but WOULD fire under the global default.
-        let mut cfg = astra_config::runtime_config::ToolSelectionConfig::default();
+        let mut cfg = astra_config::runtime_config::ToolPolicyConfig::default();
         cfg.model_profiles
             .push(astra_config::runtime_config::ModelPolicyProfile {
                 model_match: "haiku".to_string(),
@@ -4801,7 +4739,7 @@ mod tests {
     #[test]
     fn parallel_batching_force_per_profile_clamp_above_nudge() {
         for low in 1..=crate::prompts::PARALLEL_BATCHING_NUDGE_THRESHOLD as u32 {
-            let mut cfg = astra_config::runtime_config::ToolSelectionConfig::default();
+            let mut cfg = astra_config::runtime_config::ToolPolicyConfig::default();
             cfg.model_profiles
                 .push(astra_config::runtime_config::ModelPolicyProfile {
                     model_match: "haiku".to_string(),
@@ -4820,33 +4758,31 @@ mod tests {
         }
     }
 
-    /// Round-budget warning state must not override the resolved per-model
-    /// threshold. Pacing hints can be soft; hard correction should stay tied
-    /// to the explicit tool-selection policy.
+    /// LLM round count must not override the resolved per-model threshold.
+    /// Hard correction stays tied to the explicit tool policy.
     #[test]
-    fn parallel_batching_force_warning_zone_respects_resolved_per_model_threshold() {
+    fn parallel_batching_force_respects_resolved_per_model_threshold() {
         let mut state = make_state();
         state.message = "explore the codebase".into();
         for _ in 0..8 {
             push_single_tool_round(&mut state);
         }
-        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD + 1;
+        state.llm_rounds_completed = 12;
 
         assert!(
             should_force_parallel_batching(&state, 8),
-            "streak=8 in warning zone must fire under resolved threshold 8"
+            "streak=8 must fire under resolved threshold 8"
         );
         assert!(
             !should_force_parallel_batching(&state, 9),
-            "streak=8 in warning zone must NOT fire under resolved threshold 9"
+            "streak=8 must NOT fire under resolved threshold 9"
         );
     }
 
-    // ─── Round-budget convergence guard — REMOVED ─────────────────────────
-    // The old countdown-based phase1/phase2 tests have been replaced by
-    // unit tests in `astra_turn_core::loop_circuit_breaker::tests`.
-    // The circuit breaker is integration-tested via the full agentic loop
-    // E2E tests.
+    // ─── Circuit-breaker convergence guard ────────────────────────────────
+    // Countdown-based tool-round directives are gone; convergence behavior is
+    // covered by `astra_turn_core::loop_circuit_breaker::tests` and full
+    // agentic-loop E2E tests.
 
     // ── Auto-mode nudge suppression ────────────────────────────────────
     // In PermissionMode::Auto (→ TurnInteractionMode::Auto) the user
@@ -5135,7 +5071,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_mode_suppresses_round_budget_guidance_injection() {
+    async fn auto_mode_suppresses_tool_round_guidance_injection() {
         // The prompt-side tool_round_guidance (parallel-batching soft
         // nudge at streak=4, before the hard force at streak=5) also
         // must stay silent in Auto.
@@ -5162,7 +5098,7 @@ mod tests {
                     .get("content")
                     .and_then(|c| c.as_str())
                     .is_some_and(|s| s.contains("## ⚠ Sequential Tool Calls Detected"))),
-            "Auto mode must not inject round-budget/tool guidance nudges"
+            "Auto mode must not inject tool-round guidance nudges"
         );
     }
 
@@ -5499,14 +5435,14 @@ mod tests {
     }
 
     #[test]
-    fn exploration_family_phase2_fires_after_blocked_only_retry_round() {
+    fn exploration_family_lockout_fires_after_blocked_only_retry_round() {
         let mut state = make_state();
         state.message = "review local changes".into();
         state.stall.forced_exploration_family_corrective = true;
         state.stall.exploration_family_corrective_family = Some("diff".into());
         push_blocked_restricted_round(&mut state, "git_diff", 7);
 
-        let candidate = exploration_family_phase2_candidate(&state);
+        let candidate = exploration_family_lockout_candidate(&state);
         assert_eq!(
             candidate,
             Some(("diff".to_string(), vec!["git_diff".to_string()])),
@@ -5514,7 +5450,7 @@ mod tests {
     }
 
     #[test]
-    fn exploration_family_phase2_stays_silent_on_mixed_progress_round() {
+    fn exploration_family_lockout_stays_silent_on_mixed_progress_round() {
         let mut state = make_state();
         state.message = "review local changes".into();
         state.stall.forced_exploration_family_corrective = true;
@@ -5528,36 +5464,36 @@ mod tests {
             ..Default::default()
         });
 
-        assert!(exploration_family_phase2_candidate(&state).is_none());
+        assert!(exploration_family_lockout_candidate(&state).is_none());
     }
 
     #[test]
-    fn exploration_family_phase2_is_one_shot_per_turn() {
+    fn exploration_family_lockout_is_one_shot_per_turn() {
         let mut state = make_state();
         state.message = "review local changes".into();
         state.stall.forced_exploration_family_corrective = true;
         state.stall.exploration_family_corrective_family = Some("diff".into());
         push_blocked_restricted_round(&mut state, "git_diff", 7);
 
-        assert!(exploration_family_phase2_candidate(&state).is_some());
-        state.stall.forced_exploration_family_phase2 = true;
-        assert!(exploration_family_phase2_candidate(&state).is_none());
+        assert!(exploration_family_lockout_candidate(&state).is_some());
+        state.stall.forced_exploration_family_lockout = true;
+        assert!(exploration_family_lockout_candidate(&state).is_none());
     }
 
     #[test]
-    fn exploration_family_phase2_marker_recognized() {
+    fn exploration_family_lockout_marker_recognized() {
         let msg = serde_json::json!({
             "role": "user",
-            "content": exploration_family_phase2_message(
+            "content": exploration_family_lockout_message(
                 "diff",
                 &["git_diff".to_string()],
                 "review local changes",
             ),
         });
-        assert!(is_exploration_family_phase2(&msg));
+        assert!(is_exploration_family_lockout(&msg));
         assert!(is_execution_corrective_message(&msg));
         let unrelated = serde_json::json!({"role": "user", "content": "hello"});
-        assert!(!is_exploration_family_phase2(&unrelated));
+        assert!(!is_exploration_family_lockout(&unrelated));
     }
 
     #[test]

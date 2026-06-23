@@ -1567,7 +1567,7 @@ mod tests {
                     30,
                     100,
                 )
-                .with_tool_selection(
+                .with_tool_surface(
                     vec!["github_ci_status".into()],
                     vec![],
                     vec!["github_ci_status".into()],
@@ -1589,7 +1589,7 @@ mod tests {
                     90,
                 )
                 .with_cache_tokens(80, 10)
-                .with_tool_selection(
+                .with_tool_surface(
                     vec!["github_list_prs".into()],
                     vec![],
                     vec!["github_list_prs".into()],
@@ -1636,7 +1636,7 @@ mod tests {
                     50,
                     10,
                 )
-                .with_tool_selection(
+                .with_tool_surface(
                     vec!["git_log".into()],
                     vec![],
                     vec!["git_log".into()],
@@ -1666,7 +1666,7 @@ mod tests {
                     20,
                     10,
                 )
-                .with_tool_selection(
+                .with_tool_surface(
                     vec!["github_ci_status".into()],
                     vec![],
                     vec!["github_ci_status".into()],
@@ -1743,7 +1743,7 @@ mod tests {
                     8,
                     10,
                 )
-                .with_tool_selection(
+                .with_tool_surface(
                     vec!["github_ci_status".into()],
                     vec![],
                     vec!["github_ci_status".into()],

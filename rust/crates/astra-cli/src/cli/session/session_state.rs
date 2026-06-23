@@ -11,7 +11,6 @@ use crate::cli::slash::slash_team;
 use crate::mcp_client;
 use astra_runtime::plan as runtime_plan;
 use astra_runtime::prompts;
-use astra_runtime::tool_registry;
 use astra_services::session_journal;
 use astra_turn_core::conversation_log::manager::CslManager;
 
@@ -291,10 +290,6 @@ pub(crate) struct SessionState {
     pub tool_health_entries: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
     /// Last successfully synced tool health snapshot, used to compute deltas.
     pub synced_tool_health_entries: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
-    /// Cross-session tool quality tracker so the REPL save path can export
-    /// cumulative per-tool selection/quality counters.
-    pub tool_quality_tracker:
-        Option<std::sync::Arc<std::sync::Mutex<tool_registry::ToolQualityTracker>>>,
     /// Local mirror of the cloud `plans` row when plan mode was
     /// entered through the cloud workflow (`/plan "goal"` or the
     /// `enter_plan_mode` tool against an authenticated cloud
@@ -638,7 +633,6 @@ impl Default for SessionState {
             task_service: None,
             tool_health_entries: Vec::new(),
             synced_tool_health_entries: Vec::new(),
-            tool_quality_tracker: None,
             cloud_plan_mirror: None,
             plan_mode_sync_error: None,
             executing_plan: None,
@@ -1047,8 +1041,8 @@ mod default_tests {
             Some("follow repo policy")
         );
         assert_eq!(
-            serde_json::to_value(&state.runtime_config.tool_selection).unwrap(),
-            serde_json::to_value(&runtime_config.tool_selection).unwrap()
+            serde_json::to_value(&state.runtime_config.tool_policy).unwrap(),
+            serde_json::to_value(&runtime_config.tool_policy).unwrap()
         );
         assert_eq!(state.skill_search, skill_search);
     }

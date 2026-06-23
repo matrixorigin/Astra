@@ -1094,7 +1094,7 @@ fn parse_reflect_args(arg: &str) -> (Option<String>, Option<String>) {
         "skill_failure",
         "unexpected_result",
         "data_quality",
-        "tool_selection",
+        "tool_surface",
         "history",
         "performance",
         "diff",

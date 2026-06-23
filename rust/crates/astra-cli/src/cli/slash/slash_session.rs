@@ -2528,7 +2528,7 @@ pub(crate) async fn handle_session_command(
                                 .unwrap_or(0);
                             let tools_count = trace
                                 .and_then(|t| t.get("tools"))
-                                .and_then(|t| t.get("tools_selected"))
+                                .and_then(|t| t.get("visible_tools"))
                                 .and_then(|v| v.as_array())
                                 .map(|a| a.len())
                                 .unwrap_or(0);
@@ -2864,9 +2864,9 @@ fn print_context_trace_detail(evt: &session_journal::JournalEvent, turn: u32) {
         }
     }
 
-    // ─── Tool Selection ─────────────────────────────────────────────────────
+    // ─── tool surface ─────────────────────────────────────────────────────
     if let Some(tools) = trace.get("tools") {
-        eprintln!("\n  {}", "Tool Selection".bold());
+        eprintln!("\n  {}", "tool surface".bold());
         let strategy = tools
             .get("strategy")
             .and_then(|v| v.as_str())
@@ -2886,7 +2886,7 @@ fn print_context_trace_detail(evt: &session_journal::JournalEvent, turn: u32) {
             confidence
         );
 
-        if let Some(selected) = tools.get("tools_selected").and_then(|t| t.as_array()) {
+        if let Some(selected) = tools.get("visible_tools").and_then(|t| t.as_array()) {
             eprintln!(
                 "    Selected ({}/{}): {}",
                 selected.len(),
@@ -3536,8 +3536,8 @@ fn handle_session_adaptive(_arg: &str, state: &SessionState) {
                 guard.config.compression.compression_threshold
             );
             eprintln!(
-                "      tool_selection.max_tools            = {}",
-                guard.config.tool_selection.max_tools
+                "      tool_policy.max_tools            = {}",
+                guard.config.tool_policy.max_tools
             );
         }
     } else {
@@ -7398,7 +7398,7 @@ mod resume_tests {
                     5,
                     5,
                 )
-                .with_tool_selection(
+                .with_tool_surface(
                     vec![],
                     vec![],
                     vec!["bash".into(), "grep".into()],

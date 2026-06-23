@@ -89,7 +89,7 @@ fn last_pinned_tool_index(
 
 /// Place exactly one `cache_control` marker on the last non-system message.
 ///
-/// This matches Claude Code's Anthropic/Bedrock request contract: system
+/// This matches the reference agent's Anthropic/Bedrock request contract: system
 /// blocks carry the stable-prefix markers, tools carry one marker at the end
 /// of the pinned static prefix, and messages carry exactly one tail marker.
 /// Historical messages stay byte-stable because we never rewrite an older
@@ -370,7 +370,7 @@ mod tests {
 
     #[test]
     fn cache_breakpoint_multi_turn_marks_last_non_system_message() {
-        // Claude Code semantics: the current tail message gets the sole
+        // reference-agent semantics: the current tail message gets the sole
         // message-level marker.
         let mut msgs = vec![
             json!({"role": "system", "content": "sys"}),
@@ -485,7 +485,7 @@ mod tests {
 
     // ── tool-loop tail marker: observed in session d0640d3d ────────────
     //
-    // Claude Code semantics still need to handle tool loops: when the
+    // reference-agent semantics still need to handle tool loops: when the
     // conversation tail is a tool_result / assistant-with-tool_calls, the
     // sole message-level marker must sit on that tail message.
     #[test]

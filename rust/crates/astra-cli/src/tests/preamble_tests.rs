@@ -11,7 +11,7 @@ use astra_runtime::prompts;
 #[test]
 fn dispatch_turn_event_collects_explain_events() {
     let mut result = TurnResult::new();
-    let block = "data: {\"type\":\"explain\",\"total_ms\":7,\"tools_selected\":1,\"tools_available\":2,\"tool_selection\":null,\"tool_selection_fallback\":null,\"steps\":[]}\n\n";
+    let block = "data: {\"type\":\"explain\",\"total_ms\":7,\"tool_calls\":1,\"tools_available\":2,\"first_tool_call\":null,\"first_tool_call_fallback\":null,\"steps\":[]}\n\n";
     let mut render = StreamRenderState::new();
     dispatch_turn_event_block(
         block,

@@ -301,7 +301,7 @@ DIAGNOSE: Which input was the bottleneck?
     - Missing skill? → Skill gap detection
     - Insufficient context? → Context budget tuning
     - Stale knowledge? → Knowledge regression detection
-    - Wrong skill selected? → Self-improving skill selection
+    - Wrong visible capability? → Tool surface / skill activation diagnostics
     ↓
 PROPOSE: Generate candidate adjustment
     ↓
@@ -317,17 +317,17 @@ RECORD: Store the learning signal for future pattern matching
 
 ### Already Implemented
 
-- **Self-Improving Skill Selection**: ToolRegistry provides unified tool selection (pinned/dynamic split + embedding retrieval).
-- **RegressionGate (ChangeType.SELECTOR)**: Validates selector changes before deployment via unified gate
+- **Deterministic Tool Surface**: ToolRegistry provides a pinned/deferred surface with explicit deferred activation.
+- **RegressionGate (ChangeType.TOOL_SURFACE)**: Validates tool surface changes before deployment via unified gate
 - **InputFaceLearner**: ✅ Unified meta-learning loop for prompt, context budget, and knowledge input faces (`core/learning/input_face_learner.py`)
 
 ### The Generalization
 
-Meta-learning generalizes self-improving skill selection to ALL versioned inputs:
+Meta-learning generalizes improvement across all versioned inputs:
 
 | Input | Current | Meta-Learning |
 |-------|---------|---------------|
-| Skill selection | ToolRegistry | ✅ Pinned/dynamic selection
+| Tool surface | ToolRegistry | ✅ Pinned/deferred surface with explicit activation |
 | Prompt | PromptOptimizer | ✅ Auto-diagnose + improve via InputFaceLearner |
 | Context budget | _BUDGET_RATIOS | ✅ Task-aware dynamic adjustment via InputFaceLearner |
 | Knowledge | MemoryGovernanceEngine | ✅ Stale detection + targeted quarantine via InputFaceLearner |

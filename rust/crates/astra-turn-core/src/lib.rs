@@ -156,7 +156,6 @@ pub use tool::registry::chain as tool_registry_chain;
 pub use tool::registry::meta as tool_registry_meta;
 pub use tool::registry::plugin as tool_registry_plugin;
 pub use tool::registry::report as tool_registry_report;
-pub use tool::registry::selection_edge_hints as tool_registry_selection_edge_hints;
 pub use tool::registry::state as tool_registry_state;
 pub use tool::result::compression as tool_result_compression;
 pub use tool::result::dedup as tool_result_dedup;
@@ -164,7 +163,7 @@ pub use tool::result::sanitize as tool_result_sanitize;
 pub use tool::result::semantics as tool_result_semantics;
 pub use tool::result::storage as tool_result_storage;
 pub use tool::schema::prune as tool_schema_prune;
-pub use tool::schema::selection as tool_selection;
+pub use tool::schema::surface_subset as tool_surface_subset;
 
 // Re-exports: context_* → context::*
 pub use context::assembly_trace as context_assembly_trace;

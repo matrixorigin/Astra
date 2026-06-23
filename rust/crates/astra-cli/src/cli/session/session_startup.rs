@@ -22,7 +22,6 @@ use crate::cli::session::{
 use crate::cli::slash::slash_session;
 use crate::cli::startup_trace::StartupTracer;
 use crate::cli::theme;
-use astra_runtime::tool_registry;
 use astra_services::session_journal;
 use astra_text_utils::str_preview::truncate_str;
 use crossterm::style::Stylize;
@@ -35,7 +34,7 @@ pub(crate) struct SessionStartupArtifacts {
     pub shutdown_signal_rx: tokio::sync::watch::Receiver<Option<session_guard::ShutdownSignal>>,
 }
 
-// Note: `selector` field was removed — tool selection is now handled by the LLM directly.
+// Note: `selector` field was removed — tool surface is now handled by the LLM directly.
 
 pub(crate) struct GoalSteeringChange {
     pub previous_goal: Option<String>,
@@ -724,20 +723,6 @@ pub(crate) async fn complete_session_startup(
     }
     tracer.phase("config_load");
 
-    // Session-scoped quality tracker: tools that work well get boosted over time.
-    // Seed from prior session snapshot (if any) so boost factors don't reset.
-    let profile_name_for_quality = profile.unwrap_or("default");
-    let persisted_quality =
-        astra_turn_core::tool_health_persistence::load_tool_quality(profile_name_for_quality);
-    let quality_tracker = {
-        let mut tracker = tool_registry::ToolQualityTracker::new();
-        if !persisted_quality.is_empty() {
-            tracker.merge(&persisted_quality);
-        }
-        std::sync::Arc::new(std::sync::Mutex::new(tracker))
-    };
-    let quality_tracker_for_save = quality_tracker.clone();
-    state.tool_quality_tracker = Some(quality_tracker_for_save);
     // Session-scoped confidence calibrator: thresholds adapt to correction rates
     let _confidence_calibrator =
         std::sync::Arc::new(astra_turn_core::routing_metrics::ConfidenceCalibrator::default());
@@ -1247,17 +1232,12 @@ mod tests {
         ws.last_context_trace = Some(astra_services::session_workspace::ContextTraceSignal {
             turn_id: "turn-7".into(),
             captured_at: None,
-            tool_selection: Some(
-                astra_services::session_workspace::ContextTraceToolSelection {
-                    tools_available: 8,
-                    selected_tools: vec!["lsp".into()],
-                    selection_scope: "latest_round".into(),
-                    rejected_tools: 2,
-                    strategy: "code-intel".into(),
-                    confidence: 0.9,
-                    latency_ms: 11,
-                },
-            ),
+            tool_surface: Some(astra_services::session_workspace::ContextTraceToolSurface {
+                tools_available: 8,
+                visible_tools: vec!["lsp".into()],
+                surface_scope: "latest_round".into(),
+                latency_ms: 11,
+            }),
             memory: None,
             history: None,
             budget: Some(

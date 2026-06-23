@@ -113,9 +113,7 @@ mod explain_preview_tests {
             routing_domain_hint: None,
             assistant_output: Some("done"),
             tool_call_records: &tool_calls,
-            selection_strategy: None,
-            selection_confidence: None,
-            selected_tools: Vec::new(),
+            visible_tools: Vec::new(),
         };
         let turns = vec![serde_json::json!({
             "steps": [{

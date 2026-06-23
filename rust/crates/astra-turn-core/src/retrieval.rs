@@ -310,7 +310,7 @@ const DOMAIN_KEYWORDS: &[(&str, &[&str])] = &[
 ///
 /// Scans history for messages containing the same entity tokens as the query.
 /// When found, extracts domain-related keywords from surrounding context to
-/// improve tool selection. This implements the self-improving memory→selection loop.
+/// improve tool surface. This implements the self-improving memory→selection loop.
 ///
 /// Example: If history has "user follows matrixorigin on GitHub", and the query
 /// mentions "matrixorigin", this returns ["github", "repo", "repository"].
@@ -393,7 +393,7 @@ const MEMORY_RELEVANCE_THRESHOLD: f64 = 0.05;
 /// Re-rank memory results by TF-IDF cosine similarity to the query.
 /// Returns (content, score) pairs sorted by descending score, filtered
 /// by MEMORY_RELEVANCE_THRESHOLD. This prevents noisy/irrelevant memories
-/// from polluting tool selection boost terms.
+/// from polluting tool surface boost terms.
 ///
 /// Uses the same CJK-aware tokenizer and TF-IDF engine as conversation
 /// history retrieval — no new dependencies.

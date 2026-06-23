@@ -61,7 +61,7 @@ const STRUCTURAL_MARKERS: &[&str] = &[
     "## Self-Model",
     "## Conversation History",
     "File editing rules:",
-    "Tool selection rules:",
+    "Tool surface rules:",
     "Reflection rules:",
     "Introspection rules:",
 ];

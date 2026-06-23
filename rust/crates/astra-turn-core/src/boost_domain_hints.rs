@@ -1,4 +1,4 @@
-//! Derive [`DomainHint`] values from boost-term substrings (history + memory), for tool selection.
+//! Derive [`DomainHint`] values from boost-term substrings (history + memory), for tool surface.
 
 use astra_pipeline::routing::DomainHint;
 

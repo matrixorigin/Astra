@@ -1427,7 +1427,7 @@ pub enum SessionEvent {
     SessionStart,
     /// Fires when a session ends (explicit `/quit`, timeout, or graceful close).
     SessionEnd,
-    /// Fires after the user submits a prompt, before tool selection / LLM call.
+    /// Fires after the user submits a prompt, before tool surface / LLM call.
     UserPromptSubmit,
     /// Fires when a sub-agent (delegation) is spawned.
     SubagentStart,

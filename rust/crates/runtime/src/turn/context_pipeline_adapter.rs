@@ -27,7 +27,6 @@ pub(crate) fn build_external_sources(
     state: &AgenticLoopState,
     user_content: &str,
     tool_names: &[&str],
-    selection_confidence: f64,
     plan_resume_hint: Option<&str>,
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
 ) -> ExternalSources {
@@ -50,11 +49,7 @@ pub(crate) fn build_external_sources(
     let tool_conditional = if tool_names.is_empty() {
         None
     } else {
-        let text = crate::prompts::tool_conditional_section(
-            tool_names,
-            &profile_for_tc,
-            selection_confidence,
-        );
+        let text = crate::prompts::tool_conditional_section(tool_names, &profile_for_tc);
         if text.is_empty() { None } else { Some(text) }
     };
 
@@ -103,22 +98,9 @@ pub(crate) fn build_external_sources(
     let plan_context = plan_resume_hint.filter(|s| !s.is_empty()).map(String::from);
 
     // 8. Tool round guidance
-    let tool_cfg = astra_config::runtime_config::RuntimeConfig::load().tool_selection;
-    let (tool_guidance_text, _signals) = crate::prompts::tool_round_guidance_trace_with(
-        &state.messages,
-        state.llm_rounds_completed,
-        tool_cfg.effective_round_budget_warning(),
-        tool_cfg.effective_round_budget_limit(),
-    );
-    let low_confidence_guidance =
-        crate::prompts::low_confidence_tool_selection_section(selection_confidence);
-    let tool_guidance = if tool_guidance_text.is_empty() {
-        low_confidence_guidance
-    } else if let Some(low_confidence) = low_confidence_guidance {
-        Some(format!("{tool_guidance_text}{low_confidence}"))
-    } else {
-        Some(tool_guidance_text)
-    };
+    let (tool_guidance_text, _signals) =
+        crate::prompts::tool_round_guidance_trace(&state.messages, state.llm_rounds_completed);
+    let tool_guidance = (!tool_guidance_text.is_empty()).then_some(tool_guidance_text);
 
     // 9. Active skill names as hint
     let active_skill_names: Vec<&str> = edge_profile
@@ -730,7 +712,7 @@ mod tests {
             Value::String("## User Memories\n- prefers Rust\n- hates emojis".into()),
         );
         let state = make_state();
-        let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None, None);
+        let sources = build_external_sources(&ep, &state, "hi", &["bash"], None, None);
         assert!(
             !sources.memory_entries.is_empty(),
             "edge_profile.memory_section must flow into ExternalSources.memory_entries"
@@ -764,7 +746,7 @@ mod tests {
             ]),
         );
         let state = make_state();
-        let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None, None);
+        let sources = build_external_sources(&ep, &state, "hi", &["bash"], None, None);
 
         assert_eq!(sources.memory_entries.len(), 2);
         assert_eq!(sources.memory_entries[0].content, "fresh structured memory");
@@ -779,23 +761,6 @@ mod tests {
     }
 
     #[test]
-    fn low_confidence_warning_is_volatile_tool_guidance() {
-        let ep = serde_json::Map::new();
-        let state = make_state();
-        let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.1, None, None);
-
-        // tool_conditional field removed — volatile content routes to extra_dynamic_sections only
-        assert!(
-            sources
-                .tool_guidance
-                .as_deref()
-                .unwrap_or_default()
-                .contains("Low-Confidence Tool Selection"),
-            "low-confidence warning should route to RuntimeVolatile/tool_guidance"
-        );
-    }
-
-    #[test]
     fn tool_availability_protocol_is_visible_tool_scoped_in_pipeline_sources() {
         let ep = serde_json::Map::new();
         let state = make_state();
@@ -804,7 +769,6 @@ mod tests {
             &state,
             "hi",
             &["bash", "read_file", "tool_search"],
-            0.8,
             None,
             None,
         );
@@ -841,16 +805,14 @@ mod tests {
         }
     }
 
-    // `selected_tool_guidance_is_volatile` was deleted: it asserted on
-    // legacy `## Self-Model` + `Explicit Tool Requests` strings. The
-    // volatile-lane routing contract is covered by the composite integration
-    // tests below.
+    // Tool-surface volatile-lane routing is covered by the composite
+    // integration tests below.
 
     #[test]
     fn external_sources_empty_memory_when_edge_profile_has_none() {
         let ep = serde_json::Map::new();
         let state = make_state();
-        let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None, None);
+        let sources = build_external_sources(&ep, &state, "hi", &["bash"], None, None);
         assert!(sources.memory_entries.is_empty());
     }
 
@@ -863,7 +825,6 @@ mod tests {
             &state,
             "hi",
             &["bash"],
-            0.8,
             None,
             Some(astra_turn_core::cache_placement::CacheCapability {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix,
@@ -935,15 +896,8 @@ mod tests {
             None,
         );
         let turn = build_turn_state(state, user_content);
-        let external = build_external_sources(
-            edge_profile,
-            state,
-            user_content,
-            &["bash"],
-            0.8,
-            None,
-            None,
-        );
+        let external =
+            build_external_sources(edge_profile, state, user_content, &["bash"], None, None);
         CompositeInputs {
             statics,
             agent,

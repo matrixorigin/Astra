@@ -32,7 +32,7 @@ pub const MIN_ROUNDS_TO_KEEP: usize = 1;
 /// cache-friendly summary path. Kept short and stable so the main loop's
 /// system prompt + historical messages form the cached prefix and only this
 /// trailing instruction differs between the main LLM call and the compact
-/// sub-call. Matches the "Claude Code" pattern: reuse the shared prefix,
+/// sub-call. Matches the "the reference agent" pattern: reuse the shared prefix,
 /// diverge only at the tail.
 pub const INLINE_COMPACT_INSTRUCTION: &str = "\
 Please produce a dense, structured summary of our conversation above so I can \
@@ -186,7 +186,7 @@ fn build_summary_messages(rendered_conversation: &str) -> Vec<Value> {
 /// history** as the cached prefix, appending only a short compact instruction
 /// as the final user turn.
 ///
-/// This is the "Claude Code" pattern: compact requests share the main
+/// This is the "the reference agent" pattern: compact requests share the main
 /// conversation's prompt-cache prefix, so the sub-call pays only for the
 /// trailing instruction + output tokens instead of re-sending the whole
 /// history.

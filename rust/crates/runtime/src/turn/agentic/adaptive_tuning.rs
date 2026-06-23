@@ -144,31 +144,15 @@ pub(crate) fn apply_tactical_actions(
                 used,
                 budget,
             } => {
-                let baseline = state
-                    .tool_budget_override
-                    .or_else(|| {
-                        session_guard
-                            .as_ref()
-                            .map(|guard| guard.config.tool_selection.tool_budget_tokens)
-                    })
-                    .filter(|&v| v > 0)
-                    .unwrap_or(800);
-                let new_budget = shrink_u32_budget(baseline, 15, 400);
-                state.tool_budget_override = Some(new_budget);
-
-                let mut suffix = format!(" (tool budget {}->{})", baseline, new_budget);
+                let mut suffix = String::new();
                 if let Some(guard) = session_guard.as_mut() {
-                    guard.config.tool_selection.tool_budget_tokens = new_budget;
-
                     let old_threshold = guard.config.compression.compression_threshold;
                     let new_threshold = (old_threshold - 0.05)
                         .max(guard.config.context_window.compression_threshold_min);
                     guard.config.compression.compression_threshold = new_threshold;
                     if (new_threshold - old_threshold).abs() > f64::EPSILON {
-                        suffix.push_str(&format!(
-                            ", compression {:.2}->{:.2}",
-                            old_threshold, new_threshold
-                        ));
+                        suffix =
+                            format!(" (compression {:.2}->{:.2})", old_threshold, new_threshold);
                     }
                 }
 
@@ -224,14 +208,6 @@ fn carry_forward_tactical_runtime_mutations(
         .compression
         .compression_threshold
         .min(previous_config.compression.compression_threshold);
-
-    if let Some(tool_budget) = state.tool_budget_override {
-        next_config.tool_selection.tool_budget_tokens =
-            match next_config.tool_selection.tool_budget_tokens {
-                0 => tool_budget,
-                current => current.min(tool_budget),
-            };
-    }
 
     if state.max_turn_input_tokens > 0 {
         let preserved_turn_budget = state.max_turn_input_tokens.min(u32::MAX as u64) as u32;
@@ -359,20 +335,11 @@ pub(crate) fn apply_adaptive_execution_profile_with_intent(
     }
     state.max_turn_input_tokens = session_guard.config.token_budget.max_turn_input_tokens as u64;
 
-    // Propagate scenario-driven tool budget override to AgenticLoopState so the
-    // CLI host can pass it to build_agentic_tool_selection_context.
-    let cfg_budget = session_guard.config.tool_selection.tool_budget_tokens;
-    state.tool_budget_override = if cfg_budget > 0 {
-        Some(cfg_budget)
-    } else {
-        None
-    };
-
     // Sync scenario-driven execution limit so the headless round enforces
     // the per-turn tool cap from the active scenario, not the static default.
     state.max_tools_per_turn = session_guard
         .config
-        .tool_selection
+        .tool_policy
         .effective_max_tools_per_turn();
 
     // Use the session-level turn number for journal events (not the
@@ -416,29 +383,18 @@ pub(crate) fn apply_adaptive_execution_profile_with_intent(
             format!("{:.3}", profile.config.verification.strictness),
         ));
     }
-    if old_config.tool_selection.max_tools_per_turn
-        != profile.config.tool_selection.max_tools_per_turn
-    {
+    if old_config.tool_policy.max_tools_per_turn != profile.config.tool_policy.max_tools_per_turn {
         config_changes.push((
-            "tool_selection.max_tools_per_turn".to_string(),
+            "tool_policy.max_tools_per_turn".to_string(),
             old_config
-                .tool_selection
+                .tool_policy
                 .effective_max_tools_per_turn()
                 .to_string(),
             profile
                 .config
-                .tool_selection
+                .tool_policy
                 .effective_max_tools_per_turn()
                 .to_string(),
-        ));
-    }
-    if old_config.tool_selection.tool_budget_tokens
-        != profile.config.tool_selection.tool_budget_tokens
-    {
-        config_changes.push((
-            "tool_selection.tool_budget_tokens".to_string(),
-            old_config.tool_selection.tool_budget_tokens.to_string(),
-            profile.config.tool_selection.tool_budget_tokens.to_string(),
         ));
     }
     if (old_config.compression.compression_threshold

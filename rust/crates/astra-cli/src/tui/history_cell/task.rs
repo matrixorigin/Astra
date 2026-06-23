@@ -1,5 +1,5 @@
 //! Task-invocation history cell — the `▶ Task · <description>` block
-//! that mirrors the `Task` tool UX from claude-code.
+//! that mirrors the `Task` tool UX from reference-agent.
 //!
 //! Unlike [`ToolCell`](super::tool::ToolCell), a TaskCell is a
 //! **container**: it owns the header for the parent tool invocation

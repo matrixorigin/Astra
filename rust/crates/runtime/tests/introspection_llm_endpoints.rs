@@ -138,7 +138,7 @@ impl IntrospectionService for StubIntrospection {
             "decisions": [
                 {
                     "decision_id": "d1",
-                    "decision_type": "tool_selection",
+                    "decision_type": "tool_surface",
                     "created_at": "2026-05-01T10:00:00",
                     "output": {"tool": "grep"},
                 },

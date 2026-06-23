@@ -138,7 +138,7 @@ pub struct TurnRow {
     pub entity_learn_skipped_no_domain: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memoria_ms: Option<u64>,
-    pub tools_selected_count: usize,
+    pub visible_tools_count: usize,
     pub tools_used_count: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub selected_skills: Vec<String>,
@@ -602,7 +602,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     preview(ev.user_input.as_ref(), preview_len)
                 };
 
-                let tools_selected_count = ev.tools_selected.as_ref().map_or(0, |v| v.len());
+                let visible_tools_count = ev.visible_tools.as_ref().map_or(0, |v| v.len());
                 let tools_used_count = ev.tools_used.as_ref().map_or(0, |v| v.len());
                 let selected_skills = ev.selected_skills.clone().unwrap_or_default();
 
@@ -636,7 +636,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     } else {
                         None
                     },
-                    tools_selected_count,
+                    visible_tools_count,
                     tools_used_count,
                     selected_skills: if matches!(focus, DigestFocus::All) {
                         selected_skills

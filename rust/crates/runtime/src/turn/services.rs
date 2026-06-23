@@ -699,7 +699,7 @@ mod tests {
                     user_id: "u".into(),
                     event_id: "e2".into(),
                     session_id: "s".into(),
-                    decision_type: "tool_selection".into(),
+                    decision_type: "tool_surface".into(),
                     decision_output: json!({}),
                     model_used: None,
                     context_capture_id: None,

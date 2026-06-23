@@ -1,14 +1,13 @@
 //! Dynamic tool registration for plugins and skill manifests.
 //!
 //! Complements the static `TOOL_CATALOG` with runtime-registerable tools.
-//! Plugin tools participate in TF-IDF scoring alongside built-in tools,
-//! can be enabled/disabled per session, and are loaded from skill manifests.
+//! Plugin tools can be enabled/disabled per session and are loaded from skill
+//! manifests.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::tool::registry::meta::{IntentType, Scope, TOOL_CATALOG};
-use astra_text_utils::text_tokenize;
 
 // ─── Plugin Tool Entry ──────────────────────────────────────────────────────
 
@@ -37,14 +36,10 @@ pub struct PluginToolEntry {
 /// Design principles:
 /// - Additive: doesn't modify the static TOOL_CATALOG
 /// - Safe: rejects name conflicts with built-in tools
-/// - Scorable: pre-tokenizes triggers for TF-IDF matching
 /// - Toggleable: tools can be enabled/disabled per session
 #[derive(Debug, Default)]
 pub struct PluginRegistry {
     tools: Vec<PluginToolEntry>,
-    /// Pre-tokenized (triggers + description + name) for TF-IDF scoring.
-    /// Parallel to `tools` — index i of token_cache corresponds to tools[i].
-    token_cache: Vec<Vec<String>>,
 }
 
 impl PluginRegistry {
@@ -68,8 +63,6 @@ impl PluginRegistry {
             return Err(format!("Plugin tool '{}' already registered", entry.name));
         }
 
-        let tokens = tokenize_entry(&entry);
-        self.token_cache.push(tokens);
         self.tools.push(entry);
         Ok(())
     }
@@ -78,7 +71,6 @@ impl PluginRegistry {
     pub fn unregister(&mut self, name: &str) -> bool {
         if let Some(idx) = self.tools.iter().position(|t| t.name == name) {
             self.tools.remove(idx);
-            self.token_cache.remove(idx);
             true
         } else {
             false
@@ -109,66 +101,6 @@ impl PluginRegistry {
             .collect()
     }
 
-    /// TF-IDF score for a single plugin tool against query tokens.
-    ///
-    /// Uses the same tokenization engine as built-in tool scoring (CJK-aware).
-    /// IDF is computed over the plugin catalog only (not mixed with built-in).
-    pub fn tfidf_score(&self, query_tokens: &[String], plugin_idx: usize) -> f64 {
-        if plugin_idx >= self.token_cache.len() {
-            return 0.0;
-        }
-        let tool_tokens = &self.token_cache[plugin_idx];
-        if tool_tokens.is_empty() || query_tokens.is_empty() {
-            return 0.0;
-        }
-
-        let n_docs = self.token_cache.len().max(1) as f64;
-        let mut match_score = 0.0_f64;
-        let mut total_weight = 0.0_f64;
-
-        for qt in query_tokens {
-            let df = self
-                .token_cache
-                .iter()
-                .filter(|tokens| tokens.contains(qt))
-                .count();
-            let idf = if df > 0 {
-                (n_docs / df as f64).ln() + 1.0
-            } else {
-                0.0
-            };
-
-            total_weight += idf;
-            if tool_tokens.contains(qt) {
-                match_score += idf;
-            }
-        }
-
-        if total_weight > 0.0 {
-            match_score / total_weight
-        } else {
-            0.0
-        }
-    }
-
-    /// Score all enabled plugin tools against query tokens.
-    /// Returns `(plugin_index, tool_name, score)` sorted descending by score.
-    pub fn score_all(&self, query_tokens: &[String]) -> Vec<(usize, String, f64)> {
-        let mut results: Vec<_> = self
-            .tools
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.enabled)
-            .map(|(idx, t)| {
-                let score = self.tfidf_score(query_tokens, idx);
-                (idx, t.name.clone(), score)
-            })
-            .filter(|(_, _, score)| *score > 0.01)
-            .collect();
-        results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-        results
-    }
-
     pub fn len(&self) -> usize {
         self.tools.len()
     }
@@ -189,19 +121,6 @@ impl PluginRegistry {
             .map(|t| t.schema_tokens)
             .sum()
     }
-}
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-/// Tokenize a plugin entry's name + description + triggers for TF-IDF.
-fn tokenize_entry(entry: &PluginToolEntry) -> Vec<String> {
-    let mut tokens = Vec::new();
-    for trigger in &entry.triggers {
-        tokens.extend(text_tokenize::tokenize(trigger));
-    }
-    tokens.extend(text_tokenize::tokenize(&entry.description));
-    tokens.extend(text_tokenize::tokenize(&entry.name));
-    tokens
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -291,65 +210,6 @@ mod tests {
         assert_eq!(reg.enabled_tools().count(), 1);
     }
 
-    // ── TF-IDF scoring tests ──
-
-    #[test]
-    fn tfidf_scores_matching_query() {
-        let mut reg = PluginRegistry::new();
-        reg.register(make_entry(
-            "kubectl_get",
-            &["kubernetes", "kubectl", "pods", "k8s", "deployment"],
-            "Get Kubernetes resources",
-        ))
-        .unwrap();
-        reg.register(make_entry(
-            "docker_ps",
-            &["docker", "container", "image"],
-            "List Docker containers",
-        ))
-        .unwrap();
-
-        let query = text_tokenize::tokenize("show kubernetes pods");
-        let scores = reg.score_all(&query);
-
-        // kubectl_get should rank first for kubernetes query
-        assert!(!scores.is_empty(), "should have results");
-        assert_eq!(scores[0].1, "kubectl_get", "kubectl should rank first");
-    }
-
-    #[test]
-    fn tfidf_returns_zero_for_unrelated() {
-        let mut reg = PluginRegistry::new();
-        reg.register(make_entry(
-            "kubectl_get",
-            &["kubernetes", "k8s"],
-            "Kubernetes resources",
-        ))
-        .unwrap();
-
-        let query = text_tokenize::tokenize("read a python file");
-        let score = reg.tfidf_score(&query, 0);
-        assert!(
-            score < 0.01,
-            "unrelated query should score near zero: {score:.4}"
-        );
-    }
-
-    #[test]
-    fn tfidf_cjk_triggers_work() {
-        let mut reg = PluginRegistry::new();
-        reg.register(make_entry(
-            "mo_analytics",
-            &["数据库", "分析", "统计", "database", "analytics"],
-            "Database analytics and statistics",
-        ))
-        .unwrap();
-
-        let query = text_tokenize::tokenize("数据库分析");
-        let score = reg.tfidf_score(&query, 0);
-        assert!(score > 0.0, "CJK query should match: {score:.4}");
-    }
-
     // ── Schema collection tests ──
 
     #[test]
@@ -379,21 +239,6 @@ mod tests {
     }
 
     // ── Edge cases ──
-
-    #[test]
-    fn empty_registry_scores_safely() {
-        let reg = PluginRegistry::new();
-        let query = text_tokenize::tokenize("anything");
-        let scores = reg.score_all(&query);
-        assert!(scores.is_empty());
-    }
-
-    #[test]
-    fn tfidf_out_of_bounds_returns_zero() {
-        let reg = PluginRegistry::new();
-        let query = text_tokenize::tokenize("test");
-        assert_eq!(reg.tfidf_score(&query, 999), 0.0);
-    }
 
     #[test]
     fn set_enabled_unknown_tool_returns_false() {

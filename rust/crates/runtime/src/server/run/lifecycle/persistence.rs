@@ -1670,7 +1670,7 @@ async fn persist_server_loop_hook_events(
         decision_type: if tool_call_names.is_empty() {
             "response_generation".to_string()
         } else {
-            "tool_selection".to_string()
+            "tool_surface".to_string()
         },
         decision_output: json!({
             "text": truncate_for_audit(&state.final_text, 500),

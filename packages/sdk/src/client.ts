@@ -596,7 +596,7 @@ export class AstraClient {
     );
   }
 
-  /** `GET /chat/session/{id}/decision-trace` (server uses focus `tool_selection`). */
+  /** `GET /chat/session/{id}/decision-trace` (server uses focus `tool_surface`). */
   async getSessionDecisionTrace(
     sessionId: string,
     params?: ReflectQueryParams,

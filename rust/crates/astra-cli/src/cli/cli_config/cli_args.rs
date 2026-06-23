@@ -917,7 +917,7 @@ pub(crate) struct SessionCaptureDownloadArgs {
 
 #[derive(Subcommand, Debug)]
 #[command(
-    after_help = "Examples:\n  astra self snapshot\n  astra self reflect\n  astra self profile 550e8400-e29b-41d4-a716-446655440000\n  astra self mutate preview --path verification.strictness --value 0.8\n  astra self mutate apply --session-id 550e8400-e29b-41d4-a716-446655440000 --path tool_selection.tool_budget_tokens --value 900"
+    after_help = "Examples:\n  astra self snapshot\n  astra self reflect\n  astra self profile 550e8400-e29b-41d4-a716-446655440000\n  astra self mutate preview --path verification.strictness --value 0.8\n  astra self mutate apply --session-id 550e8400-e29b-41d4-a716-446655440000 --path token_budget.max_turn_input_tokens --value 90000"
 )]
 pub(crate) enum SelfCmd {
     /// Full persistent self snapshot for a session
@@ -956,7 +956,7 @@ pub(crate) struct SelfReflectArgs {
     /// Session id or unique prefix (defaults to the most recent resumable session)
     pub session_id: Option<String>,
     /// Reflection focus to prioritize in the local surface
-    #[arg(long, default_value = "auto", value_parser = ["auto", "skill_failure", "unexpected_result", "data_quality", "tool_selection", "history", "performance"])]
+    #[arg(long, default_value = "auto", value_parser = ["auto", "skill_failure", "unexpected_result", "data_quality", "tool_surface", "history", "performance"])]
     pub focus: String,
     /// Optional concrete question to keep in the reflection prompt preview
     #[arg(long)]

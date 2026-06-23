@@ -1,8 +1,8 @@
-//! First-hit latency and selection-report capture for agentic turn telemetry (CLI wires fields).
+//! First-hit latency and surface-report capture for agentic turn telemetry (CLI wires fields).
 
 use std::time::Instant;
 
-use crate::tool::registry::report::SelectionReport;
+use crate::tool::registry::report::ToolSurfaceReport;
 
 /// Set `*slot` to elapsed ms since `start` only when `slot` is still `None`.
 pub fn record_first_latency_ms_since(slot: &mut Option<u64>, start: Instant) {
@@ -11,14 +11,14 @@ pub fn record_first_latency_ms_since(slot: &mut Option<u64>, start: Instant) {
     }
 }
 
-/// Persist the first non-empty selection report and track peak budget pressure.
-/// The selection report is captured once (first non-empty call); budget pressure
+/// Persist the first non-empty surface report and track peak budget pressure.
+/// The surface report is captured once (first non-empty call); budget pressure
 /// is updated on every call, keeping the maximum observed value so that
 /// turn/eval journal events reflect actual peak pressure, not stale initial 0.0.
-pub fn capture_first_selection_report_if_empty(
-    slot: &mut Option<SelectionReport>,
+pub fn capture_first_surface_report_if_empty(
+    slot: &mut Option<ToolSurfaceReport>,
     peak_budget_pressure: &mut f64,
-    report: SelectionReport,
+    report: ToolSurfaceReport,
     budget_pressure: f64,
 ) {
     if slot.is_none() {
@@ -72,29 +72,27 @@ mod tests {
     }
 
     #[test]
-    fn capture_selection_report_once() {
+    fn capture_surface_report_once() {
         let mut slot = None;
         let mut bp = 0.0;
-        let r1 = SelectionReport {
-            tools_selected: vec!["a".into()],
-            dynamic_tools_selected: vec!["a".into()],
-            selected_count: 1,
+        let r1 = ToolSurfaceReport {
+            visible_tools: vec!["a".into()],
+            visible_count: 1,
             budget_used: 1,
             budget_total: 10,
         };
-        capture_first_selection_report_if_empty(&mut slot, &mut bp, r1.clone(), 0.3);
-        assert_eq!(slot.as_ref().unwrap().tools_selected, vec!["a"]);
+        capture_first_surface_report_if_empty(&mut slot, &mut bp, r1.clone(), 0.3);
+        assert_eq!(slot.as_ref().unwrap().visible_tools, vec!["a"]);
         assert!((bp - 0.3).abs() < f64::EPSILON);
-        let r2 = SelectionReport {
-            tools_selected: vec!["b".into()],
-            dynamic_tools_selected: vec!["b".into()],
-            selected_count: 1,
+        let r2 = ToolSurfaceReport {
+            visible_tools: vec!["b".into()],
+            visible_count: 1,
             budget_used: 2,
             budget_total: 10,
         };
         // Report stays first; pressure updates to peak
-        capture_first_selection_report_if_empty(&mut slot, &mut bp, r2, 0.9);
-        assert_eq!(slot.as_ref().unwrap().tools_selected, vec!["a"]);
+        capture_first_surface_report_if_empty(&mut slot, &mut bp, r2, 0.9);
+        assert_eq!(slot.as_ref().unwrap().visible_tools, vec!["a"]);
         assert!(
             (bp - 0.9).abs() < f64::EPSILON,
             "should track peak pressure"
@@ -105,15 +103,14 @@ mod tests {
     fn peak_pressure_does_not_regress() {
         let mut slot = None;
         let mut bp = 0.0;
-        let r = SelectionReport {
-            tools_selected: vec!["a".into()],
-            dynamic_tools_selected: vec!["a".into()],
-            selected_count: 1,
+        let r = ToolSurfaceReport {
+            visible_tools: vec!["a".into()],
+            visible_count: 1,
             budget_used: 1,
             budget_total: 10,
         };
-        capture_first_selection_report_if_empty(&mut slot, &mut bp, r.clone(), 0.8);
-        capture_first_selection_report_if_empty(&mut slot, &mut bp, r.clone(), 0.5);
+        capture_first_surface_report_if_empty(&mut slot, &mut bp, r.clone(), 0.8);
+        capture_first_surface_report_if_empty(&mut slot, &mut bp, r.clone(), 0.5);
         assert!((bp - 0.8).abs() < f64::EPSILON, "peak should not regress");
     }
 

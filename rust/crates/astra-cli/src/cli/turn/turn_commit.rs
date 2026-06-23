@@ -269,8 +269,8 @@ fn build_primary_turn_event(
         result.completion_tokens,
         turn_start.elapsed().as_millis() as u64,
     )
-    .with_tool_selection(
-        std::mem::take(&mut result.tools_selected),
+    .with_tool_surface(
+        std::mem::take(&mut result.visible_tools),
         std::mem::take(&mut result.selected_skills),
         result.tools_used.clone(),
         result.budget_used,
@@ -601,18 +601,14 @@ mod tests {
             session_id: sid.clone(),
             ..Default::default()
         };
-        trace.tools.tools_selected = vec![
-            astra_turn_core::context_assembly_trace::ToolSelected {
+        trace.tools.visible_tools = vec![
+            astra_turn_core::context_assembly_trace::VisibleTool {
                 tool_name: "git_diff".into(),
-                score: 0.0,
                 tokens: 0,
-                selection_factors: Vec::new(),
             },
-            astra_turn_core::context_assembly_trace::ToolSelected {
+            astra_turn_core::context_assembly_trace::VisibleTool {
                 tool_name: "read_file".into(),
-                score: 0.0,
                 tokens: 0,
-                selection_factors: Vec::new(),
             },
         ];
         trace.token_budget.total_used = 12_345;

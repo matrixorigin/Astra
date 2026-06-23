@@ -382,7 +382,7 @@ async fn matrix_marker_isolated_system_has_no_volatile_patterns() {
 // For marker-isolated providers, the primary system content array must
 // carry at least one cache_control block (that's how the provider knows
 // where to cut the prefix). For prefix-only providers, system_primary
-// is a string and has no cache_control at all. Claude Code semantics also
+// is a string and has no cache_control at all. reference-agent semantics also
 // require exactly one message-level marker on the last non-system message.
 
 #[tokio::test(flavor = "multi_thread")]
@@ -462,7 +462,7 @@ async fn matrix_cache_control_marker_placement_matches_provider() {
 // ── Invariant 4: tool-loop growth preserves historical byte stability ────
 //
 // Session d0640d3d regression: agentic tool loops append (assistant_tc,
-// tool_result) pairs within the same user-turn. Under Claude Code semantics
+// tool_result) pairs within the same user-turn. Under reference-agent semantics
 // the sole message marker must move to the newest tail message, while the
 // already-sent history stays byte-identical across rounds.
 //

@@ -847,26 +847,6 @@ pub struct EdgePolicySnapshot {
     pub rules_fingerprint: Option<String>,
 }
 
-/// Tool selection decision trace for post-hoc analysis.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SelectionTrace {
-    /// Candidate tools and their TF-IDF/LLM scores (top 10).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub candidate_scores: Option<Vec<(String, f64)>>,
-    /// Boost terms applied from entity graph / pattern library.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub boost_terms: Option<Vec<String>>,
-    /// Learned context summary injected into selection.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub learned_context_summary: Option<String>,
-    /// Final selected tools.
-    pub final_tools: Vec<String>,
-    /// Selection confidence score.
-    pub confidence: f64,
-    /// Strategy used (tfidf, llm, fallback, etc.).
-    pub strategy: String,
-}
-
 /// Per-tool-call audit record, embedded in turn events for granular tracking.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolCallRecord {
@@ -1149,7 +1129,7 @@ pub struct JournalEvent {
     pub facts_stored: Option<usize>,
     /// Tool names selected for the LLM request (for turn events).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools_selected: Option<Vec<String>>,
+    pub visible_tools: Option<Vec<String>>,
     /// Skill names selected for the LLM request (for turn events).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected_skills: Option<Vec<String>>,
@@ -1198,9 +1178,6 @@ pub struct JournalEvent {
     /// Edge policy snapshot for cloud–edge audit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_policy: Option<EdgePolicySnapshot>,
-    /// Tool selection decision trace for post-hoc analysis.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selection_trace: Option<SelectionTrace>,
     /// Full context assembly trace for deep observability (M1 telemetry).
     /// Stores the serialized ContextAssemblyTrace from runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2785,7 +2762,7 @@ impl JournalEvent {
             config_value: None,
             turns_compacted: None,
             facts_stored: None,
-            tools_selected: None,
+            visible_tools: None,
             selected_skills: None,
             tools_used: None,
             tool_calls: None,
@@ -2802,7 +2779,6 @@ impl JournalEvent {
             session_lineage: None,
             coordination: None,
             edge_policy: None,
-            selection_trace: None,
             context_assembly_trace: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
@@ -3454,15 +3430,15 @@ impl JournalEvent {
         evt
     }
 
-    /// Attach tool selection data to a turn event.
-    pub fn with_tool_selection(
+    /// Attach tool surface data to a turn event.
+    pub fn with_tool_surface(
         mut self,
-        tools_selected: Vec<String>,
+        visible_tools: Vec<String>,
         selected_skills: Vec<String>,
         tools_used: Vec<String>,
         budget_used: u32,
     ) -> Self {
-        self.tools_selected = Some(tools_selected);
+        self.visible_tools = Some(visible_tools);
         if !selected_skills.is_empty() {
             self.selected_skills = Some(selected_skills);
         }
@@ -4041,7 +4017,7 @@ impl JournalEvent {
             "turn_id": trace.get("turn_id").and_then(|value| value.as_str()),
             "tool_count": trace
                 .get("tools")
-                .and_then(|tools| tools.get("tools_selected"))
+                .and_then(|tools| tools.get("visible_tools"))
                 .and_then(|selected| selected.as_array())
                 .map(Vec::len),
             "total_tokens": trace
@@ -4602,7 +4578,7 @@ mod approval_tests {
             3,
             serde_json::json!({
                 "turn_id": "turn-3",
-                "tools": {"tools_selected": [{"tool_name": "read_file"}]},
+                "tools": {"visible_tools": [{"tool_name": "read_file"}]},
                 "token_budget": {"total_used": 1234}
             }),
         );
@@ -5453,10 +5429,10 @@ mod tests {
         assert!(!json.contains("\"turn\""));
     }
 
-    // ── Tool selection tracking (p5g observability + p6e feedback) ──
+    // ── tool surface tracking (p5g observability + p6e feedback) ──
 
     #[test]
-    fn turn_event_with_tool_selection_round_trip() {
+    fn turn_event_with_tool_surface_round_trip() {
         let evt = JournalEvent::turn(
             Some("s1"),
             1,
@@ -5468,7 +5444,7 @@ mod tests {
             200,
             1234,
         )
-        .with_tool_selection(
+        .with_tool_surface(
             vec!["bash".into(), "github_list_prs".into(), "read_file".into()],
             vec!["tune-performance".into()],
             vec!["github_list_prs".into()],
@@ -5477,7 +5453,7 @@ mod tests {
         .with_budget_pressure(0.6);
         let json = serde_json::to_string(&evt).unwrap();
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.tools_selected.as_ref().unwrap().len(), 3);
+        assert_eq!(parsed.visible_tools.as_ref().unwrap().len(), 3);
         assert_eq!(
             parsed.selected_skills.as_ref().unwrap(),
             &["tune-performance"]
@@ -5488,11 +5464,11 @@ mod tests {
     }
 
     #[test]
-    fn turn_event_without_tool_selection_omits_fields() {
+    fn turn_event_without_tool_surface_omits_fields() {
         let evt = JournalEvent::turn(Some("s2"), 1, None, "hello", "world", 0, 10, 5, 100);
         let json = serde_json::to_string(&evt).unwrap();
         assert!(
-            !json.contains("tools_selected"),
+            !json.contains("visible_tools"),
             "should omit None fields: {json}"
         );
         assert!(
@@ -5536,7 +5512,7 @@ mod tests {
                     50,
                     500,
                 )
-                .with_tool_selection(
+                .with_tool_surface(
                     vec!["bash".into(), "github_list_prs".into()],
                     vec![],
                     vec!["github_list_prs".into()],
@@ -5559,7 +5535,7 @@ mod tests {
         // Verify the turn event has selection data
         let turn = &events[1];
         assert_eq!(turn.event_type, JournalEventType::Turn);
-        assert_eq!(turn.tools_selected.as_ref().unwrap().len(), 2);
+        assert_eq!(turn.visible_tools.as_ref().unwrap().len(), 2);
         assert!(turn.selected_skills.is_none());
         assert_eq!(turn.tools_used.as_ref().unwrap(), &["github_list_prs"]);
         assert_eq!(turn.budget_used, Some(35));
@@ -5589,7 +5565,7 @@ mod tests {
             150,
             800,
         )
-        .with_tool_selection(
+        .with_tool_surface(
             vec!["github_list_prs".into()],
             vec![],
             vec!["github_list_prs".into()],

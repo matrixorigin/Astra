@@ -434,7 +434,7 @@ pub(super) async fn prepare_chat_turn_bridge_body(
     };
 
     let user_query = request.user_query();
-    // Tool selection is client-side; server trusts pre-selected set.
+    // Tool surface is client-side; server trusts pre-selected set.
     trim_edge_tools_for_result_turn(&mut request, &user_query);
 
     // ── Metadata extraction ─────────────────────────────────────────────

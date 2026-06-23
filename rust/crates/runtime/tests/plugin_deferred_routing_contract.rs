@@ -1,22 +1,20 @@
 //! Phase-5 contract: registering a plugin must not pollute `tools[]`.
 //!
 //! Pre-phase-5 state:
-//!   - `ToolRegistry::register_plugins` pushed plugin schemas into both
-//!     `all_schemas` (makes the schema lookup-able) AND `plugin_tool_names`
-//!     (makes the selector's `budget_select_measured` include it in
-//!     `tools[]` whenever budget permits).
+//!   - `ToolRegistry::register_plugins` made plugin schemas lookupable and
+//!     also fed them into the selector's proactive candidate set.
 //!   - Result: the moment a plugin registers, the Anthropic prompt-cache
 //!     prefix breaks; every subsequent `tools[]` also includes the plugin.
 //!   - Intended contract: MCP tools default to a deferred listing;
-//!     user must explicitly pin them.
+//!     callers must explicitly pin them when building the visible surface.
 //!
 //! Contract:
 //!   1. Plugin schemas are still **looked up** by name (so the executor
 //!      can dispatch, and `tool_search(select:NAME)` can return the
 //!      schema).
-//!   2. Plugin names are **NOT** in the selector's dynamic-candidate
-//!      list — they stay out of `tools[]` unless the user pins them via
-//!      `runtime.tool_surface.pinned_tools`.
+//!   2. Plugin names are **NOT** proactively selected — they stay out of
+//!      `tools[]` unless the caller builds a visible surface with the plugin
+//!      explicitly pinned.
 //!   3. Registering a plugin leaves the pinned `tools[]` bytes stable.
 
 use astra_config::ToolSurfaceConfig;
@@ -95,47 +93,24 @@ fn registered_plugin_is_lookupable_by_name() {
     );
 }
 
-// ── 2. Plugin names stay out of the dynamic-candidate list ──────────────────
+// ── 2. Plugin names stay out of the default visible surface ─────────────────
 //
-// The selector's `budget_select_measured` iterates over
-// `plugin_tool_names` to decide what non-catalog schemas to stuff into
-// `tools[]`. Post-phase-5 that path stays empty — plugins are deferred.
+// The real invariant is "plugin registration does not reach tools[]" unless a
+// caller explicitly pins that plugin in the visible surface.
 
-// `dynamic_candidate_names` was a zombie API that always returned `Vec::new()`;
-// deleted in P2 cleanup. The real invariant — "plugin does not reach tools[]" —
-// is covered by `selector_does_not_include_plugin_in_production_path` below
-// and `tools_array_byte_stable_when_plugin_registers`.
-
-/// Direct invariant against the concrete path the old selector used to
-/// promote plugins into `tools[]` — `select_routed_with_pressure` must
-/// not emit the plugin name in its schemas output at any budget.
+/// Direct invariant against the concrete default-surface path: it must not
+/// emit the plugin name in its schemas output at any budget.
 #[test]
-fn selector_does_not_include_plugin_in_production_path() {
-    use astra_runtime::pipeline::routing::RoutingEngine;
-
+fn default_surface_does_not_include_plugin_in_production_path() {
     let mut registry = ToolRegistry::new(catalog_schemas());
     let plugins = make_plugins();
     registry.register_plugins(&plugins);
 
-    let query = "please check the weather in Beijing and tell me";
-    let routing = RoutingEngine::analyze(query, 1, &[], &[], vec![]);
-    let (schemas, _report) = registry.select_routed_with_pressure(
-        query,
-        &routing,
-        4000, // plenty of budget
-        &[],
-        None,
-        None,
-        &[],
-        0.0,
-        &std::collections::HashMap::new(),
-        &[],
-        &std::collections::HashMap::new(),
-    );
+    let (schemas, _report) = registry.build_routed_surface(4000);
     let names = names(&schemas);
     assert!(
         !names.contains(&"mcp__weather".to_string()),
-        "production selector must NOT include plugins in tools[] at any budget; got {names:?}"
+        "production surface must NOT include plugins in tools[] at any budget; got {names:?}"
     );
 }
 

@@ -624,7 +624,7 @@ fn normalize_reflect_focus(focus: Option<&str>) -> &'static str {
         "skill_failure" => "skill_failure",
         "unexpected_result" => "unexpected_result",
         "data_quality" => "data_quality",
-        "tool_selection" => "tool_selection",
+        "tool_surface" => "tool_surface",
         "history" => "history",
         "performance" => "performance",
         _ => "auto",
@@ -650,7 +650,7 @@ fn focused_recent_event_previews(
             JournalEventType::StallDetected,
             JournalEventType::AdaptivePerTurnApplied,
         ],
-        "tool_selection" => &[
+        "tool_surface" => &[
             JournalEventType::Turn,
             JournalEventType::AdaptiveScenarioApplied,
             JournalEventType::AdaptivePerTurnApplied,
@@ -830,9 +830,9 @@ pub(crate) fn verify_runtime_config(tuned_config_json: Option<&str>) -> Vec<Chec
     });
 
     let available_tools = ToolRegistry::all_tool_names().len();
-    let min_required = ConstraintSet::default().min_tool_pool_size;
+    let min_required = ConstraintSet::default().min_available_tool_count;
     checks.push(CheckResult {
-        name: "tool_pool_floor".to_string(),
+        name: "available_tool_floor".to_string(),
         ok: available_tools >= min_required,
         detail: format!(
             "available_tools={} min_required={}",
@@ -1078,7 +1078,7 @@ mod tests {
         ws.last_context_trace = Some(ContextTraceSignal {
             turn_id: "turn-7".to_string(),
             captured_at: Some(Utc::now().to_rfc3339()),
-            tool_selection: None,
+            tool_surface: None,
             memory: None,
             history: None,
             budget: Some(
@@ -1114,7 +1114,7 @@ mod tests {
                 config_value: None,
                 turns_compacted: None,
                 facts_stored: None,
-                tools_selected: Some(vec!["bash".to_string()]),
+                visible_tools: Some(vec!["bash".to_string()]),
                 selected_skills: None,
                 tools_used: Some(vec!["bash".to_string()]),
                 tool_calls: Some(vec![ToolCallRecord {
@@ -1144,7 +1144,6 @@ mod tests {
                 session_lineage: None,
                 coordination: None,
                 edge_policy: None,
-                selection_trace: None,
                 context_assembly_trace: Some(serde_json::json!({"tokens": 7000})),
                 routing_domain_hint: Some("code".to_string()),
                 entity_learn_skipped_no_domain: false,
@@ -1211,7 +1210,7 @@ mod tests {
                 config_value: None,
                 turns_compacted: None,
                 facts_stored: None,
-                tools_selected: None,
+                visible_tools: None,
                 selected_skills: None,
                 tools_used: None,
                 tool_calls: None,
@@ -1228,7 +1227,6 @@ mod tests {
                 session_lineage: None,
                 coordination: None,
                 edge_policy: None,
-                selection_trace: None,
                 context_assembly_trace: None,
                 routing_domain_hint: Some("code".to_string()),
                 entity_learn_skipped_no_domain: false,
@@ -1270,7 +1268,7 @@ mod tests {
         ws.last_context_trace = Some(ContextTraceSignal {
             turn_id: "turn-3".to_string(),
             captured_at: Some(Utc::now().to_rfc3339()),
-            tool_selection: None,
+            tool_surface: None,
             memory: None,
             history: None,
             budget: Some(
@@ -1306,7 +1304,7 @@ mod tests {
                 config_value: None,
                 turns_compacted: None,
                 facts_stored: None,
-                tools_selected: Some(vec!["bash".to_string()]),
+                visible_tools: Some(vec!["bash".to_string()]),
                 selected_skills: Some(vec!["goal-driven-evolution".to_string()]),
                 tools_used: Some(vec!["bash".to_string()]),
                 tool_calls: Some(vec![ToolCallRecord {
@@ -1336,7 +1334,6 @@ mod tests {
                 session_lineage: None,
                 coordination: None,
                 edge_policy: None,
-                selection_trace: None,
                 context_assembly_trace: None,
                 routing_domain_hint: Some("code".to_string()),
                 entity_learn_skipped_no_domain: false,

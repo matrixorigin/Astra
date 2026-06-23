@@ -6,7 +6,7 @@
 //! `astra-turn-core`, so they can silently disagree. Runtime is the only place
 //! that depends on both — this file lives there so a drift fails CI.
 
-use astra_config::runtime_config::ToolSelectionConfig;
+use astra_config::runtime_config::ToolPolicyConfig;
 use astra_turn_core::evaluation::{
     REDUNDANT_OVERLAPPING_READS_THRESHOLD, REDUNDANT_VALIDATION_RETRIES_THRESHOLD,
     SEARCH_FANOUT_THRESHOLD,
@@ -21,7 +21,7 @@ fn assert_default_matches(actual: u32, expected: usize, name: &str) {
 
 #[test]
 fn default_redundant_reads_matches_turn_core() {
-    let cfg = ToolSelectionConfig::default();
+    let cfg = ToolPolicyConfig::default();
     assert_default_matches(
         cfg.effective_redundant_reads_eval_threshold(),
         REDUNDANT_OVERLAPPING_READS_THRESHOLD,
@@ -31,7 +31,7 @@ fn default_redundant_reads_matches_turn_core() {
 
 #[test]
 fn default_search_fanout_matches_turn_core() {
-    let cfg = ToolSelectionConfig::default();
+    let cfg = ToolPolicyConfig::default();
     assert_default_matches(
         cfg.effective_search_fanout_eval_threshold(),
         SEARCH_FANOUT_THRESHOLD,
@@ -41,7 +41,7 @@ fn default_search_fanout_matches_turn_core() {
 
 #[test]
 fn default_redundant_validation_retries_matches_turn_core() {
-    let cfg = ToolSelectionConfig::default();
+    let cfg = ToolPolicyConfig::default();
     assert_default_matches(
         cfg.effective_redundant_validation_retries_eval_threshold(),
         REDUNDANT_VALIDATION_RETRIES_THRESHOLD,

@@ -8,7 +8,7 @@ const ABSOLUTE_TRIM_SCHEMA_TOKENS: usize = 128_000;
 const ABSOLUTE_COMPACT_HISTORY_TOKENS: usize = 200_000;
 const ABSOLUTE_AGGRESSIVE_PRUNE_TOKENS: usize = 320_000;
 
-/// Same pressure value used when building `SelectionContext` for tool selection.
+/// Same pressure value used when building `SelectionContext` for tool surface.
 #[must_use]
 pub fn budget_pressure_for_chat_turn(
     messages: &[Value],

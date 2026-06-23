@@ -980,7 +980,7 @@ impl BottomPaneView for AskUserView {
             KeyCode::Esc => {
                 // In multi-select mode, Esc first clears all selections.
                 // Only when nothing is selected does it cancel the
-                // form — matching Claude Code's two-stage Esc for
+                // form — matching the reference agent's two-stage Esc for
                 // multi-select safety.
                 if question.multi_select && !state.selected.is_empty() {
                     let state = self.current_state_mut().expect("state for active question");

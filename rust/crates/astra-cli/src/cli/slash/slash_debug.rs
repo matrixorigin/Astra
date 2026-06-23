@@ -1223,7 +1223,7 @@ mod tests {
         let path = dir.path().join("test.jsonl");
         std::fs::write(&path, concat!(
             r#"{"type":"session_start","ts":"2026-01-01T00:00:00Z","session_id":"s1"}"#, "\n",
-            r#"{"type":"turn","ts":"2026-01-01T00:01:00Z","session_id":"s1","turn":1,"user_input":"hello","assistant_output":"hi","tool_count":2,"tokens_in":100,"tokens_out":50,"duration_ms":5000,"tools_selected":[],"tools_used":["bash","grep"],"budget_used":0,"budget_pressure":0.0,"ttft_ms":1000,"context_ms":200,"memoria_ms":5}"#, "\n",
+            r#"{"type":"turn","ts":"2026-01-01T00:01:00Z","session_id":"s1","turn":1,"user_input":"hello","assistant_output":"hi","tool_count":2,"tokens_in":100,"tokens_out":50,"duration_ms":5000,"visible_tools":[],"tools_used":["bash","grep"],"budget_used":0,"budget_pressure":0.0,"ttft_ms":1000,"context_ms":200,"memoria_ms":5}"#, "\n",
         )).unwrap();
         let turns = load_journal_turns(&path);
         assert_eq!(turns.len(), 1);
@@ -1260,7 +1260,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.jsonl");
         std::fs::write(&path, concat!(
-            r#"{"type":"turn","ts":"2026-01-01T00:01:00Z","session_id":"s1","turn":1,"user_input":"hi","assistant_output":"hello","tool_count":0,"tokens_in":50,"tokens_out":10,"duration_ms":1000,"tools_selected":[],"tools_used":[],"budget_used":0,"budget_pressure":0.0,"ttft_ms":500}"#, "\n",
+            r#"{"type":"turn","ts":"2026-01-01T00:01:00Z","session_id":"s1","turn":1,"user_input":"hi","assistant_output":"hello","tool_count":0,"tokens_in":50,"tokens_out":10,"duration_ms":1000,"visible_tools":[],"tools_used":[],"budget_used":0,"budget_pressure":0.0,"ttft_ms":500}"#, "\n",
         )).unwrap();
         let turns = load_journal_turns(&path);
         assert_eq!(turns.len(), 1);
@@ -1275,7 +1275,7 @@ mod tests {
         std::fs::write(&path, concat!(
             r#"{"type":"llm_round","ts":"2026-01-01T00:00:00Z","session_id":"s1","turn":2,"agentic_step":4,"round":1,"tool_calls_returned":2,"metadata":{"source":"bridge_inprocess","run_id":"run-7","finish_reason":"tool_calls"}}"#, "\n",
             r#"{"type":"interruption_recorded","ts":"2026-01-01T00:00:01Z","session_id":"s1","turn":2,"agentic_step":4,"metadata":{"interruption":{"kind":"budget_exhausted","resumable":true,"tool_calls_completed":3,"turns_completed":4,"remaining_turns":0}}}"#, "\n",
-            r#"{"type":"turn","ts":"2026-01-01T00:01:00Z","session_id":"s1","turn":2,"user_input":"continue","assistant_output":"done","tool_count":2,"tokens_in":100,"tokens_out":50,"duration_ms":5000,"tools_selected":[],"tools_used":["bash","grep"],"budget_used":0,"budget_pressure":0.0,"ttft_ms":1000}"#, "\n",
+            r#"{"type":"turn","ts":"2026-01-01T00:01:00Z","session_id":"s1","turn":2,"user_input":"continue","assistant_output":"done","tool_count":2,"tokens_in":100,"tokens_out":50,"duration_ms":5000,"visible_tools":[],"tools_used":["bash","grep"],"budget_used":0,"budget_pressure":0.0,"ttft_ms":1000}"#, "\n",
         )).unwrap();
         let turns = load_journal_turns(&path);
         assert_eq!(turns.len(), 1);

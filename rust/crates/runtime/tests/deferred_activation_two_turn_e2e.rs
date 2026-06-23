@@ -4,10 +4,10 @@
 //! Turn N : LLM sees `<deferred_tools>` listing `github`. Calls
 //!          `tool_search(query="select:github")`. Runtime returns compact
 //!          callable shape and records the selected name.
-//! Turn N+1: Surface assembly consumes that one-shot selection and injects the
-//!          full `github` schema into `tools[]`. The validator admits the tool
+//! Turn N+1: Surface assembly reads the pending selection and injects the full
+//!          `github` schema into `tools[]`. The validator admits the tool
 //!          because it is visible in the current request, not because deferred
-//!          activation became a long-lived execution allowlist.
+//!          activation became a separate execution allowlist.
 //!
 //! This test simulates both turns at the public-API level. If either
 //! primitive regresses — `tool_search(select:…)` stops returning callable
@@ -95,7 +95,8 @@ fn turn_n_plus_1_validator_admits_github_only_after_schema_is_injected() {
 #[test]
 fn two_turn_flow_composes_end_to_end() {
     // The combined assertion: turn N selects a deferred tool, turn N+1 injects
-    // its schema, and the following turn without use does not retain it.
+    // its schema, and a later validator check without that schema does not
+    // admit it by name alone.
     let schemas = all_tool_schemas();
 
     // Turn N — ask for web_fetch schema.
@@ -127,10 +128,10 @@ fn two_turn_flow_composes_end_to_end() {
         "turn N+1: web_fetch must be admissible after its schema is injected"
     );
 
-    let followup_without_invocation = admissible_tool_names_from_visible(&pinned_visible);
+    let followup_without_schema = admissible_tool_names_from_visible(&pinned_visible);
     assert!(
-        !followup_without_invocation.contains("web_fetch"),
-        "unused one-shot activation must not make web_fetch executable forever"
+        !followup_without_schema.contains("web_fetch"),
+        "activation metadata must not make web_fetch executable unless its schema is visible"
     );
 }
 

@@ -521,7 +521,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["list_prs","get_pr","ci_status","repo_stats","list_issues","get_issue","create_issue"], "description": "GitHub operation"},
-                        "repo": {"type": "string", "description": "owner/name or bare name (e.g. 'anthropics/claude-code' or 'memoria'). Inferred from current git remote when omitted."},
+                        "repo": {"type": "string", "description": "owner/name or bare name (e.g. 'anthropics/reference-agent' or 'memoria'). Inferred from current git remote when omitted."},
                         "pr_number": {"type": "integer", "description": "PR number. REQUIRED when action=get_pr or action=ci_status."},
                         "issue_number": {"type": "integer", "description": "Issue number. REQUIRED when action=get_issue."},
                         "title": {"type": "string", "description": "Issue title. REQUIRED when action=create_issue."},
@@ -1149,7 +1149,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
         // Top-level sentinel tool that flips the session into plan
         // mode. Promoted from the buried `session.enter_plan` action
         // in 2026-05 because the model rarely picked the sub-action
-        // — claudecode's dedicated `EnterPlanMode` tool is the
+        // — the reference agent's dedicated `EnterPlanMode` tool is the
         // reference. While in plan mode, write tools (str_replace,
         // write_file, bash, git commit, …) are denied at the
         // permission gate; read tools stay available for codebase

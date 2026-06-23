@@ -128,11 +128,11 @@ fn truncate_tool_result(tool_name: &str, content: &str, max_chars: usize) -> Str
         return compressed;
     }
 
-    // Second pass: legacy head+tail char truncation as ultimate fallback.
-    legacy_head_tail_truncate(&compressed, max_chars)
+    // Second pass: head+tail char truncation as ultimate fallback.
+    head_tail_truncate_fallback(&compressed, max_chars)
 }
 
-fn legacy_head_tail_truncate(content: &str, max_chars: usize) -> String {
+fn head_tail_truncate_fallback(content: &str, max_chars: usize) -> String {
     let total_chars = content.chars().count();
     if total_chars <= max_chars {
         return content.to_string();
@@ -405,13 +405,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_head_tail_truncate_reports_omitted_chars_not_bytes() {
-        // Calling the legacy helper directly so we keep verifying that
-        // the char-accounting math is correct even if the outer wrapper
-        // now prefers semantic compression.
+    fn head_tail_truncate_fallback_reports_omitted_chars_not_bytes() {
+        // Calling the fallback directly keeps the char-accounting math covered
+        // even when the outer wrapper prefers semantic compression.
         let content = "中".repeat(10_100); // 10_100 chars, 30_300 bytes
         let max = 10_000;
-        let out = super::legacy_head_tail_truncate(&content, max);
+        let out = super::head_tail_truncate_fallback(&content, max);
         // head=4000 chars, tail=4000 chars, omitted=2100 chars (not 6300 bytes)
         assert!(
             out.contains("2100 characters"),

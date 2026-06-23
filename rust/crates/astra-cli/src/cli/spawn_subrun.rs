@@ -495,7 +495,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         // Resolve per-model workflow-guard policy once; used for both the
         // `SubRunHost::tool_cache` and the `AgenticLoopState` below.
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_selection
+            .tool_policy
             .resolve_for_model(effective_model.as_deref());
 
         let mut host = SubRunHost {
@@ -672,7 +672,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             boosted_tools: HashSet::new(),
-            widen_selection_pending: false,
+            widen_surface_pending: false,
             step_recorder,
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(
@@ -753,7 +753,6 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,

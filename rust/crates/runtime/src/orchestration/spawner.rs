@@ -517,7 +517,7 @@ pub struct SpawnRunConfig {
     /// Fork children are NOT allowed to fork again — prevents
     /// degenerate case where a forked child forks with its own prefix
     /// (which differs from the original parent's, breaking the cache
-    /// reuse chain). Same semantics as Claude Code's `isInForkChild()`.
+    /// reuse chain). Same semantics as the reference agent's `isInForkChild()`.
     pub is_fork_child: bool,
     /// Delegation chain from the parent — agent_ids that led to this
     /// child (for circular delegation detection). The child's
@@ -2751,7 +2751,7 @@ pub enum SpawnError {
     ExecutorUnavailable,
 
     /// Fork children are allowed to spawn normal children, but not
-    /// another inherit-prefix fork. This mirrors Claude Code's
+    /// another inherit-prefix fork. This mirrors the reference agent's
     /// `isInForkChild()` guard and prevents recursive cache-key drift.
     #[error("Nested fork inheritance is not allowed from a fork child")]
     NestedForkInheritanceRejected,
@@ -5136,7 +5136,7 @@ mod tests {
     }
 
     /// Background spawn returns immediately even when the child is fast.
-    /// Claude Code parity: background means "launch now, report later", so
+    /// reference-agent parity: background means "launch now, report later", so
     /// the parent can fan out N agents without being serialized by child work.
     #[tokio::test]
     async fn background_spawn_returns_launched_for_fast_child() {

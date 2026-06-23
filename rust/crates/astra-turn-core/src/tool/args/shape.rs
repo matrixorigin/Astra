@@ -30,19 +30,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn tool_call_name_supports_canonical_and_legacy_shapes() {
+    fn tool_call_name_supports_openai_and_internal_shapes() {
         let canonical = json!({
             "id": "call_1",
             "type": "function",
             "function": {"name": "bash", "arguments": "{}"}
         });
-        let legacy = json!({
+        let internal = json!({
             "id": "call_2",
             "name": "grep",
             "arguments": {"pattern": "foo"}
         });
         assert_eq!(tool_call_name(&canonical), Some("bash"));
-        assert_eq!(tool_call_name(&legacy), Some("grep"));
+        assert_eq!(tool_call_name(&internal), Some("grep"));
     }
 
     #[test]

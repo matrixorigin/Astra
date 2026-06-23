@@ -82,7 +82,7 @@ enum EventLevel {
 | `sse_tool_request` | Bridge emits tool_request | `{tool, request_id, args_keys}` |
 | `sse_tool_request_dropped` | CLI drops tool_request | `{tool, request_id, reason}` |
 | `skill_intercept` | Skill call intercepted | `{skill_name, resolved, surgically_removed_ids}` |
-| `context_assembly` | Prompt assembled | `{tools_selected, memories_count, history_turns_retained, budget_pressure}` |
+| `context_assembly` | Prompt assembled | `{visible_tools, memories_count, history_turns_retained, budget_pressure}` |
 | `headless_match` | Tool output matched | `{tool, match_source (edge/by_sig/protocol_error), edge_round_len}` |
 
 #### L2 — Debug (development only)

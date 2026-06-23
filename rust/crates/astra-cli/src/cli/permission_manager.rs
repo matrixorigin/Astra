@@ -5838,7 +5838,7 @@ mod tests {
 
     #[test]
     fn make_allow_rule_uses_command_subcommand_prefix() {
-        // Match Claude Code's safe default: reusable bash rules use a
+        // Match the reference agent's safe default: reusable bash rules use a
         // command+subcommand family, not arbitrary first-word prefixes.
         let args = serde_json::json!({"command": "kubectl apply -f deployment.yaml"});
         let rule = PermissionManager::make_allow_rule("bash", &args);

@@ -1,4 +1,4 @@
-//! Top-level `/chat` (streaming) JSON body skeleton before `edge_tools`, `tool_results`, and selector hints.
+//! Top-level `/chat` (streaming) JSON body skeleton before `edge_tools`, `tool_results`, and skill context.
 
 use std::collections::HashSet;
 use std::path::Path;

@@ -280,8 +280,7 @@ fn v2_tag_names_are_unique() {
 
 #[test]
 fn system_prompt_without_lessons_has_no_lessons_header() {
-    let prompt =
-        astra_runtime::prompts::build_main_system_prompt(&["bash", "memory"], "", 1.0, None);
+    let prompt = astra_runtime::prompts::build_main_system_prompt(&["bash", "memory"], "", None);
     assert!(
         !prompt.contains("📚 Lessons"),
         "prompt without lesson injection should not render Lessons header"
@@ -290,7 +289,7 @@ fn system_prompt_without_lessons_has_no_lessons_header() {
 
 #[test]
 fn system_prompt_with_no_tools_still_valid() {
-    let prompt = astra_runtime::prompts::build_main_system_prompt(&[], "", 1.0, None);
+    let prompt = astra_runtime::prompts::build_main_system_prompt(&[], "", None);
     assert!(!prompt.is_empty());
     assert!(!prompt.contains("Memory Rules"));
 }

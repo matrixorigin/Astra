@@ -14,12 +14,6 @@ use std::fmt::Write;
 use astra_text_utils::output_style::OutputStyle;
 use astra_text_utils::xml_escape::xml_escape_text;
 
-/// Session-stable runtime context for the agent's self-knowledge.
-///
-/// Confidence threshold below which the system prompt includes an advisory
-/// telling the LLM to ask for clarification rather than guessing with wrong tools.
-pub const LOW_CONFIDENCE_THRESHOLD: f64 = 0.3;
-
 // ── Static/Dynamic prompt boundary for provider-level caching ────────
 
 // CacheScope, PromptTokenBucket, and PromptSection now live in astra-turn-core
@@ -44,8 +38,8 @@ pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str =
 /// `BUDGET_NUM/BUDGET_DEN = 1/25 = 4 chars/token × 1%` — kept as integers so the budget
 /// math is exact regardless of f64 rounding.
 ///
-/// `MAX_ENTRY_CHARS = 1024` aligns roughly with Claude Code's 1,536-char per-skill cap,
-/// but tighter because our overall listing budget is ~1% (vs Claude Code's larger budget).
+/// `MAX_ENTRY_CHARS = 1024` aligns roughly with the reference agent's 1,536-char per-skill cap,
+/// but tighter because our overall listing budget is ~1% (vs the reference agent's larger budget).
 /// Set high enough to fit `description + WHEN: when_to_use` for typical skills without
 /// truncation; per-listing budget (above) still bounds the total surface.
 const SKILL_LISTING_BUDGET_NUM: u64 = 1;
@@ -444,10 +438,10 @@ pub fn build_deferred_tools_prompt_block_with_budget(
         "Tools in `<deferred_tools>` are discovery metadata, not complete call \
          contracts. Do not invoke a tool listed only in `<deferred_tools>`. \
          Before first use, call `tool_search(query=\"select:NAME\")` to fetch \
-         the full schema; after that schema has appeared in a `tool_search` \
-         result, invoke the tool by name with the schema's exact fields even if \
-         it is still absent from `tools[]`. If a tool is already present in \
-         `tools[]`, call it directly. For dotted legacy names like `agent.spawn`, \
+         the compact schema and activate it for the next model request; call \
+         that tool only after its name appears in `tools[]`, using the schema's \
+         exact fields. If a tool is already present in `tools[]`, call it directly. \
+         For dotted legacy names like `agent.spawn`, \
          use the consolidated tool name (`agent`) and pass the action via its \
          `action` field. Never call a tool whose name does NOT appear in \
          `tools[]` or `<deferred_tools>` — use `tool_search` with a keyword \
@@ -622,7 +616,7 @@ fn core_rules_section() -> String {
          1. Live data (CI, PRs, issues, stats, memory, git) → MUST call a tool. Never answer from training data.\n\
          2. First, check history; reuse it when it already answers the question. Re-call only if args differ, state may have changed, or the user asked for refresh.\n\
          3. Tool outputs in history reflect state AT CALL TIME. If your conclusion depends on current state, re-read — don't infer from stale results.\n\
-         4. You are compatible with Claude Code skills (Agent Skills open standard). `.claude/skills/`, `.claude/commands/`, and SKILL.md files work the same as `.astra/skills/`.\n"
+         4. You are compatible with Agent Skills. `.claude/skills/`, `.claude/commands/`, and SKILL.md files work the same as `.astra/skills/`.\n"
     )
 }
 
@@ -661,7 +655,7 @@ fn planning_section() -> &'static str {
      9. **Exploration cap**: ≤2 dir listings + ≤2 full-file reads unless user names a concrete target.\n"
 }
 
-/// Failure handling + resilience. Inspired by Claude Code's prompt contract.
+/// Failure handling + resilience. Inspired by the reference agent's prompt contract.
 fn resilience_section() -> &'static str {
     "\n## Failure Handling & Resilience\n\
      - **Context window is not your concern**: the system automatically compresses prior messages as context approaches limits. Do not stop solely because of context-window pressure; follow the latest real user request and current state.\n\
@@ -770,11 +764,7 @@ fn tool_visible(tool_names: &[&str], name: &str) -> bool {
 /// schemas. Schema docs explain arguments; this text prevents the model from
 /// calling structured tools that are known only through examples, memory, or
 /// `<deferred_tools>`.
-pub(crate) fn tool_conditional_section(
-    tool_names: &[&str],
-    _profile_desc: &str,
-    _selection_confidence: f64,
-) -> String {
+pub(crate) fn tool_conditional_section(tool_names: &[&str], _profile_desc: &str) -> String {
     if tool_names.is_empty() {
         return String::new();
     }
@@ -786,7 +776,7 @@ pub(crate) fn tool_conditional_section(
     );
     if tool_visible(tool_names, "tool_search") {
         body.push_str(
-            "         - A tool listed only in `<deferred_tools>` is not callable yet. Before first use, call `tool_search(query=\"select:NAME\")` and then follow the returned schema exactly.\n",
+            "         - A tool listed only in `<deferred_tools>` is not callable yet. Before first use, call `tool_search(query=\"select:NAME\")`; call that tool only after it appears in a later `tools[]`.\n",
         );
     } else {
         body.push_str(
@@ -796,19 +786,6 @@ pub(crate) fn tool_conditional_section(
     body.push_str(&tool_precedence_section(tool_names));
     body.push_str(&search_strategy_section(tool_names));
     body
-}
-
-/// Per-turn advisory for tool-selector uncertainty.
-///
-/// This must stay out of Session-scoped prompt blocks: confidence is computed
-/// per turn from the current request and selected tools.
-pub(crate) fn low_confidence_tool_selection_section(selection_confidence: f64) -> Option<String> {
-    (selection_confidence < LOW_CONFIDENCE_THRESHOLD).then(|| {
-        "\n## ⚠ Low-Confidence Tool Selection\n\
-         Tool selection confidence is LOW. If available tools seem insufficient, ASK the user to clarify.\n\
-         Do NOT guess with bash/find/read_file when a more specific tool would be needed.\n"
-            .to_string()
-    })
 }
 
 fn symbols_guidance(tool_names: &[&str]) -> String {
@@ -1256,16 +1233,9 @@ fn search_strategy_section(tool_names: &[&str]) -> String {
 pub fn build_main_system_prompt(
     tool_names: &[&str],
     profile_desc: &str,
-    selection_confidence: f64,
     task_type: Option<&str>,
 ) -> String {
-    build_main_system_prompt_with_style(
-        tool_names,
-        profile_desc,
-        selection_confidence,
-        task_type,
-        None,
-    )
+    build_main_system_prompt_with_style(tool_names, profile_desc, task_type, None)
 }
 
 /// Full system-prompt body with output style customization.
@@ -1273,17 +1243,11 @@ pub fn build_main_system_prompt(
 pub fn build_main_system_prompt_with_style(
     tool_names: &[&str],
     profile_desc: &str,
-    selection_confidence: f64,
     task_type: Option<&str>,
     output_style: Option<&OutputStyle>,
 ) -> String {
-    let mut sections = build_system_prompt_sections_with_style(
-        tool_names,
-        profile_desc,
-        selection_confidence,
-        task_type,
-        output_style,
-    );
+    let mut sections =
+        build_system_prompt_sections_with_style(tool_names, profile_desc, task_type, output_style);
     let overrides = load_overrides(&default_overrides_dir());
     apply_overrides(&mut sections, &overrides);
     sections_to_string(&sections)
@@ -1300,23 +1264,15 @@ pub fn build_main_system_prompt_with_style(
 pub fn build_system_prompt_sections(
     tool_names: &[&str],
     profile_desc: &str,
-    selection_confidence: f64,
     task_type: Option<&str>,
 ) -> Vec<PromptSection> {
-    build_system_prompt_sections_with_style(
-        tool_names,
-        profile_desc,
-        selection_confidence,
-        task_type,
-        None,
-    )
+    build_system_prompt_sections_with_style(tool_names, profile_desc, task_type, None)
 }
 
 /// Build system prompt sections with output style customization.
 pub fn build_system_prompt_sections_with_style(
     tool_names: &[&str],
     profile_desc: &str,
-    selection_confidence: f64,
     task_type: Option<&str>,
     output_style: Option<&OutputStyle>,
 ) -> Vec<PromptSection> {
@@ -1366,28 +1322,20 @@ pub fn build_system_prompt_sections_with_style(
         ),
     ];
 
-    // ── Tool-dependent sections (CacheScope::None — derived from the active
-    //    tool list/selection-confidence values, so they MUST go after the
-    //    cache marker to keep the Global prefix stable) ──
+    // ── Tool-dependent sections derived from the active tool list. They MUST
+    //    go after the cache marker to keep the Global prefix stable. ──
     sections.push(PromptSection::dynamic(
         self_model_section(tool_names),
         PromptTokenBucket::BasePersona,
     ));
 
-    let tool_cond = tool_conditional_section(tool_names, profile_desc, selection_confidence);
+    let tool_cond = tool_conditional_section(tool_names, profile_desc);
     if !tool_cond.is_empty() {
         // Even though tool-conditional guidance is composed from live tool
         // list and runtime profile (both per-turn dynamic), the content
         // *shape* is stable per-session — same structure, similar length.
         // Putting it under `BasePersona` keeps the cache prefix stable.
         sections.push(PromptSection::stable(tool_cond, CacheScope::Session));
-    }
-
-    if let Some(low_confidence) = low_confidence_tool_selection_section(selection_confidence) {
-        sections.push(PromptSection::dynamic(
-            low_confidence,
-            PromptTokenBucket::Environment,
-        ));
     }
 
     let tt = task_type_section(task_type, tool_names);
@@ -1569,10 +1517,6 @@ pub fn build_system_prompt_trace(
         context_signals.learned_feedback_rules |=
             section.trace_signals.context_signals.learned_feedback_rules;
         context_signals.memoria_insights |= section.trace_signals.context_signals.memoria_insights;
-        guidance_signals.round_budget_warning |=
-            section.trace_signals.guidance_signals.round_budget_warning;
-        guidance_signals.synthesize_or_batch |=
-            section.trace_signals.guidance_signals.synthesize_or_batch;
         guidance_signals.parallel_feedback |=
             section.trace_signals.guidance_signals.parallel_feedback;
         guidance_signals.parallel_batching_nudge |= section
@@ -1807,17 +1751,6 @@ const TASK_TYPE_KEYWORDS: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Round budget directive — REMOVED.
-///
-/// The old countdown-based budget pressure ("⚡ Round Budget Warning") has been
-/// replaced by the anomaly-based `LoopCircuitBreaker` in `astra-turn-core`.
-/// Agents run unlimited by default; intervention fires only on stall/regression.
-///
-/// Round budget threshold - when LLM rounds reach this, guidance may change.
-pub const ROUND_BUDGET_THRESHOLD: u32 = 8;
-/// Round budget hard limit - maximum rounds before circuit breaker intervention.
-pub const ROUND_BUDGET_HARD_LIMIT: u32 = 15;
-
 /// Threshold for the parallel-batching nudge: how many consecutive trailing
 /// single-tool rounds we tolerate before injecting a corrective directive.
 /// Set lower than the force threshold (=8) so we intervene EARLY — by round 6
@@ -1928,32 +1861,13 @@ fn trailing_tool_result_count(messages: &[serde_json::Value]) -> usize {
         .count()
 }
 
-/// Combined late-round guidance block used by bridge/server dynamic prompt
-/// assembly. Keeps the policy centralized so both paths surface the same
-/// round-budget, synthesis, and batching nudges.
-pub fn tool_round_guidance_with(
-    messages: &[serde_json::Value],
-    round_index: u32,
-    warning: u32,
-    limit: u32,
-) -> String {
-    tool_round_guidance_trace_with(messages, round_index, warning, limit).0
-}
-
 pub fn tool_round_guidance(messages: &[serde_json::Value], round_index: u32) -> String {
-    tool_round_guidance_with(
-        messages,
-        round_index,
-        ROUND_BUDGET_THRESHOLD,
-        ROUND_BUDGET_HARD_LIMIT,
-    )
+    tool_round_guidance_trace(messages, round_index).0
 }
 
-pub fn tool_round_guidance_trace_with(
+pub fn tool_round_guidance_trace(
     messages: &[serde_json::Value],
     round_index: u32,
-    _warning: u32,
-    _limit: u32,
 ) -> (String, PromptGuidanceSignals) {
     let trailing_tool_count = trailing_tool_result_count(messages);
     let parallel_feedback = trailing_tool_count > 1;
@@ -1961,7 +1875,7 @@ pub fn tool_round_guidance_trace_with(
     let parallel_batching_nudge = single_tool_streak >= PARALLEL_BATCHING_NUDGE_THRESHOLD;
 
     // Only emit parallel-batching nudge and positive feedback.
-    // Round budget pressure is gone — circuit breaker handles stalls.
+    // Tool-round pressure is handled by the circuit breaker.
     let _ = round_index;
     (
         format!(
@@ -1970,8 +1884,6 @@ pub fn tool_round_guidance_trace_with(
             parallel_execution_feedback(messages)
         ),
         PromptGuidanceSignals {
-            round_budget_warning: false,
-            synthesize_or_batch: false,
             parallel_feedback,
             parallel_batching_nudge,
         },
@@ -2049,8 +1961,7 @@ mod tests {
 
     #[test]
     fn code_review_prompt_includes_commit_review_guidance() {
-        let p =
-            build_main_system_prompt(&["git", "bash", "read_file"], "", 1.0, Some("code_review"));
+        let p = build_main_system_prompt(&["git", "bash", "read_file"], "", Some("code_review"));
         assert!(
             p.contains("Specific commit review"),
             "should include commit review variant"
@@ -2068,8 +1979,7 @@ mod tests {
             "should bound read_file fanout for review turns"
         );
 
-        let p_no_read_file =
-            build_main_system_prompt(&["git", "bash"], "", 1.0, Some("code_review"));
+        let p_no_read_file = build_main_system_prompt(&["git", "bash"], "", Some("code_review"));
         assert!(
             !p_no_read_file.contains("read_file calls"),
             "review prompt must not mention structured read_file calls when read_file is hidden"
@@ -2082,12 +1992,6 @@ mod tests {
     // `self_model_section` / `tool_conditional_section`, which are now
     // no-ops (commit a1187f76 — the tools array schema already carries
     // that guidance per-tool).
-
-    #[test]
-    fn low_confidence_threshold_is_positive() {
-        const { assert!(LOW_CONFIDENCE_THRESHOLD > 0.0) };
-        const { assert!(LOW_CONFIDENCE_THRESHOLD < 1.0) };
-    }
 
     #[test]
     fn stall_nudge_is_not_empty() {
@@ -2304,7 +2208,7 @@ mod tests {
             ("deployment", &["Deployment Strategy", "CI status"]),
         ];
         for &(task_type, phrases) in strategies {
-            let p = build_main_system_prompt(&["bash"], "", 0.5, Some(task_type));
+            let p = build_main_system_prompt(&["bash"], "", Some(task_type));
             for &phrase in phrases {
                 assert!(
                     p.contains(phrase),
@@ -2314,17 +2218,13 @@ mod tests {
         }
 
         // Implementation strategy also references tool guidance when tools present
-        let p = build_main_system_prompt(
-            &["glob", "grep", "read_file"],
-            "",
-            0.5,
-            Some("implementation"),
-        );
+        let p =
+            build_main_system_prompt(&["glob", "grep", "read_file"], "", Some("implementation"));
         assert!(p.contains("glob"), "implementation should mention glob");
         assert!(p.contains("grep"), "implementation should mention grep");
 
         // Unknown task type produces no strategy sections
-        let p = build_main_system_prompt(&["bash"], "", 0.5, Some("nonexistent_type"));
+        let p = build_main_system_prompt(&["bash"], "", Some("nonexistent_type"));
         assert!(p.contains("Core Rules"), "base content should be present");
         for &(label, _) in strategies {
             assert!(
@@ -2350,7 +2250,7 @@ mod tests {
 
     #[test]
     fn test_prompt_core_sections_always_present() {
-        let p = build_main_system_prompt(&["bash"], "", 0.5, None);
+        let p = build_main_system_prompt(&["bash"], "", None);
 
         // Planning protocol
         assert!(p.contains("Plan, Batch, Execute"));
@@ -2402,7 +2302,7 @@ mod tests {
 
     #[test]
     fn test_prompt_runaway_file_exploration_bound() {
-        let p = build_main_system_prompt(&["bash", "read_file", "list_dir"], "", 0.5, None);
+        let p = build_main_system_prompt(&["bash", "read_file", "list_dir"], "", None);
         assert!(p.contains("Open-ended loops"));
         assert!(p.contains("\"as many as you can\""));
         assert!(p.contains("≤2 dir listings"));
@@ -2411,63 +2311,59 @@ mod tests {
     #[test]
     fn test_prompt_tool_conditional_sections() {
         // No tools → fabrication warning, no memory rules, no strategy extras
-        let p_no = build_main_system_prompt(&[], "", 0.5, None);
+        let p_no = build_main_system_prompt(&[], "", None);
         assert!(p_no.contains("NO tools available"));
         assert!(p_no.contains("fake data"));
         assert!(
-            !p_no.contains("Claude Code"),
+            !p_no.contains("Agent Skills"),
             "no-tools should not mention CC skills"
         );
         assert!(!p_no.contains("Memory Rules"));
 
-        // With memory tools → memory rules appear (implied by tool selector)
-        let p_mem = build_main_system_prompt(&["bash", "git"], "", 0.5, None);
+        // With memory tools → memory rules appear (implied by tool surface)
+        let p_mem = build_main_system_prompt(&["bash", "git"], "", None);
         assert!(
             !p_mem.contains("Memory Rules"),
             "without memory tools, no rules"
         );
 
         // Task lifecycle: task tool present → lifecycle stays in schema
-        let p_task = build_main_system_prompt(&["task", "bash"], "", 1.0, None);
+        let p_task = build_main_system_prompt(&["task", "bash"], "", None);
         assert!(!p_task.contains("Task Lifecycle"));
         assert!(!p_task.contains("Use the `task` tool automatically"));
 
         // Task lifecycle: no task tool → no lifecycle guidance
-        let p_no_task = build_main_system_prompt(&["bash", "read_file"], "", 1.0, None);
+        let p_no_task = build_main_system_prompt(&["bash", "read_file"], "", None);
         assert!(!p_no_task.contains("Task Lifecycle"));
 
         // Plan lifecycle: both plan tools → lifecycle stays in schema
-        let p_plan = build_main_system_prompt(
-            &["enter_plan_mode", "exit_plan_mode", "bash"],
-            "",
-            1.0,
-            None,
-        );
+        let p_plan =
+            build_main_system_prompt(&["enter_plan_mode", "exit_plan_mode", "bash"], "", None);
         assert!(!p_plan.contains("Plan Mode Lifecycle"));
         assert!(!p_plan.contains("write tools stay blocked"));
 
         // Plan lifecycle: incomplete set → no lifecycle guidance
-        let p_no_plan = build_main_system_prompt(&["enter_plan_mode", "bash"], "", 1.0, None);
+        let p_no_plan = build_main_system_prompt(&["enter_plan_mode", "bash"], "", None);
         assert!(!p_no_plan.contains("Plan Mode Lifecycle"));
 
         // Search strategy → present with search tools
-        let p_search = build_main_system_prompt(&["glob", "grep", "read_file"], "", 0.5, None);
+        let p_search = build_main_system_prompt(&["glob", "grep", "read_file"], "", None);
         assert!(p_search.contains("Search Strategy"));
         assert!(p_search.contains("Use glob first"));
 
         // Search strategy → absent without search tools
-        let p_no_search = build_main_system_prompt(&["bash"], "", 0.5, None);
+        let p_no_search = build_main_system_prompt(&["bash"], "", None);
         assert!(!p_no_search.contains("Search Strategy"));
 
         // read_file alone triggers search strategy
-        let p_read = build_main_system_prompt(&["read_file"], "", 0.5, None);
+        let p_read = build_main_system_prompt(&["read_file"], "", None);
         assert!(
             p_read.contains("Search Strategy"),
             "read_file alone should trigger search strategy"
         );
 
         // Legacy code-nav tools with no schema must not leak into the prompt.
-        let p_nav = build_main_system_prompt(&["glob", "grep", "read_file"], "", 0.5, None);
+        let p_nav = build_main_system_prompt(&["glob", "grep", "read_file"], "", None);
         for legacy in [
             "find_definition",
             "find_references",
@@ -2485,7 +2381,7 @@ mod tests {
             "symbols activation guidance must not mention tool_search when tool_search is hidden"
         );
         let p_nav_with_search =
-            build_main_system_prompt(&["glob", "grep", "read_file", "tool_search"], "", 0.5, None);
+            build_main_system_prompt(&["glob", "grep", "read_file", "tool_search"], "", None);
         assert!(
             p_nav_with_search.contains("tool_search(query=\"select:symbols\")"),
             "symbols guidance must require deferred activation when tool_search is visible"
@@ -2494,7 +2390,6 @@ mod tests {
         let p_no_grep = build_main_system_prompt(
             &["bash", "read_file", "tool_search"],
             "",
-            0.5,
             Some("implementation"),
         );
         for direct_grep_phrase in [
@@ -2519,8 +2414,7 @@ mod tests {
             "prompt should route deferred tools through tool_search activation"
         );
 
-        let p_no_git =
-            build_main_system_prompt(&["bash", "read_file"], "", 0.5, Some("code_review"));
+        let p_no_git = build_main_system_prompt(&["bash", "read_file"], "", Some("code_review"));
         for direct_git_phrase in [
             "git(action=\"status\")",
             "git(action=\"diff\")",
@@ -2535,35 +2429,17 @@ mod tests {
         }
 
         // Profile desc in prompt
-        let p_prof = build_main_system_prompt(&["bash"], "\n## Project: TestProj\n", 0.5, None);
+        let p_prof = build_main_system_prompt(&["bash"], "\n## Project: TestProj\n", None);
         assert!(p_prof.contains("Project: TestProj"));
 
         // Profile desc in no-tools path
-        let p_no_prof = build_main_system_prompt(&[], "\n## Project: MyApp\n", 0.5, None);
+        let p_no_prof = build_main_system_prompt(&[], "\n## Project: MyApp\n", None);
         assert!(p_no_prof.contains("NO tools available"));
         assert!(p_no_prof.contains("Project: MyApp"));
     }
 
     #[test]
-    fn test_prompt_confidence_thresholds_and_style() {
-        // Below threshold → advisory appears
-        let p_low = build_main_system_prompt(&["bash"], "", 0.2, None);
-        assert!(p_low.contains("Low-Confidence"));
-        assert!(p_low.contains("ASK the user"));
-
-        // Above threshold → no advisory
-        let p_high = build_main_system_prompt(&["bash"], "", 0.5, None);
-        assert!(!p_high.contains("Low-Confidence"));
-
-        // At exact threshold (strict <) → no advisory
-        let p_exact = build_main_system_prompt(&["bash"], "", LOW_CONFIDENCE_THRESHOLD, None);
-        assert!(!p_exact.contains("Low-Confidence"));
-
-        // At zero → advisory appears
-        let p_zero = build_main_system_prompt(&["bash"], "", 0.0, None);
-        assert!(p_zero.contains("Low-Confidence"));
-
-        // Output style present
+    fn test_prompt_output_style() {
         use astra_text_utils::output_style::{OutputStyle, StyleSource};
         let style = OutputStyle {
             name: "test".to_string(),
@@ -2572,12 +2448,12 @@ mod tests {
             source: StyleSource::BuiltIn,
             keep_coding_instructions: true,
         };
-        let p_style = build_main_system_prompt_with_style(&["bash"], "", 0.5, None, Some(&style));
+        let p_style = build_main_system_prompt_with_style(&["bash"], "", None, Some(&style));
         assert!(p_style.contains("# Output Style: Test"));
         assert!(p_style.contains("Be very brief"));
 
         // No output style
-        let p_no_style = build_main_system_prompt_with_style(&["bash"], "", 0.5, None, None);
+        let p_no_style = build_main_system_prompt_with_style(&["bash"], "", None, None);
         assert!(!p_no_style.contains("# Output Style:"));
     }
 
@@ -2587,29 +2463,23 @@ mod tests {
 
     #[test]
     fn test_tool_round_guidance() {
-        // Combines budget synthesis + parallel feedback
+        // Parallel feedback is the only late-round guidance that remains here;
+        // stall intervention lives in the circuit breaker.
         let messages = vec![
             serde_json::json!({"role": "user", "content": "inspect the repo"}),
             serde_json::json!({"role": "tool", "content": "Cargo.toml"}),
             serde_json::json!({"role": "tool", "content": "README.md"}),
         ];
-        let guidance = tool_round_guidance(&messages, ROUND_BUDGET_THRESHOLD);
-        assert!(!guidance.contains("Round Budget Warning"));
+        let guidance = tool_round_guidance(&messages, 0);
+        assert!(!guidance.contains("Tool Round Warning"));
         assert!(!guidance.contains("Synthesize Or Batch Now"));
         assert!(guidance.contains("2 tools executed in parallel"));
 
-        // trace_with returns matching signals
-        let (guidance2, signals2) = tool_round_guidance_trace_with(
-            &messages,
-            ROUND_BUDGET_THRESHOLD,
-            ROUND_BUDGET_THRESHOLD,
-            ROUND_BUDGET_HARD_LIMIT,
-        );
-        assert!(!guidance2.contains("Round Budget Warning"));
+        // trace returns matching signals
+        let (guidance2, signals2) = tool_round_guidance_trace(&messages, 0);
+        assert!(!guidance2.contains("Tool Round Warning"));
         assert!(!guidance2.contains("Synthesize Or Batch Now"));
         assert!(guidance2.contains("2 tools executed in parallel"));
-        assert!(!signals2.round_budget_warning);
-        assert!(!signals2.synthesize_or_batch);
         assert!(signals2.parallel_feedback);
 
         // Ignores trailing runtime system messages
@@ -2619,15 +2489,9 @@ mod tests {
             serde_json::json!({"role": "system", "content": "✓ 2 tools executed in parallel"}),
             serde_json::json!({"role": "system", "content": "## Already Fetched\nFiles: b"}),
         ];
-        let (g3, s3) = tool_round_guidance_trace_with(
-            &msgs3,
-            ROUND_BUDGET_THRESHOLD,
-            ROUND_BUDGET_THRESHOLD,
-            ROUND_BUDGET_HARD_LIMIT,
-        );
+        let (g3, s3) = tool_round_guidance_trace(&msgs3, 0);
         assert!(!g3.contains("Synthesize Or Batch Now"));
         assert!(g3.contains("2 tools executed in parallel"));
-        assert!(!s3.synthesize_or_batch);
         assert!(s3.parallel_feedback);
 
         // Ignores trailing runtime attention manifest
@@ -2639,38 +2503,10 @@ mod tests {
             serde_json::json!({"role": "system", "content": "## Already Fetched\nFiles: b"}),
             serde_json::json!({"role": "user", "content": "[attention:v1]\ngoal: inspect"}),
         ];
-        let (g4, s4) = tool_round_guidance_trace_with(
-            &msgs4,
-            ROUND_BUDGET_THRESHOLD,
-            ROUND_BUDGET_THRESHOLD,
-            ROUND_BUDGET_HARD_LIMIT,
-        );
+        let (g4, s4) = tool_round_guidance_trace(&msgs4, 0);
         assert!(!g4.contains("Synthesize Or Batch Now"));
         assert!(g4.contains("2 tools executed in parallel"));
-        assert!(!s4.synthesize_or_batch);
         assert!(s4.parallel_feedback);
-
-        // Below threshold neuters budget signals
-        let one = vec![serde_json::json!({"role": "tool", "content": "a"})];
-        let (_g_lo, s_lo) = tool_round_guidance_trace_with(
-            &one,
-            1,
-            ROUND_BUDGET_THRESHOLD,
-            ROUND_BUDGET_HARD_LIMIT,
-        );
-        assert!(!s_lo.round_budget_warning);
-
-        // At hard limit neuters budget signals
-        let many: Vec<_> = (0..ROUND_BUDGET_HARD_LIMIT as usize)
-            .map(|i| serde_json::json!({"role": "tool", "content": format!("{}", i)}))
-            .collect();
-        let (_g_hi, s_hi) = tool_round_guidance_trace_with(
-            &many,
-            ROUND_BUDGET_HARD_LIMIT,
-            ROUND_BUDGET_THRESHOLD,
-            ROUND_BUDGET_HARD_LIMIT,
-        );
-        assert!(!s_hi.round_budget_warning);
 
         // Includes batching nudge when parallel tools present
         let batch_msgs = vec![
@@ -2681,12 +2517,7 @@ mod tests {
             serde_json::json!({"role": "tool", "content": "file content"}),
             serde_json::json!({"role": "tool", "content": "grep match"}),
         ];
-        let (g_batch, s_batch) = tool_round_guidance_trace_with(
-            &batch_msgs,
-            ROUND_BUDGET_THRESHOLD,
-            ROUND_BUDGET_THRESHOLD,
-            ROUND_BUDGET_HARD_LIMIT,
-        );
+        let (g_batch, s_batch) = tool_round_guidance_trace(&batch_msgs, 0);
         assert!(g_batch.contains("2 tools executed in parallel"));
         assert!(s_batch.parallel_feedback);
     }
@@ -2694,27 +2525,26 @@ mod tests {
     #[test]
     fn test_tool_conditional_and_budget_checks() {
         // Code nav absent without tools
-        let p = build_main_system_prompt(&["bash", "read_file"], "", 0.5, Some("implementation"));
+        let p = build_main_system_prompt(&["bash", "read_file"], "", Some("implementation"));
         assert!(!p.contains("Code Navigation"));
 
         // Build/test absent without tool
-        let p = build_main_system_prompt(&["bash"], "", 0.5, Some("implementation"));
+        let p = build_main_system_prompt(&["bash"], "", Some("implementation"));
         assert!(!p.contains("Build & Test Loop"));
 
         // Plan execution warns about mutating bash in rollback boundaries.
-        let p = build_main_system_prompt(&["bash"], "", 0.5, Some("implementation"));
+        let p = build_main_system_prompt(&["bash"], "", Some("implementation"));
         assert!(p.contains("non-read-only `bash` is a manual boundary"));
         assert!(!p.contains("run_build_test"));
 
         // Git mutations absent without commit tool
-        let p = build_main_system_prompt(&["git"], "", 0.5, None);
+        let p = build_main_system_prompt(&["git"], "", None);
         assert!(!p.contains("Git Workflow"));
 
         // Implementation strategy stays grounded in surfaced tools.
         let p = build_main_system_prompt(
             &["glob", "grep", "read_file", "str_replace", "git"],
             "",
-            0.5,
             Some("implementation"),
         );
         assert!(!p.contains("find_definition"));
@@ -2725,7 +2555,7 @@ mod tests {
 
         // Default persona budget stays bounded
         let sections =
-            build_system_prompt_sections(&["bash", "glob", "grep", "read_file"], "", 0.5, None);
+            build_system_prompt_sections(&["bash", "glob", "grep", "read_file"], "", None);
         let bd = build_system_prompt_trace(&sections, vec![], vec![], None);
         assert!(bd.base_persona_tokens <= 3600);
 
@@ -2739,7 +2569,7 @@ mod tests {
         assert_eq!(timer.token_bucket, PromptTokenBucket::BasePersona);
 
         // Search strategy billed to environment bucket
-        let sections = build_system_prompt_sections(&["glob", "grep", "read_file"], "", 0.5, None);
+        let sections = build_system_prompt_sections(&["glob", "grep", "read_file"], "", None);
         let ss = sections
             .iter()
             .find(|s| s.text.contains("Search Strategy"))
@@ -2750,7 +2580,7 @@ mod tests {
     #[test]
     fn test_sections_scopes_and_content() {
         let tools = vec!["bash", "read_file", "glob", "grep"];
-        let sections = build_system_prompt_sections(&tools, "cwd: /tmp", 0.8, None);
+        let sections = build_system_prompt_sections(&tools, "cwd: /tmp", None);
 
         // Scope validation: multiple Global sections, first is Global
         let globals: Vec<_> = sections
@@ -2800,17 +2630,13 @@ mod tests {
             "should contain context reuse rule"
         );
         assert!(
-            global_text.contains("Claude Code skills"),
+            global_text.contains("compatible with Agent Skills"),
             "should contain CC skill compatibility rule"
         );
 
         // Task-type strategy lands in None-scoped segment
-        let task_sections = build_system_prompt_sections(
-            &vec!["bash", "grep", "read_file"],
-            "",
-            0.8,
-            Some("debugging"),
-        );
+        let task_sections =
+            build_system_prompt_sections(&vec!["bash", "grep", "read_file"], "", Some("debugging"));
         let post_cache_text: String = task_sections
             .iter()
             .filter(|s| s.scope == CacheScope::None)
@@ -2821,24 +2647,11 @@ mod tests {
             "task-type strategy should land in None-scoped (post-cache) segment"
         );
 
-        // Low-confidence advisory lands in None-scoped post-cache segment
-        let lc_sections = build_system_prompt_sections(&vec!["bash"], "", 0.1, None);
-        let lc_text: String = lc_sections
-            .iter()
-            .filter(|s| s.scope == CacheScope::None)
-            .map(|s| s.text.as_str())
-            .collect();
-        assert!(
-            lc_text.contains("Low-Confidence Tool Selection"),
-            "low confidence advisory should land in None-scoped post-cache segment"
-        );
-
         // sections_to_string contains core and task content
         let profile = "cwd: /test\ngit_branch: main";
         let impl_sections = build_system_prompt_sections(
             &vec!["bash", "read_file", "glob"],
             profile,
-            0.8,
             Some("implementation"),
         );
         let result = sections_to_string(&impl_sections);
@@ -2854,7 +2667,7 @@ mod tests {
     #[test]
     fn test_sections_edge_cases() {
         // Empty tools + profile → 2 sections (Global + profile-only None)
-        let sections = build_system_prompt_sections(&[], "cwd: /app", 0.5, None);
+        let sections = build_system_prompt_sections(&[], "cwd: /app", None);
         assert_eq!(sections.len(), 2);
         assert_eq!(sections[0].scope, CacheScope::Global);
         assert!(sections[0].text.contains("NO tools available"));
@@ -2862,12 +2675,12 @@ mod tests {
         assert!(sections[1].text.contains("cwd: /app"));
 
         // Empty tools + empty profile → Global only
-        let sections = build_system_prompt_sections(&[], "", 0.5, None);
+        let sections = build_system_prompt_sections(&[], "", None);
         assert_eq!(sections.len(), 1);
         assert_eq!(sections[0].scope, CacheScope::Global);
 
         // Empty tools + profile text → 2 sections
-        let sections = build_system_prompt_sections(&[], "profile text", 0.5, None);
+        let sections = build_system_prompt_sections(&[], "profile text", None);
         assert_eq!(sections.len(), 2);
         assert_eq!(sections[0].scope, CacheScope::Global);
         assert_eq!(sections[1].scope, CacheScope::None);
@@ -2889,8 +2702,7 @@ mod tests {
             source: StyleSource::BuiltIn,
             keep_coding_instructions: true,
         };
-        let sections =
-            build_system_prompt_sections_with_style(&["bash"], "", 0.5, None, Some(&style));
+        let sections = build_system_prompt_sections_with_style(&["bash"], "", None, Some(&style));
         let all_text: String = sections.iter().map(|s| s.text.as_str()).collect();
         assert!(all_text.contains("# Output Style: Concise"));
         assert!(all_text.contains("Minimize output"));
@@ -2907,7 +2719,7 @@ mod tests {
         // Replace matching section
         let tools = &["bash", "grep"];
         let mut sections =
-            build_system_prompt_sections_with_style(tools, "test project", 0.8, None, None);
+            build_system_prompt_sections_with_style(tools, "test project", None, None);
 
         let mut overrides = PromptOverrides::new();
         overrides.insert("core_rules".into(), "Custom core rules content".into());
@@ -2918,7 +2730,7 @@ mod tests {
 
         // Ignore unknown keys
         let tools2 = &["bash"];
-        let mut sections2 = build_system_prompt_sections_with_style(tools2, "", 0.8, None, None);
+        let mut sections2 = build_system_prompt_sections_with_style(tools2, "", None, None);
         let original_text = sections2[0].text.clone();
         let mut overrides2 = PromptOverrides::new();
         overrides2.insert("nonexistent_section".into(), "should be ignored".into());
@@ -2945,7 +2757,7 @@ mod tests {
         use astra_turn_core::context_assembly_trace::{MemoryInjection, SkillInjection};
 
         // ── Skills + memories ──
-        let sections = build_system_prompt_sections(&["bash", "grep"], "", 0.8, None);
+        let sections = build_system_prompt_sections(&["bash", "grep"], "", None);
         let skills = vec![SkillInjection {
             skill_name: "concise".into(),
             skill_version: None,
@@ -2969,7 +2781,7 @@ mod tests {
         assert!(bd.total_tokens >= bd.base_persona_tokens + 150 + 200);
 
         // ── Empty skills/memories ──
-        let sections2 = build_system_prompt_sections(&["bash"], "", 0.5, None);
+        let sections2 = build_system_prompt_sections(&["bash"], "", None);
         let bd2 = build_system_prompt_trace(&sections2, vec![], vec![], None);
         assert!(bd2.base_persona_tokens > 0);
         assert!(bd2.skills_injected.is_empty());
@@ -3012,10 +2824,10 @@ mod tests {
             estimate_section_tokens("env payload")
         );
 
-        // ── Ignores unannotated legacy markers ──
+        // ── Ignores unannotated marker text ──
         let bd5 = build_system_prompt_trace(
             &[PromptSection::dynamic(
-                "\n\n## System Prompt Override\nlegacy\n\n## ⚡ Round Budget Warning".to_string(),
+                "\n\n## System Prompt Override\nlegacy\n\n## Runtime Marker".to_string(),
                 PromptTokenBucket::Environment,
             )],
             vec![],
@@ -3023,7 +2835,7 @@ mod tests {
             None,
         );
         assert!(!bd5.context_signals.system_prompt_override);
-        assert!(!bd5.guidance_signals.round_budget_warning);
+        assert!(!bd5.guidance_signals.parallel_feedback);
 
         // ── Explicit section signals ──
         let bd6 = build_system_prompt_trace(
@@ -3035,7 +2847,7 @@ mod tests {
                             ..Default::default()
                         },
                         guidance_signals: PromptGuidanceSignals {
-                            round_budget_warning: true,
+                            parallel_feedback: true,
                             ..Default::default()
                         },
                     }),
@@ -3045,7 +2857,7 @@ mod tests {
             None,
         );
         assert!(bd6.context_signals.system_prompt_override);
-        assert!(bd6.guidance_signals.round_budget_warning);
+        assert!(bd6.guidance_signals.parallel_feedback);
 
         // ── Context signals from section metadata ──
         let bd7 = build_system_prompt_trace(
@@ -3078,14 +2890,12 @@ mod tests {
         assert!(bd7.context_signals.learned_feedback_rules);
 
         // ── Guidance signals from section metadata ──
-        let (guidance, guidance_signals) = tool_round_guidance_trace_with(
+        let (guidance, guidance_signals) = tool_round_guidance_trace(
             &[
                 serde_json::json!({"role": "tool", "content": "Cargo.toml"}),
                 serde_json::json!({"role": "tool", "content": "README.md"}),
             ],
-            ROUND_BUDGET_THRESHOLD,
-            ROUND_BUDGET_THRESHOLD,
-            ROUND_BUDGET_HARD_LIMIT,
+            0,
         );
         let bd8 = build_system_prompt_trace(
             &[
@@ -3099,33 +2909,7 @@ mod tests {
             vec![],
             None,
         );
-        assert!(!bd8.guidance_signals.round_budget_warning);
-        assert!(!bd8.guidance_signals.synthesize_or_batch);
         assert!(bd8.guidance_signals.parallel_feedback);
-    }
-
-    // ─── Round budget sentinel constants ─────────────────────────────────
-    //
-    // These constants are consumed by the circuit breaker (astra-turn-core::stall)
-    // and by tool_round_guidance callers that pass explicit thresholds. The
-    // tool_round_guidance trace function itself no longer emits budget warnings
-    // — circuit breaker handles stalls — so these constants serve as documented
-    // defaults for CLI / server loops that read them.
-
-    #[test]
-    fn round_budget_threshold_is_8() {
-        // Consumers (CLI bridge, server agentic loop) read this constant to
-        // configure circuit-breaker windows. If this changes, all of those
-        // call sites must be audited.
-        assert_eq!(ROUND_BUDGET_THRESHOLD, 8);
-    }
-
-    #[test]
-    fn round_budget_hard_limit_is_15() {
-        // Consumers read this constant for the absolute ceiling. Circuit
-        // breaker replaces the old countdown budget, so this is a sentinel
-        // value, not an active throttle inside tool_round_guidance.
-        assert_eq!(ROUND_BUDGET_HARD_LIMIT, 15);
     }
 
     // ─── Parallel batching nudge (real-session-shaped fixtures) ─────────
@@ -3660,6 +3444,12 @@ mod tests {
                 .section
                 .text
                 .contains("Do not invoke a tool listed only")
+        );
+        assert!(
+            block
+                .section
+                .text
+                .contains("only after its name appears in `tools[]`")
         );
         assert!(!block.section.text.contains("CALLABLE directly"));
     }

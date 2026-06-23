@@ -299,7 +299,7 @@ mod turn_guard_integration {
 //    with different arguments (legitimate multi-file edits)
 
 mod multi_file_edit_regression {
-    use astra_runtime::tool_registry::SelectionReport;
+    use astra_runtime::tool_registry::ToolSurfaceReport;
     use astra_turn_core::tool_schema_prune::pin_invoked_tool_schemas;
     use astra_turn_core::turn_guard::{TurnGuard, VerdictSeverity};
     use serde_json::{Value, json};
@@ -331,10 +331,9 @@ mod multi_file_edit_regression {
 
         // Initial selection: bash + read_file (git_diff NOT selected)
         let mut selected = vec![tool_schema("bash"), tool_schema("read_file")];
-        let mut report = SelectionReport {
-            tools_selected: vec!["bash".into(), "read_file".into()],
-            dynamic_tools_selected: Vec::new(),
-            selected_count: 2,
+        let mut report = ToolSurfaceReport {
+            visible_tools: vec!["bash".into(), "read_file".into()],
+            visible_count: 2,
             budget_used: 0,
             budget_total: 1000,
         };

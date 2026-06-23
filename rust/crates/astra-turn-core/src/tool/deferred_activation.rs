@@ -1,8 +1,8 @@
 //! Helpers for the deferred-tool activation contract.
 //!
 //! Deferred tool entries are discovery metadata. A tool becomes executable
-//! only when it is already visible in `tools[]` or the model has fetched its
-//! full schema with `tool_search(query="select:NAME")`.
+//! only when it is already visible in `tools[]`, including a later request
+//! after `tool_search(query="select:NAME")` activates its full schema.
 
 use std::collections::HashSet;
 
@@ -352,8 +352,9 @@ pub fn tool_not_admitted_message(name: &str, deferred_select_allowed: bool) -> S
         format!(
             "Error: Tool '{name}' is not available in this turn yet. It appears \
              in `<deferred_tools>`, so first call `tool_search` with \
-             `query=\"select:{name}\"` to fetch the full schema, then call \
-             `{name}` with the schema's exact fields."
+             `query=\"select:{name}\"` to activate its full schema for the \
+             next model request. Call `{name}` only after it appears in \
+             `tools[]`, using the schema's exact fields."
         )
     } else {
         format!(
@@ -385,8 +386,7 @@ pub fn deferred_tool_not_activatable_message(name: &str) -> String {
 /// the supplied arguments cannot be trusted. When the name is advertised in
 /// `<deferred_tools>` and the runtime can execute it, we record the activation
 /// and ask the model to retry on the next model request once the schema is
-/// visible — mirroring Claude Code's `defer_loading` / `tool_reference`
-/// contract locally.
+/// visible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirectDeferredCallAdmission {
     /// The name is in the deferred manifest AND has a runtime binding. Treat
@@ -596,13 +596,13 @@ mod tests {
         assert_eq!(
             activated_tool_names_for_schema_injection(&mut activated, &surface, |_| true),
             vec!["glob".to_string(), "read_file".to_string()],
-            "unused selected tools must not disappear just because earlier tools were called"
+            "unused activated tools must not disappear just because earlier tools were called"
         );
         assert!(consume_activated_tool_name(&mut activated, "glob"));
         assert_eq!(
             activated_tool_names_for_schema_injection(&mut activated, &surface, |_| true),
             vec!["read_file".to_string()],
-            "last selected tool must remain available until it is called"
+            "last activated tool must remain available until it is called"
         );
     }
 
@@ -732,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_select_without_mode_does_not_activate() {
+    fn select_without_mode_does_not_activate() {
         let out = json!({
             "query": "select:agent_fanout",
             "requested": ["agent_fanout"],

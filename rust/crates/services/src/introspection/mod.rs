@@ -78,7 +78,7 @@ pub trait IntrospectionService: Send + Sync {
     ///   "user_id": "...",
     ///   "last_n": 20,
     ///   "decisions": [
-    ///     {"decision_id": "...", "decision_type": "tool_selection",
+    ///     {"decision_id": "...", "decision_type": "tool_surface",
     ///      "created_at": "...", "output": {...}},
     ///     ...
     ///   ]

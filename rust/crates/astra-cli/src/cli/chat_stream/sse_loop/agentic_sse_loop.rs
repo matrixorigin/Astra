@@ -94,9 +94,7 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
             routing_domain_hint: None,
             assistant_output: Some(assistant_output),
             tool_call_records,
-            selection_strategy: None,
-            selection_confidence: None,
-            selected_tools: Vec::new(),
+            visible_tools: Vec::new(),
         };
         print_explain_report(
             explain_turns,
@@ -153,7 +151,7 @@ pub(crate) struct StreamResultBuild<'a> {
     pub(crate) cache_read_tokens: u64,
     pub(crate) cache_creation_tokens: u64,
     pub(crate) tool_calls_count: u32,
-    pub(crate) first_selection_report: Option<tool_registry::SelectionReport>,
+    pub(crate) first_surface_report: Option<tool_registry::ToolSurfaceReport>,
     pub(crate) selected_skills: Vec<String>,
     pub(crate) tools_used: HashSet<String>,
     pub(crate) tool_call_records: Vec<ToolCallRecord>,
@@ -214,7 +212,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         cache_read_tokens,
         cache_creation_tokens,
         tool_calls_count,
-        first_selection_report,
+        first_surface_report,
         selected_skills,
         tools_used,
         tool_call_records,
@@ -251,10 +249,9 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
     }
     .to_string();
 
-    let report = first_selection_report.unwrap_or_else(|| tool_registry::SelectionReport {
-        tools_selected: Vec::new(),
-        dynamic_tools_selected: Vec::new(),
-        selected_count: 0,
+    let report = first_surface_report.unwrap_or_else(|| tool_registry::ToolSurfaceReport {
+        visible_tools: Vec::new(),
+        visible_count: 0,
         budget_used: 0,
         budget_total: 0,
     });
@@ -290,7 +287,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         cache_read_tokens,
         cache_creation_tokens,
         tool_calls_count,
-        tools_selected: report.tools_selected,
+        visible_tools: report.visible_tools,
         selected_skills,
         tools_used,
         tool_call_records,
@@ -348,7 +345,7 @@ mod tests {
             cache_read_tokens: 800,
             cache_creation_tokens: 100,
             tool_calls_count: 3,
-            first_selection_report: None,
+            first_surface_report: None,
             selected_skills: vec!["sk1".into()],
             tools_used: HashSet::from(["bash".into(), "read".into()]),
             tool_call_records: vec![],

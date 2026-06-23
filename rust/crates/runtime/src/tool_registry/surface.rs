@@ -1,7 +1,7 @@
 //! Tool surface — T1 pinned + T2 deferred model.
 //!
-//! See `memory/project_tool_surface_rewrite.md` and the plan file for the
-//! architectural story. Short version:
+//! See `plans/tool-surface-deferred-simplification-2026-06-23.md` and
+//! `docs/design/skills-and-tools.md` for the architectural story. Short version:
 //!
 //! - **T1 pinned** = a small, stable set of tool schemas that go into the
 //!   LLM `tools[]` array on every turn. Byte-stable across a session so the
@@ -12,62 +12,37 @@
 //!   schema visible in upcoming `tools[]` payloads until the model actually
 //!   calls that tool once.
 //!
-//! The default T1 set is the coding core (see `DEFAULT_PINNED`).
+//! The default T1 set is the coding core, derived from the tool identity table.
 //! Users override via `runtime.tool_surface.pinned_tools` in TOML. A name
 //! prefixed with `-` removes a default (e.g. `"-grep"`).
 //!
-//! Implementation is complete and wired into production. See
-//! `memory/project_tool_surface_rewrite.md` for the architectural story.
+//! Implementation is complete and wired into production.
 
 use astra_config::ToolSurfaceConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::sync::LazyLock;
 
-/// Default T1 pinned tools — the coding golden path + astra intrinsics +
-/// activation primitives.
-///
-/// Rationale for each inclusion:
-/// - `bash`, `read_file`, `write_file`, `str_replace` — the coding four.
-/// - `grep`, `glob`, `list_dir` — file discovery, used in 80%+ of turns.
-/// - `memory` — astra's intrinsic memory capability (cf. TOOL_CATALOG
-///   comment at tool_registry_meta:408 — "memory is pinned, intrinsic
-///   store/retrieve capability"). Deferring it would force a
-///   round-trip for every memory op.
-/// - `git` — read-mostly VCS observability (`status`, `diff`, `log`) is part
-///   of the normal coding loop and is referenced directly by the system
-///   prompt. Deferring it makes "show diff" pay an activation round and
-///   contradicts that contract.
-/// - `skill`, `tool_search` — the two activation primitives. Needed to
-///   reach anything in the deferred list.
-/// - `task` — session_todos surface. The TUI's task dashboard lights up
-///   only when the model emits `task.create / update`. Leaving it in
-///   T2 means the model rarely activates it via `tool_search`, and the
-///   board never shows up — defeating its purpose. Pin it so multi-step
-///   work is visible by default.
-/// - `ask_user` — the structured clarification primitive. It is pinned as
-///   core interaction vocabulary, then removed by interaction-mode filtering
-///   in Auto/NonInteractive/Headless turns where no user prompt sink exists.
-///
-/// Explicitly deferred: `github`, `mo`, `agent`, `web_fetch`,
-/// `introspect`, `lsp`, `notify`, `session`, `symbols`, `powershell`,
-/// `run_script`. Users pin via config as needed.
-pub const DEFAULT_PINNED: &[&str] = &[
-    "ask_user",
-    "bash",
-    "git",
-    "glob",
-    "grep",
-    "list_dir",
-    "memory",
-    "read_file",
-    "skill",
-    "str_replace",
-    "task",
-    "tool_search",
-    "write_file",
-];
+use crate::tool_registry::identity::{ToolPublicStatus, all_tool_identities};
+
+/// Default T1 pinned tool names, derived from the single authority
+/// [`crate::tool_registry::identity::ToolIdentity`] classification.
+/// Any name classified as `ToolPublicStatus::Pinned` automatically
+/// appears here — no manual copy needed.
+pub fn default_pinned_names() -> &'static [&'static str] {
+    static NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+        let mut names: Vec<&str> = all_tool_identities()
+            .iter()
+            .filter(|id| id.status == ToolPublicStatus::Pinned)
+            .map(|id| id.name)
+            .collect();
+        names.sort_unstable();
+        names
+    });
+    &NAMES
+}
 
 /// One entry in the deferred manifest.
 ///
@@ -106,7 +81,7 @@ impl ToolSurface {
     /// plugin schemas registered this session.
     ///
     /// Algorithm:
-    /// 1. Start from [`DEFAULT_PINNED`].
+    /// 1. Start from names classified as `ToolPublicStatus::Pinned`.
     /// 2. Apply `cfg.pinned_tools`: a bare name adds, a `-name` removes.
     ///    Unknown names are silently ignored.
     /// 3. Partition the union of catalog + plugins: names in the resolved
@@ -141,8 +116,10 @@ impl ToolSurface {
         // Resolve the pinned name set: defaults + additive overrides, minus
         // any `-name` removals. Unknown names emit a warning — they are likely
         // typos (`+web_fetc`) or stale entries after a tool was renamed.
-        let mut pinned_names: std::collections::BTreeSet<String> =
-            DEFAULT_PINNED.iter().map(|s| (*s).to_string()).collect();
+        let mut pinned_names: std::collections::BTreeSet<String> = default_pinned_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         for entry in &cfg.pinned_tools {
             let trimmed = entry.trim();
             // Empty / whitespace-only / bare "-" / double-prefixed "--" are
@@ -184,25 +161,38 @@ impl ToolSurface {
     /// Build a deferred manifest from the eligible schema pool after the caller
     /// has already decided the final visible `tools[]` set for this turn.
     ///
-    /// This keeps the wire contract self-consistent: a tool is either directly
-    /// visible in `tools[]` or advertised as deferred/searchable, never both.
-    ///
-    /// NOTE: `visible_names` is only used to filter `plugin_schemas` (per-turn
-    /// dynamic tools like MCP). Catalog schemas pass through unfiltered so that
-    /// the deferred block (`<deferred_tools>`) remains stable per session —
-    /// filtering by `visible_names` would make it fluctuate with every
-    /// selector change, breaking `CacheScope::Session`.
+    /// `visible_names` filters only per-turn plugin/MCP schemas. Catalog schemas
+    /// pass through unfiltered so the `<deferred_tools>` block remains stable
+    /// per session. An activated catalog tool may therefore appear in both
+    /// `tools[]` and `<deferred_tools>`; the system prompt instructs the model
+    /// to prefer the visible `tools[]` schema.
     pub fn build_excluding_visible(
         catalog_schemas: Vec<Value>,
         cfg: &ToolSurfaceConfig,
         plugin_schemas: &[Value],
         visible_names: &HashSet<String>,
     ) -> Self {
+        let plugin_names: HashSet<String> = plugin_schemas
+            .iter()
+            .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
+            .collect();
+
         // Catalog schemas are NOT filtered by visible_names — the deferred set
-        // must be stable per session (CacheScope::Session). Selector-chosen
+        // must be stable per session (CacheScope::Session). Activated catalog
         // tools may appear in both tools[] and <deferred_tools>; the system
         // prompt instructs the model to prefer tools[].
-        // let catalog_schemas: Vec<Value> = ...; // intentionally removed
+        //
+        // Plugin/MCP schemas are different: they are per-runtime dynamic
+        // capabilities, and callers may pass a mixed all-schemas pool that
+        // already contains those plugin names. Remove plugin names from the
+        // catalog half first so the visible-name filter below remains
+        // authoritative for dynamic tools.
+        let catalog_schemas: Vec<Value> = catalog_schemas
+            .into_iter()
+            .filter(|schema| {
+                tool_schema_name(schema).is_none_or(|name| !plugin_names.contains(name))
+            })
+            .collect();
 
         let plugin_schemas: Vec<Value> = plugin_schemas
             .iter()
@@ -227,7 +217,7 @@ impl ToolSurface {
     /// This is the single runtime answer to "which tools are T1 for this
     /// surface?". Callers that need cache markers, edge metadata, or diagnostics
     /// should derive from the resolved surface instead of rebuilding the
-    /// DEFAULT_PINNED + TOML override rules locally.
+    /// identity + TOML override rules locally.
     pub fn pinned_names(&self) -> Vec<String> {
         self.pinned
             .iter()

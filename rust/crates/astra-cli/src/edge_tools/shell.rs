@@ -68,7 +68,7 @@ fn informational_failure_note(command: &str) -> &'static str {
 // ---------------------------------------------------------------------------
 // Bash security layer — detect dangerous or potentially destructive commands.
 //
-// Modeled after Claude Code's `bashSecurity.ts` top-5 detection patterns.
+// Modeled after the reference agent's `bashSecurity.ts` top-5 detection patterns.
 // Returns a warning string when a command matches; the caller decides whether
 // to block (sandbox Restrictive mode) or append the warning to the result
 // (sandbox Permissive mode, letting the model see the warning and self-correct).

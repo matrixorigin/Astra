@@ -22,8 +22,8 @@
 //! retrieving — short blurbs get rejected, forcing the caller to either
 //! summarize more durably or skip the write.
 //!
-//! This is **Claude Code's `type:` frontmatter + "what NOT to save"
-//! principle** adapted to a vector-DB backend. Claude Code enforces at
+//! This is **the reference agent's `type:` frontmatter + "what NOT to save"
+//! principle** adapted to a vector-DB backend. the reference agent enforces at
 //! write via a system-prompt section; astra enforces in code so any
 //! store path (compaction, memory tool, session-end governance, future
 //! callers) gets the same contract.

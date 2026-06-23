@@ -41,7 +41,7 @@ Same as other skills — journal JSONL or debug JSON files.
 | ----------------- | ------------------------------------------------------------- | ------------------------------------------------------ |
 | Heavy checkpoint  | Full message array sent to LLM                                | `~/.astra/sessions/<id>/step_checkpoints/*-heavy.json` |
 | Debug dump (full) | Complete turn snapshot with schema `astra-debug-turn-full-v1` | `/tmp/debug-<id>-turn<N>-full.json`                    |
-| Journal           | Per-turn token counts, tools_selected, budget_pressure        | `~/.astra/sessions/<id>.jsonl`                         |
+| Journal           | Per-turn token counts, visible tools, activated tools, budget_pressure | `~/.astra/sessions/<id>.jsonl`                         |
 
 **Heavy checkpoints are the gold standard** — they contain the exact messages sent to the LLM.
 
@@ -149,10 +149,10 @@ costs tokens proportional to its JSON size.
 
 **From `ToolRegistry::token_cost()`**: `schema_bytes / 4` (approximate).
 
-From journal `tools_selected` per turn:
+From journal/debug `visible_tools` per turn:
 
 ```
-| Turn | Tools Selected | Est. Schema Tokens | Tools Actually Used | Waste% |
+| Turn | Visible Tools | Est. Schema Tokens | Tools Actually Used | Waste% |
 |------|---------------|-------------------|--------------------|---------|
 ```
 
@@ -161,7 +161,7 @@ From journal `tools_selected` per turn:
 - **Pinned schemas**: Always sent (core tools like bash, read_file, etc.)
   - Count: typically 5-10 tools
   - Cost: ~2-4K tokens (always paid)
-- **Dynamic schemas**: Selected by tool selector per turn
+- **Deferred schemas**: Activated by `tool_search` and then visible in subsequent turns
   - Count: varies (5-25 tools)
   - Cost: ~2-10K tokens
 
@@ -169,21 +169,21 @@ From journal `tools_selected` per turn:
 
 Flag:
 
-- 🔴 >30 tools selected (>12K schema tokens — significant context waste)
-- 🟡 >20 tools selected (>8K tokens)
-- 🟢 <15 tools selected (<6K tokens — well-optimized)
+- 🔴 >30 visible tools (>12K schema tokens — significant context waste)
+- 🟡 >20 visible tools (>8K tokens)
+- 🟢 <15 visible tools (<6K tokens — well-optimized)
 
-### 3.3 Tool Selection Accuracy
+### 3.3 Tool Surface Utilization
 
-Compare `tools_selected` vs `tools_used`:
+Compare `visible_tools` vs `tools_used`:
 
 ```
-Accuracy = |tools_used| / |tools_selected|
+Utilization = |tools_used| / |visible_tools|
 ```
 
 | Accuracy | Assessment                                      |
 | -------- | ----------------------------------------------- |
-| >70%     | 🟢 Excellent — selector is precise              |
+| >70%     | 🟢 Excellent — visible surface is tight         |
 | 50-70%   | 🟡 Acceptable — some waste                      |
 | <50%     | 🔴 Poor — more than half the schemas are unused |
 
@@ -399,8 +399,8 @@ Peak tokens_in: {peak} tokens ({peak/effective * 100}% utilization)
 
 | Issue                         | Fix                                                                                                                                                    | Savings             |
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------- |
-| Low selection accuracy (<50%) | Strengthen TF-IDF signals (routing, entity graph, patterns, boost terms); tighten tool budget / thresholds — CLI does not use an LLM tool pre-selector | 2-5K tokens         |
-| >25 tools selected            | Tighten TF-IDF threshold                                                                                                                               | 2-4K tokens         |
+| Low surface utilization (<50%) | Reduce pinned tools, move rarely used tools behind deferred activation, or tighten `tool_search` activation prompts | 2-5K tokens         |
+| >25 visible tools              | Move non-core schemas to deferred activation and verify only activated tools materialize next turn | 2-4K tokens         |
 | Large individual schemas      | Trim verbose parameter descriptions                                                                                                                    | 100-500 tokens/tool |
 
 ### History
@@ -431,7 +431,7 @@ Peak tokens_in: {peak} tokens ({peak/effective * 100}% utilization)
 | Budget pressure calc   | `rust/crates/runtime/src/turn/chat_turn_budget_pressure.rs`              |
 | Payload assembly       | `rust/crates/runtime/src/turn/chat_turn_payload.rs`                      |
 | Tool registry & costs  | `rust/crates/runtime/src/tool_registry/registry.rs`                      |
-| Tool selector          | `rust/crates/runtime/src/tool_selector.rs`                               |
+| Tool surface           | `rust/crates/runtime/src/tool_registry/`                                 |
 | Compaction             | `rust/crates/runtime/src/turn/cloud/compaction.rs`                       |
 | History management     | `rust/crates/runtime/src/turn/history.rs`                                |
 

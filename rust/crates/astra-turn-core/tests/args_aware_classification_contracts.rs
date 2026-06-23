@@ -3,7 +3,7 @@
 //! These tests verify that the classification → partition → approval →
 //! speculation pipeline stays consistent when bash commands carry
 //! read-only vs mutating arguments. This is the cloud-edge advantage
-//! over Claude Code: `bash "git status"` runs in parallel without
+//! over the reference agent: `bash "git status"` runs in parallel without
 //! approval while `bash "rm -rf"` is serialized and gated.
 
 use std::sync::Arc;

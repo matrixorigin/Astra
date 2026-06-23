@@ -239,18 +239,14 @@ fn analyze_turn(
         })).collect::<Vec<_>>(),
     });
 
-    // Tool selection breakdown
+    // Tool surface breakdown
     let tools_detail = json!({
         "available": tools.tools_available,
-        "selected": tools.tools_selected.len(),
-        "rejected": tools.tools_rejected.len(),
-        "strategy": tools.selection_strategy,
-        "confidence": format!("{:.2}", tools.selection_confidence),
-        "latency_ms": tools.selection_latency_ms,
-        "selected_tools": tools.tools_selected.iter().map(|t| json!({
+        "selected": tools.visible_tools.len(),
+        "latency_ms": tools.surface_latency_ms,
+        "visible_tools": tools.visible_tools.iter().map(|t| json!({
             "name": t.tool_name,
             "tokens": t.tokens,
-            "score": format!("{:.3}", t.score),
         })).collect::<Vec<_>>(),
     });
 
@@ -435,8 +431,7 @@ fn analyze_session(
             "tool_schemas": format!("{:.0}", agg.avg_tool_schema_tokens),
             "memories_selected": format!("{:.1}", agg.avg_memories_selected),
             "memory_relevance": format!("{:.3}", agg.avg_memory_relevance),
-            "tools_selected": format!("{:.1}", agg.avg_tools_selected),
-            "selection_confidence": format!("{:.2}", agg.avg_selection_confidence),
+            "visible_tools": format!("{:.1}", agg.avg_visible_tools),
             "compression_ratio": format!("{:.2}", agg.avg_compression_ratio),
         },
         "trends": {

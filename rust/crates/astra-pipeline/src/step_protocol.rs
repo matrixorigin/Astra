@@ -241,7 +241,7 @@ pub struct MemoryContext {
     pub retrieved_memory_ids: Vec<String>,
     /// Domain hints extracted from memory
     pub domain_hints: Vec<String>,
-    /// Boost terms for tool selection
+    /// Boost terms for tool surface
     pub boost_terms: Vec<String>,
     /// Provenance: which memories influenced this step
     pub provenance: Vec<String>,
@@ -397,7 +397,7 @@ impl Step {
 pub enum StepAction {
     /// Intent recognition + memory retrieval
     Perceive,
-    /// Tool selection + strategy
+    /// tool surface + strategy
     Plan,
     /// LLM + tool execution
     Act,
@@ -950,13 +950,12 @@ pub enum StepPayload {
     },
     Plan {
         intent_signals: Vec<String>,
-        intent_confidence: f64,
         available_tool_count: usize,
         budget_tokens: u64,
         restricted_tools: Vec<String>,
     },
     Act {
-        selected_tools: Vec<String>,
+        visible_tools: Vec<String>,
         tool_calls: Vec<serde_json::Value>,
     },
     Evaluate {
@@ -984,8 +983,7 @@ pub enum StepResult {
         boost_terms: Vec<String>,
     },
     Plan {
-        selected_tools: Vec<String>,
-        confidence: f64,
+        visible_tools: Vec<String>,
     },
     Act {
         tool_results_count: usize,
@@ -1420,7 +1418,7 @@ pub enum StepEventType {
     StepStarted,
     StepCompleted,
     /// Step ended without terminal success/failure, e.g. a visible turn paused,
-    /// hit a round budget, or yielded to the next iteration.
+    /// hit a circuit-breaker hard stop, or yielded to the next iteration.
     StepIncomplete,
     /// Step evaluation completed and the runtime decided what to do next.
     /// This is not a terminal event; terminal status is recorded separately
@@ -1653,7 +1651,7 @@ mod tests {
             "n1".into(),
             StepAction::Act,
             StepPayload::Act {
-                selected_tools: vec!["grep".into()],
+                visible_tools: vec!["grep".into()],
                 tool_calls: vec![],
             },
         );
@@ -1681,7 +1679,7 @@ mod tests {
             "n1".into(),
             StepAction::Act,
             StepPayload::Act {
-                selected_tools: vec![],
+                visible_tools: vec![],
                 tool_calls: vec![],
             },
         );
@@ -2476,7 +2474,7 @@ mod tests {
             "node-a".into(),
             StepAction::Act,
             StepPayload::Act {
-                selected_tools: vec!["grep".into(), "bash".into()],
+                visible_tools: vec!["grep".into(), "bash".into()],
                 tool_calls: vec![serde_json::json!({"id": "tc1", "name": "grep"})],
             },
         );
@@ -2500,8 +2498,7 @@ mod tests {
                 boost_terms: vec!["code".into(), "review".into()],
             },
             StepResult::Plan {
-                selected_tools: vec!["grep".into()],
-                confidence: 0.9,
+                visible_tools: vec!["grep".into()],
             },
             StepResult::Evaluate {
                 verdict: StepVerdict::Continue,
@@ -2555,7 +2552,7 @@ mod tests {
             "n1".into(),
             StepAction::Act,
             StepPayload::Act {
-                selected_tools: vec!["grep".into()],
+                visible_tools: vec!["grep".into()],
                 tool_calls: vec![],
             },
         );
@@ -2724,7 +2721,7 @@ mod tests {
             "n1",
             &StepAction::Act,
             &StepPayload::Act {
-                selected_tools: vec!["grep".into()],
+                visible_tools: vec!["grep".into()],
                 tool_calls: vec![serde_json::json!({"a": 1, "b": 2})],
             },
         );
@@ -2733,7 +2730,7 @@ mod tests {
             "n1",
             &StepAction::Act,
             &StepPayload::Act {
-                selected_tools: vec!["grep".into()],
+                visible_tools: vec!["grep".into()],
                 tool_calls: vec![serde_json::json!({"b": 2, "a": 1})],
             },
         );
@@ -3120,7 +3117,7 @@ mod tests {
             "node-1".into(),
             StepAction::Act,
             StepPayload::Act {
-                selected_tools: vec![],
+                visible_tools: vec![],
                 tool_calls: vec![],
             },
         )

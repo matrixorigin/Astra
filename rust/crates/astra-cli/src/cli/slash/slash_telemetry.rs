@@ -8,7 +8,7 @@ use crossterm::style::Stylize;
 /// - (no arg)     Show summary: turns, timings, drift, decisions
 /// - `turns`      List per-turn timing breakdowns
 /// - `drift`      Check focus drift analysis
-/// - `decisions`  List tool selection decisions with confidence
+/// - `decisions`  List tool surface decisions with confidence
 ///
 /// Retention: fallback handler for `/telemetry` — called from slash_router.rs.
 /// In TUI mode this stays on the text fallback path.
@@ -367,15 +367,11 @@ fn show_decisions(
         // Format decision type nicely
         use astra_turn_core::decision_explainer::DecisionType;
         let type_label = match &decision.decision_type {
-            DecisionType::ToolSelection {
-                selected_tools,
+            DecisionType::ToolSurface {
+                visible_tools,
                 total_available,
             } => {
-                format!(
-                    "ToolSelection ({}/{})",
-                    selected_tools.len(),
-                    total_available
-                )
+                format!("ToolSurface ({}/{})", visible_tools.len(), total_available)
             }
             DecisionType::HistoryCompression {
                 turns_compressed,
@@ -522,7 +518,7 @@ fn show_help() {
         "/telemetry drift".magenta()
     );
     eprintln!(
-        "  {}  List tool selection decisions",
+        "  {}  List tool surface decisions",
         "/telemetry decisions".magenta()
     );
     eprintln!(
@@ -543,7 +539,7 @@ fn show_help() {
         "/telemetry context-detail [N]".magenta()
     );
     eprintln!(
-        "  {}    Tool selection scoring for turn N",
+        "  {}    tool surface scoring for turn N",
         "/telemetry tools [N]".magenta()
     );
     eprintln!(
@@ -828,7 +824,7 @@ fn show_context_trace(
     eprintln!();
 }
 
-// ─── Deep Trace: Tool Selection ──────────────────────────────────────────────
+// ─── Deep Trace: tool surface ──────────────────────────────────────────────
 
 fn show_tool_trace(
     session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
@@ -863,7 +859,7 @@ fn show_tool_trace(
     eprintln!(
         "\n{}",
         format!(
-            "─── Tool Selection — Turn {} ────────────────────",
+            "─── tool surface — Turn {} ────────────────────",
             trace.turn_id
         )
         .bold()
@@ -871,82 +867,24 @@ fn show_tool_trace(
     );
 
     eprintln!(
-        "  {:<22} {}",
-        "strategy:".dim(),
-        ts.selection_strategy.clone().magenta()
-    );
-    let conf_str = format!("{:.0}%", ts.selection_confidence * 100.0);
-    let conf = if ts.selection_confidence > 0.7 {
-        conf_str.green()
-    } else if ts.selection_confidence > 0.4 {
-        conf_str.yellow()
-    } else {
-        conf_str.red()
-    };
-    eprintln!("  {:<22} {}", "confidence:".dim(), conf);
-    eprintln!(
         "  {:<22} {} available → {} selected ({}ms)",
-        "selection:".dim(),
+        "surface:".dim(),
         ts.tools_available.to_string().dim(),
-        ts.tools_selected.len().to_string().green(),
-        ts.selection_latency_ms
+        ts.visible_tools.len().to_string().green(),
+        ts.surface_latency_ms
     );
 
-    if !ts.tools_selected.is_empty() {
+    if !ts.visible_tools.is_empty() {
         eprintln!();
-        eprintln!("  {}", "▸ Selected Tools".bold());
-        eprintln!(
-            "    {:<24} {:>6} {:>6}  {}",
-            "Tool".dim(),
-            "Score".dim(),
-            "Tokens".dim(),
-            "Selection Factors".dim()
-        );
-        eprintln!("    {}", "─".repeat(65).dim());
+        eprintln!("  {}", "▸ Visible Tools".bold());
+        eprintln!("    {:<24} {:>6}", "Tool".dim(), "Tokens".dim());
+        eprintln!("    {}", "─".repeat(34).dim());
 
-        for tool in &ts.tools_selected {
-            let factors: String = tool
-                .selection_factors
-                .iter()
-                .map(|f| format!("{}:{:.1}", f.factor_name, f.contribution))
-                .collect::<Vec<_>>()
-                .join(", ");
+        for tool in &ts.visible_tools {
             eprintln!(
-                "    {:<24} {:>5.2} {:>6}  {}",
+                "    {:<24} {:>6}",
                 tool.tool_name.clone().green(),
-                tool.score,
-                tool.tokens,
-                if factors.is_empty() {
-                    "—".to_string()
-                } else {
-                    factors.dim().to_string()
-                }
-            );
-        }
-    }
-
-    if !ts.tools_rejected.is_empty() {
-        let show_n = ts.tools_rejected.len().min(10);
-        eprintln!();
-        eprintln!(
-            "  {} (showing {}/{})",
-            "▸ Rejected Tools".bold(),
-            show_n,
-            ts.tools_rejected.len()
-        );
-        eprintln!(
-            "    {:<24} {:>6}  {}",
-            "Tool".dim(),
-            "Score".dim(),
-            "Reason".dim()
-        );
-        eprintln!("    {}", "─".repeat(55).dim());
-        for tool in ts.tools_rejected.iter().take(show_n) {
-            eprintln!(
-                "    {:<24} {:>5.2}  {}",
-                tool.tool_name.clone().red(),
-                tool.score,
-                tool.rejection_reason.clone().dim()
+                tool.tokens
             );
         }
     }
@@ -1494,26 +1432,24 @@ fn show_context_detail(
     eprintln!("  {}", proportional_bar(tool_pct, 50));
 
     eprintln!(
-        "    {:<20} {} available → {} selected ({})",
-        "selection:".dim(),
+        "    {:<20} {} available → {} selected",
+        "surface:".dim(),
         ts.tools_available.to_string().dim(),
-        ts.tools_selected.len().to_string().green(),
-        ts.selection_strategy.clone().dim()
+        ts.visible_tools.len().to_string().green()
     );
 
-    if !ts.tools_selected.is_empty() {
-        for tool in &ts.tools_selected {
+    if !ts.visible_tools.is_empty() {
+        for tool in &ts.visible_tools {
             let t_local_pct = if tb.tool_schema_tokens > 0 {
                 tool.tokens as f64 / tb.tool_schema_tokens as f64 * 100.0
             } else {
                 0.0
             };
             eprintln!(
-                "      {:<22} {:>4} tok ({:>4.1}%)  score: {:.2}",
+                "      {:<22} {:>4} tok ({:>4.1}%)",
                 tool.tool_name.clone().magenta(),
                 tool.tokens,
-                t_local_pct,
-                tool.score
+                t_local_pct
             );
         }
     }
@@ -1727,10 +1663,9 @@ fn show_session_analysis(
         agg.avg_memory_relevance
     );
     eprintln!(
-        "    {:<24} {:.1} tools (avg confidence: {:.0}%)",
-        "tool_selection:".dim(),
-        agg.avg_tools_selected,
-        agg.avg_selection_confidence * 100.0
+        "    {:<24} {:.1} tools",
+        "tool_surface:".dim(),
+        agg.avg_visible_tools
     );
 
     // ── Peak / Min ──
@@ -1970,8 +1905,8 @@ fn format_trace_decision_type(
 ) -> String {
     use astra_turn_core::context_assembly_trace::DecisionType;
     match dt {
-        DecisionType::ToolSelection { tools } => {
-            format!("ToolSelection ({})", tools.len())
+        DecisionType::ToolSurface { visible_tools } => {
+            format!("ToolSurface ({})", visible_tools.len())
         }
         DecisionType::HistoryCompression { turns_affected } => {
             format!("HistoryCompression ({} turns)", turns_affected.len())

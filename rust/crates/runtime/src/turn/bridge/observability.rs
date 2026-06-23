@@ -1,13 +1,10 @@
 //! Bridge-specific observability: context trace signals and quality assessment persistence.
 
-use std::collections::HashSet;
-
 use serde_json::json;
 
 use astra_services::evaluation::SessionQualityAssessmentRequest;
 use astra_services::session_workspace::{
-    ContextTraceBudgetSignal, ContextTraceSignal, ContextTraceTimingSignal,
-    ContextTraceToolSelection,
+    ContextTraceBudgetSignal, ContextTraceSignal, ContextTraceTimingSignal, ContextTraceToolSurface,
 };
 
 use crate::{
@@ -16,19 +13,17 @@ use crate::{
 };
 use astra_core::SharedPool;
 
-/// Build a legacy context trace signal for bridge turns.
-pub(crate) fn build_legacy_context_trace_signal(
+/// Build a context trace signal for bridge turns.
+pub(crate) fn build_context_trace_signal(
     turn: u32,
     turn_id: String,
     tools_available: usize,
-    selected_tools: Vec<String>,
-    selection_confidence: f64,
+    visible_tools: Vec<String>,
     measured_prompt_tokens: Option<u64>,
     model_limit: usize,
     tool_execution_ms: u64,
     total_ms: u64,
 ) -> ContextTraceSignal {
-    let unique_selected = selected_tools.iter().cloned().collect::<HashSet<_>>().len();
     let budget = measured_prompt_tokens.map(|total_used| ContextTraceBudgetSignal {
         max_tokens: model_limit.min(u32::MAX as usize) as u32,
         total_used: total_used.min(u32::MAX as u64) as u32,
@@ -44,13 +39,10 @@ pub(crate) fn build_legacy_context_trace_signal(
     ContextTraceSignal {
         turn_id,
         captured_at: Some(chrono::Utc::now().to_rfc3339()),
-        tool_selection: Some(ContextTraceToolSelection {
+        tool_surface: Some(ContextTraceToolSurface {
             tools_available: tools_available.min(u32::MAX as usize) as u32,
-            selected_tools,
-            selection_scope: "latest_round".to_string(),
-            rejected_tools: tools_available.saturating_sub(unique_selected),
-            strategy: "inprocess_bridge".to_string(),
-            confidence: selection_confidence,
+            visible_tools,
+            surface_scope: "latest_round".to_string(),
             latency_ms: 0,
         }),
         memory: None,
@@ -127,9 +119,9 @@ pub(crate) async fn persist_legacy_bridge_trace_and_quality(
             );
         }
         if let Some(tool_name) = signal
-            .tool_selection
+            .tool_surface
             .as_ref()
-            .and_then(|selection| selection.selected_tools.first())
+            .and_then(|selection| selection.visible_tools.first())
         {
             metadata_obj.insert("tool_name".to_string(), json!(tool_name));
         }

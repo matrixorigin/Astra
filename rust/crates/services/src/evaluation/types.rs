@@ -17,7 +17,7 @@ pub enum ChangeType {
     Prompt,
     Skill,
     Config,
-    Selector,
+    ToolSurface,
     ContextBudget,
     Knowledge,
 }

@@ -42,7 +42,7 @@ impl SelfSurfaceRuntimeSupport for CliSelfSurfaceRuntimeSupport {
         SurfaceConstraints {
             max_mutations_per_turn: constraints.max_mutations_per_turn,
             config_drift_ceiling: constraints.config_drift_ceiling,
-            min_tool_pool_size: constraints.min_tool_pool_size,
+            min_available_tool_count: constraints.min_available_tool_count,
             token_reserve_fraction: constraints.token_reserve_fraction,
         }
     }
@@ -50,7 +50,6 @@ impl SelfSurfaceRuntimeSupport for CliSelfSurfaceRuntimeSupport {
     fn budget_config(&self, tuned_config_json: Option<&str>) -> Result<BudgetConfig, String> {
         let config = runtime_config_from_json(tuned_config_json)?;
         Ok(BudgetConfig {
-            tool_budget_tokens: config.tool_selection.tool_budget_tokens,
             compression_threshold: config.compression.compression_threshold,
             max_turn_input_tokens: config.token_budget.max_turn_input_tokens,
             compression_threshold_min: config.context_window.compression_threshold_min,

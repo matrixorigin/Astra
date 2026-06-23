@@ -5,8 +5,7 @@
 //! agent is told to avoid it and try alternatives.
 //!
 //! This is a **session-scoped** mechanism: health resets when the session
-//! ends. It complements the cross-session `ToolQualityTracker` which
-//! tracks long-term tool reliability.
+//! ends.
 
 pub mod persistence;
 
@@ -62,8 +61,8 @@ pub struct RecentOutcomeHint {
 pub struct OutcomeBiasEntry {
     pub score: f64,
     /// Failure-class tag (e.g. `"timeout"`, `"permission"`) of the most
-    /// recent failing outcome for this tool. Stored as `String` for
-    /// Serde compatibility; callers can match on it as a stable tag set
+    /// recent failing outcome for this tool. Stored as `String` so
+    /// callers can match on it as a stable tag set
     /// defined by [`failure_category_tag`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_failure_tag: Option<String>,
@@ -960,9 +959,9 @@ impl ToolHealthTracker {
         self.outcome_cache.len()
     }
 
-    /// Build a per-tool selector bias map from recent outcomes.
+    /// Build a per-tool surface bias map from recent outcomes.
     ///
-    /// The selector uses this as a small additive nudge during ranking:
+    /// Surface assembly uses this as a small additive nudge during ranking:
     /// tools whose recent canonical-signature outcomes skew toward failure
     /// are penalized; tools with fresh successes get a mild boost. The
     /// hard-block on repeated identical failures lives elsewhere
@@ -980,7 +979,7 @@ impl ToolHealthTracker {
     /// Each entry also carries the `last_failure_tag` — the tag (e.g. `"timeout"`,
     /// `"permission"`) of the most recent failing outcome across this tool's
     /// signatures. `None` for tools with no recent failures or unclassified
-    /// failures. Lets downstream rendering say *why* the selector is
+    /// failures. Lets downstream rendering say *why* the surface is
     /// penalizing a tool instead of just "recent failures".
     #[must_use]
     pub fn outcome_bias_by_tool(&self, max_age_secs: u64) -> HashMap<String, OutcomeBiasEntry> {

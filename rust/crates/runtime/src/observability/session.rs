@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use astra_services::session_journal::{JournalEvent, JournalWriter};
 use astra_services::session_workspace::{
     ContextTraceBudgetSignal, ContextTraceHistorySignal, ContextTraceMemorySignal,
-    ContextTraceSignal, ContextTraceTimingSignal, ContextTraceToolSelection,
+    ContextTraceSignal, ContextTraceTimingSignal, ContextTraceToolSurface,
 };
 use serde::{Deserialize, Serialize};
 

@@ -1,6 +1,6 @@
 //! Normalized reads of OpenAI-style `function.arguments` (object or stringified JSON).
 //!
-//! **Canonical keys only** (no legacy aliases): file targets use `path`; shell tools use `command`.
+//! **Canonical keys only** (no alternate aliases): file targets use `path`; shell tools use `command`.
 //! Edge executors and tool schemas should emit these names; hints do not read `file_path`, `target_file`, or `cmd`.
 
 use serde_json::Value;
@@ -29,7 +29,7 @@ pub fn command_hint_from_args(args: &Value) -> Option<&str> {
 
 /// Extract the persistent allow-rule prefix from a shell command.
 ///
-/// Mirrors Claude Code's safety posture: only stable command+subcommand
+/// Mirrors the reference agent's safety posture: only stable command+subcommand
 /// shapes become reusable prefixes (`git commit`, `npm test`, `cargo test`).
 /// Single-word commands, interpreter invocations (`python -c`, `bash -c`),
 /// shell wrappers (`sudo`, `env`, `timeout`), flags, paths, and filenames fall
@@ -275,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn path_hint_ignores_legacy_file_keys() {
+    fn path_hint_ignores_noncanonical_file_keys() {
         let args = json!({"file_path": "x.rs", "target_file": "y.rs"});
         assert!(path_hint_from_args(&args).is_none());
     }

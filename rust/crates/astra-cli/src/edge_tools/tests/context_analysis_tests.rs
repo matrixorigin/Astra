@@ -75,22 +75,13 @@ fn sample_trace(turn: &str, total_used: u32, history: u32, pressure: f64) -> Con
             total_tokens: 50,
             retrieval_latency_ms: 15,
         },
-        tools: ToolSelectionTrace {
+        tools: ToolSurfaceTrace {
             tools_available: 20,
-            tools_selected: vec![ToolSelected {
+            visible_tools: vec![VisibleTool {
                 tool_name: "bash".to_string(),
-                score: 0.95,
                 tokens: 100,
-                selection_factors: vec![SelectionFactor {
-                    factor_name: "intent_match".to_string(),
-                    weight: 0.8,
-                    contribution: 0.76,
-                }],
             }],
-            tools_rejected: vec![],
-            selection_strategy: "semantic".to_string(),
-            selection_confidence: 0.9,
-            selection_latency_ms: 5,
+            surface_latency_ms: 5,
         },
         token_budget: TokenBudgetTrace {
             max_tokens: 128000,

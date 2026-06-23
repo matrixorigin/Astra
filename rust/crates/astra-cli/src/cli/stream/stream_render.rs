@@ -4078,7 +4078,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // `ToolExecutor::execute_with_metadata` takes `&self` and is `Sync`; we run all
         // tool futures concurrently on the current runtime via `join_all`, each future
         // gated by a shared semaphore so at most `MAX_CONCURRENT_TOOL_EXECUTIONS` (10)
-        // run simultaneously. This matches claude-code / parallel_tool_exec semantics and
+        // run simultaneously. This matches reference-agent / parallel_tool_exec semantics and
         // prevents unbounded fan-out on large read-only batches (e.g., 30+ grep calls)
         // from saturating edge I/O or exhausting file descriptors.
         // Each future is wrapped with `catch_unwind` so a panicking tool is surfaced as
@@ -4244,7 +4244,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // manager's check returns Allow (the shape PermissionMode::Auto
         // produces for `sandbox_expand:*`), widen the sandbox and
         // re-execute the tool. This closes the bug in session
-        // `3b7ac18f` where `cat ~/claudecode/*` was blocked 4 times in
+        // `3b7ac18f` where `cat ~/reference-agent/*` was blocked 4 times in
         // auto mode with no approval path.
         //
         // For NeedApproval and Deny we now route to the same approval

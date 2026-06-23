@@ -3,7 +3,7 @@
 //! This crate provides the foundational types for the agent's learning subsystem:
 //! - `TaskType` — 8-way task classification
 //! - `DomainHint` — 7 domain categories
-//! - `ToolFilter` — tool selection strategy
+//! - `ToolFilter` — tool surface strategy
 //! - `CalibrationAxis` — calibration targeting
 
 #![allow(clippy::too_many_arguments)]

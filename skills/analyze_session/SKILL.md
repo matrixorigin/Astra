@@ -58,7 +58,7 @@ astra journal digest --format text
 
 - **`journal_lines_non_empty`**, **`journal_lines_malformed`**: raw JSONL line counts; non-zero `malformed` means some lines were skipped during parse.
 - **`aggregates`**: `session_start_count`, `session_end_count`, `turn_count`, `turn_error_count`, `compact_count`, `stall_count`, `error_event_count`, `total_tokens_in`, `total_tokens_out`, `total_duration_ms`, `total_tool_calls`, `tool_calls_failed`, `avg_tokens_in`, `avg_tokens_out`, `avg_duration_ms`.
-- **`turns`**: per-turn `seq` (1-based chronological index), `turn_id` (session turn counter when present), `tokens_in` / `tokens_out`, `duration_ms`, `ttft_ms`, `context_ms`, `selector_ms`, `selector_strategy`, `tools_selected_count`, `tools_used_count`, `selected_skills`, `tool_calls_ok`, `tool_calls_fail`, `user_input_preview`, `budget_pressure`.
+- **`turns`**: per-turn `seq` (1-based chronological index), `turn_id` (session turn counter when present), `tokens_in` / `tokens_out`, `duration_ms`, `ttft_ms`, `context_ms`, `visible_tools_count`, `tools_used_count`, `activated_tools_count`, `selected_skills`, `tool_calls_ok`, `tool_calls_fail`, `user_input_preview`, `budget_pressure`.
 - **`compaction_events`**, **`stalls`**, **`turn_errors`**, **`other_errors`**: structured side events; cite `ts`, `turn`, and `detail` from JSON.
 - **`failed_tool_calls`**: per-call details for every failed tool call. Each entry has `seq` (turn sequence), `turn_id`, `tool`, `error_category` (`safety_guard` / `permission_denied` / `tool_error` / `unknown`), `error_preview` (first ~200 chars), `args_preview`. Only present in `--focus all` (default). Use this to identify false positives and error patterns without re-parsing raw JSONL.
 - **`aggregates.safety_guard_blocks`**: count of tool calls blocked by a safety guard. Non-zero means the agent hit safety walls — check `failed_tool_calls` for details.
@@ -82,7 +82,7 @@ Use **only** digest fields. Quote or paraphrase numbers from JSON; do not estima
 
 **tokens**: Emphasize `avg_*`, per-turn `tokens_in`, and relation to `compact_count`.
 
-**tools**: Compare `tools_selected_count` vs `tools_used_count`; `tool_calls_ok` / `tool_calls_fail`; `selector_strategy` / `selector_ms` when present.
+**tools**: Compare `visible_tools_count` vs `tools_used_count`; include `activated_tools_count` when present; report `tool_calls_ok` / `tool_calls_fail`.
 
 **errors**: `turn_errors`, `other_errors`, `stalls`, `turn_error_count`; tie to neighboring `turns` by `turn` / `seq` when possible.
 
@@ -112,7 +112,7 @@ Extract from journal: `type == "StallDetected" OR stall_type != null`
 
 For each stall event, check:
 1. **Was the nudge effective?** Compare tools_used in the stall turn vs next 2 turns
-2. **Did the agent change approach?** Look at `tools_selected` changes
+2. **Did the agent change approach?** Look at `tools_used` and `activated_tools` changes
 3. **How many nudges total?** Count stall events — each nudge reduces confidence
 
 ### 2D.2 Turn Guard Escalation Analysis
@@ -163,7 +163,7 @@ Cascade patterns:
 |---------|-----------|------------|
 | High TTFT | >10s | LLM provider latency or huge prompt |
 | High context_ms | >2s | Prompt assembly bottleneck |
-| High selector_ms | >1s | Tool selection bottleneck |
+| High context_ms | >2s | Context assembly or schema materialization bottleneck |
 | High duration_ms with no tools | >120s | LLM generating very long response or stalling |
 
 ### 2D.6 Root Cause Decision Tree
@@ -181,14 +181,14 @@ Session stuck/looping?
 │  └─ Stall detector window too wide (default 6)
 │
 Session producing wrong results?
-├─ Tool selection accuracy low? (<50% tools_used/tools_selected)
+├─ Tool surface utilization low? (<50% tools_used/visible_tools)
 ├─ Skill injection issues? (irrelevant skills bloating context)
 ├─ Compaction lost critical context? (tokens_in drops then agent re-asks)
 │
 Session slow?
 ├─ High TTFT? → LLM provider issue or prompt too large
 ├─ High context_ms? → Too many tools selected
-├─ High selector_ms? → Switch to tfidf or reduce tool pool
+├─ High context_ms? → Reduce visible tool surface or defer more schemas
 ├─ Long tool execution? → Check tool_calls[].ms for outliers
 └─ Frequent compaction? → Context window too small for task
 ```
@@ -394,7 +394,7 @@ Keep the report compact and grounded in digest JSON.
 | Nudge ignored by LLM | Strengthen nudge language in `build_stall_reflection()` |
 | Tool deprioritized incorrectly | Adjust consecutive failure threshold in `tool_health.rs` |
 | Compaction too aggressive | Lower budget_pressure thresholds in compaction config |
-| Selector picking wrong strategy | Force `llm` strategy for novel tasks in `tool_selection.rs` |
+| Deferred activation misses needed tools | Tighten `tool_search` activation descriptions and default pinned surface |
 | Context window too small | Increase model context or reduce tool schema count |
 | Error recovery not escalating | Adjust thresholds in `error_recovery.rs` EscalationLevel |
 
@@ -406,7 +406,7 @@ Keep the report compact and grounded in digest JSON.
 |-----------|------|
 | Journal digest CLI | `rust/crates/astra-cli/src/cli/journal_digest.rs` |
 | Session journal | `rust/crates/services/src/session_journal.rs` |
-| Tool selection | `rust/crates/runtime/src/turn/tool_selection.rs` |
+| Tool surface | `rust/crates/runtime/src/tool_registry/registry.rs` |
 | Compaction | `rust/crates/runtime/src/turn/cloud/compaction.rs` |
 | Stall detection | `rust/crates/runtime/src/turn/stall.rs` |
 | Turn guard & verdicts | `rust/crates/runtime/src/turn/turn_guard.rs` |

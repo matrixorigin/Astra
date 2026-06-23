@@ -666,7 +666,7 @@ async fn hard_delete_session_rows(
             "DELETE FROM skill_selection_events WHERE session_id = ? AND user_id = ?",
         ),
         // skill_selector_turn_metrics — table was removed in PR #337
-        // (tool selector subsystem deletion); the cleanup statement
+        // (tool-surface subsystem cleanup); the cleanup statement
         // remained and started failing with "no such table" once a
         // session deletion ran against a fresh schema. Drop the
         // stale cleanup entry.

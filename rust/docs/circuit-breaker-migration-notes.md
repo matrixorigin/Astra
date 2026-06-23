@@ -6,7 +6,7 @@ opt-out via explicit config; no runtime API changes.
 
 ## Defaults
 
-| Knob (`ToolSelectionConfig`)                         | Old | New | Floor (old → new) |
+| Knob (`ToolPolicyConfig`)                            | Old | New | Floor (old → new) |
 |------------------------------------------------------|-----|-----|-------------------|
 | `circuit_breaker_read_only_stall_threshold`          |  8  | 12  | 3 → 4             |
 | `circuit_breaker_max_introspect_emissions` (new)     |  —  |  3  | —  → 1            |
@@ -82,9 +82,9 @@ appropriate for real exploration. The fix is routing, not action.
 
 ## 3. Circuit breaker — physical tool lockout + clearer corrective
 
-Previously `round_budget_phase1_message` said "tools disabled" but the
+Previously the budget-pressure corrective said "tools disabled" but the
 runtime did NOT actually restrict the next round's tool list. The model
-sometimes ignored the message and kept calling tools; phase 2 then
+sometimes ignored the message and kept calling tools; the lockout then
 aborted. Two changes:
 
 - Corrective wording is now declarative: "Any tool calls you emit WILL

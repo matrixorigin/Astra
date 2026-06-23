@@ -475,15 +475,15 @@ pub fn discover_skills_in_dir(dir: &Path) -> Vec<(String, PathBuf)> {
 /// Standard skill directory search order (high -> low priority):
 ///
 /// 1. Walk-up from cwd: `{ancestor}/.astra/skills/` for each ancestor
-/// 2. Walk-up from cwd: `{ancestor}/.claude/skills/` for each ancestor (CC-compatible)
+/// 2. Walk-up from cwd: `{ancestor}/.claude/skills/` for each ancestor
 /// 3. `{cwd}/skills/`         — project-level
 /// 4. `~/.astra/skills/`      — user-level global skills
-/// 5. `~/.claude/skills/`     — Claude Code user-level skills (CC-compatible)
+/// 5. `~/.claude/skills/`     — user-level Agent Skills compatibility path
 ///
 /// Walk-up discovery traverses from `cwd` upward to the filesystem root,
 /// collecting skill directories. Astra's SKILL.md format is compatible with
-/// the Agent Skills open standard used by Claude Code, so skills authored for
-/// either tool work in both. Claude Code skills are discovered at lower
+/// the Agent Skills open standard, so skills authored for either tool work in
+/// both. Compatibility paths are discovered at lower
 /// priority so astra-native skills take precedence when names collide.
 pub fn skill_search_paths() -> Vec<PathBuf> {
     let home = dirs::home_dir();

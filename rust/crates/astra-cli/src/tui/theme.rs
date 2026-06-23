@@ -92,7 +92,7 @@ impl Theme {
             fg: Color::Reset,
             dim: Color::DarkGray,
             accent: Color::Magenta,
-            // Clearly visible grey band for user input (matches Claude Code).
+            // Clearly visible grey band for user input (matches the reference agent).
             selected_bg: Color::Rgb(55, 55, 60),
             selected_fg: Color::Rgb(232, 220, 245),
             // Soft pink for the live gutter (`█`) — reads clearly on

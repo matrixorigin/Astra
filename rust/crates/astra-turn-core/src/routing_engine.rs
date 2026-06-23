@@ -10,7 +10,7 @@
 //! - Memory-augmented domain detection
 //! - Unified confidence score (signals + task clarity + memory hints)
 //! - Tool filter strategy (Wide / Domain / Minimal)
-//! - Round budget estimation from task complexity
+//! - Expected round count from task complexity
 //!
 //! # Usage
 //!
@@ -50,16 +50,16 @@ pub struct RoutingDecision {
     /// Domain detected from signals + memory.
     pub domain_hint: Option<DomainHint>,
 
-    /// Memory-derived boost terms for TF-IDF scoring.
+    /// Memory-derived boost terms for routing analysis.
     pub boost_terms: Vec<String>,
 
     /// Unified confidence (0.0 = completely uncertain, 1.0 = very confident).
     pub confidence: f64,
 
-    /// Recommended tool selection strategy.
+    /// Recommended tool surface strategy.
     pub tool_filter: ToolFilter,
 
-    /// Estimated round budget based on task complexity.
+    /// Estimated round count based on task complexity.
     pub estimated_rounds: u32,
 
     /// Disambiguation result (from embedded IntentDisambiguation).
@@ -316,20 +316,20 @@ fn compute_routing_confidence(
 
 // ─── Tool Filter ─────────────────────────────────────────────────────────────
 
-/// Determine tool selection strategy from routing analysis.
+/// Determine tool surface strategy from routing analysis.
 fn determine_tool_filter(
     signals: &ConversationState,
     disambiguation: &DisambiguationAction,
     domain_hint: &Option<DomainHint>,
     confidence: f64,
 ) -> ToolFilter {
-    // Low confidence → wide selection
+    // Low confidence → wide tool surface
     if confidence < 0.3 {
         return ToolFilter::Wide;
     }
 
     // Strong conflict → wide
-    if *disambiguation == DisambiguationAction::WidenToolSelection {
+    if *disambiguation == DisambiguationAction::WidenToolSurface {
         return ToolFilter::Wide;
     }
 
@@ -370,7 +370,7 @@ fn determine_tool_filter(
 
 // ─── Round Estimation ────────────────────────────────────────────────────────
 
-/// Estimate round budget from task complexity.
+/// Estimate expected rounds from task complexity.
 fn estimate_rounds(task_type: &TaskType, confidence: f64) -> u32 {
     let base = match task_type {
         TaskType::Conversational => 1,
@@ -756,7 +756,7 @@ mod tests {
         assert!(d.disambiguation.conflict_score > 0.5);
         assert_eq!(
             d.disambiguation.recommendation,
-            DisambiguationAction::WidenToolSelection,
+            DisambiguationAction::WidenToolSurface,
         );
     }
 

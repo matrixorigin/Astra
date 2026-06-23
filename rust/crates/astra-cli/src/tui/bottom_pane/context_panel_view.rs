@@ -521,7 +521,7 @@ mod tests {
     use crate::tui::testing::render::draw_widget;
     use astra_turn_core::context_assembly_trace::{
         ContextAssemblyTrace, MemorySelection, MemorySource, SystemPromptBreakdown,
-        TokenBudgetTrace, ToolSelected,
+        TokenBudgetTrace, VisibleTool,
     };
     use ratatui::widgets::Widget;
 
@@ -549,12 +549,10 @@ mod tests {
             budget_pressure: 0.295,
             compression_triggered: false,
         };
-        t.tools.tools_selected = (0..20)
-            .map(|i| ToolSelected {
+        t.tools.visible_tools = (0..20)
+            .map(|i| VisibleTool {
                 tool_name: format!("tool_{i}"),
-                score: 0.5,
                 tokens: 50,
-                selection_factors: Vec::new(),
             })
             .collect();
         t.memory.memories_selected = vec![MemorySelection {

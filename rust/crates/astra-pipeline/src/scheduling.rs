@@ -478,7 +478,7 @@ mod tests {
                 "task-1",
                 StepAction::Act,
                 StepPayload::Act {
-                    selected_tools: vec!["grep".into()],
+                    visible_tools: vec!["grep".into()],
                     tool_calls: vec![],
                 },
             )
@@ -516,7 +516,7 @@ mod tests {
             "n1".into(),
             StepAction::Act,
             StepPayload::Act {
-                selected_tools: vec!["grep".into(), "read_file".into()],
+                visible_tools: vec!["grep".into(), "read_file".into()],
                 tool_calls: vec![],
             },
         );
@@ -544,7 +544,7 @@ mod tests {
             "n1".into(),
             StepAction::Act,
             StepPayload::Act {
-                selected_tools: vec!["bash".into()],
+                visible_tools: vec!["bash".into()],
                 tool_calls: vec![],
             },
         );
@@ -577,7 +577,7 @@ mod tests {
             "n1".into(),
             StepAction::Act,
             StepPayload::Act {
-                selected_tools: vec![],
+                visible_tools: vec![],
                 tool_calls: vec![],
             },
         );
@@ -607,7 +607,7 @@ mod tests {
             "n1".into(),
             StepAction::Act,
             StepPayload::Act {
-                selected_tools: vec![],
+                visible_tools: vec![],
                 tool_calls: vec![],
             },
         );
@@ -682,7 +682,7 @@ mod tests {
             "n1".into(),
             StepAction::Act,
             StepPayload::Act {
-                selected_tools: vec!["grep".into(), "read_file".into()],
+                visible_tools: vec!["grep".into(), "read_file".into()],
                 tool_calls: vec![],
             },
         );
@@ -720,7 +720,7 @@ mod tests {
             "n1".into(),
             StepAction::Act,
             StepPayload::Act {
-                selected_tools: vec!["grep".into(), "bash".into()],
+                visible_tools: vec!["grep".into(), "bash".into()],
                 tool_calls: vec![],
             },
         );
@@ -752,7 +752,7 @@ mod tests {
             "n1".into(),
             StepAction::Act,
             StepPayload::Act {
-                selected_tools: vec!["bash".into()],
+                visible_tools: vec!["bash".into()],
                 tool_calls: vec![],
             },
         );
@@ -792,7 +792,7 @@ mod tests {
             "n1".into(),
             StepAction::Act,
             StepPayload::Act {
-                selected_tools: vec!["grep".into()],
+                visible_tools: vec!["grep".into()],
                 tool_calls: vec![],
             },
         );
@@ -863,7 +863,7 @@ mod tests {
             "n1".into(),
             StepAction::Act,
             StepPayload::Act {
-                selected_tools: vec![],
+                visible_tools: vec![],
                 tool_calls: vec![],
             },
         );

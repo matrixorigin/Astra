@@ -1,7 +1,7 @@
 //! Inline slash-menu popup widget.
 //!
 //! Renders a lightweight dropdown of filtered commands directly above
-//! the composer, matching the style of claude-code and cursor: no
+//! the composer, matching the style of reference-agent and cursor: no
 //! decorative border, no title, no footer — just the list of commands.
 //!
 //! Visual anatomy (80-col example, 5 matches):

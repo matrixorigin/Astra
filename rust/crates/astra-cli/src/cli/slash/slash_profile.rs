@@ -334,8 +334,8 @@ fn show_scenario(ctx: &ProfileCommandContext<'_>) {
                 format_verbosity(strategy.detail_level)
             );
 
-            eprintln!("\n  {}", "Recommended Tools:".bold());
-            for tool in scenario.recommended_tools() {
+            eprintln!("\n  {}", "Suggested Tools:".bold());
+            for tool in scenario.suggested_tools() {
                 eprintln!("    • {}", tool.magenta());
             }
         }
@@ -401,7 +401,7 @@ fn show_tools(ctx: &ProfileCommandContext<'_>) {
         eprintln!("  {}", "No tool preferences configured.".dim());
         eprintln!(
             "  {}",
-            "Preferred tools get boosted in selection, blocked tools are never used.".dim()
+            "Preferred tools get boosted in the tool surface, blocked tools are never used.".dim()
         );
     } else {
         if !prefs.preferred_tools.is_empty() {

@@ -269,22 +269,22 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
             },
             value: Value::from(config.memory.retrieval_top_k),
         },
-        // ── Tool selection ──
+        // ── Tool surface ──
         SettingItem {
-            id: "tool_selection.max_tools".to_string(),
+            id: "tool_policy.max_tools".to_string(),
             label: "Max tools surfaced to the model".to_string(),
             kind: SettingKind::Number {
                 min: 1.0,
                 max: 200.0,
                 allow_fraction: false,
             },
-            value: Value::from(config.tool_selection.max_tools),
+            value: Value::from(config.tool_policy.max_tools),
         },
         SettingItem {
-            id: "tool_selection.prefer_recent_tools".to_string(),
+            id: "tool_policy.prefer_recent_tools".to_string(),
             label: "Prefer recently-used tools".to_string(),
             kind: SettingKind::Bool,
-            value: Value::from(config.tool_selection.prefer_recent_tools),
+            value: Value::from(config.tool_policy.prefer_recent_tools),
         },
         // ── Trace ──
         SettingItem {
@@ -528,13 +528,13 @@ pub fn apply_edit(
             ensure_range(n as f64, 1.0, 50.0, id)?;
             config.memory.retrieval_top_k = n;
         }
-        "tool_selection.max_tools" => {
+        "tool_policy.max_tools" => {
             let n = as_u32(&new_value, id)?;
             ensure_range(n as f64, 1.0, 200.0, id)?;
-            config.tool_selection.max_tools = n;
+            config.tool_policy.max_tools = n;
         }
-        "tool_selection.prefer_recent_tools" => {
-            config.tool_selection.prefer_recent_tools = as_bool(&new_value, id)?;
+        "tool_policy.prefer_recent_tools" => {
+            config.tool_policy.prefer_recent_tools = as_bool(&new_value, id)?;
         }
         "trace.profile" => {
             if let Some(s) = new_value.as_str() {

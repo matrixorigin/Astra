@@ -31,7 +31,7 @@ impl PipelineStage for MockPerceive {
 }
 
 /// Mock Plan stage — sets up tool calls then transitions to Execute.
-/// After reflection, checks widen_selection and adjusts behavior.
+/// After reflection, checks widen_surface and adjusts behavior.
 struct MockPlan {
     call_count: AtomicU32,
 }
@@ -51,7 +51,7 @@ impl PipelineStage for MockPlan {
         let widened = state
             .reflections
             .last()
-            .map(|r| r.strategy_delta.widen_selection)
+            .map(|r| r.strategy_delta.widen_surface)
             .unwrap_or(false);
 
         if widened && count >= 2 {

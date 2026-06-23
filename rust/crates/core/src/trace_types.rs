@@ -17,7 +17,7 @@ pub enum TraceCategory {
     LlmExchanges,
     /// Context assembly and compression decisions.
     ContextAssembly,
-    /// Decision explanations (tool selection rationale).
+    /// Decision explanations (tool surface rationale).
     DecisionExplain,
     /// Phase transitions (Perceive → Plan → Execute → Evaluate → Reflect).
     PhaseTransition,

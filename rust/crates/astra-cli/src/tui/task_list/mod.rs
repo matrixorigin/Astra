@@ -906,7 +906,7 @@ pub fn render_with_colors(
             .collect();
         out.push(render_task_line(task, &open_blockers, columns, colors));
         // Per-parent cap (keeps one runaway parent from monopolising
-        // the global budget) plus the global cap above. claude-code
+        // the global budget) plus the global cap above. reference-agent
         // shows every subtask inline; we cap to keep terminal layout
         // sane on tight rows.
         let max_subs_per_parent = 8usize;

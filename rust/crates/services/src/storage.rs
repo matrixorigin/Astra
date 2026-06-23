@@ -1983,7 +1983,34 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
-    // Session task scratchpad (Tier 1 — ClaudeCode-style task board).
+    for (table, column, ddl) in [
+        (
+            "agent_sessions",
+            "project_id",
+            "ALTER TABLE agent_sessions ADD COLUMN project_id VARCHAR(128) NULL",
+        ),
+        (
+            "agent_sessions",
+            "project_retention_policy",
+            "ALTER TABLE agent_sessions ADD COLUMN project_retention_policy VARCHAR(32) NOT NULL DEFAULT 'session'",
+        ),
+    ] {
+        if let Err(e) = add_column_if_missing(&pool, &settings.database, table, column, ddl).await {
+            tracing::warn!("phase4 additive column migration skipped: {table}.{column}: {e}");
+        }
+    }
+
+    for (table, index, ddl) in [(
+        "agent_sessions",
+        "idx_sessions_project",
+        "ALTER TABLE agent_sessions ADD INDEX idx_sessions_project (user_id, project_id, updated_at)",
+    )] {
+        if let Err(e) = add_index_if_missing(&pool, &settings.database, table, index, ddl).await {
+            tracing::debug!("phase4 additive index migration skipped: {table}.{index}: {e}");
+        }
+    }
+
+    // Session task scratchpad (Tier 1 — reference-agent-style task board).
     // Authoritative store for the live task board. Both edge and cloud read
     // the same rows for a given session_id; per-host `TaskManager` instances
     // are caches over this table. See `docs/plans/task-system-design.md` §2.1

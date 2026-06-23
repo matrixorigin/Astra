@@ -24,7 +24,7 @@ conversation history, skill injections, and memory signals.
 ## Key Metrics
 
 - **Budget pressure tiers**: Normal (<60%), TrimSchemas (60-75%), CompactHistory (75-85%), AggressivePrune (>85%)
-- **Tool selection accuracy**: `|tools_used| / |tools_selected|` — target >70%
+- **Tool surface utilization**: `|tools_used| / |visible_tools|` — target >70%
 - **System prompt baseline**: ~14K tokens (default estimate)
 - **Token estimation**: CJK-aware (1.5 tokens/char), JSON-aware (2 bytes/token)
 

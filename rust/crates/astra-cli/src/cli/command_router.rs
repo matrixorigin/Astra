@@ -3502,7 +3502,7 @@ mod one_shot_persistence_tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             tool_calls_count: 0,
-            tools_selected: Vec::new(),
+            visible_tools: Vec::new(),
             selected_skills: Vec::new(),
             tools_used: Vec::new(),
             tool_call_records: Vec::new(),
@@ -3615,7 +3615,7 @@ mod one_shot_persistence_tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             tool_calls_count: 0,
-            tools_selected: Vec::new(),
+            visible_tools: Vec::new(),
             selected_skills: Vec::new(),
             tools_used: Vec::new(),
             tool_call_records: Vec::new(),
@@ -4001,9 +4001,9 @@ mod show_policy_tests {
         // End-to-end: load config, resolve, format. Asserts the whole
         // wiring works — not just the string formatter. Opus's built-in
         // profile is 4 / 20 / 4 / 3 (see
-        // `ToolSelectionConfig::builtin_model_profiles`).
+        // `ToolPolicyConfig::builtin_model_profiles`).
         let cfg = astra_config::runtime_config::RuntimeConfig::load();
-        let policy = cfg.tool_selection.resolve_for_model(Some("opus"));
+        let policy = cfg.tool_policy.resolve_for_model(Some("opus"));
         let human = format_policy_output(Some("opus"), &policy, "strict", &[], false);
         assert!(human.contains("= 4"), "expected 4s for opus: {human}");
         assert!(human.contains("= 20"), "expected 20 for opus: {human}");

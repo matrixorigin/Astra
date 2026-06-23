@@ -197,10 +197,10 @@ pub struct CapabilityView {
     #[serde(default)]
     pub boosted_tools: Vec<String>,
     /// Whether the next tool-visibility assembly will consume a one-shot
-    /// `widen_selection` request from the pipeline (skipping the
+    /// `widen_surface` request from the pipeline (skipping the
     /// deprioritized→restricted merge).
     #[serde(default)]
-    pub widen_selection_pending: bool,
+    pub widen_surface_pending: bool,
     /// Compact recent signature-level execution memory surfaced back to the
     /// model so it can avoid blindly repeating identical tool calls.
     #[serde(default)]
@@ -293,7 +293,7 @@ pub struct ConstraintSet {
     /// Max config drift from baseline (0.0–1.0).
     pub config_drift_ceiling: f64,
     /// Minimum tools that must remain available.
-    pub min_tool_pool_size: usize,
+    pub min_available_tool_count: usize,
     /// Fraction of tokens always held in reserve.
     pub token_reserve_fraction: f64,
 }
@@ -303,7 +303,7 @@ impl Default for ConstraintSet {
         Self {
             max_mutations_per_turn: 2,
             config_drift_ceiling: 0.30,
-            min_tool_pool_size: 5,
+            min_available_tool_count: 5,
             token_reserve_fraction: 0.20,
         }
     }
@@ -355,7 +355,7 @@ impl SelfModel {
 
     /// Same as [`Self::snapshot`] but also incorporates the most recent
     /// [`StrategyApplication`] so the rendered self-awareness section surfaces
-    /// `boosted_tools` / `widen_selection_pending` to the agent.
+    /// `boosted_tools` / `widen_surface_pending` to the agent.
     #[allow(clippy::too_many_arguments)]
     pub fn snapshot_with_strategy(
         tool_names: &[&str],
@@ -429,7 +429,7 @@ impl SelfModel {
         }
         deprioritized.sort();
 
-        let (boosted_tools, widen_selection_pending) = match last_strategy {
+        let (boosted_tools, widen_surface_pending) = match last_strategy {
             Some(app) => {
                 let mut boosted: Vec<String> = app
                     .newly_boosted
@@ -452,7 +452,7 @@ impl SelfModel {
             pinned_tools: pinned_tools.to_vec(),
             skills: skills.to_vec(),
             boosted_tools,
-            widen_selection_pending,
+            widen_surface_pending,
             outcome_memory,
         };
 
@@ -727,9 +727,9 @@ impl SelfModel {
                 self.capabilities.boosted_tools.join(", ")
             );
         }
-        if self.capabilities.widen_selection_pending {
+        if self.capabilities.widen_surface_pending {
             s.push_str(
-                "Tool selection: widened for next turn (deprioritized set relaxed to recover from tool failures).\n",
+                "Tool surface: widened for next turn (deprioritized set relaxed to recover from tool failures).\n",
             );
         }
         // P3.1: surface the structured before/after diff of the most recent
@@ -1071,7 +1071,7 @@ impl SelfModel {
         if !self.capabilities.outcome_memory.is_empty()
             || !self.capabilities.deprioritized_tools.is_empty()
             || !self.capabilities.boosted_tools.is_empty()
-            || self.capabilities.widen_selection_pending
+            || self.capabilities.widen_surface_pending
         {
             return true;
         }
@@ -1283,8 +1283,8 @@ impl SelfModel {
         );
         let _ = writeln!(
             s,
-            "- Min tool pool size: {}",
-            self.constraints.min_tool_pool_size
+            "- Min available tools: {}",
+            self.constraints.min_available_tool_count
         );
         let _ = writeln!(
             s,
@@ -1672,7 +1672,7 @@ mod tests {
         let c = ConstraintSet::default();
         assert_eq!(c.max_mutations_per_turn, 2);
         assert!((c.config_drift_ceiling - 0.30).abs() < f64::EPSILON);
-        assert_eq!(c.min_tool_pool_size, 5);
+        assert_eq!(c.min_available_tool_count, 5);
         assert!((c.token_reserve_fraction - 0.20).abs() < f64::EPSILON);
     }
 
@@ -1709,7 +1709,7 @@ mod tests {
             model.capabilities.boosted_tools,
             vec!["bash", "grep", "read_file"]
         );
-        assert!(model.capabilities.widen_selection_pending);
+        assert!(model.capabilities.widen_surface_pending);
         let rendered = model.to_system_prompt_section();
         assert!(
             rendered.contains("Boosted tools: bash, grep, read_file"),
@@ -1726,7 +1726,7 @@ mod tests {
         use crate::turn::agentic::stage_bridge::{DiffSnapshot, SkillDiffEntry};
         let config = RuntimeConfig::default();
         let diff = SkillDiffEntry {
-            skill: "pipeline.tool_selection".to_string(),
+            skill: "pipeline.tool_surface_policy".to_string(),
             before: DiffSnapshot::default(),
             after: DiffSnapshot {
                 blocked_tools: vec!["flaky_http".to_string()],
@@ -1780,7 +1780,7 @@ mod tests {
             &config,
         );
         assert!(model.capabilities.boosted_tools.is_empty());
-        assert!(!model.capabilities.widen_selection_pending);
+        assert!(!model.capabilities.widen_surface_pending);
         let rendered = model.to_system_prompt_section();
         assert!(!rendered.contains("Boosted tools"), "got: {rendered}");
         assert!(

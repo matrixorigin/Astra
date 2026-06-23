@@ -202,8 +202,8 @@ pub struct StrategyDelta {
     pub add_tools: Vec<String>,
     /// Additional context to inject into the next prompt.
     pub inject_context: Option<String>,
-    /// Whether to widen tool selection (lower threshold).
-    pub widen_selection: bool,
+    /// Whether to widen tool surface (lower threshold).
+    pub widen_surface: bool,
 }
 
 // ─── Budget ──────────────────────────────────────────────────────────────────
@@ -317,9 +317,8 @@ pub struct TurnState {
     // ── Phase tracking ──
     pub phase: AgentPhase,
 
-    // ── Tool selection ──
+    // ── tool surface ──
     pub tools_schema: Vec<Value>,
-    pub selection_confidence: f64,
     pub boost_terms: Vec<String>,
 
     // ── Tool execution ──
@@ -395,7 +394,6 @@ impl TurnState {
             history,
             phase: AgentPhase::Perceive,
             tools_schema: Vec::new(),
-            selection_confidence: 0.0,
             boost_terms: Vec::new(),
             pending_tool_calls: Vec::new(),
             tool_failures: HashMap::new(),
@@ -735,7 +733,7 @@ mod tests {
         assert!(delta.block_tools.is_empty());
         assert!(delta.add_tools.is_empty());
         assert!(delta.inject_context.is_none());
-        assert!(!delta.widen_selection);
+        assert!(!delta.widen_surface);
     }
 
     #[test]
@@ -903,7 +901,7 @@ mod tests {
                 block_tools: vec!["bash".to_string()],
                 add_tools: vec!["grep".to_string()],
                 inject_context: Some("try grep".to_string()),
-                widen_selection: true,
+                widen_surface: true,
             },
         });
 

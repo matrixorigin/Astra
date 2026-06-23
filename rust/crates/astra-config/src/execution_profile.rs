@@ -71,9 +71,7 @@ impl ExecutionProfile {
     /// Apply scenario-specific strategy adjustments to the config.
     ///
     /// Maps [`ScenarioStrategy`] hints to concrete `RuntimeConfig` parameters:
-    /// - `max_tools_per_turn` → `tool_selection.max_tools_per_turn` (execution limit per headless round)
-    /// - `tool_budget_tokens` → `tool_selection.tool_budget_tokens` (controls actual tool selection budget)
-    /// - `prefer_read_only` → `tool_selection.confidence_threshold` boost
+    /// - `max_tools_per_turn` → `tool_policy.max_tools_per_turn` (execution limit per headless round)
     /// - Higher detail scenarios get more token budget for history
     /// - `memory_top_k` → `memory.retrieval_top_k` (if set by scenario)
     /// - `verification_strictness` → `verification.strictness` (if set by scenario)
@@ -84,18 +82,7 @@ impl ExecutionProfile {
         // Wire scenario execution limit to the correct config field.
         // `max_tools_per_turn` controls how many tool calls execute per headless round;
         // `max_tools` (selection count) is left at its user/default value.
-        self.config.tool_selection.max_tools_per_turn = strategy.max_tools_per_turn as u32;
-
-        // Preserve the legacy selector-budget field for profile round-tripping.
-        // Runtime ignores it now that selector-based tool surfacing is removed.
-        if strategy.tool_budget_tokens > 0 {
-            self.config.tool_selection.tool_budget_tokens = strategy.tool_budget_tokens;
-        }
-
-        if strategy.prefer_read_only {
-            self.config.tool_selection.confidence_threshold =
-                self.config.tool_selection.confidence_threshold.max(0.35);
-        }
+        self.config.tool_policy.max_tools_per_turn = strategy.max_tools_per_turn as u32;
 
         match strategy.detail_level {
             crate::user_profile::Verbosity::Debug => {
@@ -130,7 +117,7 @@ impl ExecutionProfile {
         }
     }
 
-    /// Store pattern library boost terms for tool selection.
+    /// Store pattern library boost terms for tool surface.
     pub fn merge_boosts(&mut self, boost_terms: Vec<String>) {
         self.boost_terms = boost_terms;
     }
@@ -160,46 +147,35 @@ mod tests {
     #[test]
     fn apply_scenario_adjusts_config() {
         let mut profile = ExecutionProfile::from_base(RuntimeConfig::default());
-        let orig_threshold = profile.config.tool_selection.confidence_threshold;
-        let orig_max_tools = profile.config.tool_selection.max_tools;
+        let orig_max_tools = profile.config.tool_policy.max_tools;
 
         profile.apply_scenario(Scenario::Debugging);
 
         assert_eq!(profile.scenario, Some(Scenario::Debugging));
         // max_tools (selection count) should remain at its default — scenarios don't touch it.
-        assert_eq!(profile.config.tool_selection.max_tools, orig_max_tools);
+        assert_eq!(profile.config.tool_policy.max_tools, orig_max_tools);
         // max_tools_per_turn (execution limit) should be set from the scenario.
         assert_eq!(
-            profile.config.tool_selection.effective_max_tools_per_turn(),
+            profile.config.tool_policy.effective_max_tools_per_turn(),
             15
-        );
-        // Debugging is not prefer_read_only, so threshold unchanged
-        assert_eq!(
-            profile.config.tool_selection.confidence_threshold,
-            orig_threshold
         );
         assert!(profile.config.compression.max_history_tokens >= 60_000);
         assert!(profile.config.token_budget.max_turn_input_tokens >= 100_000);
     }
 
     #[test]
-    fn apply_scenario_read_only_boosts_threshold() {
+    fn apply_scenario_read_only_sets_execution_limit_only() {
         let mut profile = ExecutionProfile::from_base(RuntimeConfig::default());
-        let orig = profile.config.tool_selection.confidence_threshold;
-        let orig_max_tools = profile.config.tool_selection.max_tools;
+        let orig_max_tools = profile.config.tool_policy.max_tools;
 
         profile.apply_scenario(Scenario::CodeReview);
 
         // max_tools (selection count) should remain at default.
-        assert_eq!(profile.config.tool_selection.max_tools, orig_max_tools);
+        assert_eq!(profile.config.tool_policy.max_tools, orig_max_tools);
         // max_tools_per_turn should be set from scenario.
         assert_eq!(
-            profile.config.tool_selection.effective_max_tools_per_turn(),
+            profile.config.tool_policy.effective_max_tools_per_turn(),
             10
-        );
-        assert_eq!(
-            profile.config.tool_selection.confidence_threshold,
-            orig.max(0.35)
         );
     }
 
@@ -224,11 +200,8 @@ mod tests {
         assert_eq!(restored.boost_terms, vec!["bash"]);
         assert_eq!(restored.confidence, 0.85);
         assert_eq!(
-            restored
-                .config
-                .tool_selection
-                .effective_max_tools_per_turn(),
-            profile.config.tool_selection.effective_max_tools_per_turn()
+            restored.config.tool_policy.effective_max_tools_per_turn(),
+            profile.config.tool_policy.effective_max_tools_per_turn()
         );
     }
 
@@ -265,18 +238,5 @@ mod tests {
         profile.apply_scenario(Scenario::CodeReview);
         // CodeReview wants 0.7, but max is 0.6
         assert!((profile.config.verification.strictness - 0.6).abs() < 0.01);
-    }
-
-    #[test]
-    fn apply_scenario_sets_tool_budget_tokens() {
-        let mut profile = ExecutionProfile::from_base(RuntimeConfig::default());
-        assert_eq!(profile.config.tool_selection.tool_budget_tokens, 0);
-
-        profile.apply_scenario(Scenario::Implementation);
-        assert_eq!(profile.config.tool_selection.tool_budget_tokens, 1200);
-
-        let mut profile2 = ExecutionProfile::from_base(RuntimeConfig::default());
-        profile2.apply_scenario(Scenario::Planning);
-        assert_eq!(profile2.config.tool_selection.tool_budget_tokens, 600);
     }
 }

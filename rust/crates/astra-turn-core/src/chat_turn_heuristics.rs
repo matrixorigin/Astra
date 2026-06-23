@@ -12,9 +12,9 @@ use crate::chat_history_openai::openai_user_content_message;
 use crate::interaction_types::{ASK_USER_TOOL_NAME, TurnInteractionPolicy};
 
 const DEFAULT_STALL_WINDOW: usize = 3;
-const DEFAULT_EXPLORATION_ROUND_BUDGET: usize = 5;
+const DEFAULT_EXPLORATION_ROUND_WINDOW: usize = 5;
 const EXPLORATORY_STALL_WINDOW: usize = 4;
-const EXPLORATORY_ROUND_BUDGET: usize = 8;
+const EXPLORATORY_ROUND_WINDOW: usize = 8;
 
 const STANDARD_ANALYSIS_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(24, 36, 6, 2);
 const COMPLEX_ANALYSIS_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(30, 54, 12, 2);
@@ -173,7 +173,7 @@ pub struct TaskExecutionProfile {
     pub mutates_workspace: bool,
     pub verification_required: bool,
     pub allow_factual_retry: bool,
-    pub exploration_round_budget: usize,
+    pub exploration_round_window: usize,
     pub stall_window: usize,
     pub complexity: TaskComplexity,
     pub exploratory_task: bool,
@@ -186,7 +186,7 @@ impl Default for TaskExecutionProfile {
             mutates_workspace: false,
             verification_required: false,
             allow_factual_retry: true,
-            exploration_round_budget: DEFAULT_EXPLORATION_ROUND_BUDGET,
+            exploration_round_window: DEFAULT_EXPLORATION_ROUND_WINDOW,
             stall_window: DEFAULT_STALL_WINDOW,
             complexity: TaskComplexity::Standard,
             exploratory_task: false,
@@ -210,10 +210,10 @@ pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
     } else {
         TaskComplexity::Standard
     };
-    let exploration_round_budget = if exploratory {
-        EXPLORATORY_ROUND_BUDGET
+    let exploration_round_window = if exploratory {
+        EXPLORATORY_ROUND_WINDOW
     } else {
-        DEFAULT_EXPLORATION_ROUND_BUDGET
+        DEFAULT_EXPLORATION_ROUND_WINDOW
     };
     let stall_window = if exploratory || complexity == TaskComplexity::Complex {
         EXPLORATORY_STALL_WINDOW
@@ -228,7 +228,7 @@ pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
             mutates_workspace: true,
             verification_required: true,
             allow_factual_retry: true,
-            exploration_round_budget,
+            exploration_round_window,
             stall_window,
             complexity,
             exploratory_task: exploratory,
@@ -239,7 +239,7 @@ pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
             mutates_workspace: false,
             verification_required: false,
             allow_factual_retry: true,
-            exploration_round_budget,
+            exploration_round_window,
             stall_window,
             complexity,
             exploratory_task: exploratory,
@@ -251,7 +251,7 @@ pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
             mutates_workspace: true,
             verification_required: true,
             allow_factual_retry: true,
-            exploration_round_budget,
+            exploration_round_window,
             stall_window,
             complexity,
             exploratory_task: exploratory,
@@ -259,7 +259,7 @@ pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
         }
     } else {
         TaskExecutionProfile {
-            exploration_round_budget,
+            exploration_round_window,
             stall_window,
             complexity,
             exploratory_task: exploratory,
@@ -697,7 +697,7 @@ mod tests {
 
         let exploratory =
             infer_task_execution_profile("explore the codebase and investigate the root cause");
-        assert!(exploratory.exploration_round_budget > review.exploration_round_budget);
+        assert!(exploratory.exploration_round_window > review.exploration_round_window);
         assert!(
             exploratory.agentic_turn_budget.hard_turn_limit
                 >= implementation.agentic_turn_budget.hard_turn_limit
@@ -884,7 +884,7 @@ mod tests {
     }
 
     #[test]
-    fn factual_retry_message_lists_selected_tools_when_provided() {
+    fn factual_retry_message_lists_visible_tools_when_provided() {
         let policy = TurnInteractionPolicy::from_visible_tool_names(
             TurnInteractionMode::Deny,
             vec!["mo_query".to_string(), "read_file".to_string()],

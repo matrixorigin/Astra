@@ -5960,24 +5960,19 @@ mod tests {
         trace.memory.candidates_considered = 5;
         trace.memory.retrieval_latency_ms = 51;
         trace.tools.tools_available = 27;
-        trace.tools.selection_strategy = "registry".into();
         trace
             .tools
-            .tools_selected
-            .push(astra_turn_core::context_assembly_trace::ToolSelected {
+            .visible_tools
+            .push(astra_turn_core::context_assembly_trace::VisibleTool {
                 tool_name: "bash".into(),
-                score: 1.0,
                 tokens: 243,
-                selection_factors: Vec::new(),
             });
         trace
             .tools
-            .tools_selected
-            .push(astra_turn_core::context_assembly_trace::ToolSelected {
+            .visible_tools
+            .push(astra_turn_core::context_assembly_trace::VisibleTool {
                 tool_name: "read_file".into(),
-                score: 0.9,
                 tokens: 128,
-                selection_factors: Vec::new(),
             });
         let mut turn_event = astra_services::session_journal::JournalEvent::turn(
             Some("sess-1"),

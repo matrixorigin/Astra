@@ -17,7 +17,7 @@
 //! ## Scope
 //!
 //! Only covers the **active** tool set shipped today (the names
-//! advertised in `astra-tools::schemas`). Legacy separate names
+//! advertised in `astra-tools::schemas`). Retired separate names
 //! (`task_create`, `git_show`, `memory_retrieve`, `hover_info`, …)
 //! have been retired — the model now issues unified action-param
 //! calls (`task(action="create")`, `git(action="show")`,
@@ -245,13 +245,8 @@ fn git_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bool
     match action {
         "status" => "Git status".to_string(),
         "log" => {
-            // Schema canonical key is `ref`; accept `branch` as legacy
-            // alias since some older replays still emit that.
             let n = args.get("n").and_then(Value::as_u64);
-            let git_ref = args
-                .get("ref")
-                .or_else(|| args.get("branch"))
-                .and_then(Value::as_str);
+            let git_ref = args.get("ref").and_then(Value::as_str);
             match (n, git_ref) {
                 (Some(n), Some(r)) => format!("Git log -{n} {r}"),
                 (Some(n), None) => format!("Git log -{n}"),
@@ -260,12 +255,8 @@ fn git_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bool
             }
         }
         "show" => {
-            // Schema canonical: `revision` (runtime `git_ops::show` reads
-            // this). Accept legacy `commit`/`ref` for resilience.
             let rev = args
                 .get("revision")
-                .or_else(|| args.get("commit"))
-                .or_else(|| args.get("ref"))
                 .and_then(Value::as_str)
                 .unwrap_or("HEAD");
             format!("Git show {}", trunc(rev, path_budget(9)))
@@ -305,12 +296,7 @@ fn git_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bool
             format!("Git revert {}", trunc(sha, path_budget(11)))
         }
         "stash" => {
-            // Schema canonical: `sub_action`. Accept `stash_action` alias.
-            let sub = args
-                .get("sub_action")
-                .or_else(|| args.get("stash_action"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let sub = args.get("sub_action").and_then(Value::as_str).unwrap_or("");
             if sub.is_empty() {
                 "Git stash".to_string()
             } else {
@@ -354,24 +340,15 @@ fn github_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: b
             truncate_line(s, b)
         }
     };
-    // Schema canonical: `number` (single field for both PR and issue
-    // numbers). Runtime `github.rs` still reads `pr_number` /
-    // `issue_number` — accept both so the preview works regardless
-    // of which shape the model sends.
-    let numeric = |primary: &str| -> Option<u64> {
-        args.get("number")
-            .or_else(|| args.get(primary))
-            .and_then(Value::as_u64)
-    };
     match action {
         "list_prs" => format!("GitHub: list PRs {repo_display}"),
-        "get_pr" => match numeric("pr_number") {
+        "get_pr" => match args.get("pr_number").and_then(Value::as_u64) {
             Some(n) => format!("GitHub: PR #{n} {repo_display}"),
             None => format!("GitHub: get PR {repo_display}"),
         },
         "ci_status" => format!("GitHub: CI status {repo_display}"),
         "list_issues" => format!("GitHub: list issues {repo_display}"),
-        "get_issue" => match numeric("issue_number") {
+        "get_issue" => match args.get("issue_number").and_then(Value::as_u64) {
             Some(n) => format!("GitHub: issue #{n} {repo_display}"),
             None => format!("GitHub: get issue {repo_display}"),
         },
@@ -532,7 +509,7 @@ fn agent_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bo
             // human-readable summaries that visually clutter when N
             // parallel agents all share a similar prefix
             // ("Correctness & logic review of the latest 7 commits…").
-            // Matches claudecode/Kiro: per-agent rows show the name,
+            // Matches reference-agent/Kiro: per-agent rows show the name,
             // not the full description.
             let name = args.get("name").and_then(Value::as_str);
             let label = name.or_else(|| args.get("description").and_then(Value::as_str));
@@ -1025,7 +1002,7 @@ mod tests {
     #[test]
     fn git_unified_show() {
         assert_eq!(
-            p("git", json!({"action": "show", "commit": "abc123"})),
+            p("git", json!({"action": "show", "revision": "abc123"})),
             "Git show abc123"
         );
     }
@@ -1119,7 +1096,7 @@ mod tests {
     /// agents all show "Spawn agent: Correctness & logic re…
     /// (code-revi…)" — visually indistinguishable. Names like
     /// "review_tui" / "review_fixes" make the strip readable
-    /// (claudecode/Kiro both display names this way).
+    /// (reference-agent/Kiro both display names this way).
     #[test]
     fn agent_spawn_prefers_short_name_over_long_description() {
         assert_eq!(
@@ -1139,9 +1116,6 @@ mod tests {
         );
     }
 
-    /// Backwards-compat: when `name` is absent, fall back to
-    /// `description` (the pre-fix behaviour). This keeps every
-    /// historical session's render bytes identical.
     #[test]
     fn agent_spawn_falls_back_to_description_when_name_absent() {
         assert_eq!(
@@ -1155,7 +1129,7 @@ mod tests {
                 })
             ),
             "Spawn agent: Correctness review (code-review)",
-            "without `name`, fall back to description (legacy behaviour)"
+            "without `name`, fall back to description"
         );
     }
 
@@ -1288,11 +1262,6 @@ mod tests {
     }
 
     // ─── Schema-canonical field names ──────────────────────────────────
-    // The older tests above use legacy field names (status / commit /
-    // branch / stash_action / pr_number) to pin the backward-compat
-    // fallback paths. These tests pin the schema-canonical keys so a
-    // refactor that drops an alias won't silently regress the
-    // canonical path.
 
     #[test]
     fn git_show_uses_canonical_revision_field() {
@@ -1357,22 +1326,22 @@ mod tests {
     }
 
     #[test]
-    fn github_get_pr_uses_canonical_number_field() {
+    fn github_get_pr_uses_canonical_pr_number_field() {
         assert_eq!(
             p(
                 "github",
-                json!({"action": "get_pr", "owner": "o", "repo": "r", "number": 7})
+                json!({"action": "get_pr", "owner": "o", "repo": "r", "pr_number": 7})
             ),
             "GitHub: PR #7 o/r"
         );
     }
 
     #[test]
-    fn github_get_issue_uses_canonical_number_field() {
+    fn github_get_issue_uses_canonical_issue_number_field() {
         assert_eq!(
             p(
                 "github",
-                json!({"action": "get_issue", "owner": "o", "repo": "r", "number": 99})
+                json!({"action": "get_issue", "owner": "o", "repo": "r", "issue_number": 99})
             ),
             "GitHub: issue #99 o/r"
         );

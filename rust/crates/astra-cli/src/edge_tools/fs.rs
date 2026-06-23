@@ -83,13 +83,13 @@ fn edit_type_label(edit_type: astra_turn_core::file_edit_journal::EditType) -> &
 //          tool *output* before it reaches the LLM, masking real
 //          API keys / tokens / PEMs by content pattern.
 //
-// claudecode follows the same philosophy (`tools/FileWriteTool` has
+// reference-agent follows the same philosophy (`tools/FileWriteTool` has
 // no filename-based block; the only content guard is
 // `checkTeamMemSecrets`, which is path-and-content-scoped to a
 // shared team-memory directory we don't have).
 //
 // If a content-based scan ever lands here, it should match
-// claudecode's shape: scan content, not name; warn or redact, not
+// the reference agent's shape: scan content, not name; warn or redact, not
 // hard-block; and only when writing to a path that's actually
 // shared/synced.
 

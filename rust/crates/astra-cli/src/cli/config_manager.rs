@@ -465,12 +465,12 @@ async fn config_version_dispatch(sub: ConfigVersionCmd) -> Result<(), String> {
 
 fn config_show_policy(model: Option<&str>, json: bool) -> Result<(), String> {
     let cfg = astra_config::runtime_config::RuntimeConfig::load();
-    let policy = cfg.tool_selection.resolve_for_model(model);
+    let policy = cfg.tool_policy.resolve_for_model(model);
     let trust_mode = match cfg.safety.resolved_trust_mode() {
         astra_config::runtime_config::TrustModeSerde::Strict => "strict",
         astra_config::runtime_config::TrustModeSerde::Trusted => "trusted",
     };
-    let rejected = cfg.tool_selection.rejected_model_match_patterns();
+    let rejected = cfg.tool_policy.rejected_model_match_patterns();
     println!(
         "{}",
         format_policy_output(model, &policy, trust_mode, &rejected, json)
@@ -485,7 +485,7 @@ fn config_show_policy(model: Option<&str>, json: bool) -> Result<(), String> {
 ///
 /// `rejected_patterns` is the list of `model_profiles.model_match` values
 /// that were silently ignored at resolve time because they were too short
-/// (see `ToolSelectionConfig::rejected_model_match_patterns`). When
+/// (see `ToolPolicyConfig::rejected_model_match_patterns`). When
 /// non-empty, they're surfaced so users can spot misconfigs.
 pub(crate) fn format_policy_output(
     model: Option<&str>,

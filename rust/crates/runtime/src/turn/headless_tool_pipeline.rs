@@ -25,7 +25,7 @@ mod record;
 ///
 /// `visible` is the set advertised in the current request's `tools[]`.
 /// `extras` is an explicit execution grant from the caller, e.g. a runtime
-/// or plugin transport that is installed out-of-band. Deferred-tool selection
+/// or plugin transport that is installed out-of-band. Deferred-tool surface
 /// should normally be consumed by the next surface assembly so the selected
 /// tool becomes visible instead of lingering here as long-lived state.
 pub fn admissible_tool_names(

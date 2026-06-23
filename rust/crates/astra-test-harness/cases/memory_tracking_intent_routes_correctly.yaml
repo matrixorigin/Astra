@@ -2,11 +2,11 @@ name: memory_tracking_intent_routes_correctly
 description: |
   **What**: Express tracking/interest intent in Chinese ("我关注X") and verify the agent routes to
   memory_store rather than codebase exploration tools.
-  **Tests**: Tool selection for tracking intents — "关注" (follow/track) should trigger memory persistence,
+  **Tests**: Tool surface for tracking intents — "关注" (follow/track) should trigger memory persistence,
   NOT file exploration (bash, list_dir, glob, grep). This is a regression test for session 292f7100 where
   "我关注matrixorigin" caused the LLM to explore the codebase instead of storing the interest.
   **Why**: Chinese-language tracking expressions ("关注", "追踪") are semantically memory-store operations,
-  not code search operations. The tool selector must route these to memory tools, not exploration tools.
+  not code search operations. The tool surface must expose memory tools, not exploration tools.
   After removing "关注" from github_list_prs triggers and deleting detect_store_signal, the system prompt
   memory rules must carry the full burden of routing these intents correctly.
   **Pass means**: The agent calls memory to persist the tracking interest, and does NOT waste turns

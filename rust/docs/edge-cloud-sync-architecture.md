@@ -531,7 +531,7 @@ CREATE TABLE session_sync_log (
   "tokens_in": 150,
   "tokens_out": 80,
   "duration_ms": 1200,
-  "tools_selected": ["bash", "read_file"],
+  "visible_tools": ["bash", "read_file"],
   "tools_used": ["bash"],
   "budget_used": 25,
   "budget_pressure": 0.3,

@@ -10,10 +10,8 @@ mod tests {
         let collector = TurnTraceCollector::new("turn-0", "sess-1");
         collector
             .record_token_budget_estimate(14_000, 5_000, 500, 3_000, 200, 22_700, 128_000, 0.18);
-        collector.record_tool_selection(
+        collector.record_tool_surface(
             &["bash".into(), "view".into()],
-            "tfidf",
-            0.85,
             &[("bash".into(), 1500), ("view".into(), 1500)],
             40,
             12,
@@ -28,7 +26,7 @@ mod tests {
         let trace = collector.finalize();
         assert_eq!(trace.token_budget.system_prompt_tokens, 14_000);
         assert_eq!(trace.token_budget.history_tokens, 5_000);
-        assert_eq!(trace.tools.tools_selected.len(), 2);
+        assert_eq!(trace.tools.visible_tools.len(), 2);
         assert_eq!(trace.memory.memories_selected.len(), 1);
 
         // Feed to observability session
@@ -43,7 +41,7 @@ mod tests {
         let t = &guard.context_traces[0];
         assert_eq!(t.turn_id, "turn-0");
         assert_eq!(t.token_budget.system_prompt_tokens, 14_000);
-        assert_eq!(t.tools.selection_strategy, "tfidf");
+        assert_eq!(t.tools.visible_tools.len(), 2);
         assert_eq!(t.memory.retrieval_latency_ms, 25);
     }
 }

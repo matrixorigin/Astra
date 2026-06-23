@@ -33,7 +33,7 @@
 //! |---|---|---|
 //! | `Global` | Never changes across sessions (core rules, safety guardrails) | Always at the prefix |
 //! | `Session` | Stable within a session (version, cwd, date, user, branch, strict-history model identity) | Middle, before the breakpoint |
-//! | `None` | Per-turn/non-cacheable runtime facts (model identity for marker/auto-prefix providers, skills, turn budget, low-confidence warn) | After the breakpoint |
+//! | `None` | Per-turn/non-cacheable runtime facts (model identity for marker/auto-prefix providers, skills, turn budget) | After the breakpoint |
 //!
 //! `CacheScope` implements `Ord` such that `Global < Session < None`, guaranteeing stable
 //! byte ordering regardless of insertion order.
@@ -69,8 +69,8 @@
 //!
 //! ## Cache Key Design
 //!
-//! [`section_cache_key`] (test-only) produces a hash from `(tool_names, task_type,
-//! confidence_bucket)`. It deliberately excludes prompt text, so wording tweaks and
+//! [`section_cache_key`] (test-only) produces a hash from `(tool_names, task_type)`.
+//! It deliberately excludes prompt text, so wording tweaks and
 //! formatting changes do not cause cache misses — only semantically meaningful input
 //! changes affect the key.
 //!
@@ -197,7 +197,7 @@ impl Default for PromptCacheConfig {
 
 // ── Section Cache ────────────────────────────────────────────────────────────
 // Two-level cache for static/dynamic prompt boundary:
-// - Global+Session sections are cached by (tool_names, task_type, confidence) — stable within a session
+// - Global+Session sections are cached by (tool_names, task_type) — stable within a session
 // - Per-turn volatile content (environment_volatile, memoria recall, …) is
 //   bound into RuntimeVolatile post-cache-marker so it re-sends each turn
 //   without invalidating the cached prefix.
@@ -269,7 +269,6 @@ pub(crate) fn provider_cache_policy_for(
 pub(crate) fn assemble_system_message_via_pipeline(
     tool_names: &[&str],
     extra_dynamic_sections: &[prompts::PromptSection],
-    confidence: f64,
     task_type: Option<&str>,
     cache_cfg: &PromptCacheConfig,
     session_id: &str,
@@ -286,7 +285,6 @@ pub(crate) fn assemble_system_message_via_pipeline(
         &[],
         None,
         None,
-        confidence,
         task_type,
         cache_cfg,
         None,
@@ -341,7 +339,6 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     memory_entries: &[astra_turn_core::context_sources::MemoryEntry],
     session_memory_entry: Option<&astra_turn_core::context_sources::MemoryEntry>,
     system_override: Option<&str>,
-    confidence: f64,
     task_type: Option<&str>,
     cache_cfg: &PromptCacheConfig,
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
@@ -362,7 +359,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     use astra_turn_core::pipeline_session::{AdaptiveTurnInput, PipelineSession};
 
     // Build ExternalSources from bridge-side signals. Tool-dependent prompt
-    // fragments are volatile because bridge tool selection can vary per turn.
+    // fragments are volatile because bridge tool surface can vary per turn.
     let self_model_text = if tool_names.is_empty() {
         None
     } else {
@@ -374,10 +371,9 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     let tool_conditional = if tool_names.is_empty() {
         None
     } else {
-        let text = prompts::tool_conditional_section(tool_names, &profile_for_tc, confidence);
+        let text = prompts::tool_conditional_section(tool_names, &profile_for_tc);
         if text.is_empty() { None } else { Some(text) }
     };
-    let tool_guidance = prompts::low_confidence_tool_selection_section(confidence);
     // ASTRA_OUTPUT_STYLE is a user preference — stable within a session
     // (user doesn't toggle styles mid-session). Route to stable lane.
     let model_identity_section =
@@ -444,7 +440,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         effort_hint: None,
         system_override,
         plan_context: None,
-        tool_guidance,
+        tool_guidance: None,
         extra_stable_sections: stable,
         extra_dynamic_sections: volatile,
     };
@@ -642,23 +638,15 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
 /// Previously this delegated to `section_cache_key_with_customization` which
 /// folded in prompt-override + output-style fingerprints. Those inputs
 /// belong to the pipeline path now, so the key function is a pure hash
-/// over (tool_names, task_type, confidence_bucket) — adequate for proving
+/// over (tool_names, task_type) — adequate for proving
 /// that cache-key collisions don't hide behind the same hash.
 #[cfg(test)]
-pub(crate) fn section_cache_key(
-    tool_names: &[&str],
-    task_type: Option<&str>,
-    confidence: f64,
-) -> u64 {
+pub(crate) fn section_cache_key(tool_names: &[&str], task_type: Option<&str>) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     tool_names.hash(&mut hasher);
     task_type.hash(&mut hasher);
-    // Bucket confidence into 0.0-0.3 / 0.3+ to match the legacy behaviour
-    // that the surviving tests assert (`section_cache_key_low_confidence_bucketed`).
-    let confidence_bucket = if confidence < 0.3 { 0u8 } else { 1u8 };
-    confidence_bucket.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -735,7 +723,7 @@ pub(crate) fn runtime_pinned_tool_names() -> std::collections::HashSet<String> {
 /// this config?". All callers that need cache markers or edge metadata should
 /// route through this (or [`runtime_pinned_tool_names`] when the runtime
 /// singleton is intentionally needed) rather than
-/// rebuilding DEFAULT_PINNED + TOML override rules locally.
+/// rebuilding identity + TOML override rules locally.
 ///
 /// **Cold path**: this rebuilds `all_tool_schemas()` + `ToolSurface::build()`
 /// (O(tool count)). Expected call frequency is O(1) per session. The per-turn
@@ -827,30 +815,18 @@ mod tests {
 
     #[test]
     fn section_cache_key_varies_by_tools_and_task() {
-        let key1 = section_cache_key(&["bash"], Some("implementation"), 0.8);
-        let key2 = section_cache_key(&["bash", "read_file"], Some("implementation"), 0.8);
-        let key3 = section_cache_key(&["bash"], Some("debugging"), 0.8);
-        let key4 = section_cache_key(&["bash"], Some("implementation"), 0.2);
+        let key1 = section_cache_key(&["bash"], Some("implementation"));
+        let key2 = section_cache_key(&["bash", "read_file"], Some("implementation"));
+        let key3 = section_cache_key(&["bash"], Some("debugging"));
         assert_ne!(key1, key2, "different tools should differ");
         assert_ne!(key1, key3, "different task types should differ");
-        assert_ne!(key1, key4, "different confidence buckets should differ");
     }
 
     #[test]
     fn section_cache_key_differs_for_different_tools() {
-        let k1 = section_cache_key(&["read_file"], None, 1.0);
-        let k2 = section_cache_key(&["bash"], None, 1.0);
+        let k1 = section_cache_key(&["read_file"], None);
+        let k2 = section_cache_key(&["bash"], None);
         assert_ne!(k1, k2);
-    }
-
-    #[test]
-    fn section_cache_key_low_confidence_bucketed() {
-        let k_low = section_cache_key(&["bash"], None, 0.2);
-        let k_normal = section_cache_key(&["bash"], None, 0.5);
-        assert_ne!(k_low, k_normal);
-        // Both in low bucket should match
-        let k_low2 = section_cache_key(&["bash"], None, 0.1);
-        assert_eq!(k_low, k_low2);
     }
 
     #[test]
@@ -888,7 +864,7 @@ mod tests {
     #[test]
     fn default_pinned_tool_names_tracks_runtime_surface_not_deferred_catalog() {
         let pinned = default_test_pinned_tool_names();
-        for name in crate::tool_registry::surface::DEFAULT_PINNED {
+        for name in crate::tool_registry::surface::default_pinned_names() {
             assert!(
                 pinned.contains(*name),
                 "{name} is part of the runtime default surface and must be cache-pinned"
@@ -1034,7 +1010,6 @@ mod tests {
             &[],
             None,
             None,
-            0.8,
             None,
             &cache_cfg,
             None,
@@ -1092,7 +1067,6 @@ mod tests {
             &memory_entries,
             None,
             None,
-            0.8,
             None,
             &cache_cfg,
             None,
@@ -1143,7 +1117,6 @@ mod tests {
             &[],
             Some(&session_memory),
             None,
-            0.8,
             None,
             &cache_cfg,
             None,
@@ -1201,7 +1174,6 @@ mod tests {
             &[],
             None,
             Some("You must answer using the MOI agent contract."),
-            0.8,
             None,
             &cache_cfg,
             None,
@@ -1261,7 +1233,6 @@ mod tests {
             &[],
             Some(&session_memory),
             None,
-            0.8,
             None,
             &cache_cfg,
             None,
@@ -1318,7 +1289,6 @@ mod tests {
             &[],
             None,
             None,
-            0.8,
             None,
             &cache_cfg,
             None,
@@ -1375,7 +1345,6 @@ mod tests {
             &[],
             None,
             None,
-            0.8,
             None,
             &cache_cfg,
             Some(strict_history),
@@ -1420,62 +1389,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bridge_pipeline_routes_low_confidence_warning_to_dynamic_message() {
-        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
-        remove_test_env("ASTRA_OUTPUT_STYLE");
-        let cache_cfg = PromptCacheConfig {
-            cache_enabled: false,
-            is_anthropic: false,
-        };
-
-        let outcome = assemble_bridge_pipeline_outcome(
-            &["bash"],
-            &[],
-            &[],
-            &[],
-            &[],
-            None,
-            None,
-            0.1,
-            None,
-            &cache_cfg,
-            None,
-            "sid-low-confidence",
-            "gpt-4o",
-            "openai",
-            Some("/tmp/proj"),
-            None,
-            None,
-            "",
-            "",
-            "2026-05-25",
-        );
-
-        let primary_text = outcome
-            .primary_system
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let dynamic_text = outcome
-            .dynamic_system
-            .as_ref()
-            .and_then(|msg| msg.get("content"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        // `## Self-Model` was the assertion target before commit a1187f76
-        // emptied `self_model_section`; the section no longer appears at
-        // all, so only the low-confidence warning is asserted now.
-        assert!(
-            !primary_text.contains("Low-Confidence Tool Selection"),
-            "per-turn selector confidence must not enter cached prefix: {primary_text}"
-        );
-        assert!(
-            dynamic_text.contains("Low-Confidence Tool Selection"),
-            "low confidence warning should be post-cache RuntimeVolatile: {dynamic_text}"
-        );
-    }
-
     // ── assemble_system_message_via_pipeline ─────────────────────────────
 
     #[test]
@@ -1489,7 +1402,6 @@ mod tests {
         let (primary, dynamic, sections) = assemble_system_message_via_pipeline(
             &["bash", "read_file"],
             &[],
-            0.8,
             None,
             &cache_cfg,
             "test-session",
@@ -1542,7 +1454,6 @@ mod tests {
         let (primary, dynamic, _sections) = assemble_system_message_via_pipeline(
             &["bash", "read_file"],
             &[],
-            0.8,
             None,
             &cache_cfg,
             "sid",
@@ -1599,7 +1510,6 @@ mod tests {
         let (primary, dynamic, _) = assemble_system_message_via_pipeline(
             &["bash"],
             &extra,
-            0.8,
             None,
             &cache_cfg,
             "sid",
@@ -1661,7 +1571,6 @@ mod tests {
                     "extra content".to_string(),
                     prompts::PromptTokenBucket::Environment,
                 )],
-                0.8,
                 None,
                 &cache_cfg,
                 "sid",
@@ -1693,7 +1602,6 @@ mod tests {
         let (primary, _, _) = assemble_system_message_via_pipeline(
             &["bash", "read_file"],
             &[],
-            0.8,
             None,
             &cache_cfg,
             "sid",
@@ -1747,7 +1655,6 @@ mod tests {
         let (primary, _, _) = assemble_system_message_via_pipeline(
             &["bash"],
             &[],
-            0.8,
             None,
             &PromptCacheConfig {
                 cache_enabled: true,
@@ -1796,7 +1703,6 @@ mod tests {
         let (primary1, _, _) = assemble_system_message_via_pipeline(
             &["bash"],
             &[],
-            0.8,
             None,
             &PromptCacheConfig::default(),
             "sid",
@@ -1812,7 +1718,6 @@ mod tests {
         let (primary2, _, _) = assemble_system_message_via_pipeline(
             &["bash"],
             &[],
-            0.8,
             None,
             &PromptCacheConfig::default(),
             "sid",
@@ -1843,7 +1748,6 @@ mod tests {
         let (primary1, _, _) = assemble_system_message_via_pipeline(
             &["bash"],
             &[],
-            0.8,
             None,
             &PromptCacheConfig::default(),
             "sid",
@@ -1864,7 +1768,6 @@ mod tests {
         let (primary2, _, _) = assemble_system_message_via_pipeline(
             &["bash"],
             &[],
-            0.8,
             None,
             &PromptCacheConfig::default(),
             "sid",
@@ -1994,7 +1897,6 @@ mod tests {
             &[],
             None,
             None,
-            0.8,
             None,
             &cache_cfg,
             Some(astra_turn_core::cache_placement::CacheCapability {

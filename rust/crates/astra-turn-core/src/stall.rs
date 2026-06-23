@@ -64,16 +64,6 @@ pub fn trailing_identical_sig_depth(turn_sigs: &[BTreeSet<String>]) -> usize {
 /// Call sites append the actual budget number, e.g. `format!("{} (budget: {} turns)", MSG, n)`.
 pub const CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG: &str = "Turn budget exhausted. To increase, set ASTRA_MAX_TURNS (interactive) or ASTRA_PLAN_SUBTASK_MAX_TURNS (plan subtasks).";
 
-/// User-visible error when the legacy in-process bridge exhausts the tool-round budget.
-pub fn cli_agentic_tool_round_budget_abort_msg(current_limit: usize) -> String {
-    format!(
-        "Tool-round budget exhausted (limit: {}). The circuit breaker terminated this turn \
-         due to detected stall or regression. To increase the ceiling, set \
-         `circuit_breaker_absolute_max_rounds` in your runtime config.",
-        current_limit,
-    )
-}
-
 /// Maximum consecutive exploration-only rounds before triggering correction.
 /// Lowered from 8→5→3: with auto-expanding read_file (full-file on 2nd+ ranged
 /// read) and EdgeToolCache dedup, agents need fewer exploration rounds.
@@ -448,32 +438,30 @@ pub fn assess_progress(
     }
 }
 
-/// Legacy wrapper kept for backward compatibility with existing call sites
-/// (TurnGuard). Now delegates to [`assess_progress`]: only `NoProgress`
-/// flips to `Diverging` (the single state that warrants injecting a
-/// correction). `LowNovelty` maps to `Exploring` (surfaced as a hint,
-/// not a correction), and `Healthy` maps to `Healthy`.
+/// Detect divergence using the default exploration window.
 ///
-/// The `exploration_round_budget` parameter is retained as the window
-/// size so callers that tuned the round count continue to work.
+/// Delegates to [`assess_progress`]: only `NoProgress` flips to
+/// `Diverging` (the single state that warrants injecting a correction).
+/// `LowNovelty` maps to `Exploring` (surfaced as a hint, not a correction),
+/// and `Healthy` maps to `Healthy`.
 pub fn detect_divergence(
     tool_sigs: &[BTreeSet<String>],
 ) -> Result<DivergenceStatus, StallDetectionError> {
-    detect_divergence_with_budget(tool_sigs, MAX_EXPLORATION_ROUNDS)
+    detect_divergence_with_window(tool_sigs, MAX_EXPLORATION_ROUNDS)
 }
 
-pub fn detect_divergence_with_budget(
+pub fn detect_divergence_with_window(
     tool_sigs: &[BTreeSet<String>],
-    exploration_round_budget: usize,
+    exploration_round_window: usize,
 ) -> Result<DivergenceStatus, StallDetectionError> {
-    match assess_progress(tool_sigs, exploration_round_budget)? {
+    match assess_progress(tool_sigs, exploration_round_window)? {
         ProgressStatus::Healthy => Ok(DivergenceStatus::Healthy),
         ProgressStatus::LowNovelty(_) => {
             // Report as Exploring (hint-only); callers should NOT inject
             // a correction — the agent may be doing legitimate analysis.
-            Ok(DivergenceStatus::Exploring(exploration_round_budget))
+            Ok(DivergenceStatus::Exploring(exploration_round_window))
         }
-        ProgressStatus::NoProgress => Ok(DivergenceStatus::Diverging(exploration_round_budget)),
+        ProgressStatus::NoProgress => Ok(DivergenceStatus::Diverging(exploration_round_window)),
     }
 }
 
@@ -872,16 +860,6 @@ mod tests {
         assert_eq!(
             trailing_identical_sig_depth(&[BTreeSet::new(), BTreeSet::new()]),
             0
-        );
-    }
-
-    #[test]
-    fn tool_round_abort_message_points_to_tool_round_limit() {
-        assert_eq!(
-            cli_agentic_tool_round_budget_abort_msg(30),
-            "Tool-round budget exhausted (limit: 30). The circuit breaker terminated this turn \
-             due to detected stall or regression. To increase the ceiling, set \
-             `circuit_breaker_absolute_max_rounds` in your runtime config."
         );
     }
 
@@ -1892,26 +1870,26 @@ mod tests {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  detect_divergence_with_budget — custom budgets
+    //  detect_divergence_with_window — custom windows
     // ══════════════════════════════════════════════════════════════════════
 
     #[test]
     fn divergence_with_budget_2_triggers_at_exact_repeat() {
-        // New semantics: window=2 budget, both rounds identical sig → Diverging.
+        // New semantics: window=2, both rounds identical sig → Diverging.
         let sigs = make_sigs(&[&["bash"], &["bash"]]);
         assert!(matches!(
-            detect_divergence_with_budget(&sigs, 2).unwrap(),
+            detect_divergence_with_window(&sigs, 2).unwrap(),
             DivergenceStatus::Diverging(_)
         ));
     }
 
     #[test]
     fn divergence_with_budget_2_distinct_rounds_healthy() {
-        // New semantics: two distinct rounds within budget=2 → Healthy
+        // New semantics: two distinct rounds within window=2 → Healthy
         // (novelty = 2/2 = 100%).
         let sigs = make_sigs(&[&["bash"], &["read_file"]]);
         assert_eq!(
-            detect_divergence_with_budget(&sigs, 2).unwrap(),
+            detect_divergence_with_window(&sigs, 2).unwrap(),
             DivergenceStatus::Healthy
         );
     }
@@ -1921,7 +1899,7 @@ mod tests {
         // window=1 → a single round trivially equals itself → Diverging.
         let sigs = make_sigs(&[&["bash"]]);
         assert!(matches!(
-            detect_divergence_with_budget(&sigs, 1).unwrap(),
+            detect_divergence_with_window(&sigs, 1).unwrap(),
             DivergenceStatus::Diverging(_)
         ));
     }
@@ -1931,7 +1909,7 @@ mod tests {
         // Not enough history to judge → Healthy (new semantics).
         let sigs = make_sigs(&[&["bash"], &["read_file"]]);
         assert_eq!(
-            detect_divergence_with_budget(&sigs, 10).unwrap(),
+            detect_divergence_with_window(&sigs, 10).unwrap(),
             DivergenceStatus::Healthy
         );
     }
@@ -1939,7 +1917,7 @@ mod tests {
     #[test]
     fn divergence_with_budget_empty_sigs() {
         assert_eq!(
-            detect_divergence_with_budget(&[], 5).unwrap(),
+            detect_divergence_with_window(&[], 5).unwrap(),
             DivergenceStatus::Healthy
         );
     }
@@ -1947,7 +1925,7 @@ mod tests {
     #[test]
     fn divergence_with_budget_zero_is_error() {
         assert_eq!(
-            detect_divergence_with_budget(&[], 0),
+            detect_divergence_with_window(&[], 0),
             Err(StallDetectionError::InvalidWindowOrBudget(0))
         );
     }

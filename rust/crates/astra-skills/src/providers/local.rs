@@ -1,8 +1,7 @@
 //! Local filesystem skill provider — discovers and loads skills from SKILL.md files.
 //!
 //! Scans filesystem directories for skill directories containing a `SKILL.md`
-//! file. Claude Code skills are discovered automatically since both tools follow
-//! the Agent Skills open standard.
+//! file. Agent Skills-compatible paths are discovered automatically.
 
 use async_trait::async_trait;
 use std::path::PathBuf;

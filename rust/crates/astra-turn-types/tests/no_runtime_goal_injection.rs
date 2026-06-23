@@ -10,7 +10,7 @@
 //! `ensure_goal` was set-if-empty, and (b) title-extracted the user's
 //! follow-up into a `runtime-goal` TodoItem that leaked into every turn.
 //!
-//! Design fix: the Claude Code model — runtime never auto-assigns a "goal",
+//! Design fix: reference-agent model — runtime never auto-assigns a "goal",
 //! never injects anchors/working-set headers with a `goal:` or
 //! `pending_work:` line. LLM-authored task tracking (e.g. `TodoWriteTool` /
 //! `TaskCreate`) takes over.

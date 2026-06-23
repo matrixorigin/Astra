@@ -1,7 +1,7 @@
 //! Centralized runtime limits and tuning parameters.
 //!
 //! Infrastructure-level guards that prevent runaway resource consumption.
-//! These are NOT policy knobs — policy (stall detection, round budgets) is
+//! These are NOT policy knobs — policy (stall detection, tool-round hard stops) is
 //! handled by `LoopCircuitBreaker` in `astra-turn-core` and `ServerRuntimeConfig`.
 //!
 //! All values have sensible defaults and can be overridden via environment

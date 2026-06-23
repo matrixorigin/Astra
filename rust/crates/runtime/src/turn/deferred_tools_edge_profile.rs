@@ -208,7 +208,14 @@ fn filter_block_to_names(block: &str, names: &HashSet<String>) -> Option<String>
     while let Some(open_idx) = rest.find(OPEN_TOOL) {
         rendered.push_str(&rest[..open_idx]);
         let from_tool = &rest[open_idx..];
-        let close_idx = from_tool.find(CLOSE_TOOL)?;
+        let Some(close_idx) = from_tool.find(CLOSE_TOOL) else {
+            tracing::warn!(
+                target: LOG_TARGET,
+                "deferred tool manifest XML parse failed: unclosed <tool> tag at offset {}",
+                open_idx
+            );
+            break;
+        };
         let close_end = close_idx + CLOSE_TOOL.len();
         let tool_block = &from_tool[..close_end];
         let block_names = rendered_name_keys_from_block(tool_block);

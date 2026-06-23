@@ -255,7 +255,7 @@ impl TurnGuard {
         let window = self
             .task_profile
             .stall_window
-            .max(self.task_profile.exploration_round_budget)
+            .max(self.task_profile.exploration_round_window)
             + 2;
         stall::record_server_tool_signatures(&mut self.tool_sigs, tool_calls, window);
     }
@@ -495,9 +495,9 @@ impl TurnGuard {
         // 2. Divergence detection
         // Only increment nudge_count if stall wasn't already detected this turn
         // (both detect overlapping patterns; counting both inflates escalation).
-        let divergence = stall::detect_divergence_with_budget(
+        let divergence = stall::detect_divergence_with_window(
             &self.tool_sigs,
-            self.task_profile.exploration_round_budget,
+            self.task_profile.exploration_round_window,
         )
         .unwrap_or_else(|e| {
             tracing::warn!(target: "turn_guard", error = %e, "divergence detection failed; assuming healthy");

@@ -223,7 +223,7 @@ fn build_hook_db_persist_from_payload(
         decision_type: if tool_call_names.is_empty() {
             "response_generation".to_string()
         } else {
-            "tool_selection".to_string()
+            "tool_surface".to_string()
         },
         decision_output: serde_json::json!({
             "text": truncate_text(optional_object_str(hook_payload, "full_text").unwrap_or_default(), 500),
@@ -709,7 +709,7 @@ mod inprocess_hook_contract_tests {
             "id": "call-skill-2",
             "function": {"name": "skill", "arguments": "{\"skill_name\": \"ship-it\"}"}
         })];
-        let mut payload = build_turn_hook_args(
+        let payload = build_turn_hook_args(
             "user-1",
             "session-1",
             &messages,
@@ -725,36 +725,6 @@ mod inprocess_hook_contract_tests {
             false,
             true,
             true,
-        );
-        payload.insert(
-            "skill_selector_shortlist".to_string(),
-            json!({
-                "open_catalog": true,
-                "visible_skill_count": 2,
-                "skills": [
-                    {
-                        "rank": 1,
-                        "skill_name": "inspect",
-                        "aliases": [],
-                        "description": "inspect cluster",
-                        "source": "test",
-                        "category": null
-                    },
-                    {
-                        "rank": 2,
-                        "skill_name": "deploy",
-                        "aliases": ["ship-it"],
-                        "description": "deploy service",
-                        "source": "test",
-                        "category": null
-                    }
-                ],
-                "telemetry": {
-                    "selector_tier": "lexical",
-                    "elapsed_ms": 1,
-                    "total_catalog_size": 2
-                }
-            }),
         );
         Value::Object(payload)
     }
@@ -873,7 +843,7 @@ mod inprocess_hook_contract_tests {
             .expect("decision_audit missing");
         assert_eq!(audit.session_id, "session-1");
         assert_eq!(audit.event_id, "evt-query-1");
-        assert_eq!(audit.decision_type, "tool_selection");
+        assert_eq!(audit.decision_type, "tool_surface");
         assert_eq!(audit.model_used.as_deref(), Some("gpt-4"));
         assert_eq!(
             audit.decision_output["action_profiles"][0]["tool_name"],

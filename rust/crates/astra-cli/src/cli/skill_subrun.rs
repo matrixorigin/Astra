@@ -526,7 +526,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         // Resolve per-model workflow-guard policy up front; `effective_model`
         // is moved into the SubRunHost below.
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_selection
+            .tool_policy
             .resolve_for_model(effective_model.as_deref());
 
         let all_schemas = edge_tools::all_tool_schemas();
@@ -664,7 +664,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             boosted_tools: HashSet::new(),
-            widen_selection_pending: false,
+            widen_surface_pending: false,
             step_recorder,
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(
@@ -742,7 +742,6 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
@@ -812,15 +811,14 @@ fn resolve_subrun_schemas(
     }
 }
 
-fn empty_selection_report_for_schemas(
+fn empty_surface_report_for_schemas(
     schemas: &[Value],
-) -> astra_runtime::tool_registry::SelectionReport {
-    let mut tools_selected: Vec<String> = tool_names_from_schemas(schemas).into_iter().collect();
-    tools_selected.sort();
-    astra_runtime::tool_registry::SelectionReport {
-        selected_count: tools_selected.len() as u32,
-        tools_selected,
-        dynamic_tools_selected: Vec::new(),
+) -> astra_runtime::tool_registry::ToolSurfaceReport {
+    let mut visible_tools: Vec<String> = tool_names_from_schemas(schemas).into_iter().collect();
+    visible_tools.sort();
+    astra_runtime::tool_registry::ToolSurfaceReport {
+        visible_count: visible_tools.len() as u32,
+        visible_tools,
         budget_used: 0,
         budget_total: 0,
     }
@@ -836,26 +834,17 @@ fn attach_subrun_tool_surface(
     interaction_mode: TurnInteractionMode,
 ) -> TurnInteractionPolicy {
     let activated = executor.activated_deferred_tool_names_for_schema_injection();
-    let mut selection_report = empty_selection_report_for_schemas(&schemas_to_use);
+    let mut surface_report = empty_surface_report_for_schemas(&schemas_to_use);
     if !activated.is_empty() {
         let refs: Vec<&str> = activated.iter().map(String::as_str).collect();
-        inject_required_tool_names(
-            &mut schemas_to_use,
-            &mut selection_report,
-            &refs,
-            all_schemas,
-        );
+        inject_required_tool_names(&mut schemas_to_use, &mut surface_report, &refs, all_schemas);
     }
     schemas_to_use = executor.runtime_bound_tool_schemas(schemas_to_use);
-    selection_report = empty_selection_report_for_schemas(&schemas_to_use);
 
-    astra_runtime::turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools(
+    astra_runtime::turn::agentic_prepare_payload::attach_filtered_edge_tools_to_payload(
         payload,
         schemas_to_use,
         restricted_tools,
-        Some(&selection_report),
-        0.5,   // neutral confidence
-        None,  // no learned task type
     );
     let final_visible_schemas: Vec<Value> = payload
         .get("edge_tools")
@@ -876,10 +865,11 @@ fn attach_subrun_tool_surface(
         .cloned()
         .collect();
     let eligible_surface_schemas = executor.runtime_bound_tool_schemas(eligible_surface_schemas);
+    let eligible_plugin_schemas = executor.runtime_bound_plugin_schemas_excluding(restricted_tools);
     let tool_surface = astra_runtime::tool_registry::surface::ToolSurface::build_excluding_visible(
         eligible_surface_schemas,
         &astra_config::runtime_config::RuntimeConfig::cached().tool_surface,
-        &[],
+        &eligible_plugin_schemas,
         &final_visible_tool_names,
     );
     let mut activatable_tool_names = HashSet::new();
@@ -1068,13 +1058,10 @@ mod tests {
         let interaction_mode = TurnInteractionMode::NonInteractive;
         let mut restricted_tools = interaction_scoped_tool_restrictions(interaction_mode);
 
-        astra_runtime::turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools(
+        astra_runtime::turn::agentic_prepare_payload::attach_filtered_edge_tools_to_payload(
             &mut payload,
             vec![schema("mo_query"), schema(ASK_USER_TOOL_NAME)],
             &mut restricted_tools,
-            None,
-            0.5,
-            None,
         );
 
         let policy = turn_policy_from_payload_edge_tools(&payload, interaction_mode);
@@ -1263,17 +1250,6 @@ mod tests {
         assert!(
             !edge_tool_names.contains("agent_fanout"),
             "subrun tools[] must not advertise an unbound runtime tool: {payload}"
-        );
-        let recommended: Vec<String> = payload["edge_profile"]["recommended_tools"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| entry["name"].as_str())
-            .map(ToString::to_string)
-            .collect();
-        assert!(
-            !recommended.iter().any(|name| name == "agent_fanout"),
-            "subrun edge_profile must not recommend a tool absent from the executable surface: {recommended:?}"
         );
     }
 

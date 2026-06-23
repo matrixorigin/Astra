@@ -108,8 +108,8 @@ pub enum DisambiguationAction {
     Proceed,
     /// Multiple intents but one dominates — proceed with primary, note secondary
     ProceedWithNote,
-    /// Strong conflict — widen tool selection to cover both intents
-    WidenToolSelection,
+    /// Strong conflict — widen tool surface to cover both intents
+    WidenToolSurface,
 }
 
 /// Analyze a query for conflicting intents using signal counts.
@@ -173,7 +173,7 @@ pub fn disambiguate_intents(
     };
 
     let recommendation = if conflict_score > 0.7 {
-        DisambiguationAction::WidenToolSelection
+        DisambiguationAction::WidenToolSurface
     } else if conflict_score > 0.4 {
         DisambiguationAction::ProceedWithNote
     } else {
@@ -295,7 +295,7 @@ mod tests {
         assert_eq!(result.conflict_score, 0.8);
         assert_eq!(
             result.recommendation,
-            DisambiguationAction::WidenToolSelection
+            DisambiguationAction::WidenToolSurface
         );
         assert!(result.secondary_intent.is_some());
     }

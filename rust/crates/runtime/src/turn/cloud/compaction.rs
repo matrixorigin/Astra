@@ -156,7 +156,7 @@ pub struct CompactBoundary {
     pub recent_files: Vec<String>,
     /// Discovered tools carried across compaction/replay boundaries.
     ///
-    /// These names can be used by the tool selection layer to re-materialize
+    /// These names can be used by the tool surface layer to re-materialize
     /// schemas even if the current tool index no longer lists them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discovered_tools: Vec<String>,

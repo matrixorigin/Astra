@@ -96,7 +96,7 @@ pub struct UserPreferences {
     /// Output verbosity level.
     pub verbosity: Verbosity,
 
-    /// Preferred tools (boost in selection).
+    /// Preferred tools (boost in tool-surface assembly).
     pub preferred_tools: Vec<String>,
 
     /// Blocked tools (never select).
@@ -157,19 +157,9 @@ impl UserPreferences {
 /// Apply a single config override based on key path.
 fn apply_preference_override(config: &mut RuntimeConfig, key: &str, value: &serde_json::Value) {
     match key {
-        "tool_selection.confidence_threshold" => {
-            if let Some(v) = value.as_f64() {
-                config.tool_selection.confidence_threshold = v;
-            }
-        }
-        "tool_selection.max_tools" => {
+        "tool_policy.max_tools" => {
             if let Some(v) = value.as_u64() {
-                config.tool_selection.max_tools = v as u32;
-            }
-        }
-        "tool_selection.tool_budget_tokens" => {
-            if let Some(v) = value.as_u64() {
-                config.tool_selection.tool_budget_tokens = (v as u32).clamp(0, 5000);
+                config.tool_policy.max_tools = v as u32;
             }
         }
         "token_budget.max_prompt_tokens" => {
@@ -460,8 +450,8 @@ pub enum TurnContinuationMode {
 }
 
 impl Scenario {
-    /// Get recommended tool preferences for this scenario.
-    pub fn recommended_tools(&self) -> Vec<&'static str> {
+    /// Get suggested tool labels for this scenario.
+    pub fn suggested_tools(&self) -> Vec<&'static str> {
         match self {
             Scenario::CodeReview => vec!["view", "grep", "github-mcp-server-pull_request_read"],
             Scenario::Debugging => vec!["bash", "view", "grep", "glob"],
@@ -486,7 +476,6 @@ impl Scenario {
                 detail_level: Verbosity::Verbose,
                 memory_top_k: Some(7),
                 verification_strictness: Some(0.7),
-                tool_budget_tokens: 900,
             },
             Scenario::Debugging => ScenarioStrategy {
                 max_tools_per_turn: 15,
@@ -494,7 +483,6 @@ impl Scenario {
                 detail_level: Verbosity::Debug,
                 memory_top_k: Some(8),
                 verification_strictness: None,
-                tool_budget_tokens: 1100,
             },
             Scenario::Exploration => ScenarioStrategy {
                 max_tools_per_turn: 15,
@@ -502,7 +490,6 @@ impl Scenario {
                 detail_level: Verbosity::Normal,
                 memory_top_k: Some(10),
                 verification_strictness: None,
-                tool_budget_tokens: 1000,
             },
             Scenario::Planning => ScenarioStrategy {
                 max_tools_per_turn: 8,
@@ -510,7 +497,6 @@ impl Scenario {
                 detail_level: Verbosity::Verbose,
                 memory_top_k: None,
                 verification_strictness: None,
-                tool_budget_tokens: 600,
             },
             Scenario::Implementation => ScenarioStrategy {
                 max_tools_per_turn: 12,
@@ -518,7 +504,6 @@ impl Scenario {
                 detail_level: Verbosity::Normal,
                 memory_top_k: None,
                 verification_strictness: Some(0.6),
-                tool_budget_tokens: 1200,
             },
             Scenario::Refactoring => ScenarioStrategy {
                 max_tools_per_turn: 12,
@@ -526,7 +511,6 @@ impl Scenario {
                 detail_level: Verbosity::Verbose,
                 memory_top_k: Some(7),
                 verification_strictness: Some(0.65),
-                tool_budget_tokens: 1100,
             },
             Scenario::Testing => ScenarioStrategy {
                 max_tools_per_turn: 15,
@@ -534,7 +518,6 @@ impl Scenario {
                 detail_level: Verbosity::Normal,
                 memory_top_k: None,
                 verification_strictness: Some(0.55),
-                tool_budget_tokens: 1000,
             },
             Scenario::Documentation => ScenarioStrategy {
                 max_tools_per_turn: 10,
@@ -542,7 +525,6 @@ impl Scenario {
                 detail_level: Verbosity::Verbose,
                 memory_top_k: None,
                 verification_strictness: None,
-                tool_budget_tokens: 600,
             },
             Scenario::DevOps => ScenarioStrategy {
                 max_tools_per_turn: 12,
@@ -550,7 +532,6 @@ impl Scenario {
                 detail_level: Verbosity::Normal,
                 memory_top_k: None,
                 verification_strictness: Some(0.6),
-                tool_budget_tokens: 900,
             },
             Scenario::Learning => ScenarioStrategy {
                 max_tools_per_turn: 12,
@@ -558,18 +539,16 @@ impl Scenario {
                 detail_level: Verbosity::Verbose,
                 memory_top_k: Some(10),
                 verification_strictness: None,
-                tool_budget_tokens: 700,
             },
             // QuickAnswer is intentionally the tightest profile in the set.
-            // Budget tuned so a short "why/how/where does X work" question cannot
-            // exceed ~3-5 tool calls in total without an explicit escalation.
+            // The execution cap keeps short factual questions from drifting into
+            // long tool rounds without an explicit escalation.
             Scenario::QuickAnswer => ScenarioStrategy {
                 max_tools_per_turn: 5,
                 prefer_read_only: true,
                 detail_level: Verbosity::Normal,
                 memory_top_k: Some(5),
                 verification_strictness: None,
-                tool_budget_tokens: 500,
             },
         }
     }
@@ -585,10 +564,6 @@ pub struct ScenarioStrategy {
     pub memory_top_k: Option<u32>,
     /// Suggested verification strictness override (None = use default).
     pub verification_strictness: Option<f64>,
-    /// Scenario-driven override for the tool selection token budget.
-    /// 0 = use registry default. Non-zero values override the per-turn budget,
-    /// allowing scenarios like Implementation to include more tool schemas.
-    pub tool_budget_tokens: u32,
 }
 
 // ─── Scenario Detector ──────────────────────────────────────────────────────
@@ -705,11 +680,11 @@ impl ScenarioDetector {
             return 0.0;
         }
 
-        let recommended = scenario.recommended_tools();
+        let suggested = scenario.suggested_tools();
         let mut matches = 0;
 
         for tool in &self.recent_tools {
-            if recommended.iter().any(|r| tool.contains(r)) {
+            if suggested.iter().any(|r| tool.contains(r)) {
                 matches += 1;
             }
         }

@@ -98,7 +98,7 @@ pub(crate) async fn build_one_shot_spawner(
 
 /// Resolve the user-facing cap on concurrent live subagents.
 ///
-/// Default 10 — matches the rough Claude Code parity used elsewhere
+/// Default 10 — matches the rough reference-agent parity used elsewhere
 /// (see workflow agent fan-out cap). A long-lived chat session that
 /// keeps spawning replacement agents on every transient failure can
 /// otherwise accumulate dozens of in-flight runs, all burning tokens.

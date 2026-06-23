@@ -20,9 +20,8 @@ pub use context::{
 };
 pub(crate) use context::{PER_MESSAGE_OVERHEAD, estimate_single_message_tokens};
 pub use system::{
-    CacheScope, DeferredToolsPromptBlock, LOW_CONFIDENCE_THRESHOLD,
-    PARALLEL_BATCHING_NUDGE_THRESHOLD, PromptOverrides, PromptSection, PromptTokenBucket,
-    ROUND_BUDGET_HARD_LIMIT, ROUND_BUDGET_THRESHOLD, STALL_NUDGE, SYSTEM_PROMPT_BASE,
+    CacheScope, DeferredToolsPromptBlock, PARALLEL_BATCHING_NUDGE_THRESHOLD, PromptOverrides,
+    PromptSection, PromptTokenBucket, STALL_NUDGE, SYSTEM_PROMPT_BASE,
     SYSTEM_PROMPT_DYNAMIC_BOUNDARY, SystemPromptBuilder, apply_overrides,
     build_deferred_tools_prompt_block_with_budget, build_deferred_tools_section,
     build_deferred_tools_section_with_budget, build_main_system_prompt,
@@ -32,12 +31,9 @@ pub use system::{
     build_system_prompt_sections_with_style, build_system_prompt_trace, default_overrides_dir,
     detect_task_type, load_overrides, parallel_batching_nudge_directive,
     parallel_execution_feedback, sections_to_string, self_awareness_prompt_section,
-    tool_round_guidance, tool_round_guidance_trace_with, tool_round_guidance_with,
-    trailing_single_tool_round_streak,
+    tool_round_guidance, tool_round_guidance_trace, trailing_single_tool_round_streak,
 };
-pub(crate) use system::{
-    low_confidence_tool_selection_section, self_model_section, tool_conditional_section,
-};
+pub(crate) use system::{self_model_section, tool_conditional_section};
 
 #[cfg(test)]
 mod tests {
@@ -45,7 +41,7 @@ mod tests {
 
     #[test]
     fn build_main_system_prompt_no_tools_warns_no_tools() {
-        let p = build_main_system_prompt(&[], "", 1.0, None);
+        let p = build_main_system_prompt(&[], "", None);
         assert!(p.contains(SYSTEM_PROMPT_BASE), "should include base");
         assert!(
             p.contains("NO tools available"),
@@ -59,7 +55,7 @@ mod tests {
 
     #[test]
     fn build_main_system_prompt_core_rules_and_protocol() {
-        let p = build_main_system_prompt(&["read_file", "write_file"], "", 1.0, None);
+        let p = build_main_system_prompt(&["read_file", "write_file"], "", None);
         assert!(p.contains("Core Rules"), "should include rules");
         assert!(
             p.contains("NEVER fabricate"),
@@ -77,8 +73,7 @@ mod tests {
 
     #[test]
     fn build_main_system_prompt_includes_profile() {
-        let p =
-            build_main_system_prompt(&["tool_a"], "\n\n## User Memories\nprefers Rust", 1.0, None);
+        let p = build_main_system_prompt(&["tool_a"], "\n\n## User Memories\nprefers Rust", None);
         assert!(p.contains("prefers Rust"), "profile should be appended");
     }
 
@@ -88,7 +83,7 @@ mod tests {
     /// This enforces: "prompt mentions tool X ⟹ tool X is available".
     #[test]
     fn no_memory_tools_omits_memory_section() {
-        let p = build_main_system_prompt(&["bash", "read_file"], "", 1.0, None);
+        let p = build_main_system_prompt(&["bash", "read_file"], "", None);
         assert!(
             !p.contains("`memory(action="),
             "should NOT mention the memory tool when no memory tools selected"
@@ -105,7 +100,7 @@ mod tests {
     /// When no GitHub tools are selected, GitHub-specific rules must be omitted.
     #[test]
     fn no_github_tools_omits_github_rules() {
-        let p = build_main_system_prompt(&["bash", "memory"], "", 1.0, None);
+        let p = build_main_system_prompt(&["bash", "memory"], "", None);
         assert!(
             !p.contains("github_list_prs"),
             "should NOT mention github_list_prs when no GitHub tools selected"
@@ -115,7 +110,7 @@ mod tests {
     /// History awareness rule prevents re-reading data already in context.
     #[test]
     fn prompt_includes_history_awareness() {
-        let p = build_main_system_prompt(&["read_file"], "", 1.0, None);
+        let p = build_main_system_prompt(&["read_file"], "", None);
         assert!(
             p.contains("check history") || p.contains("Reuse history"),
             "should instruct checking history before calling tools"
@@ -124,7 +119,7 @@ mod tests {
 
     #[test]
     fn no_git_tools_omits_git_guidance() {
-        let p = build_main_system_prompt(&["bash", "read_file"], "", 1.0, None);
+        let p = build_main_system_prompt(&["bash", "read_file"], "", None);
         assert!(
             !p.contains("COMPOUND git operations"),
             "should NOT include git guidance when no git tools selected"
@@ -137,7 +132,6 @@ mod tests {
         let p = build_main_system_prompt(
             &["read_file", "bash", "memory", "github_list_prs", "git_diff"],
             "",
-            1.0,
             None,
         );
         assert!(
@@ -150,7 +144,7 @@ mod tests {
     /// Discovery Before Access guidance prevents LLMs from guessing file paths.
     #[test]
     fn prompt_includes_discovery_before_access() {
-        let p = build_main_system_prompt(&["read_file", "list_dir", "glob"], "", 1.0, None);
+        let p = build_main_system_prompt(&["read_file", "list_dir", "glob"], "", None);
         assert!(
             p.contains("Discover before reading"),
             "should include discovery-first discipline guidance"
@@ -284,7 +278,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_code_review_strategy_when_task_type_set() {
-        let p = build_main_system_prompt(&["bash", "git_diff"], "", 1.0, Some("code_review"));
+        let p = build_main_system_prompt(&["bash", "git_diff"], "", Some("code_review"));
         assert!(
             p.contains("Code Review Strategy"),
             "code_review task_type should inject review strategy"
@@ -297,7 +291,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_debugging_strategy_when_task_type_set() {
-        let p = build_main_system_prompt(&["bash", "read_file"], "", 1.0, Some("debugging"));
+        let p = build_main_system_prompt(&["bash", "read_file"], "", Some("debugging"));
         assert!(
             p.contains("Debugging Strategy"),
             "debugging task_type should inject debugging strategy"
@@ -310,7 +304,7 @@ mod tests {
 
     #[test]
     fn prompt_omits_task_strategy_for_general() {
-        let p = build_main_system_prompt(&["bash", "read_file"], "", 1.0, None);
+        let p = build_main_system_prompt(&["bash", "read_file"], "", None);
         assert!(
             !p.contains("Code Review Strategy"),
             "general should not have review strategy"
@@ -323,7 +317,7 @@ mod tests {
 
     #[test]
     fn prompt_omits_task_strategy_for_unknown_type() {
-        let p = build_main_system_prompt(&["bash"], "", 1.0, Some("planning"));
+        let p = build_main_system_prompt(&["bash"], "", Some("planning"));
         assert!(
             !p.contains("Code Review Strategy"),
             "planning should not have review strategy"
@@ -336,7 +330,7 @@ mod tests {
 
     #[test]
     fn prompt_omits_editing_guidance_without_multi_edit() {
-        let p = build_main_system_prompt(&["str_replace", "read_file"], "", 1.0, None);
+        let p = build_main_system_prompt(&["str_replace", "read_file"], "", None);
         assert!(
             !p.contains("## Editing Strategy"),
             "should not include editing section without multi_edit"
@@ -345,7 +339,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_plan_execution_guidance() {
-        let p = build_main_system_prompt(&["read_file", "bash"], "", 1.0, None);
+        let p = build_main_system_prompt(&["read_file", "bash"], "", None);
         assert!(
             p.contains("## Plan Execution"),
             "should include plan execution section"

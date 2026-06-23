@@ -1300,13 +1300,11 @@ pub async fn run_product_matrix_full_journey(
             if let Some(row) = sqlx::query(
                 "SELECT \
                      JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.turn_id')) AS turn_id, \
-                     JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_selection.selected_tools[0]')) AS selected_tool, \
-                     JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_selection.strategy')) AS strategy, \
-                     CAST(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_selection.confidence')) AS DOUBLE) AS selection_confidence \
+                     JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_surface.visible_tools[0]')) AS visible_tool \
                  FROM agent_events \
                  WHERE session_id = ? \
                    AND event_type = 'context_trace_signal' \
-                   AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_selection.selected_tools[0]')) IS NOT NULL \
+                   AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_surface.visible_tools[0]')) IS NOT NULL \
                  ORDER BY created_at DESC \
                  LIMIT 1",
             )
@@ -1335,30 +1333,13 @@ pub async fn run_product_matrix_full_journey(
     );
     assert_eq!(
         trace_row
-            .try_get::<Option<String>, _>("selected_tool")
+            .try_get::<Option<String>, _>("visible_tool")
             .ok()
             .flatten()
             .as_deref(),
         Some("read_file"),
         "context trace event should persist selected tool"
     );
-    assert!(
-        trace_row
-            .try_get::<Option<String>, _>("strategy")
-            .ok()
-            .flatten()
-            .is_some_and(|strategy| !strategy.is_empty()),
-        "context trace event should persist tool selection strategy"
-    );
-    assert!(
-        trace_row
-            .try_get::<Option<f64>, _>("selection_confidence")
-            .ok()
-            .flatten()
-            .is_some_and(|confidence| confidence >= 0.0),
-        "context trace event should persist selection confidence"
-    );
-
     let assessment_row = sqlx::query(
         "SELECT score, step_count \
          FROM eval_quality_assessments \

@@ -209,13 +209,11 @@ fn is_valid_tool_name(name: &str) -> bool {
 pub(crate) fn cached_system_prompt(
     tool_names: &[&str],
     profile_desc: &str,
-    confidence: f64,
     task_type: Option<&str>,
 ) -> String {
     prompts::build_main_system_prompt_with_style(
         tool_names,
         profile_desc,
-        confidence,
         task_type,
         current_output_style(),
     )
@@ -976,7 +974,7 @@ const SYNTHETIC_TOOL_INTERRUPTED_CONTENT: &str = "[tool execution not recorded]"
 /// 3. Duplicate tool_call_id within one tool-group (retry artifact). Bedrock:
 ///    duplicate-id 400.
 ///
-/// This mirrors claudecode's `ensureToolResultPairing` but operates on OpenAI
+/// This mirrors the reference agent's `ensureToolResultPairing` but operates on OpenAI
 /// wire format (role=tool messages) instead of Anthropic blocks.
 pub(crate) fn repair_openai_tool_pairing(messages: &[Value]) -> Vec<Value> {
     let mut repaired: Vec<Value> = Vec::with_capacity(messages.len());
@@ -4600,23 +4598,16 @@ mod tests {
 
     #[test]
     fn cached_system_prompt_is_deterministic() {
-        let p1 = cached_system_prompt(&["bash"], "", 0.8, Some("code"));
-        let p2 = cached_system_prompt(&["bash"], "", 0.8, Some("code"));
+        let p1 = cached_system_prompt(&["bash"], "", Some("code"));
+        let p2 = cached_system_prompt(&["bash"], "", Some("code"));
         assert_eq!(p1, p2);
     }
 
     #[test]
     fn cached_system_prompt_varies_by_profile() {
-        let p1 = cached_system_prompt(&["bash"], "", 0.8, Some("code"));
-        let p2 = cached_system_prompt(&["bash"], "cwd: /tmp", 0.8, Some("code"));
+        let p1 = cached_system_prompt(&["bash"], "", Some("code"));
+        let p2 = cached_system_prompt(&["bash"], "cwd: /tmp", Some("code"));
         assert_ne!(p1, p2);
-    }
-
-    #[test]
-    fn cached_system_prompt_varies_by_confidence_bucket() {
-        let low = cached_system_prompt(&["bash"], "", 0.1, None);
-        let normal = cached_system_prompt(&["bash"], "", 0.5, None);
-        assert_ne!(low, normal);
     }
 
     #[test]
@@ -7648,7 +7639,7 @@ mod tests {
         // carries one response (e.g. stream was cut mid-execution on resume).
         // Bedrock would reject with "Expected toolResult blocks for the
         // following Ids: call_b". Pre-send repair must synthesize an error
-        // tool_result so the model context stays valid — matching claudecode's
+        // tool_result so the model context stays valid — matching the reference agent's
         // ensureToolResultPairing repair behavior.
         let messages = vec![
             json!({

@@ -1183,13 +1183,7 @@ impl AutoTuningEngine {
 
 fn get_config_value(config: &RuntimeConfig, path: &str) -> Option<serde_json::Value> {
     match path {
-        "tool_selection.confidence_threshold" => Some(serde_json::json!(
-            config.tool_selection.confidence_threshold
-        )),
-        "tool_selection.max_tools" => Some(serde_json::json!(config.tool_selection.max_tools)),
-        "tool_selection.tool_budget_tokens" => {
-            Some(serde_json::json!(config.tool_selection.tool_budget_tokens))
-        }
+        "tool_policy.max_tools" => Some(serde_json::json!(config.tool_policy.max_tools)),
         "token_budget.max_prompt_tokens" => {
             Some(serde_json::json!(config.token_budget.max_prompt_tokens))
         }
@@ -1220,19 +1214,9 @@ fn get_config_value(config: &RuntimeConfig, path: &str) -> Option<serde_json::Va
 
 fn apply_config_value(config: &mut RuntimeConfig, path: &str, value: &serde_json::Value) {
     match path {
-        "tool_selection.confidence_threshold" => {
-            if let Some(v) = value.as_f64() {
-                config.tool_selection.confidence_threshold = v.clamp(0.0, 1.0);
-            }
-        }
-        "tool_selection.max_tools" => {
+        "tool_policy.max_tools" => {
             if let Some(v) = value.as_u64() {
-                config.tool_selection.max_tools = (v as u32).clamp(1, 256);
-            }
-        }
-        "tool_selection.tool_budget_tokens" => {
-            if let Some(v) = value.as_u64() {
-                config.tool_selection.tool_budget_tokens = (v as u32).clamp(0, 5000);
+                config.tool_policy.max_tools = (v as u32).clamp(1, 256);
             }
         }
         "token_budget.max_prompt_tokens" => {
@@ -1331,26 +1315,6 @@ pub fn load_feedback(profile: &str, engine: &AutoTuningEngine) -> Result<bool, S
 /// Create default evolution rules.
 pub fn default_rules() -> Vec<EvolutionRule> {
     vec![
-        // Low success rate → increase confidence threshold
-        EvolutionRule::new(
-            "low-success-boost-confidence",
-            EvolutionTrigger::LowSuccessRate {
-                threshold: 0.7,
-                window_secs: 3600,
-                min_samples: 10,
-            },
-            EvolutionAction::AdjustConfig {
-                path: "tool_selection.confidence_threshold".to_string(),
-                delta: 0.05,
-                min: Some(0.5),
-                max: Some(0.95),
-            },
-        )
-        .with_name("Boost confidence on low success")
-        .with_rollback(RollbackCondition::SuccessRateDrops {
-            threshold: 0.6,
-            window_secs: 1800,
-        }),
         // High retry rate → reduce max tools
         EvolutionRule::new(
             "high-retry-reduce-tools",
@@ -1360,7 +1324,7 @@ pub fn default_rules() -> Vec<EvolutionRule> {
                 min_samples: 10,
             },
             EvolutionAction::AdjustConfig {
-                path: "tool_selection.max_tools".to_string(),
+                path: "tool_policy.max_tools".to_string(),
                 delta: -2.0,
                 min: Some(3.0),
                 max: Some(15.0),
@@ -1458,7 +1422,7 @@ pub fn default_rules() -> Vec<EvolutionRule> {
         // "80K→60K budget starvation" (session fea922a7) — the agent
         // never recovered from the shrinkage.
         //
-        // Claude Code's architecture: no per-turn budget cap reduction.
+        // the reference agent's architecture: no per-turn budget cap reduction.
         // When tokens approach the context window, auto-compact fires
         // (already implemented in handle_token_budget). The compact-and-
         // continue logic is the correct pressure relief; dynamically
@@ -1831,7 +1795,7 @@ mod tests {
                 min_samples: 10,
             },
             EvolutionAction::AdjustConfig {
-                path: "tool_selection.confidence_threshold".to_string(),
+                path: "compression.compression_threshold".to_string(),
                 delta: 0.05,
                 min: None,
                 max: None,
@@ -1876,10 +1840,10 @@ mod tests {
     fn test_config_adjustment() {
         let engine = AutoTuningEngine::new();
         let mut config = RuntimeConfig::default();
-        let initial_threshold = config.tool_selection.confidence_threshold;
+        let initial_threshold = config.compression.compression_threshold;
 
         let action = EvolutionAction::AdjustConfig {
-            path: "tool_selection.confidence_threshold".to_string(),
+            path: "compression.compression_threshold".to_string(),
             delta: 0.1,
             min: Some(0.5),
             max: Some(0.95),
@@ -1896,13 +1860,12 @@ mod tests {
         assert_eq!(executions.len(), 1);
 
         // Check the threshold was adjusted
-        // Since initial is 0.3, delta is 0.1, but min is 0.5, result should be clamped to 0.5
         let expected = (initial_threshold + 0.1).clamp(0.5, 0.95);
         assert!(
-            (config.tool_selection.confidence_threshold - expected).abs() < 0.001,
+            (config.compression.compression_threshold - expected).abs() < 0.001,
             "Expected {}, got {}, initial was {}",
             expected,
-            config.tool_selection.confidence_threshold,
+            config.compression.compression_threshold,
             initial_threshold
         );
     }

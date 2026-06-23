@@ -296,13 +296,13 @@ mod tests {
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
             boosted_tools: HashSet::new(),
-            widen_selection_pending: false,
+            widen_surface_pending: false,
             step_recorder: StepRecorder::new("test-user", "test", "run"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
             call_counts: HashMap::new(),
             max_identical_tool_calls: astra_config::runtime_config::RuntimeConfig::load()
-                .tool_selection
+                .tool_policy
                 .effective_max_identical_calls(),
             max_tools_per_turn: 15,
             repeated_cache_hit_suppression: 3,
@@ -352,7 +352,6 @@ mod tests {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,

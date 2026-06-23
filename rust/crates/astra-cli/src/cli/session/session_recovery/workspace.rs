@@ -46,23 +46,18 @@ pub(crate) fn sync_session_state_to_workspace(
 pub(crate) fn context_trace_signal_from_trace(
     trace: &astra_turn_core::context_assembly_trace::ContextAssemblyTrace,
 ) -> astra_services::session_workspace::ContextTraceSignal {
-    let tool_selection = (!trace.tools.selection_strategy.is_empty()
-        || !trace.tools.tools_selected.is_empty()
-        || trace.tools.tools_available > 0)
+    let tool_surface = (!trace.tools.visible_tools.is_empty() || trace.tools.tools_available > 0)
         .then(
-            || astra_services::session_workspace::ContextTraceToolSelection {
+            || astra_services::session_workspace::ContextTraceToolSurface {
                 tools_available: trace.tools.tools_available,
-                selected_tools: trace
+                visible_tools: trace
                     .tools
-                    .tools_selected
+                    .visible_tools
                     .iter()
                     .map(|tool| tool.tool_name.clone())
                     .collect(),
-                selection_scope: "latest_round".to_string(),
-                rejected_tools: trace.tools.tools_rejected.len(),
-                strategy: trace.tools.selection_strategy.clone(),
-                confidence: trace.tools.selection_confidence,
-                latency_ms: trace.tools.selection_latency_ms,
+                surface_scope: "latest_round".to_string(),
+                latency_ms: trace.tools.surface_latency_ms,
             },
         );
     let memory = (!trace.memory.query.trim().is_empty()
@@ -110,7 +105,7 @@ pub(crate) fn context_trace_signal_from_trace(
     astra_services::session_workspace::ContextTraceSignal {
         turn_id: trace.turn_id.clone(),
         captured_at: Some(chrono::DateTime::<chrono::Utc>::from(trace.timestamp).to_rfc3339()),
-        tool_selection,
+        tool_surface,
         memory,
         history,
         budget,

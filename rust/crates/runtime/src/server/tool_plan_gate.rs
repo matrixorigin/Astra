@@ -15,7 +15,7 @@ pub(crate) struct PlanModeSnapshot {
 }
 
 /// Tools that mutate the world outside the session. Blocked while plan mode
-/// is active (`PlanPhase` = Planning|Refining) to mirror Claude Code's
+/// is active (`PlanPhase` = Planning|Refining) to mirror the reference agent's
 /// `prepareContextForPlanMode` behaviour: the model must call ExitPlanMode
 /// before writing anything.
 ///
@@ -31,7 +31,7 @@ pub(crate) fn plan_mode_blocked_tool_result(tool: &str) -> astra_tools::ToolResu
     astra_tools::ToolResult::error(format!(
         "Tool '{tool}' is blocked while plan mode is active. \
          The agent must call `exit_plan_mode` with an approved plan \
-         before any write operation. This mirrors Claude Code's plan \
+         before any write operation. This mirrors the reference agent's plan \
          mode: the plan is authored with read-only tools, approved by \
          the user, then execution proceeds with writes unlocked."
     ))

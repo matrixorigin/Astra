@@ -19,10 +19,10 @@
 //! - `tool-failures` — a specific tool keeps returning errors. Expect
 //!   `FailureCategory::ToolFailures` + `block_tools` non-empty.
 //! - `stall` — the same tool set repeats for 3+ rounds with no new work.
-//!   Expect `FailureCategory::Stall` + `widen_selection` + context
+//!   Expect `FailureCategory::Stall` + `widen_surface` + context
 //!   injection.
 //! - `no-progress` — tools succeed but `final_text` stays empty. Expect
-//!   `FailureCategory::NoProgress` + context injection. `widen_selection`
+//!   `FailureCategory::NoProgress` + context injection. `widen_surface`
 //!   is irrelevant here so is NOT asserted (pins behaviour without
 //!   over-specifying).
 //!
@@ -162,7 +162,7 @@ fn matrix_tool_failure_blocks_primary_tool_for_every_persona() {
             delta.block_tools
         );
         assert!(
-            delta.widen_selection,
+            delta.widen_surface,
             "persona={} tool-failures workload must widen selection",
             persona.name
         );
@@ -177,7 +177,7 @@ fn matrix_stall_triggers_widen_and_injects_context_for_every_persona() {
         let delta = compute_strategy_delta(&state, category);
 
         assert!(
-            delta.widen_selection,
+            delta.widen_surface,
             "persona={} stall must widen selection",
             persona.name
         );

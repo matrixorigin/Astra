@@ -605,7 +605,7 @@ pub fn is_file_mutation_tool(name: &str) -> bool {
 
 // ── Args-aware classification ─────────────────────────────────────────
 //
-// Claude Code's killer feature: `bash "git status"` is safe to run in
+// the reference agent's killer feature: `bash "git status"` is safe to run in
 // parallel and needs no approval, while `bash "rm -rf"` is serial and
 // gated. This struct captures all classification dimensions in one call
 // so callers never disagree.

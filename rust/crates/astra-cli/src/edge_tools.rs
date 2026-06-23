@@ -1640,6 +1640,21 @@ impl ToolExecutor {
         }
     }
 
+    pub(crate) fn runtime_bound_plugin_schemas_excluding(
+        &self,
+        restricted_tools: &HashSet<String>,
+    ) -> Vec<Value> {
+        let plugin_schemas: Vec<Value> = self
+            .plugin_schemas_snapshot("plugin_schemas_deferred_manifest")
+            .into_iter()
+            .filter(|schema| {
+                astra_turn_core::tool::schema::tool_schema_name(schema)
+                    .is_none_or(|name| !restricted_tools.contains(name))
+            })
+            .collect();
+        self.runtime_bound_tool_schemas(plugin_schemas)
+    }
+
     pub(super) fn plugin_schemas_snapshot(&self, label: &str) -> Vec<Value> {
         rwlock_read_clone_or_default(&self.plugin_schemas, label)
     }
@@ -3424,7 +3439,7 @@ impl ToolExecutor {
             ));
         }
         // Task status nudge: if there is open work, remind the
-        // agent to update them (Claude Code parity: proactive nudge).
+        // agent to update them (reference-agent parity: proactive nudge).
         match self.task_manager.load_tasks().await {
             Ok(tasks) => {
                 let open_tasks: Vec<_> = tasks.iter().filter(|t| t.status.is_open_work()).collect();
@@ -4610,7 +4625,7 @@ impl ToolExecutor {
             format!(
                 "Error: Tool '{name}' is blocked while plan mode is active. \
                  The agent must call `exit_plan_mode` with an approved plan \
-                 before any write operation. This mirrors Claude Code's plan \
+                 before any write operation. This mirrors the reference agent's plan \
                  mode: the plan is authored with read-only tools, approved by \
                  the user, then execution proceeds with writes unlocked."
             )
@@ -5575,22 +5590,22 @@ impl ToolExecutor {
         let obs_session = self.observability_session.as_ref()?;
         let session = obs_session.read().ok()?;
 
-        let selected_tools: Vec<String> = session
+        let visible_tools: Vec<String> = session
             .context_traces
             .last()
             .map(|trace| {
                 trace
                     .tools
-                    .tools_selected
+                    .visible_tools
                     .iter()
                     .map(|tool| tool.tool_name.clone())
                     .collect()
             })
             .unwrap_or_default();
-        let tool_name_strs = if selected_tools.is_empty() {
+        let tool_name_strs = if visible_tools.is_empty() {
             self.tool_names()
         } else {
-            selected_tools
+            visible_tools
         };
         let tool_name_refs: Vec<&str> = tool_name_strs.iter().map(|s| s.as_str()).collect();
         let pinned_tools = self
@@ -7009,6 +7024,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn runtime_bound_plugin_schemas_excluding_filters_restricted_plugins() {
+        let executor = test_executor();
+        executor.set_plugin_schemas(vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "custom_weather",
+                "description": "Get weather for a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        })]);
+
+        let unrestricted = executor.runtime_bound_plugin_schemas_excluding(&HashSet::new());
+        assert_eq!(
+            astra_turn_core::tool::schema::tool_names_from_schemas(&unrestricted),
+            HashSet::from(["custom_weather".to_string()])
+        );
+
+        let restricted = executor
+            .runtime_bound_plugin_schemas_excluding(&HashSet::from(["custom_weather".to_string()]));
+        assert!(
+            restricted.is_empty(),
+            "restricted dynamic plugin schemas must not be advertised as deferred"
+        );
+    }
+
     #[tokio::test]
     async fn direct_mcp_call_without_runtime_binding_names_recovery_path() {
         let executor = test_executor();
@@ -7138,7 +7183,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_search_select_web_fetch_returns_schema_on_cli_path() {
-        // web_fetch is DEFERRED (not in DEFAULT_PINNED). The whole point
+        // web_fetch is deferred by default. The whole point
         // of this test is to exercise the deferred activation flow.
         let executor = test_executor();
         let out = executor

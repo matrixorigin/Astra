@@ -14,7 +14,7 @@
 //!    dependent (Sonnet 4.6 gets 800k; 128k-window models get 102k).
 //!    Users should not have to run a code audit to discover that.
 //!
-//! C. `/config edit` — interactive TUI edit flow. Follows Claude Code's
+//! C. `/config edit` — interactive TUI edit flow. Follows the reference agent's
 //!    Config.tsx model: flat list of { id, label, type, value, onChange }
 //!    items, filtered by a search query, dispatched to per-type editors
 //!    (bool toggle / enum select / number input). Per-source snapshot

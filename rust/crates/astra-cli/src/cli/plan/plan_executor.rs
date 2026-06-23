@@ -1638,8 +1638,8 @@ async fn plan_executor_task(
                             result.completion_tokens,
                             subtask_start.elapsed().as_millis() as u64,
                         )
-                        .with_tool_selection(
-                            result.tools_selected.clone(),
+                        .with_tool_surface(
+                            result.visible_tools.clone(),
                             result.selected_skills.clone(),
                             result.tools_used.clone(),
                             result.budget_used,
@@ -2298,7 +2298,7 @@ mod tests {
     }
 
     // Test `background_selector_without_pipeline_modules_still_selects` removed:
-    // tool selector has been deleted — tool schemas are sent in full each turn.
+    // Tool schemas are surfaced by the current deterministic tool-surface path.
 
     #[test]
     fn turn_retry_counts_increments_correctly() {
@@ -3747,7 +3747,7 @@ All acceptance checks pass:
     }
 
     #[test]
-    fn turn_event_carries_tool_selection_and_budget_telemetry() {
+    fn turn_event_carries_tool_surface_and_budget_telemetry() {
         let result = StreamResult {
             session_id: None,
             run_id: None,
@@ -3758,7 +3758,7 @@ All acceptance checks pass:
             cache_read_tokens: 17,
             cache_creation_tokens: 9,
             tool_calls_count: 2,
-            tools_selected: vec!["read_file".into(), "write_file".into()],
+            visible_tools: vec!["read_file".into(), "write_file".into()],
             selected_skills: vec!["debug".into()],
             tools_used: vec!["read_file".into(), "write_file".into()],
             tool_call_records: vec![
@@ -3808,8 +3808,8 @@ All acceptance checks pass:
             result.completion_tokens,
             2000,
         )
-        .with_tool_selection(
-            result.tools_selected.clone(),
+        .with_tool_surface(
+            result.visible_tools.clone(),
             result.selected_skills.clone(),
             result.tools_used.clone(),
             result.budget_used,
@@ -3837,7 +3837,7 @@ All acceptance checks pass:
         }
 
         assert_eq!(
-            turn_evt.tools_selected,
+            turn_evt.visible_tools,
             Some(vec!["read_file".into(), "write_file".into()])
         );
         assert_eq!(turn_evt.selected_skills, Some(vec!["debug".into()]));

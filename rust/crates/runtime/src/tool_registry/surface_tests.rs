@@ -1,9 +1,7 @@
-//! Phase-1 red tests for the new `ToolSurface` API.
+//! Contract tests for the `ToolSurface` API.
 //!
-//! This file exists to drive TDD for the tool-surfacing rewrite. Every test
-//! exercises the *target* shape of the API — not the current one — so these
-//! tests are expected to fail (or not compile) until the matching impl
-//! lands. See `docs/plans/` and `memory/project_tool_surface_rewrite.md`.
+//! These tests pin the current deterministic pinned/deferred model. See
+//! `plans/tool-surface-deferred-simplification-2026-06-23.md`.
 //!
 //! Contracts under test:
 //!   1. Default T1 (pinned) members are a configurable set — not the
@@ -19,7 +17,7 @@
 
 #![cfg(test)]
 
-use crate::tool_registry::surface::{DEFAULT_PINNED, DeferredEntry, ToolSurface};
+use crate::tool_registry::surface::{DeferredEntry, ToolSurface, default_pinned_names};
 use astra_config::ToolSurfaceConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_registry_meta::TOOL_CATALOG;
@@ -63,17 +61,18 @@ fn every_default_pin_has_a_schema_in_the_canonical_pool() {
     let schema_names: std::collections::HashSet<String> =
         names(&catalog_schemas()).into_iter().collect();
 
-    for pinned in DEFAULT_PINNED {
+    for pinned in default_pinned_names() {
         assert!(
             schema_names.contains(*pinned),
-            "DEFAULT_PINNED contains {pinned}, but the canonical schema pool has no schema for it"
+            "default pinned identity contains {pinned}, but the canonical schema pool has no schema for it"
         );
     }
 }
 
 #[test]
 fn catalog_pinned_metadata_matches_runtime_default_surface_for_catalog_tools() {
-    let default_pinned: std::collections::HashSet<&str> = DEFAULT_PINNED.iter().copied().collect();
+    let default_pinned: std::collections::HashSet<&str> =
+        default_pinned_names().iter().copied().collect();
     let catalog_default_pinned: std::collections::BTreeSet<&str> = TOOL_CATALOG
         .iter()
         .filter(|tool| default_pinned.contains(tool.name))
@@ -87,12 +86,12 @@ fn catalog_pinned_metadata_matches_runtime_default_surface_for_catalog_tools() {
 
     assert_eq!(
         catalog_metadata_pinned, catalog_default_pinned,
-        "catalog pinned metadata must not drift from runtime DEFAULT_PINNED for catalog-backed tools"
+        "catalog pinned metadata must not drift from runtime default pinned identities for catalog-backed tools"
     );
 }
 
 /// The default pinned set is the 13-member core.
-/// See `DEFAULT_PINNED` comment for rationale per-entry.
+/// See `tool_registry::identity` for the per-tool classification.
 #[test]
 fn pinned_default_members_are_the_core_set() {
     let cfg = ToolSurfaceConfig::default();
@@ -252,7 +251,7 @@ fn deferred_list_contains_every_non_pinned_tool() {
 }
 
 #[test]
-fn deferred_list_excludes_final_visible_tools_even_when_not_default_pinned() {
+fn deferred_catalog_stays_stable_when_catalog_tools_are_visible() {
     let cfg = ToolSurfaceConfig::default();
     let visible = std::collections::HashSet::from([
         "enter_plan_mode".to_string(),
@@ -279,6 +278,46 @@ fn deferred_list_excludes_final_visible_tools_even_when_not_default_pinned() {
     assert!(
         deferred.is_disjoint(&pinned_from_config),
         "pinned tools must never appear in deferred; pinned={pinned_from_config:?} deferred={deferred:?}"
+    );
+}
+
+#[test]
+fn visible_plugin_is_filtered_even_when_mixed_into_catalog_pool() {
+    let cfg = ToolSurfaceConfig::default();
+    let plugin = plugin_schema("mcp__weather", "Get weather for a city.");
+    let mut mixed_catalog = catalog_schemas();
+    mixed_catalog.push(plugin.clone());
+    let visible = std::collections::HashSet::from(["mcp__weather".to_string()]);
+
+    let surface = ToolSurface::build_excluding_visible(mixed_catalog, &cfg, &[plugin], &visible);
+
+    assert!(
+        !surface
+            .deferred()
+            .iter()
+            .any(|entry| entry.name == "mcp__weather"),
+        "visible plugin schemas must not also remain activatable in deferred"
+    );
+}
+
+#[test]
+fn non_visible_plugin_is_deferred_once_when_mixed_into_catalog_pool() {
+    let cfg = ToolSurfaceConfig::default();
+    let plugin = plugin_schema("mcp__weather", "Get weather for a city.");
+    let mut mixed_catalog = catalog_schemas();
+    mixed_catalog.push(plugin.clone());
+    let visible = std::collections::HashSet::new();
+
+    let surface = ToolSurface::build_excluding_visible(mixed_catalog, &cfg, &[plugin], &visible);
+    let count = surface
+        .deferred()
+        .iter()
+        .filter(|entry| entry.name == "mcp__weather")
+        .count();
+
+    assert_eq!(
+        count, 1,
+        "plugin schemas should be represented by the dynamic plugin pool, not duplicated through mixed catalog input"
     );
 }
 
@@ -400,7 +439,7 @@ fn deferred_manifest_exists_when_every_tool_is_visible() {
 
     // Deferred set is STABLE per session — it persists even when every tool
     // is marked visible. The system prompt's <deferred_tools> block must
-    // remain byte-stable (CacheScope::Session) regardless of selector picks.
+    // remain byte-stable (CacheScope::Session) regardless of tool surface includes.
     assert!(
         !surface.deferred().is_empty(),
         "deferred set must persist even when all tools are referenced as visible"

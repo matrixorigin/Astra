@@ -238,7 +238,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         // Resolve per-model workflow-guard policy up front; `effective_model`
         // is moved into the SubRunHost below.
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_selection
+            .tool_policy
             .resolve_for_model(effective_model.as_deref());
 
         let all_schemas = edge_tools::all_tool_schemas();
@@ -409,7 +409,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             boosted_tools: HashSet::new(),
-            widen_selection_pending: false,
+            widen_surface_pending: false,
             step_recorder,
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(
@@ -503,7 +503,6 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,

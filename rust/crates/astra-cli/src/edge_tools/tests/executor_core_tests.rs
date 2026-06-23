@@ -1127,7 +1127,7 @@ async fn execute_reflect_uses_local_surface_with_session() {
     ws.last_context_trace = Some(ContextTraceSignal {
         turn_id: "turn-3".to_string(),
         captured_at: Some(Utc::now().to_rfc3339()),
-        tool_selection: None,
+        tool_surface: None,
         memory: None,
         history: None,
         budget: Some(
@@ -1163,7 +1163,7 @@ async fn execute_reflect_uses_local_surface_with_session() {
             config_value: None,
             turns_compacted: None,
             facts_stored: None,
-            tools_selected: Some(vec!["bash".to_string()]),
+            visible_tools: Some(vec!["bash".to_string()]),
             selected_skills: None,
             tools_used: Some(vec!["bash".to_string()]),
             tool_calls: Some(vec![session_journal::ToolCallRecord {
@@ -1193,7 +1193,6 @@ async fn execute_reflect_uses_local_surface_with_session() {
             session_lineage: None,
             coordination: None,
             edge_policy: None,
-            selection_trace: None,
             context_assembly_trace: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,

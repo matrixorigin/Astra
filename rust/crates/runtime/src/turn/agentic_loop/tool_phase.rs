@@ -1094,7 +1094,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     //
     //   round 1 post-wrap-up: physical lockout — drop the tool_calls,
     //     populate `restricted_tools` (same mechanism as
-    //     `round_budget_phase1_message`), inject a short terminal reminder,
+    //     `tool_round_hard_stop_message`), inject a short terminal reminder,
     //     and continue the loop so the model gets one more LLM call to
     //     produce text.
     //   round 2+ post-wrap-up: abort the turn with an interruption. One
@@ -1120,9 +1120,9 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                     ),
                 );
             }
-            // Physical lockout: tool_selector + policy.rs both consult
-            // `restricted_tools`. Any tool call the model emits on the
-            // next round will be filtered / blocked rather than executed.
+            // Physical lockout: the host policy consults `restricted_tools`.
+            // Any tool call the model emits on the next round will be
+            // filtered / blocked rather than executed.
             for name in host.valid_tool_names() {
                 state.restricted_tools.insert(name.clone());
             }
@@ -1934,7 +1934,7 @@ fn build_introspect_snapshot(
         forced_redundant_reads_corrective: state.stall.forced_redundant_reads_corrective,
         forced_cache_waste_corrective: state.stall.forced_cache_waste_corrective,
         forced_search_fanout_corrective: state.stall.forced_search_fanout_corrective,
-        forced_exploration_family_phase2: state.stall.forced_exploration_family_phase2,
+        forced_exploration_family_lockout: state.stall.forced_exploration_family_lockout,
         forced_exploration_family_corrective: state.stall.forced_exploration_family_corrective,
         forced_completion_soft_stop: state.stall.forced_completion_soft_stop,
     };

@@ -2,22 +2,26 @@ use serde_json::Value;
 
 use astra_config::ToolSurfaceConfig;
 
-use super::scoring::{DEFAULT_TOOL_BUDGET_TOKENS, FilterOptions, pre_filter_dynamic};
-use crate::pipeline::routing::{RoutingDecision, ToolFilter};
-use astra_turn_core::routing_metrics::ConfidenceCalibrator;
+use super::DEFAULT_TOOL_BUDGET_TOKENS;
 use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_registry_meta::{TOOL_CATALOG, ToolMeta};
-use astra_turn_core::tool_registry_report::{SelectionReport, ToolQualityTracker};
+use astra_turn_core::tool_registry_report::ToolSurfaceReport;
 use astra_turn_core::tool_registry_state::ConversationState;
 
-use super::tool_pool::sort_schemas_by_name;
+fn sort_schemas_by_name(schemas: &mut [Value]) {
+    schemas.sort_by(|a, b| {
+        let a_name = tool_schema_name(a).unwrap_or("");
+        let b_name = tool_schema_name(b).unwrap_or("");
+        a_name.cmp(b_name)
+    });
+}
 
-/// The main tool selection interface.
+/// The main tool surface interface.
 ///
 /// ```text
 /// let registry = ToolRegistry::new(all_tool_schemas());
-/// let selected = registry.select("matrixorigin memoria最新的pr?", 1);
-/// // selected contains: 7 pinned + relevant dynamic tools within budget
+/// let surface = registry.build_pinned_surface("matrixorigin memoria最新的pr?", 1);
+/// // surface contains the stable pinned tools; deferred tools are activated explicitly
 /// ```
 pub struct ToolRegistry {
     all_schemas: Vec<Value>,
@@ -37,8 +41,6 @@ pub struct ToolRegistry {
     /// Avoids reconstructing a `HashSet<String>` (cloning ~14 names) on every
     /// selection path — 2-3 calls per turn previously.
     pinned_name_cache: std::collections::HashSet<String>,
-    /// Plugin tool names (registered dynamically, always included in selection).
-    plugin_tool_names: Vec<String>,
 }
 
 impl ToolRegistry {
@@ -82,7 +84,6 @@ impl ToolRegistry {
             pinned_schemas,
             pinned_sorted: std::sync::Arc::new(pinned_sorted),
             pinned_name_cache,
-            plugin_tool_names: Vec::new(),
         }
     }
 
@@ -160,13 +161,6 @@ impl ToolRegistry {
         &self.pinned_schemas
     }
 
-    /// Borrow the cached set of pinned tool names. Rebuilt alongside
-    /// `pinned_sorted` whenever the pinned set mutates, so this is O(1)
-    /// and allocation-free per call.
-    fn pinned_name_set(&self) -> &std::collections::HashSet<String> {
-        &self.pinned_name_cache
-    }
-
     /// Return the resolved pinned tool names in stable order for cross-crate
     /// wire metadata. The internal cache remains a set because hot-path
     /// membership checks should stay O(1).
@@ -174,19 +168,6 @@ impl ToolRegistry {
         let mut names: Vec<String> = self.pinned_name_cache.iter().cloned().collect();
         names.sort();
         names
-    }
-
-    fn dynamic_budget_used_for_names(&self, names: &[String]) -> u32 {
-        names.iter().map(|name| self.token_cost(name)).sum()
-    }
-
-    fn dynamic_names_for_selected(&self, names: &[String]) -> Vec<String> {
-        let pinned_names = self.pinned_name_set();
-        names
-            .iter()
-            .filter(|name| !pinned_names.contains(*name))
-            .cloned()
-            .collect()
     }
 
     /// Total measured token cost of all pinned tool schemas.
@@ -207,33 +188,33 @@ impl ToolRegistry {
         })
     }
 
-    /// Select tools for a given user query and conversation turn.
+    /// Build the visible tool surface for a given user query and conversation turn.
     ///
     /// Returns tool schemas to include in the LLM request.
-    /// Pinned tools are always included. Dynamic tools are ranked by
-    /// relevance and added within the token budget.
-    pub fn select(&self, query: &str, turn_count: u32) -> Vec<Value> {
-        self.select_with_budget(query, turn_count, self.budget_tokens)
+    /// Pinned tools are included deterministically. Non-pinned built-ins are
+    /// deferred and must be activated explicitly through `tool_search`.
+    pub fn build_pinned_surface(&self, query: &str, turn_count: u32) -> Vec<Value> {
+        self.build_pinned_surface_with_budget(query, turn_count, self.budget_tokens)
     }
 
-    /// Select tools with a custom token budget, returning both schemas and a report.
-    pub fn select_with_report(
+    /// Build a tool surface with a custom token budget, returning both schemas and a report.
+    pub fn build_pinned_surface_with_report(
         &self,
         query: &str,
         turn_count: u32,
         budget: u32,
-    ) -> (Vec<Value>, SelectionReport) {
-        self.select_with_report_ctx(query, turn_count, budget, &[])
+    ) -> (Vec<Value>, ToolSurfaceReport) {
+        self.build_pinned_surface_with_report_ctx(query, turn_count, budget, &[])
     }
 
-    /// Select tools with context from recent turns (for recency boost).
-    pub fn select_with_report_ctx(
+    /// Build a tool surface with context from recent turns.
+    pub fn build_pinned_surface_with_report_ctx(
         &self,
         query: &str,
         turn_count: u32,
         budget: u32,
         recent_tools: &[String],
-    ) -> (Vec<Value>, SelectionReport) {
+    ) -> (Vec<Value>, ToolSurfaceReport) {
         let state = ConversationState::from_message_with_context(query, turn_count, recent_tools);
 
         // Conversational short-circuit: pure greetings/acks need no tools.
@@ -247,317 +228,56 @@ impl ToolRegistry {
             && !state.references_history
             && state.recent_tools.is_empty()
         {
-            let report = SelectionReport {
-                tools_selected: Vec::new(),
-                dynamic_tools_selected: Vec::new(),
-                selected_count: 0,
+            let report = ToolSurfaceReport {
+                visible_tools: Vec::new(),
+                visible_count: 0,
                 budget_used: 0,
                 budget_total: budget,
             };
             return (Vec::new(), report);
         }
 
-        let pinned_names = self.pinned_name_set();
-        let filter = FilterOptions {
-            pinned_names: Some(pinned_names),
-            ..Default::default()
-        };
-        let ranked = pre_filter_dynamic(&state, query, &filter);
-        let schemas = self.budget_select_measured(&ranked, budget);
-        let names = Self::selected_names(&schemas);
-        let dynamic_tools_selected = self.dynamic_names_for_selected(&names);
+        let schemas = self.pinned_only();
+        let names = Self::visible_names(&schemas);
 
-        let budget_used = self.dynamic_budget_used_for_names(&dynamic_tools_selected);
-
-        // Observability: dynamic path — record the top-ranked
-        // candidates before budget trimming so a reviewer can see
-        // WHY a tool was excluded (scored too low vs. priced out).
-        // Cap the top list at 10 to keep lines bounded.
-
-        let report = SelectionReport {
-            selected_count: schemas.len() as u32,
-            tools_selected: names,
-            dynamic_tools_selected,
-            budget_used,
+        let report = ToolSurfaceReport {
+            visible_count: schemas.len() as u32,
+            visible_tools: names,
+            budget_used: 0,
             budget_total: budget,
         };
 
         (schemas, report)
     }
 
-    /// Select tools with a custom token budget.
-    pub fn select_with_budget(&self, query: &str, turn_count: u32, budget: u32) -> Vec<Value> {
-        let (schemas, _report) = self.select_with_report(query, turn_count, budget);
-        schemas
-    }
-
-    /// Select tools with quality-aware scoring: uses historical effectiveness
-    /// data from the tracker to boost/penalize tool rankings.
-    pub fn select_with_quality(
+    /// Build a tool surface with a custom token budget.
+    pub fn build_pinned_surface_with_budget(
         &self,
         query: &str,
         turn_count: u32,
         budget: u32,
-        recent_tools: &[String],
-        quality_tracker: Option<&ToolQualityTracker>,
-    ) -> (Vec<Value>, SelectionReport) {
-        let state = ConversationState::from_message_with_context(query, turn_count, recent_tools);
-
-        if state.is_conversational
-            && !state.is_fetch
-            && !state.is_mutate
-            && !state.is_analytical
-            && !state.references_history
-            && state.recent_tools.is_empty()
-        {
-            let report = SelectionReport {
-                tools_selected: Vec::new(),
-                dynamic_tools_selected: Vec::new(),
-                selected_count: 0,
-                budget_used: 0,
-                budget_total: budget,
-            };
-            return (Vec::new(), report);
-        }
-
-        let pinned_names = self.pinned_name_set();
-        let filter = FilterOptions {
-            pinned_names: Some(pinned_names),
-            quality_tracker,
-            ..Default::default()
-        };
-        let ranked = pre_filter_dynamic(&state, query, &filter);
-        let schemas = self.budget_select_measured(&ranked, budget);
-        let names = Self::selected_names(&schemas);
-        let dynamic_tools_selected = self.dynamic_names_for_selected(&names);
-
-        let budget_used = self.dynamic_budget_used_for_names(&dynamic_tools_selected);
-
-        let report = SelectionReport {
-            selected_count: schemas.len() as u32,
-            tools_selected: names,
-            dynamic_tools_selected,
-            budget_used,
-            budget_total: budget,
-        };
-
-        (schemas, report)
+    ) -> Vec<Value> {
+        let (schemas, _report) = self.build_pinned_surface_with_report(query, turn_count, budget);
+        schemas
     }
-    /// Pipeline-integrated selection using a pre-computed RoutingDecision.
+
+    /// Pipeline-integrated tool surface using a pre-computed RoutingDecision.
     ///
-    /// This is the new preferred entry point for tool selection. It uses
-    /// the RoutingDecision's embedded ConversationState for backward-compatible
-    /// TF-IDF scoring, while leveraging the enriched routing intelligence
-    /// (task type, domain, confidence, tool filter) for better decisions.
-    ///
-    /// ```text
-    /// let routing = RoutingEngine::analyze(query, turn, &recent, &hints, boost);
-    /// let (schemas, report) = registry.select_routed(query, &routing, 800, &[], None, None);
-    /// ```
-    pub fn select_routed(
-        &self,
-        query: &str,
-        routing: &RoutingDecision,
-        budget: u32,
-        extra_boost_terms: &[String],
-        quality_tracker: Option<&ToolQualityTracker>,
-        calibrator: Option<&ConfidenceCalibrator>,
-    ) -> (Vec<Value>, SelectionReport) {
-        self.select_routed_with_memory(
-            query,
-            routing,
-            budget,
-            extra_boost_terms,
-            quality_tracker,
-            calibrator,
-            &[],
-        )
-    }
-
-    /// Like [`select_routed`] but also accepts memory domain hints for gate softening.
-    #[allow(clippy::too_many_arguments)]
-    pub fn select_routed_with_memory(
-        &self,
-        query: &str,
-        routing: &RoutingDecision,
-        budget: u32,
-        extra_boost_terms: &[String],
-        quality_tracker: Option<&ToolQualityTracker>,
-        calibrator: Option<&ConfidenceCalibrator>,
-        memory_domain_hints: &[crate::pipeline::routing::DomainHint],
-    ) -> (Vec<Value>, SelectionReport) {
-        self.select_routed_with_pressure(
-            query,
-            routing,
-            budget,
-            extra_boost_terms,
-            quality_tracker,
-            calibrator,
-            memory_domain_hints,
-            0.0,
-            &std::collections::HashMap::new(),
-            &[],
-            &std::collections::HashMap::new(),
-        )
-    }
-
-    /// Pressure-aware tool selection.  When `budget_pressure` > 0, the scoring
-    /// pipeline applies a rising minimum-score floor that excludes marginally
-    /// relevant tools, saving schema tokens under token pressure.
-    #[allow(clippy::too_many_arguments)]
-    pub fn select_routed_with_pressure(
-        &self,
-        query: &str,
-        routing: &RoutingDecision,
-        budget: u32,
-        extra_boost_terms: &[String],
-        quality_tracker: Option<&ToolQualityTracker>,
-        calibrator: Option<&ConfidenceCalibrator>,
-        memory_domain_hints: &[crate::pipeline::routing::DomainHint],
-        budget_pressure: f64,
-        co_occurrence: &std::collections::HashMap<String, f64>,
-        file_context: &[String],
-        outcome_bias: &std::collections::HashMap<String, f64>,
-    ) -> (Vec<Value>, SelectionReport) {
-        // Use tool_filter for early conversational detection
-        if routing.tool_filter == ToolFilter::Minimal {
-            let schemas = self.pinned_only();
-            let names = Self::selected_names(&schemas);
-            // Observability: minimal-filter early return. A G3-class
-            // bug where a tool is missing from the routed-minimal
-            // path shows up as `final` not containing the expected
-            // tool — visible without reading the routing engine.
-            return (
-                schemas,
-                SelectionReport {
-                    tools_selected: names.clone(),
-                    dynamic_tools_selected: Vec::new(),
-                    selected_count: names.len() as u32,
-                    budget_used: 0,
-                    budget_total: budget,
-                },
-            );
-        }
-
-        // Build effective query: original + routing boost terms + extra boost
-        let effective_query = if routing.boost_terms.is_empty() && extra_boost_terms.is_empty() {
-            query.to_string()
-        } else {
-            let mut parts = vec![query.to_string()];
-            parts.extend(routing.boost_terms.iter().cloned());
-            parts.extend(extra_boost_terms.iter().cloned());
-            parts.join(" ")
-        };
-
-        // Use the routing's ConversationState for scoring.
-        // Pass memory domain hints for gate softening in tool relevance scoring.
-        // When budget_pressure > 0 or co-occurrence data exists, apply the full
-        // co-occurrence-aware scoring pipeline for maximum selection quality.
-        let has_co_occurrence = !co_occurrence.is_empty();
-        let has_file_context = !file_context.is_empty();
-        let has_outcome_bias = !outcome_bias.is_empty();
-        let pinned_names = self.pinned_name_set();
-        let mut filter = FilterOptions {
-            pinned_names: Some(pinned_names),
-            quality_tracker,
-            calibrator,
-            memory_domain_hints,
-            ..Default::default()
-        };
-        if budget_pressure > 0.01 || has_co_occurrence || has_file_context || has_outcome_bias {
-            filter.budget_pressure = budget_pressure;
-            filter.co_occurrence = Some(co_occurrence);
-            filter.file_context = Some(file_context);
-            filter.outcome_bias = Some(outcome_bias);
-        }
-        let ranked = pre_filter_dynamic(&routing.conversation_state, &effective_query, &filter);
-        let schemas = self.budget_select_measured(&ranked, budget);
-        let names = Self::selected_names(&schemas);
-        let selected_count = schemas.len() as u32;
-        let dynamic_tools_selected = self.dynamic_names_for_selected(&names);
-
-        let budget_used = self.dynamic_budget_used_for_names(&dynamic_tools_selected);
-
-        // Observability: routed + pressure dynamic path — this is
-        // the production selector entry point (tool_selector.rs).
-        // G3 would show up here as a final list missing the tool
-        // the caller expected, paired with a top list that shows
-        // either (a) the tool absent entirely, or (b) a low score.
-
+    /// Routing decides whether this is a tool-bearing turn. The built-in
+    /// surface is deterministic: only pinned schemas are returned. Deferred
+    /// tools stay deferred until explicitly activated via `tool_search`.
+    pub fn build_routed_surface(&self, budget: u32) -> (Vec<Value>, ToolSurfaceReport) {
+        let schemas = self.pinned_only();
+        let names = Self::visible_names(&schemas);
         (
             schemas,
-            SelectionReport {
-                selected_count,
-                tools_selected: names,
-                dynamic_tools_selected,
-                budget_used,
+            ToolSurfaceReport {
+                visible_count: names.len() as u32,
+                visible_tools: names,
+                budget_used: 0,
                 budget_total: budget,
             },
         )
-    }
-
-    /// Budget selection using measured token costs from actual schemas.
-    fn budget_select_measured(
-        &self,
-        ranked_dynamic: &[(usize, f64)],
-        budget_tokens: u32,
-    ) -> Vec<Value> {
-        let mut result = Vec::new();
-        let mut used_tokens: u32 = 0;
-        let mut included_names = std::collections::HashSet::new();
-
-        // Always include pinned tools first (budget-exempt).
-        // Iterate over the pre-sorted Arc to avoid per-turn ~5-8KB clone.
-        for schema in self.pinned_sorted.iter() {
-            if let Some(name) = tool_schema_name(schema) {
-                included_names.insert(name.to_string());
-            }
-            result.push(schema.clone());
-        }
-
-        // Add dynamic tools greedily from ranked list using measured costs
-        for &(idx, _score) in ranked_dynamic {
-            let tool = &TOOL_CATALOG[idx];
-            if included_names.contains(tool.name) {
-                continue;
-            }
-            let cost = self.token_cost(tool.name);
-            if used_tokens + cost > budget_tokens {
-                continue;
-            }
-            if let Some(schema) = self.find_schema(tool.name) {
-                included_names.insert(tool.name.to_string());
-                result.push(schema);
-                used_tokens += cost;
-            }
-        }
-
-        // Include registered plugin tools if budget permits
-        for name in &self.plugin_tool_names {
-            if included_names.contains(name) {
-                continue;
-            }
-            let cost = self.token_cost(name);
-            if used_tokens + cost > budget_tokens {
-                continue;
-            }
-            if let Some(schema) = self.find_schema(name) {
-                result.push(schema);
-                used_tokens += cost;
-            }
-        }
-
-        // Sort alphabetically for prompt-cache stability (same rationale as select_two_phase)
-        sort_schemas_by_name(&mut result);
-
-        result
-    }
-
-    fn find_schema(&self, name: &str) -> Option<Value> {
-        self.all_schemas
-            .iter()
-            .find(|s| tool_schema_name(s) == Some(name))
-            .cloned()
     }
 
     /// Return only pinned tools.
@@ -595,8 +315,8 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Return names of currently selected tools.
-    pub fn selected_names(schemas: &[Value]) -> Vec<String> {
+    /// Return names of currently visible tools.
+    pub fn visible_names(schemas: &[Value]) -> Vec<String> {
         schemas
             .iter()
             .filter_map(|s| tool_schema_name(s).map(String::from))
@@ -613,25 +333,21 @@ impl ToolRegistry {
     /// Post-Phase-5 contract:
     /// plugin schemas become **lookup-able** (the executor can dispatch
     /// them, `tool_search(select:NAME)` can return them), but they do
-    /// NOT join the selector's dynamic-candidate list. Plugins default
-    /// to the deferred listing; the user must explicitly pin them via
-    /// `runtime.tool_surface.pinned_tools` to put them in `tools[]`.
+    /// NOT join any proactive surface candidate set. Plugins default
+    /// to the deferred listing. Callers that need a plugin in `tools[]`
+    /// must build the visible surface with that plugin explicitly pinned.
     ///
     /// This keeps the Anthropic prompt-cache prefix byte-stable across
-    /// plugin registration — previously a single `register_plugins`
-    /// call pushed the plugin into `plugin_tool_names`, which
-    /// `budget_select_measured` then stuffed into every turn's `tools[]`,
-    /// silently busting the cache boundary for the rest of the session.
+    /// plugin registration: schemas are added to lookup/execution indexes,
+    /// but the selected `tools[]` surface remains pinned-only.
     pub fn register_plugins(&mut self, plugins: &super::plugin::PluginRegistry) {
         let plugin_schemas = plugins.schemas();
         if plugin_schemas.is_empty() {
             return;
         }
-        // Plugins are looked up by name (for executor dispatch and
-        // `tool_search(select:NAME)`) but intentionally NOT added to
-        // `plugin_tool_names` — that field drives `budget_select_measured`,
-        // which puts names into `tools[]`. Plugins live in the deferred
-        // listing instead.
+        // Plugins are looked up by name for executor dispatch and
+        // `tool_search(select:NAME)`. They live in the deferred listing unless
+        // the caller builds a pinned visible surface for them.
         self.all_schemas.extend(
             plugin_schemas
                 .into_iter()
@@ -645,8 +361,8 @@ impl ToolRegistry {
     /// Inject a single tool schema dynamically (e.g. the `skill` or `delegate` tool).
     ///
     /// When `pinned` is true the tool is budget-exempt (always included like
-    /// core tools such as `bash` and `read_file`).  When false it behaves as a
-    /// plugin tool that is only included when budget allows.
+    /// core tools such as `bash` and `read_file`). When false it is lookupable
+    /// by name but does not enter `tools[]` unless explicitly reinserted as pinned.
     pub fn inject_schema(&mut self, schema: Value) {
         self.inject_schema_pinned(schema, true);
     }
@@ -666,8 +382,6 @@ impl ToolRegistry {
             if pinned {
                 self.pinned_schemas.push((name_owned, schema.clone()));
                 self.rebuild_pinned_sorted();
-            } else {
-                self.plugin_tool_names.push(name_owned);
             }
             self.all_schemas.push(schema);
         }
@@ -791,15 +505,22 @@ mod tests {
         reg.inject_schema(sample_schema("skill"));
         // Default inject is pinned (budget-exempt)
         assert!(reg.pinned_schemas.iter().any(|(n, _)| n == "skill"));
-        assert!(!reg.plugin_tool_names.contains(&"skill".to_string()));
     }
 
     #[test]
-    fn injected_schema_unpinned_is_plugin() {
+    fn injected_schema_unpinned_is_lookupable_but_not_selected() {
         let mut reg = ToolRegistry::new(vec![sample_schema("bash")]);
         reg.inject_schema_pinned(sample_schema("skill"), false);
-        assert!(reg.plugin_tool_names.contains(&"skill".to_string()));
+        assert!(reg.schema_by_name("skill").is_some());
         assert!(!reg.pinned_schemas.iter().any(|(n, _)| n == "skill"));
+
+        let (selected, report) = reg.build_pinned_surface_with_report("use the skill tool", 1, 800);
+        let names = ToolRegistry::visible_names(&selected);
+        assert!(
+            !names.contains(&"skill".to_string()),
+            "unpinned injected tools must not be proactively selected"
+        );
+        assert_eq!(report.budget_used, 0);
     }
 
     #[test]
@@ -855,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_pinned_tool_is_budget_exempt_in_selection_report() {
+    fn custom_pinned_tool_is_budget_exempt_in_surface_report() {
         let schemas = vec![
             sample_schema("bash"),
             sample_schema("tool_search"),
@@ -866,25 +587,18 @@ mod tests {
         };
         let reg = ToolRegistry::new_with_tool_surface(schemas, &cfg);
 
-        let (selected, report) = reg.select_with_report("fetch this web page", 1, 0);
-        let names = ToolRegistry::selected_names(&selected);
+        let (selected, report) = reg.build_pinned_surface_with_report("fetch this web page", 1, 0);
+        let names = ToolRegistry::visible_names(&selected);
 
         assert!(names.contains(&"web_fetch".to_string()));
         assert_eq!(
             report.budget_used, 0,
-            "user-pinned tools are part of this registry's pinned surface and must not consume dynamic budget"
-        );
-        assert!(
-            !report
-                .dynamic_tools_selected
-                .iter()
-                .any(|name| name == "web_fetch"),
-            "user-pinned tools must not be advertised as dynamically selected"
+            "user-pinned tools are part of this registry's pinned surface and must not consume deferred-tool budget"
         );
     }
 
     #[test]
-    fn custom_unpinned_default_tool_can_be_selected_as_dynamic_when_relevant() {
+    fn custom_unpinned_default_tool_stays_deferred_even_when_relevant() {
         let schemas = vec![
             sample_schema("bash"),
             sample_schema("grep"),
@@ -895,48 +609,46 @@ mod tests {
         };
         let reg = ToolRegistry::new_with_tool_surface(schemas, &cfg);
 
-        let (selected, report) = reg.select_with_report("grep for UserSession in the code", 1, 800);
-        let names = ToolRegistry::selected_names(&selected);
+        let (selected, report) =
+            reg.build_pinned_surface_with_report("grep for UserSession in the code", 1, 800);
+        let names = ToolRegistry::visible_names(&selected);
 
         assert!(
             !reg.pinned_schemas.iter().any(|(name, _)| name == "grep"),
             "grep is intentionally unpinned for this registry instance"
         );
         assert!(
-            names.contains(&"grep".to_string()),
-            "relevant custom-unpinned tools must be selectable dynamically; got: {names:?}"
+            !names.contains(&"grep".to_string()),
+            "user-unpinned tools stay deferred until explicitly activated; got: {names:?}"
         );
-        assert!(
-            report
-                .dynamic_tools_selected
-                .iter()
-                .any(|name| name == "grep"),
-            "user-unpinned default tools must be reported as dynamic; got: {:?}",
-            report.dynamic_tools_selected
+        assert_eq!(
+            report.budget_used, 0,
+            "user-unpinned tools must stay deferred and consume no proactive surface budget"
         );
     }
 
-    // ── Selector observability integration (Pass B) ──
+    // ── Tool surface observability integration (Pass B) ──
     //
-    // These tests verify the `[selector]` stderr hook plumbs through
-    // the real `select_with_report_ctx` path. They exercise both the
-    // conversational short-circuit and the dynamic ranking branch.
+    // These tests verify the real `build_pinned_surface_with_report_ctx` path. They exercise
+    // both the conversational short-circuit and the non-conversational
+    // pinned-only branch.
     // Stderr content is not captured (no stable API in tokio tests),
     // but the flag guard ensures the hot path runs without panic
     // when observability is on — which is what we'd regress if the
     // obs module grew a lifetime bug or serde panic.
 
     #[test]
-    fn select_with_report_ctx_conversational_path_does_not_panic_with_obs_on() {
+    fn build_pinned_surface_with_report_ctx_conversational_path_does_not_panic_with_obs_on() {
         let mut schemas = vec![sample_schema("bash"), sample_schema("read_file")];
-        // Ensure a pinned + non-pinned mix so both branches of
-        // pinned_only + filter are exercised under observability.
+        // Ensure a pinned + non-pinned mix so construction keeps the deferred
+        // schema lookupable while the conversational path returns no tools.
         schemas.push(sample_schema("github_list_prs"));
         let registry = ToolRegistry::new(schemas);
         // "hello" is the conversational short-circuit case.
-        let (out_schemas, report) = registry.select_with_report_ctx("hello", 0, 800, &[]);
+        let (out_schemas, report) =
+            registry.build_pinned_surface_with_report_ctx("hello", 0, 800, &[]);
         assert!(out_schemas.is_empty());
-        assert_eq!(report.selected_count as usize, out_schemas.len());
+        assert_eq!(report.visible_count as usize, out_schemas.len());
     }
 
     #[test]
@@ -944,9 +656,9 @@ mod tests {
         let schemas: Vec<Value> = TOOL_CATALOG.iter().map(|t| sample_schema(t.name)).collect();
         let registry = ToolRegistry::new(schemas);
         // "谢谢" with no recent_tools → should short-circuit to no tools.
-        let (out, report) = registry.select_with_report_ctx("谢谢", 1, 800, &[]);
+        let (out, report) = registry.build_pinned_surface_with_report_ctx("谢谢", 1, 800, &[]);
         assert_eq!(
-            report.selected_count, 0,
+            report.visible_count, 0,
             "conversational + no recent_tools should return no tools"
         );
         assert!(
@@ -956,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn select_with_report_ctx_dynamic_path_does_not_panic_with_obs_on() {
+    fn build_pinned_surface_with_report_ctx_non_conversational_path_returns_pinned_tools() {
         let schemas = vec![
             sample_schema("bash"),
             sample_schema("read_file"),
@@ -964,11 +676,15 @@ mod tests {
             sample_schema("list_dir"),
         ];
         let registry = ToolRegistry::new(schemas);
-        // Analytical-ish query — forces the dynamic branch.
-        let (out, report) =
-            registry.select_with_report_ctx("search for TODO in source files", 0, 800, &[]);
+        // Analytical-ish query forces the non-conversational pinned-only path.
+        let (out, report) = registry.build_pinned_surface_with_report_ctx(
+            "search for TODO in source files",
+            0,
+            800,
+            &[],
+        );
         assert!(!out.is_empty());
-        assert!(report.selected_count > 0);
+        assert!(report.visible_count > 0);
     }
 }
 

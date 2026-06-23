@@ -50,9 +50,9 @@ pub struct DecisionExplanation {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum DecisionType {
-    /// Tool selection decision.
-    ToolSelection {
-        selected_tools: Vec<String>,
+    /// Tool surface decision.
+    ToolSurface {
+        visible_tools: Vec<String>,
         total_available: u32,
     },
 
@@ -227,7 +227,7 @@ impl DecisionExplanation {
 
     fn decision_type_name(&self) -> &str {
         match &self.decision_type {
-            DecisionType::ToolSelection { .. } => "Tool Selection",
+            DecisionType::ToolSurface { .. } => "tool surface",
             DecisionType::HistoryCompression { .. } => "History Compression",
             DecisionType::MemoryRetrieval { .. } => "Memory Retrieval",
             DecisionType::StrategyChoice { .. } => "Strategy Choice",
@@ -838,11 +838,11 @@ mod tests {
     #[test]
     fn test_decision_explanation_builder() {
         let exp = DecisionExplanation::new(
-            DecisionType::ToolSelection {
-                selected_tools: vec!["grep".to_string(), "view".to_string()],
+            DecisionType::ToolSurface {
+                visible_tools: vec!["grep".to_string(), "view".to_string()],
                 total_available: 50,
             },
-            "Selected grep and view based on query pattern matching code search.",
+            "Surfaced grep and view based on query pattern matching code search.",
         )
         .with_input("query", "find the auth module", 0.8)
         .with_input_explained("file_type", "*.rs", 0.3, "Rust files targeted")
@@ -936,16 +936,16 @@ mod tests {
     #[test]
     fn test_human_readable_explanation() {
         let exp = DecisionExplanation::new(
-            DecisionType::ToolSelection {
-                selected_tools: vec!["grep".to_string()],
+            DecisionType::ToolSurface {
+                visible_tools: vec!["grep".to_string()],
                 total_available: 10,
             },
-            "Grep selected for code search.",
+            "Grep surfaced for code search.",
         )
         .with_confidence(0.9);
 
         let text = exp.to_human_readable();
-        assert!(text.contains("Tool Selection"));
+        assert!(text.contains("tool surface"));
         assert!(text.contains("90%"));
     }
 

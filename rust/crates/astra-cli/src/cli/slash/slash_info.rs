@@ -1366,8 +1366,8 @@ pub(crate) async fn handle_info_command(
                 .with_tool_calls(sr.tool_call_records)
                 .with_budget_pressure(sr.budget_pressure)
                 .with_cache_tokens(sr.cache_read_tokens, sr.cache_creation_tokens)
-                .with_tool_selection(
-                    sr.tools_selected,
+                .with_tool_surface(
+                    sr.visible_tools,
                     sr.selected_skills,
                     sr.tools_used.clone(),
                     sr.budget_used,
@@ -2096,12 +2096,12 @@ fn print_context_explain(trace: &astra_turn_core::context_assembly_trace::Contex
         trace.memory.total_tokens.to_string().dim()
     );
 
-    let tools_selected = trace.tools.tools_selected.len();
-    let tool_tokens: u32 = trace.tools.tools_selected.iter().map(|t| t.tokens).sum();
+    let visible_tools = trace.tools.visible_tools.len();
+    let tool_tokens: u32 = trace.tools.visible_tools.iter().map(|t| t.tokens).sum();
     eprintln!(
         "  {:<14}  selected {} tools ({} tokens)",
         "tools".magenta(),
-        tools_selected.to_string().dim(),
+        visible_tools.to_string().dim(),
         tool_tokens.to_string().dim()
     );
 
@@ -2109,8 +2109,8 @@ fn print_context_explain(trace: &astra_turn_core::context_assembly_trace::Contex
         eprintln!("\n  {}", "Decisions & Reasoning".bold());
         for (idx, exp) in trace.explanations.iter().enumerate() {
             let label = match &exp.decision_type {
-                DecisionType::ToolSelection { tools } => {
-                    format!("tool selection ({} tools)", tools.len())
+                DecisionType::ToolSurface { visible_tools } => {
+                    format!("tool surface ({} tools)", visible_tools.len())
                 }
                 DecisionType::HistoryCompression { turns_affected } => {
                     format!("history compression ({} turns)", turns_affected.len())
@@ -2262,8 +2262,8 @@ fn print_context_breakdown(trace: &astra_turn_core::context_assembly_trace::Cont
         }
 
         // Sub-components for tool_schemas
-        if *label == "tool_schemas" && !tools.tools_selected.is_empty() {
-            for ts in &tools.tools_selected {
+        if *label == "tool_schemas" && !tools.visible_tools.is_empty() {
+            for ts in &tools.visible_tools {
                 eprintln!(
                     "    {:<14} {:>5}",
                     format!("└ {}", ts.tool_name).dim(),
@@ -2294,14 +2294,12 @@ fn print_context_breakdown(trace: &astra_turn_core::context_assembly_trace::Cont
         }
     );
 
-    // Tool selection summary
-    if !tools.tools_selected.is_empty() {
+    // tool surface summary
+    if !tools.visible_tools.is_empty() {
         eprintln!(
-            "\n  {} {} tools via {} (conf={:.0}%)",
+            "\n  {} {} visible tools",
             "Tools:".bold(),
-            tools.tools_selected.len(),
-            tools.selection_strategy.clone().dim(),
-            tools.selection_confidence * 100.0
+            tools.visible_tools.len()
         );
     }
     if trace.memory.candidates_considered > 0 {
@@ -2440,7 +2438,7 @@ pub(crate) fn render_cognition(state: &SessionState) -> String {
     let _ = writeln!(out, "  turn             : {}", state.turn);
     let _ = writeln!(
         out,
-        "  note             : boosted_tools/widen_selection_pending are applied per-turn on the server loop; inspect per-turn via /turn trace or runtime logs."
+        "  note             : boosted_tools/widen_surface_pending are applied per-turn on the server loop; inspect per-turn via /turn trace or runtime logs."
     );
     out
 }

@@ -635,10 +635,12 @@ impl ServerToolExecutor {
         // Use set-based comparison, not length comparison: same-count with
         // different names (e.g., {a,b} → {c,d}) must also trigger pruning.
         let retained_set: HashSet<&str> = retained.iter().map(String::as_str).collect();
+        let before = guard.len();
         guard.retain(|name| retained_set.contains(name.as_str()));
+        let after = guard.len();
         tracing::debug!(
-            before = guard.len(),
-            after = guard.len(),
+            before,
+            after,
             "pruning stale activated_deferred_tools entries"
         );
         retained
@@ -4285,7 +4287,7 @@ esac
     // ── Path traversal security ────────────────────────────────────────
 
     #[tokio::test]
-    async fn server_tool_search_falls_back_to_global_catalog_without_installed_surface() {
+    async fn server_tool_search_fails_closed_without_installed_surface() {
         let (exec, _dir) = test_executor();
 
         let result = exec
@@ -4294,14 +4296,19 @@ esac
 
         let parsed = parse_tool_search_output(&result.output);
         assert_eq!(parsed["mode"].as_str(), Some("select"));
-        // When surface is not installed, tool_search falls back to the
-        // full global catalog so callers that depend on tool_search without
-        // a surface aren't silently broken.
-        assert!(parsed["status"].as_str() != Some("empty_surface"));
-        assert!(parsed["total_tools"].as_u64().is_some_and(|n| n > 0));
+        assert_eq!(parsed["status"].as_str(), Some("completed"));
+        assert_eq!(parsed["selection_status"].as_str(), Some("empty_surface"));
+        assert_eq!(parsed["total_tools"].as_u64(), Some(0));
+        assert!(tool_search_match_names(&parsed).is_empty());
+        assert_eq!(
+            tool_search_string_array(&parsed, "missing"),
+            vec!["github".to_string()]
+        );
         assert!(
-            !tool_search_match_names(&parsed).is_empty(),
-            "must find github in global fallback catalog"
+            parsed["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("No tools are searchable")),
+            "{parsed}"
         );
     }
 

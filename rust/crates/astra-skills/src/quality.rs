@@ -1,4 +1,4 @@
-//! Per-skill quality tracking — mirrors the ToolQualityTracker pattern.
+//! Per-skill quality tracking.
 //!
 //! Records execution outcomes (success/failure/partial via verification criteria)
 //! and produces quality scores that feed back into skill selection priority.

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::capability::Capability;
 
-/// Intent type for tag-based pre-filtering.
+/// Intent type for catalog diagnostics and tool discovery metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntentType {
@@ -37,7 +37,7 @@ impl IntentType {
     }
 }
 
-/// Data source scope for tag-based pre-filtering.
+/// Data source scope for catalog diagnostics and capability filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
@@ -51,16 +51,16 @@ pub enum Scope {
     CrossSession,
 }
 
-/// Static metadata for a tool — used for selection, never sent to LLM.
+/// Static metadata for a tool — used for catalog diagnostics and discovery, never sent to LLM.
 #[derive(Debug, Clone)]
 pub struct ToolMeta {
     /// Tool function name (e.g. "bash", "github_list_prs")
     pub name: &'static str,
-    /// Short description for embedding index
+    /// Short description for deferred discovery metadata.
     pub description: &'static str,
-    /// Trigger phrases — additional semantic signals for retrieval
+    /// Trigger phrases — search hints for `tool_search`.
     pub triggers: &'static [&'static str],
-    /// Whether this tool is always included (no selection needed)
+    /// Whether this tool is part of the default pinned surface.
     pub pinned: bool,
     /// Intent classification tags
     pub intents: &'static [IntentType],
@@ -69,7 +69,7 @@ pub struct ToolMeta {
     /// Runtime capabilities required before this tool can be advertised.
     pub requires: &'static [Capability],
     /// Calls that may be routed to schema/shape validation without an active
-    /// executor for `requires`. This is for validation-only legacy actions,
+    /// executor for `requires`. This is for validation-only action shapes,
     /// not for executing capability-gated work.
     pub binding_validation: RuntimeBindingValidation,
     /// Estimated token cost of the full JSON schema (~JSON bytes / 4)

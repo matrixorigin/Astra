@@ -32,8 +32,8 @@ impl TurnInteractionMode {
 
     /// True when the runtime should suppress its own *interruption-style*
     /// nudges (execution-escalation, parallel-batching force, cache-waste,
-    /// redundant-reads, exploration-family, round-budget phase1, circuit-
-    /// breaker finalization).
+    /// redundant-reads, exploration-family lockout, tool-round hard-stop,
+    /// circuit-breaker finalization).
     ///
     /// Motivation: when the user explicitly chose `Auto` they are
     /// signalling "trust the model to finish the task end-to-end — don't

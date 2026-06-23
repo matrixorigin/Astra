@@ -1,11 +1,10 @@
 /// Lightweight signals extracted from the user message.
-/// Pure regex, no LLM cost. Used for pre-filter reordering.
+/// Pure regex, no LLM cost. Used for coarse turn classification and the
+/// conversational no-tools short-circuit.
 ///
-/// **ARCHITECTURAL NOTE**: This is an implementation detail of [`TfIdfSelector`](crate::tool_selector::TfIdfSelector).
-/// It is a **leaky abstraction** — each edge case requires a new field, effectively
-/// simulating a mini language model with struct fields. **Do NOT add new fields.**
-/// New edge cases should be handled by improving the LLM tool selector instead.
-/// This struct is preserved only as a fast fallback for when LLM selection is unavailable.
+/// This is deliberately small and structural. Each new edge case tends to
+/// become an implicit classifier field, so prefer explicit tool visibility or
+/// runtime policy over adding more booleans here.
 #[derive(Debug, Clone, Default)]
 pub struct ConversationState {
     pub references_history: bool,
@@ -26,8 +25,7 @@ pub struct ConversationState {
 }
 
 impl ConversationState {
-    /// Count of active binary signals. Low count = low selector confidence.
-    /// Used by adaptive threshold: 0 signals → include all dynamic tools.
+    /// Count of active binary signals.
     pub fn signal_count(&self) -> usize {
         [
             self.is_fetch,
@@ -726,7 +724,7 @@ mod tests {
         let s = ConversationState::from_message("pr呢？", 2);
         assert!(
             !s.is_fetch,
-            "fallback selector must not infer fetch intent from short follow-up phrasing"
+            "fallback classifier must not infer fetch intent from short follow-up phrasing"
         );
     }
 

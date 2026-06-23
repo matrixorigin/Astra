@@ -1,5 +1,5 @@
 //! Wiring test: verifies per-model workflow-guard policies reach the loop
-//! state. Guards against the regression where `ToolSelectionConfig::resolve_for_model`
+//! state. Guards against the regression where `ToolPolicyConfig::resolve_for_model`
 //! exists but isn't consulted by the state builder — which silently gives every
 //! model the same global defaults regardless of `ModelPolicyProfile`.
 //!
@@ -13,7 +13,7 @@ use astra_runtime::turn::agentic_loop::host::make_test_loop_state_for_model;
 #[test]
 fn opus_model_picks_up_builtin_profile_thresholds() {
     // Built-in profile for "opus" is 4 / 20 (see
-    // `ToolSelectionConfig::builtin_model_profiles`). If this test fails,
+    // `ToolPolicyConfig::builtin_model_profiles`). If this test fails,
     // the state builder is no longer threading model_id through
     // `resolve_for_model` — the per-model policy is silently dead code.
     let state = make_test_loop_state_for_model(Some("us.anthropic.claude-opus-4-7"));

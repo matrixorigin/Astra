@@ -1180,8 +1180,8 @@ fn build_working_memory_content(messages: &[Value], max_chars: usize) -> String 
     // cleanup path. Single source of truth:
     // `astra_turn_types::should_store_in_memory`.
     //
-    // Systematic rather than whack-a-mole: Claude Code's memdir design
-    // (see docs/design/memoria-compared-to-claude-code.md) makes the
+    // Systematic rather than whack-a-mole: the reference agent's memdir design
+    // (see docs/design/memoria-compared-to-reference-agent.md) makes the
     // type-and-description frontmatter mandatory at store time; this
     // is L1 of porting that principle — reject obvious non-memories
     // before they ever reach the index. L2 (require [@ns/type] prefix

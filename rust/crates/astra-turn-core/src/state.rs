@@ -30,13 +30,6 @@ pub fn normalize_bridge_cache_entry(entry: &Map<String, Value>) -> Option<Map<St
         entry.get("sections").cloned().unwrap_or(Value::Null),
     );
     normalized.insert(
-        "tool_quality_assessments".to_string(),
-        entry
-            .get("tool_quality_assessments")
-            .cloned()
-            .unwrap_or_else(|| Value::Array(Vec::new())),
-    );
-    normalized.insert(
         "turn_count".to_string(),
         entry.get("turn_count").cloned().unwrap_or_else(|| json!(0)),
     );
@@ -212,18 +205,6 @@ mod tests {
             Map::from_iter([("created_at".to_string(), json!("2025-01-01T08:00:00+08:00"))]);
         let norm = normalize_bridge_cache_entry(&entry).unwrap();
         assert_eq!(norm["created_at"].as_str().unwrap(), "2025-01-01T00:00:00Z");
-    }
-
-    #[test]
-    fn cache_entry_tool_quality_defaults_empty_array() {
-        let entry = Map::from_iter([("turn_count".to_string(), json!(5))]);
-        let norm = normalize_bridge_cache_entry(&entry).unwrap();
-        assert!(
-            norm["tool_quality_assessments"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
     }
 
     // --- resolve_turn_identifiers ---

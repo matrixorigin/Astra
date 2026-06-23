@@ -11,7 +11,7 @@
 //!   authenticated server catalog that Web sees.
 //!
 //! Keeping those rules here prevents the Web picker, runtime prompt assembly,
-//! and CLI tool selector from growing separate capability policies.
+//! and CLI tool-surface assembly from growing separate capability policies.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

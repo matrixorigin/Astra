@@ -99,7 +99,7 @@ mod tests {
     fn user_pin_closed_overrides_auto_open() {
         // User explicitly hit Ctrl+T to close. A new task arriving
         // must NOT re-pop the board — that's the "don't fight me"
-        // rule that separates astra from claude-code's auto surface.
+        // rule that separates astra from reference-agent's auto surface.
         let (expanded, _) = resolve_board_visibility(false, Some(false), true, false);
         assert!(!expanded, "user pin closed must stay closed");
     }

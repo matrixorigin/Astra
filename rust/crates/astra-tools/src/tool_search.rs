@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Tool search — semantic search over available tool schemas.
 //!
 //! Takes a set of tool schemas and a query, returning ranked matches.
@@ -58,8 +57,8 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
         .collect();
 
     // Direct selection mode: select:tool_name or select:a,b,c.
-    // Returns compact callable shape and lets the host queue the selected
-    // schema for the next request's tools[].
+    // Returns compact schema shape and lets the host queue the selected schema
+    // for the next request's tools[].
     if let Some(tool_names) = select_payload(query) {
         let mut requested = Vec::new();
         for name in tool_names
@@ -102,10 +101,10 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
                         "name": tool_name,
                         "description": desc,
                     });
-                    // Include callable parameter shape, but strip nested
-                    // prose. The full schema will be injected into tools[] on
-                    // the next request; this tool_result should not become a
-                    // long-lived duplicate copy in history.
+                    // Include parameter shape, but strip nested prose. The
+                    // full schema will be injected into tools[] on the next
+                    // request; this tool_result should not become a long-lived
+                    // duplicate copy in history.
                     if let Some(params) = func.get("parameters")
                         && let Some(obj) = entry.as_object_mut()
                     {
@@ -484,7 +483,7 @@ mod tests {
         assert_eq!(parsed["total_tools"].as_u64(), Some(schemas.len() as u64));
         assert!(
             parsed["matches"][0].get("score").is_none(),
-            "select mode must return callable schema entries, not keyword scores: {parsed}"
+            "select mode must return schema entries, not keyword scores: {parsed}"
         );
     }
 
@@ -721,10 +720,11 @@ mod tests {
         );
     }
 
-    // ── select: mode must return callable schema shape ───────────────────
-    // The LLM needs parameter shapes to call the tool. Long parameter prose is
-    // stripped because the selected tool is injected into tools[] on the next
-    // request; keeping a duplicate verbose schema in history burns tokens.
+    // ── select: mode must return compact schema shape ─────────────────────
+    // The next request needs enough shape for activation metadata. Long
+    // parameter prose is stripped because the selected tool is injected into
+    // tools[] on the next request; keeping a duplicate verbose schema in
+    // history burns tokens.
 
     fn schemas_with_params() -> Vec<Value> {
         vec![json!({
@@ -745,8 +745,8 @@ mod tests {
 
     #[test]
     fn select_vs_keyword_params() {
-        // select: mode returns full parameters so the LLM can call the tool;
-        // keyword mode omits parameters to stay compact.
+        // select: mode returns parameter shape so the next request can receive
+        // the full tool schema; keyword mode omits parameters to stay compact.
         let schemas = schemas_with_params();
 
         let result = tool_search(&schemas, &json!({"query": "select:read_file"}));

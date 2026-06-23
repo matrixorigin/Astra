@@ -141,9 +141,9 @@ Extend `_build_reflect_evidence()` to include two new fields:
         "avg_prompt_per_call": 6252,
     },
 
-    # NEW: Quality grades from tool_result_quality events (if firewall enabled)
+    # NEW: Result quality grades from tool_result_quality events (if firewall enabled)
     # Allows reflect to answer "was the data any good?"
-    "tool_quality_summary": [
+    "result_quality_summary": [
         {"tool": "stock_assistant", "grade": "degraded", "score": 0.35,
          "signals": ["technical_indicators empty", "risk_score is default"]},
     ],
@@ -152,7 +152,7 @@ Extend `_build_reflect_evidence()` to include two new fields:
 
 Data sources:
 - `token_summary`: `SELECT SUM(token_usage->>'$.prompt_tokens'), ... FROM agent_events WHERE session_id = :sid AND event_type = 'llm_response'`
-- `tool_quality_summary`: `SELECT metadata FROM agent_events WHERE session_id = :sid AND event_type = 'tool_result_quality'`
+- `result_quality_summary`: `SELECT metadata FROM agent_events WHERE session_id = :sid AND event_type = 'tool_result_quality'`
 
 Both queries use existing indexed columns. No schema changes needed.
 

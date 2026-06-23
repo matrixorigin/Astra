@@ -118,7 +118,7 @@ const EVENT_RING_CAP: usize = 32;
 /// transition. Beyond this, the renderer drops the row from the
 /// expanded panel — counts in the header still reflect it. Picked
 /// to be long enough that the user can glance and verify the
-/// completion landed (claudecode uses ~30s for the same purpose),
+/// completion landed (reference-agent uses ~30s for the same purpose),
 /// short enough that a long agentic run doesn't accumulate dozens of
 /// completed rows above the spinner.
 pub(crate) const COMPLETED_TASK_TTL: Duration = Duration::from_secs(30);
@@ -338,7 +338,7 @@ impl TaskBoardObserver {
     /// IDs of tasks that changed within [`EVENT_FRESH_WINDOW`] of
     /// the call. The renderer uses this to flash a highlight on
     /// newly-created or newly-completed rows — the "something just
-    /// happened" cue claude-code gets from its task-state reducer.
+    /// happened" cue reference-agent gets from its task-state reducer.
     /// Events older than the window are ignored but stay in the
     /// ring until trimmed on the next push.
     pub fn fresh_event_task_ids(&self) -> Vec<String> {

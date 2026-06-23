@@ -1,4 +1,4 @@
-//! Tool schema pruning and selection.
+//! Tool schema pruning and surface helpers.
 //!
 //! The canonical `tool_schema_name` family lives in [`astra_core::tool_schema`]
 //! so that every crate (astra-tools, astra-runtime-env, astra-turn-core)
@@ -8,7 +8,7 @@
 //! This module re-exports it for callers already rooted at `astra_turn_core`.
 
 pub mod prune;
-pub mod selection;
+pub mod surface_subset;
 
 /// Re-export of the canonical [`astra_core::tool_schema`] helpers.
 ///

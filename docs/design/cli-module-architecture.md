@@ -9,7 +9,7 @@ cli/
 ├── Core Infrastructure
 │   ├── command_registry.rs    — Single source of truth for 62 slash commands
 │   ├── command_router.rs      — CLI argument parsing and one-shot command dispatch
-│   ├── session_runtime.rs     — Tool selector, skill registry, MCP manager setup
+│   ├── session_runtime.rs     — Tool surface, skill registry, MCP manager setup
 │   ├── session_state.rs       — `SessionState` for the active chat session
 │   ├── session_startup.rs     — Startup orchestration shared with the TUI
 │   └── chat_turn.rs           — Single conversation turn execution
@@ -70,7 +70,7 @@ main.rs
   └─► command_router.rs::route_cli_command()
         ├─► Parse clap args
         ├─► Apply system prompt
-        ├─► session_runtime::create_tool_selector()
+        ├─► tool surface assembly
         └─► stream_render::consume_chat_turn_sse()
               └─► Terminal output
 ```
@@ -314,7 +314,7 @@ cd rust && cargo test -p astra-cli
 
 ## Performance Considerations
 
-- **Startup**: Tool selector creation is expensive (~200ms). Deferred completions refresh to first TUI iteration.
+- **Startup**: Tool surface assembly and skill/MCP discovery should not block the first TUI iteration. Deferred completions refresh asynchronously.
 - **Streaming**: SSE events processed incrementally; terminal updates batched.
 - **Skills**: Hot-reload via `SkillWatcherHandle` avoids restart for skill changes.
 - **Fuzzy matching**: Incremental scoring with early termination.

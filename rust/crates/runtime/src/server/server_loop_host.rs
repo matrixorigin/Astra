@@ -530,7 +530,7 @@ pub struct CapturedLlmRequest {
     /// `cache_control` marker anywhere in their content. Order matches the
     /// message order. Empty for non-Anthropic providers.
     ///
-    /// Used by tests to assert Claude Code-style message-marker behavior:
+    /// Used by tests to assert reference-agent-style message-marker behavior:
     /// exactly one marker on the last non-system message for
     /// Anthropic/Bedrock-compatible requests.
     pub message_cache_control_indices: Vec<usize>,
@@ -848,7 +848,6 @@ pub struct ServerAgenticLoopHost {
     /// path before the first `sync_valid_tools_to_visible` call; stable
     /// for the rest of the session.
     admissible_extras: Vec<String>,
-    selection_confidence: f64,
     /// `true` when tools were auto-populated from astra-tools (no CLI connected).
     server_side_tools: bool,
     /// `true` when the connected client can answer ask_user prompts.
@@ -975,7 +974,6 @@ pub struct ServerAgenticLoopHostBuilder {
     edge_tools: Vec<Value>,
     edge_profile: Map<String, Value>,
     execution_bindings: Option<ExecutionBindingSnapshot>,
-    selection_confidence: f64,
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     user_id: String,
     session_id: String,
@@ -1026,7 +1024,6 @@ impl ServerAgenticLoopHostBuilder {
             edge_tools: Vec::new(),
             edge_profile: Map::new(),
             execution_bindings: None,
-            selection_confidence: 1.0,
             edge_callback_ledger: Arc::new(TokioMutex::new(HashMap::new())),
             user_id,
             session_id,
@@ -1147,11 +1144,6 @@ impl ServerAgenticLoopHostBuilder {
             WorkspaceBinding::server_sandbox(root),
             ExecutorBinding::server_local(),
         ));
-        self
-    }
-
-    pub fn with_selection_confidence(mut self, confidence: f64) -> Self {
-        self.selection_confidence = confidence;
         self
     }
 
@@ -1330,7 +1322,6 @@ impl ServerAgenticLoopHostBuilder {
             pinned_tool_names,
             current_server_tool_executor: None,
             admissible_extras,
-            selection_confidence: self.selection_confidence,
             server_side_tools,
             interactive_client: self.interactive_client,
             interaction_mode: self.interaction_mode,
@@ -2855,7 +2846,7 @@ impl ServerAgenticLoopHost {
     /// 4. boost rescue
     /// 5. activated-deferred-tool rescue
     ///
-    /// `consume_widen` controls whether the `widen_selection_pending` flag is
+    /// `consume_widen` controls whether the `widen_surface_pending` flag is
     /// consumed (authoritative path: main turn / test helper) or merely
     /// peeked (preview path: pre-turn summary, which must not steal the flag
     /// from the main turn that follows it). This is the only legitimate
@@ -2871,7 +2862,7 @@ impl ServerAgenticLoopHost {
         // 1. Consume or peek the widen flag. Soft health diagnostics are not
         // promoted into the hard restricted-tool set.
         if consume_widen {
-            let _ = std::mem::take(&mut state.widen_selection_pending);
+            let _ = std::mem::take(&mut state.widen_surface_pending);
         }
         // 2-5. layered restrictions from the merged base.
         let mut effective = state.restricted_tools.clone();
@@ -2968,11 +2959,6 @@ impl ServerAgenticLoopHost {
             crate::prompts::PromptTokenBucket::Environment,
         )];
         let restricted_snapshot = state.restricted_tools.clone();
-        let selection_trace = Some(json!({
-            "source": "server_loop_host",
-            "visible_tool_count": visible_tools.len(),
-            "restricted_tool_count": restricted_snapshot.len(),
-        }));
         let deferred_tools_block =
             self.deferred_tools_block_for_wire_surface(visible_tools, state, model_name);
         let cache_cfg =
@@ -2985,12 +2971,10 @@ impl ServerAgenticLoopHost {
                     visible_tools,
                     &restricted_snapshot,
                 )
-                .with_deferred_tools_block(&deferred_tools_block)
-                .with_selection_trace(selection_trace),
+                .with_deferred_tools_block(&deferred_tools_block),
                 runtime_signals: crate::turn::llm::context::RuntimeSignals::new(
                     &self.edge_profile,
                     plan_hint,
-                    self.selection_confidence,
                 )
                 .with_extra_sections(&[], &lifecycle_sections)
                 .with_session_memory_entry(session_memory_entry),
@@ -6508,20 +6492,6 @@ mod tests {
         assert!(host.emitted_events.is_empty());
     }
 
-    #[test]
-    fn builder_with_selection_confidence() {
-        let host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u".to_string(),
-            "s".to_string(),
-        )
-        .with_selection_confidence(0.42)
-        .build();
-
-        assert!((host.selection_confidence - 0.42).abs() < f64::EPSILON);
-    }
-
     #[tokio::test]
     async fn assemble_llm_messages_includes_system_and_user() {
         let host = ServerAgenticLoopHostBuilder::new(
@@ -7537,13 +7507,13 @@ mod tests {
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
             boosted_tools: HashSet::new(),
-            widen_selection_pending: false,
+            widen_surface_pending: false,
             step_recorder: StepRecorder::new("test-user", "test-session", "test-task"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
             call_counts: HashMap::new(),
             max_identical_tool_calls: astra_config::runtime_config::RuntimeConfig::load()
-                .tool_selection
+                .tool_policy
                 .effective_max_identical_calls(),
             max_tools_per_turn: 15,
             repeated_cache_hit_suppression: 3,
@@ -7593,7 +7563,6 @@ mod tests {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,

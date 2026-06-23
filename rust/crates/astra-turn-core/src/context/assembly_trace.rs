@@ -4,7 +4,7 @@
 //! - System prompt breakdown (base, skills, environment, memories)
 //! - Conversation history selection (retained, compressed, dropped)
 //! - Memory retrieval (queries, candidates, selections)
-//! - Tool selection (scoring, filtering, final set)
+//! - tool surface (scoring, filtering, final set)
 //!
 //! This enables answering questions like:
 //! - "Why did the agent lose focus?" → compression dropped critical context
@@ -35,8 +35,8 @@ pub struct ContextAssemblyTrace {
     /// Memory retrieval trace.
     pub memory: MemoryRetrievalTrace,
 
-    /// Tool selection trace.
-    pub tools: ToolSelectionTrace,
+    /// tool surface trace.
+    pub tools: ToolSurfaceTrace,
 
     /// Final token budget and allocation.
     pub token_budget: TokenBudgetTrace,
@@ -69,7 +69,7 @@ impl Default for ContextAssemblyTrace {
             system_prompt: SystemPromptBreakdown::default(),
             history: HistorySelectionTrace::default(),
             memory: MemoryRetrievalTrace::default(),
-            tools: ToolSelectionTrace::default(),
+            tools: ToolSurfaceTrace::default(),
             token_budget: TokenBudgetTrace::default(),
             explanations: Vec::new(),
         }
@@ -129,8 +129,6 @@ pub struct SystemPromptBreakdown {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptGuidanceSignals {
-    pub round_budget_warning: bool,
-    pub synthesize_or_batch: bool,
     pub parallel_feedback: bool,
     /// Set when the trailing N rounds in conversation history each ran
     /// exactly one tool — strong signal the model is making sequential
@@ -304,49 +302,24 @@ pub enum MemorySource {
     UserProfile,
 }
 
-// ─── Tool Selection Trace ────────────────────────────────────────────────────
+// ─── Tool Surface Trace ─────────────────────────────────────────────────────
 
-/// Trace of tool selection process.
+/// Trace of the concrete tool schemas exposed to an LLM call.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ToolSelectionTrace {
-    /// Tools that were available.
+pub struct ToolSurfaceTrace {
+    /// Tools available before final payload filtering.
     pub tools_available: u32,
-    /// Tools that were selected for the LLM.
-    pub tools_selected: Vec<ToolSelected>,
-    /// Tools that were considered but not selected.
-    pub tools_rejected: Vec<ToolRejected>,
-    /// Strategy used for selection.
-    pub selection_strategy: String,
-    /// Confidence in the selection.
-    pub selection_confidence: f64,
-    /// Selection latency in milliseconds.
-    pub selection_latency_ms: u64,
+    /// Tools included in the LLM-visible surface.
+    pub visible_tools: Vec<VisibleTool>,
+    /// Tool surface assembly latency in milliseconds.
+    pub surface_latency_ms: u64,
 }
 
-/// A tool that was selected.
+/// A tool schema included in the LLM-visible surface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolSelected {
+pub struct VisibleTool {
     pub tool_name: String,
-    pub score: f64,
     pub tokens: u32,
-    /// Why this tool was selected.
-    pub selection_factors: Vec<SelectionFactor>,
-}
-
-/// A factor that contributed to tool selection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SelectionFactor {
-    pub factor_name: String,
-    pub weight: f64,
-    pub contribution: f64,
-}
-
-/// A tool that was rejected.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolRejected {
-    pub tool_name: String,
-    pub score: f64,
-    pub rejection_reason: String,
 }
 
 // ─── Token Budget Trace ──────────────────────────────────────────────────────
@@ -388,8 +361,8 @@ pub struct DecisionExplanation {
 /// Type of decision being explained.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DecisionType {
-    /// Tool selection decision.
-    ToolSelection { tools: Vec<String> },
+    /// Tool surface decision.
+    ToolSurface { visible_tools: Vec<String> },
     /// History compression decision.
     HistoryCompression { turns_affected: Vec<u32> },
     /// Memory retrieval decision.
@@ -441,7 +414,7 @@ impl ContextAssemblyTraceBuilder {
         self
     }
 
-    pub fn with_tools(mut self, tools: ToolSelectionTrace) -> Self {
+    pub fn with_tools(mut self, tools: ToolSurfaceTrace) -> Self {
         self.trace.tools = tools;
         self
     }
@@ -478,9 +451,8 @@ pub struct TraceAggregation {
     /// Memory effectiveness.
     pub avg_memories_selected: f64,
     pub avg_memory_relevance: f64,
-    /// Tool selection statistics.
-    pub avg_tools_selected: f64,
-    pub avg_selection_confidence: f64,
+    /// Tool surface statistics.
+    pub avg_visible_tools: f64,
 }
 
 impl TraceAggregation {
@@ -544,14 +516,9 @@ impl TraceAggregation {
                     0.0
                 }
             },
-            avg_tools_selected: traces
+            avg_visible_tools: traces
                 .iter()
-                .map(|t| t.tools.tools_selected.len() as f64)
-                .sum::<f64>()
-                / n,
-            avg_selection_confidence: traces
-                .iter()
-                .map(|t| t.tools.selection_confidence)
+                .map(|t| t.tools.visible_tools.len() as f64)
                 .sum::<f64>()
                 / n,
         }
@@ -603,47 +570,32 @@ pub fn build_history_trace_from_compression(
     }
 }
 
-/// Build ToolSelectionTrace from SelectionResult.
-///
-/// This function converts the tool selector's result into the telemetry
-/// trace format for observability.
-pub fn build_tool_trace_from_selection(
+/// Build [`ToolSurfaceTrace`] from the effective tool surface.
+pub fn build_tool_surface_trace(
     tools_available: u32,
-    selected_tools: &[String],
-    strategy: &str,
-    confidence: f64,
+    visible_tools: &[String],
     per_tool_costs: &[(String, u32)],
-    selection_latency_ms: u64,
-) -> ToolSelectionTrace {
-    let tools_selected: Vec<ToolSelected> = selected_tools
+    surface_latency_ms: u64,
+) -> ToolSurfaceTrace {
+    let visible_tools: Vec<VisibleTool> = visible_tools
         .iter()
-        .enumerate()
-        .map(|(idx, name)| {
+        .map(|name| {
             let tokens = per_tool_costs
                 .iter()
                 .find(|(n, _)| n == name)
                 .map(|(_, c)| *c)
                 .unwrap_or(0);
-            ToolSelected {
+            VisibleTool {
                 tool_name: name.clone(),
-                score: (1.0 - (idx as f64 * 0.1)).max(0.0),
                 tokens,
-                selection_factors: vec![SelectionFactor {
-                    factor_name: "selector".to_string(),
-                    weight: 1.0,
-                    contribution: confidence,
-                }],
             }
         })
         .collect();
 
-    ToolSelectionTrace {
+    ToolSurfaceTrace {
         tools_available,
-        tools_selected,
-        tools_rejected: Vec::new(), // Would need scorer internals
-        selection_strategy: strategy.to_string(),
-        selection_confidence: confidence,
-        selection_latency_ms,
+        visible_tools,
+        surface_latency_ms,
     }
 }
 
@@ -778,10 +730,12 @@ mod tests {
     }
 
     #[test]
-    fn tool_trace_scores_are_clamped_non_negative() {
-        let selected_tools: Vec<String> = (0..16).map(|i| format!("tool-{i}")).collect();
-        let trace = build_tool_trace_from_selection(16, &selected_tools, "tfidf", 0.4, &[], 5);
-        assert!(trace.tools_selected.iter().all(|tool| tool.score >= 0.0));
+    fn tool_surface_trace_preserves_visible_order() {
+        let visible_tools: Vec<String> = (0..16).map(|i| format!("tool-{i}")).collect();
+        let trace = build_tool_surface_trace(16, &visible_tools, &[], 5);
+        assert_eq!(trace.visible_tools.len(), 16);
+        assert_eq!(trace.visible_tools[0].tool_name, "tool-0");
+        assert_eq!(trace.surface_latency_ms, 5);
     }
 
     #[test]

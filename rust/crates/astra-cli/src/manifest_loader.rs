@@ -865,7 +865,7 @@ depends_on: []
     }
 
     #[test]
-    fn registered_manifest_tools_score_via_tfidf() {
+    fn registered_manifest_tools_expose_enabled_schemas() {
         let manifest = parse_manifest(SAMPLE_MANIFEST).unwrap();
         let mut registry = PluginRegistry::new();
 
@@ -874,10 +874,12 @@ depends_on: []
             registry.register(entry).unwrap();
         }
 
-        let query = astra_runtime::text_tokenize::tokenize("show kubernetes pods");
-        let scores = registry.score_all(&query);
-        assert!(!scores.is_empty());
-        assert_eq!(scores[0].1, "kubectl_get");
+        let names: Vec<_> = registry
+            .enabled_tools()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["kubectl_get", "kubectl_apply"]);
+        assert_eq!(registry.schemas().len(), 2);
     }
 
     // ── Command template expansion ──

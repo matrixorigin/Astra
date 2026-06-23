@@ -111,7 +111,7 @@ pinned_tools = ["github"]
 #[test]
 #[serial_test::serial]
 fn missing_toml_defaults_are_in_wire() {
-    // Empty TOML dir — no overrides. Wire reflects DEFAULT_PINNED exactly.
+    // Empty TOML dir — no overrides. Wire reflects the default pinned identities exactly.
     with_user_runtime_toml("# empty", |config| {
         let surface = ToolSurface::build(catalog_schemas(), &config.tool_surface, &[]);
         let pinned = names(&surface.pinned_schemas());

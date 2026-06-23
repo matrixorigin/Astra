@@ -376,11 +376,10 @@ pub struct ToolSurfacePlan {
     pub required_schemas: Vec<Value>,
     pub deferred_tools_block: String,
     pub restricted_tools: HashSet<String>,
-    pub selection_trace: ToolSelectionTrace,
 }
 ```
 
-The CLI adapter can fill this from the existing registry selector.
+The CLI adapter can fill this from the final visible tool surface.
 
 The web adapter can fill this from server-side tools, browser/edge tools, plugin schemas, MCP tools, and any server-side tool search/deferred activation result.
 

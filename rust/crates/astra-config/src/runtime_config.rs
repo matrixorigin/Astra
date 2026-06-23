@@ -38,9 +38,9 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub memory: MemoryConfig,
 
-    /// Tool selection configuration.
+    /// tool surface configuration.
     #[serde(default)]
-    pub tool_selection: ToolSelectionConfig,
+    pub tool_policy: ToolPolicyConfig,
 
     /// Per-session trace configuration.
     #[serde(default)]
@@ -315,7 +315,7 @@ impl Default for RuntimeConfig {
             allow_implicit_request_scoped_mcp: false,
             compression: CompressionConfig::default(),
             memory: MemoryConfig::default(),
-            tool_selection: ToolSelectionConfig::default(),
+            tool_policy: ToolPolicyConfig::default(),
             trace: SessionTraceConfig::default(),
             token_budget: TokenBudgetConfig::default(),
             verification: VerificationConfig::default(),
@@ -559,18 +559,14 @@ pub enum MemoryStrategy {
     Custom,
 }
 
-// ─── Tool Selection Configuration ────────────────────────────────────────────
+// ─── tool surface Configuration ────────────────────────────────────────────
 
-/// Configuration for tool selection.
+/// Configuration for tool surface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolSelectionConfig {
+pub struct ToolPolicyConfig {
     /// Maximum number of tools to include in the prompt.
     #[serde(default = "default_max_tools")]
     pub max_tools: u32,
-
-    /// Minimum confidence score for a tool to be selected.
-    #[serde(default = "default_tool_confidence_threshold")]
-    pub confidence_threshold: f64,
 
     /// Whether to prefer tools used recently in the conversation.
     #[serde(default = "default_true")]
@@ -584,11 +580,6 @@ pub struct ToolSelectionConfig {
     #[serde(default = "default_max_tool_schema_tokens")]
     pub max_tool_schema_tokens: u32,
 
-    /// Deprecated scenario-driven override for the removed tool selector budget.
-    /// 0 = no override. Retained so older config files continue to deserialize.
-    #[serde(default)]
-    pub tool_budget_tokens: u32,
-
     /// Max times the same (tool, args) can execute across a session.
     /// 0 = use default (2). Prevents infinite loops from ignored dedup hints.
     #[serde(default)]
@@ -599,16 +590,6 @@ pub struct ToolSelectionConfig {
     /// Prevents pathological turns where the agent requests 50+ tool calls.
     #[serde(default)]
     pub max_tools_per_turn: u32,
-
-    /// Round budget warning — DEPRECATED, always ignored.
-    /// Retained for config file backward compatibility (deserialization won't fail).
-    #[serde(default)]
-    pub round_budget_warning: u32,
-
-    /// Round budget limit — DEPRECATED, always ignored.
-    /// Retained for config file backward compatibility (deserialization won't fail).
-    #[serde(default)]
-    pub round_budget_limit: u32,
 
     /// Circuit breaker: consecutive stall rounds (no new patterns, no mutations)
     /// before tripping. 0 = use default (3).
@@ -707,20 +688,20 @@ pub struct ToolSelectionConfig {
     /// Per-model overrides for workflow-guard thresholds.
     ///
     /// Matched against the request's `model` field. The first matching profile
-    /// wins; fields left at 0 fall back to the global `ToolSelectionConfig`
+    /// wins; fields left at 0 fall back to the global `ToolPolicyConfig`
     /// defaults. Typical layout:
     ///
     /// ```toml
-    /// [[tool_selection.model_profiles]]
+    /// [[tool_policy.model_profiles]]
     /// model_match = "opus"            # prefix match on model id
     /// max_identical_tool_calls = 4
     ///
-    /// [[tool_selection.model_profiles]]
+    /// [[tool_policy.model_profiles]]
     /// model_match = "haiku"
     /// max_identical_tool_calls = 2
     /// ```
     ///
-    /// Built-in defaults are seeded from [`ToolSelectionConfig::builtin_model_profiles`]
+    /// Built-in defaults are seeded from [`ToolPolicyConfig::builtin_model_profiles`]
     /// when no user profiles match; explicit user entries always take priority.
     #[serde(default)]
     pub model_profiles: Vec<ModelPolicyProfile>,
@@ -742,7 +723,7 @@ pub struct ModelPolicyProfile {
     pub model_match: String,
 
     /// Override for `max_identical_tool_calls`. 0 = inherit from the global
-    /// [`ToolSelectionConfig`].
+    /// [`ToolPolicyConfig`].
     #[serde(default)]
     pub max_identical_tool_calls: u32,
 
@@ -764,14 +745,14 @@ pub struct ModelPolicyProfile {
     pub max_consecutive_empty_name: u32,
 
     /// Override for the mid-loop parallel-batching force streak threshold.
-    /// 0 = inherit from the global [`ToolSelectionConfig`].
+    /// 0 = inherit from the global [`ToolPolicyConfig`].
     #[serde(default)]
     pub parallel_batching_force_streak: u32,
 }
 
 /// Resolved per-model workflow-guard policy.
 ///
-/// Returned by [`ToolSelectionConfig::resolve_for_model`]. All fields are
+/// Returned by [`ToolPolicyConfig::resolve_for_model`]. All fields are
 /// concrete (no sentinel zeros) — callers can use them directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EffectiveToolPolicy {
@@ -787,13 +768,13 @@ pub struct EffectiveToolPolicy {
     pub parallel_batching_force_streak: u32,
 }
 
-impl ToolSelectionConfig {
+impl ToolPolicyConfig {
     /// Resolved max identical tool calls (0 → default of 3, floor of 2).
     ///
     /// Default raised from 2 → 3 on 2026-04-27: the prior limit fired on the
     /// common "read → re-check after an edit" flow, which is legitimate rather
     /// than a loop. Per-model profiles can tighten or loosen this further —
-    /// see [`ToolSelectionConfig::resolve_for_model`].
+    /// see [`ToolPolicyConfig::resolve_for_model`].
     ///
     /// The floor of 2 is symmetric with the per-profile floor in
     /// `apply_profile`. A value of 1 would turn every second identical call
@@ -910,18 +891,6 @@ impl ToolSelectionConfig {
         }
     }
 
-    /// DEPRECATED — always returns a high value so callers that still check
-    /// this never trigger budget pressure.
-    pub fn effective_round_budget_warning(&self) -> u32 {
-        200
-    }
-
-    /// DEPRECATED — always returns a high value so callers that still check
-    /// this never trigger the old phase1/phase2 logic.
-    pub fn effective_round_budget_limit(&self) -> u32 {
-        200
-    }
-
     /// Resolved circuit breaker stall threshold (0 → default 3, floor 2).
     pub fn effective_circuit_breaker_stall_threshold(&self) -> u32 {
         resolve_threshold(self.circuit_breaker_stall_threshold, 6, 3)
@@ -965,7 +934,7 @@ impl ToolSelectionConfig {
     /// The mirror-image floor in `apply_profile` MUST agree.
     ///
     /// This is the canonical non-model baseline used by
-    /// [`ToolSelectionConfig::resolve_for_model`] when seeding the base policy.
+    /// [`ToolPolicyConfig::resolve_for_model`] when seeding the base policy.
     pub fn effective_parallel_batching_force_streak(&self) -> u32 {
         resolve_parallel_batching_force_streak(self.parallel_batching_force_streak)
     }
@@ -1053,7 +1022,7 @@ fn resolve_parallel_batching_force_streak(value: u32) -> u32 {
 /// Shorter patterns are almost always a misconfig (`"4"` would match any
 /// model containing a `4`, `"us"` would match every Bedrock id, etc.).
 /// Rejected patterns are silently ignored at resolve time — use
-/// [`ToolSelectionConfig::rejected_model_match_patterns`] to surface them
+/// [`ToolPolicyConfig::rejected_model_match_patterns`] to surface them
 /// (e.g. `astra config show-policy` prints a warning block for each).
 const MIN_MODEL_MATCH_LEN: usize = 3;
 
@@ -1074,7 +1043,7 @@ fn model_profile_matches(pattern: &str, model_lower: &str) -> bool {
     model_lower.contains(&pattern.to_ascii_lowercase())
 }
 
-impl ToolSelectionConfig {
+impl ToolPolicyConfig {
     /// Return every `model_match` pattern in `model_profiles` that is too
     /// short to be considered at resolve time (see [`MIN_MODEL_MATCH_LEN`]).
     ///
@@ -1140,9 +1109,6 @@ fn apply_profile(base: EffectiveToolPolicy, profile: &ModelPolicyProfile) -> Eff
 fn default_max_tools() -> u32 {
     30
 }
-fn default_tool_confidence_threshold() -> f64 {
-    0.3
-}
 fn default_recent_tool_boost() -> f64 {
     0.15
 }
@@ -1150,19 +1116,15 @@ fn default_max_tool_schema_tokens() -> u32 {
     15000
 }
 
-impl Default for ToolSelectionConfig {
+impl Default for ToolPolicyConfig {
     fn default() -> Self {
         Self {
             max_tools: default_max_tools(),
-            confidence_threshold: default_tool_confidence_threshold(),
             prefer_recent_tools: default_true(),
             recent_tool_boost: default_recent_tool_boost(),
             max_tool_schema_tokens: default_max_tool_schema_tokens(),
-            tool_budget_tokens: 0,
             max_identical_tool_calls: 0,
             max_tools_per_turn: 0,
-            round_budget_warning: 0,
-            round_budget_limit: 0,
             circuit_breaker_stall_threshold: 0,
             circuit_breaker_repetition_threshold: 0,
             circuit_breaker_half_open_patience: 0,
@@ -1820,7 +1782,7 @@ impl RuntimeConfig {
             version,
             compression,
             memory,
-            tool_selection,
+            tool_policy,
             trace,
             token_budget,
             verification,
@@ -1924,17 +1886,13 @@ impl RuntimeConfig {
             MemoryStrategy::default(),
         );
 
-        let ToolSelectionConfig {
+        let ToolPolicyConfig {
             max_tools,
-            confidence_threshold,
             prefer_recent_tools,
             recent_tool_boost,
             max_tool_schema_tokens,
-            tool_budget_tokens,
             max_identical_tool_calls,
             max_tools_per_turn,
-            round_budget_warning,
-            round_budget_limit,
             circuit_breaker_stall_threshold,
             circuit_breaker_repetition_threshold,
             circuit_breaker_half_open_patience,
@@ -1950,137 +1908,111 @@ impl RuntimeConfig {
             cache_waste_midloop_threshold,
             exploration_family_churn_midloop_threshold,
             model_profiles,
-        } = tool_selection;
+        } = tool_policy;
         merge_if_non_default(
-            &mut self.tool_selection.max_tools,
+            &mut self.tool_policy.max_tools,
             max_tools,
             default_max_tools(),
         );
         merge_if_non_default(
-            &mut self.tool_selection.confidence_threshold,
-            confidence_threshold,
-            default_tool_confidence_threshold(),
-        );
-        merge_if_non_default(
-            &mut self.tool_selection.prefer_recent_tools,
+            &mut self.tool_policy.prefer_recent_tools,
             prefer_recent_tools,
             default_true(),
         );
         merge_if_non_default(
-            &mut self.tool_selection.recent_tool_boost,
+            &mut self.tool_policy.recent_tool_boost,
             recent_tool_boost,
             default_recent_tool_boost(),
         );
         merge_if_non_default(
-            &mut self.tool_selection.max_tool_schema_tokens,
+            &mut self.tool_policy.max_tool_schema_tokens,
             max_tool_schema_tokens,
             default_max_tool_schema_tokens(),
         );
         merge_if_non_default(
-            &mut self.tool_selection.tool_budget_tokens,
-            tool_budget_tokens,
-            0,
-        );
-        merge_if_non_default(
-            &mut self.tool_selection.max_identical_tool_calls,
+            &mut self.tool_policy.max_identical_tool_calls,
             max_identical_tool_calls,
             0,
         );
         merge_if_non_default(
-            &mut self.tool_selection.max_tools_per_turn,
+            &mut self.tool_policy.max_tools_per_turn,
             max_tools_per_turn,
             0,
         );
         merge_if_non_default(
-            &mut self.tool_selection.round_budget_warning,
-            round_budget_warning,
-            0,
-        );
-        merge_if_non_default(
-            &mut self.tool_selection.round_budget_limit,
-            round_budget_limit,
-            0,
-        );
-        merge_if_non_default(
-            &mut self.tool_selection.circuit_breaker_stall_threshold,
+            &mut self.tool_policy.circuit_breaker_stall_threshold,
             circuit_breaker_stall_threshold,
             0,
         );
         merge_if_non_default(
-            &mut self.tool_selection.circuit_breaker_repetition_threshold,
+            &mut self.tool_policy.circuit_breaker_repetition_threshold,
             circuit_breaker_repetition_threshold,
             0,
         );
         merge_if_non_default(
-            &mut self.tool_selection.circuit_breaker_half_open_patience,
+            &mut self.tool_policy.circuit_breaker_half_open_patience,
             circuit_breaker_half_open_patience,
             0,
         );
         merge_if_non_default(
-            &mut self.tool_selection.circuit_breaker_absolute_max_rounds,
+            &mut self.tool_policy.circuit_breaker_absolute_max_rounds,
             circuit_breaker_absolute_max_rounds,
             0,
         );
         merge_if_non_default(
-            &mut self
-                .tool_selection
-                .circuit_breaker_read_only_stall_threshold,
+            &mut self.tool_policy.circuit_breaker_read_only_stall_threshold,
             circuit_breaker_read_only_stall_threshold,
             0,
         );
         merge_if_non_default(
-            &mut self.tool_selection.circuit_breaker_max_introspect_emissions,
+            &mut self.tool_policy.circuit_breaker_max_introspect_emissions,
             circuit_breaker_max_introspect_emissions,
             0,
         );
         merge_if_non_default(
-            &mut self.tool_selection.parallel_batching_force_streak,
+            &mut self.tool_policy.parallel_batching_force_streak,
             parallel_batching_force_streak,
             0,
         );
         merge_if_non_default(
-            &mut self.tool_selection.redundant_reads_midloop_threshold,
+            &mut self.tool_policy.redundant_reads_midloop_threshold,
             redundant_reads_midloop_threshold,
             0,
         );
         merge_if_non_default(
-            &mut self.tool_selection.sequential_read_churn_eval_threshold,
+            &mut self.tool_policy.sequential_read_churn_eval_threshold,
             sequential_read_churn_eval_threshold,
             0,
         );
         merge_if_non_default(
-            &mut self.tool_selection.redundant_reads_eval_threshold,
+            &mut self.tool_policy.redundant_reads_eval_threshold,
             redundant_reads_eval_threshold,
             0,
         );
         merge_if_non_default(
-            &mut self.tool_selection.search_fanout_eval_threshold,
+            &mut self.tool_policy.search_fanout_eval_threshold,
             search_fanout_eval_threshold,
             0,
         );
         merge_if_non_default(
-            &mut self
-                .tool_selection
-                .redundant_validation_retries_eval_threshold,
+            &mut self.tool_policy.redundant_validation_retries_eval_threshold,
             redundant_validation_retries_eval_threshold,
             0,
         );
         merge_if_non_default(
-            &mut self.tool_selection.cache_waste_midloop_threshold,
+            &mut self.tool_policy.cache_waste_midloop_threshold,
             cache_waste_midloop_threshold,
             0,
         );
         merge_if_non_default(
-            &mut self
-                .tool_selection
-                .exploration_family_churn_midloop_threshold,
+            &mut self.tool_policy.exploration_family_churn_midloop_threshold,
             exploration_family_churn_midloop_threshold,
             0,
         );
         // model_profiles: non-empty override replaces; empty preserves existing.
         // Merging by model_match would be ambiguous when patterns overlap.
         if !model_profiles.is_empty() {
-            self.tool_selection.model_profiles = model_profiles;
+            self.tool_policy.model_profiles = model_profiles;
         }
 
         let SessionTraceConfig {
@@ -2385,7 +2317,7 @@ mod tests {
 
     #[test]
     fn test_effective_max_identical_calls() {
-        let mut config = ToolSelectionConfig::default();
+        let mut config = ToolPolicyConfig::default();
         // Default raised from 2 → 3 on 2026-04-27 (see
         // `effective_max_identical_calls` doc).
         assert_eq!(config.effective_max_identical_calls(), 3);
@@ -2410,13 +2342,13 @@ mod tests {
     /// returned 1 verbatim.
     #[test]
     fn global_and_profile_floors_for_max_identical_calls_agree() {
-        let cfg = ToolSelectionConfig {
+        let cfg = ToolPolicyConfig {
             max_identical_tool_calls: 1,
             ..Default::default()
         };
         let global = cfg.effective_max_identical_calls();
 
-        let mut cfg2 = ToolSelectionConfig::default();
+        let mut cfg2 = ToolPolicyConfig::default();
         cfg2.model_profiles.push(ModelPolicyProfile {
             model_match: "custom".to_string(),
             max_identical_tool_calls: 1,
@@ -2434,7 +2366,7 @@ mod tests {
 
     #[test]
     fn test_effective_max_tools_per_turn() {
-        let mut config = ToolSelectionConfig::default();
+        let mut config = ToolPolicyConfig::default();
         assert_eq!(config.effective_max_tools_per_turn(), 15);
 
         config.max_tools_per_turn = 10;
@@ -2549,17 +2481,13 @@ mod tests {
                 include_repository_memories: false,
                 strategy: MemoryStrategy::Comprehensive,
             },
-            tool_selection: ToolSelectionConfig {
+            tool_policy: ToolPolicyConfig {
                 max_tools: 12,
-                confidence_threshold: 0.7,
                 prefer_recent_tools: false,
                 recent_tool_boost: 0.4,
                 max_tool_schema_tokens: 22000,
-                tool_budget_tokens: 0,
                 max_identical_tool_calls: 0,
                 max_tools_per_turn: 0,
-                round_budget_warning: 0,
-                round_budget_limit: 0,
                 circuit_breaker_stall_threshold: 0,
                 circuit_breaker_repetition_threshold: 0,
                 circuit_breaker_half_open_patience: 0,
@@ -2652,11 +2580,10 @@ mod tests {
         assert!(!merged.memory.include_repository_memories);
         assert_eq!(merged.memory.strategy, MemoryStrategy::Comprehensive);
 
-        assert_eq!(merged.tool_selection.max_tools, 12);
-        assert!((merged.tool_selection.confidence_threshold - 0.7).abs() < 0.001);
-        assert!(!merged.tool_selection.prefer_recent_tools);
-        assert!((merged.tool_selection.recent_tool_boost - 0.4).abs() < 0.001);
-        assert_eq!(merged.tool_selection.max_tool_schema_tokens, 22000);
+        assert_eq!(merged.tool_policy.max_tools, 12);
+        assert!(!merged.tool_policy.prefer_recent_tools);
+        assert!((merged.tool_policy.recent_tool_boost - 0.4).abs() < 0.001);
+        assert_eq!(merged.tool_policy.max_tool_schema_tokens, 22000);
 
         assert_eq!(merged.trace.profile, TraceProfile::Custom);
         assert_eq!(merged.trace.min_level, TraceLevelSerde::Debug);
@@ -2702,14 +2629,6 @@ mod tests {
         assert_eq!(merged.adaptive_tuning.budget_cooldown_turns, 6);
         assert_eq!(merged.adaptive_tuning.tuning_cycle_interval, 8);
         assert_eq!(merged.agent_binding_registry.max_agent_md_bytes, 4096);
-    }
-
-    #[test]
-    fn round_budget_defaults() {
-        // Deprecated: always returns 200 (effectively disabled).
-        let cfg = ToolSelectionConfig::default();
-        assert_eq!(cfg.effective_round_budget_warning(), 200);
-        assert_eq!(cfg.effective_round_budget_limit(), 200);
     }
 
     #[test]
@@ -2760,55 +2679,21 @@ mod tests {
     }
 
     #[test]
-    fn round_budget_custom_values() {
-        // Deprecated: custom values are ignored, always returns 200.
-        let cfg = ToolSelectionConfig {
-            round_budget_warning: 5,
-            round_budget_limit: 10,
-            ..Default::default()
-        };
-        assert_eq!(cfg.effective_round_budget_warning(), 200);
-        assert_eq!(cfg.effective_round_budget_limit(), 200);
-    }
-
-    #[test]
-    fn round_budget_limit_enforces_above_warning() {
-        // Deprecated: always returns 200 regardless of config.
-        let cfg = ToolSelectionConfig {
-            round_budget_warning: 8,
-            round_budget_limit: 5,
-            ..Default::default()
-        };
-        assert_eq!(cfg.effective_round_budget_limit(), 200);
-    }
-
-    #[test]
-    fn round_budget_limit_zero_uses_default_regardless_of_warning() {
-        // Deprecated: always returns 200.
-        let cfg = ToolSelectionConfig {
-            round_budget_warning: 5,
-            round_budget_limit: 0,
-            ..Default::default()
-        };
-        assert_eq!(cfg.effective_round_budget_limit(), 200);
-    }
-
-    #[test]
     fn parallel_batching_force_streak_default_and_floor() {
         // 0 → relaxed default. The floor remains lower than the default, but
         // still above the runtime prompt-side nudge threshold.
-        let cfg = ToolSelectionConfig::default();
+        let cfg = ToolPolicyConfig::default();
         assert_eq!(
             cfg.effective_parallel_batching_force_streak(),
             DEFAULT_PARALLEL_BATCHING_FORCE_STREAK
         );
         // explicit override respected
-        let cfg = ToolSelectionConfig {
+        let cfg = ToolPolicyConfig {
             parallel_batching_force_streak: 8,
             ..Default::default()
         };
         assert_eq!(cfg.effective_parallel_batching_force_streak(), 8);
-        let cfg = ToolSelectionConfig {
+        let cfg = ToolPolicyConfig {
             parallel_batching_force_streak: u32::MAX,
             ..Default::default()
         };
@@ -2819,7 +2704,7 @@ mod tests {
         // pathological override 1 floors to MIN_PARALLEL_BATCHING_FORCE_STREAK
         // (strictly above PARALLEL_BATCHING_NUDGE_THRESHOLD=6 to preserve
         // the soft→hard cascade).
-        let cfg = ToolSelectionConfig {
+        let cfg = ToolPolicyConfig {
             parallel_batching_force_streak: 1,
             ..Default::default()
         };
@@ -2829,7 +2714,7 @@ mod tests {
         );
         // any value at or below the runtime nudge threshold (6) is clamped up
         for low in 2..=6 {
-            let cfg = ToolSelectionConfig {
+            let cfg = ToolPolicyConfig {
                 parallel_batching_force_streak: low,
                 ..Default::default()
             };
@@ -2843,7 +2728,7 @@ mod tests {
 
     #[test]
     fn resolve_for_model_parallel_batching_force_profile_uses_floor() {
-        let mut cfg = ToolSelectionConfig::default();
+        let mut cfg = ToolPolicyConfig::default();
         cfg.model_profiles.push(ModelPolicyProfile {
             model_match: "flash".to_string(),
             parallel_batching_force_streak: 1,
@@ -2859,7 +2744,7 @@ mod tests {
         // sets force at/below the nudge threshold would let the hard corrective
         // fire on the same round the prompt-layer first nudges.
         for low in 2..=6 {
-            let mut cfg = ToolSelectionConfig::default();
+            let mut cfg = ToolPolicyConfig::default();
             cfg.model_profiles.push(ModelPolicyProfile {
                 model_match: "flash".to_string(),
                 parallel_batching_force_streak: low,
@@ -2872,7 +2757,7 @@ mod tests {
             );
         }
 
-        let mut cfg = ToolSelectionConfig::default();
+        let mut cfg = ToolPolicyConfig::default();
         cfg.model_profiles.push(ModelPolicyProfile {
             model_match: "flash".to_string(),
             parallel_batching_force_streak: u32::MAX,
@@ -2890,13 +2775,13 @@ mod tests {
     /// threshold and silently invert the soft→hard cascade.
     #[test]
     fn global_and_profile_floors_for_parallel_batching_force_agree() {
-        let global = ToolSelectionConfig {
+        let global = ToolPolicyConfig {
             parallel_batching_force_streak: 1,
             ..Default::default()
         }
         .effective_parallel_batching_force_streak();
 
-        let mut cfg = ToolSelectionConfig::default();
+        let mut cfg = ToolPolicyConfig::default();
         cfg.model_profiles.push(ModelPolicyProfile {
             model_match: "flash".to_string(),
             parallel_batching_force_streak: 1,
@@ -2916,16 +2801,16 @@ mod tests {
     #[test]
     fn redundant_reads_midloop_threshold_default_and_floor() {
         // 0 → default 4
-        let cfg = ToolSelectionConfig::default();
+        let cfg = ToolPolicyConfig::default();
         assert_eq!(cfg.effective_redundant_reads_midloop_threshold(), 4);
         // explicit override respected
-        let cfg = ToolSelectionConfig {
+        let cfg = ToolPolicyConfig {
             redundant_reads_midloop_threshold: 6,
             ..Default::default()
         };
         assert_eq!(cfg.effective_redundant_reads_midloop_threshold(), 6);
         // pathological override 1 floors to 2
-        let cfg = ToolSelectionConfig {
+        let cfg = ToolPolicyConfig {
             redundant_reads_midloop_threshold: 1,
             ..Default::default()
         };
@@ -2934,16 +2819,16 @@ mod tests {
 
     #[test]
     fn sequential_read_churn_eval_threshold_default_and_floor() {
-        let cfg = ToolSelectionConfig::default();
+        let cfg = ToolPolicyConfig::default();
         assert_eq!(cfg.effective_sequential_read_churn_eval_threshold(), 8);
 
-        let cfg = ToolSelectionConfig {
+        let cfg = ToolPolicyConfig {
             sequential_read_churn_eval_threshold: 10,
             ..Default::default()
         };
         assert_eq!(cfg.effective_sequential_read_churn_eval_threshold(), 10);
 
-        let cfg = ToolSelectionConfig {
+        let cfg = ToolPolicyConfig {
             sequential_read_churn_eval_threshold: 1,
             ..Default::default()
         };
@@ -2952,16 +2837,16 @@ mod tests {
 
     #[test]
     fn redundant_reads_eval_threshold_default_and_floor() {
-        let cfg = ToolSelectionConfig::default();
+        let cfg = ToolPolicyConfig::default();
         assert_eq!(cfg.effective_redundant_reads_eval_threshold(), 3);
 
-        let cfg = ToolSelectionConfig {
+        let cfg = ToolPolicyConfig {
             redundant_reads_eval_threshold: 6,
             ..Default::default()
         };
         assert_eq!(cfg.effective_redundant_reads_eval_threshold(), 6);
 
-        let cfg = ToolSelectionConfig {
+        let cfg = ToolPolicyConfig {
             redundant_reads_eval_threshold: 1,
             ..Default::default()
         };
@@ -2970,16 +2855,16 @@ mod tests {
 
     #[test]
     fn search_fanout_eval_threshold_default_and_floor() {
-        let cfg = ToolSelectionConfig::default();
+        let cfg = ToolPolicyConfig::default();
         assert_eq!(cfg.effective_search_fanout_eval_threshold(), 8);
 
-        let cfg = ToolSelectionConfig {
+        let cfg = ToolPolicyConfig {
             search_fanout_eval_threshold: 10,
             ..Default::default()
         };
         assert_eq!(cfg.effective_search_fanout_eval_threshold(), 10);
 
-        let cfg = ToolSelectionConfig {
+        let cfg = ToolPolicyConfig {
             search_fanout_eval_threshold: 1,
             ..Default::default()
         };
@@ -2988,13 +2873,13 @@ mod tests {
 
     #[test]
     fn redundant_validation_retries_eval_threshold_default_and_override() {
-        let cfg = ToolSelectionConfig::default();
+        let cfg = ToolPolicyConfig::default();
         assert_eq!(
             cfg.effective_redundant_validation_retries_eval_threshold(),
             2
         );
 
-        let cfg = ToolSelectionConfig {
+        let cfg = ToolPolicyConfig {
             redundant_validation_retries_eval_threshold: 4,
             ..Default::default()
         };
@@ -3003,7 +2888,7 @@ mod tests {
             4
         );
 
-        let cfg = ToolSelectionConfig {
+        let cfg = ToolPolicyConfig {
             redundant_validation_retries_eval_threshold: 1,
             ..Default::default()
         };
@@ -3031,13 +2916,13 @@ mod tests {
     fn effective_max_identical_calls_default_is_three() {
         // Raised from 2 on 2026-04-27 — update the doc in
         // `effective_max_identical_calls` if this changes.
-        let cfg = ToolSelectionConfig::default();
+        let cfg = ToolPolicyConfig::default();
         assert_eq!(cfg.effective_max_identical_calls(), 3);
     }
 
     #[test]
     fn resolve_for_model_without_model_id_uses_global_default() {
-        let cfg = ToolSelectionConfig::default();
+        let cfg = ToolPolicyConfig::default();
         let policy = cfg.resolve_for_model(None);
         assert_eq!(policy.max_identical_tool_calls, 3);
         assert_eq!(policy.max_tools_per_turn, 15);
@@ -3045,7 +2930,7 @@ mod tests {
 
     #[test]
     fn resolve_for_model_hits_builtin_opus_profile() {
-        let cfg = ToolSelectionConfig::default();
+        let cfg = ToolPolicyConfig::default();
         // Full Bedrock-style id with "opus" embedded.
         let policy = cfg.resolve_for_model(Some("us.anthropic.claude-opus-4-7-v1"));
         assert_eq!(policy.max_identical_tool_calls, 4);
@@ -3054,7 +2939,7 @@ mod tests {
 
     #[test]
     fn resolve_for_model_builtin_haiku_keeps_conservative() {
-        let cfg = ToolSelectionConfig::default();
+        let cfg = ToolPolicyConfig::default();
         let policy = cfg.resolve_for_model(Some("claude-haiku-4-5-20251001"));
         assert_eq!(policy.max_identical_tool_calls, 2);
         assert_eq!(policy.max_tools_per_turn, 12);
@@ -3062,7 +2947,7 @@ mod tests {
 
     #[test]
     fn resolve_for_model_unknown_falls_back_to_global() {
-        let cfg = ToolSelectionConfig::default();
+        let cfg = ToolPolicyConfig::default();
         let policy = cfg.resolve_for_model(Some("some-obscure-model-id"));
         // No built-in match → global defaults (3 / 15).
         assert_eq!(policy.max_identical_tool_calls, 3);
@@ -3071,7 +2956,7 @@ mod tests {
 
     #[test]
     fn resolve_for_model_user_profile_overrides_builtin() {
-        let mut cfg = ToolSelectionConfig::default();
+        let mut cfg = ToolPolicyConfig::default();
         cfg.model_profiles.push(ModelPolicyProfile {
             model_match: "opus".to_string(),
             max_identical_tool_calls: 8,
@@ -3087,7 +2972,7 @@ mod tests {
 
     #[test]
     fn resolve_for_model_empty_pattern_matches_any() {
-        let mut cfg = ToolSelectionConfig::default();
+        let mut cfg = ToolPolicyConfig::default();
         cfg.model_profiles.push(ModelPolicyProfile {
             model_match: String::new(),
             max_identical_tool_calls: 7,
@@ -3100,7 +2985,7 @@ mod tests {
 
     #[test]
     fn resolve_for_model_match_is_case_insensitive() {
-        let cfg = ToolSelectionConfig::default();
+        let cfg = ToolPolicyConfig::default();
         let policy = cfg.resolve_for_model(Some("CLAUDE-OPUS-4-7"));
         assert_eq!(policy.max_identical_tool_calls, 4);
     }
@@ -3108,7 +2993,7 @@ mod tests {
     #[test]
     fn resolve_for_model_floor_applied_to_user_override() {
         // Floor of 5 for max_tools_per_turn — defense against misconfig.
-        let mut cfg = ToolSelectionConfig::default();
+        let mut cfg = ToolPolicyConfig::default();
         cfg.model_profiles.push(ModelPolicyProfile {
             model_match: "custom".to_string(),
             max_identical_tool_calls: 0,
@@ -3125,7 +3010,7 @@ mod tests {
         // (claude-opus-4-7, gpt-4, etc.) — almost certainly a misconfig
         // rather than intent. Require ≥ 3 chars. Empty string stays the
         // explicit fallback-profile sentinel and is unaffected.
-        let mut cfg = ToolSelectionConfig::default();
+        let mut cfg = ToolPolicyConfig::default();
         cfg.model_profiles.push(ModelPolicyProfile {
             model_match: "4".to_string(),
             max_identical_tool_calls: 99,
@@ -3145,7 +3030,7 @@ mod tests {
     fn resolve_for_model_rejects_two_char_pattern() {
         // Boundary: "op" is still too short (most pathological match cases
         // — "o", "4", "us" — are 1–2 chars).
-        let mut cfg = ToolSelectionConfig::default();
+        let mut cfg = ToolPolicyConfig::default();
         cfg.model_profiles.push(ModelPolicyProfile {
             model_match: "op".to_string(),
             max_identical_tool_calls: 99,
@@ -3159,7 +3044,7 @@ mod tests {
     fn resolve_for_model_accepts_three_char_pattern() {
         // Boundary: 3 chars is the minimum allowed — "gpt", "opus" minus
         // one, etc. Honoring this lets users target narrower model families.
-        let mut cfg = ToolSelectionConfig::default();
+        let mut cfg = ToolPolicyConfig::default();
         cfg.model_profiles.push(ModelPolicyProfile {
             model_match: "4-7".to_string(),
             max_identical_tool_calls: 7,
@@ -3176,7 +3061,7 @@ mod tests {
         // from "disable tool use entirely after N=1". That's almost
         // certainly a misconfig; clamp to the lowest value any built-in
         // profile uses (2, matching haiku).
-        let mut cfg = ToolSelectionConfig::default();
+        let mut cfg = ToolPolicyConfig::default();
         cfg.model_profiles.push(ModelPolicyProfile {
             model_match: "custom".to_string(),
             max_identical_tool_calls: 1,
@@ -3193,7 +3078,7 @@ mod tests {
     fn resolve_for_model_empty_pattern_still_works_as_fallback() {
         // Regression guard: after tightening the min-length check, the
         // empty-string fallback-profile pattern must still match any model.
-        let mut cfg = ToolSelectionConfig::default();
+        let mut cfg = ToolPolicyConfig::default();
         cfg.model_profiles.push(ModelPolicyProfile {
             model_match: String::new(),
             max_identical_tool_calls: 9,
@@ -3207,7 +3092,7 @@ mod tests {
     fn rejected_model_match_patterns_lists_short_patterns_preserves_order() {
         // Intent: `show-policy` can read this list verbatim and tell the
         // user "these patterns are being ignored".
-        let mut cfg = ToolSelectionConfig::default();
+        let mut cfg = ToolPolicyConfig::default();
         for p in ["4", "op", "opus", "", "us"] {
             cfg.model_profiles.push(ModelPolicyProfile {
                 model_match: p.to_string(),
@@ -3225,7 +3110,7 @@ mod tests {
 
     #[test]
     fn rejected_model_match_patterns_empty_when_all_valid() {
-        let mut cfg = ToolSelectionConfig::default();
+        let mut cfg = ToolPolicyConfig::default();
         cfg.model_profiles.push(ModelPolicyProfile {
             model_match: "gpt-5".to_string(),
             ..Default::default()
@@ -3236,7 +3121,7 @@ mod tests {
     #[test]
     fn model_profiles_round_trip_through_toml() {
         let mut cfg = RuntimeConfig::default();
-        cfg.tool_selection.model_profiles.push(ModelPolicyProfile {
+        cfg.tool_policy.model_profiles.push(ModelPolicyProfile {
             model_match: "gpt-5".to_string(),
             max_identical_tool_calls: 6,
             max_tools_per_turn: 25,
@@ -3248,7 +3133,7 @@ mod tests {
         assert!(toml.contains("model_profiles"));
         assert!(toml.contains("gpt-5"));
         let parsed: RuntimeConfig = toml::from_str(&toml).unwrap();
-        let profile = &parsed.tool_selection.model_profiles[0];
+        let profile = &parsed.tool_policy.model_profiles[0];
         assert_eq!(profile.model_match, "gpt-5");
         assert_eq!(profile.max_identical_tool_calls, 6);
     }
@@ -3367,7 +3252,7 @@ mod tests {
         // Global default: suppression threshold = 3, empty-name cap = 3.
         // These replaced the hardcoded `REPEATED_CACHE_HIT_SUPPRESSION_THRESHOLD`
         // and `MAX_CONSECUTIVE_EMPTY_NAME` constants in the runtime pipeline.
-        let cfg = ToolSelectionConfig::default();
+        let cfg = ToolPolicyConfig::default();
         let policy = cfg.resolve_for_model(None);
         assert_eq!(policy.repeated_cache_hit_suppression, 3);
         assert_eq!(policy.max_consecutive_empty_name, 3);
@@ -3377,7 +3262,7 @@ mod tests {
     fn opus_profile_loosens_cache_hit_suppression() {
         // Stronger models repeat reads more deliberately — give them more rope
         // before suppression kicks in. Haiku stays tight.
-        let cfg = ToolSelectionConfig::default();
+        let cfg = ToolPolicyConfig::default();
         let opus = cfg.resolve_for_model(Some("claude-opus-4-7"));
         assert_eq!(opus.repeated_cache_hit_suppression, 4);
 
@@ -3387,7 +3272,7 @@ mod tests {
 
     #[test]
     fn user_profile_overrides_new_fields_independently() {
-        let mut cfg = ToolSelectionConfig::default();
+        let mut cfg = ToolPolicyConfig::default();
         cfg.model_profiles.push(ModelPolicyProfile {
             model_match: "custom".to_string(),
             max_identical_tool_calls: 0,

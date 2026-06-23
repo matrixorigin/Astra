@@ -52,7 +52,7 @@ use agentic_sse_loop::{
 use cli_loop_host::CliAgenticLoopHost;
 use serde_json::{Value, json};
 
-/// Map `ToolSelectionConfig` (from `astra-config`) to `BreakerConfig` (from
+/// Map `ToolPolicyConfig` (from `astra-config`) to `BreakerConfig` (from
 /// `astra-turn-core`).
 ///
 /// Lives in the CLI because `astra-config` and `astra-turn-core` are sibling
@@ -61,8 +61,8 @@ use serde_json::{Value, json};
 /// The CLI is the natural composition layer that already depends on both.
 /// If a second caller appears, promote this to a dedicated adapter crate
 /// rather than coupling the two base crates.
-fn circuit_breaker_config_from_tool_selection(
-    config: &astra_config::runtime_config::ToolSelectionConfig,
+fn circuit_breaker_config_from_tool_policy(
+    config: &astra_config::runtime_config::ToolPolicyConfig,
 ) -> astra_turn_core::loop_circuit_breaker::BreakerConfig {
     // Resolve each threshold and warn when a user-supplied value was clamped
     // to its floor so operators can diagnose unexpected behaviour.
@@ -145,15 +145,6 @@ async fn finalize_root_mailbox(
             );
         }
     }
-}
-
-fn extend_restricted_with_blocked_tools(
-    _restricted: &mut HashSet<String>,
-    _observability_hub: Option<&Arc<astra_runtime::observability::ObservabilityHub>>,
-) {
-    // Pattern-library / evolution-driven tool blocking was removed along with
-    // the self-evolution subsystem. The function is retained as a no-op so
-    // callers don't need signature changes; add future block sources here.
 }
 
 type RootPermissionContextHandle = astra_runtime::orchestration::PermissionSyncHandle;
@@ -241,9 +232,9 @@ pub(crate) async fn stream_chat_sse(
     let model_id_for_policy = p.model;
     let runtime_manifest =
         runtime_manifest_for_model("cli_turn_selection", "cli_edge", model_id_for_policy);
-    let tool_selection_config = astra_config::runtime_config::RuntimeConfig::load().tool_selection;
-    let resolved_tool_policy = tool_selection_config.resolve_for_model(model_id_for_policy);
-    let circuit_breaker_config = circuit_breaker_config_from_tool_selection(&tool_selection_config);
+    let tool_policy_config = astra_config::runtime_config::RuntimeConfig::load().tool_policy;
+    let resolved_tool_policy = tool_policy_config.resolve_for_model(model_id_for_policy);
+    let circuit_breaker_config = circuit_breaker_config_from_tool_policy(&tool_policy_config);
 
     // Paint an immediate spinner so the user sees feedback during init (executor, schemas,
     // skill discovery, etc.) before the per-turn prep spinner takes over.
@@ -516,9 +507,6 @@ pub(crate) async fn stream_chat_sse(
         }
     }
 
-    // Seed persisted hard-blocks from cross-session learning so blocked tools
-    // never appear in the visible schema set for a new CLI turn.
-    extend_restricted_with_blocked_tools(&mut initial_restricted, p.observability_hub.as_ref());
     initial_restricted.extend(p.resume_restricted_tools.iter().cloned());
 
     let current_session_id = p.session_id.map(|s| s.to_string());
@@ -745,7 +733,7 @@ pub(crate) async fn stream_chat_sse(
         turn_guard,
         restricted_tools: initial_restricted,
         boosted_tools: HashSet::new(),
-        widen_selection_pending: false,
+        widen_surface_pending: false,
         step_recorder,
         idempotency_cache: p.idempotency_cache.unwrap_or_default(),
         semantic_dedup: SemanticDedup::new(
@@ -768,14 +756,14 @@ pub(crate) async fn stream_chat_sse(
             forced_execution_retry: false,
             forced_execution_escalation: false,
             forced_parallel_batching: false,
-            forced_round_budget_phase1: false,
-            forced_round_budget_phase2: false,
+            forced_tool_round_hard_stop: false,
+            forced_tool_round_abort: false,
             introspection_count: 0,
             forced_redundant_reads_corrective: false,
             forced_cache_waste_corrective: false,
             forced_search_fanout_corrective: false,
             forced_exploration_family_corrective: false,
-            forced_exploration_family_phase2: false,
+            forced_exploration_family_lockout: false,
             exploration_family_corrective_family: None,
             nudge_count: 0,
             circuit_breaker: astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::new(
@@ -790,12 +778,11 @@ pub(crate) async fn stream_chat_sse(
             explain_turns: Vec::new(),
             first_ttft_ms: None,
             all_tools_used: HashSet::new(),
-            first_selection_report: None,
+            first_surface_report: None,
             first_budget_pressure: 0.0,
             first_context_assembly_ms: None,
             first_memoria_ms: None,
             all_selected_skills: Vec::new(),
-            initial_skill_selector_shortlist: None,
             observability_session: p.observability_session.clone(),
             observability_hub: p.observability_hub.clone(),
             turn_trace_collector: None,
@@ -894,7 +881,6 @@ pub(crate) async fn stream_chat_sse(
         permission_handler: None,
         tactical_adapter: None,
         step_signal_collector: None,
-        tool_budget_override: None,
         recent_tactical_actions: Vec::new(),
         server_tool_executor: None,
         interruption: None,
@@ -1064,9 +1050,7 @@ pub(crate) async fn stream_chat_sse(
                 routing_domain_hint: None,
                 assistant_output: Some(&state.final_text),
                 tool_call_records: &state.stall.tool_call_records,
-                selection_strategy: None,
-                selection_confidence: None,
-                selected_tools: Vec::new(),
+                visible_tools: Vec::new(),
             };
             if let Some(text) = explain_reports::render_explain_report_text(
                 &state.telemetry.explain_turns,
@@ -1096,7 +1080,7 @@ pub(crate) async fn stream_chat_sse(
         cache_read_tokens: state.total_cache_read,
         cache_creation_tokens: state.total_cache_creation,
         tool_calls_count: state.total_tool_calls,
-        first_selection_report: state.telemetry.first_selection_report,
+        first_surface_report: state.telemetry.first_surface_report,
         selected_skills: state.telemetry.all_selected_skills,
         tools_used: state.telemetry.all_tools_used,
         tool_call_records: state.stall.tool_call_records,
@@ -1223,26 +1207,23 @@ fn load_turn_messages(
 #[cfg(test)]
 mod tests {
     use super::{
-        circuit_breaker_config_from_tool_selection, detect_turn_hook_sets,
-        extend_restricted_with_blocked_tools, missing_model_selection_journal_event,
-        missing_model_selection_turn_failure, normalize_turn_model,
-        refresh_root_permission_context, require_selected_turn_model,
+        circuit_breaker_config_from_tool_policy, detect_turn_hook_sets,
+        missing_model_selection_journal_event, missing_model_selection_turn_failure,
+        normalize_turn_model, refresh_root_permission_context, require_selected_turn_model,
         restored_compaction_effectiveness, root_permission_context_handle,
     };
     use crate::cli::permission_manager::{PermissionManager, PermissionMode};
-    use astra_runtime::observability::ObservabilityHub;
     use astra_runtime::turn::permission_gate::{PermissionCheckResult, check_tool_permission};
     use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
     use serde_json::json;
-    use std::collections::HashSet;
     use std::path::Path;
     use std::sync::Arc;
     use tempfile::tempdir;
 
     #[test]
     fn circuit_breaker_config_uses_runtime_config_defaults() {
-        let cfg = circuit_breaker_config_from_tool_selection(
-            &astra_config::runtime_config::ToolSelectionConfig::default(),
+        let cfg = circuit_breaker_config_from_tool_policy(
+            &astra_config::runtime_config::ToolPolicyConfig::default(),
         );
 
         assert_eq!(cfg.stall_threshold, 6);
@@ -1540,7 +1521,7 @@ mod tests {
 
     #[test]
     fn circuit_breaker_config_uses_runtime_config_overrides_with_floors() {
-        let tool_selection = astra_config::runtime_config::ToolSelectionConfig {
+        let tool_policy = astra_config::runtime_config::ToolPolicyConfig {
             circuit_breaker_stall_threshold: 1,
             circuit_breaker_repetition_threshold: 7,
             circuit_breaker_read_only_stall_threshold: 2,
@@ -1551,7 +1532,7 @@ mod tests {
             ..Default::default()
         };
 
-        let cfg = circuit_breaker_config_from_tool_selection(&tool_selection);
+        let cfg = circuit_breaker_config_from_tool_policy(&tool_policy);
 
         // stall: resolve(1, 6, 3) = max(1, 3) = 3 (floored)
         assert_eq!(cfg.stall_threshold, 3);
@@ -1569,11 +1550,11 @@ mod tests {
     #[test]
     fn circuit_breaker_config_introspect_floor_is_one() {
         // user supplies explicit value=1 (at the floor) — should pass through unchanged
-        let tool_selection = astra_config::runtime_config::ToolSelectionConfig {
+        let tool_policy = astra_config::runtime_config::ToolPolicyConfig {
             circuit_breaker_max_introspect_emissions: 1,
             ..Default::default()
         };
-        let cfg = circuit_breaker_config_from_tool_selection(&tool_selection);
+        let cfg = circuit_breaker_config_from_tool_policy(&tool_policy);
         assert_eq!(cfg.max_introspect_emissions, 1);
     }
 
@@ -1691,16 +1672,5 @@ hooks:
         );
         assert_eq!(s.stop_hooks.len(), 1);
         assert_eq!(s.stop_hooks[0].label, "audit");
-    }
-
-    #[test]
-    fn blocked_patterns_do_not_restrict_pinned_tools() {
-        // After the pattern-library subsystem was removed, the blocked-tools
-        // set is always empty — verify `extend_restricted_with_blocked_tools`
-        // is a safe no-op on an ObservabilityHub without any evolution inputs.
-        let hub = Arc::new(ObservabilityHub::new());
-        let mut restricted = HashSet::new();
-        extend_restricted_with_blocked_tools(&mut restricted, Some(&hub));
-        assert!(restricted.is_empty());
     }
 }

@@ -751,7 +751,7 @@ mod tests {
     // Read-only tools (read_file, grep, glob, list_dir) stay allowed so
     // the model can still explore the codebase to write a good plan.
     //
-    // claudecode references: plan-mode write block enforces "DO NOT
+    // reference-agent references: plan-mode write block enforces "DO NOT
     // write or edit any files yet. This is a read-only exploration and
     // planning phase." Without this gate, the model can call write
     // tools while in plan mode and silently bypass the workflow.

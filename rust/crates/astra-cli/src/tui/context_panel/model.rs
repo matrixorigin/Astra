@@ -17,7 +17,7 @@
 use crate::cli::session::session_state::ContinuationAnchor;
 use astra_turn_core::context_assembly_trace::{
     ContextAssemblyTrace, DecisionExplanation, DecisionType, MemoryInjection, MemoryRejection,
-    MemorySelection, RejectionReason, SkillInjection, ToolSelected,
+    MemorySelection, RejectionReason, SkillInjection, VisibleTool,
 };
 
 use ratatui::style::Color;
@@ -271,11 +271,6 @@ pub(crate) struct Category {
 pub(crate) struct ToolItem {
     pub name: String,
     pub tokens: u32,
-    pub score: f64,
-    /// Top-ranked selection factors from the tool scorer.  Each
-    /// entry is `(factor_name, weight)` — kept short so expanded
-    /// rows stay readable.
-    pub factors: Vec<(String, f64)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -292,7 +287,7 @@ pub(crate) struct SkillItem {
     pub name: String,
     pub tokens: u32,
     /// Optional one-line description (populated only when the
-    /// model data source carries it — e.g. selector shortlist).
+    /// model data source carries it, e.g. injected skill metadata).
     pub description: Option<String>,
     pub source: Option<String>,
 }
@@ -560,25 +555,16 @@ impl ContextBreakdown {
 
         let free_space_tokens = limit.saturating_sub(budget.total_used);
 
-        // Tools: keep the original selection order (trace-scoring
-        // already ranks them).  Tokens come from the per-tool count
-        // the selector emitted.  Zero-token entries are filtered so
-        // a partial trace doesn't fill the panel with noise.
+        // Tools: keep the original visible-surface order. Zero-token entries
+        // are filtered so a partial trace doesn't fill the panel with noise.
         let tools: Vec<ToolItem> = trace
             .tools
-            .tools_selected
+            .visible_tools
             .iter()
-            .filter(|t: &&ToolSelected| t.tokens > 0)
+            .filter(|t: &&VisibleTool| t.tokens > 0)
             .map(|t| ToolItem {
                 name: t.tool_name.clone(),
                 tokens: t.tokens,
-                score: t.score,
-                factors: t
-                    .selection_factors
-                    .iter()
-                    .take(3)
-                    .map(|f| (f.factor_name.clone(), f.weight))
-                    .collect(),
             })
             .collect();
 
@@ -602,9 +588,8 @@ impl ContextBreakdown {
         memories.sort_by_key(|m| std::cmp::Reverse(m.tokens));
 
         // Skills: prefer the rich `skills_injected` list — it has
-        // per-skill token counts.  When the runtime only records a
-        // selector shortlist (common for providers that don't break
-        // down per-skill cost), fall back to those names with
+        // per-skill token counts. When the runtime only records names
+        // without per-skill cost, fall back to those names with
         // tokens=0 so the section still renders something useful.
         let mut skills: Vec<SkillItem> = trace
             .system_prompt
@@ -913,16 +898,6 @@ fn build_prompt_signals(trace: &ContextAssemblyTrace) -> Vec<SignalItem> {
             "Learned corrections from prior sessions are active",
         ),
         guide(
-            gs.round_budget_warning,
-            "round_budget_warning",
-            "Per-round token budget is tight — warn the model",
-        ),
-        guide(
-            gs.synthesize_or_batch,
-            "synthesize_or_batch",
-            "Encourage synthesis / batching instead of drive-by actions",
-        ),
-        guide(
             gs.parallel_feedback,
             "parallel_feedback",
             "Parallel-execution feedback attached",
@@ -961,7 +936,9 @@ fn build_decisions(trace: &ContextAssemblyTrace) -> Vec<DecisionItem> {
 
 fn render_decision_label(t: &DecisionType) -> String {
     match t {
-        DecisionType::ToolSelection { tools } => format!("Tool selection ({})", tools.join(", ")),
+        DecisionType::ToolSurface { visible_tools } => {
+            format!("Tool surface ({})", visible_tools.join(", "))
+        }
         DecisionType::HistoryCompression { turns_affected } => {
             format!("History compression ({} turns)", turns_affected.len())
         }

@@ -92,7 +92,7 @@ pub struct BreakerConfig {
     ///
     /// **Sentinel**: `0` here means **unbounded** (no cap on introspect emissions).
     ///
-    /// **Note**: if this config is populated from `ToolSelectionConfig`
+    /// **Note**: if this config is populated from `ToolPolicyConfig`
     /// (via the CLI adapter), `circuit_breaker_max_introspect_emissions = 0`
     /// in the user config means "use default (3)", NOT unbounded — the
     /// `0 = unbounded` sentinel only applies directly to `BreakerConfig`.

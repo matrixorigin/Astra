@@ -1141,7 +1141,6 @@ impl StateSyncService for MatrixOneSyncService {
 pub mod pref_keys {
     pub const EXPLAIN_MODE: &str = "explain_mode";
     pub const DEFAULT_MODEL: &str = "default_model";
-    pub const TOOL_BUDGET: &str = "tool_budget_tokens";
     pub const CHECKPOINT_INTERVAL: &str = "checkpoint_interval";
     pub const FOCUS_ENTITIES: &str = "focus_entities";
     pub const LANGUAGE: &str = "language";
@@ -1270,7 +1269,6 @@ mod tests {
     fn pref_keys_are_defined() {
         assert_eq!(pref_keys::EXPLAIN_MODE, "explain_mode");
         assert_eq!(pref_keys::DEFAULT_MODEL, "default_model");
-        assert_eq!(pref_keys::TOOL_BUDGET, "tool_budget_tokens");
         assert_eq!(pref_keys::NOTIFICATION_METHOD, "notification_method");
     }
 

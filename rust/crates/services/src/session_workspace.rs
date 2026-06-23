@@ -29,19 +29,13 @@ fn is_zero_u64(v: &u64) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ContextTraceToolSelection {
+pub struct ContextTraceToolSurface {
     #[serde(default)]
     pub tools_available: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub selected_tools: Vec<String>,
+    pub visible_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub selection_scope: String,
-    #[serde(default)]
-    pub rejected_tools: usize,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub strategy: String,
-    #[serde(default)]
-    pub confidence: f64,
+    pub surface_scope: String,
     #[serde(default)]
     pub latency_ms: u64,
 }
@@ -114,7 +108,7 @@ pub struct ContextTraceSignal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub captured_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_selection: Option<ContextTraceToolSelection>,
+    pub tool_surface: Option<ContextTraceToolSurface>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<ContextTraceMemorySignal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -133,20 +127,14 @@ impl ContextTraceSignal {
         if !self.turn_id.is_empty() {
             parts.push(self.turn_id.clone());
         }
-        if let Some(selection) = self.tool_selection.as_ref() {
-            if !selection.selected_tools.is_empty() {
-                let label = if selection.selection_scope.is_empty() {
+        if let Some(selection) = self.tool_surface.as_ref() {
+            if !selection.visible_tools.is_empty() {
+                let label = if selection.surface_scope.is_empty() {
                     "tools".to_string()
                 } else {
-                    format!("tools[{}]", selection.selection_scope)
+                    format!("tools[{}]", selection.surface_scope)
                 };
-                parts.push(format!("{label}: {}", selection.selected_tools.join(", ")));
-            }
-            if !selection.strategy.is_empty() {
-                parts.push(format!(
-                    "strategy: {} ({:.2})",
-                    selection.strategy, selection.confidence
-                ));
+                parts.push(format!("{label}: {}", selection.visible_tools.join(", ")));
             }
         }
         if let Some(memory) = self.memory.as_ref()
@@ -1125,13 +1113,10 @@ mod tests {
         ws.last_context_trace = Some(ContextTraceSignal {
             turn_id: "turn-7".into(),
             captured_at: Some("2026-04-10T12:00:00Z".into()),
-            tool_selection: Some(ContextTraceToolSelection {
+            tool_surface: Some(ContextTraceToolSurface {
                 tools_available: 12,
-                selected_tools: vec!["lsp".into(), "view".into()],
-                selection_scope: "latest_round".into(),
-                rejected_tools: 4,
-                strategy: "code-intel".into(),
-                confidence: 0.91,
+                visible_tools: vec!["lsp".into(), "view".into()],
+                surface_scope: "latest_round".into(),
                 latency_ms: 18,
             }),
             memory: Some(ContextTraceMemorySignal {
@@ -1225,17 +1210,14 @@ mod tests {
     }
 
     #[test]
-    fn context_trace_preview_labels_tool_selection_scope() {
+    fn context_trace_preview_labels_tool_surface_scope() {
         let trace = ContextTraceSignal {
             turn_id: "turn-7".into(),
             captured_at: None,
-            tool_selection: Some(ContextTraceToolSelection {
+            tool_surface: Some(ContextTraceToolSurface {
                 tools_available: 4,
-                selected_tools: vec!["lsp".into()],
-                selection_scope: "latest_round".into(),
-                rejected_tools: 1,
-                strategy: "code-intel".into(),
-                confidence: 0.88,
+                visible_tools: vec!["lsp".into()],
+                surface_scope: "latest_round".into(),
                 latency_ms: 9,
             }),
             memory: None,

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use astra_services::session_journal::{JournalEvent, JournalWriter};
 use astra_services::session_workspace::{
     ContextTraceBudgetSignal, ContextTraceHistorySignal, ContextTraceMemorySignal,
-    ContextTraceSignal, ContextTraceTimingSignal, ContextTraceToolSelection,
+    ContextTraceSignal, ContextTraceTimingSignal, ContextTraceToolSurface,
 };
 use serde::{Deserialize, Serialize};
 
@@ -93,7 +93,7 @@ pub struct ObservabilitySession {
 
     /// Most recent [`StrategyApplication`] summary, if any, published into
     /// observability for self-model rendering so the agent passively "knows"
-    /// what tool-selection surfaces were adjusted (blocked/boosted/widened).
+    /// what tool-surface surfaces were adjusted (blocked/boosted/widened).
     ///
     /// Reset lazily — it lingers until the next published strategy update.
     pub last_strategy_application: Option<crate::turn::agentic::stage_bridge::StrategyApplication>,
