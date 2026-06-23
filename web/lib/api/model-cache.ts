@@ -111,9 +111,9 @@ export function createModelCacheService<T = unknown>(opts?: {
   return new ModelCacheService<T>(opts);
 }
 
-/** Singleton model list cache used by resolveBackendModelName. */
+/** Singleton model list cache used by requireKnownBackendModelName. */
 export const modelCache = new ModelCacheService<
-  Array<{ model_id?: string; name?: string }>
+  Array<{ name?: string | null }>
 >({ ttlMs: DEFAULT_TTL_MS, maxEntries: MAX_ENTRIES });
 
 export function resetModelCacheForTests() {

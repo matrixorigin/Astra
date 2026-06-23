@@ -2352,7 +2352,7 @@ async function callBackendAgent(params: {
       auth: "optional",
       operation: "start web chat turn",
     });
-    const model = await resolveBackendModelName(client, params.model);
+    const model = await requireKnownBackendModelName(client, params.model);
     const activeSkills = normalizedActiveSkills(params.activeSkills);
 
     const run = await client.sdk.createRun(
@@ -2545,7 +2545,7 @@ function parseRunSseText(text: string): StreamResult {
   };
 }
 
-export async function resolveBackendModelName(
+export async function requireKnownBackendModelName(
   runtime: RuntimeConfig | WebRuntimeClient,
   model: string,
 ): Promise<string> {
@@ -2554,38 +2554,48 @@ export async function resolveBackendModelName(
     throw new Error("model is required");
   }
 
-  try {
-    const client =
-      runtime instanceof WebRuntimeClient
-        ? runtime
-        : new WebRuntimeClient(runtime);
-    const accessToken = client.config.accessToken;
-    if (!accessToken) {
-      return requestedModel;
-    }
-
-    const cached = modelCache.get(accessToken);
-    let modelsPromise: Promise<Array<{ model_id?: string; name?: string }>>;
-    if (cached) {
-      modelsPromise = cached;
-    } else {
-      modelsPromise = client.sdk.listModels();
-      modelCache.set(accessToken, modelsPromise);
-    }
-
-    const models = await modelsPromise.catch((err) => {
-      modelCache.invalidate(accessToken);
-      throw err;
+  const client =
+    runtime instanceof WebRuntimeClient ? runtime : new WebRuntimeClient(runtime);
+  const accessToken = client.config.accessToken;
+  if (!accessToken) {
+    throw new RuntimeClientError({
+      operation: "resolve runtime model",
+      path: "/models",
+      status: 401,
+      detail: "Runtime authentication is missing.",
     });
-    const matched = models.find(
-      (item) => item.model_id === requestedModel || item.name === requestedModel,
-    );
-    return matched?.name ?? requestedModel;
-  } catch (error) {
-    console.warn(
-      "[web-store] resolveBackendModelName failed, returning raw model name:",
-      error instanceof Error ? error.message : error,
-    );
-    return requestedModel;
   }
+
+  const cached = modelCache.get(accessToken);
+  let modelsPromise: Promise<Array<{ name?: string | null }>>;
+  if (cached) {
+    modelsPromise = cached;
+  } else {
+    modelsPromise = client.sdk.listModels();
+    modelCache.set(accessToken, modelsPromise);
+  }
+
+  let models: Array<{ name?: string | null }>;
+  try {
+    models = await modelsPromise;
+  } catch (error) {
+    modelCache.invalidate(accessToken);
+    throw runtimeOperationError("resolve runtime model", error);
+  }
+
+  const knownNames = new Set(
+    models
+      .map((item) => item.name?.trim())
+      .filter((name): name is string => Boolean(name)),
+  );
+  if (!knownNames.has(requestedModel)) {
+    throw new RuntimeClientError({
+      operation: "resolve runtime model",
+      path: "/models",
+      status: 400,
+      detail: `Unknown model "${requestedModel}". Select a model returned by /api/models.`,
+    });
+  }
+
+  return requestedModel;
 }

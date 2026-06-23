@@ -10,7 +10,7 @@ import {
   beginStreamingMessage,
   ensureChatBackendSession,
   getChat,
-  resolveBackendModelName,
+  requireKnownBackendModelName,
   selectedWebModel,
   setChatActiveRun,
   updateChatWorkspaceSelection,
@@ -647,7 +647,7 @@ export async function POST(
           model: requestedModel,
           runtime,
         }),
-        resolveBackendModelName(runtime, requestedModel),
+        requireKnownBackendModelName(runtime, requestedModel),
       ]);
       runtimeSessionId = ensuredSessionId;
       emit({

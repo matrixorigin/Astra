@@ -28,8 +28,8 @@ function formatThinking(value: RuntimeModelListItem['thinking_capability']) {
 }
 
 function toModelSummary(model: RuntimeModelListItem): ModelSummary | null {
-  const id = model.name ?? model.model_id;
-  if (!id) {
+  const name = model.name?.trim();
+  if (!name) {
     return null;
   }
 
@@ -42,8 +42,8 @@ function toModelSummary(model: RuntimeModelListItem): ModelSummary | null {
   ].filter((part): part is string => Boolean(part));
 
   return {
-    id,
-    name: model.name ?? id,
+    id: name,
+    name,
     subtitle: parts.length > 0 ? parts.join(' · ') : 'Imported Astra model',
     tier: 'included',
   };

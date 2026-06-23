@@ -16,11 +16,13 @@ const fallbackModels: ModelSummary[] = [
 export function ModelSwitcher({
   value,
   onChange,
+  onModelAvailabilityChange,
   thinking,
   onThinkingChange,
 }: {
   value: string;
   onChange: (value: string) => void;
+  onModelAvailabilityChange?: (available: boolean) => void;
   thinking: boolean;
   onThinkingChange: (value: boolean) => void;
 }) {
@@ -39,13 +41,12 @@ export function ModelSwitcher({
       });
   }, []);
 
-  useEffect(() => {
-    if (loadedModels && models.length > 0 && !models.some((model) => model.id === value)) {
-      onChange(models[0].id);
-    }
-  }, [loadedModels, models, onChange, value]);
-
   const selected = models.find((model) => model.id === value);
+  const modelUnavailable = loadedModels && Boolean(value) && !selected;
+
+  useEffect(() => {
+    onModelAvailabilityChange?.(!modelUnavailable);
+  }, [modelUnavailable, onModelAvailabilityChange]);
 
   return (
     <Popover
@@ -53,9 +54,14 @@ export function ModelSwitcher({
       trigger={
         <button
           type="button"
+          aria-invalid={modelUnavailable || undefined}
+          title={modelUnavailable ? value : undefined}
           className="flex max-w-56 items-center gap-2 rounded-control px-2 py-1 text-sm text-text-secondary hover:bg-surface-muted hover:text-text"
         >
-          <span className="truncate">{selected?.name ?? value ?? 'Model'}</span>
+          <span className="truncate">
+            {selected?.name ??
+              (modelUnavailable ? 'Unavailable model' : value || 'Model')}
+          </span>
           <ChevronDown className="size-4" />
         </button>
       }
