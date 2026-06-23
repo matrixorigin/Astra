@@ -441,9 +441,7 @@ pub fn build_deferred_tools_prompt_block_with_budget(
          the compact schema and activate it for the next model request; call \
          that tool only after its name appears in `tools[]`, using the schema's \
          exact fields. If a tool is already present in `tools[]`, call it directly. \
-         For dotted legacy names like `agent.spawn`, \
-         use the consolidated tool name (`agent`) and pass the action via its \
-         `action` field. Never call a tool whose name does NOT appear in \
+         Never call a tool whose name does NOT appear in \
          `tools[]` or `<deferred_tools>` — use `tool_search` with a keyword \
          query to discover what exists.",
     );

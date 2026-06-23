@@ -104,21 +104,6 @@ impl ToolExecutionOutcome {
         }
     }
 
-    /// Constructor for text output.
-    ///
-    /// **Do not use in new code.** Prefer [`Self::ok`] / [`Self::error`] so the
-    /// error flag is explicit at the call site. A successful output that
-    /// happens to start with the literal text `"Error"` would be misclassified
-    /// here — which is exactly the bug commit 454f9f47 set out to eliminate.
-    pub fn text(output: String) -> Self {
-        let is_error = output.starts_with("Error");
-        Self {
-            output,
-            tool_result_fields: None,
-            is_error,
-        }
-    }
-
     pub fn error(output: String) -> Self {
         Self {
             output,

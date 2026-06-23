@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn internal_names_do_not_have_public_schemas() {
         let schema_names = schema_names();
-        for identity in all_tool_declarations()
+        for declaration in all_tool_declarations()
             .iter()
             .filter(|declaration| declaration.load_policy == ToolLoadPolicy::Internal)
         {

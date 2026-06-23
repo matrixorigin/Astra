@@ -623,8 +623,8 @@ pub fn discover_skills_tool_schema() -> Value {
     })
 }
 
-/// True if this tool call targets `discover_skills` (legacy name) or
-/// the consolidated `skill {action: "discover"}` form.
+/// True if this tool call targets the public `discover_skills` tool or the
+/// consolidated `skill {action: "discover"}` form.
 ///
 /// Tool name comparison is case-insensitive to stay aligned with
 /// `astra_turn_core::tool_allowlist::normalize_tool_name`, which the runtime
