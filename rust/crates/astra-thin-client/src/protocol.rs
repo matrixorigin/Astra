@@ -195,24 +195,17 @@ impl ToolResultRequest {
         }
     }
 
-    /// Parse a dispatch result JSON string back into `(output, is_error)`.
-    ///
-    /// The JSON is the serialized `ToolResultRequest` produced by
-    /// `edge_callback_handlers` / `deliver_result`.  Both the tool-executor
-    /// fallback path and the turn-bridge polling path need to extract the
-    /// same two fields — this avoids duplicated parsing logic.
-    pub fn parse_output_and_error(result_json: &str) -> (String, bool) {
-        let (output, is_error, _fields) = Self::parse_output_error_and_fields(result_json);
-        (output, is_error)
-    }
-
     /// Parse a dispatch result JSON string back into output, error status, and
     /// structured tool-result fields.
     pub fn parse_output_error_and_fields(
         result_json: &str,
     ) -> (String, bool, Option<Map<String, Value>>) {
-        let v: serde_json::Value = serde_json::from_str(result_json)
-            .unwrap_or_else(|_| serde_json::json!({"output": result_json}));
+        let v: serde_json::Value = match serde_json::from_str(result_json) {
+            Ok(value) => value,
+            Err(error) => {
+                return (format!("invalid tool result JSON: {error}"), true, None);
+            }
+        };
         let output = v
             .get("output")
             .and_then(|v| v.as_str())
@@ -1243,22 +1236,24 @@ mod tests {
         }
     }
 
-    // ── ToolResultRequest serialization / parse_output_and_error ──────
+    // ── ToolResultRequest serialization / parse_output_error_and_fields ──────
 
     #[test]
-    fn tool_result_parse_output_and_error_success() {
+    fn tool_result_parse_output_error_and_fields_success() {
         let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"completed","output":"hello","duration_ms":42}"#;
-        let (output, is_error) = ToolResultRequest::parse_output_and_error(json);
+        let (output, is_error, fields) = ToolResultRequest::parse_output_error_and_fields(json);
         assert_eq!(output, "hello");
         assert!(!is_error);
+        assert!(fields.is_none());
     }
 
     #[test]
-    fn tool_result_parse_output_and_error_error_status() {
+    fn tool_result_parse_output_error_and_fields_error_status() {
         let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"failed","output":"fail"}"#;
-        let (output, is_error) = ToolResultRequest::parse_output_and_error(json);
+        let (output, is_error, fields) = ToolResultRequest::parse_output_error_and_fields(json);
         assert_eq!(output, "fail");
         assert!(is_error);
+        assert!(fields.is_none());
     }
 
     #[test]
@@ -1276,31 +1271,35 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_parse_output_and_error_rejects_legacy_status_aliases() {
+    fn tool_result_parse_output_error_and_fields_unknown_status_fails_closed() {
         for status in ["ok", "success", "error", "mystery"] {
             let json = format!(
                 r#"{{"request_id":"r1","edge_agent_id":"agt","status":"{status}","output":"body"}}"#
             );
-            let (output, is_error) = ToolResultRequest::parse_output_and_error(&json);
+            let (output, is_error, fields) =
+                ToolResultRequest::parse_output_error_and_fields(&json);
             assert_eq!(output, "body");
             assert!(is_error, "status {status:?} must fail closed");
+            assert!(fields.is_none());
         }
     }
 
     #[test]
-    fn tool_result_parse_output_and_error_non_json_fallback() {
-        // When input is not JSON, fallback uses the whole string as output
-        let (output, is_error) = ToolResultRequest::parse_output_and_error("plain text result");
-        assert_eq!(output, "plain text result");
-        assert!(!is_error);
+    fn tool_result_parse_output_error_and_fields_invalid_json_is_error() {
+        let (output, is_error, fields) =
+            ToolResultRequest::parse_output_error_and_fields("plain text result");
+        assert!(output.contains("invalid tool result JSON"));
+        assert!(is_error);
+        assert!(fields.is_none());
     }
 
     #[test]
-    fn tool_result_parse_output_and_error_missing_output() {
+    fn tool_result_parse_output_error_and_fields_missing_output() {
         let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"completed"}"#;
-        let (output, is_error) = ToolResultRequest::parse_output_and_error(json);
+        let (output, is_error, fields) = ToolResultRequest::parse_output_error_and_fields(json);
         assert_eq!(output, "");
         assert!(!is_error);
+        assert!(fields.is_none());
     }
 
     #[test]

@@ -132,15 +132,6 @@ impl ToolResult {
         );
         self
     }
-
-    /// Convert a legacy `String` output into a `ToolResult`.
-    ///
-    /// A string payload has no reliable error semantics. Callers that know the
-    /// result is an error must use [`ToolResult::error`] instead of relying on
-    /// output text.
-    pub fn from_string(output: String) -> Self {
-        Self::text(output)
-    }
 }
 
 /// Trait for executing tools. Implementations provide the actual tool logic
@@ -758,13 +749,6 @@ mod tests {
         let r = ToolResult::error("boom".into());
         assert_eq!(r.output, "boom");
         assert!(r.is_error);
-    }
-
-    #[test]
-    fn tool_result_from_string_does_not_infer_error_from_text() {
-        let r = ToolResult::from_string("Error count: 0".into());
-        assert_eq!(r.output, "Error count: 0");
-        assert!(!r.is_error);
     }
 
     #[test]
