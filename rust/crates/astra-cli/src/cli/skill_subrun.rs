@@ -20,7 +20,7 @@ use astra_runtime::{
     turn::agentic_loop::host::{
         AgenticLoopHost, AgenticLoopState, CancellationState, HostTurnResult, SkillState,
         StopHookState, TurnInteractionMode, TurnInteractionPolicy,
-        interaction_scoped_tool_restrictions,
+        interaction_scoped_tool_restrictions, runtime_manifest_for_model,
     },
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::chat_turn_payload::{
@@ -626,7 +626,11 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             context_manifest_pool: None,
             context_manifest_user_id: None,
             context_manifest_model_name: effective_model.clone(),
-            runtime_manifest: None,
+            runtime_manifest: runtime_manifest_for_model(
+                "cli_skill_subrun",
+                "cli_skill_subrun",
+                effective_model.as_deref(),
+            ),
             recursion_depth: child_recursion_depth,
             final_text: String::new(),
             final_text_streamed: false,

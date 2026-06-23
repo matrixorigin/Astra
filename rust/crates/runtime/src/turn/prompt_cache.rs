@@ -19,9 +19,9 @@
 //! ┌─ stable_prefix (cached) ────────────┬─ dynamic_suffix (per-turn) ─┐
 //! │                                      │                             │
 //! │  Global-scoped sections   Session-   │  None-scoped sections       │
-//! │  (core rules, safety)     scoped     │  (model identity, skills,  │
-//! │                           sections   │   turn budget, low-conf     │
-//! │                           ▲          │   warnings)                 │
+//! │  (core rules, safety)     scoped     │  (skills, turn budget,      │
+//! │                           sections   │   low-conf warnings)        │
+//! │                           ▲          │                             │
 //! │                           │          │                             │
 //! └───────────────────────────┘──────────┴─────────────────────────────┘
 //!                      cache_control breakpoint
@@ -32,8 +32,8 @@
 //! | Scope | Meaning | Serialised positions |
 //! |---|---|---|
 //! | `Global` | Never changes across sessions (core rules, safety guardrails) | Always at the prefix |
-//! | `Session` | Stable within a session (version, cwd, date, user, branch) | Middle, before the breakpoint |
-//! | `None` | Per-turn volatile (model id, skills, turn budget, low-confidence warn) | After the breakpoint |
+//! | `Session` | Stable within a session (version, cwd, date, user, branch, strict-history model identity) | Middle, before the breakpoint |
+//! | `None` | Per-turn/non-cacheable runtime facts (model identity for marker/auto-prefix providers, skills, turn budget, low-confidence warn) | After the breakpoint |
 //!
 //! `CacheScope` implements `Ord` such that `Global < Session < None`, guaranteeing stable
 //! byte ordering regardless of insertion order.
@@ -125,6 +125,32 @@ pub struct PromptCacheConfig {
     /// which reuse the same stable-prefix strategy and are translated to
     /// Bedrock-native `cachePoint` blocks at request-build time.
     pub is_anthropic: bool,
+}
+
+pub(crate) fn model_identity_prompt_text(model_id: &str, provider: &str) -> String {
+    format!("Model: {model_id} (via {provider})")
+}
+
+pub(crate) fn model_identity_prompt_section_for_cache_capability(
+    cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+    provider: &str,
+    model_id: &str,
+) -> prompts::PromptSection {
+    let cache_cap =
+        astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider_model(
+            cache_capability,
+            provider,
+            model_id,
+        );
+    let text = model_identity_prompt_text(model_id, provider);
+    if matches!(
+        cache_cap.volatile_placement,
+        astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly
+    ) {
+        prompts::PromptSection::stable(text, prompts::CacheScope::Session)
+    } else {
+        prompts::PromptSection::dynamic(text, prompts::PromptTokenBucket::Environment)
+    }
 }
 
 impl PromptCacheConfig {
@@ -292,13 +318,17 @@ pub(crate) fn assemble_system_message_via_pipeline(
 ///
 /// Extra-sections are split into two lanes per cache strategy:
 ///
-/// * `extra_stable_sections` — session-stable bridge-composed content
-///   (skill_hint, feedback rules, self-awareness). Bound into RuntimeIdentity
-///   (Session scope) so they sit BEFORE the Session→None cache marker.
+/// * `extra_stable_sections` — session-stable bridge-composed content.
+///   Bound into RuntimeIdentity (Session scope) so it sits BEFORE the
+///   Session→None cache marker.
 /// * `extra_volatile_sections` — per-turn bridge-composed content
 ///   (session anchor, memoria insights, tool round guidance). Bound into
 ///   RuntimeVolatile (None scope) so churn does not invalidate the
 ///   cached session prefix.
+/// * Model identity is injected here with provider-aware placement: strict
+///   history providers get a stable section because volatile is suppressed;
+///   marker/auto-prefix providers get a non-cacheable section so model-only
+///   changes do not churn the cacheable prefix.
 /// * `memory_entries` — per-turn Memoria retrieval results. Bound through
 ///   the Memory section (None scope), where the core binder applies rank,
 ///   deduplication, and token-budget trimming.
@@ -350,7 +380,15 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     let tool_guidance = prompts::low_confidence_tool_selection_section(confidence);
     // ASTRA_OUTPUT_STYLE is a user preference — stable within a session
     // (user doesn't toggle styles mid-session). Route to stable lane.
+    let model_identity_section =
+        model_identity_prompt_section_for_cache_capability(cache_capability, provider, model_id);
     let mut stable = extra_stable_sections.to_vec();
+    let mut volatile = extra_volatile_sections.to_vec();
+    if matches!(model_identity_section.scope, prompts::CacheScope::None) {
+        volatile.push(model_identity_section);
+    } else {
+        stable.push(model_identity_section);
+    }
     if let Some(style) = astra_text_utils::output_style::current_output_style()
         && !style.prompt.is_empty()
     {
@@ -376,7 +414,6 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
                 },
             )
     });
-    let mut volatile = extra_volatile_sections.to_vec();
     if let Some(ref text) = self_model_text {
         volatile.push(prompts::PromptSection::dynamic(
             text.clone(),
@@ -1313,6 +1350,77 @@ mod tests {
     }
 
     #[test]
+    fn bridge_pipeline_keeps_model_visible_when_volatile_is_dynamic() {
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
+        remove_test_env("ASTRA_OUTPUT_STYLE");
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let strict_history = astra_turn_core::cache_placement::CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
+            volatile_placement:
+                astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+            reuse_scope: None,
+        };
+
+        let outcome = assemble_bridge_pipeline_outcome(
+            &["bash"],
+            &[],
+            &[],
+            &[prompts::PromptSection::dynamic(
+                "## Volatile\nmust be suppressed".to_string(),
+                prompts::PromptTokenBucket::Environment,
+            )],
+            &[],
+            None,
+            None,
+            0.8,
+            None,
+            &cache_cfg,
+            Some(strict_history),
+            "sid-deepseek",
+            "deepseek-v4-pro",
+            "openai",
+            None,
+            None,
+            None,
+            "",
+            "",
+            "2026-05-25",
+        );
+
+        let primary_text = outcome
+            .primary_system
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let dynamic_text = outcome
+            .dynamic_system
+            .as_ref()
+            .and_then(|msg| msg.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        assert!(
+            primary_text.contains("Model: deepseek-v4-pro (via openai)"),
+            "strict-history model identity must remain visible in stable prompt: {primary_text}"
+        );
+        assert!(
+            !primary_text.contains("must be suppressed"),
+            "volatile sections must not leak into strict-history stable prompt: {primary_text}"
+        );
+        assert!(
+            dynamic_text.contains("must be suppressed"),
+            "pipeline keeps volatile content in the dynamic lane until wire assembly: {dynamic_text}"
+        );
+        assert!(
+            !dynamic_text.contains("Model:"),
+            "model identity must not be duplicated into volatile dynamic lane: {dynamic_text}"
+        );
+    }
+
+    #[test]
     fn bridge_pipeline_routes_low_confidence_warning_to_dynamic_message() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
@@ -1391,28 +1499,28 @@ mod tests {
             Some("main"),
         );
 
-        // Anthropic path: stable blocks cached, volatile (CacheScope::None)
-        // content — including the always-present model identity line — goes
-        // into dynamic_system so it doesn't invalidate the cached prefix.
-        assert!(
-            dynamic.is_some(),
-            "anthropic path emits dynamic message for volatile (model identity) content"
-        );
-        let dtext = dynamic
-            .as_ref()
-            .unwrap()
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        assert!(
-            dtext.contains("Model:"),
-            "dynamic message must carry model identity: {dtext}"
-        );
         let content = primary
             .get("content")
             .and_then(Value::as_array)
             .expect("anthropic primary.content is an array");
         assert!(!content.is_empty(), "must emit at least one content block");
+        let primary_text = content
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<String>();
+        assert!(
+            !primary_text.contains("Model: claude-sonnet-4-6"),
+            "anthropic cacheable prefix must not churn on model id changes: {primary_text}"
+        );
+        let dtext = dynamic
+            .as_ref()
+            .and_then(|msg| msg.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            dtext.contains("Model: claude-sonnet-4-6 (via bedrock)"),
+            "anthropic model identity should remain visible outside the cacheable prefix: {dtext}"
+        );
         assert!(
             content.iter().any(|b| b.get("cache_control").is_some()),
             "anthropic path must carry at least one cache_control marker"
@@ -1452,11 +1560,19 @@ mod tests {
             !primary_text.is_empty(),
             "primary system message must be non-empty"
         );
+        assert!(
+            !primary_text.contains("Model: gpt-4o"),
+            "openai auto-prefix primary must not churn on model identity: {primary_text}"
+        );
         // Dynamic may or may not be present depending on whether any None-scoped
         // section was emitted — assert at least the split is structurally sound.
         if let Some(d) = dynamic {
             let dtext = d.get("content").and_then(Value::as_str).unwrap_or_default();
             assert!(!dtext.is_empty(), "if dynamic present, must be non-empty");
+            assert!(
+                dtext.contains("Model: gpt-4o (via openai)"),
+                "model identity should be visible in the non-cacheable lane: {dtext}"
+            );
         }
     }
 
@@ -1900,10 +2016,8 @@ mod tests {
             "2026-05-25",
         );
 
-        // Model identity is always emitted in volatile (CacheScope::None),
-        // so the explicit-marker path will have a dynamic_system if model_id
-        // is provided. This is correct — volatile content doesn't belong in
-        // the cache-annotated prefix.
+        // Marker-style capability keeps model identity outside the
+        // cache-annotated prefix, so the dynamic system may carry it.
         let _ = outcome.dynamic_system; // may or may not be present depending on volatile content
         assert!(
             outcome

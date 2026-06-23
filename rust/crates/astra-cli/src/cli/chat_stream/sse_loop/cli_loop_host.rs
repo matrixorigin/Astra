@@ -696,6 +696,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         let lifecycle_summary = self.append_system_prompt.clone().unwrap_or_default();
         self.executor
             .update_introspect_snapshot(astra_turn_core::introspect::IntrospectSnapshot {
+                current_model: state.current_model_identity().map(str::to_string),
                 token_pressure: 0.0,
                 cache_hit_ratio: cache_ratio,
                 turns_completed: state.llm_rounds_completed,

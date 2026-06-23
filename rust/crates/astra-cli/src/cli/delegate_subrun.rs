@@ -20,6 +20,7 @@ use astra_runtime::{
     turn::agentic_loop::finalization::run_agentic_loop_with_host,
     turn::agentic_loop::host::{
         AgenticLoopState, CancellationState, MessagingState, SkillState, StopHookState,
+        runtime_manifest_for_model,
     },
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::turn_guard::TurnGuard,
@@ -376,7 +377,11 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             context_manifest_pool: None,
             context_manifest_user_id: None,
             context_manifest_model_name: effective_model.clone(),
-            runtime_manifest: None,
+            runtime_manifest: runtime_manifest_for_model(
+                "cli_delegate_subrun",
+                "cli_delegate_subrun",
+                effective_model.as_deref(),
+            ),
             recursion_depth: config.recursion_depth,
             final_text: String::new(),
             final_text_streamed: false,

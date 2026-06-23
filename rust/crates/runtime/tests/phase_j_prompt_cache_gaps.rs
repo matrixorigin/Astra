@@ -56,6 +56,17 @@ fn scripted_round(text: &str) -> Value {
     })
 }
 
+fn non_cacheable_visible_text(capture: &CapturedLlmRequest) -> String {
+    let mut text = String::new();
+    if let Some(dynamic) = capture.system_dynamic.as_ref()
+        && let Some(content) = dynamic.get("content").and_then(Value::as_str)
+    {
+        text.push_str(content);
+    }
+    text.push_str(&serde_json::to_string(&capture.messages).unwrap_or_default());
+    text
+}
+
 fn build_host_with_tools(
     rounds: Vec<Value>,
     provider: Option<(&str, &str)>,
@@ -203,6 +214,16 @@ async fn anthropic_model_change_preserves_prefix_and_surfaces_model_id() {
     assert!(a[0].is_anthropic && b[0].is_anthropic);
     assert_eq!(a[0].model, "claude-haiku-4.5");
     assert_eq!(b[0].model, "claude-sonnet-4.5");
+    let a_visible = non_cacheable_visible_text(&a[0]);
+    let b_visible = non_cacheable_visible_text(&b[0]);
+    assert!(
+        a_visible.contains("Model: claude-haiku-4.5 (via anthropic)"),
+        "model id must remain prompt-visible outside the cacheable prefix: {a_visible}"
+    );
+    assert!(
+        b_visible.contains("Model: claude-sonnet-4.5 (via anthropic)"),
+        "model id must remain prompt-visible outside the cacheable prefix: {b_visible}"
+    );
     assert_eq!(
         a[0].cacheable_prefix_sha256, b[0].cacheable_prefix_sha256,
         "model name alone (same provider, same tools) must not churn the cacheable prefix"

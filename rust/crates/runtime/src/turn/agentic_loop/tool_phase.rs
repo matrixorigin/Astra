@@ -1382,15 +1382,13 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     // what powers `introspect(subtopic=recent)` — the agent can ask
     // "what were my last few rounds doing?" without any disk I/O.
     //
-    // provider/model aren't plumbed through `AgenticLoopState` today;
-    // leave empty. Introspect readers care most about tokens +
-    // tool_calls + duration — those are all fed from `turn_result`.
     let round_duration_ms = prep.turn_start_time.elapsed().as_millis() as u64;
+    let model = state.current_model_identity().unwrap_or("").to_string();
     let recent_summary = super::host::RecentRoundSummary {
         turn: state.session_turn,
         round: state.current_round_index,
         provider: String::new(),
-        model: String::new(),
+        model,
         prompt_tokens: turn_result.accum.prompt_tokens,
         cache_read_tokens: turn_result.accum.cache_read_tokens,
         cache_creation_tokens: 0,
@@ -1922,6 +1920,7 @@ fn build_introspect_snapshot(
     let token_pressure = introspect_token_pressure(state);
 
     astra_turn_core::introspect::IntrospectSnapshot {
+        current_model: state.current_model_identity().map(str::to_string),
         token_pressure,
         cache_hit_ratio: cache_ratio,
         turns_completed: state.llm_rounds_completed,

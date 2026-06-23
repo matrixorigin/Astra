@@ -1011,6 +1011,10 @@ pub struct ToolExecutor {
     /// Session id for persisting self-modification state and serving `astra self`
     /// compatible diagnostics from inside the live agent loop.
     active_session_id: std::sync::Mutex<Option<String>>,
+    /// Concrete model selected for the active turn/session. This is the
+    /// source used by self-introspection tools; it is set by the CLI turn
+    /// boundary and never inferred from a tool surface default.
+    current_model: std::sync::RwLock<Option<String>>,
     /// Self-modification pinned tool preferences (manual override hints).
     self_mod_pinned_tools: std::sync::Mutex<Vec<String>>,
     /// Self-modification deprioritized tool preferences (manual override hints).
@@ -1156,6 +1160,7 @@ impl ToolExecutor {
             introspect_snapshot: std::sync::Arc::new(std::sync::RwLock::new(None)),
             session_memory_observatory: None,
             active_session_id: std::sync::Mutex::new(None),
+            current_model: std::sync::RwLock::new(None),
             self_mod_pinned_tools: std::sync::Mutex::new(Vec::new()),
             self_mod_deprioritized_tools: std::sync::Mutex::new(Vec::new()),
             session_lessons: std::sync::Mutex::new(Vec::new()),
@@ -1820,6 +1825,9 @@ impl ToolExecutor {
             if let Ok(mut feedback) = self.latest_turn_quality_feedback.lock() {
                 *feedback = None;
             }
+            if let Ok(mut current_model) = self.current_model.write() {
+                *current_model = None;
+            }
         }
         if let Ok(mut guard) = self.active_session_id.lock() {
             *guard = Some(session_id);
@@ -1828,6 +1836,19 @@ impl ToolExecutor {
 
     pub(crate) fn active_session_id(&self) -> Option<String> {
         self.active_session_id.lock().ok().and_then(|g| g.clone())
+    }
+
+    pub fn set_current_model(&self, model: impl Into<String>) {
+        let raw = model.into();
+        let model = astra_core::model_override::normalize_model_override(Some(raw.as_str()))
+            .map(str::to_string);
+        if let Ok(mut guard) = self.current_model.write() {
+            *guard = model;
+        }
+    }
+
+    fn current_model(&self) -> Option<String> {
+        self.current_model.read().ok().and_then(|g| g.clone())
     }
 
     fn memory_args_with_context(&self, args: &Value) -> Value {
@@ -3738,6 +3759,9 @@ impl ToolExecutor {
         // host has had a chance to populate one) so the model always gets
         // structured output instead of an opaque "first turn" string.
         let mut snap = snapshot.unwrap_or_default();
+        if snap.current_model.is_none() {
+            snap.current_model = self.current_model();
+        }
 
         // Overlay session-scoped injection freshness. The per-turn
         // snapshot lives on `AgenticLoopState` (not session) so the
@@ -5355,11 +5379,13 @@ impl ToolExecutor {
         }
 
         let self_model = self.build_self_model_snapshot();
+        let current_model = self.current_model();
         match dimension {
             "capability" => self.capability_info_json().to_string(),
             "state" => {
                 if let Some(ref model) = self_model {
                     serde_json::json!({
+                        "current_model": current_model,
                         "turn": model.state.turn_number,
                         "token_budget": model.state.token_budget,
                         "scenario": model.state.scenario,
@@ -5372,6 +5398,7 @@ impl ToolExecutor {
                     .to_string()
                 } else {
                     serde_json::json!({
+                        "current_model": current_model,
                         "note": "No observability session available."
                     })
                     .to_string()
@@ -5395,13 +5422,20 @@ impl ToolExecutor {
                 "name": "astra",
                 "version": env!("CARGO_PKG_VERSION"),
                 "runtime": "Rust edge CLI",
+                "current_model": current_model,
             })
             .to_string(),
             _ => {
                 if let Some(ref model) = self_model {
-                    model.to_detailed_text()
+                    let mut text = model.to_detailed_text();
+                    if let Some(current_model) = current_model {
+                        text.push_str("\nCurrent model: ");
+                        text.push_str(&current_model);
+                    }
+                    text
                 } else {
                     serde_json::json!({
+                        "current_model": current_model,
                         "tools_available": self.tool_names(),
                         "tool_count": self.tool_count(),
                         "runtime": "astra Rust CLI",
@@ -5415,9 +5449,11 @@ impl ToolExecutor {
 
     fn capability_info_json(&self) -> Value {
         let caps = self.cli_capability_view();
+        let current_model = self.current_model();
         if let Some(ref model) = self.build_self_model_snapshot() {
             json!({
                 "surface": "CliLocal",
+                "current_model": current_model,
                 "capabilities_active": caps.active_names,
                 "capabilities_inactive": caps.inactive_names,
                 "tools_visible": model.capabilities.tool_names,
@@ -5441,6 +5477,7 @@ impl ToolExecutor {
             let tool_count = caps.visible_names.len();
             json!({
                 "surface": "CliLocal",
+                "current_model": current_model,
                 "capabilities_active": caps.active_names,
                 "capabilities_inactive": caps.inactive_names,
                 "tools_visible": caps.visible_names,
@@ -7175,6 +7212,19 @@ mod tests {
     }
 
     #[test]
+    fn introspect_first_turn_reports_current_model_from_executor() {
+        let executor = test_executor();
+        executor.set_current_model("deepseek-v4-pro-official(thinking:high)");
+
+        let out = executor.handle_introspect(&serde_json::json!({"detail": "minimal"}));
+
+        assert!(
+            out.contains("model=deepseek-v4-pro-official(thinking:high)"),
+            "expected first-turn introspect to expose current model, got: {out}"
+        );
+    }
+
+    #[test]
     fn introspect_reflects_updated_snapshot() {
         let executor = test_executor();
         // Populate a non-trivial snapshot.
@@ -7191,6 +7241,30 @@ mod tests {
         assert!(out.contains("Turns: 5/15"), "got: {out}");
         assert!(out.contains("12345in"), "got: {out}");
         assert!(out.contains("resume pending"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn get_agent_info_reports_current_model_without_observability_session() {
+        let executor = test_executor();
+        executor.set_current_model("deepseek-v4-pro-official(thinking:high)");
+
+        let capability = executor
+            .get_agent_info(&serde_json::json!({"dimension": "capability"}))
+            .await;
+        let capability_json: serde_json::Value = serde_json::from_str(&capability).unwrap();
+        assert_eq!(
+            capability_json["current_model"],
+            "deepseek-v4-pro-official(thinking:high)"
+        );
+
+        let identity = executor
+            .get_agent_info(&serde_json::json!({"dimension": "identity"}))
+            .await;
+        let identity_json: serde_json::Value = serde_json::from_str(&identity).unwrap();
+        assert_eq!(
+            identity_json["current_model"],
+            "deepseek-v4-pro-official(thinking:high)"
+        );
     }
 
     #[test]

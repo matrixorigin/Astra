@@ -22,7 +22,7 @@ use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
 use crate::turn::agentic_loop::host::{
     AgenticLoopHost as _, AgenticLoopState, CancellationState, RequestConstraints, SkillState,
-    StopHookState, TurnInteractionPolicy, run_agentic_loop_with_host,
+    StopHookState, TurnInteractionPolicy, run_agentic_loop_with_host, runtime_manifest_for_model,
 };
 use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
 use astra_pipeline::step_recorder::StepRecorder;
@@ -391,7 +391,11 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             context_manifest_pool: None,
             context_manifest_user_id: None,
             context_manifest_model_name: effective_model.clone(),
-            runtime_manifest: None,
+            runtime_manifest: runtime_manifest_for_model(
+                "server_skill_subrun",
+                "server_skill_subrun",
+                effective_model.as_deref(),
+            ),
             recursion_depth: child_recursion_depth,
             final_text: String::new(),
             final_text_streamed: false,

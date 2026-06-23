@@ -230,7 +230,9 @@ fn bind_working_memory(sources: &ContextSources<'_>) -> String {
 /// Includes typed CWD/Branch header plus fragments that only
 /// change at session boundaries: `system_override` and opt-in
 /// `extra_stable_sections` (environment_static from the bridge / adapter
-/// edge_profile, output style, etc.). Turn-volatile content —
+/// edge_profile, output style, etc.). Runtime facts whose placement depends on
+/// provider cache semantics, including model identity, are injected by the
+/// runtime entrypoint before binding. Turn-volatile content —
 /// self-awareness, tool-dependent guidance, memoria insights — routes
 /// through `RuntimeVolatile` (`bind_runtime_volatile`) so it sits after
 /// the Session→None cache marker and doesn't invalidate the prefix.
@@ -249,11 +251,6 @@ fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
 
     // Agent version: compile-time constant, truly session-stable.
     parts.push(format!("Astra v{}", env!("CARGO_PKG_VERSION")));
-
-    // Core identity. Exact model id is request metadata, not prompt content:
-    // putting it in the Session-scoped prefix churns prompt caches when a
-    // session switches between models in the same provider family.
-    let _model_id_is_transport_metadata = &sources.session.model_id;
 
     // Current date (session-stable: computed once at session creation)
     let current_date = &sources.session.current_date;
@@ -303,15 +300,6 @@ fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
 fn bind_runtime_volatile(sources: &ContextSources<'_>) -> String {
     let ext = &sources.external;
     let mut parts = Vec::new();
-
-    // Model identity lives in the volatile (CacheScope::None) lane so
-    // model-switching mid-session doesn't invalidate the Session-scoped
-    // cache prefix. The model needs this for self-awareness ("what model
-    // are you?").
-    parts.push(format!(
-        "Model: {} (via {})",
-        sources.session.model_id, sources.session.provider_name,
-    ));
 
     // Session UUID is *not* emitted to the prompt. It used to ride the
     // volatile lane ("Session: <uuid>\n" = ~45c/turn) so it wouldn't
@@ -651,15 +639,26 @@ mod tests {
     }
 
     #[test]
-    fn bind_runtime_identity_produces_none_scope() {
+    fn bind_runtime_identity_leaves_model_identity_to_runtime_policy() {
         let fixture = test_sources();
         let sources = fixture.context();
         let content = bind_runtime_identity(&sources);
         assert!(
-            !content.contains("test-model"),
-            "exact model id must stay out of cacheable RuntimeIdentity: {content}"
+            !content.contains("Model: test-model"),
+            "core binder must not decide model identity cache placement: {content}"
         );
         assert!(content.contains("main")); // git branch
+    }
+
+    #[test]
+    fn bind_runtime_volatile_leaves_model_identity_to_runtime_policy() {
+        let fixture = test_sources();
+        let sources = fixture.context();
+        let content = bind_runtime_volatile(&sources);
+        assert!(
+            !content.contains("Model: test-model"),
+            "runtime entrypoints inject model identity with provider-aware cache placement: {content}"
+        );
     }
 
     /// HTTP bridge escape hatch: `extra_dynamic_sections` gives callers a

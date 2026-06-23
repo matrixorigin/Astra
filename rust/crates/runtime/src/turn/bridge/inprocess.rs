@@ -69,6 +69,43 @@ use astra_turn_core::tool_schema_prune::prune_tool_schemas;
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
 const ROOT_TURN_JOURNAL_HEADER: &str = "x-mo-root-turn-journal";
 
+fn rewrite_bridge_runtime_manifest_model_resolution(
+    trace: &mut Value,
+    requested_model: Option<&str>,
+    resolved_model: &str,
+    provider: &str,
+    fallback_trace: Option<&Value>,
+) {
+    let Some(trace_obj) = trace.as_object_mut() else {
+        return;
+    };
+    let manifest = trace_obj
+        .entry("runtime_manifest")
+        .or_insert_with(|| json!({}));
+    if !manifest.is_object() {
+        *manifest = json!({});
+    }
+    let selected_model = requested_model.unwrap_or(resolved_model);
+    let source = if fallback_trace.is_some() {
+        "rate_limit_fallback"
+    } else {
+        "bridge_request"
+    };
+    manifest["schema_version"] = json!("astra_runtime_manifest.v1");
+    manifest["selected_model"] = json!({
+        "model": selected_model,
+    });
+    manifest["model_resolution"] = json!({
+        "source": source,
+        "requested_model": requested_model,
+        "model": resolved_model,
+        "provider": provider,
+        "resolved": true,
+        "fallback": fallback_trace,
+    });
+    manifest["runtime_profile"] = json!("bridge_inprocess");
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct CachedSessionStartMemory {
     stable_memory_section: Option<String>,
@@ -1465,6 +1502,8 @@ impl InProcessChatTurnBridge {
             let pool_ref = shared_pool.as_ref().map(SharedPool::get);
             let requested_model_override =
                 astra_core::model_override::normalize_model_override(model_override.as_deref());
+            let requested_model_name = requested_model_override.map(str::to_string);
+            let mut rate_limit_fallback_trace: Option<Value> = None;
             if !use_e2e_llm && requested_model_override.is_none() {
                 tracing::warn!(
                     target: "astra_runtime::bridge_inprocess",
@@ -1572,6 +1611,20 @@ impl InProcessChatTurnBridge {
                     .await
                     {
                         FallbackOutcome::Resolved(fb) => {
+                            let from_model = model_name.clone();
+                            let to_model = fb.model_name.clone();
+                            astra_core::agent_warn!(
+                                "llm",
+                                "rate-limit fallback: {} -> {} ({})",
+                                from_model,
+                                to_model,
+                                reason.as_str()
+                            );
+                            rate_limit_fallback_trace = Some(json!({
+                                "from_model": from_model,
+                                "to_model": to_model,
+                                "reason": reason.as_str(),
+                            }));
                             model_name = fb.model_name;
                             wire_model_name = fb.wire_model_name;
                             api_key = fb.api_key;
@@ -1659,9 +1712,10 @@ impl InProcessChatTurnBridge {
             //   it never invalidates the cached prefix.
             //
             // The `# Project Profile` wrapper with cwd/git_branch is
-            // dropped: `bind_runtime_identity` already emits typed
-            // `Model: / CWD: / Branch:` lines from `SessionContext`, so
-            // repeating them as a Markdown block was pure duplicate.
+            // dropped: runtime assembly emits provider-aware `Model:` and
+            // `bind_runtime_identity` emits typed `CWD: / Branch:` lines from
+            // `SessionContext`, so repeating them as a Markdown block was pure
+            // duplicate.
             let env_static = edge_profile
                 .get("environment_static")
                 .and_then(Value::as_str)
@@ -2275,6 +2329,13 @@ impl InProcessChatTurnBridge {
             let mut pipeline_tool_schemas = pipeline_outcome.tool_schemas;
             let mut bridge_manifest_trace = pipeline_outcome.manifest_trace;
             let mut bridge_manifest_trace_json = bridge_manifest_trace.to_json();
+            rewrite_bridge_runtime_manifest_model_resolution(
+                &mut bridge_manifest_trace_json,
+                requested_model_name.as_deref(),
+                &model_name,
+                &provider,
+                rate_limit_fallback_trace.as_ref(),
+            );
             // Debug: dump system prompt for cache analysis (env-gated).
             // Enable with ASTRA_PIPELINE_DUMP_SYSTEM_PROMPT=1. Writes to
             // $TMPDIR/astra-bridge-prompt-<sid>-<ts>.json so `diff` between
@@ -2414,6 +2475,13 @@ impl InProcessChatTurnBridge {
                     pipeline_tool_schemas = rerun.tool_schemas;
                     bridge_manifest_trace = rerun.manifest_trace;
                     bridge_manifest_trace_json = bridge_manifest_trace.to_json();
+                    rewrite_bridge_runtime_manifest_model_resolution(
+                        &mut bridge_manifest_trace_json,
+                        requested_model_name.as_deref(),
+                        &model_name,
+                        &provider,
+                        rate_limit_fallback_trace.as_ref(),
+                    );
                     llm_messages.clear();
                     llm_messages.push(system_msg.clone());
                     bridge_volatile_text = dynamic_msg
@@ -4667,6 +4735,44 @@ mod tests {
         crate::turn::prompt_cache::resolve_pinned_tool_names_for_config(
             &astra_config::ToolSurfaceConfig::default(),
         )
+    }
+
+    #[test]
+    fn bridge_runtime_manifest_distinguishes_requested_and_fallback_model() {
+        let mut trace = json!({
+            "source": "llm_context_bridge",
+            "runtime_manifest": {
+                "schema_version": "astra_runtime_manifest.v1"
+            }
+        });
+        let fallback = json!({
+            "from_model": "deepseek-v4-pro-official",
+            "to_model": "deepseek-v4-flash",
+            "reason": "rate_limit",
+        });
+
+        rewrite_bridge_runtime_manifest_model_resolution(
+            &mut trace,
+            Some("deepseek-v4-pro-official"),
+            "deepseek-v4-flash",
+            "openai",
+            Some(&fallback),
+        );
+
+        let manifest = &trace["runtime_manifest"];
+        assert_eq!(
+            manifest["selected_model"]["model"],
+            "deepseek-v4-pro-official"
+        );
+        assert_eq!(
+            manifest["model_resolution"]["source"],
+            "rate_limit_fallback"
+        );
+        assert_eq!(manifest["model_resolution"]["model"], "deepseek-v4-flash");
+        assert_eq!(
+            manifest["model_resolution"]["fallback"]["from_model"],
+            "deepseek-v4-pro-official"
+        );
     }
 
     /// RAII guard that restores an environment variable on drop (panic-safe).

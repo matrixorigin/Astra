@@ -14,6 +14,11 @@ use crate::injection_tracking::{ChannelFreshness, ChannelStatus, InjectionChanne
 /// Input snapshot provided by the runtime to the introspect renderer.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IntrospectSnapshot {
+    /// Concrete model selected for this turn. This is the authoritative
+    /// self-identity fact for "what model am I?" questions; callers must not
+    /// infer it from recent rounds or defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_model: Option<String>,
     pub token_pressure: f64,
     pub cache_hit_ratio: f64,
     pub turns_completed: u32,
@@ -197,7 +202,7 @@ pub fn render_introspect(snapshot: &IntrospectSnapshot, detail: IntrospectDetail
 }
 
 fn render_minimal(s: &IntrospectSnapshot) -> String {
-    format!(
+    let mut out = format!(
         "pressure={:.0}% cache={:.0}% turns={}/{} alerts={} tier={}",
         s.token_pressure * 100.0,
         s.cache_hit_ratio * 100.0,
@@ -205,7 +210,12 @@ fn render_minimal(s: &IntrospectSnapshot) -> String {
         s.turns_completed + s.turns_remaining,
         s.alerts.len(),
         s.compaction_tier,
-    )
+    );
+    if let Some(model) = s.current_model.as_deref() {
+        out.push_str(" model=");
+        out.push_str(model);
+    }
+    out
 }
 
 fn render_summary(s: &IntrospectSnapshot) -> String {
@@ -224,6 +234,11 @@ fn render_summary(s: &IntrospectSnapshot) -> String {
         s.cache_read_tokens,
         s.cache_creation_tokens,
     ));
+    if let Some(model) = s.current_model.as_deref() {
+        out.push_str("Current model: ");
+        out.push_str(model);
+        out.push('\n');
+    }
     if !s.alerts.is_empty() {
         out.push_str("Alerts:\n");
         for alert in s.alerts.iter().take(3) {
@@ -582,6 +597,7 @@ mod tests {
 
     fn sample_snapshot() -> IntrospectSnapshot {
         IntrospectSnapshot {
+            current_model: Some("deepseek-v4-pro-official(thinking:high)".into()),
             token_pressure: 0.72,
             cache_hit_ratio: 0.65,
             turns_completed: 8,
@@ -649,6 +665,7 @@ mod tests {
         assert!(output.contains("cache=65%"));
         assert!(output.contains("turns=8/20"));
         assert!(output.contains("alerts=2"));
+        assert!(output.contains("model=deepseek-v4-pro-official(thinking:high)"));
     }
 
     #[test]
@@ -656,6 +673,7 @@ mod tests {
         let output = render_introspect(&sample_snapshot(), IntrospectDetail::Summary);
         assert!(output.contains("## Session Health"));
         assert!(output.contains("cache_regression"));
+        assert!(output.contains("Current model: deepseek-v4-pro-official(thinking:high)"));
         assert!(output.contains("Goal: implement streaming resume"));
         assert!(output.contains("### Turn-start session execution state"));
         // Should NOT contain full tool table

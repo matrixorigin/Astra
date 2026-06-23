@@ -202,10 +202,8 @@ impl CacheCapability {
             // other strict-history providers.
             "openai"
                 if model_lower.contains("minimax")
-                    || matches!(
-                        model_lower.as_str(),
-                        "deepseek-v4-flash" | "deepseek-v4-pro"
-                    ) =>
+                    || model_lower.contains("deepseek-v4-flash")
+                    || model_lower.contains("deepseek-v4-pro") =>
             {
                 Self {
                     protocol: CacheProtocol::StrictHistoryMatch,
@@ -367,6 +365,16 @@ mod tests {
     #[test]
     fn deepseek_v4_pro_openai_routes_to_current_user_only() {
         let c = CacheCapability::for_provider_and_model("openai", "DEEPSEEK-V4-PRO");
+        assert_eq!(c.protocol, CacheProtocol::StrictHistoryMatch);
+        assert_eq!(c.volatile_placement, VolatilePlacement::CurrentUserOnly);
+    }
+
+    #[test]
+    fn deepseek_v4_registry_suffix_routes_to_current_user_only() {
+        let c = CacheCapability::for_provider_and_model(
+            "openai",
+            "deepseek-v4-pro-official(thinking:high)",
+        );
         assert_eq!(c.protocol, CacheProtocol::StrictHistoryMatch);
         assert_eq!(c.volatile_placement, VolatilePlacement::CurrentUserOnly);
     }

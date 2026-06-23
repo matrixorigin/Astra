@@ -41,9 +41,11 @@ use crate::cli::skill_catalog::{
 use crate::cli::slash::slash_bug::handle_bug_command;
 use crate::cli::slash::slash_debug::handle_debug_command;
 use crate::cli::slash::slash_info::handle_info_command;
+#[cfg(feature = "harness")]
+use crate::cli::slash::slash_inspect;
 use crate::cli::slash::slash_memory::handle_memory_domain_command;
 use crate::cli::slash::slash_messaging::handle_messaging_command;
-use crate::cli::slash::{slash_agent, slash_inspect, slash_task, slash_team, slash_telemetry};
+use crate::cli::slash::{slash_agent, slash_task, slash_team, slash_telemetry};
 use crate::cli::stream::streaming_types::StreamResult;
 use crate::cli::surface::task_checkpoint_surface::encode_task_failure_message;
 use crate::cli::task::task_command_utils::task_run_title;
@@ -2764,10 +2766,9 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
 
 #[cfg(test)]
 mod exit_code_tests {
-    use super::{
-        ExitCode, StreamResult, append_headless_inspect_snapshot, compute_exit_code,
-        message_requests_headless_inspect,
-    };
+    use super::{ExitCode, StreamResult, compute_exit_code};
+    #[cfg(feature = "harness")]
+    use super::{append_headless_inspect_snapshot, message_requests_headless_inspect};
     use crate::cli::stream::streaming_types::VerdictEvent;
 
     fn empty_stream_result() -> StreamResult {

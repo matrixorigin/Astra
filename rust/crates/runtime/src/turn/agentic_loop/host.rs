@@ -1469,6 +1469,31 @@ pub struct AgenticLoopState {
     pub harness: super::super::harness_adapter::HarnessSlot,
 }
 
+/// Build the stable runtime manifest carried through context metadata.
+///
+/// `model` must already be the selected concrete model for the run. Symbolic
+/// values such as `default` and invalid/control-character strings fail closed
+/// to `None` so callers cannot accidentally publish a guessed identity.
+pub fn runtime_manifest_for_model(
+    source: &'static str,
+    runtime_profile: &'static str,
+    model: Option<&str>,
+) -> Option<serde_json::Value> {
+    let model = astra_core::model_override::normalize_model_override(model)?;
+    Some(serde_json::json!({
+        "schema_version": "astra_runtime_manifest.v1",
+        "selected_model": {
+            "model": model,
+        },
+        "model_resolution": {
+            "source": source,
+            "model": model,
+            "resolved": true,
+        },
+        "runtime_profile": runtime_profile,
+    }))
+}
+
 impl AgenticLoopState {
     /// Refresh the cached active task-board snapshot from the shared
     /// TaskManager, when one is attached. Call this before any terminal
@@ -1700,6 +1725,24 @@ impl AgenticLoopState {
             .or_else(|| self.recent_rounds.last().map(|r| r.model.as_str()))
     }
 
+    /// Authoritative model identity for user/model-visible diagnostics.
+    ///
+    /// This answers "which model is running this session/turn?" and must not
+    /// fall back to symbolic values such as `default`. Skill model overrides
+    /// remain secondary because they are transient execution hints; the
+    /// selected/context-manifest model is the user's chosen model identity.
+    pub fn current_model_identity(&self) -> Option<&str> {
+        self.context_manifest_model_name
+            .as_deref()
+            .or(self.skills.model_override.as_deref())
+            .or_else(|| {
+                self.recent_rounds
+                    .last()
+                    .map(|r| r.model.as_str())
+                    .filter(|model| !model.is_empty())
+            })
+    }
+
     /// 1-based session turn number for the turn currently in progress.
     ///
     /// Two ways to derive it, in order:
@@ -1730,8 +1773,10 @@ pub(crate) const MAX_TRACKED_FILE_READS: usize = 20;
 /// Maximum number of times the harness pause signal triggers checkpoint
 /// injection and loop continuation before forcing a text-only finalization
 /// turn.
+#[cfg(feature = "harness")]
 const MAX_HARNESS_PAUSE_RECOVERIES: u32 = 2;
 
+#[cfg(feature = "harness")]
 fn harness_pause_finalization_message(reason: &str, original_query: &str) -> String {
     format!(
         "Harness checkpoint: the run is still in a read-heavy stall after repeated recovery prompts.\n\n\
@@ -1746,6 +1791,7 @@ fn harness_pause_finalization_message(reason: &str, original_query: &str) -> Str
     )
 }
 
+#[cfg(feature = "harness")]
 fn force_text_only_harness_finalization<H: AgenticLoopHost>(
     host: &H,
     state: &mut AgenticLoopState,
@@ -1764,6 +1810,7 @@ fn force_text_only_harness_finalization<H: AgenticLoopHost>(
     }));
 }
 
+#[cfg(any(feature = "harness", test))]
 fn apply_harness_pause_recovery_threshold(
     state: &mut AgenticLoopState,
     recovery_threshold: Option<u32>,
@@ -1896,6 +1943,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 
     let loop_start_time = Instant::now();
     let mut turn_index = 0usize;
+    #[cfg(feature = "harness")]
     let mut harness_pause_recovery_count: u32 = 0;
     while turn_index < state.max_turns || state.remaining_turns == 0 {
         state.current_round_index = turn_index as u32;
@@ -2295,7 +2343,7 @@ mod synthesise_finish_reason_tests {
 ///
 /// Delegates to [`make_test_loop_state_for_model`] with `None`, which
 /// resolves workflow-guard thresholds from the global config defaults.
-#[cfg(feature = "bridge-e2e-hooks")]
+#[cfg(any(test, feature = "bridge-e2e-hooks"))]
 pub fn make_test_loop_state() -> AgenticLoopState {
     make_test_loop_state_for_model(None)
 }
@@ -2304,7 +2352,7 @@ pub fn make_test_loop_state() -> AgenticLoopState {
 /// thresholds (`max_identical_tool_calls`, `max_tools_per_turn`) through
 /// [`astra_config::runtime_config::ToolSelectionConfig::resolve_for_model`], so a
 /// request carrying a specific model id sees that model's profile.
-#[cfg(feature = "bridge-e2e-hooks")]
+#[cfg(any(test, feature = "bridge-e2e-hooks"))]
 pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
     let policy = astra_config::runtime_config::RuntimeConfig::load()
         .tool_selection

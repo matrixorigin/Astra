@@ -191,11 +191,12 @@ fn record_early_exit_llm_round(
     let agentic_step = current_agentic_step(state);
     let run_id = state.current_run_id.clone();
     let duration_ms = turn_start.elapsed().as_millis() as u64;
+    let model = state.current_model_identity().unwrap_or("").to_string();
     state.push_recent_round(super::host::RecentRoundSummary {
         turn: state.session_turn,
         round: state.current_round_index,
         provider: String::new(),
-        model: String::new(),
+        model,
         prompt_tokens: turn_result.accum.prompt_tokens,
         cache_read_tokens: turn_result.accum.cache_read_tokens,
         cache_creation_tokens: turn_result.accum.cache_creation_tokens,
@@ -349,9 +350,9 @@ async fn persist_context_manifest_for_llm_call(
     let turn_id = format!("{run_id}:llm:{llm_attempt_index}");
     let reason = manifest_reason_for_llm_call(state);
     let model_name = state
-        .context_manifest_model_name
-        .clone()
-        .unwrap_or_else(|| "default".to_string());
+        .current_model_identity()
+        .unwrap_or("unknown")
+        .to_string();
     let context_window_tokens =
         u32::try_from(crate::prompts::budget_for_model(Some(&model_name)).model_limit)
             .unwrap_or(u32::MAX);
@@ -1058,6 +1059,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // can still move by-value into the control-flow mapper below.
     let ingest_is_fatal = matches!(ingest_outcome, AgenticTurnIngestOutcome::Fatal(_));
     if !ingest_is_fatal {
+        let model_id = state
+            .current_model_identity()
+            .unwrap_or("unknown")
+            .to_string();
         if let Some(ref mut pipeline_sess) = state.pipeline_session {
             let mut feedback = astra_turn_core::context_feedback::ContextFeedback::from_usage(
                 turn_result.accum.prompt_tokens,
@@ -1066,8 +1071,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 turn_result.accum.completion_tokens,
                 false,
             );
-            let model_id = state.skills.model_override.as_deref().unwrap_or("default");
-            pipeline_sess.record_feedback(model_id, "agentic_loop", &mut feedback, None);
+            pipeline_sess.record_feedback(&model_id, "agentic_loop", &mut feedback, None);
 
             // Emit pipeline journal events for observability and cloud sync
             if let Some(ref mut buf) = state.turn_event_buffer {
@@ -1077,7 +1081,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 // Per-turn feedback event
                 let feedback_evt =
                     astra_turn_core::pipeline_journal::PipelineJournalEvent::from_feedback(
-                        turn, model_id, &feedback,
+                        turn, &model_id, &feedback,
                     );
                 if let Ok(payload) = serde_json::to_value(&feedback_evt) {
                     buf.record(

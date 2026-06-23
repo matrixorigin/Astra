@@ -74,6 +74,7 @@ use crate::turn::agentic_loop::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CancellationState,
     ContextTracePersistenceContext, EvaluationPersistenceContext, MessagingState,
     RequestConstraints, SkillState, StopHookState, run_agentic_loop_with_host,
+    runtime_manifest_for_model,
 };
 use crate::{
     DatabaseEvaluationService, DatabaseEventService, DatabaseTraceEventWriter,
@@ -7150,7 +7151,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
             context_manifest_pool: self.shared_pool.clone(),
             context_manifest_user_id: Some(config.user_id.clone()),
             context_manifest_model_name: config.agent_profile.model_override.clone(),
-            runtime_manifest: None,
+            runtime_manifest: runtime_manifest_for_model(
+                "server_agent_subrun",
+                "server_agent_subrun",
+                config.agent_profile.model_override.as_deref(),
+            ),
             recursion_depth: config.recursion_depth,
             final_text: String::new(),
             final_text_streamed: false,

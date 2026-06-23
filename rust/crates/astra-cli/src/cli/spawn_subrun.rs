@@ -19,7 +19,7 @@ use astra_runtime::{
     turn::agentic_loop::finalization::run_agentic_loop_with_host,
     turn::agentic_loop::host::{
         AgenticLoopOutcome, AgenticLoopState, CancellationState, MessagingState, SkillState,
-        StopHookState,
+        StopHookState, runtime_manifest_for_model,
     },
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::turn_guard::TurnGuard,
@@ -628,6 +628,11 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             .as_deref()
             .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
             .unwrap_or_default();
+        let runtime_manifest = runtime_manifest_for_model(
+            "cli_spawn_subrun",
+            "cli_spawn_subrun",
+            effective_model.as_deref(),
+        );
 
         let mut state = AgenticLoopState {
             messages,
@@ -641,7 +646,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             context_manifest_pool: None,
             context_manifest_user_id: None,
             context_manifest_model_name: effective_model,
-            runtime_manifest: None,
+            runtime_manifest,
             recursion_depth: config.recursion_depth,
             final_text: String::new(),
             final_text_streamed: false,

@@ -103,7 +103,10 @@ impl PromptSection {
     ///
     /// Guidance:
     /// - Prefer [`PromptSection::stable`] whenever the content is
-    ///   session-stable (model id, cwd, git branch, tool list, skills).
+    ///   session-stable and safe to include in the provider's cacheable prefix
+    ///   (cwd, git branch, tool list, skills). Model identity needs
+    ///   provider-aware placement because Anthropic cache-control prefixes should
+    ///   not churn when only the model id changes.
     /// - Prefer [`PromptSection::dynamic`] (plain `CacheScope::None` with no
     ///   social-engineering red flag) for ordinary per-turn environment
     ///   context that already lives post-boundary.

@@ -738,7 +738,19 @@ pub(crate) fn assemble_bridge_context(
             volatile_preamble_count,
             tool_schema_count,
             selection_trace: input.tool_surface.selection_trace.clone(),
-            runtime_manifest: None,
+            runtime_manifest: Some(json!({
+                "schema_version": "astra_runtime_manifest.v1",
+                "selected_model": {
+                    "model": input.session.model_id,
+                },
+                "model_resolution": {
+                    "source": "bridge_request",
+                    "model": input.session.model_id,
+                    "provider": input.session.provider,
+                    "resolved": true,
+                },
+                "runtime_profile": "bridge_inprocess",
+            })),
         },
     }
 }
@@ -800,6 +812,20 @@ pub(crate) fn assemble_context_pipeline(
             .iter()
             .cloned(),
     );
+    let model_identity_section =
+        crate::turn::prompt_cache::model_identity_prompt_section_for_cache_capability(
+            input.cache_capability,
+            input.provider,
+            input.model_name,
+        );
+    if matches!(
+        model_identity_section.scope,
+        astra_turn_core::section_types::CacheScope::None
+    ) {
+        external.extra_dynamic_sections.push(model_identity_section);
+    } else {
+        external.extra_stable_sections.push(model_identity_section);
+    }
     external.session_memory_entry = input.runtime_signals.session_memory_entry.clone();
     let turn_state = build_turn_state(state, input.user_content);
     // `AgenticLoopState::max_turn_input_tokens` is an input-budget/wind-down
@@ -1280,6 +1306,65 @@ mod context_cache_contract_tests {
                 "dynamic_a",
                 "visible_a"
             ]
+        );
+    }
+
+    #[test]
+    fn assemble_context_pipeline_keeps_strict_history_model_visible_without_volatile_preamble() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "which model are you?"}));
+        let edge_profile = serde_json::Map::new();
+        let visible_tools = vec![tool("bash")];
+        let restricted_tools = HashSet::new();
+        let volatile = vec![crate::prompts::PromptSection::dynamic(
+            "## Volatile\nmust be suppressed".to_string(),
+            crate::prompts::PromptTokenBucket::Environment,
+        )];
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let strict_history = astra_turn_core::cache_placement::CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
+            volatile_placement:
+                astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+            reuse_scope: None,
+        };
+
+        let output = assemble_context_pipeline(LlmContextAssemblyInput {
+            state: &mut state,
+            session_id: "sid-deepseek",
+            tool_surface: ToolSurfacePlan::from_visible_tools(&visible_tools, &restricted_tools),
+            runtime_signals: RuntimeSignals::new(&edge_profile, None, 0.8)
+                .with_extra_sections(&[], &volatile),
+            cache_cfg: &cache_cfg,
+            provider: "openai",
+            model_name: "deepseek-v4-pro-official(thinking:high)",
+            cache_capability: Some(strict_history),
+            user_content: "which model are you?",
+            query_source: "test",
+        })
+        .expect("context pipeline should assemble");
+
+        let primary_text = output
+            .system_messages
+            .first()
+            .and_then(|msg| msg.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            primary_text.contains("Model: deepseek-v4-pro-official(thinking:high) (via openai)"),
+            "strict-history model identity must survive volatile suppression: {primary_text}"
+        );
+        assert!(
+            !primary_text.contains("must be suppressed"),
+            "ordinary volatile content must stay out of strict-history stable prompt: {primary_text}"
+        );
+        assert!(
+            output.volatile_preamble.is_empty(),
+            "CurrentUserOnly providers must still suppress normal volatile preamble"
         );
     }
 
