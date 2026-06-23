@@ -7,7 +7,10 @@ use uuid::Uuid;
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
 use crate::pagination::clamp_api_list_pagination;
-use crate::storage::{load_agent_event_count, upsert_agent_session_event_count};
+use crate::storage::{
+    agent_session_exists_for_user, load_agent_event_count_for_user,
+    upsert_agent_session_event_count,
+};
 
 const MAX_CAUSAL_CHAIN_EVENTS: i64 = 500;
 
@@ -230,19 +233,10 @@ impl EventService for DatabaseEventService {
         let mut conn = pool.acquire().await.map_err(internal_error)?;
         let mut tx = conn.begin().await.map_err(internal_error)?;
 
-        let session_row = query("SELECT user_id FROM agent_sessions WHERE session_id = ?")
-            .bind(&session_id)
-            .fetch_optional(&mut *tx)
+        if !agent_session_exists_for_user(&mut *tx, &session_id, &user_id)
             .await
-            .map_err(internal_error)?;
-        let session_row = session_row.ok_or_else(|| {
-            error_response(
-                StatusCode::NOT_FOUND,
-                format!("Session {} not found", session_id),
-            )
-        })?;
-        let session_owner: String = session_row.try_get("user_id").map_err(internal_error)?;
-        if session_owner != user_id {
+            .map_err(internal_error)?
+        {
             return Err(error_response(
                 StatusCode::NOT_FOUND,
                 format!("Session {} not found", session_id),
@@ -309,7 +303,7 @@ impl EventService for DatabaseEventService {
         // increment to prevent drift from concurrent requests or duplicate detection.
         // MatrixOne rejects the earlier subquery-in-upsert form, so count first and
         // then upsert with bound values.
-        let event_count = load_agent_event_count(&mut *tx, &session_id)
+        let event_count = load_agent_event_count_for_user(&mut *tx, &session_id, &user_id)
             .await
             .map_err(internal_error)?;
         upsert_agent_session_event_count(&mut *tx, &session_id, &user_id, event_count)
@@ -421,11 +415,12 @@ impl EventService for DatabaseEventService {
     ) -> Result<EventRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let select_sql = format!(
-            "SELECT {} FROM agent_events WHERE event_id = ?",
+            "SELECT {} FROM agent_events WHERE event_id = ? AND user_id = ?",
             EVENT_DETAIL_SELECT_COLS
         );
         let row = query(&select_sql)
             .bind(&event_id)
+            .bind(&user_id)
             .fetch_optional(&pool)
             .await
             .map_err(internal_error)?;
@@ -438,14 +433,7 @@ impl EventService for DatabaseEventService {
         })?;
         let mut records = vec![Self::event_record_from_row(row)?];
         Self::hydrate_parent_event_ids(&pool, &mut records).await?;
-        let record = records.pop().expect("single event record");
-        if record.user_id != user_id {
-            return Err(error_response(
-                StatusCode::NOT_FOUND,
-                format!("Event {} not found", event_id),
-            ));
-        }
-        Ok(record)
+        Ok(records.pop().expect("single event record"))
     }
 
     async fn get_causal_chain(
@@ -484,39 +472,33 @@ impl EventService for DatabaseEventService {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let (limit, offset) = clamp_api_list_pagination(limit, offset);
 
-        let session_row = query("SELECT user_id FROM agent_sessions WHERE session_id = ?")
-            .bind(&session_id)
-            .fetch_optional(&pool)
+        if !agent_session_exists_for_user(&pool, &session_id, &user_id)
             .await
-            .map_err(internal_error)?;
-        let session_row = session_row.ok_or_else(|| {
-            error_response(
-                StatusCode::NOT_FOUND,
-                format!("Session {} not found", session_id),
-            )
-        })?;
-        let owner: String = session_row.try_get("user_id").map_err(internal_error)?;
-        if owner != user_id {
+            .map_err(internal_error)?
+        {
             return Err(error_response(
                 StatusCode::NOT_FOUND,
                 format!("Session {} not found", session_id),
             ));
         }
 
-        let count_row =
-            query("SELECT COUNT(event_id) AS total FROM agent_events WHERE session_id = ?")
-                .bind(&session_id)
-                .fetch_one(&pool)
-                .await
-                .map_err(internal_error)?;
+        let count_row = query(
+            "SELECT COUNT(event_id) AS total FROM agent_events WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(internal_error)?;
         let total = count_row.try_get::<i64, _>("total").unwrap_or(0);
 
         let select_sql = format!(
-            "SELECT {} FROM agent_events WHERE session_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?",
+            "SELECT {} FROM agent_events WHERE session_id = ? AND user_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?",
             EVENT_LIST_SELECT_COLS
         );
         let rows = query(&select_sql)
             .bind(&session_id)
+            .bind(&user_id)
             .bind(i64::from(limit))
             .bind(i64::from(offset))
             .fetch_all(&pool)
@@ -544,11 +526,12 @@ impl EventService for DatabaseEventService {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
         let select_sql = format!(
-            "SELECT {} FROM agent_events WHERE event_id = ?",
+            "SELECT {} FROM agent_events WHERE event_id = ? AND user_id = ?",
             EVENT_DETAIL_SELECT_COLS
         );
         let row = query(&select_sql)
             .bind(&event_id)
+            .bind(&user_id)
             .fetch_optional(&pool)
             .await
             .map_err(internal_error)?;
@@ -559,12 +542,6 @@ impl EventService for DatabaseEventService {
             )
         })?;
         let record = Self::event_record_from_row(row)?;
-        if record.user_id != user_id {
-            return Err(error_response(
-                StatusCode::NOT_FOUND,
-                format!("Event {} not found", event_id),
-            ));
-        }
 
         let mut tx = pool.begin().await.map_err(internal_error)?;
         query("DELETE FROM agent_event_edges WHERE child_event_id = ? OR parent_event_id = ?")
@@ -573,13 +550,14 @@ impl EventService for DatabaseEventService {
             .execute(&mut *tx)
             .await
             .map_err(internal_error)?;
-        query("DELETE FROM agent_events WHERE event_id = ?")
+        query("DELETE FROM agent_events WHERE event_id = ? AND user_id = ?")
             .bind(&event_id)
+            .bind(&user_id)
             .execute(&mut *tx)
             .await
             .map_err(internal_error)?;
         // Reconcile session event_count after deletion to prevent permanent drift.
-        let event_count = load_agent_event_count(&mut *tx, &record.session_id)
+        let event_count = load_agent_event_count_for_user(&mut *tx, &record.session_id, &user_id)
             .await
             .map_err(internal_error)?;
         upsert_agent_session_event_count(&mut *tx, &record.session_id, &user_id, event_count)

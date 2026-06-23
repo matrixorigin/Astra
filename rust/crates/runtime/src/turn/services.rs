@@ -1,5 +1,5 @@
 use crate::data_layer::storage::{
-    insert_trace_event, load_agent_event_count, upsert_agent_session_event_count,
+    insert_trace_event, load_agent_event_count_for_user, upsert_agent_session_event_count,
 };
 use crate::*;
 use astra_turn_core::trace_event::{TraceEvent, TraceEventWriter, TraceWriteError};
@@ -271,7 +271,7 @@ impl DatabaseTraceEventWriter {
             );
         }
         for (session_id, (user_id, last_event_id)) in touched_sessions {
-            let event_count = load_agent_event_count(&mut **tx, &session_id)
+            let event_count = load_agent_event_count_for_user(&mut **tx, &session_id, &user_id)
                 .await
                 .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
             upsert_agent_session_event_count(&mut **tx, &session_id, &user_id, event_count)
@@ -281,10 +281,11 @@ impl DatabaseTraceEventWriter {
                 "UPDATE agent_sessions \
                  SET last_event_id = COALESCE(?, last_event_id), \
                      last_active_at = NOW(), updated_at = NOW() \
-                 WHERE session_id = ?",
+                 WHERE session_id = ? AND user_id = ?",
             )
             .bind(last_event_id)
-            .bind(session_id)
+            .bind(&session_id)
+            .bind(&user_id)
             .execute(&mut **tx)
             .await
             .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
@@ -504,6 +505,7 @@ impl TurnSessionActivityWriter for DatabaseTurnSessionActivityWriter {
     async fn update_session_activity(
         &self,
         session_id: &str,
+        user_id: &str,
         plan: SessionActivityUpdatePlan,
     ) -> Result<(), String> {
         let pool = self.get_pool()?;
@@ -515,14 +517,16 @@ impl TurnSessionActivityWriter for DatabaseTurnSessionActivityWriter {
         // with actual count. The subquery ensures accuracy even if events are deduplicated.
         let result = query(
             "UPDATE agent_sessions \
-             SET event_count = (SELECT COUNT(*) FROM agent_events WHERE session_id = ?), \
+             SET event_count = (SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND user_id = ?), \
                  last_active_at = NOW(), updated_at = NOW(), \
                  last_event_id = COALESCE(?, last_event_id) \
-             WHERE session_id = ?",
+             WHERE session_id = ? AND user_id = ?",
         )
         .bind(session_id)
+        .bind(user_id)
         .bind(plan.last_event_id)
         .bind(session_id)
+        .bind(user_id)
         .execute(&pool)
         .await
         .map_err(|error| error.to_string());
@@ -538,6 +542,7 @@ impl TurnSessionActivityWriter for NoopTurnSessionActivityWriter {
     async fn update_session_activity(
         &self,
         _session_id: &str,
+        _user_id: &str,
         _plan: SessionActivityUpdatePlan,
     ) -> Result<(), String> {
         Ok(())
@@ -752,6 +757,7 @@ mod tests {
         let r = w
             .update_session_activity(
                 "s",
+                "u",
                 SessionActivityUpdatePlan {
                     event_count_increment: 1,
                     last_event_id: Some("e5".into()),

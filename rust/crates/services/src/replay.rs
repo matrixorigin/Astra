@@ -6,6 +6,8 @@ use uuid::Uuid;
 
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
+use crate::storage::agent_session_exists_for_user;
+
 // ── Data types ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -91,17 +93,11 @@ impl ReplayService for DatabaseReplayService {
     ) -> Result<ReplayResponse, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        let session_row = query("SELECT user_id FROM agent_sessions WHERE session_id = ?")
-            .bind(&session_id)
-            .fetch_optional(&pool)
+        if !agent_session_exists_for_user(&pool, &session_id, &user_id)
             .await
-            .map_err(internal_error)?;
-
-        let session_row = session_row
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Session not found"))?;
-        let owner: String = session_row.try_get("user_id").map_err(internal_error)?;
-        if owner != user_id {
-            return Err(error_response(StatusCode::FORBIDDEN, "Not authorized"));
+            .map_err(internal_error)?
+        {
+            return Err(error_response(StatusCode::NOT_FOUND, "Session not found"));
         }
 
         let count_row =
@@ -134,17 +130,11 @@ impl ReplayService for DatabaseReplayService {
     ) -> Result<ComparisonResponse, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        let session_row = query("SELECT user_id FROM agent_sessions WHERE session_id = ?")
-            .bind(&session_id)
-            .fetch_optional(&pool)
+        if !agent_session_exists_for_user(&pool, &session_id, &user_id)
             .await
-            .map_err(internal_error)?;
-
-        let session_row = session_row
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Session not found"))?;
-        let owner: String = session_row.try_get("user_id").map_err(internal_error)?;
-        if owner != user_id {
-            return Err(error_response(StatusCode::FORBIDDEN, "Not authorized"));
+            .map_err(internal_error)?
+        {
+            return Err(error_response(StatusCode::NOT_FOUND, "Session not found"));
         }
 
         let counts = query(

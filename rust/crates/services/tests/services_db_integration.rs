@@ -14,6 +14,7 @@
 
 use astra_core::{MatrixOneSettings, SharedPool};
 use astra_services::event_ingestion::{EventIngestionWorker, IngestionConfig, IngestionEvent};
+use astra_services::replay::ReplaySessionRequestData;
 use astra_services::session_audit::TurnListParams;
 use astra_services::session_audit::{
     AuditSessionListParams, CrossSessionRuntimePromotionListParams, CrossSessionStatsParams,
@@ -28,14 +29,15 @@ use astra_services::session_workspace::{
     ContextTraceSignal, ContextTraceToolSelection, WorkspaceMetadata, persist_remote_workspace,
 };
 use astra_services::{
-    AdminAuditFilter, AdminAuditReader, DatabaseAdminAuditReader, DatabaseDecisionService,
-    DatabaseEventService, DatabaseMarketplaceStatsService, DatabaseSessionArtifactStore,
-    DatabaseSessionService, DatabaseSkillService, DecisionListFilter, DecisionService,
-    DurableTaskLifecycle, EventCreateRequestData, EventListFilter, EventService,
+    AdminAuditFilter, AdminAuditReader, ContextService, DatabaseAdminAuditReader,
+    DatabaseContextService, DatabaseDecisionService, DatabaseEventService,
+    DatabaseMarketplaceStatsService, DatabaseReplayService, DatabaseSessionArtifactStore,
+    DatabaseSessionService, DatabaseSkillService, DecisionCreateRequestData, DecisionListFilter,
+    DecisionService, DurableTaskLifecycle, EventCreateRequestData, EventListFilter, EventService,
     MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET, MAX_MARKETPLACE_SEARCH_OFFSET,
-    MarketplaceStatsService, MatrixOneDurableTaskLifecycle, MatrixOneSyncService,
+    MarketplaceStatsService, MatrixOneDurableTaskLifecycle, MatrixOneSyncService, ReplayService,
     SessionArtifactJsonStore, SessionArtifactStore, SessionListFilter, SessionService,
-    SkillSearchQuery, SkillService,
+    SkillSearchQuery, SkillService, SnapshotCreateRequestData,
 };
 use sqlx::Row;
 use std::collections::HashSet;
@@ -2796,6 +2798,415 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
     assert_eq!(checkpoint_sync_successes, 1);
 
     cleanup_restore_fixture(&pool, &[session_id, heavy_only_session]).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_matrixone() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let owner_user_id = Uuid::new_v4().to_string();
+    let other_user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let stray_event_id = Uuid::new_v4().to_string();
+    let non_owner_session_end_event_id = Uuid::new_v4().to_string();
+
+    cleanup_agent_sessions_and_events(
+        &pool,
+        std::slice::from_ref(&session_id),
+        &[
+            stray_event_id.clone(),
+            non_owner_session_end_event_id.clone(),
+        ],
+        &[],
+    )
+    .await;
+
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'owner-bound-it', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .execute(&pool)
+    .await
+    .expect("insert owner session");
+
+    sqlx::query(
+        "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, causal_chain_id) \
+         VALUES (?, ?, ?, 'stray_evt', '{}', '')",
+    )
+    .bind(&stray_event_id)
+    .bind(&session_id)
+    .bind(&other_user_id)
+    .execute(&pool)
+    .await
+    .expect("insert stray event");
+
+    let event_service = DatabaseEventService::new(settings).with_pool(shared);
+    let owner_event = event_service
+        .create_event(
+            owner_user_id.clone(),
+            EventCreateRequestData {
+                session_id: session_id.clone(),
+                event_type: "owner_evt".into(),
+                content: "owner visible".into(),
+                agent_id: None,
+                agent_version: None,
+                parent_event_id: None,
+                parent_event_ids: None,
+                causal_chain_id: None,
+                metadata: None,
+            },
+        )
+        .await
+        .expect("owner can create event");
+
+    let stored_count =
+        sqlx::query("SELECT event_count FROM agent_sessions WHERE session_id = ? AND user_id = ?")
+            .bind(&session_id)
+            .bind(&owner_user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load owner session count")
+            .try_get::<i64, _>("event_count")
+            .expect("decode owner event_count");
+    assert_eq!(
+        stored_count, 1,
+        "event_count must reconcile only rows owned by the session owner"
+    );
+
+    let owner_events = event_service
+        .get_session_events(session_id.clone(), owner_user_id.clone(), 100, 0)
+        .await
+        .expect("owner can list session events");
+    assert_eq!(owner_events.events.len(), 1);
+    assert_eq!(owner_events.events[0].event_id, owner_event.event_id);
+
+    let other_session_result = event_service
+        .get_session_events(session_id.clone(), other_user_id.clone(), 100, 0)
+        .await;
+    assert_eq!(
+        other_session_result
+            .expect_err("non-owner cannot list session")
+            .0,
+        axum::http::StatusCode::NOT_FOUND
+    );
+
+    let other_get_result = event_service
+        .get_event(owner_event.event_id.clone(), other_user_id.clone())
+        .await;
+    assert_eq!(
+        other_get_result
+            .expect_err("non-owner cannot load owner event")
+            .0,
+        axum::http::StatusCode::NOT_FOUND
+    );
+
+    let other_delete_result = event_service
+        .delete_event(owner_event.event_id.clone(), other_user_id.clone())
+        .await;
+    assert_eq!(
+        other_delete_result
+            .expect_err("non-owner cannot delete owner event")
+            .0,
+        axum::http::StatusCode::NOT_FOUND
+    );
+
+    let owner_event_still_exists =
+        sqlx::query("SELECT COUNT(*) AS c FROM agent_events WHERE event_id = ? AND user_id = ?")
+            .bind(&owner_event.event_id)
+            .bind(&owner_user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count owner event")
+            .try_get::<i64, _>("c")
+            .expect("decode owner event count");
+    assert_eq!(
+        owner_event_still_exists, 1,
+        "failed non-owner delete must not remove the owner event"
+    );
+
+    let config = IngestionConfig {
+        batch_size: 1,
+        flush_interval_secs: 300,
+        channel_capacity: 2,
+        ..Default::default()
+    };
+    let (sender, shutdown, stats, join) = EventIngestionWorker::spawn(pool.clone(), config);
+    sender
+        .enqueue_async(IngestionEvent {
+            event_id: non_owner_session_end_event_id.clone(),
+            session_id: session_id.clone(),
+            user_id: other_user_id,
+            event_type: "session_end".into(),
+            content: Some("non-owner close attempt".into()),
+            token_usage: None,
+            llm_model_used: None,
+            skill_name: None,
+            metadata: None,
+            created_at: "2026-09-03T08:30:00Z".into(),
+            parent_event_id: None,
+            parent_event_ids: Vec::new(),
+            causal_chain_id: None,
+        })
+        .await;
+    shutdown.signal();
+    sender.shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(10), join)
+        .await
+        .expect("owner-bound ingestion worker join timeout")
+        .expect("owner-bound ingestion worker join");
+    let ingestion_error = {
+        let stats = stats.lock().expect("owner-bound ingestion stats");
+        stats.last_error.clone()
+    };
+    assert!(
+        ingestion_error.is_some(),
+        "non-owner event for an existing owner session must fail closed instead of mutating session state"
+    );
+
+    let session_after_non_owner_end =
+        sqlx::query("SELECT status, event_count FROM agent_sessions WHERE session_id = ?")
+            .bind(&session_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load owner session after non-owner session_end");
+    assert_eq!(
+        session_after_non_owner_end
+            .try_get::<String, _>("status")
+            .expect("decode status"),
+        "active",
+        "non-owner session_end must not close owner session"
+    );
+    assert_eq!(
+        session_after_non_owner_end
+            .try_get::<i64, _>("event_count")
+            .expect("decode event_count"),
+        1,
+        "non-owner ingestion failure must not change owner event_count"
+    );
+
+    cleanup_agent_sessions_and_events(
+        &pool,
+        &[session_id],
+        &[
+            owner_event.event_id,
+            stray_event_id,
+            non_owner_session_end_event_id,
+        ],
+        &[],
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_owned_services_reject_non_owner_side_effects_on_live_matrixone() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let owner_user_id = Uuid::new_v4().to_string();
+    let other_user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let event_id = Uuid::new_v4().to_string();
+    let context_capture_id = Uuid::new_v4().to_string();
+
+    let _ = sqlx::query("DELETE FROM ctx_decision_audits WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM ctx_snapshots WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    cleanup_agent_sessions_and_events(&pool, std::slice::from_ref(&session_id), &[], &[]).await;
+
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'owner-bound-side-effects-it', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .execute(&pool)
+    .await
+    .expect("insert owner session");
+
+    let context_service = DatabaseContextService::new(settings.clone()).with_pool(shared.clone());
+    let snapshot_result = context_service
+        .create_snapshot(
+            other_user_id.clone(),
+            SnapshotCreateRequestData {
+                session_id: session_id.clone(),
+                event_id: event_id.clone(),
+                context_data: serde_json::json!({"attempt": "non-owner"}),
+            },
+        )
+        .await;
+    assert_eq!(
+        snapshot_result
+            .expect_err("non-owner cannot create context snapshot")
+            .0,
+        axum::http::StatusCode::NOT_FOUND
+    );
+
+    let decision_service = DatabaseDecisionService::new(settings.clone()).with_pool(shared.clone());
+    let decision_result = decision_service
+        .record_decision(
+            other_user_id.clone(),
+            DecisionCreateRequestData {
+                session_id: session_id.clone(),
+                event_id: event_id.clone(),
+                context_capture_id,
+                decision_type: "it_decision".into(),
+                decision_output: serde_json::json!({"allowed": false}),
+                model_params: None,
+            },
+        )
+        .await;
+    assert_eq!(
+        decision_result
+            .expect_err("non-owner cannot record decision")
+            .0,
+        axum::http::StatusCode::NOT_FOUND
+    );
+
+    let replay_service = DatabaseReplayService::new(settings).with_pool(shared);
+    let replay_result = replay_service
+        .replay_session(
+            other_user_id.clone(),
+            session_id.clone(),
+            ReplaySessionRequestData {
+                sandbox_name: None,
+                mock_mode: true,
+            },
+        )
+        .await;
+    assert_eq!(
+        replay_result
+            .expect_err("non-owner cannot replay session")
+            .0,
+        axum::http::StatusCode::NOT_FOUND
+    );
+    let compare_result = replay_service
+        .compare_replay(other_user_id, session_id.clone())
+        .await;
+    assert_eq!(
+        compare_result
+            .expect_err("non-owner cannot compare replay")
+            .0,
+        axum::http::StatusCode::NOT_FOUND
+    );
+
+    let snapshot_count =
+        sqlx::query("SELECT COUNT(*) AS c FROM ctx_snapshots WHERE session_id = ?")
+            .bind(&session_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count context snapshots")
+            .try_get::<i64, _>("c")
+            .expect("decode snapshot count");
+    assert_eq!(snapshot_count, 0, "rejected snapshot must not write rows");
+
+    let decision_count =
+        sqlx::query("SELECT COUNT(*) AS c FROM ctx_decision_audits WHERE session_id = ?")
+            .bind(&session_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count decisions")
+            .try_get::<i64, _>("c")
+            .expect("decode decision count");
+    assert_eq!(decision_count, 0, "rejected decision must not write rows");
+
+    cleanup_agent_sessions_and_events(&pool, &[session_id], &[], &[]).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_delete_blocks_mixed_owner_core_rows_on_live_matrixone() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let owner_user_id = Uuid::new_v4().to_string();
+    let other_user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let owner_event_id = Uuid::new_v4().to_string();
+    let stray_event_id = Uuid::new_v4().to_string();
+
+    cleanup_agent_sessions_and_events(
+        &pool,
+        std::slice::from_ref(&session_id),
+        &[owner_event_id.clone(), stray_event_id.clone()],
+        &[],
+    )
+    .await;
+
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'mixed-owner-delete-it', 'active', 1)",
+    )
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .execute(&pool)
+    .await
+    .expect("insert owner session");
+
+    for (event_id, user_id, event_type) in [
+        (&owner_event_id, &owner_user_id, "owner_evt"),
+        (&stray_event_id, &other_user_id, "stray_evt"),
+    ] {
+        sqlx::query(
+            "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, causal_chain_id) \
+             VALUES (?, ?, ?, ?, '{}', '')",
+        )
+        .bind(event_id)
+        .bind(&session_id)
+        .bind(user_id)
+        .bind(event_type)
+        .execute(&pool)
+        .await
+        .expect("insert event");
+    }
+
+    let session_service = DatabaseSessionService::new(settings).with_pool(shared);
+    let delete_result = session_service
+        .delete_session(session_id.clone(), owner_user_id.clone())
+        .await;
+    assert_eq!(
+        delete_result
+            .expect_err("mixed-owner session delete must fail closed")
+            .0,
+        axum::http::StatusCode::CONFLICT
+    );
+
+    let remaining_session = sqlx::query(
+        "SELECT COUNT(*) AS c FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count remaining session")
+    .try_get::<i64, _>("c")
+    .expect("decode remaining session count");
+    assert_eq!(remaining_session, 1, "blocked delete must keep session");
+
+    let remaining_events =
+        sqlx::query("SELECT COUNT(*) AS c FROM agent_events WHERE session_id = ?")
+            .bind(&session_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count remaining events")
+            .try_get::<i64, _>("c")
+            .expect("decode remaining event count");
+    assert_eq!(
+        remaining_events, 2,
+        "blocked delete must not partially remove owner or non-owner events"
+    );
+
+    cleanup_agent_sessions_and_events(&pool, &[session_id], &[owner_event_id, stray_event_id], &[])
+        .await;
 }
 
 #[tokio::test]

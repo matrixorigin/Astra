@@ -1,6 +1,7 @@
 mod common;
 
 use sqlx::Row;
+use std::path::{Path, PathBuf};
 
 #[test]
 fn web_traceability_agent_events_schema_source_contract() {
@@ -95,6 +96,48 @@ fn schema_rationalization_source_contract() {
         !prompt_source.contains("payload_json, previous_chunk_hash"),
         "prompt deltas must not persist unread payload_json blobs"
     );
+}
+
+#[test]
+fn service_table_queries_name_columns_explicitly() {
+    let mut files = Vec::new();
+    collect_rust_files(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+
+    let mut offenders = Vec::new();
+    for path in files {
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for (line_idx, line) in source.lines().enumerate() {
+            let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
+            if normalized.contains("SELECT *") && !normalized.contains("mo_diff(") {
+                offenders.push(format!("{}:{}", path.display(), line_idx + 1));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "production table reads must name selected columns; offenders:\n{}",
+        offenders.join("\n")
+    );
+}
+
+fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rust_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
 }
 
 #[tokio::test]

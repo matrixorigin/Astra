@@ -5,6 +5,8 @@ use sqlx::{Row, query};
 
 use astra_core::{MatrixOneSettings, SharedPool, error_response, internal_error};
 
+use crate::storage::agent_session_exists_for_user;
+
 use super::scoring::{
     DEGRADATION_DELTA, QUALITY_DEGRADED, QUALITY_GOOD, TOKEN_CHAR_RATIO, analyze_context_health,
     billable_input_from_canonical, compaction_effectiveness, compaction_forecast, compute_drift,
@@ -36,22 +38,13 @@ impl DatabaseIntrospectionService {
         session_id: &str,
         user_id: &str,
     ) -> ServiceResult<()> {
-        let row = query("SELECT user_id FROM agent_sessions WHERE session_id = ?")
-            .bind(session_id)
-            .fetch_optional(pool)
+        if agent_session_exists_for_user(pool, session_id, user_id)
             .await
-            .map_err(internal_error)?;
-
-        match row {
-            Some(r) => {
-                let owner: String = r.try_get("user_id").map_err(internal_error)?;
-                if owner != user_id {
-                    Err(error_response(StatusCode::NOT_FOUND, "Session not found"))
-                } else {
-                    Ok(())
-                }
-            }
-            None => Err(error_response(StatusCode::NOT_FOUND, "Session not found")),
+            .map_err(internal_error)?
+        {
+            Ok(())
+        } else {
+            Err(error_response(StatusCode::NOT_FOUND, "Session not found"))
         }
     }
     pub fn with_pool(mut self, pool: SharedPool) -> Self {

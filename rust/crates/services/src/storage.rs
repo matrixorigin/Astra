@@ -101,18 +101,40 @@ pub fn normalized_parent_event_ids(
     out
 }
 
-pub async fn load_agent_event_count<'e, E>(
+pub async fn load_agent_event_count_for_user<'e, E>(
     executor: E,
     session_id: &str,
+    user_id: &str,
 ) -> Result<i64, sqlx::Error>
 where
     E: Executor<'e, Database = MySql>,
 {
-    let row = query("SELECT COUNT(*) AS event_count FROM agent_events WHERE session_id = ?")
-        .bind(session_id)
-        .fetch_one(executor)
-        .await?;
-    Ok(row.try_get::<i64, _>("event_count").unwrap_or(0))
+    let row = query(
+        "SELECT COUNT(*) AS event_count FROM agent_events \
+         WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .fetch_one(executor)
+    .await?;
+    row.try_get::<i64, _>("event_count")
+}
+
+pub async fn agent_session_exists_for_user<'e, E>(
+    executor: E,
+    session_id: &str,
+    user_id: &str,
+) -> Result<bool, sqlx::Error>
+where
+    E: Executor<'e, Database = MySql>,
+{
+    let row =
+        query("SELECT 1 AS owned FROM agent_sessions WHERE session_id = ? AND user_id = ? LIMIT 1")
+            .bind(session_id)
+            .bind(user_id)
+            .fetch_optional(executor)
+            .await?;
+    Ok(row.is_some())
 }
 
 pub async fn upsert_agent_session_event_count<'e, E>(
@@ -127,18 +149,32 @@ where
     query(
         "INSERT INTO agent_sessions \
          (session_id, user_id, status, event_count, created_at, updated_at, last_active_at) \
-         VALUES (?, ?, 'active', ?, NOW(), NOW(), NOW()) \
+         SELECT ?, ?, 'active', ?, NOW(6), NOW(6), NOW(6) \
+         FROM DUAL \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM agent_sessions \
+             WHERE session_id = ? AND user_id <> ? \
+             LIMIT 1 \
+         ) \
          ON DUPLICATE KEY UPDATE \
-         event_count = ?, \
-         updated_at = NOW(), \
-         last_active_at = NOW()",
+         event_count = VALUES(event_count), \
+         updated_at = NOW(6), \
+         last_active_at = NOW(6)",
     )
     .bind(session_id)
     .bind(user_id)
     .bind(event_count)
-    .bind(event_count)
+    .bind(session_id)
+    .bind(user_id)
     .execute(executor)
-    .await?;
+    .await
+    .and_then(|result| {
+        if result.rows_affected() == 0 {
+            Err(sqlx::Error::RowNotFound)
+        } else {
+            Ok(result)
+        }
+    })?;
     Ok(())
 }
 

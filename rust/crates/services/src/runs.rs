@@ -17,6 +17,18 @@ use uuid::Uuid;
 
 pub const RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE: &str = "run_lifecycle_unconfigured";
 pub const SSE_HEARTBEAT_INTERVAL_SECS: u64 = 15;
+const RUN_RECORD_SELECT_COLS: &str = "\
+    run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth, \
+    delegation_id, agent_id, retry_of, retry_scope, status, waiting_for, owner_pod_id, \
+    owner_lease_expires_at, run_generation, last_event_idx, checkpoint_version, checkpoint_json, \
+    error_code, error_message, retry_count, total_prompt_tokens, total_completion_tokens, \
+    total_tool_calls, agent_binding_id, agent_binding_name, agent_binding_schema_version, \
+    selected_model_json, selected_model_name, selected_model_gateway, capability_server_refs_json, \
+    runtime_profile, created_at, updated_at";
+const RUN_PROJECTION_SELECT_COLS: &str = "\
+    run_id, user_id, session_id, status, waiting_for, error_message, projection_event_idx, \
+    latest_event_type, latest_checkpoint_id, latest_checkpoint_kind, latest_checkpoint_version, \
+    total_prompt_tokens, total_completion_tokens, total_tool_calls, projection_hash, updated_at";
 
 pub fn is_run_lifecycle_unconfigured_error(status: StatusCode, error: &ErrorResponse) -> bool {
     status == StatusCode::NOT_IMPLEMENTED
@@ -1735,7 +1747,8 @@ impl DatabaseRunStateStore {
     }
 
     async fn load_run_metadata(&self, run_id: &str) -> DbStoreResult<Option<DurableRunRecord>> {
-        let row = sqlx::query("SELECT * FROM agent_runs WHERE run_id = ?")
+        let sql = format!("SELECT {RUN_RECORD_SELECT_COLS} FROM agent_runs WHERE run_id = ?");
+        let row = sqlx::query(&sql)
             .bind(run_id)
             .fetch_optional(self.pool.get())
             .await
@@ -1747,7 +1760,10 @@ impl DatabaseRunStateStore {
         &self,
         run_id: &str,
     ) -> DbStoreResult<Option<DurableRunDisplayProjectionRecord>> {
-        let row = sqlx::query("SELECT * FROM run_display_projections WHERE run_id = ?")
+        let sql = format!(
+            "SELECT {RUN_PROJECTION_SELECT_COLS} FROM run_display_projections WHERE run_id = ?"
+        );
+        let row = sqlx::query(&sql)
             .bind(run_id)
             .fetch_optional(self.pool.get())
             .await
@@ -2578,15 +2594,17 @@ impl RunStateStore for DatabaseRunStateStore {
             .await
             .map_err(|source| db_error("count_user_runs", user_id, source).to_string())?;
         let total = total_row.try_get::<i64, _>("total").unwrap_or(0);
-        let rows = sqlx::query(
-            "SELECT * FROM agent_runs WHERE user_id = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?",
-        )
-        .bind(user_id)
-        .bind(limit as i64)
-        .bind(offset as i64)
-        .fetch_all(self.pool.get())
-        .await
-        .map_err(|source| db_error("list_user_runs", user_id, source).to_string())?;
+        let sql = format!(
+            "SELECT {RUN_RECORD_SELECT_COLS} FROM agent_runs \
+             WHERE user_id = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(user_id)
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(self.pool.get())
+            .await
+            .map_err(|source| db_error("list_user_runs", user_id, source).to_string())?;
         let runs = rows
             .into_iter()
             .map(run_record_from_row)
@@ -2600,13 +2618,16 @@ impl RunStateStore for DatabaseRunStateStore {
     }
 
     async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
-        let rows =
-            sqlx::query("SELECT * FROM agent_runs WHERE status IN (?, ?) ORDER BY updated_at ASC")
-                .bind(STATUS_RUNNING)
-                .bind(STATUS_INPUT_QUEUED)
-                .fetch_all(self.pool.get())
-                .await
-                .map_err(|source| db_error("find_running_runs", "active", source).to_string())?;
+        let sql = format!(
+            "SELECT {RUN_RECORD_SELECT_COLS} FROM agent_runs \
+             WHERE status IN (?, ?) ORDER BY updated_at ASC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(STATUS_RUNNING)
+            .bind(STATUS_INPUT_QUEUED)
+            .fetch_all(self.pool.get())
+            .await
+            .map_err(|source| db_error("find_running_runs", "active", source).to_string())?;
         rows.into_iter()
             .map(run_record_from_row)
             .collect::<DbStoreResult<Vec<_>>>()
@@ -2614,8 +2635,8 @@ impl RunStateStore for DatabaseRunStateStore {
     }
 
     async fn find_recoverable_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
-        let rows = sqlx::query(
-            "SELECT * FROM agent_runs
+        let sql = format!(
+            "SELECT {RUN_RECORD_SELECT_COLS} FROM agent_runs
              WHERE status IN (?, ?)
                AND (
                    owner_pod_id IS NULL
@@ -2623,16 +2644,17 @@ impl RunStateStore for DatabaseRunStateStore {
                    OR owner_lease_expires_at IS NULL
                    OR owner_lease_expires_at < NOW(6)
                )
-             ORDER BY updated_at ASC",
-        )
-        .bind(STATUS_RUNNING)
-        .bind(STATUS_INPUT_QUEUED)
-        .bind(&self.owner_pod_id)
-        .fetch_all(self.pool.get())
-        .await
-        .map_err(|source| {
-            db_error("find_recoverable_running_runs", "active", source).to_string()
-        })?;
+             ORDER BY updated_at ASC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(STATUS_RUNNING)
+            .bind(STATUS_INPUT_QUEUED)
+            .bind(&self.owner_pod_id)
+            .fetch_all(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("find_recoverable_running_runs", "active", source).to_string()
+            })?;
         rows.into_iter()
             .map(run_record_from_row)
             .collect::<DbStoreResult<Vec<_>>>()
@@ -2644,35 +2666,40 @@ impl RunStateStore for DatabaseRunStateStore {
         user_id: &str,
         session_id: &str,
     ) -> Result<Option<DurableRunRecord>, String> {
-        let row = sqlx::query(
-            "SELECT * FROM agent_runs \
+        let sql = format!(
+            "SELECT {RUN_RECORD_SELECT_COLS} FROM agent_runs \
              WHERE user_id = ? AND session_id = ? \
                AND (status IN (?, ?, ?) OR (status = ? AND waiting_for IS NOT NULL)) \
              ORDER BY updated_at DESC \
-             LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .bind(STATUS_RUNNING)
-        .bind(STATUS_INPUT_QUEUED)
-        .bind(STATUS_WAITING)
-        .bind(STATUS_PAUSED)
-        .fetch_optional(self.pool.get())
-        .await
-        .map_err(|source| db_error("find_blocking_session_run", session_id, source).to_string())?;
+             LIMIT 1"
+        );
+        let row = sqlx::query(&sql)
+            .bind(user_id)
+            .bind(session_id)
+            .bind(STATUS_RUNNING)
+            .bind(STATUS_INPUT_QUEUED)
+            .bind(STATUS_WAITING)
+            .bind(STATUS_PAUSED)
+            .fetch_optional(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("find_blocking_session_run", session_id, source).to_string()
+            })?;
         row.map(run_record_from_row)
             .transpose()
             .map_err(|e| e.to_string())
     }
 
     async fn find_sub_runs(&self, delegation_id: &str) -> Result<Vec<DurableRunRecord>, String> {
-        let rows = sqlx::query(
-            "SELECT * FROM agent_runs WHERE delegation_id = ? ORDER BY depth ASC, created_at ASC",
-        )
-        .bind(delegation_id)
-        .fetch_all(self.pool.get())
-        .await
-        .map_err(|source| db_error("find_sub_runs", delegation_id, source).to_string())?;
+        let sql = format!(
+            "SELECT {RUN_RECORD_SELECT_COLS} FROM agent_runs \
+             WHERE delegation_id = ? ORDER BY depth ASC, created_at ASC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(delegation_id)
+            .fetch_all(self.pool.get())
+            .await
+            .map_err(|source| db_error("find_sub_runs", delegation_id, source).to_string())?;
         rows.into_iter()
             .map(run_record_from_row)
             .collect::<DbStoreResult<Vec<_>>>()
@@ -2694,7 +2721,11 @@ impl RunStateStore for DatabaseRunStateStore {
 
 impl DatabaseRunStateStore {
     async fn find_runs_by_status(&self, status: &str) -> Result<Vec<DurableRunRecord>, String> {
-        let rows = sqlx::query("SELECT * FROM agent_runs WHERE status = ? ORDER BY updated_at ASC")
+        let sql = format!(
+            "SELECT {RUN_RECORD_SELECT_COLS} FROM agent_runs \
+             WHERE status = ? ORDER BY updated_at ASC"
+        );
+        let rows = sqlx::query(&sql)
             .bind(status)
             .fetch_all(self.pool.get())
             .await

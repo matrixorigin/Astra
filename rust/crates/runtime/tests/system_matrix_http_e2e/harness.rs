@@ -948,15 +948,15 @@ pub async fn bootstrap_trusted_moi() -> TrustedMoiBootstrapResult {
     );
     let session_id = sess["session_id"].as_str().expect("session_id").to_string();
 
-    let row = sqlx::query("SELECT user_id FROM agent_sessions WHERE session_id = ?")
-        .bind(&session_id)
-        .fetch_optional(&pool)
-        .await
-        .expect("trusted_moi session owner select");
-    let row = row.expect("trusted_moi session row");
-    assert_eq!(
-        row.try_get::<String, _>("user_id").ok().as_deref(),
-        Some(user_id.as_str()),
+    let row =
+        sqlx::query("SELECT 1 AS owned FROM agent_sessions WHERE session_id = ? AND user_id = ?")
+            .bind(&session_id)
+            .bind(user_id.as_str())
+            .fetch_optional(&pool)
+            .await
+            .expect("trusted_moi session owner select");
+    assert!(
+        row.is_some(),
         "trusted_moi session should be owned by external user id"
     );
 

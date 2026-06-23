@@ -1,7 +1,6 @@
 //! Trusted MOI E2E: external user JWT is accepted and propagated to Astra-owned data surfaces.
 use axum::http::StatusCode;
 use serde_json::json;
-use sqlx::Row;
 
 use super::harness::{bootstrap_trusted_moi, cleanup_session_data, get_json, post_json};
 
@@ -81,15 +80,15 @@ pub async fn run_trusted_moi_user_system_integration() {
         .expect("trusted_moi session_id")
         .to_string();
 
-    let row = sqlx::query("SELECT user_id FROM agent_sessions WHERE session_id = ?")
-        .bind(&extra_session_id)
-        .fetch_optional(pool)
-        .await
-        .expect("select trusted_moi session owner");
-    let row = row.expect("trusted_moi created session row");
-    assert_eq!(
-        row.try_get::<String, _>("user_id").ok().as_deref(),
-        Some(ctx.user_id.as_str()),
+    let row =
+        sqlx::query("SELECT 1 AS owned FROM agent_sessions WHERE session_id = ? AND user_id = ?")
+            .bind(&extra_session_id)
+            .bind(ctx.user_id.as_str())
+            .fetch_optional(pool)
+            .await
+            .expect("select trusted_moi session owner");
+    assert!(
+        row.is_some(),
         "session owner should be external user id from trusted_moi token"
     );
 

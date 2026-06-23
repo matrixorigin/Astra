@@ -1376,7 +1376,7 @@ pub async fn run_saas_session_replay_post_positive() {
     .await;
     assert_eq!(
         st_forbid,
-        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
         "foreign user replay: {forbid_j}"
     );
 

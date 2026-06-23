@@ -234,7 +234,7 @@ struct AllCaptures {
     core_plans: Arc<Mutex<Vec<TurnCorePersistPlan>>>,
     tool_plans: Arc<Mutex<Vec<TurnToolEventPersistPlan>>>,
     aux_events: Arc<Mutex<Vec<TurnAuxiliaryEventRecord>>>,
-    activity_plans: Arc<Mutex<Vec<(String, SessionActivityUpdatePlan)>>>,
+    activity_plans: Arc<Mutex<Vec<(String, String, SessionActivityUpdatePlan)>>>,
     hook_plans: Arc<Mutex<Vec<TurnHookDbPersistPlan>>>,
     /// Tracks total persist operations for deterministic wait
     persist_count: Arc<AtomicUsize>,
@@ -323,13 +323,14 @@ impl TurnSessionActivityWriter for CapActivityWriter {
     async fn update_session_activity(
         &self,
         session_id: &str,
+        user_id: &str,
         plan: SessionActivityUpdatePlan,
     ) -> Result<(), String> {
-        self.0
-            .activity_plans
-            .lock()
-            .await
-            .push((session_id.to_string(), plan));
+        self.0.activity_plans.lock().await.push((
+            session_id.to_string(),
+            user_id.to_string(),
+            plan,
+        ));
         self.0.signal_persist();
         Ok(())
     }
@@ -2395,8 +2396,9 @@ async fn session_activity_event_count_increment_accuracy() {
 
     let acts = cap.activity_plans.lock().await;
     assert!(!acts.is_empty(), "activity writer should be called");
-    let (session_id, plan) = &acts[0];
+    let (session_id, user_id, plan) = &acts[0];
     assert!(!session_id.is_empty(), "session_id should be non-empty");
+    assert!(!user_id.is_empty(), "user_id should be non-empty");
     // Text-only: 1 user_query + 1 llm_response = 2 events.
     assert_eq!(
         plan.event_count_increment, 2,
@@ -2437,7 +2439,8 @@ async fn session_activity_event_count_for_tool_call_turn() {
 
     let acts = cap.activity_plans.lock().await;
     assert!(!acts.is_empty());
-    let (_, plan) = &acts[0];
+    let (_, user_id, plan) = &acts[0];
+    assert!(!user_id.is_empty(), "user_id should be non-empty");
     // user_query(1) + tool_calls(2) + llm_response(1) = 4
     assert_eq!(
         plan.event_count_increment, 4,
@@ -2481,7 +2484,8 @@ async fn session_activity_event_count_for_continuation_turn() {
 
     let acts = cap.activity_plans.lock().await;
     assert!(!acts.is_empty());
-    let (_, plan) = &acts[0];
+    let (_, user_id, plan) = &acts[0];
+    assert!(!user_id.is_empty(), "user_id should be non-empty");
     // core_event_count counts user_content.is_some() (1) + should_persist_llm (1) = 2,
     // even though user_query_event is NOT persisted on continuation (P2 fix).
     // Plus tool_event_count = 1 (tool_result). Total = 3.
@@ -4020,7 +4024,7 @@ async fn sync_activity_count_matches_persisted_events() {
 
     let activity = cap.activity_plans.lock().await;
     assert!(!activity.is_empty());
-    let increment = activity[0].1.event_count_increment;
+    let increment = activity[0].2.event_count_increment;
 
     // Increment should be core_count + tool_count
     assert_eq!(
@@ -4179,7 +4183,7 @@ async fn sync_activity_last_event_id_correct() {
 
     let activity = cap.activity_plans.lock().await;
     assert!(!activity.is_empty());
-    let last_eid = activity[0].1.last_event_id.as_deref().unwrap();
+    let last_eid = activity[0].2.last_event_id.as_deref().unwrap();
     assert_eq!(
         last_eid, lr.event_id,
         "activity last_event_id should be llm_response event_id"
@@ -6296,8 +6300,9 @@ async fn deep_all_event_types_single_turn() {
     // 4. Activity writer: session activity updated
     let activity = cap.activity_plans.lock().await;
     assert_eq!(activity.len(), 1, "activity updated once");
-    let (sid, act_plan) = &activity[0];
+    let (sid, user_id, act_plan) = &activity[0];
     assert!(!sid.is_empty(), "session_id non-empty");
+    assert!(!user_id.is_empty(), "user_id non-empty");
     assert!(
         act_plan.event_count_increment > 0,
         "event_count_increment > 0"
@@ -6381,7 +6386,7 @@ async fn deep_session_activity_cumulative_across_turns() {
 
     // Each turn's event_count reflects that turn's events (not cumulative in the plan itself;
     // the writer is responsible for accumulating). But each plan should have positive count.
-    for (i, (_sid, plan)) in activity.iter().enumerate() {
+    for (i, (_sid, _user_id, plan)) in activity.iter().enumerate() {
         assert!(
             plan.event_count_increment > 0,
             "turn {} event_count_increment should be > 0, got {}",
@@ -6392,12 +6397,12 @@ async fn deep_session_activity_cumulative_across_turns() {
 
     // Turn 1 (text-only): 2 events (user_query + llm_response)
     assert_eq!(
-        activity[0].1.event_count_increment, 2,
+        activity[0].2.event_count_increment, 2,
         "turn 1: user_query + llm_response"
     );
     // Turn 2 (tool call): 2 core + 1 tool = 3
     assert_eq!(
-        activity[1].1.event_count_increment, 3,
+        activity[1].2.event_count_increment, 3,
         "turn 2: user_query + llm_response + tool_call"
     );
 }
@@ -6876,6 +6881,7 @@ impl TurnSessionActivityWriter for FailActivityWriter {
     async fn update_session_activity(
         &self,
         _session_id: &str,
+        _user_id: &str,
         _plan: SessionActivityUpdatePlan,
     ) -> Result<(), String> {
         Err("simulated activity update failure".to_string())
@@ -9696,11 +9702,12 @@ async fn c1_trace_activity_plan_has_session_id() {
 
     let activities = cap.activity_plans.lock().await;
     assert!(!activities.is_empty(), "should have activity update");
-    let (sess_id, plan) = &activities[0];
+    let (sess_id, user_id, plan) = &activities[0];
     assert_eq!(
         sess_id, "c1-activity-unique-sess",
         "session_id should match payload"
     );
+    assert!(!user_id.is_empty(), "user_id should be non-empty");
     assert!(
         plan.event_count_increment > 0,
         "should count at least one event"
@@ -9882,7 +9889,8 @@ async fn c2_journal_activity_count_consistent() {
 
     let activities = cap.activity_plans.lock().await;
     assert!(!activities.is_empty(), "activity update required");
-    let (_, plan) = &activities[0];
+    let (_, user_id, plan) = &activities[0];
+    assert!(!user_id.is_empty(), "user_id should be non-empty");
     // Text-only turn: user_query + llm_response = at least 2 events
     assert!(
         plan.event_count_increment >= 2,

@@ -4157,6 +4157,7 @@ impl InProcessChatTurnBridge {
             let tool_writer = turn_tool_event_writer.clone();
             let sa_writer = turn_session_activity_writer.clone();
             let sid = session_id.clone();
+            let activity_user_id = user_id.clone();
             let user_query_event_id_for_activity = user_query_event_id.clone();
             let core_event_count = usize::from(user_content.is_some()) + usize::from(should_persist_llm);
             let tool_event_count = tool_event_plan
@@ -4224,7 +4225,10 @@ impl InProcessChatTurnBridge {
                     event_count_increment: persisted_event_count,
                     last_event_id,
                 };
-                if let Err(e) = sa_writer.update_session_activity(&sid, plan).await {
+                if let Err(e) = sa_writer
+                    .update_session_activity(&sid, &activity_user_id, plan)
+                    .await
+                {
                     astra_core::agent_persist_fail!("bridge",
                         session = sid,
                         stage = "activity",

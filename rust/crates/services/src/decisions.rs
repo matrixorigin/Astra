@@ -7,6 +7,7 @@ use uuid::Uuid;
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
 use crate::pagination::clamp_api_list_pagination;
+use crate::storage::agent_session_exists_for_user;
 
 // ── Data types ───────────────────────────────────────────────────────────────
 
@@ -151,20 +152,14 @@ impl DecisionService for DatabaseDecisionService {
     ) -> Result<DecisionRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        let session_row = query("SELECT user_id FROM agent_sessions WHERE session_id = ?")
-            .bind(&request.session_id)
-            .fetch_optional(&pool)
+        if !agent_session_exists_for_user(&pool, &request.session_id, &user_id)
             .await
-            .map_err(internal_error)?;
-        let session_row = session_row.ok_or_else(|| {
-            error_response(
+            .map_err(internal_error)?
+        {
+            return Err(error_response(
                 StatusCode::NOT_FOUND,
                 format!("Session {} not found", request.session_id),
-            )
-        })?;
-        let owner: String = session_row.try_get("user_id").map_err(internal_error)?;
-        if owner != user_id {
-            return Err(error_response(StatusCode::FORBIDDEN, "Permission denied"));
+            ));
         }
 
         let decision_id = Uuid::new_v4().to_string();

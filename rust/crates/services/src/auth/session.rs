@@ -8,6 +8,7 @@ use sqlx::{MySql, QueryBuilder, Row, query};
 use uuid::Uuid;
 
 const MAX_SESSION_ACTIVITY_ROWS: u32 = 200;
+const SESSION_DELETE_OWNER_MISMATCH_PREFIX: &str = "session_delete_owner_mismatch:";
 
 #[async_trait]
 pub trait SessionService: Send + Sync {
@@ -389,9 +390,9 @@ impl SessionService for DatabaseSessionService {
         }
 
         let mut tx = pool.begin().await.map_err(internal_error)?;
-        hard_delete_session_rows(&mut tx, &session_id)
+        hard_delete_session_rows(&mut tx, &session_id, &user_id)
             .await
-            .map_err(internal_error)?;
+            .map_err(map_hard_delete_session_error)?;
         tx.commit().await.map_err(internal_error)?;
 
         let details = serde_json::json!({ "title": existing.title });
@@ -498,29 +499,95 @@ async fn delete_session_rows_2(
         .map_err(|source| format!("delete_session.{label}: {source}"))
 }
 
+async fn delete_session_rows_session_user(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    label: &'static str,
+    statement: &'static str,
+    session_id: &str,
+    user_id: &str,
+) -> Result<u64, String> {
+    query(statement)
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(|source| format!("delete_session.{label}: {source}"))
+}
+
+async fn ensure_session_delete_owner_consistency(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    session_id: &str,
+    user_id: &str,
+) -> Result<(), String> {
+    for (label, statement) in [
+        (
+            "agent_events",
+            "SELECT COUNT(*) AS c FROM agent_events WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "agent_runs",
+            "SELECT COUNT(*) AS c FROM agent_runs WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "agent_run_events",
+            "SELECT COUNT(*) AS c FROM agent_run_events WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "run_checkpoints",
+            "SELECT COUNT(*) AS c FROM run_checkpoints WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "run_display_projections",
+            "SELECT COUNT(*) AS c FROM run_display_projections WHERE session_id = ? AND user_id <> ?",
+        ),
+    ] {
+        let row = query(statement)
+            .bind(session_id)
+            .bind(user_id)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|source| format!("delete_session.{label}.owner_check: {source}"))?;
+        let mismatches = row.try_get::<i64, _>("c").unwrap_or(0);
+        if mismatches > 0 {
+            return Err(format!(
+                "{SESSION_DELETE_OWNER_MISMATCH_PREFIX}{label}:{mismatches}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn hard_delete_session_rows(
     tx: &mut sqlx::Transaction<'_, MySql>,
     session_id: &str,
+    user_id: &str,
 ) -> Result<u64, String> {
     let mut deleted = 0_u64;
+    ensure_session_delete_owner_consistency(tx, session_id, user_id).await?;
 
     for (label, statement) in [(
         "user_skill_evaluations",
         "DELETE FROM user_skill_evaluations
-             WHERE run_id IN (SELECT run_id FROM agent_runs WHERE session_id = ?)",
+             WHERE run_id IN (SELECT run_id FROM agent_runs WHERE session_id = ? AND user_id = ?)",
     )] {
-        deleted += delete_session_rows_1(tx, label, statement, session_id).await?;
+        deleted +=
+            delete_session_rows_session_user(tx, label, statement, session_id, user_id).await?;
     }
 
-    deleted += delete_session_rows_2(
-        tx,
-        "agent_event_edges",
+    deleted += query(
         "DELETE FROM agent_event_edges
-         WHERE child_event_id IN (SELECT event_id FROM agent_events WHERE session_id = ?)
-            OR parent_event_id IN (SELECT event_id FROM agent_events WHERE session_id = ?)",
-        session_id,
+         WHERE child_event_id IN (SELECT event_id FROM agent_events WHERE session_id = ? AND user_id = ?)
+            OR parent_event_id IN (SELECT event_id FROM agent_events WHERE session_id = ? AND user_id = ?)",
     )
-    .await?;
+    .bind(session_id)
+    .bind(user_id)
+    .bind(session_id)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await
+    .map(|result| result.rows_affected())
+    .map_err(|source| format!("delete_session.agent_event_edges: {source}"))?;
 
     for (label, statement) in [
         (
@@ -674,32 +741,51 @@ async fn hard_delete_session_rows(
             "conversation_log",
             "DELETE FROM conversation_log WHERE session_id = ?",
         ),
-        (
-            "agent_run_events",
-            "DELETE FROM agent_run_events WHERE session_id = ?",
-        ),
-        (
-            "run_checkpoints",
-            "DELETE FROM run_checkpoints WHERE session_id = ?",
-        ),
-        (
-            "run_display_projections",
-            "DELETE FROM run_display_projections WHERE session_id = ?",
-        ),
-        ("agent_runs", "DELETE FROM agent_runs WHERE session_id = ?"),
-        (
-            "agent_events",
-            "DELETE FROM agent_events WHERE session_id = ?",
-        ),
-        (
-            "agent_sessions",
-            "DELETE FROM agent_sessions WHERE session_id = ?",
-        ),
     ] {
         deleted += delete_session_rows_1(tx, label, statement, session_id).await?;
     }
 
+    for (label, statement) in [
+        (
+            "agent_run_events",
+            "DELETE FROM agent_run_events WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "run_checkpoints",
+            "DELETE FROM run_checkpoints WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "run_display_projections",
+            "DELETE FROM run_display_projections WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "agent_runs",
+            "DELETE FROM agent_runs WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "agent_events",
+            "DELETE FROM agent_events WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "agent_sessions",
+            "DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+        ),
+    ] {
+        deleted +=
+            delete_session_rows_session_user(tx, label, statement, session_id, user_id).await?;
+    }
+
     Ok(deleted)
+}
+
+fn map_hard_delete_session_error(error: String) -> (StatusCode, Json<ErrorResponse>) {
+    if error.starts_with(SESSION_DELETE_OWNER_MISMATCH_PREFIX) {
+        return error_response(
+            StatusCode::CONFLICT,
+            "Session ownership is inconsistent; deletion blocked",
+        );
+    }
+    internal_error(error)
 }
 
 #[derive(Clone, Debug)]

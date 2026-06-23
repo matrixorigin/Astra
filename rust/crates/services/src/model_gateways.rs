@@ -15,6 +15,9 @@ use astra_core::{
     is_duplicate_key_error,
 };
 
+const MODEL_GATEWAY_SELECT_COLS: &str =
+    "id, resolve_url, model_protocol, status, metadata_json, created_at, updated_at, disabled_at";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelProtocol {
@@ -361,7 +364,8 @@ async fn load_gateway_row(
     pool: &sqlx::Pool<MySql>,
     id: &str,
 ) -> Result<Option<ModelGatewayRecord>, (StatusCode, Json<ErrorResponse>)> {
-    let row = query("SELECT * FROM model_gateways WHERE id = ?")
+    let sql = format!("SELECT {MODEL_GATEWAY_SELECT_COLS} FROM model_gateways WHERE id = ?");
+    let row = query(&sql)
         .bind(id)
         .fetch_optional(pool)
         .await

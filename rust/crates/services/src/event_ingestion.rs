@@ -762,9 +762,10 @@ impl EventIngestionWorker {
                 .get(session_id)
                 .copied()
                 .ok_or_else(|| format!("missing user_id for session {session_id}"))?;
-            let event_count = crate::storage::load_agent_event_count(&mut *tx, session_id)
-                .await
-                .map_err(|e| format!("event_count load for {session_id}: {e}"))?;
+            let event_count =
+                crate::storage::load_agent_event_count_for_user(&mut *tx, session_id, user_id)
+                    .await
+                    .map_err(|e| format!("event_count load for {session_id}: {e}"))?;
             crate::storage::upsert_agent_session_event_count(
                 &mut *tx,
                 session_id,
@@ -780,9 +781,10 @@ impl EventIngestionWorker {
             if event.event_type == "session_end" {
                 sqlx::query(
                     "UPDATE agent_sessions SET status = 'ended', ended_at = NOW() \
-                     WHERE session_id = ? AND status != 'ended'",
+                     WHERE session_id = ? AND user_id = ? AND status != 'ended'",
                 )
                 .bind(&event.session_id)
+                .bind(&event.user_id)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| format!("session close for {}: {e}", event.session_id))?;

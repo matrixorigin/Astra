@@ -1917,7 +1917,7 @@ async fn reconcile_session_event_count(
     session_id: &str,
     user_id: &str,
 ) -> Result<(), String> {
-    let event_count = crate::storage::load_agent_event_count(pool, session_id)
+    let event_count = crate::storage::load_agent_event_count_for_user(pool, session_id, user_id)
         .await
         .map_err(|e| format!("reconcile_session_event_count load: {e}"))?;
     crate::storage::upsert_agent_session_event_count(pool, session_id, user_id, event_count)

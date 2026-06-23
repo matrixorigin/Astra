@@ -8,6 +8,7 @@ pub trait TurnSessionActivityWriter: Send + Sync {
     async fn update_session_activity(
         &self,
         session_id: &str,
+        user_id: &str,
         plan: SessionActivityUpdatePlan,
     ) -> Result<(), String>;
 }
