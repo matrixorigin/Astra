@@ -90,7 +90,7 @@ describe('scenarios / tool loop', () => {
     sse.close();
     expect(seq).toEqual(['text_delta', 'tool_call_start', 'tool_call_end', 'turn_complete']);
 
-    await client.postToolResult({ request_id: 'r1', status: 'ok', output: 'out' });
+    await client.postToolResult({ request_id: 'r1', status: 'completed', output: 'out' });
     const toolUrl = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls[1][0] as string;
     expect(toolUrl).toContain('/tools/result');
   });

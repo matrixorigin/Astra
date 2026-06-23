@@ -255,6 +255,41 @@ describe('work surface reducer', () => {
     });
   });
 
+  it('does not treat blank error_kind as a tool failure', () => {
+    const state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
+      type: 'tool_call_end',
+      call_id: 'call-blank-kind',
+      tool: 'bash',
+      status: 'done',
+      error_kind: '',
+      result: 'ok',
+    });
+
+    expect(state.tools[0]).toMatchObject({
+      callId: 'call-blank-kind',
+      status: 'done',
+      errorKind: undefined,
+      result: 'ok',
+    });
+  });
+
+  it('does not let skipped hint override explicit done status', () => {
+    const state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
+      type: 'tool_call_end',
+      call_id: 'call-done',
+      tool: 'bash',
+      status: 'done',
+      skipped: true,
+      result: 'ok',
+    });
+
+    expect(state.tools[0]).toMatchObject({
+      callId: 'call-done',
+      status: 'done',
+      result: 'ok',
+    });
+  });
+
   it('projects workspace and executor bindings onto live tool cards', () => {
     let state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
       type: 'workspace_bound',

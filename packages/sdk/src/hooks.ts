@@ -13,8 +13,9 @@ import type {
 import { AstraClient } from "./client";
 import {
   extractBlockedReason,
-  extractEventStatus,
+  planStepResultStatus,
   projectRunWaitingState,
+  toolTerminalStatus,
 } from "./lifecycle-utils";
 
 // ─── useAstraChat ──────────────────────────────────────────────────
@@ -115,36 +116,6 @@ function executionFieldsFromEvent(event: StreamEvent): Partial<ToolCall> {
   if (source.blocked !== undefined) fields.blocked = source.blocked;
   if (source.duration_ms !== undefined) fields.durationMs = source.duration_ms;
   return fields;
-}
-
-/** Shared: resolve a stream event's tool terminal status with a consistent
- *  priority: error → skipped → done. Exported for use by both SDK hooks
- *  and web work-surface. */
-export function toolTerminalStatus(event: StreamEvent): ToolCall["status"] {
-  const e = event as Record<string, unknown>;
-
-  // Error conditions take priority over everything else
-  const hasError =
-    e.success === false ||
-    typeof e.error_kind === "string" ||
-    e.type === "tool_transport_failed";
-  if (hasError) return "error";
-
-  const rawStatus = extractEventStatus(event);
-
-  // Then check explicit error/failure status strings
-  if (
-    rawStatus === "error" ||
-    rawStatus === "failed" ||
-    rawStatus === "timed_out"
-  ) {
-    return "error";
-  }
-
-  // skipped is a protective dedup status, not an error
-  if (rawStatus === "skipped" || e.skipped === true) return "skipped";
-
-  return "done";
 }
 
 function compactToolCall(call: ToolCall): ToolCall {
@@ -697,9 +668,7 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
                       s.id === (event.subtask_id ?? event.step)
                         ? {
                             ...s,
-                            status: (event.result === "error"
-                              ? "error"
-                              : "done") as "done" | "error",
+                            status: planStepResultStatus(event.result),
                           }
                         : s,
                     ),
@@ -855,6 +824,22 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
   const stop = useCallback(() => {
     streamGenerationRef.current += 1;
     controllerRef.current?.abort();
+    toolCallMapRef.current = new Map(
+      Array.from(toolCallMapRef.current.entries()).map(([callId, call]) => [
+        callId,
+        call.status === "running"
+          ? compactToolCall({
+              ...call,
+              status: "cancelled",
+              finishedAt: call.finishedAt ?? Date.now(),
+            })
+          : call,
+      ]),
+    );
+    dispatch({
+      type: "SET_TOOL_CALLS",
+      toolCalls: Array.from(toolCallMapRef.current.values()),
+    });
     dispatch({ type: "SET_STREAMING", isStreaming: false });
     dispatch({ type: "SET_RUN_STATUS", status: "cancelled", waitingFor: null });
     dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });

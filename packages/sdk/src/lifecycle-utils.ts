@@ -14,7 +14,7 @@
  *   TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE = "workspace_executor_unavailable"
  */
 
-import type { StreamEvent } from "./types";
+import type { ToolStatus } from "./types";
 
 export const EXECUTION_BOUNDARY_WAIT_REASONS = new Set([
   "executor_offline",
@@ -27,18 +27,92 @@ export function isExecutionBoundaryWait(reason: string): boolean {
   return EXECUTION_BOUNDARY_WAIT_REASONS.has(reason);
 }
 
-/**
- * Extract a normalized status string from a stream event.
- *
- * Only the direct `status` field on the event is authoritative. Tool result
- * text is output payload and is not parsed for metadata.
- */
-export function extractEventStatus(event: StreamEvent): string | undefined {
-  const source = event as Record<string, unknown>;
-  if (typeof source.status === "string" && source.status.length > 0) {
-    return source.status.trim().toLowerCase();
+export type ToolTerminalStatusEvent = {
+  type?: string;
+  status?: unknown;
+  success?: boolean;
+  error_kind?: string | null;
+  reason?: string | null;
+  cancelled?: boolean;
+  skipped?: boolean;
+};
+
+export function normalizeToolStatus(status: unknown): ToolStatus | undefined {
+  if (typeof status !== "string") return undefined;
+  switch (status.trim().toLowerCase()) {
+    case "done":
+    case "completed":
+      return "done";
+    case "error":
+    case "failed":
+    case "timed_out":
+      return "error";
+    case "cancelled":
+    case "canceled":
+      return "cancelled";
+    case "skipped":
+      return "skipped";
+    default:
+      return undefined;
   }
-  return undefined;
+}
+
+export function toolEventIsCancelled(event: ToolTerminalStatusEvent): boolean {
+  return (
+    event.cancelled === true ||
+    normalizeToolStatus(event.status) === "cancelled" ||
+    normalizeReason(event.error_kind) === "cancelled" ||
+    normalizeReason(event.reason) === "cancelled"
+  );
+}
+
+export function toolTerminalStatus(
+  event: ToolTerminalStatusEvent,
+): ToolStatus {
+  const rawStatus = normalizeToolStatus(event.status);
+
+  if (rawStatus === "cancelled" || toolEventIsCancelled(event)) {
+    return "cancelled";
+  }
+  if (rawStatus === "skipped") {
+    return "skipped";
+  }
+
+  const hasFailure =
+    event.success === false ||
+    nonEmptyString(event.error_kind) ||
+    event.type === "tool_transport_failed";
+  if (hasFailure) {
+    return "error";
+  }
+
+  if (rawStatus === "error") {
+    return "error";
+  }
+  if (rawStatus === "done") {
+    return "done";
+  }
+
+  return event.skipped === true ? "skipped" : "done";
+}
+
+export function planStepResultStatus(result: unknown): "done" | "error" {
+  const normalized = normalizeReason(result);
+  return normalized === "error" ||
+    normalized === "failed" ||
+    normalized === "timed_out"
+    ? "error"
+    : "done";
+}
+
+function nonEmptyString(value: unknown): boolean {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function normalizeReason(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim().toLowerCase()
+    : undefined;
 }
 
 /**

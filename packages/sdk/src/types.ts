@@ -56,6 +56,16 @@ export type StreamEventType =
   | "tool_output_delta"
   | "tool_execution_completed";
 
+export type ToolEventStatus =
+  | "running"
+  | "done"
+  | "completed"
+  | "error"
+  | "failed"
+  | "timed_out"
+  | "cancelled"
+  | "skipped";
+
 export type SessionInfoEvent = {
   type: "session_info";
   session_id: string;
@@ -217,7 +227,7 @@ export type ToolCallEndEvent = {
   type: "tool_call_end";
   call_id: string;
   result?: string;
-  status?: string;
+  status?: ToolEventStatus;
   success?: boolean;
   skipped?: boolean;
   duration_ms?: number;
@@ -440,7 +450,7 @@ export type ToolTransportCompletedEvent = {
   call_id: string;
   tool?: string;
   result?: unknown;
-  status?: string;
+  status?: ToolEventStatus;
   success?: boolean;
   skipped?: boolean;
   duration_ms?: number;
@@ -451,10 +461,12 @@ export type ToolTransportFailedEvent = {
   call_id: string;
   tool?: string;
   error?: string;
-  status?: string;
+  status?: Exclude<
+    ToolEventStatus,
+    "running" | "done" | "completed" | "skipped"
+  >;
   error_kind?: string;
   blocked?: boolean;
-  skipped?: boolean;
   success?: false;
   duration_ms?: number;
 } & ExecutionBindingFields;
@@ -1325,7 +1337,7 @@ export type EdgeStatusResponse = {
 
 export type ToolResultRequestBody = {
   request_id: string;
-  status: string;
+  status: "completed" | "failed" | "skipped";
   output?: string;
   duration_ms?: number;
 };

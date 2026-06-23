@@ -1,5 +1,10 @@
-import type { WorkspaceBinding, ExecutorBinding, ToolStatus } from "@astra/sdk";
-import { extractEventStatus } from "@astra/sdk";
+import type {
+  WorkspaceBinding,
+  ExecutorBinding,
+  ToolStatus,
+  ToolTerminalStatusEvent,
+} from "@astra/sdk";
+import { toolEventIsCancelled, toolTerminalStatus } from "@astra/sdk";
 import {
   blockedRunMessage,
   runWaitingStatusMessage,
@@ -609,12 +614,10 @@ function finishToolTransport(
 ): WorkSurfaceState {
   const callId = stringField(event, "call_id");
   if (!callId) return state;
-  const isFailure =
-    event.type === "tool_transport_failed" || event.success === false;
   const result = stringifyMaybe(event.error ?? event.result);
   const durationMs = numberField(event, "duration_ms");
   const timestamp = timestampFromEvent(event);
-  const status = terminalToolStatus(event, isFailure);
+  const status = toolTerminalStatus(terminalStatusEvent(event));
   const tools = capToolSurfaceItems(
     upsertList(state.tools, callId, "callId", (existing) => ({
       ...existing,
@@ -648,7 +651,7 @@ function finishToolCall(
   const callId = stringField(event, "call_id");
   if (!callId) return state;
   const result = stringifyMaybe(event.result);
-  const status = terminalToolStatus(event, event.success === false);
+  const status = toolTerminalStatus(terminalStatusEvent(event));
   const durationMs = numberField(event, "duration_ms");
   const tools = capToolSurfaceItems(
     upsertList(state.tools, callId, "callId", (existing) => ({
@@ -689,37 +692,6 @@ function finishToolCall(
     event,
   );
   return applyAgentWaitingFromToolEvent(next, event);
-}
-
-function terminalToolStatus(
-  event: Record<string, unknown>,
-  isFailure: boolean,
-): ToolSurfaceItem["status"] {
-  // A user cancellation is terminal, but it is not a tool failure.
-  if (eventIsCancelled(event)) {
-    return "cancelled";
-  }
-
-  // Error conditions take priority after explicit cancellations.
-  if (isFailure) return "error";
-
-  const rawStatus = extractEventStatus(
-    event as Parameters<typeof extractEventStatus>[0],
-  );
-  if (
-    rawStatus === "error" ||
-    rawStatus === "failed" ||
-    rawStatus === "timed_out"
-  ) {
-    return "error";
-  }
-
-  // Skipped is a protective dedup status, not an error
-  if (rawStatus === "skipped" || booleanField(event, "skipped") === true) {
-    return "skipped";
-  }
-
-  return "done";
 }
 
 function upsertAgent(
@@ -1193,11 +1165,21 @@ function defaultRunFinishedToolMessage(runStatus: string) {
 }
 
 function eventIsCancelled(event: Record<string, unknown>) {
-  return (
-    booleanField(event, "cancelled") === true ||
-    stringField(event, "error_kind") === "cancelled" ||
-    stringField(event, "reason") === "cancelled"
-  );
+  return toolEventIsCancelled(terminalStatusEvent(event));
+}
+
+function terminalStatusEvent(
+  event: Record<string, unknown>,
+): ToolTerminalStatusEvent {
+  return {
+    type: stringField(event, "type"),
+    status: stringField(event, "status"),
+    success: booleanField(event, "success"),
+    error_kind: stringField(event, "error_kind") ?? null,
+    reason: stringField(event, "reason") ?? null,
+    cancelled: booleanField(event, "cancelled"),
+    skipped: booleanField(event, "skipped"),
+  };
 }
 
 function isTerminalRunStatus(status: string) {
