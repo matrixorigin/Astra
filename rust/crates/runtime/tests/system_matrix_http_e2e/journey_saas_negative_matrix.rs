@@ -705,6 +705,7 @@ pub async fn run_saas_edge_tool_result_success_path() {
     let payload = json!({
         "agent_id": "saas-edge-callback-agent",
         "session_id": ctx.session_id,
+        "selected_model": selected_model(seeded_model_name(ctx)),
         "messages": [{ "role": "user", "content": "read saas probe file" }],
         "edge_tools": [{
             "type": "function",

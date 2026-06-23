@@ -1540,6 +1540,7 @@ async fn run_bridge_failure_session_artifact_latest_and_download_routes(
     let payload = json!({
         "agent_id": agent_id,
         "session_id": &session_id,
+        "selected_model": seeded_selected_model(ctx),
         "messages": [{ "role": "user", "content": user_message }],
         "test_llm_stream_blocks": stream_blocks
     });
@@ -3023,6 +3024,7 @@ pub async fn run_bridge_tail_parse_error_artifact_preserves_partial_state_routes
     let payload = json!({
         "agent_id": "system-matrix-bridge-tail-parse-artifact",
         "session_id": &session_id,
+        "selected_model": seeded_selected_model(ctx),
         "messages": [{ "role": "user", "content": "trigger a bridge tail parse failure after partial state" }],
         "test_llm_stream_blocks": [
             format!("data: {{\"type\":\"text_delta\",\"content\":\"{partial_text}\"}}\n\n"),
@@ -3199,7 +3201,7 @@ pub async fn run_bridge_transport_failure_session_artifact_latest_and_download_r
     let payload = json!({
         "agent_id": "system-matrix-bridge-transport-artifact",
         "session_id": &session_id,
-        "model": model_name,
+        "selected_model": selected_model(model_name.clone()),
         "messages": [{ "role": "user", "content": "trigger a bridge transport failure after partial output" }]
     });
     let (status, body) = chat_turn_full(app, auth, payload).await;
@@ -3334,7 +3336,7 @@ pub async fn run_bridge_client_disconnect_session_artifact_latest_and_download_r
     let request_body = json!({
         "agent_id": "system-matrix-bridge-client-disconnect",
         "session_id": &session_id,
-        "model": model_name,
+        "selected_model": selected_model(model_name.clone()),
         "messages": [{ "role": "user", "content": "trigger a bridge client disconnect after partial output" }]
     })
     .to_string();
@@ -3493,7 +3495,7 @@ pub async fn run_bridge_idle_failure_session_artifact_latest_and_download_routes
     let payload = json!({
         "agent_id": "system-matrix-bridge-idle-artifact",
         "session_id": &session_id,
-        "model": model_name,
+        "selected_model": selected_model(model_name.clone()),
         "messages": [{ "role": "user", "content": "trigger a bridge idle failure after partial output" }]
     });
     let (status, body) = chat_turn_full(app, auth, payload).await;
@@ -3627,7 +3629,7 @@ pub async fn run_bridge_rate_limit_failure_session_artifact_latest_and_download_
     let payload = json!({
         "agent_id": "system-matrix-bridge-rate-limit-artifact",
         "session_id": &session_id,
-        "model": model_name,
+        "selected_model": selected_model(model_name.clone()),
         "messages": [{ "role": "user", "content": "trigger repeated bridge rate limits" }]
     });
     let (status, body) = chat_turn_full(app, auth, payload.clone()).await;
@@ -3768,7 +3770,7 @@ pub async fn run_bridge_rate_limit_retry_success_session_artifact_latest_and_dow
     let payload = json!({
         "agent_id": "system-matrix-bridge-rate-limit-retry-success",
         "session_id": &session_id,
-        "model": model_name,
+        "selected_model": selected_model(model_name.clone()),
         "messages": [{ "role": "user", "content": "trigger one bridge rate limit and then recover" }]
     });
     let (status, body) = chat_turn_full(app, auth, payload).await;
@@ -3897,7 +3899,7 @@ pub async fn run_bridge_tool_call_block_parse_recovery_preserves_arguments_route
     let payload = json!({
         "agent_id": "system-matrix-bridge-tool-call-block-parse-recovery",
         "session_id": &session_id,
-        "model": model_name,
+        "selected_model": selected_model(model_name.clone()),
         "messages": [{ "role": "user", "content": "trigger a bridge tool-call block parse failure and recover with full arguments" }]
     });
     let (status, body) = chat_turn_full(app, auth, payload).await;

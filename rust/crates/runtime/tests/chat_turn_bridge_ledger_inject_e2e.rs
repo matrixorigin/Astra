@@ -244,6 +244,7 @@ async fn chat_turn_tool_request_tools_result_ledger_injects_before_second_round(
     // the tool or proceed to round 2.  The tool_calls appear in turn_complete.
     let payload = json!({
         "agent_id": "ledger-e2e-agent",
+        "selected_model": { "model": "mock-model" },
         "messages": [{ "role": "user", "content": "read README" }],
         "edge_tools": [read_file_tool],
         "test_llm_rounds": [

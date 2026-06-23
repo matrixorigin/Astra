@@ -11,7 +11,8 @@ use tower::util::ServiceExt;
 use super::harness::{
     E2eAuthMode, MatrixE2eCtx, cleanup_edge_registry, cleanup_session_data, delete_json,
     delete_no_content, get_json, post_empty, post_json, post_json_with_headers, put_json,
-    row_get_opt_i64, row_get_opt_str, row_get_str, wait_for_agent_event_types,
+    row_get_opt_i64, row_get_opt_str, row_get_str, seeded_selected_model,
+    wait_for_agent_event_types,
 };
 
 async fn run_tool_backed_chat_turn(
@@ -19,6 +20,7 @@ async fn run_tool_backed_chat_turn(
     auth_header: &str,
     session_id: &str,
     agent_id: &str,
+    selected_model: serde_json::Value,
     test_secret: &str,
 ) -> String {
     let read_file_tool = json!({
@@ -36,6 +38,7 @@ async fn run_tool_backed_chat_turn(
     let payload = json!({
         "agent_id": agent_id,
         "session_id": session_id,
+        "selected_model": selected_model,
         "messages": [{ "role": "user", "content": "read README through a tool" }],
         "edge_tools": [read_file_tool],
         "test_llm_rounds": [
@@ -1106,6 +1109,7 @@ pub async fn run_product_matrix_full_journey(
     let chat_body = json!({
         "agent_id": agent_id,
         "session_id": session_id,
+        "selected_model": seeded_selected_model(ctx),
         "messages": [{ "role": "user", "content": "matrix journey ping" }],
         "edge_tools": [],
         "test_llm_rounds": [{
@@ -1265,6 +1269,7 @@ pub async fn run_product_matrix_full_journey(
         auth_header.as_str(),
         &session_id,
         &agent_id,
+        seeded_selected_model(ctx),
         &test_secret,
     )
     .await;

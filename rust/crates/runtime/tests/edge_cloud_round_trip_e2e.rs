@@ -226,7 +226,16 @@ fn build_app_with_capture(capture: Capture) -> Router {
     build_app(state)
 }
 
+fn bridge_payload(mut payload: Value) -> Value {
+    if let Some(obj) = payload.as_object_mut() {
+        obj.entry("selected_model")
+            .or_insert_with(|| json!({ "model": "mock-model" }));
+    }
+    payload
+}
+
 async fn chat_turn(app: &Router, payload: Value) -> (StatusCode, Vec<u8>) {
+    let payload = bridge_payload(payload);
     let req = Request::builder()
         .method("POST")
         .uri("/chat/turn")

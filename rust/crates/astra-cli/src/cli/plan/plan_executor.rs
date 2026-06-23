@@ -2104,7 +2104,7 @@ mod tests {
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             token: String::new(),
             profile: None,
-            model: None,
+            model: Some("mock-model".into()),
             cli_context: crate::cli::cli_config::cli_context::CliContext::default(),
             plan: TaskPlan::default(),
             plan_goal: None,

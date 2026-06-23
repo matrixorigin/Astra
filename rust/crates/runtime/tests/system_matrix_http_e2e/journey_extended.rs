@@ -394,6 +394,7 @@ pub async fn run_duplicate_tool_result_is_idempotent() {
     let payload = json!({
         "agent_id": "system-matrix-dup-tool-agent",
         "session_id": ctx.session_id,
+        "selected_model": seeded_selected_model(ctx),
         "messages": [{ "role": "user", "content": "read the duplicate path" }],
         "edge_tools": [{
             "type": "function",
@@ -566,6 +567,7 @@ pub async fn run_chat_turn_partial_batch_failure() {
     let payload = json!({
         "agent_id": "system-matrix-partial-batch-agent",
         "session_id": ctx.session_id,
+        "selected_model": seeded_selected_model(ctx),
         "messages": [{ "role": "user", "content": "read two files and continue even if one fails" }],
         "edge_tools": [{
             "type": "function",
@@ -732,6 +734,7 @@ pub async fn run_chat_turn_out_of_order_tool_results() {
     let payload = json!({
         "agent_id": "system-matrix-race-agent",
         "session_id": ctx.session_id,
+        "selected_model": seeded_selected_model(ctx),
         "messages": [{ "role": "user", "content": "read two files even if callbacks arrive out of order" }],
         "edge_tools": [{
             "type": "function",
@@ -899,6 +902,7 @@ pub async fn run_same_session_concurrent_turns_isolated() {
     let payload_a = json!({
         "agent_id": "system-matrix-overlap-agent",
         "session_id": session_id,
+        "selected_model": seeded_selected_model(ctx),
         "messages": [{ "role": "user", "content": "same-session overlap request A" }],
         "test_llm_rounds": [{
             "full_text": "Overlap response A"
@@ -907,6 +911,7 @@ pub async fn run_same_session_concurrent_turns_isolated() {
     let payload_b = json!({
         "agent_id": "system-matrix-overlap-agent",
         "session_id": ctx.session_id,
+        "selected_model": seeded_selected_model(ctx),
         "messages": [{ "role": "user", "content": "same-session overlap request B" }],
         "test_llm_rounds": [{
             "full_text": "Overlap response B"
@@ -1034,6 +1039,7 @@ pub async fn run_same_session_waiting_turn_overlap_isolated() {
     let tool_turn_payload = json!({
         "agent_id": "system-matrix-overlap-agent",
         "session_id": ctx.session_id,
+        "selected_model": seeded_selected_model(ctx),
         "messages": [{ "role": "user", "content": "waiting overlap tool turn" }],
         "edge_tools": [{
             "type": "function",
@@ -1138,6 +1144,7 @@ pub async fn run_same_session_waiting_turn_overlap_isolated() {
                 json!({
                     "agent_id": "system-matrix-overlap-agent",
                     "session_id": ctx.session_id,
+                    "selected_model": seeded_selected_model(ctx),
                     "messages": [{ "role": "user", "content": "waiting overlap plain turn" }],
                     "test_llm_rounds": [{
                         "full_text": "Waiting overlap plain turn finished."

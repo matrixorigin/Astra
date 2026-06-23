@@ -2482,8 +2482,8 @@ impl AgenticRunLifecycleService {
         let selected_model = selected_model.ok_or_else(|| {
             error_response_coded(
                 StatusCode::BAD_REQUEST,
-                "selected_model is required for /chat/stream",
-                "selected_model_missing",
+                astra_core::model_override::MISSING_MODEL_SELECTION_MESSAGE,
+                "missing_model_selection",
             )
         })?;
         exact_runtime_string(
@@ -10357,7 +10357,7 @@ mod tests {
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(
             err.1.0.error_code.as_deref(),
-            Some("selected_model_missing")
+            Some("missing_model_selection")
         );
     }
 

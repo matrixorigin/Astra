@@ -18,6 +18,55 @@ fn chat_request_json_rejection_to_error(
     error_response(StatusCode::BAD_REQUEST, detail)
 }
 
+#[allow(clippy::result_large_err)]
+fn validate_chat_request_selected_model(
+    endpoint: &'static str,
+    selected_model: Option<&astra_services::runs::SelectedModelRequest>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let Some(selected_model) = selected_model else {
+        tracing::warn!(
+            target: "astra_runtime::server::chat_handlers",
+            reason = "missing_model_selection",
+            endpoint,
+            "selected_model.model is required before chat request can create or bind a session",
+        );
+        return Err(astra_core::error_response_coded(
+            StatusCode::BAD_REQUEST,
+            astra_core::model_override::MISSING_MODEL_SELECTION_MESSAGE,
+            "missing_model_selection",
+        ));
+    };
+    validate_exact_selected_model_string(
+        "selected_model.model",
+        &selected_model.model,
+        "selected_model_invalid",
+    )?;
+    if let Some(gateway) = selected_model.gateway.as_deref() {
+        validate_exact_selected_model_string(
+            "selected_model.gateway",
+            gateway,
+            "selected_model_invalid",
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_exact_selected_model_string(
+    field: &'static str,
+    value: &str,
+    error_code: &'static str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if value.is_empty() || value.trim() != value || value.chars().any(char::is_control) {
+        return Err(astra_core::error_response_coded(
+            StatusCode::BAD_REQUEST,
+            format!("{field} must be a non-empty exact string"),
+            error_code,
+        ));
+    }
+    Ok(())
+}
+
 /// Safely convert a string to a HeaderValue, returning an SSE error response on failure.
 #[allow(clippy::result_large_err)]
 fn safe_header_value(value: &str) -> Result<HeaderValue, Response> {
@@ -155,7 +204,10 @@ fn chat_stream_bridge_fallback_payload(
     serde_json::json!({
         "session_id": chat_data.session_id.as_deref(),
         "agent_id": chat_data.agent_id.as_deref(),
-        "model": chat_data.model.as_deref(),
+        "selected_model": chat_data
+            .selected_model
+            .as_ref()
+            .map(|selected_model| serde_json::json!(selected_model)),
         "llm_token_service": chat_data
             .llm_token_service
             .as_ref()
@@ -201,6 +253,7 @@ pub(super) async fn chat_handler(
 ) -> Result<Json<ChatResponse>, (StatusCode, Json<ErrorResponse>)> {
     let Json(request) = request.map_err(chat_request_json_rejection_to_error)?;
     let user = state.auth_service.current_user(&headers).await?;
+    validate_chat_request_selected_model("/chat", request.selected_model.as_ref())?;
     let mut chat_data = chat_request_into_data(request);
     chat_data.forward_headers = collect_forward_headers(&headers);
     let resolved = resolve_or_create_chat_session(
@@ -237,6 +290,11 @@ pub(super) async fn chat_stream_handler(
         Ok(user) => user,
         Err((status, error)) => return sse_error_response_from_error(status, error.0),
     };
+    if let Err((status, error)) =
+        validate_chat_request_selected_model("/chat/stream", request.selected_model.as_ref())
+    {
+        return sse_error_response_from_error(status, error.0);
+    }
 
     let mut chat_data = chat_request_into_data(request);
     chat_data.forward_headers = collect_forward_headers(&headers);
@@ -357,7 +415,7 @@ pub(super) async fn dispatch_chat_turn_bridge(
 
     let prepared = match prepare_chat_turn_bridge_body(state, user, body, None).await {
         Ok(result) => result,
-        Err((status, error)) => return sse_error_response(status, error.0.detail),
+        Err((status, error)) => return sse_error_response_from_error(status, error.0),
     };
     if let Some(trusted_session_id) = prepared.trusted_session_id.as_deref() {
         bridge_headers.insert(
@@ -504,7 +562,7 @@ pub(super) async fn chat_route_handler(
 #[cfg(test)]
 mod tests {
     use astra_core::SkillSearchSettings;
-    use astra_services::runs::ChatRequestData;
+    use astra_services::runs::{ChatRequestData, SelectedModelRequest};
 
     use super::*;
 
@@ -581,7 +639,10 @@ mod tests {
             full_llm_capture: false,
             agent_id: Some("a1".to_string()),
             model: Some("gpt-4".to_string()),
-            selected_model: None,
+            selected_model: Some(SelectedModelRequest {
+                model: "gpt-4".to_string(),
+                gateway: None,
+            }),
             agent_binding: None,
             runtime_auth: None,
             runtime_profile: None,
@@ -616,6 +677,8 @@ mod tests {
         let obj = payload.as_object().unwrap();
         assert!(obj.contains_key("messages"));
         assert!(obj.contains_key("session_id"));
+        assert!(!obj.contains_key("model"));
+        assert_eq!(obj["selected_model"]["model"], "gpt-4");
         assert_eq!(obj["execution_budget"]["initial_turns"], 3);
         assert_eq!(obj["execution_budget"]["hard_turn_limit"], 7);
         assert_eq!(obj["explain"], true);
@@ -651,7 +714,10 @@ mod tests {
             full_llm_capture: false,
             agent_id: Some("a1".to_string()),
             model: Some("gpt-4".to_string()),
-            selected_model: None,
+            selected_model: Some(SelectedModelRequest {
+                model: "gpt-4".to_string(),
+                gateway: None,
+            }),
             agent_binding: None,
             runtime_auth: None,
             runtime_profile: None,
@@ -970,6 +1036,7 @@ mod session_resolution_tests {
 #[cfg(test)]
 mod chat_stream_bridge_fallback_tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use astra_core::error_response_coded;
     use astra_services::runs::{
@@ -1064,6 +1131,22 @@ mod chat_stream_bridge_fallback_tests {
 
     #[derive(Clone)]
     struct CaptureEnabledSessionService;
+
+    #[derive(Clone, Default)]
+    struct CountingSessionService {
+        create_calls: Arc<AtomicUsize>,
+        get_calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingSessionService {
+        fn create_calls(&self) -> usize {
+            self.create_calls.load(Ordering::SeqCst)
+        }
+
+        fn get_calls(&self) -> usize {
+            self.get_calls.load(Ordering::SeqCst)
+        }
+    }
 
     #[derive(Clone, Default)]
     struct RecordingCreateRunLifecycle {
@@ -1221,6 +1304,92 @@ mod chat_stream_bridge_fallback_tests {
                     crate::turn::llm::exchange_capture::FULL_LLM_CAPTURE_METADATA_KEY.to_string(),
                     serde_json::json!(true),
                 )]),
+                status: "active".to_string(),
+                event_count: 0,
+                created_at: "2026-01-01T00:00:00".to_string(),
+                updated_at: Some("2026-01-01T00:00:00".to_string()),
+                ended_at: None,
+            })
+        }
+
+        async fn update_session(
+            &self,
+            session_id: String,
+            user_id: String,
+            _request: SessionUpdateRequestData,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.get_session(session_id, user_id).await
+        }
+
+        async fn delete_session(
+            &self,
+            _session_id: String,
+            _user_id: String,
+        ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+            Ok(())
+        }
+
+        async fn get_session_activity(
+            &self,
+            _session_id: String,
+            _user_id: String,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
+            Ok(SessionActivityRecord {
+                session_id: String::new(),
+                activities: vec![],
+                total: 0,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl SessionService for CountingSessionService {
+        async fn create_session(
+            &self,
+            user_id: String,
+            request: SessionCreateRequestData,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.create_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(SessionRecord {
+                session_id: "s-counting-created".to_string(),
+                user_id,
+                agent_id: request.agent_id,
+                title: Some("Created".to_string()),
+                metadata: request.metadata.unwrap_or_default(),
+                status: "active".to_string(),
+                event_count: 0,
+                created_at: "2026-01-01T00:00:00".to_string(),
+                updated_at: Some("2026-01-01T00:00:00".to_string()),
+                ended_at: None,
+            })
+        }
+
+        async fn list_sessions(
+            &self,
+            _filter: SessionListFilter,
+        ) -> Result<SessionListRecord, (StatusCode, Json<ErrorResponse>)> {
+            Ok(SessionListRecord {
+                sessions: Vec::new(),
+                total: 0,
+                limit: 20,
+                offset: 0,
+            })
+        }
+
+        async fn get_session(
+            &self,
+            session_id: String,
+            user_id: String,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(SessionRecord {
+                session_id,
+                user_id,
+                agent_id: None,
+                title: Some("Existing".to_string()),
+                metadata: serde_json::Map::new(),
                 status: "active".to_string(),
                 event_count: 0,
                 created_at: "2026-01-01T00:00:00".to_string(),
@@ -1763,6 +1932,107 @@ mod chat_stream_bridge_fallback_tests {
     }
 
     #[tokio::test]
+    async fn chat_stream_missing_selected_model_fails_before_session_resolution() {
+        let sessions = CountingSessionService::default();
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_session_service(Arc::new(sessions.clone()))
+                .with_run_lifecycle_service(Arc::new(StubConfiguredLifecycle)),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat/stream")
+                    .header("authorization", "Bearer good-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"message":"hi"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body should be readable");
+        let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
+        assert!(text.contains("\"type\":\"error\""));
+        assert!(text.contains("\"error_code\":\"missing_model_selection\""));
+        assert!(!text.contains("\"type\":\"session_info\""));
+        assert_eq!(sessions.create_calls(), 0);
+        assert_eq!(sessions.get_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn chat_missing_selected_model_fails_before_session_resolution() {
+        let sessions = CountingSessionService::default();
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_session_service(Arc::new(sessions.clone()))
+                .with_run_lifecycle_service(Arc::new(StubConfiguredLifecycle)),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat")
+                    .header("authorization", "Bearer good-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"message":"hi"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body should be readable");
+        let text = String::from_utf8(body.to_vec()).expect("body should be utf8");
+        assert!(text.contains("\"error_code\":\"missing_model_selection\""));
+        assert_eq!(sessions.create_calls(), 0);
+        assert_eq!(sessions.get_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn chat_turn_missing_selected_model_returns_typed_sse_error_before_session_info() {
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_session_service(Arc::new(StubSessionService)),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat/turn")
+                    .header("authorization", "Bearer good-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body should be readable");
+        let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
+        assert!(text.contains("\"type\":\"error\""));
+        assert!(text.contains("\"error_code\":\"missing_model_selection\""));
+        assert!(!text.contains("\"type\":\"session_info\""));
+    }
+
+    #[tokio::test]
     async fn chat_stream_agent_binding_skill_discovery_error_redacts_runtime_auth_in_sse() {
         use axum::{Router, routing::post};
 
@@ -1850,7 +2120,9 @@ mod chat_stream_bridge_fallback_tests {
                     .uri("/chat/stream")
                     .header("authorization", "Bearer good-token")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"message":"hi"}"#))
+                    .body(Body::from(
+                        r#"{"message":"hi","selected_model":{"model":"demo-model"}}"#,
+                    ))
                     .expect("request should build"),
             )
             .await
@@ -1889,7 +2161,7 @@ mod chat_stream_bridge_fallback_tests {
                     .header("authorization", "Bearer good-token")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"session_id":"capture-session","message":"hi"}"#,
+                        r#"{"session_id":"capture-session","message":"hi","selected_model":{"model":"demo-model"}}"#,
                     ))
                     .expect("request should build"),
             )
@@ -1922,7 +2194,7 @@ mod chat_stream_bridge_fallback_tests {
                     .header("authorization", "Bearer good-token")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"session_id":"capture-session","message":"hi"}"#,
+                        r#"{"session_id":"capture-session","message":"hi","selected_model":{"model":"demo-model"}}"#,
                     ))
                     .expect("request should build"),
             )
@@ -1952,7 +2224,9 @@ mod chat_stream_bridge_fallback_tests {
                     .uri("/chat/stream")
                     .header("authorization", "Bearer good-token")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"message":"hi"}"#))
+                    .body(Body::from(
+                        r#"{"message":"hi","selected_model":{"model":"demo-model"}}"#,
+                    ))
                     .expect("request should build"),
             )
             .await
@@ -2022,7 +2296,9 @@ mod chat_stream_bridge_fallback_tests {
                     .uri("/chat/stream")
                     .header("authorization", "Bearer good-token")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"message":"hi"}"#))
+                    .body(Body::from(
+                        r#"{"message":"hi","selected_model":{"model":"demo-model"}}"#,
+                    ))
                     .expect("request should build"),
             )
             .await

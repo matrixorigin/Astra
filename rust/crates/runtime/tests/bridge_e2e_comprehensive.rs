@@ -370,7 +370,16 @@ fn build_test_app(cap: AllCaptures) -> Router {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+fn bridge_payload(mut payload: Value) -> Value {
+    if let Some(obj) = payload.as_object_mut() {
+        obj.entry("selected_model")
+            .or_insert_with(|| json!({ "model": "mock-model" }));
+    }
+    payload
+}
+
 async fn chat_turn(app: &Router, payload: Value) -> (StatusCode, String) {
+    let payload = bridge_payload(payload);
     let req = Request::builder()
         .method("POST")
         .uri("/chat/turn")
@@ -5246,14 +5255,15 @@ async fn sse_no_reasoning_done_without_reasoning() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Area 3: /chat/stream Integration (Bridge Fallback)
+// Area 3: /chat/stream Integration (Bridge Route)
 // ══════════════════════════════════════════════════════════════════════════════
 
 /// Helper: POST /chat/stream with bridge-e2e test secret
 async fn chat_stream(app: &Router, message: &str, extra: Value) -> (StatusCode, String) {
     let mut payload = json!({
         "message": message,
-        "agent_id": "stream-test-agent"
+        "agent_id": "stream-test-agent",
+        "selected_model": { "model": "mock-model" }
     });
     if let Some(obj) = extra.as_object() {
         for (k, v) in obj {
@@ -5281,7 +5291,7 @@ async fn chat_stream(app: &Router, message: &str, extra: Value) -> (StatusCode, 
 /// so the bridge will fall through to the real LLM path (which has no API key → error).
 /// We verify the routing works by checking we get a valid SSE response (even if it errors).
 #[tokio::test]
-async fn chat_stream_bridge_fallback_routes_to_bridge() {
+async fn chat_stream_bridge_route_emits_session_info() {
     init_env();
     let cap = AllCaptures::default();
     let app = build_test_app(cap.clone());
@@ -5298,7 +5308,7 @@ async fn chat_stream_bridge_fallback_routes_to_bridge() {
     assert_eq!(
         st,
         StatusCode::OK,
-        "bridge fallback returns 200 OK SSE envelope"
+        "bridge route returns 200 OK SSE envelope"
     );
 
     // session_info is emitted before LLM call, so it should always appear

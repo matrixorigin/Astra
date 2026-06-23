@@ -145,6 +145,13 @@ async fn run_chat_turn(
     session_id: Option<&str>,
     semantic_query_override: Option<&str>,
 ) -> TurnAttempt {
+    if let Some(failure) = model_selection_preflight_failure(
+        state.model.as_deref(),
+        session_id,
+        state.turn.saturating_add(1),
+    ) {
+        return TurnAttempt::Completed(Box::new(Err(failure)));
+    }
     prepare_turn_adaptation(state, api, token, message).await;
     let attempt = execute_stream_turn(
         state,
@@ -158,6 +165,30 @@ async fn run_chat_turn(
     .await;
     finalize_turn_adaptation(state, matches!(attempt, TurnAttempt::Interrupted(_))).await;
     attempt
+}
+
+fn model_selection_preflight_failure(
+    model: Option<&str>,
+    session_id: Option<&str>,
+    turn_index: u32,
+) -> Option<crate::TurnFailure> {
+    if astra_core::model_override::normalize_model_override(model).is_some() {
+        return None;
+    }
+    tracing::warn!(
+        target: "astra_cli::model_selection",
+        reason = "missing_model_selection",
+        session_id = ?session_id,
+        turn_index,
+        "missing concrete model selection; refusing turn before session adaptation or bridge POST"
+    );
+    Some(crate::TurnFailure {
+        error: astra_core::model_override::missing_model_selection_error().to_string(),
+        partial: crate::PartialTurnData {
+            session_id: session_id.map(str::to_string),
+            ..Default::default()
+        },
+    })
 }
 
 fn run_chat_turn_boxed<'a>(
@@ -298,12 +329,41 @@ pub(crate) async fn handle_chat_input_with_ui(
 
 #[cfg(test)]
 mod tests {
-    use super::{ShellPassthroughDecision, classify_shell_passthrough};
+    use super::{
+        ShellPassthroughDecision, classify_shell_passthrough, model_selection_preflight_failure,
+    };
 
     #[test]
     fn shell_passthrough_returns_none_for_ordinary_input() {
         assert!(classify_shell_passthrough("hello world").is_none());
         assert!(classify_shell_passthrough("/help").is_none());
+    }
+
+    #[test]
+    fn model_preflight_blocks_missing_selection_before_turn_side_effects() {
+        for missing in [None, Some(""), Some(" default ")] {
+            let failure = model_selection_preflight_failure(missing, Some("sess-missing-model"), 2)
+                .expect("missing model must fail before turn side effects");
+            let classified = astra_core::ClassifiedError::from(failure.error.clone());
+            assert_eq!(
+                classified.kind,
+                astra_core::ErrorKind::MissingModelSelection
+            );
+            assert_eq!(
+                failure.partial.session_id.as_deref(),
+                Some("sess-missing-model")
+            );
+        }
+
+        assert!(
+            model_selection_preflight_failure(
+                Some("deepseek-v4-pro-official(thinking:high)"),
+                Some("sess-ok"),
+                2,
+            )
+            .is_none(),
+            "thinking selectors are concrete model choices and must reach payload assembly"
+        );
     }
 
     #[test]

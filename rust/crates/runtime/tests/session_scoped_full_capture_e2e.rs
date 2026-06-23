@@ -378,7 +378,10 @@ async fn http_chat_propagates_session_scoped_full_capture_over_real_http() {
         .bearer_auth("test-capture-token")
         .json(&json!({
             "session_id": "capture-session",
-            "message": "hello over http"
+            "message": "hello over http",
+            "selected_model": {
+                "model": "test-model"
+            }
         }))
         .send()
         .await
