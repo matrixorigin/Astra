@@ -258,6 +258,32 @@ fn stored_artifact_from_row(
     })
 }
 
+pub(crate) async fn load_latest_json_artifact_from_pool(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    artifact_kind: &str,
+) -> Result<Option<StoredSessionArtifact>, SessionArtifactStoreError> {
+    validate_session_id(session_id)?;
+    let row = query(
+        "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
+                 content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
+                 CAST(retention_until AS CHAR) AS retention_until, status, \
+                 referenced_by_manifest_count, referenced_by_state_items_count, \
+                 referenced_by_citation_count, CAST(created_at AS CHAR) AS created_at \
+          FROM session_artifacts \
+          WHERE user_id = ? AND session_id = ? AND artifact_kind = ? \
+          ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(artifact_kind)
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref().map(stored_artifact_from_row).transpose()
+}
+
 #[async_trait]
 impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
     async fn persist_json_artifact(
@@ -355,29 +381,8 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         session_id: &str,
         artifact_kind: &str,
     ) -> Result<Option<StoredSessionArtifact>, SessionArtifactStoreError> {
-        validate_session_id(session_id)?;
         let pool = self.get_pool().await?;
-        let row = query(
-            "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
-                     content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
-                     CAST(retention_until AS CHAR) AS retention_until, status, \
-                     referenced_by_manifest_count, referenced_by_state_items_count, \
-                     referenced_by_citation_count, CAST(created_at AS CHAR) AS created_at \
-              FROM session_artifacts \
-              WHERE user_id = ? AND session_id = ? AND artifact_kind = ? \
-              ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .bind(artifact_kind)
-        .fetch_optional(&pool)
-        .await?;
-
-        let Some(row) = row else {
-            return Ok(None);
-        };
-
-        Ok(Some(stored_artifact_from_row(&row)?))
+        load_latest_json_artifact_from_pool(&pool, user_id, session_id, artifact_kind).await
     }
 
     async fn list_json_artifacts(

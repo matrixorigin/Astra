@@ -492,35 +492,25 @@ impl HybridRestoreService {
         user_id: &str,
         session_id: &str,
     ) -> Result<Option<CloudWorkspaceArtifact>, String> {
-        let pool = match &self.pool {
-            Some(p) => p,
+        let pool = match self.pool.as_ref() {
+            Some(pool) => pool,
             None => return Ok(None),
         };
-        crate::session_journal::validate_session_id(session_id)?;
-        use sqlx::Row;
-
-        let row = sqlx::query(
-            "SELECT content_json \
-             FROM session_artifacts \
-             WHERE session_id = ? AND user_id = ? AND artifact_kind = ? \
-             ORDER BY created_at DESC LIMIT 1",
+        let artifact = crate::session_artifact_store::load_latest_json_artifact_from_pool(
+            pool,
+            user_id,
+            session_id,
+            super::session_workspace::WORKSPACE_METADATA_ARTIFACT_KIND,
         )
-        .bind(session_id)
-        .bind(user_id)
-        .bind(super::session_workspace::WORKSPACE_METADATA_ARTIFACT_KIND)
-        .fetch_optional(pool)
         .await
         .map_err(|e| format!("restore_cloud_workspace: {e}"))?;
 
-        let Some(row) = row else {
+        let Some(artifact) = artifact else {
             return Ok(None);
         };
 
-        let metadata_json: String = row
-            .try_get("content_json")
-            .map_err(|e| format!("restore_cloud_workspace: {e}"))?;
         let metadata =
-            serde_json::from_str::<super::session_workspace::WorkspaceMetadata>(&metadata_json)
+            serde_json::from_value::<super::session_workspace::WorkspaceMetadata>(artifact.content)
                 .map_err(|e| format!("restore_cloud_workspace: {e}"))?;
 
         Ok(Some(CloudWorkspaceArtifact { metadata }))
@@ -531,36 +521,26 @@ impl HybridRestoreService {
         user_id: &str,
         session_id: &str,
     ) -> Result<Option<astra_core::composite_snapshot::CompositeSnapshotIndex>, String> {
-        let pool = match &self.pool {
+        let pool = match self.pool.as_ref() {
             Some(pool) => pool,
             None => return Ok(None),
         };
-        crate::session_journal::validate_session_id(session_id)?;
-        use sqlx::Row;
-
-        let row = sqlx::query(
-            "SELECT content_json \
-             FROM session_artifacts \
-             WHERE session_id = ? AND user_id = ? AND artifact_kind = ? \
-             ORDER BY created_at DESC LIMIT 1",
+        let artifact = crate::session_artifact_store::load_latest_json_artifact_from_pool(
+            pool,
+            user_id,
+            session_id,
+            COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND,
         )
-        .bind(session_id)
-        .bind(user_id)
-        .bind(COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND)
-        .fetch_optional(pool)
         .await
         .map_err(|error| format!("restore_cloud_composite_snapshot_index: {error}"))?;
 
-        let Some(row) = row else {
+        let Some(artifact) = artifact else {
             return Ok(None);
         };
 
-        let index_json: String = row
-            .try_get("content_json")
-            .map_err(|error| format!("restore_cloud_composite_snapshot_index: {error}"))?;
-        let mut index = serde_json::from_str::<
+        let mut index = serde_json::from_value::<
             astra_core::composite_snapshot::CompositeSnapshotIndex,
-        >(&index_json)
+        >(artifact.content)
         .map_err(|error| format!("restore_cloud_composite_snapshot_index: {error}"))?;
         index.normalize_versions();
         Ok(Some(index))

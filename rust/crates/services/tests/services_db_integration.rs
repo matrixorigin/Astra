@@ -551,6 +551,27 @@ async fn cleanup_restore_fixture(pool: &sqlx::Pool<sqlx::MySql>, session_ids: &[
     }
 }
 
+async fn force_session_artifacts_created_at(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    artifact_ids: &[String],
+    created_at: &str,
+) {
+    for artifact_id in artifact_ids {
+        let result =
+            sqlx::query("UPDATE session_artifacts SET created_at = ? WHERE artifact_id = ?")
+                .bind(created_at)
+                .bind(artifact_id)
+                .execute(pool)
+                .await
+                .expect("force tied artifact timestamp");
+        assert_eq!(
+            result.rows_affected(),
+            1,
+            "test fixture must update exactly one artifact timestamp for {artifact_id}"
+        );
+    }
+}
+
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn session_artifact_latest_and_list_use_stable_tiebreaker_for_tied_timestamps() {
@@ -2172,21 +2193,21 @@ async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matr
     .await
     .expect("insert owner session for remote workspace restore");
 
-    let mut workspace = WorkspaceMetadata::with_context(
+    let mut older_workspace = WorkspaceMetadata::with_context(
         &session_id,
         "gpt-5.4",
         "/srv/remote-agent",
-        Some("feature/remote-workspace"),
+        Some("feature/remote-workspace-old"),
     );
-    workspace.record_turn(120, 45, 0, 0);
-    workspace.plan_goal = Some("prove remote workspace restore".into());
-    workspace.plan_execution_rounds = 3;
-    workspace.last_context_trace = Some(ContextTraceSignal {
-        turn_id: "turn-remote-workspace".into(),
+    older_workspace.record_turn(120, 45, 0, 0);
+    older_workspace.plan_goal = Some("prove old remote workspace restore".into());
+    older_workspace.plan_execution_rounds = 2;
+    older_workspace.last_context_trace = Some(ContextTraceSignal {
+        turn_id: "turn-remote-workspace-old".into(),
         captured_at: Some("2026-09-07T10:00:00Z".into()),
         tool_selection: Some(ContextTraceToolSelection {
             tools_available: 12,
-            selected_tools: vec!["bash".into(), "rg".into()],
+            selected_tools: vec!["bash".into()],
             selection_scope: "latest_round".into(),
             rejected_tools: 0,
             strategy: "artifact-restore".into(),
@@ -2197,27 +2218,76 @@ async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matr
         history: None,
         budget: None,
         timing: None,
-        explanations: vec!["restored from remote workspace artifact".into()],
+        explanations: vec!["restored from old remote workspace artifact".into()],
+    });
+
+    let mut newer_workspace = WorkspaceMetadata::with_context(
+        &session_id,
+        "gpt-5.5",
+        "/srv/remote-agent",
+        Some("feature/remote-workspace-new"),
+    );
+    newer_workspace.record_turn(120, 45, 0, 0);
+    newer_workspace.record_turn(240, 90, 0, 0);
+    newer_workspace.plan_goal = Some("prove newest remote workspace restore".into());
+    newer_workspace.plan_execution_rounds = 4;
+    newer_workspace.last_context_trace = Some(ContextTraceSignal {
+        turn_id: "turn-remote-workspace-new".into(),
+        captured_at: Some("2026-09-07T10:00:00Z".into()),
+        tool_selection: Some(ContextTraceToolSelection {
+            tools_available: 12,
+            selected_tools: vec!["git".into(), "rg".into()],
+            selection_scope: "latest_round".into(),
+            rejected_tools: 0,
+            strategy: "artifact-restore-newest".into(),
+            confidence: 0.99,
+            latency_ms: 3,
+        }),
+        memory: None,
+        history: None,
+        budget: None,
+        timing: None,
+        explanations: vec!["restored from newest remote workspace artifact".into()],
     });
 
     let artifact_store = DatabaseSessionArtifactStore::new(settings.clone()).with_pool(shared);
-    let stored_artifact = persist_remote_workspace(&workspace, &user_id, &artifact_store)
+    let older_artifact = persist_remote_workspace(&older_workspace, &user_id, &artifact_store)
         .await
-        .expect("persist remote workspace");
-    assert_eq!(stored_artifact.session_id, session_id);
-    assert_eq!(stored_artifact.user_id, user_id);
+        .expect("persist old remote workspace");
+    let newer_artifact = persist_remote_workspace(&newer_workspace, &user_id, &artifact_store)
+        .await
+        .expect("persist newest remote workspace");
+    force_session_artifacts_created_at(
+        &pool,
+        &[
+            older_artifact.artifact_id.clone(),
+            newer_artifact.artifact_id.clone(),
+        ],
+        "2026-09-07 10:00:00.123456",
+    )
+    .await;
+
+    let (expected_artifact, expected_workspace) =
+        if newer_artifact.artifact_id > older_artifact.artifact_id {
+            (&newer_artifact, &newer_workspace)
+        } else {
+            (&older_artifact, &older_workspace)
+        };
+
+    assert_eq!(expected_artifact.session_id, session_id);
+    assert_eq!(expected_artifact.user_id, user_id);
     assert_eq!(
-        stored_artifact.artifact_kind,
+        expected_artifact.artifact_kind,
         WORKSPACE_METADATA_ARTIFACT_KIND
     );
-    assert_eq!(stored_artifact.turn, Some(1));
+    assert_eq!(expected_artifact.turn, Some(expected_workspace.turn_count));
 
     let latest_artifact = artifact_store
         .load_latest_json_artifact(&user_id, &session_id, WORKSPACE_METADATA_ARTIFACT_KIND)
         .await
         .expect("load latest remote workspace artifact")
         .expect("remote workspace artifact exists");
-    assert_eq!(latest_artifact.artifact_id, stored_artifact.artifact_id);
+    assert_eq!(latest_artifact.artifact_id, expected_artifact.artifact_id);
 
     let restore = HybridRestoreService::new(pool.clone());
     let restored = restore
@@ -2227,29 +2297,44 @@ async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matr
         .expect("session restored from remote workspace artifact");
 
     assert!(restored.restored_from_cloud);
-    assert_eq!(restored.turn_count, 1);
-    assert_eq!(restored.total_tokens_in, 120);
-    assert_eq!(restored.total_tokens_out, 45);
+    assert_eq!(restored.turn_count, expected_workspace.turn_count);
+    assert_eq!(restored.total_tokens_in, expected_workspace.total_tokens_in);
     assert_eq!(
-        restored.recent_tools,
-        vec!["bash".to_string(), "rg".to_string()]
+        restored.total_tokens_out,
+        expected_workspace.total_tokens_out
     );
+    let expected_tools = expected_workspace
+        .last_context_trace
+        .as_ref()
+        .and_then(|trace| trace.tool_selection.as_ref())
+        .map(|selection| selection.selected_tools.clone())
+        .unwrap_or_default();
+    assert_eq!(restored.recent_tools, expected_tools);
     assert_eq!(
         restored.git_branch.as_deref(),
-        Some("feature/remote-workspace")
+        expected_workspace.git_branch.as_deref()
     );
-    assert_eq!(restored.model.as_deref(), Some("gpt-5.4"));
+    assert_eq!(
+        restored.model.as_deref(),
+        expected_workspace.model.as_deref()
+    );
     assert_eq!(
         restored.plan_goal.as_deref(),
-        Some("prove remote workspace restore")
+        expected_workspace.plan_goal.as_deref()
     );
-    assert_eq!(restored.plan_execution_rounds, 3);
+    assert_eq!(
+        restored.plan_execution_rounds,
+        expected_workspace.plan_execution_rounds
+    );
     assert_eq!(
         restored
             .last_context_trace
             .as_ref()
             .map(|trace| trace.turn_id.as_str()),
-        Some("turn-remote-workspace")
+        expected_workspace
+            .last_context_trace
+            .as_ref()
+            .map(|trace| trace.turn_id.as_str())
     );
 
     cleanup_restore_fixture(&pool, &[session_id]).await;
@@ -2306,74 +2391,124 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
     .await
     .expect("push checkpoint");
 
-    let data_snapshot = astra_services::DataSnapshotRef {
-        snapshot_name: format!("snapshot-{session_id}"),
-        databases: vec!["app_db".into()],
-        timestamp: Some("2026-09-08T10:00:00Z".into()),
-        branch_name: Some("feature/remote-composite".into()),
+    let build_index = |label: &str, branch: &str, git_commit: &str| {
+        let data_snapshot = astra_services::DataSnapshotRef {
+            snapshot_name: format!("snapshot-{session_id}-{label}"),
+            databases: vec!["app_db".into()],
+            timestamp: Some("2026-09-08T10:00:00Z".into()),
+            branch_name: Some(branch.into()),
+        };
+        let mut composite_snapshot =
+            astra_core::composite_snapshot::CompositeSnapshotBuilder::new(&session_id, 7)
+                .label(label)
+                .session_state("000003-heavy.json")
+                .data_snapshot(data_snapshot.clone())
+                .git_commit(git_commit)
+                .workspace_state(&session_id)
+                .build();
+        let mut index = astra_services::CompositeSnapshotIndex::default();
+        index
+            .append(&mut composite_snapshot)
+            .expect("append composite snapshot");
+        (index, composite_snapshot, data_snapshot)
     };
-    let mut composite_snapshot =
-        astra_core::composite_snapshot::CompositeSnapshotBuilder::new(&session_id, 7)
-            .label("remote-composite")
-            .session_state("000003-heavy.json")
-            .data_snapshot(data_snapshot.clone())
-            .git_commit("0123456789abcdef0123456789abcdef01234567")
-            .workspace_state(&session_id)
-            .build();
-    let mut index = astra_services::CompositeSnapshotIndex::default();
-    index
-        .append(&mut composite_snapshot)
-        .expect("append composite snapshot");
+
+    let old_git_commit = "0123456789abcdef0123456789abcdef01234567";
+    let new_git_commit = "fedcba9876543210fedcba9876543210fedcba98";
+    let (old_index, old_snapshot, old_data_snapshot) = build_index(
+        "remote-composite-old",
+        "feature/remote-composite-old",
+        old_git_commit,
+    );
+    let (new_index, new_snapshot, new_data_snapshot) = build_index(
+        "remote-composite-new",
+        "feature/remote-composite-new",
+        new_git_commit,
+    );
 
     let artifact_store = DatabaseSessionArtifactStore::new(settings.clone()).with_pool(shared);
-    persist_remote_composite_snapshot_index(&session_id, &user_id, &index, &artifact_store)
-        .await
-        .expect("persist remote composite snapshot index");
-
-    let artifact_count: i64 = sqlx::query(
-        "SELECT COUNT(*) AS c FROM session_artifacts WHERE session_id = ? AND artifact_kind = ?",
+    let old_artifact =
+        persist_remote_composite_snapshot_index(&session_id, &user_id, &old_index, &artifact_store)
+            .await
+            .expect("persist old remote composite snapshot index");
+    let new_artifact =
+        persist_remote_composite_snapshot_index(&session_id, &user_id, &new_index, &artifact_store)
+            .await
+            .expect("persist newest remote composite snapshot index");
+    force_session_artifacts_created_at(
+        &pool,
+        &[
+            old_artifact.artifact_id.clone(),
+            new_artifact.artifact_id.clone(),
+        ],
+        "2026-09-08 10:00:00.123456",
     )
-    .bind(&session_id)
-    .bind(COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND)
-    .fetch_one(&pool)
-    .await
-    .expect("load composite snapshot artifact count")
-    .try_get("c")
-    .expect("decode composite snapshot artifact count");
-    assert_eq!(artifact_count, 1);
+    .await;
+
+    let (
+        expected_artifact,
+        expected_index,
+        expected_snapshot,
+        expected_data_snapshot,
+        expected_git,
+    ) = if new_artifact.artifact_id > old_artifact.artifact_id {
+        (
+            &new_artifact,
+            &new_index,
+            &new_snapshot,
+            &new_data_snapshot,
+            new_git_commit,
+        )
+    } else {
+        (
+            &old_artifact,
+            &old_index,
+            &old_snapshot,
+            &old_data_snapshot,
+            old_git_commit,
+        )
+    };
+
+    let latest_artifact = artifact_store
+        .load_latest_json_artifact(
+            &user_id,
+            &session_id,
+            COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND,
+        )
+        .await
+        .expect("load latest remote composite snapshot artifact")
+        .expect("remote composite snapshot artifact exists");
+    assert_eq!(latest_artifact.artifact_id, expected_artifact.artifact_id);
 
     let restore = HybridRestoreService::new(pool.clone());
     let listed = restore
         .list_composite_snapshots(&user_id, &session_id)
         .await
         .expect("list composite snapshots");
-    assert_eq!(listed.snapshots.len(), 1);
-    assert_eq!(listed.current_version(), 1);
+    assert_eq!(listed.snapshots.len(), expected_index.snapshots.len());
+    assert_eq!(listed.current_version(), expected_index.current_version());
     assert_eq!(
         listed.snapshots[0].snapshot_id,
-        composite_snapshot.snapshot_id
+        expected_snapshot.snapshot_id
     );
     assert_eq!(
         listed.snapshots[0].label.as_deref(),
-        Some("remote-composite")
+        expected_snapshot.label.as_deref()
     );
-    assert_eq!(listed.snapshots[0].turn, 7);
+    assert_eq!(listed.snapshots[0].turn, expected_snapshot.turn);
 
     let restored = restore
         .restore_to_composite_snapshot(
             &user_id,
             &session_id,
-            &composite_snapshot.snapshot_id,
+            &expected_snapshot.snapshot_id,
             &astra_core::composite_snapshot::RestoreSelector::default(),
         )
         .await
         .expect("restore composite snapshot")
         .expect("composite snapshot restored");
 
-    assert_eq!(
-        restored.snapshot.snapshot_id,
-        composite_snapshot.snapshot_id
-    );
+    assert_eq!(restored.snapshot.snapshot_id, expected_snapshot.snapshot_id);
     assert!(
         restored
             .restored_dimensions
@@ -2383,11 +2518,11 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
     );
     assert_eq!(
         restored.git_commit_to_checkout.as_deref(),
-        Some("0123456789abcdef0123456789abcdef01234567")
+        Some(expected_git)
     );
     assert_eq!(
         restored.data_snapshot_to_restore.as_ref(),
-        Some(&data_snapshot)
+        Some(expected_data_snapshot)
     );
 
     let session = restored.session.expect("session restored from checkpoint");
