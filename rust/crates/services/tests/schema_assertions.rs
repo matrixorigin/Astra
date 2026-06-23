@@ -707,6 +707,38 @@ async fn phase4_state_projection_schema_contract() {
     let pool = common::setup_pool().await;
     let schema = current_schema(&pool).await;
 
+    let conversation_log_columns = column_names(&pool, &schema, "conversation_log").await;
+    for expected in ["user_id", "session_id", "seq", "turn", "entry_type"] {
+        assert!(
+            conversation_log_columns
+                .iter()
+                .any(|column| column == expected),
+            "conversation_log missing {expected}"
+        );
+    }
+    assert_eq!(
+        index_columns(&pool, &schema, "conversation_log", "idx_csl_owner_snapshot").await,
+        ["user_id", "session_id", "entry_type", "seq"],
+        "CSL latest-snapshot lookup must use owner/session index"
+    );
+    assert_eq!(
+        index_columns(&pool, &schema, "conversation_log", "idx_csl_owner_turn").await,
+        ["user_id", "session_id", "turn"],
+        "CSL fork/read-by-turn lookup must use owner/session index"
+    );
+    assert!(
+        index_columns(&pool, &schema, "conversation_log", "idx_csl_snapshot")
+            .await
+            .is_empty(),
+        "conversation_log must not keep obsolete session-only snapshot index"
+    );
+    assert!(
+        index_columns(&pool, &schema, "conversation_log", "idx_csl_turn")
+            .await
+            .is_empty(),
+        "conversation_log must not keep obsolete session-only turn index"
+    );
+
     let todo_counter_columns = column_names(&pool, &schema, "session_todo_counters").await;
     for expected in ["user_id", "session_id", "next_id", "version"] {
         assert!(

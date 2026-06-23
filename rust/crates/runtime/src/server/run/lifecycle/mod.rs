@@ -1967,11 +1967,21 @@ impl AgenticRunLifecycleService {
         });
     }
 
-    fn build_csl_store(&self) -> Option<Arc<dyn astra_turn_core::conversation_log::CslStore>> {
+    fn build_csl_store(
+        &self,
+        user_id: &str,
+    ) -> Option<Arc<dyn astra_turn_core::conversation_log::CslStore>> {
         let pool = self.shared_pool.as_ref()?;
-        let store =
-            astra_turn_core::conversation_log::db_store::DbCslStore::new(self.matrixone.clone())
-                .with_pool(pool.clone());
+        let store = match astra_turn_core::conversation_log::db_store::DbCslStore::new(
+            self.matrixone.clone(),
+            user_id.to_string(),
+        ) {
+            Ok(store) => store.with_pool(pool.clone()),
+            Err(error) => {
+                tracing::warn!(%error, "CSL DB store creation failed");
+                return None;
+            }
+        };
         Some(Arc::new(store))
     }
 
@@ -1982,7 +1992,7 @@ impl AgenticRunLifecycleService {
         run_id: &str,
         loop_state: &mut AgenticLoopState,
     ) -> Option<astra_turn_core::conversation_log::manager::CslManager> {
-        let store = self.build_csl_store()?;
+        let store = self.build_csl_store(user_id)?;
         let mut mgr = match astra_turn_core::conversation_log::manager::CslManager::new(
             store,
             session_id.to_string(),

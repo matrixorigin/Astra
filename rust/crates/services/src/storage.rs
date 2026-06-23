@@ -3293,6 +3293,7 @@ pub async fn ensure_core_schema(
 
     query(
         "CREATE TABLE IF NOT EXISTS conversation_log (
+            user_id       VARCHAR(64) NOT NULL,
             session_id    VARCHAR(64) NOT NULL,
             seq           BIGINT NOT NULL,
             turn          INT NOT NULL,
@@ -3302,11 +3303,35 @@ pub async fn ensure_core_schema(
             payload       MEDIUMTEXT NOT NULL,
             created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (session_id, seq),
-            INDEX idx_csl_snapshot (session_id, entry_type, seq DESC),
-            INDEX idx_csl_turn (session_id, turn)
+            INDEX idx_csl_owner_snapshot (user_id, session_id, entry_type, seq DESC),
+            INDEX idx_csl_owner_turn (user_id, session_id, turn)
         )",
     )
     .execute(&pool)
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "conversation_log",
+        "user_id",
+        "ALTER TABLE conversation_log ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT ''",
+    )
+    .await?;
+    add_index_if_missing(
+        &pool,
+        &settings.database,
+        "conversation_log",
+        "idx_csl_owner_snapshot",
+        "ALTER TABLE conversation_log ADD INDEX idx_csl_owner_snapshot (user_id, session_id, entry_type, seq DESC)",
+    )
+    .await?;
+    add_index_if_missing(
+        &pool,
+        &settings.database,
+        "conversation_log",
+        "idx_csl_owner_turn",
+        "ALTER TABLE conversation_log ADD INDEX idx_csl_owner_turn (user_id, session_id, turn)",
+    )
     .await?;
 
     // ─── Content-addressed config versions (Step 4a) ────────────────────────────
@@ -3659,6 +3684,20 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
             recorded_at  BIGINT UNSIGNED NOT NULL DEFAULT 0,
             PRIMARY KEY (session_id, dedup_key)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+    )
+    .await?;
+
+    run_migration_batch(
+        pool,
+        20,
+        "bind conversation_log to owner scope",
+        &[
+            "ALTER TABLE conversation_log ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT ''",
+            "ALTER TABLE conversation_log ADD INDEX idx_csl_owner_snapshot (user_id, session_id, entry_type, seq DESC)",
+            "ALTER TABLE conversation_log ADD INDEX idx_csl_owner_turn (user_id, session_id, turn)",
+            "ALTER TABLE conversation_log DROP INDEX idx_csl_snapshot",
+            "ALTER TABLE conversation_log DROP INDEX idx_csl_turn",
+        ],
     )
     .await?;
 

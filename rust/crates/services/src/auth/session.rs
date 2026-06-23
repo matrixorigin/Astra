@@ -453,20 +453,6 @@ impl SessionService for DatabaseSessionService {
     }
 }
 
-async fn delete_session_rows_1(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    label: &'static str,
-    statement: &'static str,
-    session_id: &str,
-) -> Result<u64, String> {
-    query(statement)
-        .bind(session_id)
-        .execute(&mut **tx)
-        .await
-        .map(|result| result.rows_affected())
-        .map_err(|source| format!("delete_session.{label}: {source}"))
-}
-
 async fn delete_session_rows_session_user(
     tx: &mut sqlx::Transaction<'_, MySql>,
     label: &'static str,
@@ -550,6 +536,10 @@ async fn ensure_session_delete_owner_consistency(
         (
             "transcript_pages",
             "SELECT COUNT(*) AS c FROM transcript_pages WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "conversation_log",
+            "SELECT COUNT(*) AS c FROM conversation_log WHERE session_id = ? AND user_id <> ?",
         ),
         (
             "ctx_snapshots",
@@ -803,6 +793,10 @@ async fn hard_delete_session_rows(
             "DELETE FROM transcript_pages WHERE session_id = ? AND user_id = ?",
         ),
         (
+            "conversation_log",
+            "DELETE FROM conversation_log WHERE session_id = ? AND user_id = ?",
+        ),
+        (
             "ctx_snapshots",
             "DELETE FROM ctx_snapshots WHERE session_id = ? AND user_id = ?",
         ),
@@ -886,13 +880,6 @@ async fn hard_delete_session_rows(
     ] {
         deleted +=
             delete_session_rows_session_user(tx, label, statement, session_id, user_id).await?;
-    }
-
-    for (label, statement) in [(
-        "conversation_log",
-        "DELETE FROM conversation_log WHERE session_id = ?",
-    )] {
-        deleted += delete_session_rows_1(tx, label, statement, session_id).await?;
     }
 
     for (label, statement) in [

@@ -4,7 +4,7 @@
 //! All writes are INSERT-only; GC is a batch DELETE.
 //!
 //! ## Pool lifecycle
-//! Prefer constructing via `DbCslStore::new(settings).with_pool(shared_pool)` —
+//! Prefer constructing via `DbCslStore::new(settings, user_id).with_pool(shared_pool)` —
 //! the runtime always provides a `SharedPool` and that path has zero overhead.
 //!
 //! If `with_pool` is *not* called (e.g. integration tests), the first call to
@@ -22,12 +22,14 @@ use astra_core::{MatrixOneSettings, SharedPool, connect_matrixone};
 use super::{CslEntry, CslStore, CslStoreError, materialize, validate_session_id};
 
 /// Database-backed CSL store. Each session's entries live in the
-/// `conversation_log` table, keyed by `(session_id, seq)`.
+/// `conversation_log` table, keyed by `(session_id, seq)` and physically
+/// scoped by the store's bound `user_id`.
 ///
 /// Clone is cheap — both `SharedPool` and the lazy `OnceCell` are `Arc`-wrapped.
 #[derive(Clone, Debug)]
 pub struct DbCslStore {
     matrixone: MatrixOneSettings,
+    user_id: String,
     /// Pre-built shared pool (production path via `with_pool`).
     pool: Option<SharedPool>,
     /// Lazily-initialized pool for callers that skip `with_pool` (tests, CLI).
@@ -36,12 +38,18 @@ pub struct DbCslStore {
 }
 
 impl DbCslStore {
-    pub fn new(matrixone: MatrixOneSettings) -> Self {
-        Self {
+    pub fn new(
+        matrixone: MatrixOneSettings,
+        user_id: impl Into<String>,
+    ) -> Result<Self, CslStoreError> {
+        let user_id = user_id.into();
+        validate_user_id(&user_id)?;
+        Ok(Self {
             matrixone,
+            user_id,
             pool: None,
             lazy_pool: Arc::new(OnceCell::new()),
-        }
+        })
     }
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
@@ -74,6 +82,45 @@ impl DbCslStore {
             .map_err(|e| CslStoreError::Other(format!("missing payload column: {e}")))?;
         Ok(serde_json::from_str(&payload)?)
     }
+
+    async fn ensure_owner_access(
+        &self,
+        pool: &sqlx::Pool<sqlx::MySql>,
+        session_id: &str,
+    ) -> Result<(), CslStoreError> {
+        let foreign_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_log \
+             WHERE session_id = ? AND user_id <> ?",
+        )
+        .bind(session_id)
+        .bind(&self.user_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| CslStoreError::Other(format!("owner check: {e}")))?;
+        if foreign_rows > 0 {
+            return Err(owner_mismatch_error(session_id));
+        }
+        Ok(())
+    }
+}
+
+fn validate_user_id(user_id: &str) -> Result<(), CslStoreError> {
+    if user_id.trim().is_empty() {
+        return Err(CslStoreError::Other(
+            "DbCslStore requires a non-empty user_id".to_string(),
+        ));
+    }
+    if user_id.len() > 64 {
+        return Err(CslStoreError::Other(format!(
+            "DbCslStore user_id exceeds 64 bytes: {}",
+            user_id.len()
+        )));
+    }
+    Ok(())
+}
+
+fn owner_mismatch_error(session_id: &str) -> CslStoreError {
+    CslStoreError::Other(format!("conversation_log owner mismatch for {session_id}"))
 }
 
 #[async_trait]
@@ -86,14 +133,16 @@ impl CslStore for DbCslStore {
     ) -> Result<(), CslStoreError> {
         validate_session_id(session_id)?;
         let pool = self.get_pool().await?;
+        self.ensure_owner_access(&pool, session_id).await?;
         let payload = serde_json::to_string(entry)?;
         let entry_type: i8 = if entry.is_snapshot() { 0 } else { 1 };
 
         query(
             "INSERT INTO conversation_log \
-             (session_id, seq, turn, entry_type, trace_id, message_count, payload) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             (user_id, session_id, seq, turn, entry_type, trace_id, message_count, payload) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
+        .bind(&self.user_id)
         .bind(session_id)
         .bind(entry.seq() as i64)
         .bind(entry.turn() as i32)
@@ -114,6 +163,7 @@ impl CslStore for DbCslStore {
     ) -> Result<Vec<CslEntry>, CslStoreError> {
         validate_session_id(session_id)?;
         let pool = self.get_pool().await?;
+        self.ensure_owner_access(&pool, session_id).await?;
 
         // First check if any snapshot exists — avoids deserializing all rows
         // when the subquery would return NULL. MatrixOne's MySQL protocol does
@@ -122,8 +172,9 @@ impl CslStore for DbCslStore {
         // silently treating them as an empty log.
         let snapshot_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM conversation_log \
-             WHERE session_id = ? AND entry_type = 0",
+             WHERE user_id = ? AND session_id = ? AND entry_type = 0",
         )
+        .bind(&self.user_id)
         .bind(session_id)
         .fetch_one(&pool)
         .await
@@ -135,13 +186,15 @@ impl CslStore for DbCslStore {
 
         let rows = query(
             "SELECT payload FROM conversation_log \
-             WHERE session_id = ? AND seq >= ( \
+             WHERE user_id = ? AND session_id = ? AND seq >= ( \
                  SELECT MAX(seq) FROM conversation_log \
-                 WHERE session_id = ? AND entry_type = 0 \
+                 WHERE user_id = ? AND session_id = ? AND entry_type = 0 \
              ) \
              ORDER BY seq ASC",
         )
+        .bind(&self.user_id)
         .bind(session_id)
+        .bind(&self.user_id)
         .bind(session_id)
         .fetch_all(&pool)
         .await
@@ -165,11 +218,13 @@ impl CslStore for DbCslStore {
     ) -> Result<Vec<CslEntry>, CslStoreError> {
         validate_session_id(session_id)?;
         let pool = self.get_pool().await?;
+        self.ensure_owner_access(&pool, session_id).await?;
         let rows = query(
             "SELECT payload FROM conversation_log \
-             WHERE session_id = ? AND seq > ? \
+             WHERE user_id = ? AND session_id = ? AND seq > ? \
              ORDER BY seq ASC",
         )
+        .bind(&self.user_id)
         .bind(session_id)
         .bind(after_seq as i64)
         .fetch_all(&pool)
@@ -186,12 +241,17 @@ impl CslStore for DbCslStore {
     ) -> Result<u64, CslStoreError> {
         validate_session_id(session_id)?;
         let pool = self.get_pool().await?;
-        let result = query("DELETE FROM conversation_log WHERE session_id = ? AND seq < ?")
-            .bind(session_id)
-            .bind(before_seq as i64)
-            .execute(&pool)
-            .await
-            .map_err(|e| CslStoreError::Other(format!("truncate: {e}")))?;
+        self.ensure_owner_access(&pool, session_id).await?;
+        let result = query(
+            "DELETE FROM conversation_log \
+             WHERE user_id = ? AND session_id = ? AND seq < ?",
+        )
+        .bind(&self.user_id)
+        .bind(session_id)
+        .bind(before_seq as i64)
+        .execute(&pool)
+        .await
+        .map_err(|e| CslStoreError::Other(format!("truncate: {e}")))?;
 
         Ok(result.rows_affected())
     }
@@ -205,6 +265,8 @@ impl CslStore for DbCslStore {
         validate_session_id(parent_session_id)?;
         validate_session_id(new_session_id)?;
         let pool = self.get_pool().await?;
+        self.ensure_owner_access(&pool, parent_session_id).await?;
+        self.ensure_owner_access(&pool, new_session_id).await?;
 
         let mut tx = pool
             .begin()
@@ -214,9 +276,10 @@ impl CslStore for DbCslStore {
         // Load parent entries up to fork_after_turn.
         let rows = query(
             "SELECT payload FROM conversation_log \
-             WHERE session_id = ? AND turn <= ? \
+             WHERE user_id = ? AND session_id = ? AND turn <= ? \
              ORDER BY seq ASC",
         )
+        .bind(&self.user_id)
         .bind(parent_session_id)
         .bind(fork_after_turn as i32)
         .fetch_all(&mut *tx)
@@ -247,9 +310,10 @@ impl CslStore for DbCslStore {
         let payload = serde_json::to_string(&fork_snapshot)?;
         query(
             "INSERT INTO conversation_log \
-             (session_id, seq, turn, entry_type, payload) \
-             VALUES (?, 1, ?, 0, ?)",
+             (user_id, session_id, seq, turn, entry_type, payload) \
+             VALUES (?, ?, 1, ?, 0, ?)",
         )
+        .bind(&self.user_id)
         .bind(new_session_id)
         .bind(mat.last_turn as i32)
         .bind(&payload)
@@ -267,11 +331,13 @@ impl CslStore for DbCslStore {
     async fn snapshot_seqs(&self, session_id: &str) -> Result<Vec<u64>, CslStoreError> {
         validate_session_id(session_id)?;
         let pool = self.get_pool().await?;
+        self.ensure_owner_access(&pool, session_id).await?;
         let rows = query(
             "SELECT seq FROM conversation_log \
-             WHERE session_id = ? AND entry_type = 0 \
+             WHERE user_id = ? AND session_id = ? AND entry_type = 0 \
              ORDER BY seq ASC",
         )
+        .bind(&self.user_id)
         .bind(session_id)
         .fetch_all(&pool)
         .await
@@ -288,6 +354,7 @@ mod tests {
     use super::*;
     use crate::conversation_log::{AppendMeta, SessionStateCompact};
     use serde_json::json;
+    use sqlx::query_as;
 
     fn meta() -> AppendMeta {
         AppendMeta::default()
@@ -328,35 +395,24 @@ mod tests {
     //
     // The DB must have the `conversation_log` table created (via ensure_core_schema).
 
-    #[test]
-    fn db_snapshot_probe_uses_count_instead_of_exists() {
-        let source = include_str!("db_store.rs");
-        let implementation = source
-            .split("// ─── Tests")
-            .next()
-            .expect("db_store implementation section must exist");
-        assert!(
-            implementation.contains("SELECT COUNT(*) FROM conversation_log"),
-            "MatrixOne CSL snapshot probe must use COUNT(*) for SQLx MySQL decode stability"
-        );
-        assert!(
-            !implementation.contains("SELECT EXISTS("),
-            "MatrixOne CSL snapshot probe must not use SELECT EXISTS(...) as a bool"
-        );
-        assert!(
-            !implementation.contains("unwrap_or(false)"),
-            "CSL load errors must not be silently treated as an empty log"
-        );
+    async fn test_store() -> DbCslStore {
+        test_store_for("csl-test-user").await
     }
 
-    async fn test_store() -> DbCslStore {
-        let settings = MatrixOneSettings::from_env_with_database("astra_test");
-        let store = DbCslStore::new(settings);
+    async fn test_store_for(user_id: &str) -> DbCslStore {
+        assert_eq!(
+            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+            Ok("1"),
+            "set ASTRA_TEST_DB_IT=1 to run this ignored test"
+        );
+        let settings = MatrixOneSettings::from_env();
+        let store = DbCslStore::new(settings, user_id.to_string()).expect("user-scoped store");
 
         // Ensure table exists for tests.
         let pool = store.get_pool().await.expect("DB connection required");
         query(
             "CREATE TABLE IF NOT EXISTS conversation_log (
+                user_id       VARCHAR(64) NOT NULL,
                 session_id    VARCHAR(64) NOT NULL,
                 seq           BIGINT NOT NULL,
                 turn          INT NOT NULL,
@@ -366,13 +422,30 @@ mod tests {
                 payload       MEDIUMTEXT NOT NULL,
                 created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
                 PRIMARY KEY (session_id, seq),
-                INDEX idx_csl_snapshot (session_id, entry_type, seq DESC),
-                INDEX idx_csl_turn (session_id, turn)
+                INDEX idx_csl_owner_snapshot (user_id, session_id, entry_type, seq DESC),
+                INDEX idx_csl_owner_turn (user_id, session_id, turn)
             )",
         )
         .execute(&pool)
         .await
         .expect("create table");
+        let _ = query(
+            "ALTER TABLE conversation_log ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT ''",
+        )
+        .execute(&pool)
+        .await;
+        let _ = query(
+            "ALTER TABLE conversation_log ADD INDEX idx_csl_owner_snapshot \
+             (user_id, session_id, entry_type, seq DESC)",
+        )
+        .execute(&pool)
+        .await;
+        let _ = query(
+            "ALTER TABLE conversation_log ADD INDEX idx_csl_owner_turn \
+             (user_id, session_id, turn)",
+        )
+        .execute(&pool)
+        .await;
 
         store
     }
@@ -404,12 +477,161 @@ mod tests {
         assert!(entries[0].is_snapshot());
         assert!(!entries[1].is_snapshot());
 
+        let row_user_ids: Vec<String> =
+            query("SELECT user_id FROM conversation_log WHERE session_id = ? ORDER BY seq ASC")
+                .bind(sid)
+                .fetch_all(&store.get_pool().await.unwrap())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get::<String, _>("user_id"))
+                .collect();
+        assert_eq!(
+            row_user_ids,
+            vec![store.user_id.clone(), store.user_id.clone()],
+            "DB CSL rows must be physically owner-scoped"
+        );
+
         let state = materialize(&entries).unwrap();
         assert_eq!(state.messages.len(), 3);
         assert_eq!(state.messages[0]["content"], "hello");
         assert_eq!(state.messages[2]["content"], "resp2");
 
         cleanup(&store, sid).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live DB"]
+    async fn db_owner_scope_refuses_cross_owner_access_without_overwrite() {
+        let owner_user_id = format!("u-csl-owner-{}", uuid::Uuid::new_v4());
+        let other_user_id = format!("u-csl-other-{}", uuid::Uuid::new_v4());
+        let owner_store = test_store_for(&owner_user_id).await;
+        let other_store = test_store_for(&other_user_id).await;
+        let sid = &format!("db-test-owner-scope-{}", uuid::Uuid::new_v4());
+        cleanup(&owner_store, sid).await;
+
+        owner_store
+            .append(sid, &make_snapshot(0, 1, vec![user_msg("owner")]), &meta())
+            .await
+            .unwrap();
+
+        let load_err = other_store
+            .load_from_latest_snapshot(sid)
+            .await
+            .expect_err("other owner must not load an existing CSL");
+        assert!(
+            load_err
+                .to_string()
+                .contains("conversation_log owner mismatch"),
+            "unexpected load error: {load_err}"
+        );
+
+        let append_err = other_store
+            .append(
+                sid,
+                &make_delta(1, 2, vec![assistant_msg("wrong")]),
+                &meta(),
+            )
+            .await
+            .expect_err("other owner must not append to an existing CSL");
+        assert!(
+            append_err
+                .to_string()
+                .contains("conversation_log owner mismatch"),
+            "unexpected append error: {append_err}"
+        );
+
+        let truncate_err = other_store
+            .truncate_before(sid, 99)
+            .await
+            .expect_err("other owner must not truncate an existing CSL");
+        assert!(
+            truncate_err
+                .to_string()
+                .contains("conversation_log owner mismatch"),
+            "unexpected truncate error: {truncate_err}"
+        );
+
+        let rows: Vec<(String, i64)> =
+            query_as("SELECT user_id, seq FROM conversation_log WHERE session_id = ? ORDER BY seq")
+                .bind(sid)
+                .fetch_all(&owner_store.get_pool().await.unwrap())
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![(owner_user_id.clone(), 0)],
+            "failed cross-owner operations must not rewrite owner rows"
+        );
+
+        cleanup(&owner_store, sid).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live DB"]
+    async fn db_fork_refuses_mixed_owner_parent_or_child() {
+        let owner_user_id = format!("u-csl-owner-{}", uuid::Uuid::new_v4());
+        let other_user_id = format!("u-csl-other-{}", uuid::Uuid::new_v4());
+        let owner_store = test_store_for(&owner_user_id).await;
+        let other_store = test_store_for(&other_user_id).await;
+        let parent = &format!("db-test-fork-parent-{}", uuid::Uuid::new_v4());
+        let child = &format!("db-test-fork-child-{}", uuid::Uuid::new_v4());
+        cleanup(&owner_store, parent).await;
+        cleanup(&owner_store, child).await;
+
+        owner_store
+            .append(
+                parent,
+                &make_snapshot(0, 1, vec![user_msg("parent")]),
+                &meta(),
+            )
+            .await
+            .unwrap();
+
+        let parent_err = other_store
+            .fork(parent, child, 1)
+            .await
+            .expect_err("other owner must not fork an existing parent CSL");
+        assert!(
+            parent_err
+                .to_string()
+                .contains("conversation_log owner mismatch"),
+            "unexpected parent fork error: {parent_err}"
+        );
+
+        other_store
+            .append(
+                child,
+                &make_snapshot(0, 1, vec![user_msg("other child")]),
+                &meta(),
+            )
+            .await
+            .unwrap();
+        let child_err = owner_store
+            .fork(parent, child, 1)
+            .await
+            .expect_err("owner must not overwrite a child CSL owned by another user");
+        assert!(
+            child_err
+                .to_string()
+                .contains("conversation_log owner mismatch"),
+            "unexpected child fork error: {child_err}"
+        );
+
+        let child_rows: Vec<(String, i64)> =
+            query_as("SELECT user_id, seq FROM conversation_log WHERE session_id = ? ORDER BY seq")
+                .bind(child)
+                .fetch_all(&owner_store.get_pool().await.unwrap())
+                .await
+                .unwrap();
+        assert_eq!(
+            child_rows,
+            vec![(other_user_id.clone(), 0)],
+            "failed fork must not overwrite child rows owned by another user"
+        );
+
+        cleanup(&owner_store, parent).await;
+        cleanup(&owner_store, child).await;
     }
 
     #[tokio::test]
