@@ -1463,6 +1463,19 @@ impl InProcessChatTurnBridge {
             // Resolve LLM model (skipped when `test_llm_rounds` drives the turn — feature `bridge-e2e-hooks`).
             // Also capture fallback_chain for rate-limit-triggered fallback.
             let pool_ref = shared_pool.as_ref().map(SharedPool::get);
+            let requested_model_override =
+                astra_core::model_override::normalize_model_override(model_override.as_deref());
+            if !use_e2e_llm && requested_model_override.is_none() {
+                tracing::warn!(
+                    target: "astra_runtime::bridge_inprocess",
+                    session_id = %session_id,
+                    run_id = %run_id,
+                    turn = trace_turn,
+                    round = round_index,
+                    reason = "missing_model_override",
+                    "missing explicit model override; refusing implicit model fallback"
+                );
+            }
             let (mut model_name, mut wire_model_name, mut api_key, mut base_url, mut provider, mut request_body_overrides, mut cache_capability, fallback_chain) = if use_e2e_llm {
                 (
                     "bridge-e2e-mock".to_string(),
@@ -1478,7 +1491,7 @@ impl InProcessChatTurnBridge {
                 match astra_services::resolve_active_llm_model(
                     &matrixone,
                     encryptor.as_ref(),
-                    model_override.as_deref(),
+                    requested_model_override,
                     pool_ref,
                 )
                 .await

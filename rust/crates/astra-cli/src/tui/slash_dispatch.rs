@@ -148,7 +148,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         //   /model                   → open the picker (legacy default)
         //   /model list              → explicit alias for the picker
         //   /model info              → details panel for current model
-        //   /model clear             → reset to API default
+        //   /model clear             → clear the active model selection
         //   /model <name>            → direct switch to <name>
         //
         // There is intentionally no `/model set <name>` — the
@@ -2695,7 +2695,7 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
         ctx.state.model = None;
         crate::cli::slash::slash_config::set_active_model_for_display(None);
         ctx.bottom_pane.footer.model = None;
-        ctx.show_response("Model override cleared — using API default.".into());
+        ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
         return;
     };
     ctx.state.model = Some(name.to_string());
@@ -2704,14 +2704,13 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
     ctx.show_response(format!("Set model to {name}"));
 }
 
-/// `/model clear` — unset the session override so the edge's
-/// default model applies.  Reports the change to scrollback so
-/// the user sees the footer switch.
+/// `/model clear` — unset the session model. Reports the change to
+/// scrollback so the user sees the footer switch.
 async fn handle_model_clear(ctx: &mut DispatchContext<'_>) -> SlashResult {
     ctx.state.model = None;
     crate::cli::slash::slash_config::set_active_model_for_display(None);
     ctx.bottom_pane.footer.model = None;
-    ctx.show_response("Model override cleared — using API default.".into());
+    ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
     SlashResult::Handled
 }
 

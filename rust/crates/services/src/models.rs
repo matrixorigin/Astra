@@ -702,6 +702,9 @@ const RESOLVE_COLS: &str = "\
     IFNULL(CAST(pricing AS CHAR), '{}') AS pricing_json, \
     IFNULL(CAST(tags AS CHAR), '[]') AS tags_json, \
     thinking_capability";
+const REQUIRED_MODEL_SELECTION_ERROR: &str = "\
+Model selection is required. Pass a concrete selected_model.model or set a CLI \
+default_model; refusing to choose the first active model.";
 
 /// Require an explicitly wired pool reference.
 async fn require_pool(
@@ -719,8 +722,8 @@ async fn require_pool(
 /// Resolve the active LLM model from the database for in-process / server-side callers.
 ///
 /// When `preferred` is `Some(name)`, the row **must** exist and be active — otherwise this
-/// returns an error (no silent fallback to another model). When `preferred` is `None`, uses
-/// the lexicographically first active model. `pool` must be provided explicitly by the caller.
+/// returns an error (no silent fallback to another model). When `preferred` is `None`, returns
+/// an error instead of silently choosing an arbitrary active model.
 ///
 /// Also extracts `fallback_chain` from the `quirks` JSON column (cloud-managed config).
 pub async fn resolve_active_llm_model(
@@ -729,86 +732,80 @@ pub async fn resolve_active_llm_model(
     preferred: Option<&str>,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
 ) -> Result<ResolvedActiveLlmModel, String> {
-    let pool = require_pool(pool, matrixone).await?;
-
     let pref = preferred
         .map(normalize_model_selector_for_resolution)
         .filter(|s| !s.is_empty());
+    let Some(name) = pref else {
+        tracing::warn!(
+            target: "astra_services::models",
+            reason = "missing_model_selection",
+            "model selection required; refusing implicit first-active model fallback"
+        );
+        return Err(REQUIRED_MODEL_SELECTION_ERROR.to_string());
+    };
 
-    if let Some(name) = pref {
-        // Try exact match first — the fast path. If the LLM supplied
-        // the fully-qualified name it resolves in one query.
-        let exact_row = sqlx::query(&format!(
-            "SELECT {RESOLVE_COLS}, is_active FROM infra_llm_models WHERE model_name = ? LIMIT 1"
-        ))
-        .bind(name)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|e| format!("DB query: {e}"))?;
+    let pool = require_pool(pool, matrixone).await?;
 
-        // Class C fix: fall through to the alias resolver when exact
-        // match fails. The LLM often produces short names like
-        // `claude-sonnet` for `spawn_agent`'s `model_override`; doing
-        // a deterministic substring / case-insensitive match against
-        // active rows lets those calls succeed without forcing every
-        // case author to retrain the prompt. Ambiguity still errors.
-        //
-        // Track canonical name separately so the `is_active` error
-        // message below can name BOTH the requested alias and the
-        // resolved form when they differ — without this, a reader
-        // would see "Model 'claude-sonnet' is inactive" even though
-        // the DB row is keyed on the full bedrock name.
-        let (row, canonical) = match exact_row {
-            Some(r) => (r, name.to_string()),
-            None => {
-                let active_names: Vec<String> = sqlx::query_scalar::<_, String>(
-                    "SELECT model_name FROM infra_llm_models WHERE is_active = 1",
-                )
-                .fetch_all(&pool)
-                .await
-                .map_err(|e| format!("DB query: {e}"))?;
-
-                match resolve_model_alias(name, &active_names) {
-                    Ok(canonical_ref) => {
-                        let canonical = canonical_ref.to_string();
-                        let r = sqlx::query(&format!(
-                            "SELECT {RESOLVE_COLS}, is_active \
-                             FROM infra_llm_models WHERE model_name = ? LIMIT 1"
-                        ))
-                        .bind(&canonical)
-                        .fetch_optional(&pool)
-                        .await
-                        .map_err(|e| format!("DB query: {e}"))?
-                        .ok_or_else(|| {
-                            format!(
-                                "alias resolver returned '{canonical}' but no row exists \
-                                 — concurrent delete?"
-                            )
-                        })?;
-                        (r, canonical)
-                    }
-                    Err(e) => return Err(e.to_string()),
-                }
-            }
-        };
-
-        let is_active_int: i16 = row.try_get("is_active").unwrap_or(0);
-        if is_active_int == 0 {
-            return Err(format_inactive_model_error(name, &canonical));
-        }
-
-        return build_resolved_active_llm_from_row(&row, encryptor);
-    }
-
-    let row = sqlx::query(&format!(
-        "SELECT {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1 ORDER BY model_name LIMIT 1"
+    // Try exact match first — the fast path. If the LLM supplied
+    // the fully-qualified name it resolves in one query.
+    let exact_row = sqlx::query(&format!(
+        "SELECT {RESOLVE_COLS}, is_active FROM infra_llm_models WHERE model_name = ? LIMIT 1"
     ))
+    .bind(name)
     .fetch_optional(&pool)
     .await
-    .map_err(|e| format!("DB query fallback: {e}"))?;
+    .map_err(|e| format!("DB query: {e}"))?;
 
-    let row = row
-        .ok_or_else(|| "No active LLM model configured. Run: astra-admin model add".to_string())?;
+    // Class C fix: fall through to the alias resolver when exact
+    // match fails. The LLM often produces short names like
+    // `claude-sonnet` for `spawn_agent`'s `model_override`; doing
+    // a deterministic substring / case-insensitive match against
+    // active rows lets those calls succeed without forcing every
+    // case author to retrain the prompt. Ambiguity still errors.
+    //
+    // Track canonical name separately so the `is_active` error
+    // message below can name BOTH the requested alias and the
+    // resolved form when they differ — without this, a reader
+    // would see "Model 'claude-sonnet' is inactive" even though
+    // the DB row is keyed on the full bedrock name.
+    let (row, canonical) = match exact_row {
+        Some(r) => (r, name.to_string()),
+        None => {
+            let active_names: Vec<String> = sqlx::query_scalar::<_, String>(
+                "SELECT model_name FROM infra_llm_models WHERE is_active = 1",
+            )
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| format!("DB query: {e}"))?;
+
+            match resolve_model_alias(name, &active_names) {
+                Ok(canonical_ref) => {
+                    let canonical = canonical_ref.to_string();
+                    let r = sqlx::query(&format!(
+                        "SELECT {RESOLVE_COLS}, is_active \
+                         FROM infra_llm_models WHERE model_name = ? LIMIT 1"
+                    ))
+                    .bind(&canonical)
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(|e| format!("DB query: {e}"))?
+                    .ok_or_else(|| {
+                        format!(
+                            "alias resolver returned '{canonical}' but no row exists \
+                             — concurrent delete?"
+                        )
+                    })?;
+                    (r, canonical)
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    };
+
+    let is_active_int: i16 = row.try_get("is_active").unwrap_or(0);
+    if is_active_int == 0 {
+        return Err(format_inactive_model_error(name, &canonical));
+    }
 
     build_resolved_active_llm_from_row(&row, encryptor)
 }
@@ -2527,6 +2524,18 @@ mod tests {
             resolve_model_alias("   ", &active),
             Err(ModelAliasResolutionError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn active_model_resolution_requires_explicit_model_selection() {
+        let encryptor = FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=")
+            .expect("valid fernet key");
+
+        let err = resolve_active_llm_model(&MatrixOneSettings::mock(), &encryptor, None, None)
+            .await
+            .expect_err("missing preferred model must fail before DB fallback");
+
+        assert_eq!(err, REQUIRED_MODEL_SELECTION_ERROR);
     }
 
     #[test]

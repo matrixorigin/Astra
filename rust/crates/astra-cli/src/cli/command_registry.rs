@@ -162,7 +162,7 @@ impl CommandMeta {
 const MODEL_SUBCOMMANDS: &[(&str, &str)] = &[
     ("info", "Show details for the current model"),
     ("list", "Open the picker to choose a model"),
-    ("clear", "Reset to the API default model"),
+    ("clear", "Clear the active model selection"),
 ];
 
 const STATS_SUBCOMMANDS: &[(&str, &str)] = &[

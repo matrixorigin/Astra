@@ -1751,7 +1751,7 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn initialize_session_state_treats_default_model_as_server_default() {
+    fn initialize_session_state_treats_symbolic_default_as_no_model_selection() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let _creds_guard = isolate_credentials();
 
