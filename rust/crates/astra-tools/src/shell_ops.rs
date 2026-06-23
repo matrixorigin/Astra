@@ -1062,7 +1062,8 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
             result = format!("Error: bash timed out after {timeout_secs}s with no captured output");
         }
         return ToolResult::error(truncate_output(result, output_limit))
-            .with_exit_semantics(ExitSemantics::TimedOut);
+            .with_exit_semantics(ExitSemantics::TimedOut)
+            .with_exit_code(output.exit_code);
     }
 
     if output.cancelled {
@@ -1072,7 +1073,8 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
             result = "Error: bash cancelled before any output was captured".into();
         }
         return ToolResult::error(truncate_output(result, output_limit))
-            .with_exit_semantics(ExitSemantics::Cancelled);
+            .with_exit_semantics(ExitSemantics::Cancelled)
+            .with_exit_code(output.exit_code);
     }
 
     let exit_semantics = classify_exit(command, output.exit_code);
@@ -1083,15 +1085,18 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
         Some(output.exit_code),
     );
     if output.exit_code != 0 || result_class.is_tool_error() {
-        let output = truncate_output(result, output_limit);
+        let exit_code = output.exit_code;
+        let output_text = truncate_output(result, output_limit);
         if exit_semantics.is_tool_error() || result_class.is_tool_error() {
-            return ToolResult::error(output)
+            return ToolResult::error(output_text)
                 .with_exit_semantics(exit_semantics)
-                .with_result_class(result_class);
+                .with_result_class(result_class)
+                .with_exit_code(exit_code);
         }
-        return ToolResult::text(output)
+        return ToolResult::text(output_text)
             .with_exit_semantics(exit_semantics)
-            .with_result_class(result_class);
+            .with_result_class(result_class)
+            .with_exit_code(exit_code);
     }
 
     if command_has_background_operator(command) {
@@ -1110,10 +1115,12 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
         ToolResult::text("(command completed with no output)".into())
             .with_exit_semantics(ExitSemantics::Success)
             .with_result_class(result_class)
+            .with_exit_code(output.exit_code)
     } else {
         ToolResult::text(truncate_output(result, output_limit))
             .with_exit_semantics(ExitSemantics::Success)
             .with_result_class(result_class)
+            .with_exit_code(output.exit_code)
     }
 }
 
@@ -4953,6 +4960,19 @@ printf 'probe.txt:1:needle\n'
             result.output.contains("[exit code: 7]"),
             "got: {}",
             result.output
+        );
+        let metadata = result
+            .metadata
+            .as_ref()
+            .expect("bash failure must carry structured metadata");
+        assert_eq!(metadata.get("exit_code").and_then(Value::as_i64), Some(7));
+        assert_eq!(
+            metadata.get("exit_semantics").and_then(Value::as_str),
+            Some("execution_error")
+        );
+        assert_eq!(
+            metadata.get("result_class").and_then(Value::as_str),
+            Some("execution_error")
         );
     }
 

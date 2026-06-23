@@ -123,6 +123,16 @@ impl ToolResult {
         self
     }
 
+    /// Attach a process exit code as structured metadata.
+    pub fn with_exit_code(mut self, exit_code: i32) -> Self {
+        let metadata = self.metadata.get_or_insert_with(serde_json::Map::new);
+        metadata.insert(
+            "exit_code".to_string(),
+            Value::Number(serde_json::Number::from(exit_code)),
+        );
+        self
+    }
+
     /// Convert a legacy `String` output into a `ToolResult`.
     ///
     /// A string payload has no reliable error semantics. Callers that know the

@@ -1,9 +1,9 @@
-//! Tool surface — T1 pinned + T2 deferred model.
+//! Tool surface — T1 always_load + T2 deferred model.
 //!
 //! See `plans/tool-surface-deferred-simplification-2026-06-23.md` and
 //! `docs/design/skills-and-tools.md` for the architectural story. Short version:
 //!
-//! - **T1 pinned** = a small, stable set of tool schemas that go into the
+//! - **T1 always_load** = a small, stable set of tool schemas that go into the
 //!   LLM `tools[]` array on every turn. Byte-stable across a session so the
 //!   Anthropic/Bedrock prompt cache can hit the whole prefix.
 //! - **T2 deferred** = every other known tool, listed as `name + short_desc`
@@ -12,8 +12,8 @@
 //!   schema visible in upcoming `tools[]` payloads until the model actually
 //!   calls that tool once.
 //!
-//! The default T1 set is the coding core, derived from the tool identity table.
-//! Users override via `runtime.tool_surface.pinned_tools` in TOML. A name
+//! The default T1 set is the coding core, derived from the tool declaration table.
+//! Users override via `runtime.tool_surface.always_load_tools` in TOML. A name
 //! prefixed with `-` removes a default (e.g. `"-grep"`).
 //!
 //! Implementation is complete and wired into production.
@@ -25,17 +25,17 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-use crate::tool_registry::identity::{ToolPublicStatus, all_tool_identities};
+use crate::tool_registry::declaration::{ToolLoadPolicy, all_tool_declarations};
 
-/// Default T1 pinned tool names, derived from the single authority
-/// [`crate::tool_registry::identity::ToolIdentity`] classification.
-/// Any name classified as `ToolPublicStatus::Pinned` automatically
+/// Default T1 always_load tool names, derived from the single authority
+/// [`crate::tool_registry::declaration::ToolDeclaration`] classification.
+/// Any name classified as `ToolLoadPolicy::AlwaysLoad` automatically
 /// appears here — no manual copy needed.
-pub fn default_pinned_names() -> &'static [&'static str] {
+pub fn default_always_load_names() -> &'static [&'static str] {
     static NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-        let mut names: Vec<&str> = all_tool_identities()
+        let mut names: Vec<&str> = all_tool_declarations()
             .iter()
-            .filter(|id| id.status == ToolPublicStatus::Pinned)
+            .filter(|id| id.load_policy == ToolLoadPolicy::AlwaysLoad)
             .map(|id| id.name)
             .collect();
         names.sort_unstable();
@@ -64,7 +64,7 @@ pub struct DeferredManifest {
 
 /// The resolved tool surface for a session.
 pub struct ToolSurface {
-    pinned: Vec<Value>,
+    always_load: Vec<Value>,
     deferred: Vec<DeferredEntry>,
 }
 
@@ -81,11 +81,11 @@ impl ToolSurface {
     /// plugin schemas registered this session.
     ///
     /// Algorithm:
-    /// 1. Start from names classified as `ToolPublicStatus::Pinned`.
-    /// 2. Apply `cfg.pinned_tools`: a bare name adds, a `-name` removes.
+    /// 1. Start from names classified as `ToolLoadPolicy::AlwaysLoad`.
+    /// 2. Apply `cfg.always_load_tools`: a bare name adds, a `-name` removes.
     ///    Unknown names are silently ignored.
     /// 3. Partition the union of catalog + plugins: names in the resolved
-    ///    pinned set → `pinned_schemas`; everything else → `deferred`.
+    ///    always_load set → `always_load_schemas`; everything else → `deferred`.
     /// 4. Sort both alphabetically for byte-stability.
     pub fn build(
         catalog_schemas: Vec<Value>,
@@ -113,14 +113,14 @@ impl ToolSurface {
             }
         }
 
-        // Resolve the pinned name set: defaults + additive overrides, minus
+        // Resolve the always_load name set: defaults + additive overrides, minus
         // any `-name` removals. Unknown names emit a warning — they are likely
         // typos (`+web_fetc`) or stale entries after a tool was renamed.
-        let mut pinned_names: std::collections::BTreeSet<String> = default_pinned_names()
+        let mut always_load_names: std::collections::BTreeSet<String> = default_always_load_names()
             .iter()
             .map(|s| s.to_string())
             .collect();
-        for entry in &cfg.pinned_tools {
+        for entry in &cfg.always_load_tools {
             let trimmed = entry.trim();
             // Empty / whitespace-only / bare "-" / double-prefixed "--" are
             // user-config noise — silently skip. The fence against "-- foo"
@@ -130,32 +130,35 @@ impl ToolSurface {
                 continue;
             }
             if let Some(name) = trimmed.strip_prefix('-') {
-                pinned_names.remove(name);
+                always_load_names.remove(name);
             } else if by_name.contains_key(trimmed) {
-                pinned_names.insert(trimmed.to_string());
+                always_load_names.insert(trimmed.to_string());
             } else {
                 tracing::warn!(
                     target: "astra.tool_surface",
                     entry = trimmed,
-                    "tool_surface.pinned_tools: unknown tool name '{trimmed}' ignored — typo or renamed tool?"
+                    "tool_surface.always_load_tools: unknown tool name '{trimmed}' ignored — typo or renamed tool?"
                 );
             }
         }
 
         // Partition. BTreeMap iteration is already alphabetical, so the
         // resulting vectors come out sorted for free.
-        let mut pinned: Vec<Value> = Vec::new();
+        let mut always_load: Vec<Value> = Vec::new();
         let mut deferred: Vec<DeferredEntry> = Vec::new();
         for (name, schema) in by_name {
-            if pinned_names.contains(&name) {
-                pinned.push(schema);
+            if always_load_names.contains(&name) {
+                always_load.push(schema);
             } else {
                 let short_desc = short_description(&schema);
                 deferred.push(DeferredEntry { name, short_desc });
             }
         }
 
-        Self { pinned, deferred }
+        Self {
+            always_load,
+            deferred,
+        }
     }
 
     /// Build a deferred manifest from the eligible schema pool after the caller
@@ -208,24 +211,24 @@ impl ToolSurface {
     ///
     /// Returned by value so callers can annotate `cache_control` without
     /// mutating the surface.
-    pub fn pinned_schemas(&self) -> Vec<Value> {
-        self.pinned.clone()
+    pub fn always_load_schemas(&self) -> Vec<Value> {
+        self.always_load.clone()
     }
 
-    /// Resolved pinned names in the same stable order as [`pinned_schemas`].
+    /// Resolved always_load names in the same stable order as [`always_load_schemas`].
     ///
     /// This is the single runtime answer to "which tools are T1 for this
     /// surface?". Callers that need cache markers, edge metadata, or diagnostics
     /// should derive from the resolved surface instead of rebuilding the
-    /// identity + TOML override rules locally.
-    pub fn pinned_names(&self) -> Vec<String> {
-        self.pinned
+    /// declaration + TOML override rules locally.
+    pub fn always_load_names(&self) -> Vec<String> {
+        self.always_load
             .iter()
             .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
             .collect()
     }
 
-    /// The deferred manifest — one `name + short_desc` entry per non-pinned
+    /// The deferred manifest — one `name + short_desc` entry per non-always_load
     /// tool, ready to render into the system-reminder block.
     pub fn deferred(&self) -> &[DeferredEntry] {
         &self.deferred

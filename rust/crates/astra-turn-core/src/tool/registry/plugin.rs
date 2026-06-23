@@ -18,7 +18,7 @@ pub struct PluginToolEntry {
     pub name: String,
     pub description: String,
     pub triggers: Vec<String>,
-    pub pinned: bool,
+    pub always_load: bool,
     pub intents: Vec<IntentType>,
     pub scope: Scope,
     pub schema: Value,
@@ -135,7 +135,7 @@ mod tests {
             name: name.to_string(),
             description: desc.to_string(),
             triggers: triggers.iter().map(|s| s.to_string()).collect(),
-            pinned: false,
+            always_load: false,
             intents: vec![IntentType::CodeRead],
             scope: Scope::Local,
             schema: json!({

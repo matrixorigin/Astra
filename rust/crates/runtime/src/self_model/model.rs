@@ -187,8 +187,8 @@ pub struct CapabilityView {
     pub tool_health: Vec<ToolHealthSummary>,
     /// Currently deprioritized tools.
     pub deprioritized_tools: Vec<String>,
-    /// Pinned (always-available) tools.
-    pub pinned_tools: Vec<String>,
+    /// Manually prioritized tools.
+    pub prioritized_tools: Vec<String>,
     /// Discovered skills.
     pub skills: Vec<String>,
     /// Tools currently boosted by the last auto-reflection strategy delta.
@@ -318,7 +318,7 @@ impl SelfModel {
     /// sections rather than errors.
     pub fn snapshot(
         tool_names: &[&str],
-        pinned_tools: &[String],
+        prioritized_tools: &[String],
         manual_deprioritized_tools: &[String],
         skills: &[String],
         tool_health: Option<&ToolHealthTracker>,
@@ -335,7 +335,7 @@ impl SelfModel {
     ) -> Self {
         Self::snapshot_with_strategy(
             tool_names,
-            pinned_tools,
+            prioritized_tools,
             manual_deprioritized_tools,
             skills,
             tool_health,
@@ -359,7 +359,7 @@ impl SelfModel {
     #[allow(clippy::too_many_arguments)]
     pub fn snapshot_with_strategy(
         tool_names: &[&str],
-        pinned_tools: &[String],
+        prioritized_tools: &[String],
         manual_deprioritized_tools: &[String],
         skills: &[String],
         tool_health: Option<&ToolHealthTracker>,
@@ -449,7 +449,7 @@ impl SelfModel {
             tool_names: tool_names.iter().map(|s| s.to_string()).collect(),
             tool_health: tool_health_summaries,
             deprioritized_tools: deprioritized,
-            pinned_tools: pinned_tools.to_vec(),
+            prioritized_tools: prioritized_tools.to_vec(),
             skills: skills.to_vec(),
             boosted_tools,
             widen_surface_pending,
@@ -1199,11 +1199,11 @@ impl SelfModel {
         // ── Capabilities ──
         s.push_str("\n## Capabilities\n");
         let _ = writeln!(s, "- Total tools: {}", self.capabilities.total_tools);
-        if !self.capabilities.pinned_tools.is_empty() {
+        if !self.capabilities.prioritized_tools.is_empty() {
             let _ = writeln!(
                 s,
-                "- Pinned tools: {}",
-                self.capabilities.pinned_tools.join(", ")
+                "- Prioritized tools: {}",
+                self.capabilities.prioritized_tools.join(", ")
             );
         }
         if !self.capabilities.deprioritized_tools.is_empty() {
@@ -1637,7 +1637,7 @@ mod tests {
         assert!(text.contains("Turn: 10"));
         assert!(text.contains("exp-123"));
         assert!(text.contains("User corrections: 2"));
-        assert!(text.contains("Pinned tools: bash"));
+        assert!(text.contains("Prioritized tools: bash"));
         assert!(text.contains("Implement feature X"));
     }
 

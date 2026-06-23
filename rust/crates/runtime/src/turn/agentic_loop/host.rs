@@ -1300,7 +1300,7 @@ pub struct AgenticLoopState {
     /// Measured token cost of the tool schemas injected into the LLM request.
     /// Passed to `estimate_tokens` so pressure estimates include the
     /// schema overhead the API will count. 0 = unknown (legacy / sub-runs).
-    pub pinned_tool_schema_tokens: u64,
+    pub always_load_tool_schema_tokens: u64,
     /// Cache-sensitive sticky tool schema set for the current user turn.
     /// When a cache-capable provider sees multiple LLM rounds in one turn,
     /// we keep once-advertised tools stable instead of letting the planner
@@ -2447,7 +2447,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         last_measured_prompt_tokens: None,
         consecutive_context_window_errors: 0,
         compaction_effectiveness: Default::default(),
-        pinned_tool_schema_tokens: 0,
+        always_load_tool_schema_tokens: 0,
         sticky_tool_schemas: Vec::new(),
         max_turn_input_tokens: 0,
         budget_wrapup_injected: false,
@@ -2948,7 +2948,7 @@ pub(crate) mod tests {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
-            pinned_tool_schema_tokens: 0,
+            always_load_tool_schema_tokens: 0,
             sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,

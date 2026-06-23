@@ -10,14 +10,14 @@ use astra_runtime::prompts::{estimate_str_tokens, estimate_tokens};
 use astra_runtime::text_tokenize::{build_tf, tokenize};
 use astra_runtime::tool_registry::ConversationState;
 
-// ── Tool Surface: build_pinned_surface (hot path, every turn) ──────
+// ── Tool Surface: always-load build (hot path, every turn) ──────
 
-fn bench_build_pinned_surface(c: &mut Criterion) {
+fn bench_build_always_load_surface(c: &mut Criterion) {
     let catalog = astra_tools::schemas::all_tool_schemas();
     let cfg = astra_config::ToolSurfaceConfig::default();
 
-    let mut group = c.benchmark_group("build_pinned_surface");
-    group.bench_function("default_13_pinned", |b| {
+    let mut group = c.benchmark_group("build_always_load_surface");
+    group.bench_function("default_13_always_load", |b| {
         b.iter(|| {
             astra_runtime::tool_registry::surface::ToolSurface::build(
                 black_box(catalog.clone()),
@@ -29,12 +29,12 @@ fn bench_build_pinned_surface(c: &mut Criterion) {
     group.finish();
 }
 
-// ── Tool Surface: default_pinned_names (LazyLock derivation) ──────
+// ── Tool Surface: default_always_load_names (LazyLock derivation) ──────
 
-fn bench_default_pinned_names(c: &mut Criterion) {
-    let mut group = c.benchmark_group("default_pinned_names");
+fn bench_default_always_load_names(c: &mut Criterion) {
+    let mut group = c.benchmark_group("default_always_load_names");
     group.bench_function("cached_access", |b| {
-        b.iter(|| astra_runtime::tool_registry::surface::default_pinned_names())
+        b.iter(|| astra_runtime::tool_registry::surface::default_always_load_names())
     });
     group.finish();
 }
@@ -98,9 +98,9 @@ fn bench_inject_required_tool_names(c: &mut Criterion) {
     group.finish();
 }
 
-// ── Schema Prune: pin_invoked_tool_schemas (O(n+m) HashMap path) ──
+// ── Schema Prune: retain_invoked_tool_schemas (O(n+m) HashMap path) ──
 
-fn bench_pin_invoked_tool_schemas(c: &mut Criterion) {
+fn bench_retain_invoked_tool_schemas(c: &mut Criterion) {
     let all_schemas: Vec<serde_json::Value> = astra_tools::schemas::all_tool_schemas();
     let tool_results: Vec<serde_json::Value> = vec![
         json!({"name": "web_fetch", "tool_call_id": "c1", "content": "ok"}),
@@ -137,12 +137,12 @@ fn bench_pin_invoked_tool_schemas(c: &mut Criterion) {
         budget_total: 800,
     };
 
-    let mut group = c.benchmark_group("pin_invoked_tool_schemas");
+    let mut group = c.benchmark_group("retain_invoked_tool_schemas");
     group.bench_function("5_results_1_visible", |b| {
         b.iter(|| {
             let mut s = black_box(surface.clone());
             let mut r = black_box(report.clone());
-            astra_turn_core::tool_schema_prune::pin_invoked_tool_schemas(
+            astra_turn_core::tool_schema_prune::retain_invoked_tool_schemas(
                 black_box(&mut s),
                 black_box(&mut r),
                 black_box(&tool_results),
@@ -339,9 +339,9 @@ criterion_group!(
     bench_sse_frame_end,
     bench_parse_sse_json_frame,
     bench_conversation_state,
-    bench_build_pinned_surface,
-    bench_default_pinned_names,
+    bench_build_always_load_surface,
+    bench_default_always_load_names,
     bench_inject_required_tool_names,
-    bench_pin_invoked_tool_schemas,
+    bench_retain_invoked_tool_schemas,
 );
 criterion_main!(benches);

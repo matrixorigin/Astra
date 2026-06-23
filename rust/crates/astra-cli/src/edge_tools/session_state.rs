@@ -8,7 +8,7 @@ use super::{ToolExecutor, task_mgmt::TaskManagerSnapshot};
 #[derive(Debug, Clone)]
 pub(crate) enum SessionStateRollbackAction {
     ToolPreferences {
-        previous_pinned_tools: Vec<String>,
+        previous_prioritized_tools: Vec<String>,
         previous_deprioritized_tools: Vec<String>,
     },
     ConfigOverride {
@@ -113,14 +113,14 @@ impl ToolExecutor {
 
     pub(crate) fn record_tool_preferences_rollback(
         &self,
-        previous_pinned_tools: Vec<String>,
+        previous_prioritized_tools: Vec<String>,
         previous_deprioritized_tools: Vec<String>,
         label: impl Into<String>,
     ) {
         self.record_session_state_rollback(
             label.into(),
             SessionStateRollbackAction::ToolPreferences {
-                previous_pinned_tools,
+                previous_prioritized_tools,
                 previous_deprioritized_tools,
             },
         );
@@ -261,29 +261,29 @@ impl ToolExecutor {
     ) -> Result<(), String> {
         match &entry.action {
             SessionStateRollbackAction::ToolPreferences {
-                previous_pinned_tools,
+                previous_prioritized_tools,
                 previous_deprioritized_tools,
             } => {
-                let mut pinned = self
-                    .self_mod_pinned_tools
+                let mut prioritized = self
+                    .self_mod_prioritized_tools
                     .lock()
-                    .map_err(|_| "Failed to access pinned tools".to_string())?;
+                    .map_err(|_| "Failed to access prioritized tools".to_string())?;
                 let mut deprioritized = self
                     .self_mod_deprioritized_tools
                     .lock()
                     .map_err(|_| "Failed to access deprioritized tools".to_string())?;
-                let current_pinned = pinned.clone();
+                let current_prioritized = prioritized.clone();
                 let current_deprioritized = deprioritized.clone();
-                *pinned = previous_pinned_tools.clone();
+                *prioritized = previous_prioritized_tools.clone();
                 *deprioritized = previous_deprioritized_tools.clone();
                 if let Some(session_id) = self.active_session_id()
                     && let Err(error) = crate::cli::self_command::persist_tool_preferences(
                         &session_id,
-                        &pinned,
+                        &prioritized,
                         &deprioritized,
                     )
                 {
-                    *pinned = current_pinned;
+                    *prioritized = current_prioritized;
                     *deprioritized = current_deprioritized;
                     return Err(format!(
                         "failed to persist restored tool preferences: {error}"

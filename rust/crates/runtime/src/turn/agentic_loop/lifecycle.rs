@@ -1106,13 +1106,14 @@ fn apply_user_correction_reanchor(state: &mut AgenticLoopState) -> bool {
 #[inline]
 pub(crate) fn estimate_context_pressure(
     messages: &[serde_json::Value],
-    pinned_tool_schema_tokens: usize,
+    always_load_tool_schema_tokens: usize,
     max_turn_input_tokens: u64,
 ) -> (f64, u64) {
     if max_turn_input_tokens == 0 {
         return (0.0, 0);
     }
-    let tokens = crate::prompts::estimate_tokens(messages, pinned_tool_schema_tokens, 0) as u64;
+    let tokens =
+        crate::prompts::estimate_tokens(messages, always_load_tool_schema_tokens, 0) as u64;
     (tokens as f64 / max_turn_input_tokens as f64, tokens)
 }
 
@@ -1792,7 +1793,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         // legacy inline estimation.
         let (pressure, pressure_estimate_tokens) = estimate_context_pressure(
             &state.messages,
-            state.pinned_tool_schema_tokens as usize,
+            state.always_load_tool_schema_tokens as usize,
             state.max_turn_input_tokens,
         );
 
@@ -1885,13 +1886,13 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
 
         // Re-estimate pressure after microcompact (messages may have shrunk).
         // Use the same precise estimation as the pre-microcompact check
-        // above so that pinned tool schema tokens are included — without
+        // above so that always-load tool schema tokens are included — without
         // them, the guard under-estimates pressure and skips compaction
         // (observed in session 540c37d1 where budget_pressure=0.887 but
         // post_mc_pressure was ~0.61 and never crossed the 0.75 threshold).
         let (post_mc_pressure, post_mc_tokens) = estimate_context_pressure(
             &state.messages,
-            state.pinned_tool_schema_tokens as usize,
+            state.always_load_tool_schema_tokens as usize,
             state.max_turn_input_tokens,
         );
 
@@ -1925,7 +1926,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     if turn_index == 0 && state.messages.len() > 10 && state.max_turn_input_tokens > 0 {
         let (estimated_pressure, estimated_tokens) = estimate_context_pressure(
             &state.messages,
-            state.pinned_tool_schema_tokens as usize,
+            state.always_load_tool_schema_tokens as usize,
             state.max_turn_input_tokens,
         );
         if estimated_pressure >= CompactionTier::pre_turn_trigger(state.max_turn_input_tokens) {
@@ -3428,7 +3429,7 @@ mod tests {
     fn high_pressure_cjk_state(max_tokens: u64, schema_tokens: usize) -> AgenticLoopState {
         let mut state = make_state();
         state.max_turn_input_tokens = max_tokens;
-        state.pinned_tool_schema_tokens = schema_tokens as u64;
+        state.always_load_tool_schema_tokens = schema_tokens as u64;
         state.messages = (0..150)
             .map(|i| {
                 json!({"role": "user", "content": format!("这是第{}条测试消息，用于模拟高压力场景，包含足够多的中文字符来产生真实的token估算。会话540c37d1显示CJK文本的token估算往往被低估，这个测试确保修复后不会退化。", i)})
@@ -3485,7 +3486,7 @@ mod tests {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
         state.max_turn_input_tokens = 32_000;
-        state.pinned_tool_schema_tokens = 10_000;
+        state.always_load_tool_schema_tokens = 10_000;
         state.messages = (0..100)
             .map(|i| {
                 json!({"role": "user", "content": format!("CJK压力测试第{}条消息——确保恢复路径也能正常压缩上下文窗口。", i)})

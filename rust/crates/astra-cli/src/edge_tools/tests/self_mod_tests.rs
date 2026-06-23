@@ -97,16 +97,16 @@ async fn tool_priority_updates_self_model_snapshot() {
     let parsed2: Value = serde_json::from_str(&out2).unwrap();
     assert_eq!(parsed1["status"], "completed");
     assert_eq!(parsed2["status"], "completed");
-    assert_eq!(parsed1["previous_pinned_tools"], json!([]));
+    assert_eq!(parsed1["previous_prioritized_tools"], json!([]));
     assert_eq!(parsed1["previous_deprioritized_tools"], json!([]));
-    assert_eq!(parsed2["previous_pinned_tools"], json!(["bash"]));
+    assert_eq!(parsed2["previous_prioritized_tools"], json!(["bash"]));
     assert_eq!(parsed2["previous_deprioritized_tools"], json!([]));
 
     let model = exe.build_self_model_snapshot().unwrap();
     assert!(
         model
             .capabilities
-            .pinned_tools
+            .prioritized_tools
             .contains(&"bash".to_string())
     );
     assert!(
@@ -140,7 +140,7 @@ async fn self_mod_persists_config_and_tool_preferences() {
     assert_eq!(parsed_adjust["status"], "completed");
 
     let ws = session_workspace::read_workspace(&session_id).unwrap();
-    assert!(ws.pinned_tools.contains(&"bash".to_string()));
+    assert!(ws.prioritized_tools.contains(&"bash".to_string()));
     assert!(ws.tuned_config_json.is_some());
 }
 
@@ -155,7 +155,7 @@ fn switching_to_session_without_workspace_clears_self_mod_preferences() {
         "/repo",
         Some("main"),
     );
-    ws.pinned_tools = vec!["bash".to_string()];
+    ws.prioritized_tools = vec!["bash".to_string()];
     ws.deprioritized_tools = vec!["web_fetch".to_string()];
     session_workspace::write_workspace(&ws).unwrap();
 
@@ -169,7 +169,7 @@ fn switching_to_session_without_workspace_clears_self_mod_preferences() {
     assert!(
         model
             .capabilities
-            .pinned_tools
+            .prioritized_tools
             .contains(&"bash".to_string())
     );
     assert!(
@@ -183,8 +183,8 @@ fn switching_to_session_without_workspace_clears_self_mod_preferences() {
 
     let model = exe.build_self_model_snapshot().unwrap();
     assert!(
-        model.capabilities.pinned_tools.is_empty(),
-        "session switch without workspace must clear pinned tool carry-over"
+        model.capabilities.prioritized_tools.is_empty(),
+        "session switch without workspace must clear prioritized tool carry-over"
     );
     assert!(
         model.capabilities.deprioritized_tools.is_empty(),
@@ -205,7 +205,7 @@ fn switching_to_session_with_corrupt_workspace_clears_self_mod_preferences() {
         "/repo",
         Some("main"),
     );
-    ws.pinned_tools = vec!["bash".to_string()];
+    ws.prioritized_tools = vec!["bash".to_string()];
     ws.deprioritized_tools = vec!["web_fetch".to_string()];
     session_workspace::write_workspace(&ws).unwrap();
 
@@ -227,7 +227,7 @@ fn switching_to_session_with_corrupt_workspace_clears_self_mod_preferences() {
     assert!(
         model
             .capabilities
-            .pinned_tools
+            .prioritized_tools
             .contains(&"bash".to_string())
     );
     assert!(
@@ -241,8 +241,8 @@ fn switching_to_session_with_corrupt_workspace_clears_self_mod_preferences() {
 
     let model = exe.build_self_model_snapshot().unwrap();
     assert!(
-        model.capabilities.pinned_tools.is_empty(),
-        "corrupt target workspace must not leak pinned tools from prior session"
+        model.capabilities.prioritized_tools.is_empty(),
+        "corrupt target workspace must not leak prioritized tools from prior session"
     );
     assert!(
         model.capabilities.deprioritized_tools.is_empty(),
@@ -319,7 +319,7 @@ async fn prioritize_tool_preserves_existing_state_when_persist_fails() {
         "/repo",
         Some("main"),
     );
-    ws.pinned_tools = vec!["bash".to_string()];
+    ws.prioritized_tools = vec!["bash".to_string()];
     session_workspace::write_workspace(&ws).unwrap();
 
     let session = std::sync::Arc::new(std::sync::RwLock::new(
@@ -342,7 +342,7 @@ async fn prioritize_tool_preserves_existing_state_when_persist_fails() {
     assert!(
         model
             .capabilities
-            .pinned_tools
+            .prioritized_tools
             .contains(&"bash".to_string())
     );
     assert!(
@@ -395,7 +395,7 @@ async fn deprioritize_tool_preserves_existing_state_when_persist_fails() {
     assert!(
         !model
             .capabilities
-            .pinned_tools
+            .prioritized_tools
             .contains(&"bash".to_string())
     );
 

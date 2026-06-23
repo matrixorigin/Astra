@@ -82,7 +82,7 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub fork_prefix: ForkPrefixConfig,
 
-    /// Tool surface configuration — which tools are pinned into the
+    /// Tool surface configuration — which tools are always-load into the
     /// LLM `tools[]` array vs. exposed through the deferred
     /// system-reminder listing. See [`ToolSurfaceConfig`].
     #[serde(default)]
@@ -337,43 +337,44 @@ impl Default for RuntimeConfig {
 ///
 /// The runtime exposes tools to the LLM in two tiers:
 ///
-/// - **Pinned** — schemas live in the request `tools[]` array on every turn.
+/// - **Always-load** — schemas live in the request `tools[]` array on every turn.
 ///   Small set, byte-stable across a session so the Anthropic prompt cache
-///   hits. Defaults to the runtime `DEFAULT_PINNED` set.
+///   hits. Defaults to the runtime `default always-load` set.
 /// - **Deferred** — every other tool appears as `name + short_desc` in a
 ///   system-reminder block. The model calls `tool_search(query="select:X")`
 ///   to pull a schema into context when it needs X.
 ///
-/// # `pinned_tools` semantics
+/// # `always_load_tools` semantics
 ///
 /// **Within a single config file** (e.g. one `runtime.toml`), entries
-/// apply additively to the built-in [`DEFAULT_PINNED`](runtime crate) set:
-/// - A plain name (e.g. `"github"`) *adds* that tool to the pinned set.
+/// apply additively to the built-in [`default always-load`](runtime crate) set:
+/// - A plain name (e.g. `"github"`) *adds* that tool to the always-load set.
 /// - A name prefixed with `-` (e.g. `"-grep"`) *removes* a default from
-///   the pinned set (it lands in deferred instead).
+///   the always-load set (it lands in deferred instead).
 /// - Unknown names, whitespace-only, bare `-`, or `--foo` are silently
 ///   ignored (see `ToolSurface::build`).
 ///
 /// **Across config layers** (user `~/.astra/config/runtime.toml` vs.
 /// project `.astra/config/runtime.toml`), the merge is **atomic, not
-/// additive**: a project-level `pinned_tools` list fully replaces the
+/// additive**: a project-level `always_load_tools` list fully replaces the
 /// user-level one. This is intentional — a project should own its tool
-/// surface without silently inheriting a user's personal pins. If you
-/// want user-level pins in a project session, copy them into the project
-/// file. See `merge()` at the bottom of this file for the precise rule.
+/// surface without silently inheriting a user's personal always-load
+/// preferences. If you want user-level entries in a project session,
+/// copy them into the project file. See `merge()` at the bottom of this
+/// file for the precise rule.
 ///
 /// Example `runtime.toml`:
 /// ```toml
 /// [tool_surface]
-/// pinned_tools = ["github", "memory", "-grep"]
+/// always_load_tools = ["github", "memory", "-grep"]
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolSurfaceConfig {
-    /// Tools to pin into the LLM `tools[]` array. See struct-level
+    /// Tools to always load into the LLM `tools[]` array. See struct-level
     /// doc for within-file (additive) vs cross-file (atomic replace)
     /// semantics.
     #[serde(default)]
-    pub pinned_tools: Vec<String>,
+    pub always_load_tools: Vec<String>,
 }
 
 // ─── Compression Configuration ───────────────────────────────────────────────
@@ -2219,11 +2220,12 @@ impl RuntimeConfig {
         }
 
         // ToolSurfaceConfig: whole-struct replacement when `other` is
-        // non-empty. `pinned_tools` is a user-expressed override list —
+        // non-empty. `always_load_tools` is a user-expressed override list —
         // additive merge would let a project config silently inherit a
-        // user's pins, which is surprising. Treat it atomically: if the
-        // project (or env) file sets it, it wins outright.
-        if !tool_surface.pinned_tools.is_empty() {
+        // user's personal always-load preferences, which is surprising.
+        // Treat it atomically: if the project (or env) file sets it, it
+        // wins outright.
+        if !tool_surface.always_load_tools.is_empty() {
             self.tool_surface = tool_surface;
         }
 

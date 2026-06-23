@@ -275,31 +275,31 @@ impl ToolExecutor {
             return json!({"error": format!("Unknown tool: {tool}")}).to_string();
         }
 
-        let mut pinned = match self.self_mod_pinned_tools.lock() {
+        let mut prioritized = match self.self_mod_prioritized_tools.lock() {
             Ok(v) => v,
-            Err(_) => return json!({"error": "Failed to access pinned tools"}).to_string(),
+            Err(_) => return json!({"error": "Failed to access prioritized tools"}).to_string(),
         };
         let mut deprioritized = match self.self_mod_deprioritized_tools.lock() {
             Ok(v) => v,
             Err(_) => return json!({"error": "Failed to access deprioritized tools"}).to_string(),
         };
-        let original_pinned = pinned.clone();
+        let original_prioritized = prioritized.clone();
         let original_deprioritized = deprioritized.clone();
 
-        if !pinned.contains(&tool) {
-            pinned.push(tool.clone());
+        if !prioritized.contains(&tool) {
+            prioritized.push(tool.clone());
         }
-        pinned.sort();
+        prioritized.sort();
         deprioritized.retain(|t| t != &tool);
 
         if let Some(session_id) = self.active_session_id()
             && let Err(error) = crate::cli::self_command::persist_tool_preferences(
                 &session_id,
-                &pinned,
+                &prioritized,
                 &deprioritized,
             )
         {
-            *pinned = original_pinned;
+            *prioritized = original_prioritized;
             *deprioritized = original_deprioritized;
             return json!({
                 "error": "failed_to_persist_tool_preferences",
@@ -309,10 +309,11 @@ impl ToolExecutor {
             .to_string();
         }
 
-        let changed = original_pinned != *pinned || original_deprioritized != *deprioritized;
+        let changed =
+            original_prioritized != *prioritized || original_deprioritized != *deprioritized;
         if changed {
             self.record_tool_preferences_rollback(
-                original_pinned.clone(),
+                original_prioritized.clone(),
                 original_deprioritized.clone(),
                 format!("prioritize_tool:{tool}"),
             );
@@ -320,9 +321,9 @@ impl ToolExecutor {
         json!({
             "status": "completed",
             "prioritized_tool": tool,
-            "previous_pinned_tools": original_pinned,
+            "previous_prioritized_tools": original_prioritized,
             "previous_deprioritized_tools": original_deprioritized,
-            "pinned_tools": pinned.clone(),
+            "prioritized_tools": prioritized.clone(),
             "deprioritized_tools": deprioritized.clone()
         })
         .to_string()
@@ -336,31 +337,31 @@ impl ToolExecutor {
             return json!({"error": format!("Unknown tool: {tool}")}).to_string();
         }
 
-        let mut pinned = match self.self_mod_pinned_tools.lock() {
+        let mut prioritized = match self.self_mod_prioritized_tools.lock() {
             Ok(v) => v,
-            Err(_) => return json!({"error": "Failed to access pinned tools"}).to_string(),
+            Err(_) => return json!({"error": "Failed to access prioritized tools"}).to_string(),
         };
         let mut deprioritized = match self.self_mod_deprioritized_tools.lock() {
             Ok(v) => v,
             Err(_) => return json!({"error": "Failed to access deprioritized tools"}).to_string(),
         };
-        let original_pinned = pinned.clone();
+        let original_prioritized = prioritized.clone();
         let original_deprioritized = deprioritized.clone();
 
         if !deprioritized.contains(&tool) {
             deprioritized.push(tool.clone());
         }
         deprioritized.sort();
-        pinned.retain(|t| t != &tool);
+        prioritized.retain(|t| t != &tool);
 
         if let Some(session_id) = self.active_session_id()
             && let Err(error) = crate::cli::self_command::persist_tool_preferences(
                 &session_id,
-                &pinned,
+                &prioritized,
                 &deprioritized,
             )
         {
-            *pinned = original_pinned;
+            *prioritized = original_prioritized;
             *deprioritized = original_deprioritized;
             return json!({
                 "error": "failed_to_persist_tool_preferences",
@@ -370,10 +371,11 @@ impl ToolExecutor {
             .to_string();
         }
 
-        let changed = original_pinned != *pinned || original_deprioritized != *deprioritized;
+        let changed =
+            original_prioritized != *prioritized || original_deprioritized != *deprioritized;
         if changed {
             self.record_tool_preferences_rollback(
-                original_pinned.clone(),
+                original_prioritized.clone(),
                 original_deprioritized.clone(),
                 format!("deprioritize_tool:{tool}"),
             );
@@ -381,9 +383,9 @@ impl ToolExecutor {
         json!({
             "status": "completed",
             "deprioritized_tool": tool,
-            "previous_pinned_tools": original_pinned,
+            "previous_prioritized_tools": original_prioritized,
             "previous_deprioritized_tools": original_deprioritized,
-            "pinned_tools": pinned.clone(),
+            "prioritized_tools": prioritized.clone(),
             "deprioritized_tools": deprioritized.clone()
         })
         .to_string()

@@ -24,41 +24,41 @@ pub fn anthropic_ephemeral_cache_control() -> Value {
     json!({ "type": "ephemeral" })
 }
 
-/// Place a single `cache_control` marker on the last pinned tool schema in
+/// Place a single `cache_control` marker on the last always-load tool schema in
 /// `tool_schemas`, ending the static-lib prefix. Later dynamic tools still
 /// appear in the array but do not invalidate the cached prefix.
 ///
-/// `pinned_names` is the set of tool names guaranteed present every turn
-/// (the "static lib"). If no pinned tool is present (e.g. a delegated
+/// `always_load_names` is the set of tool names guaranteed present every turn
+/// (the "static lib"). If no always-load tool is present (e.g. a delegated
 /// sub-run with a fully custom toolset), the marker falls back to the last
 /// tool in the array — cache hits on dynamic tail are still a best-effort
 /// win, and the caller is expected to log a warning at the call-site.
 ///
 /// No-op when `tool_schemas` is empty.
-/// Annotates tool schemas with `cache_control` on the last pinned tool. See
+/// Annotates tool schemas with `cache_control` on the last always-load tool. See
 /// module-level docs for cache-key rationale.
 ///
-/// Fallback: if no pinned tools are present in the input slice, falls back to
+/// Fallback: if no always-load tools are present in the input slice, falls back to
 /// marking the final tool to preserve cache-boundary behavior and emits a
 /// `warn!` log (observability for the degraded case).
-pub fn annotate_pinned_tool_schema(
+pub fn annotate_always_load_tool_schema(
     tool_schemas: &mut [Value],
-    pinned_names: &std::collections::HashSet<String>,
+    always_load_names: &std::collections::HashSet<String>,
 ) {
     if tool_schemas.is_empty() {
         return;
     }
-    let marker_idx = match last_pinned_tool_index(tool_schemas, pinned_names) {
+    let marker_idx = match last_always_load_tool_index(tool_schemas, always_load_names) {
         Some(idx) => idx,
         None => {
-            // Degraded path: no pinned tools present. Fall back to the last
+            // Degraded path: no always-load tools present. Fall back to the last
             // tool to preserve the cache-boundary contract, but emit a warn!
             // so this shows up in observability (L3 remediation).
             tracing::warn!(
                 target: "astra::cache",
                 tool_count = tool_schemas.len(),
-                pinned_count = pinned_names.len(),
-                "annotate_pinned_tool_schema: no pinned tools found — \
+                always_load_count = always_load_names.len(),
+                "annotate_always_load_tool_schema: no always-load tools found — \
                  falling back to final tool for cache_control marker"
             );
             tool_schemas.len() - 1
@@ -67,11 +67,11 @@ pub fn annotate_pinned_tool_schema(
     tool_schemas[marker_idx]["cache_control"] = anthropic_ephemeral_cache_control();
 }
 
-fn last_pinned_tool_index(
+fn last_always_load_tool_index(
     tools: &[Value],
-    pinned_names: &std::collections::HashSet<String>,
+    always_load_names: &std::collections::HashSet<String>,
 ) -> Option<usize> {
-    if pinned_names.is_empty() {
+    if always_load_names.is_empty() {
         return None;
     }
     tools.iter().enumerate().rev().find_map(|(idx, t)| {
@@ -79,7 +79,7 @@ fn last_pinned_tool_index(
             .get("function")
             .and_then(|f| f.get("name"))
             .and_then(Value::as_str)?;
-        if pinned_names.contains(name) {
+        if always_load_names.contains(name) {
             Some(idx)
         } else {
             None
@@ -91,7 +91,7 @@ fn last_pinned_tool_index(
 ///
 /// This matches the reference agent's Anthropic/Bedrock request contract: system
 /// blocks carry the stable-prefix markers, tools carry one marker at the end
-/// of the pinned static prefix, and messages carry exactly one tail marker.
+/// of the always-load static prefix, and messages carry exactly one tail marker.
 /// Historical messages stay byte-stable because we never rewrite an older
 /// round to preserve a second "historical" marker.
 ///
@@ -316,17 +316,17 @@ mod tests {
     }
 
     #[test]
-    fn annotate_pinned_tool_schema_marks_last_pinned() {
+    fn annotate_always_load_tool_schema_marks_last_always_load() {
         let mut tools = vec![
-            tool_schema("bash"),      // pinned
-            tool_schema("read_file"), // pinned
+            tool_schema("bash"),      // always-load
+            tool_schema("read_file"), // always-load
             tool_schema("custom_a"),  // dynamic
             tool_schema("custom_b"),  // dynamic
         ];
-        let pinned: std::collections::HashSet<String> =
+        let always_load: std::collections::HashSet<String> =
             ["bash".into(), "read_file".into()].into_iter().collect();
-        annotate_pinned_tool_schema(&mut tools, &pinned);
-        // Marker goes on last pinned (read_file, idx 1), NOT the last
+        annotate_always_load_tool_schema(&mut tools, &always_load);
+        // Marker goes on last always-load (read_file, idx 1), NOT the last
         // overall tool — dynamic churn after this marker is expected
         // and cache-safe.
         assert!(tools[0]["cache_control"].is_null());
@@ -336,18 +336,18 @@ mod tests {
     }
 
     #[test]
-    fn annotate_pinned_tool_schema_fallback_on_last_when_no_pinned() {
+    fn annotate_always_load_tool_schema_fallback_on_last_when_no_always_load() {
         let mut tools = vec![tool_schema("custom_a"), tool_schema("custom_b")];
-        let pinned = std::collections::HashSet::new();
-        annotate_pinned_tool_schema(&mut tools, &pinned);
+        let always_load = std::collections::HashSet::new();
+        annotate_always_load_tool_schema(&mut tools, &always_load);
         assert!(tools[0]["cache_control"].is_null());
         assert_eq!(tools[1]["cache_control"], json!({"type": "ephemeral"}));
     }
 
     #[test]
-    fn annotate_pinned_tool_schema_noop_on_empty() {
+    fn annotate_always_load_tool_schema_noop_on_empty() {
         let mut tools: Vec<Value> = Vec::new();
-        annotate_pinned_tool_schema(&mut tools, &std::collections::HashSet::new());
+        annotate_always_load_tool_schema(&mut tools, &std::collections::HashSet::new());
         assert!(tools.is_empty());
     }
 
@@ -648,7 +648,7 @@ mod tests {
     /// If `annotate_last_message_cache_breakpoint` lands its marker on
     /// one of those trailing system messages, the marker's content
     /// changes every round and invalidates the cache boundary for the
-    /// rest of the request. Cache_read stays pinned at the size of the
+    /// rest of the request. Cache_read stays anchored at the size of the
     /// stable prefix only.
     ///
     /// The fix walks the tail backwards past any `role=system` msgs and

@@ -12,7 +12,7 @@
 //! 1. `cc_marker_frozen` — marker positions unchanged across 3+
 //!    consecutive rounds of the same turn → agentic tool-loop rolling
 //!    regression.
-//! 2. `tool_marker_not_on_tail` — pinned-tool cache_control lands
+//! 2. `tool_marker_not_on_tail` — always-load tool cache_control lands
 //!    strictly before the last tool → later tools fall outside the
 //!    cached prefix.
 //! 3. `cache_read_collapsed` — `cache_read` drops >50% between
@@ -457,9 +457,9 @@ fn rule_cc_marker_frozen(rounds: &[RoundSnapshot]) -> Option<CacheFinding> {
 
 /// **Rule 2 — tool_marker_not_on_tail.**
 ///
-/// If the pinned-tool cache_control marker lands at an index strictly
+/// If the always-load tool cache_control marker lands at an index strictly
 /// before the last tool, every tool after it falls outside the cached
-/// prefix. In session d0640d3d the pinned set omitted `web_search`
+/// prefix. In session d0640d3d the always-load set omitted `web_search`
 /// (idx 20 of 21), so the marker landed on `skill` (idx 19) and every
 /// request paid tokens on web_search's schema.
 #[must_use]
@@ -486,7 +486,7 @@ fn rule_tool_marker_not_on_tail(rounds: &[RoundSnapshot]) -> Option<CacheFinding
             s = if gap == 1 { "" } else { "s" },
         ),
         actionable_fix: "If the trailing schemas are meant to be static every turn, audit \
-             `default_pinned_tool_names()`; deferred or turn-selected tools after the marker \
+             `default_always_load_tool_names()`; deferred or turn-selected tools after the marker \
              are expected to sit outside the cached prefix."
             .into(),
         triggered_on: vec![(sample.turn, sample.round)],

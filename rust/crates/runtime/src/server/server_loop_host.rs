@@ -511,7 +511,7 @@ pub struct CapturedLlmRequest {
     pub system_primary: Value,
     /// The optional per-turn dynamic system message (OpenAI split only).
     pub system_dynamic: Option<Value>,
-    /// Tool schemas after pruning + `annotate_tool_schemas_for_caching_with_pinned`.
+    /// Tool schemas after pruning + `annotate_tool_schemas_for_caching_with_always_load`.
     pub tools: Vec<Value>,
     /// Conversation messages after `add_message_cache_breakpoint` was applied
     /// (for Anthropic) or a clone of `state.messages` (otherwise).
@@ -830,12 +830,12 @@ pub struct ServerAgenticLoopHost {
     /// This is the set that `tool_search(select:NAME)` can safely expose and
     /// that a direct deferred call may convert into an activation intent.
     current_activatable_deferred_tool_names: HashSet<String>,
-    /// Resolved pinned (T1) tool names for this session. Populated from the
-    /// CLI-side `edge_profile.pinned_tool_names`. Used to place cache_control
-    /// markers at the correct pinned/dynamic boundary. Falls back to
-    /// `prompt_cache::runtime_pinned_tool_names()` when the edge omits this key
+    /// Resolved always-load (T1) tool names for this session. Populated from the
+    /// CLI-side `edge_profile.always_load_tool_names`. Used to place cache_control
+    /// markers at the correct always-load/dynamic boundary. Falls back to
+    /// `prompt_cache::runtime_always_load_tool_names()` when the edge omits this key
     /// (e.g. test fixtures or server-side-tools mode).
-    pinned_tool_names: HashSet<String>,
+    always_load_tool_names: HashSet<String>,
     /// Executor whose admission state mirrors the current wire tool surface.
     /// Used by edge-ledger validation to record direct deferred calls as
     /// next-round activations instead of returning a misleading hard error.
@@ -1282,15 +1282,15 @@ impl ServerAgenticLoopHostBuilder {
         };
         valid_tools.extend(admissible_extras.iter().cloned());
 
-        // Resolve pinned tool names from the CLI-sent edge_profile. The CLI
-        // sends `EDGE_PROFILE_KEY_PINNED_TOOL_NAMES` as the ToolSurface's
-        // resolved pinned name set (user TOML overrides included). When the
+        // Resolve always-load tool names from the CLI-sent edge_profile. The CLI
+        // sends `EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES` as the ToolSurface's
+        // resolved always-load name set (user TOML overrides included). When the
         // edge omits it (test fixtures or server-side-tools mode), fall back
         // to the runtime-configured surface so cache_control markers still
         // match TOML overrides.
-        let pinned_tool_names: HashSet<String> = self
+        let always_load_tool_names: HashSet<String> = self
             .edge_profile
-            .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_PINNED_TOOL_NAMES)
+            .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES)
             .and_then(Value::as_array)
             .map(|arr| {
                 arr.iter()
@@ -1298,7 +1298,7 @@ impl ServerAgenticLoopHostBuilder {
                     .map(str::to_string)
                     .collect()
             })
-            .unwrap_or_else(|| crate::turn::prompt_cache::runtime_pinned_tool_names());
+            .unwrap_or_else(|| crate::turn::prompt_cache::runtime_always_load_tool_names());
 
         let progress_rx = self.progress_broadcaster.as_ref().map(|b| b.subscribe());
         let progress_filter = self
@@ -1319,7 +1319,7 @@ impl ServerAgenticLoopHostBuilder {
             valid_tools,
             current_deferred_tool_names: HashSet::new(),
             current_activatable_deferred_tool_names: HashSet::new(),
-            pinned_tool_names,
+            always_load_tool_names,
             current_server_tool_executor: None,
             admissible_extras,
             server_side_tools,
@@ -1932,7 +1932,7 @@ impl ServerAgenticLoopHost {
         crate::turn::llm::context::annotate_tool_schemas_for_cache(
             &mut annotated_tools,
             &cache_cfg,
-            &self.pinned_tool_names,
+            &self.always_load_tool_names,
         );
         self.sync_valid_tools_to_wire_surface_for_state(&annotated_tools, state);
         self.last_turn_tool_schemas = annotated_tools.clone();
@@ -3485,7 +3485,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         crate::turn::llm::context::annotate_tool_schemas_for_cache(
             &mut final_tools,
             &cache_cfg,
-            &self.pinned_tool_names,
+            &self.always_load_tool_names,
         );
         // Runtime admission must mirror the exact tool schemas sent on the
         // wire. Pipeline pruning, sticky schema stabilization, and cache
@@ -3505,7 +3505,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &final_system_prompt_breakdown,
             state.last_llm_context_manifest_trace.as_ref(),
         );
-        state.pinned_tool_schema_tokens = estimate_tool_schema_tokens(&final_tools);
+        state.always_load_tool_schema_tokens = estimate_tool_schema_tokens(&final_tools);
         state.last_turn_policy =
             TurnInteractionPolicy::from_tool_schemas(self.turn_interaction_mode(), &final_tools);
 
@@ -4760,7 +4760,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_edge_profile_pinned_tool_names_controls_cache_marker_boundary() {
+    fn builder_edge_profile_always_load_tool_names_controls_cache_marker_boundary() {
         let cache_cfg = crate::turn::prompt_cache::PromptCacheConfig {
             cache_enabled: true,
             is_anthropic: true,
@@ -4778,17 +4778,18 @@ mod tests {
         crate::turn::llm::context::annotate_tool_schemas_for_cache(
             &mut default_tools,
             &cache_cfg,
-            &default_host.pinned_tool_names,
+            &default_host.always_load_tool_names,
         );
         assert!(default_tools[0].get("cache_control").is_none());
         assert!(
             default_tools[1].get("cache_control").is_some(),
-            "without edge override, the runtime default pinned set keeps read_file inside the cached prefix"
+            "without edge override, the runtime default always-load set keeps read_file inside the cached prefix"
         );
 
         let mut edge_profile = Map::new();
         edge_profile.insert(
-            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_PINNED_TOOL_NAMES.to_string(),
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES
+                .to_string(),
             json!(["bash"]),
         );
         let override_host = ServerAgenticLoopHostBuilder::new(
@@ -4804,11 +4805,11 @@ mod tests {
         crate::turn::llm::context::annotate_tool_schemas_for_cache(
             &mut override_tools,
             &cache_cfg,
-            &override_host.pinned_tool_names,
+            &override_host.always_load_tool_names,
         );
         assert!(
             override_tools[0].get("cache_control").is_some(),
-            "edge_profile pinned_tool_names must move the marker to the actual resolved pinned prefix"
+            "edge_profile always_load_tool_names must move the marker to the actual resolved always-load prefix"
         );
         assert!(override_tools[1].get("cache_control").is_none());
     }
@@ -7549,7 +7550,7 @@ mod tests {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
-            pinned_tool_schema_tokens: 0,
+            always_load_tool_schema_tokens: 0,
             sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,

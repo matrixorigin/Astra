@@ -227,7 +227,7 @@ pub fn manifest_tool_to_entry(skill_name: &str, tool: &ManifestToolDef) -> Plugi
         name: tool.name.clone(),
         description: tool.description.clone(),
         triggers: tool.triggers.clone(),
-        pinned: false,
+        always_load: false,
         intents: tool
             .intents
             .iter()
@@ -834,7 +834,7 @@ depends_on: []
         assert_eq!(entry.name, "kubectl_get");
         assert_eq!(entry.source, "skills/kubernetes");
         assert!(entry.enabled);
-        assert!(!entry.pinned);
+        assert!(!entry.always_load);
         assert!(entry.intents.contains(&IntentType::CodeRead));
         assert_eq!(entry.scope, Scope::Local);
         assert!(entry.schema_tokens > 0);

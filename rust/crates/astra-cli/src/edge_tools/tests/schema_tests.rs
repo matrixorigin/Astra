@@ -407,7 +407,7 @@ fn ask_user_schema_advertises_questionnaire_tabs_and_multi_select() {
         .expect("ask_user description should be a string");
     assert!(
         description.len() <= 180,
-        "ask_user description must stay compact in the pinned prefix: {description}"
+        "ask_user description must stay compact in the always-load prefix: {description}"
     );
     assert!(
         description.contains("structured questions") && description.contains("multi_select"),

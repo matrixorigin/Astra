@@ -248,7 +248,7 @@ impl AgenticLoopHost for SubRunHost {
             );
         let schemas_to_use = resolve_subrun_schemas(
             self.inherited_prefix.as_ref(),
-            base_tool_surface.pinned_schemas(),
+            base_tool_surface.always_load_schemas(),
         );
         state.last_turn_policy = attach_subrun_tool_surface(
             &mut payload,
@@ -728,7 +728,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
-            pinned_tool_schema_tokens: 0,
+            always_load_tool_schema_tokens: 0,
             sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
@@ -779,7 +779,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
 ///
 /// Returns the parent's frozen canonical schemas when fork-prefix
 /// inheritance is active **and** schemas were captured; otherwise
-/// returns `fallback_pinned` (the live surface's T1 set).
+/// returns `fallback_always_load` (the live surface's T1 set).
 ///
 /// When fork inheritance is configured but `frozen_tool_schemas` is
 /// `None` we **must** fall back, but we also emit a warning: the
@@ -790,7 +790,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
 /// better than silent.
 fn resolve_subrun_schemas(
     inherited: Option<&astra_runtime::orchestration::InheritedChildPrefix>,
-    fallback_pinned: Vec<Value>,
+    fallback_always_load: Vec<Value>,
 ) -> Vec<Value> {
     match inherited {
         Some(ip) => match &ip.frozen_tool_schemas {
@@ -801,13 +801,13 @@ fn resolve_subrun_schemas(
                     prefix_id = %ip.prefix_id,
                     parent_run_id = %ip.parent_run_id,
                     "fork inheritance active but frozen_tool_schemas is None; \
-                     falling back to T1 pinned schemas — child tool_schema_hash \
+                     falling back to T1 always-load schemas — child tool_schema_hash \
                      will not match parent's, prefix-cache reuse will miss"
                 );
-                fallback_pinned
+                fallback_always_load
             }
         },
-        None => fallback_pinned,
+        None => fallback_always_load,
     }
 }
 
@@ -1325,12 +1325,12 @@ mod tests {
         assert_eq!(SUBRUN_MAX_CUMULATIVE_TOKENS, 120_000);
     }
 
-    /// No fork inheritance → just use the live surface's pinned set.
+    /// No fork inheritance → just use the live surface's always-load set.
     #[test]
-    fn resolve_subrun_schemas_no_inheritance_uses_pinned_fallback() {
-        let pinned = vec![schema("read_file"), schema("write_file")];
-        let resolved = resolve_subrun_schemas(None, pinned.clone());
-        assert_eq!(resolved, pinned);
+    fn resolve_subrun_schemas_no_inheritance_uses_always_load_fallback() {
+        let always_load = vec![schema("read_file"), schema("write_file")];
+        let resolved = resolve_subrun_schemas(None, always_load.clone());
+        assert_eq!(resolved, always_load);
     }
 
     /// Fork inheritance with captured schemas → use the captured set
@@ -1339,7 +1339,7 @@ mod tests {
     fn resolve_subrun_schemas_fork_with_frozen_uses_parent_schemas() {
         use astra_runtime::orchestration::InheritedChildPrefix;
         let frozen = vec![schema("bash"), schema("grep")];
-        let pinned_fallback = vec![schema("read_file"), schema("write_file")];
+        let always_load_fallback = vec![schema("read_file"), schema("write_file")];
         let ip = InheritedChildPrefix {
             prefix_id: "p1".into(),
             parent_run_id: "r1".into(),
@@ -1349,20 +1349,20 @@ mod tests {
             frozen_tool_schemas: Some(frozen.clone()),
             expected_cache_read_tokens: 0,
         };
-        let resolved = resolve_subrun_schemas(Some(&ip), pinned_fallback);
+        let resolved = resolve_subrun_schemas(Some(&ip), always_load_fallback);
         assert_eq!(resolved, frozen);
     }
 
     /// Fork inheritance present but `frozen_tool_schemas` is None — the
     /// degenerate case the reviewer flagged. We still have to return
     /// *something* that lets the child run, so we fall back to the
-    /// T1 pinned set, but the helper's job is to make the regression
+    /// T1 always-load set, but the helper's job is to make the regression
     /// loud (verified by the tracing target/log assertions in the
     /// surrounding integration; here we pin behavior + payload shape).
     #[test]
-    fn resolve_subrun_schemas_fork_without_frozen_falls_back_to_pinned() {
+    fn resolve_subrun_schemas_fork_without_frozen_falls_back_to_always_load() {
         use astra_runtime::orchestration::InheritedChildPrefix;
-        let pinned_fallback = vec![schema("read_file"), schema("write_file")];
+        let always_load_fallback = vec![schema("read_file"), schema("write_file")];
         let ip = InheritedChildPrefix {
             prefix_id: "p2".into(),
             parent_run_id: "r2".into(),
@@ -1372,9 +1372,9 @@ mod tests {
             frozen_tool_schemas: None,
             expected_cache_read_tokens: 0,
         };
-        let resolved = resolve_subrun_schemas(Some(&ip), pinned_fallback.clone());
+        let resolved = resolve_subrun_schemas(Some(&ip), always_load_fallback.clone());
         // Behaviour: must return fallback (NOT empty, NOT inherited).
-        assert_eq!(resolved, pinned_fallback);
+        assert_eq!(resolved, always_load_fallback);
     }
 
     // Session c47c2dca regression guard. Same invariant as

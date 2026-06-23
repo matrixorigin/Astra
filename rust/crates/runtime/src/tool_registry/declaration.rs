@@ -1,13 +1,13 @@
-//! Stable identity metadata for known tool names.
+//! Stable declarations for known tool names.
 //!
 //! This module is deliberately not a surface builder. It only classifies names so the
-//! schema catalog, runtime capability registry, and default pinned surface can
+//! schema catalog, runtime capability registry, and default always-load surface can
 //! be checked for drift.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ToolPublicStatus {
+pub enum ToolLoadPolicy {
     /// Visible in the default `tools[]` surface when the schema exists.
-    Pinned,
+    AlwaysLoad,
     /// Advertised through the deferred catalog and activated with `tool_search`.
     Deferred,
     /// Callable only through a narrower control-plane path, not via the public
@@ -18,66 +18,66 @@ pub enum ToolPublicStatus {
     Internal,
 }
 
-impl ToolPublicStatus {
+impl ToolLoadPolicy {
     #[cfg(test)]
-    pub const fn is_public_schema_status(self) -> bool {
-        matches!(self, Self::Pinned | Self::Deferred | Self::ExplicitOnly)
+    pub const fn is_public_schema_policy(self) -> bool {
+        matches!(self, Self::AlwaysLoad | Self::Deferred | Self::ExplicitOnly)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ToolIdentity {
+pub struct ToolDeclaration {
     pub name: &'static str,
-    pub status: ToolPublicStatus,
+    pub load_policy: ToolLoadPolicy,
     pub note: &'static str,
 }
 
-const fn pinned(name: &'static str, note: &'static str) -> ToolIdentity {
-    ToolIdentity {
+const fn always_load(name: &'static str, note: &'static str) -> ToolDeclaration {
+    ToolDeclaration {
         name,
-        status: ToolPublicStatus::Pinned,
+        load_policy: ToolLoadPolicy::AlwaysLoad,
         note,
     }
 }
 
-const fn deferred(name: &'static str, note: &'static str) -> ToolIdentity {
-    ToolIdentity {
+const fn deferred(name: &'static str, note: &'static str) -> ToolDeclaration {
+    ToolDeclaration {
         name,
-        status: ToolPublicStatus::Deferred,
+        load_policy: ToolLoadPolicy::Deferred,
         note,
     }
 }
 
-const fn explicit_only(name: &'static str, note: &'static str) -> ToolIdentity {
-    ToolIdentity {
+const fn explicit_only(name: &'static str, note: &'static str) -> ToolDeclaration {
+    ToolDeclaration {
         name,
-        status: ToolPublicStatus::ExplicitOnly,
+        load_policy: ToolLoadPolicy::ExplicitOnly,
         note,
     }
 }
 
-const fn internal(name: &'static str, note: &'static str) -> ToolIdentity {
-    ToolIdentity {
+const fn internal(name: &'static str, note: &'static str) -> ToolDeclaration {
+    ToolDeclaration {
         name,
-        status: ToolPublicStatus::Internal,
+        load_policy: ToolLoadPolicy::Internal,
         note,
     }
 }
 
-static TOOL_IDENTITIES: &[ToolIdentity] = &[
-    pinned("ask_user", "structured clarification"),
-    pinned("bash", "core shell escape hatch"),
-    pinned("git", "core version-control observability"),
-    pinned("glob", "core file discovery"),
-    pinned("grep", "core content search"),
-    pinned("list_dir", "core directory inspection"),
-    pinned("memory", "intrinsic memory"),
-    pinned("read_file", "core file read"),
-    pinned("skill", "runtime-injected skill activation"),
-    pinned("str_replace", "core targeted edit"),
-    pinned("task", "visible task board"),
-    pinned("tool_search", "deferred activation primitive"),
-    pinned("write_file", "core file write/delete"),
+static TOOL_DECLARATIONS: &[ToolDeclaration] = &[
+    always_load("ask_user", "structured clarification"),
+    always_load("bash", "core shell escape hatch"),
+    always_load("git", "core version-control observability"),
+    always_load("glob", "core file discovery"),
+    always_load("grep", "core content search"),
+    always_load("list_dir", "core directory inspection"),
+    always_load("memory", "intrinsic memory"),
+    always_load("read_file", "core file read"),
+    always_load("skill", "runtime-injected skill activation"),
+    always_load("str_replace", "core targeted edit"),
+    always_load("task", "visible task board"),
+    always_load("tool_search", "deferred activation primitive"),
+    always_load("write_file", "core file write/delete"),
     deferred("agent", "delegation"),
     deferred("agent_fanout", "parallel delegation"),
     deferred("compress_context", "manual context compression"),
@@ -116,15 +116,15 @@ static TOOL_IDENTITIES: &[ToolIdentity] = &[
     internal("git_clone", "deployment/runtime clone helper"),
 ];
 
-pub fn all_tool_identities() -> &'static [ToolIdentity] {
-    TOOL_IDENTITIES
+pub fn all_tool_declarations() -> &'static [ToolDeclaration] {
+    TOOL_DECLARATIONS
 }
 
 #[cfg(test)]
-pub fn tool_identity(name: &str) -> Option<&'static ToolIdentity> {
-    TOOL_IDENTITIES
+pub fn tool_declaration(name: &str) -> Option<&'static ToolDeclaration> {
+    TOOL_DECLARATIONS
         .iter()
-        .find(|identity| identity.name == name)
+        .find(|declaration| declaration.name == name)
 }
 
 #[cfg(test)]
@@ -140,58 +140,58 @@ mod tests {
     }
 
     #[test]
-    fn identities_have_unique_names() {
+    fn declarations_have_unique_names() {
         let mut seen = std::collections::BTreeSet::new();
-        for identity in all_tool_identities() {
+        for declaration in all_tool_declarations() {
             assert!(
-                seen.insert(identity.name),
-                "duplicate tool identity: {}",
-                identity.name
+                seen.insert(declaration.name),
+                "duplicate tool declaration: {}",
+                declaration.name
             );
         }
     }
 
-    /// Renamed: pinned names are now derived from [`ToolIdentity`] classification
-    /// (see `surface::default_pinned_names()`), so identity-pinned consistency is
-    /// guaranteed by construction. This test verifies the derivation contract.
+    /// Always-load names are derived from [`ToolDeclaration`] classification
+    /// (see `surface::default_always_load_names()`), so consistency is
+    /// guaranteed by construction. This test verifies that derivation contract.
     #[test]
-    fn default_pinned_names_derived_from_pinned_identities() {
+    fn default_always_load_names_derived_from_always_load_declarations() {
         let derived: std::collections::BTreeSet<&str> =
-            crate::tool_registry::surface::default_pinned_names()
+            crate::tool_registry::surface::default_always_load_names()
                 .iter()
                 .copied()
                 .collect();
-        let identity_pinned: std::collections::BTreeSet<&str> =
-            crate::tool_registry::identity::all_tool_identities()
+        let declaration_always_load: std::collections::BTreeSet<&str> =
+            crate::tool_registry::declaration::all_tool_declarations()
                 .iter()
-                .filter(|id| id.status == ToolPublicStatus::Pinned)
+                .filter(|id| id.load_policy == ToolLoadPolicy::AlwaysLoad)
                 .map(|id| id.name)
                 .collect();
         assert_eq!(
-            derived, identity_pinned,
-            "default_pinned_names() must include every Pinned identity and nothing else"
+            derived, declaration_always_load,
+            "default_always_load_names() must include every AlwaysLoad declaration and nothing else"
         );
     }
 
     #[test]
-    fn public_schema_names_have_public_identity() {
+    fn public_schema_names_have_public_declaration() {
         for name in schema_names() {
-            let identity = tool_identity(&name)
-                .unwrap_or_else(|| panic!("schema tool has no identity: {name}"));
+            let declaration = tool_declaration(&name)
+                .unwrap_or_else(|| panic!("schema tool has no declaration: {name}"));
             assert!(
-                identity.status.is_public_schema_status(),
+                declaration.load_policy.is_public_schema_policy(),
                 "schema tool must not be internal or alias-only: {name}"
             );
         }
     }
 
     #[test]
-    fn runtime_env_builtins_have_identity() {
+    fn runtime_env_builtins_have_declaration() {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         for spec in registry.iter() {
             assert!(
-                tool_identity(&spec.name).is_some(),
-                "runtime-env builtin has no identity: {}",
+                tool_declaration(&spec.name).is_some(),
+                "runtime-env builtin has no declaration: {}",
                 spec.name
             );
         }
@@ -200,14 +200,14 @@ mod tests {
     #[test]
     fn internal_names_do_not_have_public_schemas() {
         let schema_names = schema_names();
-        for identity in all_tool_identities()
+        for identity in all_tool_declarations()
             .iter()
-            .filter(|identity| identity.status == ToolPublicStatus::Internal)
+            .filter(|declaration| declaration.load_policy == ToolLoadPolicy::Internal)
         {
             assert!(
-                !schema_names.contains(identity.name),
-                "internal identity must not have a public schema: {}",
-                identity.name
+                !schema_names.contains(declaration.name),
+                "internal declaration must not have a public schema: {}",
+                declaration.name
             );
         }
     }

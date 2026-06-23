@@ -5,7 +5,7 @@
 > **Implementation**: Rust — `rust/crates/runtime/src/skills/`, `rust/crates/runtime/src/tool_registry/`
 >
 > 🟢 **Implemented**: UnifiedSkillRegistry, SKILL.md parser, 16 bundled skills, local/MCP providers,
-> ToolRegistry with deterministic pinned/deferred surface, explicit deferred activation, surface reporting, file watcher hot-reload,
+> ToolRegistry with deterministic always-load/deferred surface, explicit deferred activation, surface reporting, file watcher hot-reload,
 > CLI commands (/skill list|info|search|new|dev|test|doctor|validate|config|system),
 > non-blocking permission checks, skill tool schema injection.
 >
@@ -23,7 +23,7 @@ Skills and Tools are orthogonal systems that serve different purposes:
 | Aspect       | Tool                              | Skill                                |
 |--------------|-----------------------------------|--------------------------------------|
 | **What**     | JSON schema for LLM function call | AI instruction set (SKILL.md)        |
-| **Selection**| Pinned surface + deferred activation | Metadata budget, path activation     |
+| **Selection**| Always-load surface + deferred activation | Metadata budget, path activation     |
 | **Injection**| `tools` array in API request      | System prompt text (or sub-agent)    |
 | **Execution**| Tool call → handler → result      | Inline expand or fork sub-agent      |
 | **Budget**   | Schema JSON tokens                | Metadata tokens + instruction tokens |
@@ -427,29 +427,29 @@ pub struct ToolRegistry {
     budget_tokens: u32,                     // Report/compatibility budget
     measured_costs: HashMap<String, u32>,   // Real token costs per tool
     schema_index: HashMap<String, usize>,   // O(1) name→index lookup
-    pinned_schemas: Vec<(String, Value)>,   // Always-included (budget-exempt)
+    always_load_schemas: Vec<(String, Value)>,   // Always-included (budget-exempt)
 }
 ```
 
 ### 5.2 Tool Surface Layers
 
-1. **Pinned Tools** — Always included, no budget cost (bash, read_file, write_file, etc.)
+1. **Always-load Tools** — Always included, no budget cost (bash, read_file, write_file, etc.)
 2. **Deferred Tools** — Advertised compactly and activated explicitly with `tool_search(select:NAME)`
-3. **Injected Tools** — Runtime-injected schemas are pinned by default; unpinned injected schemas remain lookupable but do not enter `tools[]`
+3. **Injected Tools** — Runtime-injected schemas are always-load by default when required by their execution path; otherwise they remain lookupable/deferred and do not enter `tools[]`
 
 ### 5.3 Surface Methods
 
 | Method                | Use Case              | Features                              |
 |-----------------------|-----------------------|---------------------------------------|
-| `build_surface()` | Basic surface build | Pinned-only surface; conversational turns may return no tools |
-| `build_surface_with_report()` | Telemetry | Pinned-only surface + `ToolSurfaceReport` |
+| `build_surface()` | Basic surface build | Always-load-only surface; conversational turns may return no tools |
+| `build_surface_with_report()` | Telemetry | Always-load-only surface + `ToolSurfaceReport` |
 | `build_surface_with_report_ctx()` | Recent-tool context | Preserves conversational short-circuit behavior |
-| `build_routed_surface()` | Pipeline-integrated surface | Returns the pinned-only surface after routing has decided the turn is tool-bearing |
+| `build_routed_surface()` | Pipeline-integrated surface | Returns the always-load-only surface after routing has decided the turn is tool-bearing |
 | `schema_by_name()`    | Activation/execution lookup | Resolves full schemas for explicitly selected deferred tools |
 
 ### 5.4 Skill Tool Integration
 
-The `skill` tool is injected into the ToolRegistry as a pinned schema:
+The `skill` tool is injected into the ToolRegistry as an always-load schema:
 
 ```rust
 // rust/crates/runtime/src/turn/skill_tool.rs
@@ -459,7 +459,7 @@ pub fn skill_tool_schema(skills: &[SkillToolInfo]) -> Value {
 }
 
 // Injected via:
-registry.inject_schema("skill", schema, /* pinned = */ true);
+registry.inject_schema("skill", schema);
 ```
 
 ### 5.5 Token Budget for Skill Listing
@@ -777,7 +777,7 @@ Both come from same MCP server but enter different systems.
 | LocalSkillProvider           | ✅ Done     | `runtime/src/skills/providers/local.rs`   | 10+   |
 | McpSkillProvider             | ✅ Done     | `runtime/src/skills/providers/mcp.rs`     | 5+    |
 | DatabaseSkillProvider        | ⚠️ Adapter  | `runtime/src/skills/providers/database.rs`| 2     |
-| ToolRegistry (pinned/dynamic)| ✅ Done     | `runtime/src/tool_registry/registry.rs`   | 50+   |
+| ToolRegistry (always-load/deferred)| ✅ Done     | `runtime/src/tool_registry/registry.rs`   | 50+   |
 | Skill tool schema + budget   | ✅ Done     | `runtime/src/turn/skill_tool.rs`          | 10+   |
 | Conditional activation       | ✅ Done     | `runtime/src/skills/activation.rs`        | 15+   |
 | File watcher hot-reload      | ✅ Done     | `runtime/src/skills/watcher.rs`           | 3     |

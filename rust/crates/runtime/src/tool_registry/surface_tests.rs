@@ -1,23 +1,23 @@
 //! Contract tests for the `ToolSurface` API.
 //!
-//! These tests pin the current deterministic pinned/deferred model. See
+//! These tests specify the current deterministic always_load/deferred model. See
 //! `plans/tool-surface-deferred-simplification-2026-06-23.md`.
 //!
 //! Contracts under test:
-//!   1. Default T1 (pinned) members are a configurable set — not the
+//!   1. Default T1 (always_load) members are a configurable set — not the
 //!      whole TOOL_CATALOG.
-//!   2. User config can add, remove, or replace the default pinned set.
+//!   2. User config can add, remove, or replace the default always_load set.
 //!   3. Every non-T1 tool appears in the deferred list as `name + short_desc`
 //!      (no schema, no parameters).
 //!   4. `tools[]` bytes are stable across two successive builds with the
 //!      same inputs — the Anthropic prompt-cache invariant.
 //!   5. Registering a plugin does not perturb `tools[]` bytes; the new
 //!      plugin appears only in the deferred manifest.
-//!   6. `cache_control` lands on the last pinned tool schema.
+//!   6. `cache_control` lands on the last always_load tool schema.
 
 #![cfg(test)]
 
-use crate::tool_registry::surface::{DeferredEntry, ToolSurface, default_pinned_names};
+use crate::tool_registry::surface::{DeferredEntry, ToolSurface, default_always_load_names};
 use astra_config::ToolSurfaceConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_registry_meta::TOOL_CATALOG;
@@ -57,47 +57,47 @@ fn names(schemas: &[Value]) -> Vec<String> {
 // ── 1. Defaults ─────────────────────────────────────────────────────────────
 
 #[test]
-fn every_default_pin_has_a_schema_in_the_canonical_pool() {
+fn every_default_always_load_has_a_schema_in_the_canonical_pool() {
     let schema_names: std::collections::HashSet<String> =
         names(&catalog_schemas()).into_iter().collect();
 
-    for pinned in default_pinned_names() {
+    for always_load in default_always_load_names() {
         assert!(
-            schema_names.contains(*pinned),
-            "default pinned identity contains {pinned}, but the canonical schema pool has no schema for it"
+            schema_names.contains(*always_load),
+            "default always_load declaration contains {always_load}, but the canonical schema pool has no schema for it"
         );
     }
 }
 
 #[test]
-fn catalog_pinned_metadata_matches_runtime_default_surface_for_catalog_tools() {
-    let default_pinned: std::collections::HashSet<&str> =
-        default_pinned_names().iter().copied().collect();
-    let catalog_default_pinned: std::collections::BTreeSet<&str> = TOOL_CATALOG
+fn catalog_always_load_metadata_matches_runtime_default_surface_for_catalog_tools() {
+    let default_always_load: std::collections::HashSet<&str> =
+        default_always_load_names().iter().copied().collect();
+    let catalog_default_always_load: std::collections::BTreeSet<&str> = TOOL_CATALOG
         .iter()
-        .filter(|tool| default_pinned.contains(tool.name))
+        .filter(|tool| default_always_load.contains(tool.name))
         .map(|tool| tool.name)
         .collect();
-    let catalog_metadata_pinned: std::collections::BTreeSet<&str> = TOOL_CATALOG
+    let catalog_metadata_always_load: std::collections::BTreeSet<&str> = TOOL_CATALOG
         .iter()
-        .filter(|tool| tool.pinned)
+        .filter(|tool| tool.always_load)
         .map(|tool| tool.name)
         .collect();
 
     assert_eq!(
-        catalog_metadata_pinned, catalog_default_pinned,
-        "catalog pinned metadata must not drift from runtime default pinned identities for catalog-backed tools"
+        catalog_metadata_always_load, catalog_default_always_load,
+        "catalog always_load metadata must not drift from runtime default always_load declarations for catalog-backed tools"
     );
 }
 
-/// The default pinned set is the 13-member core.
-/// See `tool_registry::identity` for the per-tool classification.
+/// The default always_load set is the 13-member core.
+/// See `tool_registry::declaration` for the per-tool classification.
 #[test]
-fn pinned_default_members_are_the_core_set() {
+fn always_load_default_members_are_the_core_set() {
     let cfg = ToolSurfaceConfig::default();
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
 
-    let pinned_names = names(&surface.pinned_schemas());
+    let always_load_names = names(&surface.always_load_schemas());
     let expected: std::collections::HashSet<&str> = [
         "ask_user", // structured clarification; interaction mode filters when unavailable
         "bash",
@@ -118,67 +118,67 @@ fn pinned_default_members_are_the_core_set() {
 
     for must_have in &expected {
         assert!(
-            pinned_names.iter().any(|n| n == must_have),
-            "default pinned must contain {must_have}; got {pinned_names:?}"
+            always_load_names.iter().any(|n| n == must_have),
+            "default always_load must contain {must_have}; got {always_load_names:?}"
         );
     }
     assert_eq!(
-        pinned_names.len(),
+        always_load_names.len(),
         expected.len(),
-        "exactly {} default pinned, got {}: {pinned_names:?}",
+        "exactly {} default always_load, got {}: {always_load_names:?}",
         expected.len(),
-        pinned_names.len()
+        always_load_names.len()
     );
     assert!(
-        !pinned_names.iter().any(|n| n == "introspect"),
+        !always_load_names.iter().any(|n| n == "introspect"),
         "introspect is diagnostic-only and must remain deferred by default"
     );
 }
 
 #[test]
-fn pinned_schemas_are_sorted_alphabetically_for_cache_stability() {
+fn always_load_schemas_are_sorted_alphabetically_for_cache_stability() {
     let cfg = ToolSurfaceConfig::default();
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
-    let names = names(&surface.pinned_schemas());
+    let names = names(&surface.always_load_schemas());
     let mut sorted = names.clone();
     sorted.sort();
-    assert_eq!(names, sorted, "pinned must be sorted alphabetically");
+    assert_eq!(names, sorted, "always_load must be sorted alphabetically");
 }
 
 // ── 2. Config overrides ─────────────────────────────────────────────────────
 
 #[test]
-fn config_pinned_tools_additive_appends_to_defaults() {
+fn config_always_load_tools_additive_appends_to_defaults() {
     let cfg = ToolSurfaceConfig {
-        pinned_tools: vec!["github".into(), "memory".into()],
+        always_load_tools: vec!["github".into(), "memory".into()],
     };
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
 
-    let pinned = names(&surface.pinned_schemas());
-    assert!(pinned.iter().any(|n| n == "github"));
-    assert!(pinned.iter().any(|n| n == "memory"));
+    let always_load = names(&surface.always_load_schemas());
+    assert!(always_load.iter().any(|n| n == "github"));
+    assert!(always_load.iter().any(|n| n == "memory"));
     // Defaults still there
-    assert!(pinned.iter().any(|n| n == "bash"));
-    assert!(pinned.iter().any(|n| n == "tool_search"));
+    assert!(always_load.iter().any(|n| n == "bash"));
+    assert!(always_load.iter().any(|n| n == "tool_search"));
 }
 
 #[test]
-fn config_pinned_tools_prefix_dash_removes_default() {
+fn config_always_load_tools_prefix_dash_removes_default() {
     // Remove grep from the default set — user prefers `bash grep` instead.
     let cfg = ToolSurfaceConfig {
-        pinned_tools: vec!["-grep".into()],
+        always_load_tools: vec!["-grep".into()],
     };
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
 
-    let pinned = names(&surface.pinned_schemas());
+    let always_load = names(&surface.always_load_schemas());
     assert!(
-        !pinned.iter().any(|n| n == "grep"),
-        "-grep in config must remove grep from pinned; got {pinned:?}"
+        !always_load.iter().any(|n| n == "grep"),
+        "-grep in config must remove grep from always_load; got {always_load:?}"
     );
     // grep now appears in deferred instead.
     assert!(
         surface.deferred().iter().any(|e| e.name == "grep"),
-        "grep removed from pinned must land in deferred"
+        "grep removed from always_load must land in deferred"
     );
 }
 
@@ -188,7 +188,7 @@ fn empty_and_malformed_config_entries_are_ignored_not_panic() {
     // empty string, leading whitespace. All should be silently ignored
     // (or sanitised), not panic and not misinterpret.
     let cfg = ToolSurfaceConfig {
-        pinned_tools: vec![
+        always_load_tools: vec![
             "".into(),
             "-".into(),
             "--foo".into(),
@@ -197,54 +197,54 @@ fn empty_and_malformed_config_entries_are_ignored_not_panic() {
         ],
     };
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
-    let pinned = names(&surface.pinned_schemas());
+    let always_load = names(&surface.always_load_schemas());
     // `--foo` is NOT a valid "remove -foo" because -foo isn't a real tool
     // AND double-dash is not our syntax. Must be ignored, not applied.
     // ` github` (leading space) is NOT the same as `github` — must be ignored.
-    assert!(!pinned.iter().any(|n| n == "foo"));
+    assert!(!always_load.iter().any(|n| n == "foo"));
     assert!(
-        !pinned.iter().any(|n| n == " github"),
+        !always_load.iter().any(|n| n == " github"),
         "whitespace-prefixed names must be rejected"
     );
     // Defaults survive all this malformed input.
-    assert!(pinned.iter().any(|n| n == "bash"));
-    assert!(pinned.iter().any(|n| n == "tool_search"));
+    assert!(always_load.iter().any(|n| n == "bash"));
+    assert!(always_load.iter().any(|n| n == "tool_search"));
 }
 
 #[test]
 fn unknown_tool_name_in_config_is_ignored_not_panic() {
     let cfg = ToolSurfaceConfig {
-        pinned_tools: vec!["not_a_real_tool".into(), "-also_not_real".into()],
+        always_load_tools: vec!["not_a_real_tool".into(), "-also_not_real".into()],
     };
     // Should not panic; unknown names simply do nothing.
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
-    let pinned = names(&surface.pinned_schemas());
-    assert!(!pinned.iter().any(|n| n == "not_a_real_tool"));
+    let always_load = names(&surface.always_load_schemas());
+    assert!(!always_load.iter().any(|n| n == "not_a_real_tool"));
     // Defaults preserved.
-    assert!(pinned.iter().any(|n| n == "bash"));
+    assert!(always_load.iter().any(|n| n == "bash"));
 }
 
 // ── 3. Deferred manifest ────────────────────────────────────────────────────
 
 #[test]
-fn deferred_list_contains_every_non_pinned_tool() {
+fn deferred_list_contains_every_non_always_load_tool() {
     let cfg = ToolSurfaceConfig::default();
     let schemas = catalog_schemas();
     let schema_names = names(&schemas);
     let surface = ToolSurface::build(schemas, &cfg, &[]);
 
-    let pinned: std::collections::HashSet<String> =
-        names(&surface.pinned_schemas()).into_iter().collect();
+    let always_load: std::collections::HashSet<String> =
+        names(&surface.always_load_schemas()).into_iter().collect();
     let deferred: std::collections::HashSet<String> =
         surface.deferred().iter().map(|e| e.name.clone()).collect();
 
     // Partition: every canonical schema is in exactly one of the two.
     for tool_name in schema_names {
-        let in_pinned = pinned.contains(&tool_name);
+        let in_always_load = always_load.contains(&tool_name);
         let in_deferred = deferred.contains(&tool_name);
         assert!(
-            in_pinned ^ in_deferred,
-            "{} must be in exactly one of {{pinned, deferred}}; pinned={in_pinned} deferred={in_deferred}",
+            in_always_load ^ in_deferred,
+            "{} must be in exactly one of {{always_load, deferred}}; always_load={in_always_load} deferred={in_deferred}",
             tool_name
         );
     }
@@ -268,16 +268,16 @@ fn deferred_catalog_stays_stable_when_catalog_tools_are_visible() {
     // Deferred set is STABLE per session — visible tools MAY also appear
     // in deferred. The system prompt instructs the model to prefer tools[]
     // over <deferred_tools>. This test now verifies the deferred set is
-    // non-empty and self-consistent (no duplicates, no pinned tools in deferred).
+    // non-empty and self-consistent (no duplicates, no always_load tools in deferred).
     assert!(
         !deferred.is_empty(),
         "deferred set should be non-empty even when some tools are visible"
     );
-    let pinned_from_config: std::collections::HashSet<String> =
-        cfg.pinned_tools.iter().cloned().collect();
+    let always_load_from_config: std::collections::HashSet<String> =
+        cfg.always_load_tools.iter().cloned().collect();
     assert!(
-        deferred.is_disjoint(&pinned_from_config),
-        "pinned tools must never appear in deferred; pinned={pinned_from_config:?} deferred={deferred:?}"
+        deferred.is_disjoint(&always_load_from_config),
+        "always_load tools must never appear in deferred; always_load={always_load_from_config:?} deferred={deferred:?}"
     );
 }
 
@@ -396,9 +396,9 @@ fn deferred_manifest_names_follow_rendered_budget_subset() {
 }
 
 #[test]
-fn custom_type_is_rejected_while_missing_type_function_shorthand_can_be_pinned() {
+fn custom_type_is_rejected_while_missing_type_function_shorthand_can_be_always_load() {
     let cfg = ToolSurfaceConfig {
-        pinned_tools: vec!["missing_type".to_string(), "custom_shape".to_string()],
+        always_load_tools: vec!["missing_type".to_string(), "custom_shape".to_string()],
     };
     let surface = ToolSurface::build(
         vec![
@@ -410,8 +410,8 @@ fn custom_type_is_rejected_while_missing_type_function_shorthand_can_be_pinned()
         &[],
     );
 
-    assert!(names(&surface.pinned_schemas()).contains(&"missing_type".to_string()));
-    assert!(!names(&surface.pinned_schemas()).contains(&"custom_shape".to_string()));
+    assert!(names(&surface.always_load_schemas()).contains(&"missing_type".to_string()));
+    assert!(!names(&surface.always_load_schemas()).contains(&"custom_shape".to_string()));
     assert_eq!(
         surface
             .deferred()
@@ -535,9 +535,9 @@ fn tools_array_is_byte_stable_across_two_builds() {
     let cfg = ToolSurfaceConfig::default();
     let a = ToolSurface::build(catalog_schemas(), &cfg, &[]);
     let b = ToolSurface::build(catalog_schemas(), &cfg, &[]);
-    let bytes_a = serde_json::to_vec(&a.pinned_schemas()).expect("json");
-    let bytes_b = serde_json::to_vec(&b.pinned_schemas()).expect("json");
-    assert_eq!(bytes_a, bytes_b, "pinned tools[] must be byte-stable");
+    let bytes_a = serde_json::to_vec(&a.always_load_schemas()).expect("json");
+    let bytes_b = serde_json::to_vec(&b.always_load_schemas()).expect("json");
+    assert_eq!(bytes_a, bytes_b, "always_load tools[] must be byte-stable");
 }
 
 #[test]
@@ -548,11 +548,11 @@ fn tools_array_byte_stable_when_plugin_registered_as_deferred() {
     let plugin = vec![plugin_schema("mcp__weather", "Get weather for a city")];
     let with_plugin = ToolSurface::build(catalog_schemas(), &cfg, &plugin);
 
-    let bytes_baseline = serde_json::to_vec(&baseline.pinned_schemas()).expect("json");
-    let bytes_with = serde_json::to_vec(&with_plugin.pinned_schemas()).expect("json");
+    let bytes_baseline = serde_json::to_vec(&baseline.always_load_schemas()).expect("json");
+    let bytes_with = serde_json::to_vec(&with_plugin.always_load_schemas()).expect("json");
     assert_eq!(
         bytes_baseline, bytes_with,
-        "registering a plugin must NOT perturb pinned tools[] bytes — plugin goes to deferred"
+        "registering a plugin must NOT perturb always_load tools[] bytes — plugin goes to deferred"
     );
     assert!(
         with_plugin
@@ -564,17 +564,17 @@ fn tools_array_byte_stable_when_plugin_registered_as_deferred() {
 }
 
 #[test]
-fn plugin_is_not_auto_pinned() {
+fn plugin_is_not_auto_always_load() {
     // Corollary of the previous test: plugins default to deferred even if
-    // they'd fit in the pinned budget. User must opt-in via config.
+    // they'd fit in the always_load budget. User must opt-in via config.
     let cfg = ToolSurfaceConfig::default();
     let plugin = vec![plugin_schema("mcp__db", "Query the internal DB")];
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &plugin);
     assert!(
-        !names(&surface.pinned_schemas())
+        !names(&surface.always_load_schemas())
             .iter()
             .any(|n| n == "mcp__db"),
-        "plugin must NOT be auto-pinned"
+        "plugin must NOT be auto-always_load"
     );
 }
 
@@ -598,47 +598,47 @@ fn deferred_entries_are_sorted_alphabetically() {
 }
 
 #[test]
-fn pinned_schemas_are_sorted_alphabetically() {
+fn always_load_schemas_are_sorted_alphabetically() {
     let cfg = ToolSurfaceConfig::default();
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
-    let pinned_names = names(&surface.pinned_schemas());
-    let mut sorted: Vec<String> = pinned_names.clone().into_iter().collect();
+    let always_load_names = names(&surface.always_load_schemas());
+    let mut sorted: Vec<String> = always_load_names.clone().into_iter().collect();
     sorted.sort();
     assert_eq!(
-        Vec::from_iter(pinned_names),
+        Vec::from_iter(always_load_names),
         sorted,
-        "pinned schemas must be sorted alphabetically for cache stability"
+        "always_load schemas must be sorted alphabetically for cache stability"
     );
 }
 
 // ── 5. cache_control placement ──────────────────────────────────────────────
 
 #[test]
-fn cache_control_sits_on_last_pinned_tool_schema() {
+fn cache_control_sits_on_last_always_load_tool_schema() {
     use crate::turn::prompt_cache::{
-        PromptCacheConfig, annotate_tool_schemas_for_caching_with_pinned,
+        PromptCacheConfig, annotate_tool_schemas_for_caching_with_always_load,
     };
     let cfg = ToolSurfaceConfig::default();
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
-    let mut tools = surface.pinned_schemas();
-    let pinned_names = surface.pinned_names().into_iter().collect();
+    let mut tools = surface.always_load_schemas();
+    let always_load_names = surface.always_load_names().into_iter().collect();
     let cache_cfg = PromptCacheConfig {
         cache_enabled: true,
         is_anthropic: true,
     };
-    annotate_tool_schemas_for_caching_with_pinned(&mut tools, &cache_cfg, &pinned_names);
+    annotate_tool_schemas_for_caching_with_always_load(&mut tools, &cache_cfg, &always_load_names);
 
     let last = tools.last().expect("non-empty");
     assert!(
         last.get("cache_control").is_some(),
-        "last pinned tool must carry cache_control; got {}",
+        "last always_load tool must carry cache_control; got {}",
         serde_json::to_string(last).unwrap()
     );
     // And no other tool should.
     for t in &tools[..tools.len() - 1] {
         assert!(
             t.get("cache_control").is_none(),
-            "only the last pinned tool should carry cache_control"
+            "only the last always_load tool should carry cache_control"
         );
     }
 }

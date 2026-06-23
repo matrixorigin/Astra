@@ -202,6 +202,15 @@ impl ToolResultRequest {
     /// fallback path and the turn-bridge polling path need to extract the
     /// same two fields — this avoids duplicated parsing logic.
     pub fn parse_output_and_error(result_json: &str) -> (String, bool) {
+        let (output, is_error, _fields) = Self::parse_output_error_and_fields(result_json);
+        (output, is_error)
+    }
+
+    /// Parse a dispatch result JSON string back into output, error status, and
+    /// structured tool-result fields.
+    pub fn parse_output_error_and_fields(
+        result_json: &str,
+    ) -> (String, bool, Option<Map<String, Value>>) {
         let v: serde_json::Value = serde_json::from_str(result_json)
             .unwrap_or_else(|_| serde_json::json!({"output": result_json}));
         let output = v
@@ -219,7 +228,11 @@ impl ToolResultRequest {
                 )
             })
             .unwrap_or(false);
-        (output, is_error)
+        let fields = v
+            .get("tool_result_fields")
+            .and_then(Value::as_object)
+            .cloned();
+        (output, is_error, fields)
     }
 }
 
@@ -1246,6 +1259,20 @@ mod tests {
         let (output, is_error) = ToolResultRequest::parse_output_and_error(json);
         assert_eq!(output, "fail");
         assert!(is_error);
+    }
+
+    #[test]
+    fn tool_result_parse_output_error_and_fields_preserves_metadata() {
+        let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"failed","output":"fail","tool_result_fields":{"exit_code":7,"result_class":"execution_error"}}"#;
+        let (output, is_error, fields) = ToolResultRequest::parse_output_error_and_fields(json);
+        assert_eq!(output, "fail");
+        assert!(is_error);
+        let fields = fields.expect("fields");
+        assert_eq!(fields.get("exit_code").and_then(Value::as_i64), Some(7));
+        assert_eq!(
+            fields.get("result_class").and_then(Value::as_str),
+            Some("execution_error")
+        );
     }
 
     #[test]

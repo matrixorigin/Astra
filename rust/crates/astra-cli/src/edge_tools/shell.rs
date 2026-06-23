@@ -4323,6 +4323,47 @@ impl ToolExecutor {
         result
     }
 
+    fn render_bash_outcome(
+        &self,
+        command: &str,
+        out: std::process::Output,
+    ) -> super::ToolExecutionOutcome {
+        let exit_code = out.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let exit_semantics = astra_tools::exit_semantics::classify_exit(command, exit_code);
+        let result_class = astra_tools::exit_semantics::classify_command_result(
+            command,
+            &stdout,
+            &stderr,
+            Some(exit_code),
+        );
+        let output = self.render_bash_output(command, out);
+        let mut outcome = if exit_semantics.is_tool_error() || result_class.is_tool_error() {
+            super::ToolExecutionOutcome::error(output)
+        } else {
+            super::ToolExecutionOutcome::ok(output)
+        };
+        let fields = outcome
+            .tool_result_fields
+            .get_or_insert_with(serde_json::Map::new);
+        fields.insert(
+            "exit_code".to_string(),
+            Value::Number(serde_json::Number::from(exit_code)),
+        );
+        fields.insert(
+            "exit_semantics".to_string(),
+            serde_json::to_value(exit_semantics).unwrap_or_else(|_| {
+                Value::String(format!("{exit_semantics:?}").to_ascii_lowercase())
+            }),
+        );
+        fields.insert(
+            "result_class".to_string(),
+            Value::String(result_class.as_str().to_string()),
+        );
+        outcome
+    }
+
     pub(crate) async fn bash_async(&self, args: &Value) -> String {
         let (command, timeout_secs) = match self.prepare_bash_invocation(args) {
             Ok(invocation) => invocation,
@@ -4370,10 +4411,10 @@ impl ToolExecutor {
         match outcome {
             Ok(DetachableShellOutput::Completed(out)) => {
                 self.restore_bash_detach_handle(slot, handle).await;
-                let output =
-                    self.finalize_tool_output(self.render_bash_output(&command, out), "bash");
-                self.record_output_size(output.len());
-                Some(super::tool_execution_outcome_from_output(output))
+                let mut outcome = self.render_bash_outcome(&command, out);
+                outcome.output = self.finalize_tool_output(outcome.output, "bash");
+                self.record_output_size(outcome.output.len());
+                Some(outcome)
             }
             Ok(DetachableShellOutput::Detached {
                 payload,
@@ -4442,13 +4483,21 @@ impl ToolExecutor {
         args: &Value,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> String {
+        self.bash_outcome_with_cancel(args, cancel_token).output
+    }
+
+    pub(crate) fn bash_outcome_with_cancel(
+        &self,
+        args: &Value,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> super::ToolExecutionOutcome {
         let (command, timeout_secs) = match self.prepare_bash_invocation(args) {
             Ok(invocation) => invocation,
-            Err(message) => return message,
+            Err(message) => return super::tool_execution_outcome_from_output(message),
         };
         match self.run_shell_output_cancelable(&command, timeout_secs, cancel_token) {
-            Ok(out) => self.render_bash_output(&command, out),
-            Err(error) => error,
+            Ok(out) => self.render_bash_outcome(&command, out),
+            Err(error) => super::ToolExecutionOutcome::error(error),
         }
     }
 

@@ -97,7 +97,7 @@ pub struct EnvironmentSurface {
     pub resolved_sources: Vec<&'static str>,
     pub available_tools: usize,
     pub tool_names: Vec<String>,
-    pub pinned_tools: Vec<String>,
+    pub prioritized_tools: Vec<String>,
     pub deprioritized_tools: Vec<String>,
     pub discovered_skills: Vec<String>,
     pub active_experiment_id: Option<String>,
@@ -205,7 +205,7 @@ pub struct ProfileSurface {
 pub struct CapabilitySurface {
     pub total_tools: usize,
     pub tool_names: Vec<String>,
-    pub pinned_tools: Vec<String>,
+    pub prioritized_tools: Vec<String>,
     pub deprioritized_tools: Vec<String>,
     pub skills: Vec<String>,
     pub tool_health: Vec<ToolHealthView>,
@@ -662,8 +662,8 @@ fn build_environment_surface(
         resolved_sources: resolved_sources(artifacts),
         available_tools: tool_names.len(),
         tool_names,
-        pinned_tools: workspace
-            .map(|ws| ws.pinned_tools.clone())
+        prioritized_tools: workspace
+            .map(|ws| ws.prioritized_tools.clone())
             .unwrap_or_default(),
         deprioritized_tools: merged_deprioritized_tools(artifacts),
         discovered_skills: merged_skills(workspace),
@@ -833,7 +833,7 @@ fn build_profile_surface(
         capabilities: CapabilitySurface {
             total_tools: snapshot.environment.available_tools,
             tool_names: snapshot.environment.tool_names.clone(),
-            pinned_tools: snapshot.environment.pinned_tools.clone(),
+            prioritized_tools: snapshot.environment.prioritized_tools.clone(),
             deprioritized_tools: snapshot.environment.deprioritized_tools.clone(),
             skills: snapshot.environment.discovered_skills.clone(),
             tool_health: health.tool_health.into_iter().take(8).collect(),

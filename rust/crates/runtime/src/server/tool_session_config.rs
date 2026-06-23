@@ -315,33 +315,33 @@ pub(crate) fn persist_config_override(
 
 pub(crate) fn persist_tool_preferences(
     session_id: &str,
-    pinned_tools: &[String],
+    prioritized_tools: &[String],
     deprioritized_tools: &[String],
     source: &str,
 ) -> Result<(), String> {
     let mut workspace =
         astra_services::session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
-    let mut pinned = pinned_tools.to_vec();
-    pinned.sort();
-    pinned.dedup();
+    let mut prioritized = prioritized_tools.to_vec();
+    prioritized.sort();
+    prioritized.dedup();
     let mut deprioritized = deprioritized_tools.to_vec();
     deprioritized.sort();
     deprioritized.dedup();
 
-    let old_pinned = workspace.pinned_tools.clone();
+    let old_prioritized = workspace.prioritized_tools.clone();
     let old_deprioritized = workspace.deprioritized_tools.clone();
-    workspace.pinned_tools = pinned.clone();
+    workspace.prioritized_tools = prioritized.clone();
     workspace.deprioritized_tools = deprioritized.clone();
     workspace.updated_at = chrono::Utc::now().to_rfc3339();
     astra_services::session_workspace::write_workspace(&workspace).map_err(|e| e.to_string())?;
 
-    if old_pinned != pinned {
+    if old_prioritized != prioritized {
         append_config_change_event(
             session_id,
             workspace.turn_count,
-            "pinned_tools",
-            &json!(pinned),
-            Some(json!(old_pinned)),
+            "prioritized_tools",
+            &json!(prioritized),
+            Some(json!(old_prioritized)),
             source,
         )?;
     }
@@ -382,7 +382,7 @@ impl ToolPreferenceAction {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolPreferenceRollback {
-    pub(crate) previous_pinned_tools: Vec<String>,
+    pub(crate) previous_prioritized_tools: Vec<String>,
     pub(crate) previous_deprioritized_tools: Vec<String>,
     pub(crate) label: String,
 }
@@ -425,22 +425,22 @@ where
     }
 
     // Lock, compute new state, clone, then release lock before I/O.
-    let (new_pinned, new_deprioritized, original_pinned, original_deprioritized) = {
+    let (new_prioritized, new_deprioritized, original_prioritized, original_deprioritized) = {
         let mut inner = match config.lock() {
             Ok(inner) => inner,
             Err(_) => {
                 return tool_preference_output(json!({"error": "Failed to access session config"}));
             }
         };
-        let original_pinned = inner.pinned_tools.clone();
+        let original_prioritized = inner.prioritized_tools.clone();
         let original_deprioritized = inner.deprioritized_tools.clone();
 
         match action {
             ToolPreferenceAction::Prioritize => {
-                if !inner.pinned_tools.contains(&tool) {
-                    inner.pinned_tools.push(tool.clone());
+                if !inner.prioritized_tools.contains(&tool) {
+                    inner.prioritized_tools.push(tool.clone());
                 }
-                inner.pinned_tools.sort();
+                inner.prioritized_tools.sort();
                 inner.deprioritized_tools.retain(|entry| entry != &tool);
             }
             ToolPreferenceAction::Deprioritize => {
@@ -448,26 +448,29 @@ where
                     inner.deprioritized_tools.push(tool.clone());
                 }
                 inner.deprioritized_tools.sort();
-                inner.pinned_tools.retain(|entry| entry != &tool);
+                inner.prioritized_tools.retain(|entry| entry != &tool);
             }
         }
 
         (
-            inner.pinned_tools.clone(),
+            inner.prioritized_tools.clone(),
             inner.deprioritized_tools.clone(),
-            original_pinned,
+            original_prioritized,
             original_deprioritized,
         )
         // lock released here
     };
 
     // I/O outside the lock: persist first.
-    if let Err(error) =
-        persist_tool_preferences(session_id, &new_pinned, &new_deprioritized, action.source())
-    {
+    if let Err(error) = persist_tool_preferences(
+        session_id,
+        &new_prioritized,
+        &new_deprioritized,
+        action.source(),
+    ) {
         // Rollback in-memory state to original.
         if let Ok(mut inner) = config.lock() {
-            inner.pinned_tools = original_pinned.clone();
+            inner.prioritized_tools = original_prioritized.clone();
             inner.deprioritized_tools = original_deprioritized.clone();
         }
         return tool_preference_output(json!({
@@ -479,7 +482,7 @@ where
 
     if let Err(error) = publish_workspace() {
         if let Ok(mut inner) = config.lock() {
-            inner.pinned_tools = original_pinned.clone();
+            inner.prioritized_tools = original_prioritized.clone();
             inner.deprioritized_tools = original_deprioritized.clone();
         }
         return tool_preference_output(json!({
@@ -490,9 +493,10 @@ where
     }
 
     // I/O succeeded — in-memory state is still the new values from the first lock scope.
-    let changed = original_pinned != new_pinned || original_deprioritized != new_deprioritized;
+    let changed =
+        original_prioritized != new_prioritized || original_deprioritized != new_deprioritized;
     let rollback = changed.then(|| ToolPreferenceRollback {
-        previous_pinned_tools: original_pinned.clone(),
+        previous_prioritized_tools: original_prioritized.clone(),
         previous_deprioritized_tools: original_deprioritized.clone(),
         label: action.rollback_label(&tool),
     });
@@ -502,7 +506,7 @@ where
             journal_turn_index,
             r.label.clone(),
             SessionStateRollbackAction::ToolPreferences {
-                previous_pinned_tools: r.previous_pinned_tools.clone(),
+                previous_prioritized_tools: r.previous_prioritized_tools.clone(),
                 previous_deprioritized_tools: r.previous_deprioritized_tools.clone(),
             },
         );
@@ -515,7 +519,7 @@ where
                 ToolPreferenceAction::Prioritize => "prioritize",
                 ToolPreferenceAction::Deprioritize => "deprioritize",
             },
-            "pinned_tools": new_pinned,
+            "prioritized_tools": new_prioritized,
             "deprioritized_tools": new_deprioritized,
         })
         .to_string(),
@@ -1054,10 +1058,10 @@ mod tests {
         assert_eq!(output["status"], "ok");
         assert_eq!(output["tool"], "bash");
         let inner = config.lock().expect("config");
-        assert_eq!(inner.pinned_tools, vec!["bash".to_string()]);
+        assert_eq!(inner.prioritized_tools, vec!["bash".to_string()]);
         assert!(inner.deprioritized_tools.is_empty());
         let rollback = outcome.rollback.expect("preference rollback");
-        assert!(rollback.previous_pinned_tools.is_empty());
+        assert!(rollback.previous_prioritized_tools.is_empty());
         assert_eq!(
             rollback.previous_deprioritized_tools,
             vec!["bash".to_string()]
@@ -1065,7 +1069,7 @@ mod tests {
         assert_eq!(rollback.label, "prioritize_tool:bash");
         let workspace =
             astra_services::session_workspace::read_workspace(session_id).expect("workspace read");
-        assert_eq!(workspace.pinned_tools, vec!["bash".to_string()]);
+        assert_eq!(workspace.prioritized_tools, vec!["bash".to_string()]);
         assert!(workspace.deprioritized_tools.is_empty());
     }
 
@@ -1096,7 +1100,7 @@ mod tests {
         assert_eq!(output["error"], "failed_to_publish_workspace_artifact");
         assert!(outcome.rollback.is_none());
         let inner = config.lock().expect("config");
-        assert!(inner.pinned_tools.is_empty());
+        assert!(inner.prioritized_tools.is_empty());
         assert!(inner.deprioritized_tools.is_empty());
     }
 

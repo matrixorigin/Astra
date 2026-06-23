@@ -8,7 +8,9 @@ use serde_json::{Value, json};
 use crate::relevance_score::Scoreable;
 
 const KEYWORD_DESCRIPTION_MAX_CHARS: usize = 180;
+const SELECT_DESCRIPTION_MAX_CHARS: usize = 220;
 const TOOL_RESULT_STATUS_COMPLETED: &str = "completed";
+const TOOL_RESULT_STATUS_FAILED: &str = "failed";
 
 struct ToolSchemaAdapter<'a>(&'a Value);
 
@@ -39,11 +41,11 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
         Some(q) => {
             let trimmed = q.trim();
             if trimmed.is_empty() {
-                return "Error: 'query' is required".to_string();
+                return tool_search_error("'query' is required").to_string();
             }
             trimmed
         }
-        None => return "Error: 'query' is required".to_string(),
+        None => return tool_search_error("'query' is required").to_string(),
     };
 
     let max_results = args
@@ -74,7 +76,7 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
             }
         }
         if requested.is_empty() {
-            return "Error: 'select:' requires at least one tool name".to_string();
+            return tool_search_error("'select:' requires at least one tool name").to_string();
         }
         let mut found = Vec::new();
         let mut resolved = Vec::new();
@@ -97,9 +99,13 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
                         .get("description")
                         .and_then(Value::as_str)
                         .unwrap_or("");
+                    let (compact_desc, desc_truncated) =
+                        compact_description(desc, SELECT_DESCRIPTION_MAX_CHARS);
                     let mut entry = json!({
                         "name": tool_name,
-                        "description": desc,
+                        "description": compact_desc,
+                        "description_truncated": desc_truncated,
+                        "detail_query": format!("detail:{tool_name}"),
                     });
                     // Include parameter shape, but strip nested prose. The
                     // full schema will be injected into tools[] on the next
@@ -148,6 +154,87 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
         return result.to_string();
     }
 
+    if let Some(tool_names) = detail_payload(query) {
+        let mut requested = Vec::new();
+        for name in tool_names
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            if !requested
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(name))
+            {
+                requested.push(name.to_string());
+            }
+        }
+        if requested.is_empty() {
+            return tool_search_error("'detail:' requires at least one tool name").to_string();
+        }
+
+        let mut found = Vec::new();
+        let mut resolved = Vec::new();
+        let mut missing = Vec::new();
+        let mut ambiguous = Vec::new();
+
+        for name in &requested {
+            match resolve_select_tool(&valid_schemas, name) {
+                SelectResolution::Found {
+                    schema,
+                    canonical_name,
+                    matched_by_prefix,
+                } => {
+                    let Some(func) = schema.get("function") else {
+                        missing.push(name.clone());
+                        continue;
+                    };
+                    let mut entry = json!({
+                        "name": func.get("name").and_then(Value::as_str).unwrap_or(""),
+                        "description": func.get("description").and_then(Value::as_str).unwrap_or(""),
+                    });
+                    if let Some(params) = func.get("parameters")
+                        && let Some(obj) = entry.as_object_mut()
+                    {
+                        obj.insert("parameters".to_string(), params.clone());
+                    }
+                    if matched_by_prefix && let Some(obj) = entry.as_object_mut() {
+                        obj.insert("requested".to_string(), json!(name));
+                        obj.insert("matched_by".to_string(), json!("unique_prefix"));
+                    }
+                    resolved.push(canonical_name.to_string());
+                    found.push(entry);
+                }
+                SelectResolution::Ambiguous { candidates } => {
+                    ambiguous.push(json!({
+                        "requested": name,
+                        "candidates": candidates,
+                    }));
+                    missing.push(name.clone());
+                }
+                SelectResolution::Missing => {
+                    missing.push(name.clone());
+                }
+            }
+        }
+
+        let outcome = select_outcome(valid_schemas.len(), found.len(), missing.len());
+        let mut result = json!({
+            "mode": "detail",
+            "status": TOOL_RESULT_STATUS_COMPLETED,
+            "detail_status": outcome,
+            "query": query,
+            "requested": requested,
+            "resolved": resolved,
+            "matches": found,
+            "missing": missing,
+            "ambiguous": ambiguous,
+            "total_tools": valid_schemas.len()
+        });
+        let message = select_message(outcome, &result);
+        add_tool_search_guidance(&mut result, outcome, message);
+        return result.to_string();
+    }
+
     // Keyword search mode — delegates scoring to shared utility.
     let adapters: Vec<ToolSchemaAdapter> = valid_schemas
         .iter()
@@ -165,11 +252,13 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
                 .get("description")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let short_desc: String = desc.chars().take(KEYWORD_DESCRIPTION_MAX_CHARS).collect();
-            let was_truncated = desc.chars().count() > KEYWORD_DESCRIPTION_MAX_CHARS;
+            let (short_desc, was_truncated) =
+                compact_description(desc, KEYWORD_DESCRIPTION_MAX_CHARS);
             json!({
                 "name": name,
-                "description": if was_truncated { format!("{}...", short_desc) } else { desc.to_string() },
+                "description": short_desc,
+                "description_truncated": was_truncated,
+                "detail_query": format!("detail:{name}"),
                 "score": score
             })
         })
@@ -196,6 +285,33 @@ fn select_payload(query: &str) -> Option<&str> {
         .get(..SELECT_PREFIX.len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(SELECT_PREFIX))
         .then(|| &query[SELECT_PREFIX.len()..])
+}
+
+fn detail_payload(query: &str) -> Option<&str> {
+    const DETAIL_PREFIX: &str = "detail:";
+    query
+        .get(..DETAIL_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(DETAIL_PREFIX))
+        .then(|| &query[DETAIL_PREFIX.len()..])
+}
+
+fn compact_description(description: &str, max_chars: usize) -> (String, bool) {
+    let mut iter = description.chars();
+    let compact: String = iter.by_ref().take(max_chars).collect();
+    let truncated = iter.next().is_some();
+    if truncated {
+        (format!("{compact}..."), true)
+    } else {
+        (description.to_string(), false)
+    }
+}
+
+fn tool_search_error(message: &str) -> Value {
+    json!({
+        "mode": "error",
+        "status": TOOL_RESULT_STATUS_FAILED,
+        "error": message,
+    })
 }
 
 enum SelectResolution<'a> {
@@ -468,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn select_mode_exact_match_returns_full_schema() {
+    fn select_mode_exact_match_returns_compact_schema() {
         let schemas = sample_schemas();
 
         let result = tool_search(&schemas, &json!({"query": "select:bash"}));
@@ -484,6 +600,10 @@ mod tests {
         assert!(
             parsed["matches"][0].get("score").is_none(),
             "select mode must return schema entries, not keyword scores: {parsed}"
+        );
+        assert_eq!(
+            parsed["matches"][0]["detail_query"].as_str(),
+            Some("detail:bash")
         );
     }
 
@@ -592,7 +712,12 @@ mod tests {
             }),
         ];
         let result = tool_search(&schemas, &json!({"query": "select:"}));
-        assert_eq!(result, "Error: 'select:' requires at least one tool name");
+        let parsed = parse_result(&result);
+        assert_eq!(parsed["status"].as_str(), Some("failed"));
+        assert_eq!(
+            parsed["error"].as_str(),
+            Some("'select:' requires at least one tool name")
+        );
 
         let result = tool_search(&schemas, &json!({"query": "select:read"}));
         let parsed = parse_result(&result);
@@ -670,10 +795,14 @@ mod tests {
         let schemas = sample_schemas();
         for q in &["", "   ", "\t", "\n\n", " \t \n "] {
             let result = tool_search(&schemas, &json!({"query": q}));
-            assert_eq!(result, "Error: 'query' is required", "query {q:?}");
+            let parsed = parse_result(&result);
+            assert_eq!(parsed["status"].as_str(), Some("failed"), "query {q:?}");
+            assert_eq!(parsed["error"].as_str(), Some("'query' is required"));
         }
         let result = tool_search(&schemas, &json!({}));
-        assert_eq!(result, "Error: 'query' is required");
+        let parsed = parse_result(&result);
+        assert_eq!(parsed["status"].as_str(), Some("failed"));
+        assert_eq!(parsed["error"].as_str(), Some("'query' is required"));
     }
 
     #[test]
@@ -681,8 +810,11 @@ mod tests {
         let schemas = sample_schemas();
         for query in &["select:", "select:   ", "SELECT: , , "] {
             let result = tool_search(&schemas, &json!({"query": query}));
+            let parsed = parse_result(&result);
+            assert_eq!(parsed["status"].as_str(), Some("failed"), "query {query:?}");
             assert_eq!(
-                result, "Error: 'select:' requires at least one tool name",
+                parsed["error"].as_str(),
+                Some("'select:' requires at least one tool name"),
                 "query {query:?}"
             );
         }
@@ -745,8 +877,8 @@ mod tests {
 
     #[test]
     fn select_vs_keyword_params() {
-        // select: mode returns parameter shape so the next request can receive
-        // the full tool schema; keyword mode omits parameters to stay compact.
+        // select: mode returns compact parameter shape; detail: returns full
+        // prose only when the model explicitly asks for expansion.
         let schemas = schemas_with_params();
 
         let result = tool_search(&schemas, &json!({"query": "select:read_file"}));
@@ -760,6 +892,15 @@ mod tests {
             "select result should keep callable shape but strip nested prose: {parsed}"
         );
 
+        let result = tool_search(&schemas, &json!({"query": "detail:read_file"}));
+        let parsed: Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(parsed["mode"].as_str(), Some("detail"));
+        assert_eq!(
+            parsed["matches"][0]["parameters"]["properties"]["path"]["description"].as_str(),
+            Some("File path"),
+            "detail result should preserve full parameter prose: {parsed}"
+        );
+
         let result = tool_search(&schemas, &json!({"query": "file"}));
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert!(parsed["matches"][0].get("parameters").is_none());
@@ -767,8 +908,7 @@ mod tests {
 
     #[test]
     fn select_vs_keyword_description() {
-        // select: returns full description (LLM invoked it explicitly);
-        // keyword search truncates for compact browsing.
+        // select and keyword stay compact; detail expands full prose.
         let long_desc = "x".repeat(500);
         let schemas = vec![json!({
             "type": "function",
@@ -782,8 +922,20 @@ mod tests {
         let result = tool_search(&schemas, &json!({"query": "select:big"}));
         let parsed: Value = serde_json::from_str(&result).unwrap();
         let desc = parsed["matches"][0]["description"].as_str().unwrap();
+        assert!(desc.len() < 500, "select should stay compact: {desc}");
+        assert_eq!(
+            parsed["matches"][0]["description_truncated"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["matches"][0]["detail_query"].as_str(),
+            Some("detail:big")
+        );
+
+        let result = tool_search(&schemas, &json!({"query": "detail:big"}));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let desc = parsed["matches"][0]["description"].as_str().unwrap();
         assert_eq!(desc.len(), 500);
-        assert!(!desc.contains('…'));
 
         let result = tool_search(&schemas, &json!({"query": "big"}));
         let parsed: Value = serde_json::from_str(&result).unwrap();

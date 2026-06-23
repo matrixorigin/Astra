@@ -1,6 +1,6 @@
-//! P0-T end-to-end: user's `runtime.toml` `[tool_surface].pinned_tools`
+//! P0-T end-to-end: user's `runtime.toml` `[tool_surface].always_load_tools`
 //! flows all the way through `RuntimeConfig::load` → `ToolSurface::build`
-//! → pinned schemas that would be sent on the wire as `tools[]`.
+//! → always_load schemas that would be sent on the wire as `tools[]`.
 //!
 //! Without this test, a typo in any hop (config → surface → wire) fails
 //! silently. The whole "user can customize their tools[]" promise rests
@@ -63,18 +63,18 @@ fn with_user_runtime_toml<F: FnOnce(&RuntimeConfig)>(contents: &str, f: F) {
 
 #[test]
 #[serial_test::serial]
-fn user_pinned_tools_with_dash_removes_default_from_wire() {
+fn user_always_load_tools_with_dash_removes_default_from_wire() {
     with_user_runtime_toml(
         r#"
 [tool_surface]
-pinned_tools = ["-grep"]
+always_load_tools = ["-grep"]
 "#,
         |config| {
             let surface = ToolSurface::build(catalog_schemas(), &config.tool_surface, &[]);
-            let pinned = names(&surface.pinned_schemas());
+            let always_load = names(&surface.always_load_schemas());
             assert!(
-                !pinned.iter().any(|n| n == "grep"),
-                "user TOML said `-grep` — grep must NOT be in wire tools[]: got {pinned:?}"
+                !always_load.iter().any(|n| n == "grep"),
+                "user TOML said `-grep` — grep must NOT be in wire tools[]: got {always_load:?}"
             );
             // grep now lives in deferred.
             let deferred: Vec<&str> = surface.deferred().iter().map(|e| e.name.as_str()).collect();
@@ -88,22 +88,22 @@ pinned_tools = ["-grep"]
 
 #[test]
 #[serial_test::serial]
-fn user_pinned_tools_adds_github_to_wire() {
+fn user_always_load_tools_adds_github_to_wire() {
     with_user_runtime_toml(
         r#"
 [tool_surface]
-pinned_tools = ["github"]
+always_load_tools = ["github"]
 "#,
         |config| {
             let surface = ToolSurface::build(catalog_schemas(), &config.tool_surface, &[]);
-            let pinned = names(&surface.pinned_schemas());
+            let always_load = names(&surface.always_load_schemas());
             assert!(
-                pinned.iter().any(|n| n == "github"),
-                "github must be pinned per user config: got {pinned:?}"
+                always_load.iter().any(|n| n == "github"),
+                "github must be always_load per user config: got {always_load:?}"
             );
-            // Default pins still there.
-            assert!(pinned.iter().any(|n| n == "bash"));
-            assert!(pinned.iter().any(|n| n == "memory"));
+            // Default always-load tools still there.
+            assert!(always_load.iter().any(|n| n == "bash"));
+            assert!(always_load.iter().any(|n| n == "memory"));
         },
     );
 }
@@ -111,10 +111,10 @@ pinned_tools = ["github"]
 #[test]
 #[serial_test::serial]
 fn missing_toml_defaults_are_in_wire() {
-    // Empty TOML dir — no overrides. Wire reflects the default pinned identities exactly.
+    // Empty TOML dir — no overrides. Wire reflects the default always_load identities exactly.
     with_user_runtime_toml("# empty", |config| {
         let surface = ToolSurface::build(catalog_schemas(), &config.tool_surface, &[]);
-        let pinned = names(&surface.pinned_schemas());
+        let always_load = names(&surface.always_load_schemas());
         // Spot check: all defaults present, no extras.
         for must in [
             "ask_user",
@@ -126,10 +126,13 @@ fn missing_toml_defaults_are_in_wire() {
             "skill",
             "tool_search",
         ] {
-            assert!(pinned.iter().any(|n| n == must), "missing default {must}");
+            assert!(
+                always_load.iter().any(|n| n == must),
+                "missing default {must}"
+            );
         }
-        assert!(!pinned.iter().any(|n| n == "github"));
-        assert!(!pinned.iter().any(|n| n == "web_fetch"));
+        assert!(!always_load.iter().any(|n| n == "github"));
+        assert!(!always_load.iter().any(|n| n == "web_fetch"));
     });
 }
 
@@ -142,16 +145,16 @@ fn malformed_toml_falls_back_to_defaults_silently() {
     with_user_runtime_toml(
         r#"
 [tool_surface
-pinned_tools = ["github
+always_load_tools = ["github
 "#,
         |config| {
             let surface = ToolSurface::build(catalog_schemas(), &config.tool_surface, &[]);
-            let pinned = names(&surface.pinned_schemas());
+            let always_load = names(&surface.always_load_schemas());
             assert!(
-                !pinned.iter().any(|n| n == "github"),
-                "malformed TOML must NOT silently pin github; fallback to defaults"
+                !always_load.iter().any(|n| n == "github"),
+                "malformed TOML must NOT silently always-load github; fallback to defaults"
             );
-            assert!(pinned.iter().any(|n| n == "bash"));
+            assert!(always_load.iter().any(|n| n == "bash"));
         },
     );
 }

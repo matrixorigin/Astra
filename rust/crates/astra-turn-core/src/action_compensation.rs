@@ -416,7 +416,7 @@ fn tool_priority_compensation_summary(tool: Option<&str>) -> String {
         .map(|tool| format!("tool `{tool}`"))
         .unwrap_or_else(|| "the affected tool".to_string());
     format!(
-        "prefer `rollback_session_state` with scope=`current_turn` (or {}) to restore {}'s prior preference state; the `previous_pinned_tools` and `previous_deprioritized_tools` fields remain the manual fallback",
+        "prefer `rollback_session_state` with scope=`current_turn` (or {}) to restore {}'s prior preference state; the `previous_prioritized_tools` and `previous_deprioritized_tools` fields remain the manual fallback",
         rollback_turn_tool_scope_hint(),
         target
     )

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use super::tool_execution_binding::{
@@ -103,13 +103,25 @@ impl EdgeBoundExecutionPlan {
         is_error: bool,
         transport: ToolTransportKind,
     ) -> astra_tools::ToolResult {
+        self.delivered_result_with_fields(output, is_error, transport, None)
+    }
+
+    pub(crate) fn delivered_result_with_fields(
+        &self,
+        output: String,
+        is_error: bool,
+        transport: ToolTransportKind,
+        tool_result_fields: Option<Map<String, Value>>,
+    ) -> astra_tools::ToolResult {
+        let mut metadata = tool_result_fields.unwrap_or_default();
+        for (key, value) in
+            delivered_binding_event_fields(&self.workspace, &self.executor, transport)
+        {
+            metadata.entry(key).or_insert(value);
+        }
         astra_tools::ToolResult {
             output,
-            metadata: Some(delivered_binding_event_fields(
-                &self.workspace,
-                &self.executor,
-                transport,
-            )),
+            metadata: Some(metadata),
             is_error,
             exit_semantics: None,
         }

@@ -451,7 +451,7 @@ pub(crate) async fn stream_chat_sse(
     // can resolve plugin tool schemas by name.
     executor.set_plugin_schemas(mcp_plugin_schemas);
     let registry = ToolRegistry::new_runtime_surface(all_schemas.clone());
-    let pinned_schema_tokens = registry.total_pinned_token_cost() as u64;
+    let always_load_schema_tokens = registry.total_always_load_token_cost() as u64;
     // Full runtime inventory is used only for static allow/deny policy
     // calculations. The headless validator's admitted tool set is populated
     // per round from the final `edge_tools` payload actually sent to the model.
@@ -867,7 +867,7 @@ pub(crate) async fn stream_chat_sse(
         last_measured_prompt_tokens: None,
         consecutive_context_window_errors: p.consecutive_context_window_errors,
         compaction_effectiveness: restored_compaction_effectiveness(p.compaction_state.as_ref()),
-        pinned_tool_schema_tokens: pinned_schema_tokens,
+        always_load_tool_schema_tokens: always_load_schema_tokens,
         sticky_tool_schemas: Vec::new(),
         max_turn_input_tokens: RuntimeLimits::global().effective_max_turn_input_tokens(p.model),
         budget_wrapup_injected: false,

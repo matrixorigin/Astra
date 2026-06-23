@@ -517,31 +517,31 @@ pub(crate) fn persist_config_override(
 
 pub(crate) fn persist_tool_preferences(
     session_id: &str,
-    pinned_tools: &[String],
+    prioritized_tools: &[String],
     deprioritized_tools: &[String],
 ) -> Result<(), String> {
     let mut ws = session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
-    let mut pinned = pinned_tools.to_vec();
-    pinned.sort();
-    pinned.dedup();
+    let mut prioritized = prioritized_tools.to_vec();
+    prioritized.sort();
+    prioritized.dedup();
     let mut deprioritized = deprioritized_tools.to_vec();
     deprioritized.sort();
     deprioritized.dedup();
 
-    let old_pinned = ws.pinned_tools.clone();
+    let old_prioritized = ws.prioritized_tools.clone();
     let old_deprioritized = ws.deprioritized_tools.clone();
-    ws.pinned_tools = pinned.clone();
+    ws.prioritized_tools = prioritized.clone();
     ws.deprioritized_tools = deprioritized.clone();
     ws.updated_at = Utc::now().to_rfc3339();
     session_workspace::write_workspace(&ws).map_err(|e| e.to_string())?;
 
-    if old_pinned != pinned {
+    if old_prioritized != prioritized {
         append_config_change_event(
             session_id,
             ws.turn_count,
-            "pinned_tools",
-            &serde_json::json!(pinned),
-            Some(serde_json::json!(old_pinned)),
+            "prioritized_tools",
+            &serde_json::json!(prioritized),
+            Some(serde_json::json!(old_prioritized)),
         )?;
     }
     if old_deprioritized != deprioritized {
@@ -1410,7 +1410,7 @@ mod tests {
         let mut workspace =
             WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/srv/cloud-repo", Some("main"));
         workspace.plan_goal = Some("ship cloud restore".to_string());
-        workspace.pinned_tools = vec!["bash".to_string()];
+        workspace.prioritized_tools = vec!["bash".to_string()];
         workspace.discovered_skills = vec!["session-recovery".to_string()];
         let restored = astra_services::session_restore::RestoredSession {
             session_id: session_id.to_string(),

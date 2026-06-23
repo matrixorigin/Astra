@@ -1010,8 +1010,8 @@ pub struct ToolExecutor {
     /// source used by self-introspection tools; it is set by the CLI turn
     /// boundary and never inferred from a tool surface default.
     current_model: std::sync::RwLock<Option<String>>,
-    /// Self-modification pinned tool preferences (manual override hints).
-    self_mod_pinned_tools: std::sync::Mutex<Vec<String>>,
+    /// Self-modification prioritized tool preferences (manual override hints).
+    self_mod_prioritized_tools: std::sync::Mutex<Vec<String>>,
     /// Self-modification deprioritized tool preferences (manual override hints).
     self_mod_deprioritized_tools: std::sync::Mutex<Vec<String>>,
     /// P3.1 seam: cross-session lessons loaded at session bootstrap.
@@ -1156,7 +1156,7 @@ impl ToolExecutor {
             session_memory_observatory: None,
             active_session_id: std::sync::Mutex::new(None),
             current_model: std::sync::RwLock::new(None),
-            self_mod_pinned_tools: std::sync::Mutex::new(Vec::new()),
+            self_mod_prioritized_tools: std::sync::Mutex::new(Vec::new()),
             self_mod_deprioritized_tools: std::sync::Mutex::new(Vec::new()),
             session_lessons: std::sync::Mutex::new(Vec::new()),
             latest_skill_diagnosis: std::sync::Mutex::new(None),
@@ -1741,9 +1741,9 @@ impl ToolExecutor {
     pub fn set_active_session_id(&self, session_id: impl Into<String>) {
         let session_id = session_id.into();
         let session_changed = self.active_session_id().as_deref() != Some(session_id.as_str());
-        let (pinned_tools, deprioritized_tools) =
+        let (prioritized_tools, deprioritized_tools) =
             match astra_services::session_workspace::read_workspace_optional(&session_id) {
-                Ok(Some(ws)) => (ws.pinned_tools, ws.deprioritized_tools),
+                Ok(Some(ws)) => (ws.prioritized_tools, ws.deprioritized_tools),
                 Ok(None) => (Vec::new(), Vec::new()),
                 Err(error) => {
                     tracing::warn!(
@@ -1754,8 +1754,8 @@ impl ToolExecutor {
                     (Vec::new(), Vec::new())
                 }
             };
-        if let Ok(mut pinned) = self.self_mod_pinned_tools.lock() {
-            *pinned = pinned_tools;
+        if let Ok(mut prioritized) = self.self_mod_prioritized_tools.lock() {
+            *prioritized = prioritized_tools;
         }
         if let Ok(mut deprioritized) = self.self_mod_deprioritized_tools.lock() {
             *deprioritized = deprioritized_tools;
@@ -4516,9 +4516,10 @@ impl ToolExecutor {
         // only consume site for shell-tool paths.
         self.consume_activated_deferred_tool_if_called(name);
         if name == "bash" {
-            let output = self.finalize_tool_output(self.bash_with_cancel(args, cancel_token), name);
-            self.record_output_size(output.len());
-            return Some(tool_execution_outcome_from_output(output));
+            let mut outcome = self.bash_outcome_with_cancel(args, cancel_token);
+            outcome.output = self.finalize_tool_output(outcome.output, name);
+            self.record_output_size(outcome.output.len());
+            return Some(outcome);
         }
         #[cfg(windows)]
         if name == "powershell" {
@@ -5457,7 +5458,7 @@ impl ToolExecutor {
                 "tool_count": model.capabilities.total_tools,
                 "deprioritized_tools": model.capabilities.deprioritized_tools,
                 "skills": model.capabilities.skills,
-                "pinned_tools": model.capabilities.pinned_tools,
+                "prioritized_tools": model.capabilities.prioritized_tools,
                 "tool_health": model.capabilities.tool_health.iter().map(|t| {
                     json!({
                         "name": t.name,
@@ -5608,8 +5609,8 @@ impl ToolExecutor {
             visible_tools
         };
         let tool_name_refs: Vec<&str> = tool_name_strs.iter().map(|s| s.as_str()).collect();
-        let pinned_tools = self
-            .self_mod_pinned_tools
+        let prioritized_tools = self
+            .self_mod_prioritized_tools
             .lock()
             .map(|v| v.clone())
             .unwrap_or_default();
@@ -5639,7 +5640,7 @@ impl ToolExecutor {
 
         let mut snapshot = astra_runtime::self_model::SelfModel::snapshot_with_strategy(
             &tool_name_refs,
-            &pinned_tools,
+            &prioritized_tools,
             &deprioritized_tools,
             skills_slice,
             tool_health_tracker.as_ref(),

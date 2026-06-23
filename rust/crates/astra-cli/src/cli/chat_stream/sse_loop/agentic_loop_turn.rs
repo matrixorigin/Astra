@@ -26,8 +26,8 @@ use astra_runtime::{
     },
     turn::chat_turn_budget_pressure::budget_pressure_for_chat_turn,
     turn::chat_turn_edge_profile::{
-        EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW,
-        EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT, EDGE_PROFILE_KEY_PINNED_TOOL_NAMES,
+        EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES,
+        EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW, EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT,
         detect_active_system_skills_in_message, read_git_branch_abbrev,
     },
     turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
@@ -38,7 +38,7 @@ use astra_runtime::{
     },
     turn::chat_turn_step_plan::record_agentic_step_plan_after_payload_prep,
     turn::prepare_turn_explain_text::restricted_tools_explain_text,
-    turn::tool_schema_prune::pin_invoked_tool_schemas,
+    turn::tool_schema_prune::retain_invoked_tool_schemas,
     turn::turn_guard::{TurnGuard, merge_deprioritized_tools_into_restricted},
 };
 use astra_turn_core::tool::schema::tool_schema_name;
@@ -446,7 +446,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     touch_prep_ui_phase(&ctx.prep_ui_phase, "Recalling memory…");
 
     let budget_pressure = {
-        let schema_tokens = ctx.registry.total_pinned_token_cost();
+        let schema_tokens = ctx.registry.total_always_load_token_cost();
         budget_pressure_for_chat_turn(ctx.messages, requested_model, schema_tokens as usize)
     };
 
@@ -536,14 +536,19 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         let sel_start = Instant::now();
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Loading schemas…");
         let budget = ctx.registry.default_budget();
-        let (mut schemas, mut report) = ctx.registry.build_pinned_surface_with_report_ctx(
+        let (mut schemas, mut report) = ctx.registry.build_initial_surface_with_report_ctx(
             semantic_query_str,
             ctx.history.len() as u32,
             budget,
             ctx.recent_tools,
         );
         if !ctx.tool_results.is_empty() {
-            pin_invoked_tool_schemas(&mut schemas, &mut report, ctx.tool_results, ctx.all_schemas);
+            retain_invoked_tool_schemas(
+                &mut schemas,
+                &mut report,
+                ctx.tool_results,
+                ctx.all_schemas,
+            );
         }
         let sel_latency_ms = sel_start.elapsed().as_millis() as u64;
         (schemas, report, sel_latency_ms)
@@ -705,16 +710,16 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         &final_visible_tool_names,
     );
     let mut activatable_tool_names = HashSet::new();
-    // Always send pinned tool names so the server can place cache_control
-    // markers at the correct pinned/dynamic boundary. User TOML overrides
-    // can add or remove tools from the default pinned set, so this must be
+    // Always send always_load tool names so the server can place cache_control
+    // markers at the correct always_load/dynamic boundary. User TOML overrides
+    // can add or remove tools from the default always_load set, so this must be
     // the resolved runtime set — not a compile-time constant.
-    let pinned_names = ctx.registry.pinned_tool_names_sorted();
-    if !final_visible_tool_names.is_empty() && !pinned_names.is_empty() {
+    let always_load_names = ctx.registry.always_load_tool_names_sorted();
+    if !final_visible_tool_names.is_empty() && !always_load_names.is_empty() {
         merge_edge_profile_extensions(
             &mut payload,
             &json!({
-                EDGE_PROFILE_KEY_PINNED_TOOL_NAMES: pinned_names,
+                EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES: always_load_names,
             }),
         );
     }
@@ -1406,8 +1411,8 @@ mod tests {
     use astra_runtime::turn::agentic_loop::host::{ASK_USER_TOOL_NAME, TurnInteractionMode};
     use astra_turn_core::chat_history_openai::merge_skill_names_track;
     use astra_turn_core::chat_turn_edge_profile::{
-        EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT,
-        EDGE_PROFILE_KEY_PINNED_TOOL_NAMES,
+        EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES,
+        EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT,
     };
     use serde_json::{Value, json};
 
@@ -1995,17 +2000,18 @@ mod tests {
             .iter()
             .map(|name| (*name).to_string())
             .collect();
-        let pinned_names: Vec<String> = payload["edge_profile"][EDGE_PROFILE_KEY_PINNED_TOOL_NAMES]
+        let always_load_names: Vec<String> = payload["edge_profile"]
+            [EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES]
             .as_array()
-            .expect("edge_profile must carry resolved pinned tool names on tool turns")
+            .expect("edge_profile must carry resolved always_load tool names on tool turns")
             .iter()
             .filter_map(Value::as_str)
             .map(ToString::to_string)
             .collect();
         assert_eq!(
-            pinned_names,
-            registry.pinned_tool_names_sorted(),
-            "CLI must send the resolved pinned set so runtime cache boundaries follow user tool_surface overrides"
+            always_load_names,
+            registry.always_load_tool_names_sorted(),
+            "CLI must send the resolved always_load set so runtime cache boundaries follow user tool_surface overrides"
         );
         assert_eq!(
             valid_tool_names, edge_tool_name_set,
@@ -2426,7 +2432,7 @@ mod tests {
         executor.clear_current_tool_surface_for_tests();
 
         let cfg = astra_config::ToolSurfaceConfig {
-            pinned_tools: astra_runtime::tool_registry::surface::default_pinned_names()
+            always_load_tools: astra_runtime::tool_registry::surface::default_always_load_names()
                 .iter()
                 .map(|name| format!("-{name}"))
                 .collect(),

@@ -8,7 +8,7 @@
 
 ## What astra has today (nuance)
 
-- **Runtime 基建**：`ToolRegistry` 构建一个小而稳定的可见 tool surface；默认 pinned 工具直接进入 `tools[]`，deferred 工具只通过 `<deferred_tools>` 目录暴露短描述。
+- **Runtime 基建**：`ToolRegistry` 构建一个小而稳定的可见 tool surface；默认 always-load 工具直接进入 `tools[]`，deferred 工具只通过 `<deferred_tools>` 目录暴露短描述。
 - **激活入口**：`tool_search` 是唯一的工具发现/激活接口。模型主动请求 `select:NAME` 后，下一轮才物化对应完整 schema。
 - **CLI / `stream_chat_sse` 主路径**：最终 payload 只携带当前可见 tool surface。runtime 只负责过滤、注入必需工具、应用 activation 状态；不再维护主动 ranking 或两阶段选择路径。
 
@@ -21,4 +21,4 @@
 
 - [context-compact.md](./context-compact.md) — 上下文与 compact 对比（与本节正交）。  
 - [skills-and-tools.md](./skills-and-tools.md) — 技能与工具总览。  
-- Runtime 实现：`tool_registry/registry.rs`、`tool_registry/surface.rs`、`tool_registry/identity.rs`。
+- Runtime 实现：`tool_registry/registry.rs`、`tool_registry/surface.rs`、`tool_registry/declaration.rs`。

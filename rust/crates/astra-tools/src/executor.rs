@@ -21,9 +21,23 @@ use crate::{ToolApprovalGate, ToolContext, ToolExecutor, ToolProgressCallback, T
 // ─── Helper ─────────────────────────────────────────────────────────────────
 
 /// Convert a String-returning tool function to ToolResult.
-/// Convention: outputs starting with "Error" are error results.
+/// Prefer structured JSON failure (`status=failed`, `success=false`, or
+/// `error`) over legacy text prefixes.
 fn string_to_result(output: String) -> ToolResult {
-    if output.starts_with("Error") {
+    let parsed = serde_json::from_str::<Value>(&output).ok();
+    let structured_error = parsed
+        .as_ref()
+        .and_then(|value| value.get("success").and_then(Value::as_bool))
+        .is_some_and(|success| !success)
+        || parsed
+            .as_ref()
+            .and_then(|value| value.get("status").and_then(Value::as_str))
+            .is_some_and(|status| status == "failed" || status == "error")
+        || parsed
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .is_some();
+    if structured_error || output.starts_with("Error") {
         ToolResult::error(output)
     } else {
         ToolResult::text(output)
@@ -1054,6 +1068,38 @@ mod tests {
             "ok() outcomes must stay successful even when output starts with 'Error'"
         );
         assert!(result.output.starts_with("Error code 0"));
+    }
+
+    #[test]
+    fn string_to_result_uses_structured_failure_status() {
+        let result = string_to_result(
+            serde_json::json!({
+                "status": "failed",
+                "error": "'query' is required",
+            })
+            .to_string(),
+        );
+
+        assert!(
+            result.is_error,
+            "structured status=failed must classify as tool error"
+        );
+    }
+
+    #[test]
+    fn string_to_result_does_not_misclassify_completed_json() {
+        let result = string_to_result(
+            serde_json::json!({
+                "status": "completed",
+                "output": "Error count: 0",
+            })
+            .to_string(),
+        );
+
+        assert!(
+            !result.is_error,
+            "completed structured JSON must not be classified by incidental text"
+        );
     }
 
     #[tokio::test]

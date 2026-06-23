@@ -1,10 +1,10 @@
-//! Tool surface registry: deterministic pinned tools plus explicit deferred activation.
+//! Tool surface registry: deterministic always_load tools plus explicit deferred activation.
 //!
 //! Layered architecture:
 //!
-//! 1. **Pinned tools** — stable schemas included in `tools[]` for tool-bearing turns.
+//! 1. **AlwaysLoad tools** — stable schemas included in `tools[]` for tool-bearing turns.
 //! 2. **Deferred tools** — advertised compactly and activated with `tool_search`.
-//! 3. **Identity drift checks** — test metadata keeps schema, runtime, and
+//! 3. **Declaration drift checks** — test metadata keeps schema, runtime, and
 //!    provider inventories from drifting silently.
 //!
 //! The registry no longer proactively ranks built-in deferred tools into every
@@ -16,7 +16,7 @@ pub use astra_turn_core::tool_registry_meta::{IntentType, Scope, TOOL_CATALOG, T
 mod registry;
 pub mod surface;
 
-mod identity;
+mod declaration;
 #[cfg(test)]
 mod surface_tests;
 
@@ -67,58 +67,58 @@ mod tests {
     }
 
     #[test]
-    fn catalog_pinned_metadata_matches_default_pinned_catalog_subset() {
+    fn catalog_always_load_metadata_matches_default_always_load_catalog_subset() {
         let catalog_names: std::collections::HashSet<&str> =
             TOOL_CATALOG.iter().map(|tool| tool.name).collect();
-        let expected: std::collections::HashSet<&str> = surface::default_pinned_names()
+        let expected: std::collections::HashSet<&str> = surface::default_always_load_names()
             .iter()
             .copied()
             .filter(|name| catalog_names.contains(name))
             .collect();
         let actual: std::collections::HashSet<&str> = TOOL_CATALOG
             .iter()
-            .filter(|tool| tool.pinned)
+            .filter(|tool| tool.always_load)
             .map(|tool| tool.name)
             .collect();
         assert_eq!(
             actual, expected,
-            "catalog pinned metadata is only a catalog subset mirror; the runtime ToolSurface remains the source of truth"
+            "catalog always_load metadata is only a catalog subset mirror; the runtime ToolSurface remains the source of truth"
         );
     }
 
     #[test]
-    fn pinned_tools_are_core_set() {
-        let pinned: Vec<&str> = TOOL_CATALOG
+    fn always_load_tools_are_core_set() {
+        let always_load: Vec<&str> = TOOL_CATALOG
             .iter()
-            .filter(|t| t.pinned)
+            .filter(|t| t.always_load)
             .map(|t| t.name)
             .collect();
         // Runtime default catalog core — file, edit, search, git, memory, and activation.
-        assert!(pinned.contains(&"bash"));
-        assert!(pinned.contains(&"read_file"));
-        assert!(pinned.contains(&"str_replace"));
-        assert!(pinned.contains(&"list_dir"));
+        assert!(always_load.contains(&"bash"));
+        assert!(always_load.contains(&"read_file"));
+        assert!(always_load.contains(&"str_replace"));
+        assert!(always_load.contains(&"list_dir"));
         assert!(
-            pinned.contains(&"memory"),
-            "consolidated memory tool must be pinned — intrinsic capability"
+            always_load.contains(&"memory"),
+            "consolidated memory tool must be always_load — intrinsic capability"
         );
         assert!(
-            pinned.contains(&"write_file"),
+            always_load.contains(&"write_file"),
             "write_file completes the read/edit/write triad"
         );
         assert!(
-            pinned.contains(&"grep") && pinned.contains(&"glob"),
+            always_load.contains(&"grep") && always_load.contains(&"glob"),
             "grep/glob are near-universal for code navigation"
         );
         assert!(
-            pinned.contains(&"git"),
-            "consolidated git tool must be pinned — git ops appear in most coding turns"
+            always_load.contains(&"git"),
+            "consolidated git tool must be always_load — git ops appear in most coding turns"
         );
         assert!(
-            !pinned.contains(&"web_fetch")
-                && !pinned.contains(&"session")
-                && !pinned.contains(&"introspect"),
-            "runtime-deferred tools must not stay catalog-pinned"
+            !always_load.contains(&"web_fetch")
+                && !always_load.contains(&"session")
+                && !always_load.contains(&"introspect"),
+            "runtime-deferred tools must not stay catalog-always_load"
         );
     }
 
@@ -192,20 +192,21 @@ mod tests {
     // ── Tool surface contract ──
 
     #[test]
-    fn pinned_memory_always_available_for_recall() {
-        // memory is pinned so memory lifecycle cases always have it available
+    fn always_load_memory_always_available_for_recall() {
+        // memory is always_load so memory lifecycle cases always have it available
         // without an activation round trip.
         let tool = TOOL_CATALOG.iter().find(|t| t.name == "memory").unwrap();
         assert!(
-            tool.pinned,
-            "memory must be pinned for reliable memory lifecycle"
+            tool.always_load,
+            "memory must be always_load for reliable memory lifecycle"
         );
     }
 
     #[test]
     fn code_intel_query_leaves_lsp_deferred() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_pinned_surface("find references for this symbol with lsp", 1);
+        let selected =
+            registry.build_initial_surface("find references for this symbol with lsp", 1);
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             !names.contains(&"lsp".to_string()),
@@ -218,17 +219,17 @@ mod tests {
     #[test]
     fn select_memory_query_has_memory() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_pinned_surface("我有哪些记忆？", 1);
+        let selected = registry.build_initial_surface("我有哪些记忆？", 1);
         let names = ToolRegistry::visible_names(&selected);
         assert!(names.contains(&"memory".to_string()));
     }
 
     /// Regression: implicit Chinese preferences still have memory available
-    /// because memory is pinned.
+    /// because memory is always_load.
     #[test]
     fn select_preference_statement_has_memory() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_pinned_surface("苹果比较好吃", 1);
+        let selected = registry.build_initial_surface("苹果比较好吃", 1);
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             names.contains(&"memory".to_string()),
@@ -240,7 +241,7 @@ mod tests {
     #[test]
     fn select_tracking_intent_has_memory() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_pinned_surface("我关注 matrixorigin", 1);
+        let selected = registry.build_initial_surface("我关注 matrixorigin", 1);
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             names.contains(&"memory".to_string()),
@@ -250,28 +251,28 @@ mod tests {
     }
 
     #[test]
-    fn non_conversational_zero_budget_includes_pinned() {
+    fn non_conversational_zero_budget_includes_always_load() {
         let registry = ToolRegistry::new(mock_schemas());
         let result =
-            registry.build_pinned_surface_with_budget("inspect the repository files", 1, 0);
+            registry.build_initial_surface_with_budget("inspect the repository files", 1, 0);
         let names = ToolRegistry::visible_names(&result);
         assert!(
             names.contains(&"bash".to_string()),
-            "non-conversational zero-budget query must still include pinned bash"
+            "non-conversational zero-budget query must still include always_load bash"
         );
         assert!(
             names.contains(&"read_file".to_string()),
-            "non-conversational zero-budget query must still include pinned read_file"
+            "non-conversational zero-budget query must still include always_load read_file"
         );
-        assert_eq!(names.len(), registry.pinned_tool_names_sorted().len());
+        assert_eq!(names.len(), registry.always_load_tool_names_sorted().len());
     }
 
     #[test]
     fn budget_does_not_add_deferred_tools() {
         let registry = ToolRegistry::new(mock_schemas());
-        let result = registry.build_pinned_surface_with_budget("最新的pr?", 1, 50);
+        let result = registry.build_initial_surface_with_budget("最新的pr?", 1, 50);
         let names = ToolRegistry::visible_names(&result);
-        assert_eq!(names, registry.pinned_tool_names_sorted());
+        assert_eq!(names, registry.always_load_tool_names_sorted());
     }
 
     // ── ToolRegistry integration ──
@@ -279,14 +280,14 @@ mod tests {
     #[test]
     fn registry_select_pr_query_leaves_github_deferred() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_pinned_surface("matrixorigin memoria 最新的pr?", 1);
+        let selected = registry.build_initial_surface("matrixorigin memoria 最新的pr?", 1);
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             !names.contains(&"github".to_string()),
             "github must stay deferred until activated, got: {:?}",
             names
         );
-        // Pinned always present
+        // AlwaysLoad always present
         assert!(names.contains(&"bash".to_string()));
         assert!(names.contains(&"read_file".to_string()));
     }
@@ -297,7 +298,7 @@ mod tests {
             mock_schemas(),
             &astra_config::ToolSurfaceConfig::default(),
         );
-        let selected = registry.build_pinned_surface_with_budget(
+        let selected = registry.build_initial_surface_with_budget(
             "fetch the contents of https://example.com and summarize the web page",
             1,
             800,
@@ -306,7 +307,7 @@ mod tests {
 
         assert!(
             !registry
-                .pinned_schemas()
+                .always_load_schemas()
                 .iter()
                 .any(|(name, _)| name == "web_fetch"),
             "web_fetch is intentionally deferred by the runtime surface"
@@ -320,7 +321,7 @@ mod tests {
     #[test]
     fn registry_select_conversational_uses_no_tools() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_pinned_surface("你好", 1);
+        let selected = registry.build_initial_surface("你好", 1);
         let names = ToolRegistry::visible_names(&selected);
         assert_eq!(
             names.len(),
@@ -334,7 +335,7 @@ mod tests {
     fn registry_select_complex_query() {
         let registry = ToolRegistry::new(mock_schemas());
         let selected =
-            registry.build_pinned_surface("analyze why the CI failed on the latest PR", 1);
+            registry.build_initial_surface("analyze why the CI failed on the latest PR", 1);
         let names = ToolRegistry::visible_names(&selected);
         assert!(names.contains(&"git".to_string()));
         assert!(!names.contains(&"github".to_string()));
@@ -343,7 +344,7 @@ mod tests {
     #[test]
     fn registry_select_repo_stats_query_leaves_github_deferred() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_pinned_surface("matrixorigin memoria 多少star了？", 1);
+        let selected = registry.build_initial_surface("matrixorigin memoria 多少star了？", 1);
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             !names.contains(&"github".to_string()),
@@ -355,7 +356,7 @@ mod tests {
     #[test]
     fn registry_select_memory_query() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_pinned_surface("我之前记住的偏好是什么?", 1);
+        let selected = registry.build_initial_surface("我之前记住的偏好是什么?", 1);
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             names.contains(&"memory".to_string()),
@@ -367,7 +368,7 @@ mod tests {
     #[test]
     fn registry_select_create_issue_leaves_github_deferred() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_pinned_surface("create a new issue for this bug", 1);
+        let selected = registry.build_initial_surface("create a new issue for this bug", 1);
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             !names.contains(&"github".to_string()),
@@ -379,7 +380,7 @@ mod tests {
     #[test]
     fn registry_select_git_status() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_pinned_surface("git status 看看改了什么", 1);
+        let selected = registry.build_initial_surface("git status 看看改了什么", 1);
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             names.contains(&"git".to_string()),
@@ -391,7 +392,7 @@ mod tests {
     #[test]
     fn registry_select_reflect_query_leaves_introspect_deferred() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_pinned_surface("为什么上次选错了工具?", 1);
+        let selected = registry.build_initial_surface("为什么上次选错了工具?", 1);
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             !names.contains(&"introspect".to_string()),
@@ -403,13 +404,13 @@ mod tests {
     // ── Budgeted surface assembly ──
 
     #[test]
-    fn build_surface_with_budget_larger_returns_same_pinned_tools() {
+    fn build_surface_with_budget_larger_returns_same_always_load_tools() {
         let schemas = mock_schemas();
         let registry = ToolRegistry::new(schemas);
         let small =
-            registry.build_pinned_surface_with_budget("matrixorigin memoria 最新的pr?", 1, 500);
+            registry.build_initial_surface_with_budget("matrixorigin memoria 最新的pr?", 1, 500);
         let large =
-            registry.build_pinned_surface_with_budget("matrixorigin memoria 最新的pr?", 1, 6000);
+            registry.build_initial_surface_with_budget("matrixorigin memoria 最新的pr?", 1, 6000);
         assert_eq!(
             ToolRegistry::visible_names(&large),
             ToolRegistry::visible_names(&small)
@@ -417,13 +418,16 @@ mod tests {
     }
 
     #[test]
-    fn build_surface_with_budget_zero_still_returns_pinned() {
+    fn build_surface_with_budget_zero_still_returns_always_load() {
         let schemas = mock_schemas();
         let registry = ToolRegistry::new(schemas);
         let selected =
-            registry.build_pinned_surface_with_budget("matrixorigin memoria 最新的pr?", 1, 0);
-        // Pinned tools are budget-exempt, always included
-        assert_eq!(selected.len(), registry.pinned_tool_names_sorted().len());
+            registry.build_initial_surface_with_budget("matrixorigin memoria 最新的pr?", 1, 0);
+        // AlwaysLoad tools are budget-exempt, always included
+        assert_eq!(
+            selected.len(),
+            registry.always_load_tool_names_sorted().len()
+        );
     }
 
     #[test]
@@ -488,7 +492,7 @@ mod tests {
     fn build_surface_with_report_returns_consistent_data() {
         let registry = ToolRegistry::new(mock_schemas());
         let (schemas, report) =
-            registry.build_pinned_surface_with_report("matrixorigin 最新的pr?", 1, 3000);
+            registry.build_initial_surface_with_report("matrixorigin 最新的pr?", 1, 3000);
         assert_eq!(schemas.len(), report.visible_count as usize);
         assert_eq!(ToolRegistry::visible_names(&schemas), report.visible_tools);
         assert_eq!(report.budget_total, 3000);
@@ -497,7 +501,7 @@ mod tests {
     #[test]
     fn build_surface_with_report_conversational_zero_budget() {
         let registry = ToolRegistry::new(mock_schemas());
-        let (_schemas, report) = registry.build_pinned_surface_with_report("你好", 1, 3000);
+        let (_schemas, report) = registry.build_initial_surface_with_report("你好", 1, 3000);
         assert_eq!(
             report.budget_used, 0,
             "conversational query should use 0 budget"
@@ -631,11 +635,11 @@ mod tests {
     fn budget_edge_exactly_one_tool_fits() {
         // Phase 6.2: Budget exhaustion boundary
         let reg = ToolRegistry::new(mock_schemas());
-        // Use a very small budget — pinned tools remain budget-exempt.
-        let (schemas, report) = reg.build_pinned_surface_with_report("list PRs", 1, 1);
+        // Use a very small budget — always_load tools remain budget-exempt.
+        let (schemas, report) = reg.build_initial_surface_with_report("list PRs", 1, 1);
         assert!(
-            schemas.len() >= reg.pinned_tool_names_sorted().len(),
-            "should always include pinned tools even with tiny budget"
+            schemas.len() >= reg.always_load_tool_names_sorted().len(),
+            "should always include always_load tools even with tiny budget"
         );
         assert!(report.budget_used <= 1 || report.budget_used == 0);
     }
@@ -643,7 +647,7 @@ mod tests {
     #[test]
     fn conversational_query_returns_no_tools() {
         let reg = ToolRegistry::new(mock_schemas());
-        let (schemas, _) = reg.build_pinned_surface_with_report("hello there", 1, 2000);
+        let (schemas, _) = reg.build_initial_surface_with_report("hello there", 1, 2000);
         assert!(
             schemas.is_empty(),
             "conversational turns should be tool-free"
@@ -682,7 +686,7 @@ mod tests {
         // Phase 6: Data consistency check
         let reg = ToolRegistry::new(mock_schemas());
         let (schemas, report) =
-            reg.build_pinned_surface_with_report("show me open PRs in matrixone", 3, 800);
+            reg.build_initial_surface_with_report("show me open PRs in matrixone", 3, 800);
         assert_eq!(
             schemas.len(),
             report.visible_count as usize,
@@ -699,7 +703,7 @@ mod tests {
     fn surface_report_has_no_proactive_deferred_budget() {
         let registry = ToolRegistry::new(mock_schemas());
         let (_schemas, report) =
-            registry.build_pinned_surface_with_report("analyze everything", 1, 800);
+            registry.build_initial_surface_with_report("analyze everything", 1, 800);
         assert_eq!(report.budget_used, 0);
     }
 }

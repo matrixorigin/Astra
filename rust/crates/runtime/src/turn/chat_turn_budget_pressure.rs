@@ -13,9 +13,9 @@ const ABSOLUTE_AGGRESSIVE_PRUNE_TOKENS: usize = 320_000;
 pub fn budget_pressure_for_chat_turn(
     messages: &[Value],
     model: Option<&str>,
-    pinned_schema_tokens: usize,
+    always_load_schema_tokens: usize,
 ) -> f64 {
-    let estimated = prompts::estimate_tokens(messages, pinned_schema_tokens, 0);
+    let estimated = prompts::estimate_tokens(messages, always_load_schema_tokens, 0);
     let budget = prompts::budget_for_model(model);
     let tier = budget.compaction_tier(estimated);
     tier.budget_pressure()

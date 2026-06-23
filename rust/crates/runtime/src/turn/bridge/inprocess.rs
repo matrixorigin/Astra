@@ -224,17 +224,17 @@ fn deferred_tools_block_for_bridge_model(
         .unwrap_or_default()
 }
 
-/// Extract the pinned (T1) tool names from the CLI-built `edge_profile`.
+/// Extract the always_load (T1) tool names from the CLI-built `edge_profile`.
 ///
-/// When the key is present, the names reflect the resolved `ToolSurface` pinned
+/// When the key is present, the names reflect the resolved `ToolSurface` always_load
 /// set (user TOML overrides included). When absent (test-only path or
 /// server-side tools), falls back to the runtime-configured surface so
 /// cache_control markers still match TOML overrides.
-fn pinned_tool_names_for_bridge(
+fn always_load_tool_names_for_bridge(
     edge_profile: &Map<String, Value>,
 ) -> std::collections::HashSet<String> {
     edge_profile
-        .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_PINNED_TOOL_NAMES)
+        .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES)
         .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
@@ -242,7 +242,7 @@ fn pinned_tool_names_for_bridge(
                 .map(str::to_string)
                 .collect()
         })
-        .unwrap_or_else(crate::turn::prompt_cache::runtime_pinned_tool_names)
+        .unwrap_or_else(crate::turn::prompt_cache::runtime_always_load_tool_names)
 }
 
 /// Decide whether the bridge should run its own `prefetch_memories` call.
@@ -2245,7 +2245,7 @@ impl InProcessChatTurnBridge {
             // catalog change flips the cache once then stabilizes.
             //
             // `ToolSurfaceConfig` honours the user's `runtime.tool_surface`
-            // TOML: pinned_tools additive over defaults; `-name` removes a
+            // TOML: always_load_tools additive over defaults; `-name` removes a
             // default. Loaded via the same `RuntimeConfig::load()` path as
             // `tool_surface` above (line 1451) for consistency.
             let deferred_block_str = deferred_tools_block_for_bridge_model(
@@ -2578,7 +2578,7 @@ impl InProcessChatTurnBridge {
                 crate::turn::llm::context::annotate_tool_schemas_for_cache(
                     &mut pruned_tools,
                     &cache_cfg,
-                    &pinned_tool_names_for_bridge(&edge_profile),
+                    &always_load_tool_names_for_bridge(&edge_profile),
                 );
 
                 let loop_started = Instant::now();
@@ -3097,7 +3097,7 @@ impl InProcessChatTurnBridge {
                             crate::turn::llm::context::annotate_tool_schemas_for_cache(
                                 &mut pruned_tools,
                                 &cache_cfg,
-                                &pinned_tool_names_for_bridge(&edge_profile),
+                                &always_load_tool_names_for_bridge(&edge_profile),
                             );
                             crate::turn::llm::context::augment_manifest_trace_with_wire(
                                 &mut bridge_manifest_trace_json,
@@ -4705,7 +4705,7 @@ pub mod bridge_inprocess_test_helpers {
 mod tests {
     use super::*;
     use crate::turn::bridge::sse_helpers::apply_forward_llm_sse_event;
-    use crate::turn::prompt_cache::runtime_pinned_tool_names;
+    use crate::turn::prompt_cache::runtime_always_load_tool_names;
     use astra_services::SessionArtifactStore;
     use astra_services::{
         SessionArtifactJsonRecord, SessionArtifactJsonStore, StoredSessionArtifact,
@@ -4718,8 +4718,8 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    fn default_test_pinned_tool_names() -> std::collections::HashSet<String> {
-        crate::turn::prompt_cache::resolve_pinned_tool_names_for_config(
+    fn default_test_always_load_tool_names() -> std::collections::HashSet<String> {
+        crate::turn::prompt_cache::resolve_always_load_tool_names_for_config(
             &astra_config::ToolSurfaceConfig::default(),
         )
     }
@@ -5320,19 +5320,20 @@ mod tests {
     use crate::turn::prompt_cache::CACHE_ENV_MUTEX;
 
     #[test]
-    fn pinned_tool_names_for_bridge_uses_edge_profile_override_or_runtime_fallback() {
+    fn always_load_tool_names_for_bridge_uses_edge_profile_override_or_runtime_fallback() {
         let mut edge_profile = Map::new();
         edge_profile.insert(
-            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_PINNED_TOOL_NAMES.to_string(),
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES
+                .to_string(),
             json!(["bash"]),
         );
 
-        let overridden = pinned_tool_names_for_bridge(&edge_profile);
+        let overridden = always_load_tool_names_for_bridge(&edge_profile);
         assert!(overridden.contains("bash"));
         assert!(!overridden.contains("read_file"));
 
-        let fallback = pinned_tool_names_for_bridge(&Map::new());
-        assert_eq!(fallback, runtime_pinned_tool_names());
+        let fallback = always_load_tool_names_for_bridge(&Map::new());
+        assert_eq!(fallback, runtime_always_load_tool_names());
     }
 
     #[test]
@@ -5518,7 +5519,7 @@ mod tests {
         annotate_tool_schemas_for_caching(
             &mut tools,
             &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-            &default_test_pinned_tool_names(),
+            &default_test_always_load_tool_names(),
         );
 
         // Only last tool should have cache_control
@@ -5543,7 +5544,7 @@ mod tests {
         annotate_tool_schemas_for_caching(
             &mut tools,
             &PromptCacheConfig::latch("openai", "gpt-4"),
-            &default_test_pinned_tool_names(),
+            &default_test_always_load_tool_names(),
         );
         assert!(
             tools[0].get("cache_control").is_none(),
@@ -5552,14 +5553,14 @@ mod tests {
     }
 
     #[test]
-    fn annotate_tool_schemas_marks_end_of_pinned_prefix() {
+    fn annotate_tool_schemas_marks_end_of_always_load_prefix() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         unsafe {
             std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
-        // bash and read_file are pinned (static lib); github_list_prs is dynamic.
-        // The marker must sit on the last pinned tool so dynamic churn after
+        // bash and read_file are always_load (static lib); github_list_prs is dynamic.
+        // The marker must sit on the last always_load tool so dynamic churn after
         // it doesn't invalidate the cached prefix.
         let mut tools = vec![
             json!({"function": {"name": "bash"}}),
@@ -5569,16 +5570,16 @@ mod tests {
         annotate_tool_schemas_for_caching(
             &mut tools,
             &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-            &default_test_pinned_tool_names(),
+            &default_test_always_load_tool_names(),
         );
 
         assert!(
             tools[0].get("cache_control").is_none(),
-            "first pinned tool should not have cache_control"
+            "first always_load tool should not have cache_control"
         );
         assert!(
             tools[1].get("cache_control").is_some(),
-            "last pinned tool (read_file) should have cache_control — end of static prefix"
+            "last always_load tool (read_file) should have cache_control — end of static prefix"
         );
         assert!(
             tools[2].get("cache_control").is_none(),
@@ -5736,7 +5737,7 @@ mod tests {
             json!({"function": {"name": "bash"}}),
             json!({"function": {"name": "read_file"}}),
         ];
-        annotate_tool_schemas_for_caching(&mut tools, &cfg, &default_test_pinned_tool_names());
+        annotate_tool_schemas_for_caching(&mut tools, &cfg, &default_test_always_load_tool_names());
 
         for (i, tool) in tools.iter().enumerate() {
             assert!(
@@ -5957,7 +5958,7 @@ mod tests {
         annotate_tool_schemas_for_caching(
             &mut tools,
             &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-            &default_test_pinned_tool_names(),
+            &default_test_always_load_tool_names(),
         );
         assert!(tools.is_empty());
     }

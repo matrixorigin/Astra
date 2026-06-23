@@ -337,7 +337,9 @@ async fn persist_context_manifest_for_llm_call(
         return;
     };
     let turn_intent = infer_turn_intent_for_llm_call(state, pre_llm_messages);
-    let schema_tokens = state.pinned_tool_schema_tokens.min(u64::from(u32::MAX)) as u32;
+    let schema_tokens = state
+        .always_load_tool_schema_tokens
+        .min(u64::from(u32::MAX)) as u32;
     let result_prompt_tokens = turn_result
         .map(|result| {
             result

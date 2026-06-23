@@ -1,4 +1,4 @@
-//! Tool schema manipulation: pruning under token pressure and pinning previously-invoked tools.
+//! Tool schema manipulation: pruning under token pressure and retaining previously-invoked tools.
 
 use std::collections::{HashMap, HashSet};
 
@@ -213,10 +213,10 @@ fn strip_property_descriptions(func: &mut Value) {
 /// Ensure tool schemas for previously-invoked tools remain available in follow-up turns.
 ///
 /// When the tool surface includes a fresh set of tools for the next LLM round it may drop
-/// tools the LLM already called (because the query shifted). This function re-pins
+/// tools the LLM already called (because the query shifted). This function retains
 /// those schemas so the LLM can continue using them. Mutates `surface` and `report`
 /// in-place, returning the count of schemas that were added.
-pub fn pin_invoked_tool_schemas(
+pub fn retain_invoked_tool_schemas(
     surface: &mut Vec<Value>,
     report: &mut ToolSurfaceReport,
     tool_results: &[Value],
@@ -228,7 +228,7 @@ pub fn pin_invoked_tool_schemas(
         .filter_map(|s| tool_schema_name(s).map(String::from))
         .collect();
 
-    let mut pinned = 0u32;
+    let mut retained = 0u32;
     for tr in tool_results {
         if let Some(name) = tr.get("name").and_then(|n| n.as_str())
             && !visible_names.contains(name)
@@ -238,10 +238,10 @@ pub fn pin_invoked_tool_schemas(
             surface.push((*schema).clone());
             report.visible_tools.push(name.to_string());
             report.visible_count += 1;
-            pinned += 1;
+            retained += 1;
         }
     }
-    pinned
+    retained
 }
 
 /// Force-inject skill `allowed_tools` that the assembled surface missed.
@@ -571,10 +571,10 @@ mod tests {
         );
     }
 
-    // ── pin_invoked_tool_schemas ──────────────────────────────
+    // ── retain_invoked_tool_schemas ──────────────────────────────
 
     #[test]
-    fn pin_adds_missing_invoked_tool() {
+    fn retain_adds_missing_invoked_tool() {
         let all = vec![
             make_tool_schema("bash", "run", false),
             make_tool_schema("grep", "search", false),
@@ -589,9 +589,9 @@ mod tests {
         };
         let results = vec![json!({"name": "grep"}), json!({"name": "read_file"})];
 
-        let pinned = pin_invoked_tool_schemas(&mut selected, &mut report, &results, &all);
+        let retained = retain_invoked_tool_schemas(&mut selected, &mut report, &results, &all);
 
-        assert_eq!(pinned, 2);
+        assert_eq!(retained, 2);
         assert_eq!(selected.len(), 3);
         assert_eq!(report.visible_count, 3);
         assert!(report.visible_tools.contains(&"grep".to_string()));
@@ -599,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn pin_does_not_duplicate_already_selected() {
+    fn retain_does_not_duplicate_already_selected() {
         let all = vec![make_tool_schema("bash", "run", false)];
         let mut selected = vec![make_tool_schema("bash", "run", false)];
         let mut report = ToolSurfaceReport {
@@ -610,14 +610,14 @@ mod tests {
         };
         let results = vec![json!({"name": "bash"})];
 
-        let pinned = pin_invoked_tool_schemas(&mut selected, &mut report, &results, &all);
+        let retained = retain_invoked_tool_schemas(&mut selected, &mut report, &results, &all);
 
-        assert_eq!(pinned, 0);
+        assert_eq!(retained, 0);
         assert_eq!(selected.len(), 1);
     }
 
     #[test]
-    fn pin_skips_unknown_tools() {
+    fn retain_skips_unknown_tools() {
         let all = vec![make_tool_schema("bash", "run", false)];
         let mut selected = vec![];
         let mut report = ToolSurfaceReport {
@@ -628,14 +628,14 @@ mod tests {
         };
         let results = vec![json!({"name": "nonexistent_tool"})];
 
-        let pinned = pin_invoked_tool_schemas(&mut selected, &mut report, &results, &all);
+        let retained = retain_invoked_tool_schemas(&mut selected, &mut report, &results, &all);
 
-        assert_eq!(pinned, 0);
+        assert_eq!(retained, 0);
         assert!(selected.is_empty());
     }
 
     #[test]
-    fn pin_empty_results_is_noop() {
+    fn retain_empty_results_is_noop() {
         let all = vec![make_tool_schema("bash", "run", false)];
         let mut selected = vec![make_tool_schema("bash", "run", false)];
         let mut report = ToolSurfaceReport {
@@ -645,18 +645,18 @@ mod tests {
             budget_total: 100,
         };
 
-        let pinned = pin_invoked_tool_schemas(&mut selected, &mut report, &[], &all);
+        let retained = retain_invoked_tool_schemas(&mut selected, &mut report, &[], &all);
 
-        assert_eq!(pinned, 0);
+        assert_eq!(retained, 0);
         assert_eq!(selected.len(), 1);
     }
 
     /// Regression: when the same tool appears in multiple tool_results (e.g.
-    /// git_diff called 12 times), pin_invoked_tool_schemas must add the schema
+    /// git_diff called 12 times), retain_invoked_tool_schemas must add the schema
     /// only once. Previously, `visible_names` was a snapshot that was never
     /// updated, causing N duplicate schemas → LLM 400 "function name duplicated".
     #[test]
-    fn pin_deduplicates_same_tool_in_multiple_results() {
+    fn retain_deduplicates_same_tool_in_multiple_results() {
         let all = vec![
             make_tool_schema("bash", "run", false),
             make_tool_schema("git_diff", "diff", false),
@@ -671,9 +671,9 @@ mod tests {
         // 12 tool results for the same tool (different args, but same name)
         let results: Vec<Value> = (0..12).map(|_| json!({"name": "git_diff"})).collect();
 
-        let pinned = pin_invoked_tool_schemas(&mut selected, &mut report, &results, &all);
+        let retained = retain_invoked_tool_schemas(&mut selected, &mut report, &results, &all);
 
-        assert_eq!(pinned, 1, "should pin git_diff exactly once");
+        assert_eq!(retained, 1, "should retain git_diff exactly once");
         assert_eq!(selected.len(), 2, "bash + git_diff");
         assert_eq!(
             report

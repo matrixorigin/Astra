@@ -156,7 +156,7 @@ pub(crate) struct LlmContextAssemblyInput<'a> {
 /// executors. The shared assembler only sees the selected visible schemas.
 pub(crate) struct ToolSurfacePlan<'a> {
     pub visible_tools: &'a [Value],
-    pub pinned_tools: &'a [Value],
+    pub always_load_tools: &'a [Value],
     pub dynamic_tools: &'a [Value],
     pub required_tools: &'a [Value],
     pub deferred_tools_block: &'a str,
@@ -170,7 +170,7 @@ impl<'a> ToolSurfacePlan<'a> {
     ) -> Self {
         Self {
             visible_tools,
-            pinned_tools: visible_tools,
+            always_load_tools: visible_tools,
             dynamic_tools: &[],
             required_tools: &[],
             deferred_tools_block: "",
@@ -181,7 +181,7 @@ impl<'a> ToolSurfacePlan<'a> {
     fn effective_tools(&self) -> Vec<Value> {
         let tools = effective_tool_schemas(
             self.visible_tools,
-            self.pinned_tools,
+            self.always_load_tools,
             self.dynamic_tools,
             self.required_tools,
         );
@@ -340,13 +340,13 @@ fn push_unique_tool(out: &mut Vec<Value>, seen: &mut HashSet<String>, schema: &V
 
 fn effective_tool_schemas(
     visible_tools: &[Value],
-    pinned_tools: &[Value],
+    always_load_tools: &[Value],
     dynamic_tools: &[Value],
     required_tools: &[Value],
 ) -> Vec<Value> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for schema in pinned_tools {
+    for schema in always_load_tools {
         push_unique_tool(&mut out, &mut seen, schema);
     }
     for schema in required_tools {
@@ -668,7 +668,7 @@ pub(crate) fn assemble_bridge_context(
         .collect();
     let _tool_surface_metadata = (
         input.tool_surface.visible_tools.len(),
-        input.tool_surface.pinned_tools.len(),
+        input.tool_surface.always_load_tools.len(),
         input.tool_surface.dynamic_tools.len(),
         input.tool_surface.required_tools.len(),
         input.tool_surface.restricted_tools.len(),
@@ -753,7 +753,7 @@ pub(crate) fn assemble_context_pipeline(
     let state = input.state;
     let effective_tools = input.tool_surface.effective_tools();
     let _tool_surface_metadata = (
-        input.tool_surface.pinned_tools.len(),
+        input.tool_surface.always_load_tools.len(),
         input.tool_surface.dynamic_tools.len(),
         input.tool_surface.required_tools.len(),
         input.tool_surface.restricted_tools.len(),
@@ -1082,12 +1082,12 @@ pub(crate) fn assemble_wire_messages(input: LlmWireAssemblyInput<'_>) -> Vec<Val
 pub(crate) fn annotate_tool_schemas_for_cache(
     tool_schemas: &mut [Value],
     cache_cfg: &PromptCacheConfig,
-    pinned_names: &std::collections::HashSet<String>,
+    always_load_names: &std::collections::HashSet<String>,
 ) {
-    crate::turn::prompt_cache::annotate_tool_schemas_for_caching_with_pinned(
+    crate::turn::prompt_cache::annotate_tool_schemas_for_caching_with_always_load(
         tool_schemas,
         cache_cfg,
-        pinned_names,
+        always_load_names,
     );
 }
 
@@ -1265,22 +1265,22 @@ mod context_cache_contract_tests {
 
     #[test]
     fn effective_tool_schemas_merges_priority_dedupes_and_filters_restricted() {
-        let visible = vec![tool("visible_a"), tool("pinned_a"), tool("dynamic_a")];
-        let pinned = vec![tool("pinned_a"), tool("pinned_b")];
+        let visible = vec![tool("visible_a"), tool("always_load_a"), tool("dynamic_a")];
+        let always_load = vec![tool("always_load_a"), tool("always_load_b")];
         let dynamic = vec![tool("dynamic_a"), tool("dynamic_b")];
-        let required = vec![tool("required_a"), tool("pinned_b")];
+        let required = vec![tool("required_a"), tool("always_load_b")];
         let restricted = HashSet::from(["dynamic_b".to_string()]);
 
         let merged = filter_restricted_tool_schemas(
-            effective_tool_schemas(&visible, &pinned, &dynamic, &required),
+            effective_tool_schemas(&visible, &always_load, &dynamic, &required),
             &restricted,
         );
 
         assert_eq!(
             tool_names(&merged),
             vec![
-                "pinned_a",
-                "pinned_b",
+                "always_load_a",
+                "always_load_b",
                 "required_a",
                 "dynamic_a",
                 "visible_a"

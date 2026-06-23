@@ -293,14 +293,14 @@ mod turn_guard_integration {
 // ── Multi-file edit & continuation round regression tests ───────────────────
 //
 // These tests reproduce the exact scenarios from session c98e2e7e that exposed:
-// 1. pin_invoked_tool_schemas duplicating schemas when the same tool appears
+// 1. retain_invoked_tool_schemas duplicating schemas when the same tool appears
 //    in multiple tool_results (→ LLM 400 "function name duplicated")
 // 2. TurnGuard reward-hacking false positive when the same tool is called
 //    with different arguments (legitimate multi-file edits)
 
 mod multi_file_edit_regression {
     use astra_runtime::tool_registry::ToolSurfaceReport;
-    use astra_turn_core::tool_schema_prune::pin_invoked_tool_schemas;
+    use astra_turn_core::tool_schema_prune::retain_invoked_tool_schemas;
     use astra_turn_core::turn_guard::{TurnGuard, VerdictSeverity};
     use serde_json::{Value, json};
 
@@ -315,7 +315,7 @@ mod multi_file_edit_regression {
     /// Reproduces the exact scenario from session c98e2e7e turn 5:
     /// - Skill activates review-changes, agent calls git_diff 12 times
     /// - Continuation turn sends 12 tool_results for git_diff
-    /// - pin_invoked_tool_schemas must NOT duplicate the schema
+    /// - retain_invoked_tool_schemas must NOT duplicate the schema
     ///
     /// Before fix: 12 git_diff schemas → kimi-k2.5 returns 400
     /// After fix: 1 git_diff schema
@@ -357,10 +357,10 @@ mod multi_file_edit_regression {
         .map(|_| json!({"name": "git_diff"}))
         .collect();
 
-        let pinned =
-            pin_invoked_tool_schemas(&mut selected, &mut report, &tool_results, &all_schemas);
+        let retained =
+            retain_invoked_tool_schemas(&mut selected, &mut report, &tool_results, &all_schemas);
 
-        assert_eq!(pinned, 1, "git_diff should be pinned exactly once");
+        assert_eq!(retained, 1, "git_diff should be retained exactly once");
         assert_eq!(selected.len(), 3, "bash + read_file + git_diff");
 
         // Verify no duplicate function names in the final schema list

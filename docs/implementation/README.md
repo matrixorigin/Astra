@@ -6,11 +6,11 @@ This directory contains detailed implementation documentation for astra-engine f
 
 ## 📚 Core Features
 
-### Tool Selection (ToolRegistry)
-Unified tool selection with pinned/dynamic split, embedding retrieval, and context-aware pre-filtering.
+### Tool Surface (ToolRegistry)
+Unified tool surface with a stable always-load set, deferred manifest, and explicit `tool_search` activation.
 
-- **Architecture:** [../design/skills-and-tools.md#3-skill-selection-pipeline](../design/skills-and-tools.md#3-skill-selection-pipeline)
-- **Implementation:** `core/skills/tool_registry.py`
+- **Architecture:** [../design/tool-discovery-claude-code.md](../design/tool-discovery-claude-code.md)
+- **Implementation:** `rust/crates/runtime/src/tool_registry/`
 
 ### Other Features
 
@@ -57,7 +57,7 @@ docs/
 | Feature | Status |
 |---------|--------|
 | Memory Governance | ✅ Stable |
-| Tool Selection (ToolRegistry) | ✅ Stable |
+| Tool Surface (ToolRegistry) | ✅ Stable |
 | Authentication | ✅ Stable |
 | LLM Integration | ✅ Stable |
 | GitHub Integration | ✅ Stable |

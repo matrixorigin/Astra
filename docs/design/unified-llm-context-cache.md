@@ -16,7 +16,7 @@ Astra currently has a strong prompt/context cache design in the CLI-era agentic 
 - Anthropic and Bedrock use explicit cache markers.
 - OpenAI-compatible providers rely on byte-stable prefix caching.
 - MiniMax-style strict-history providers suppress volatile injection when needed.
-- Tool schemas are selected, pinned, pruned, and cache-aligned.
+- Tool schemas are selected, always-loaded, pruned, and cache-aligned.
 - Message history and tool results are compacted through one shared wire assembly path.
 
 The latest `main` already contains part of the right shared architecture: `ContextPipeline`, `context_pipeline_adapter`, `PipelineSession`, and `wire_assembly`. However, the CLI and web agent still differ in where context is collected, how tool visibility is decided, how the bridge lifecycle carries pipeline state, and how the new web-agent `context_manifest` is produced.
@@ -42,7 +42,7 @@ Current integration points:
 - CLI bridge calls `llm_context::assemble_bridge_context`, preserves skill listing, and emits `context_manifest_trace` through SSE.
 - CLI loop execution copies `ChatTurnSseAccum.context_manifest_trace` back into `AgenticLoopState` before context-manifest persistence.
 - Web/server host calls `llm_context::assemble_context_pipeline`, `assemble_wire_messages`, and common tool-schema cache annotation.
-- Effective tool schemas are merged as `pinned -> required -> dynamic -> remaining visible` and restricted inside the shared context module, so callers do not need to duplicate final deny-list filtering.
+- Effective tool schemas are merged as `always_load -> required -> dynamic -> remaining visible` and restricted inside the shared context module, so callers do not need to duplicate final deny-list filtering.
 - `context_meta` SSE event construction is centralized in the shared context module.
 - External run-event transformation preserves both already-shaped and persisted `context_meta` events.
 - Web/server `context_meta` is emitted after final wire cache annotation, so the trace includes final wire marker counts.
@@ -77,7 +77,7 @@ The assembler is the only place that owns:
 - Anthropic, Bedrock, OpenAI-compatible, and strict-history cache behavior.
 - Tool schema selection output normalization.
 - Tool schema pruning.
-- Pinned tool cache-prefix layout.
+- Always-load tool cache-prefix layout.
 - Message compaction.
 - Tool result compaction.
 - Volatile preamble placement.
@@ -154,7 +154,7 @@ The CLI path contributes these context sources:
 | Skill listing prefix | Routed through `edge_profile` instead of leading system message | Stable `Session` section when listing is session-stable |
 | Memory boost | Top-k memory search, semantic query normalization, digest rendering | `ExternalSources.memory_entries` plus optional volatile recall digest |
 | Tool schemas | Registry selection by semantic query, budget, recent tools | `ToolSurfacePlan.selected_schemas` |
-| Invoked tool pinning | Re-add schemas for tools used in tool loop | `ToolSurfacePlan.pinned_schemas` |
+| Invoked tool retention | Re-add schemas for tools used in tool loop | `ToolSurfacePlan.retained_invoked_schemas` |
 | Skill allowed tools | Force-inject schemas declared by active skill | `ToolSurfacePlan.required_schemas` |
 | Deferred tool catalog | Edge profile deferred block | `SessionContext.deferred_tools_block` |
 | Runtime turn overrides | effort, agent type, subtask, rollback hints | `ExternalSources.effort_hint`, `plan_context`, or typed policy fields |
@@ -231,7 +231,7 @@ This is useful as an audit and budget ledger. It is not the actual prompt assemb
 
 Current limitations:
 
-- It estimates from `pre_llm_messages`, `state.tool_results`, and `state.pinned_tool_schema_tokens`.
+- It estimates from `pre_llm_messages`, `state.tool_results`, and `state.always_load_tool_schema_tokens`.
 - It does not consume the exact `PipelineSession` output.
 - It records a fixed `budget_v1_8k` view even when the actual model context window is larger.
 - It can drift from the real prompt if the wire assembler moves volatile content, reinjects attachments, prunes schemas, or annotates cache markers.
@@ -287,12 +287,12 @@ The caller must not decide cache marker placement. The shared assembler must own
 Tool schemas are one of the largest prompt components. The baseline behavior is:
 
 - Select schemas by semantic task need.
-- Keep a pinned stable tool prefix.
+- Keep an always-load stable tool prefix.
 - Re-add invoked tools during tool loops.
 - Inject required skill tools if selection missed them.
 - Prune schemas by compaction tier.
-- Annotate the last pinned tool schema for Anthropic cache prefix.
-- Keep dynamic or newly discovered tools after the pinned prefix.
+- Annotate the last always-load tool schema for Anthropic cache prefix.
+- Keep dynamic or newly discovered tools after the always-load prefix.
 
 ### Message and volatile handling
 
@@ -371,7 +371,7 @@ This input must be constructed by adapters, not by the assembler.
 ```rust
 pub struct ToolSurfacePlan {
     pub selected_schemas: Vec<Value>,
-    pub pinned_schemas: Vec<Value>,
+    pub always_load_schemas: Vec<Value>,
     pub dynamic_schemas: Vec<Value>,
     pub required_schemas: Vec<Value>,
     pub deferred_tools_block: String,
@@ -465,7 +465,7 @@ The CLI adapter should preserve CLI's existing strengths:
 - Memory boost search and ranking.
 - Preferred repo boost terms.
 - Tool registry selection.
-- Invoked tool schema pinning.
+- Invoked tool schema retention.
 - Skill `allowed_tools` injection.
 - Deferred tool surface text.
 - Permission and interaction-mode restrictions.
@@ -536,7 +536,7 @@ Today it estimates:
 ```text
 pre_llm_messages
 state.tool_results
-state.pinned_tool_schema_tokens
+state.always_load_tool_schema_tokens
 ```
 
 The new source of truth should be:
@@ -701,8 +701,8 @@ These invariants should be enforced with tests.
 | Session UUID does not appear in prompt text | String scan |
 | Skill listing is session-stable when unchanged | Cache scope assertion |
 | Project context is session-stable | Cache scope assertion |
-| Pinned tools precede dynamic tools | Tool schema order assertion |
-| Last pinned tool gets cache marker for Anthropic | Tool schema annotation assertion |
+| Always-load tools precede dynamic tools | Tool schema order assertion |
+| Last always-load tool gets cache marker for Anthropic | Tool schema annotation assertion |
 | Invoked tools remain visible in the next tool-loop round | Tool-loop test |
 | Context manifest zones are derived from actual assembly output | Manifest trace versus wire output test |
 | Token usage buckets are disjoint | Usage parser test |
@@ -725,7 +725,7 @@ messages
 semantic query
 memory hits
 selected tool schemas
-invoked tool pins
+retained invoked tools
 skill allowed tools
 deferred tools block
 environment static

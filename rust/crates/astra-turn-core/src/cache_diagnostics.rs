@@ -2229,18 +2229,18 @@ mod tests {
         let tools = make_tools(&["bash"]);
         let mut det = CacheBreakDetector::new();
 
-        det.record_turn_for_source("pinned", snap("p", &tools, "m"), None);
-        // Fill the rest to the cap; "pinned" is currently oldest.
+        det.record_turn_for_source("stable", snap("p", &tools, "m"), None);
+        // Fill the rest to the cap; "stable" is currently oldest.
         for i in 0..(MAX_TRACKED_SOURCES - 1) {
             det.record_turn_for_source(&format!("t{i}"), snap("p", &tools, "m"), None);
         }
-        // Refresh pinned — it becomes most recent.
-        det.record_turn_for_source("pinned", snap("p", &tools, "m"), None);
-        // One more write triggers eviction — but "pinned" is no longer oldest.
+        // Refresh stable — it becomes most recent.
+        det.record_turn_for_source("stable", snap("p", &tools, "m"), None);
+        // One more write triggers eviction — but "stable" is no longer oldest.
         det.record_turn_for_source("overflow", snap("p", &tools, "m"), None);
 
         assert!(
-            det.snapshot_for_source("pinned").is_some(),
+            det.snapshot_for_source("stable").is_some(),
             "refreshed source must survive eviction"
         );
         assert!(

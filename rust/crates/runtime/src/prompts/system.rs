@@ -772,7 +772,7 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str], _profile_desc: &str)
     let mut body = String::from(
         "\n## Tool Availability Protocol\n\
          - Call a structured tool only if it is visible in this turn's `tools[]`.\n\
-         - Do not infer tool availability from examples, prior turns, pinned defaults, or local executor capability; the current `tools[]` is authoritative.\n",
+         - Do not infer tool availability from examples, prior turns, always-load defaults, or local executor capability; the current `tools[]` is authoritative.\n",
     );
     if tool_visible(tool_names, "tool_search") {
         body.push_str(
@@ -3320,11 +3320,11 @@ mod tests {
                 )
             })
             .collect();
-        // Build with empty pinned override list so all non-default tools go to deferred.
+        // Build with empty always-load override list so all non-default tools go to deferred.
         crate::tool_registry::surface::ToolSurface::build(
             schemas,
             &astra_config::ToolSurfaceConfig {
-                pinned_tools: vec![],
+                always_load_tools: vec![],
             },
             &[],
         )
@@ -3364,7 +3364,7 @@ mod tests {
         let surface = crate::tool_registry::surface::ToolSurface::build(
             schemas,
             &astra_config::ToolSurfaceConfig {
-                pinned_tools: vec![],
+                always_load_tools: vec![],
             },
             &[],
         );
@@ -3406,7 +3406,7 @@ mod tests {
         let surface = crate::tool_registry::surface::ToolSurface::build(
             schemas,
             &astra_config::ToolSurfaceConfig {
-                pinned_tools: vec![],
+                always_load_tools: vec![],
             },
             &[],
         );

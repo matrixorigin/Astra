@@ -10,7 +10,7 @@ use crate::server::tool_session_config::{persist_config_override, persist_tool_p
 #[derive(Debug, Clone)]
 pub(crate) enum SessionStateRollbackAction {
     ToolPreferences {
-        previous_pinned_tools: Vec<String>,
+        previous_prioritized_tools: Vec<String>,
         previous_deprioritized_tools: Vec<String>,
     },
     ConfigOverride {
@@ -284,24 +284,24 @@ pub(crate) async fn restore_entry(
 
     match &entry.action {
         SessionStateRollbackAction::ToolPreferences {
-            previous_pinned_tools,
+            previous_prioritized_tools,
             previous_deprioritized_tools,
         } => {
             let mut inner = context
                 .config
                 .lock()
                 .map_err(|_| "Failed to access session config".to_string())?;
-            let current_pinned = inner.pinned_tools.clone();
+            let current_prioritized = inner.prioritized_tools.clone();
             let current_deprioritized = inner.deprioritized_tools.clone();
-            inner.pinned_tools = previous_pinned_tools.clone();
+            inner.prioritized_tools = previous_prioritized_tools.clone();
             inner.deprioritized_tools = previous_deprioritized_tools.clone();
             if let Err(error) = persist_tool_preferences(
                 context.session_id,
-                &inner.pinned_tools,
+                &inner.prioritized_tools,
                 &inner.deprioritized_tools,
                 "tool_session_state_rollback:restore_entry",
             ) {
-                inner.pinned_tools = current_pinned;
+                inner.prioritized_tools = current_prioritized;
                 inner.deprioritized_tools = current_deprioritized;
                 return Err(format!(
                     "failed to persist restored tool preferences: {error}"
@@ -551,7 +551,7 @@ mod tests {
             3,
             "first".to_string(),
             SessionStateRollbackAction::ToolPreferences {
-                previous_pinned_tools: vec!["bash".to_string()],
+                previous_prioritized_tools: vec!["bash".to_string()],
                 previous_deprioritized_tools: vec![],
             },
         );
@@ -596,7 +596,7 @@ mod tests {
             5,
             "prefs".to_string(),
             SessionStateRollbackAction::ToolPreferences {
-                previous_pinned_tools: vec!["bash".to_string()],
+                previous_prioritized_tools: vec!["bash".to_string()],
                 previous_deprioritized_tools: vec![],
             },
         );
@@ -625,7 +625,7 @@ mod tests {
             1,
             "prefs".to_string(),
             SessionStateRollbackAction::ToolPreferences {
-                previous_pinned_tools: vec!["bash".to_string()],
+                previous_prioritized_tools: vec!["bash".to_string()],
                 previous_deprioritized_tools: vec![],
             },
         );
@@ -647,7 +647,7 @@ mod tests {
             timestamp: UNIX_EPOCH - Duration::from_millis(1),
             label: "prefs".to_string(),
             action: SessionStateRollbackAction::ToolPreferences {
-                previous_pinned_tools: vec![],
+                previous_prioritized_tools: vec![],
                 previous_deprioritized_tools: vec![],
             },
         };
@@ -667,7 +667,7 @@ mod tests {
             1,
             "prefs".to_string(),
             SessionStateRollbackAction::ToolPreferences {
-                previous_pinned_tools: vec![],
+                previous_prioritized_tools: vec![],
                 previous_deprioritized_tools: vec![],
             },
         );

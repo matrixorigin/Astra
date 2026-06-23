@@ -2004,7 +2004,7 @@ fn introspect_token_pressure(state: &super::host::AgenticLoopState) -> f64 {
     }
     let fresh_estimate = crate::prompts::estimate_tokens(
         &state.messages,
-        state.pinned_tool_schema_tokens as usize,
+        state.always_load_tool_schema_tokens as usize,
         0,
     ) as u64;
     fresh_estimate as f64 / state.max_turn_input_tokens as f64
@@ -2363,7 +2363,7 @@ mod tests {
         let mut state = make_state();
         state.max_turn_input_tokens = 0;
         state.messages = vec![json!({"role": "user", "content": "hello world"})];
-        state.pinned_tool_schema_tokens = 50;
+        state.always_load_tool_schema_tokens = 50;
         assert_eq!(introspect_token_pressure(&state), 0.0);
     }
 
@@ -2374,10 +2374,10 @@ mod tests {
             json!({"role": "system", "content": "system prompt"}),
             json!({"role": "user", "content": "hello world"}),
         ];
-        state.pinned_tool_schema_tokens = 120;
+        state.always_load_tool_schema_tokens = 120;
         let expected = crate::prompts::estimate_tokens(
             &state.messages,
-            state.pinned_tool_schema_tokens as usize,
+            state.always_load_tool_schema_tokens as usize,
             0,
         ) as f64
             / 10_000.0;

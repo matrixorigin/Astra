@@ -939,7 +939,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "description":
                     "Search deferred tools. Use keyword queries to find matches, or \
                      `query=\"select:NAME\"` / `select:NAME1,NAME2` to queue selected tools \
-                     for the next request's tools[] and return compact callable shape. Then \
+                     for the next request's tools[] and return compact callable shape. Use \
+                     `detail:NAME` only when full description/parameter prose is needed. Then \
                      invoke the chosen tool directly.",
                 "parameters": {
                     "type": "object",
@@ -947,7 +948,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "query": {
                             "type": "string",
                             "description":
-                                "Keyword query, or `select:NAME` / `select:NAME1,NAME2`."
+                                "Keyword query, `select:NAME` / `select:NAME1,NAME2`, or `detail:NAME`."
                         },
                         "max_results": {
                             "type": "integer",
@@ -1477,7 +1478,7 @@ mod tests {
             .unwrap_or_default();
         assert!(
             desc.len() <= 140,
-            "task description should stay compact in the pinned prefix: {desc}"
+            "task description should stay compact in the always-load prefix: {desc}"
         );
         assert!(
             desc.contains("3+ outcomes") && desc.contains("subtasks"),
@@ -1505,7 +1506,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_high_frequency_descriptions_stay_compact() {
+    fn always_load_high_frequency_descriptions_stay_compact() {
         let schemas = all_tool_schemas_with_env(|_| None);
         for (name, max_len) in [
             ("bash", 180usize),
@@ -1587,7 +1588,7 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .contains("Archive completed"),
-            "archive bulk criteria should live on older_than_days, not in the pinned description"
+            "archive bulk criteria should live on older_than_days, not in the always-load description"
         );
         let subtask_id_desc = properties["subtask_id"]["description"]
             .as_str()

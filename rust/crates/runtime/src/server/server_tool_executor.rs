@@ -101,15 +101,15 @@ fn resolved_server_tool_names(
 pub(crate) struct SessionConfigInner {
     /// Per-turn mutation accounting for adjust_config governor.
     pub(crate) mutation_counter: (u32, u32),
-    /// Self-modification pinned tool preferences.
-    pub(crate) pinned_tools: Vec<String>,
+    /// Self-modification prioritized tool preferences.
+    pub(crate) prioritized_tools: Vec<String>,
     /// Self-modification deprioritized tool preferences.
     pub(crate) deprioritized_tools: Vec<String>,
 }
 
 /// Self-modification session configuration state.
 ///
-/// Groups pinned/deprioritized tool preferences and mutation counter
+/// Groups prioritized/deprioritized tool preferences and mutation counter
 /// that were previously scattered across individual fields on
 /// [`ServerToolExecutor`].
 pub(crate) struct SessionConfigState {
@@ -117,11 +117,11 @@ pub(crate) struct SessionConfigState {
 }
 
 impl SessionConfigState {
-    fn new(pinned_tools: Vec<String>, deprioritized_tools: Vec<String>) -> Self {
+    fn new(prioritized_tools: Vec<String>, deprioritized_tools: Vec<String>) -> Self {
         Self {
             inner: Mutex::new(SessionConfigInner {
                 mutation_counter: (0, 0),
-                pinned_tools,
+                prioritized_tools,
                 deprioritized_tools,
             }),
         }
@@ -280,9 +280,9 @@ impl ServerToolExecutor {
 
         let memoria_client =
             astra_tools::memoria::MemoriaClient::new(cloud_base.clone(), cloud_token.clone());
-        let (pinned_tools, deprioritized_tools) =
+        let (prioritized_tools, deprioritized_tools) =
             astra_services::session_workspace::read_workspace(&session_id)
-                .map(|workspace| (workspace.pinned_tools, workspace.deprioritized_tools))
+                .map(|workspace| (workspace.prioritized_tools, workspace.deprioritized_tools))
                 .unwrap_or_else(|_| (Vec::new(), Vec::new()));
 
         let default_executor = DefaultToolExecutor::for_workspace(
@@ -323,7 +323,7 @@ impl ServerToolExecutor {
             tool_execution_service: ToolExecutionService::builder().build(),
             observability_session: None,
             introspect_snapshot: Arc::new(std::sync::RwLock::new(None)),
-            session_config: SessionConfigState::new(pinned_tools, deprioritized_tools),
+            session_config: SessionConfigState::new(prioritized_tools, deprioritized_tools),
             cancel_token: None,
             workspace_artifact_store: None,
             context_manifest_pool: None,
@@ -8001,7 +8001,7 @@ esac
             exec.journal_turn_index.load(Ordering::Relaxed),
             "prefs-seed".to_string(),
             SessionStateRollbackAction::ToolPreferences {
-                previous_pinned_tools: vec!["bash".into()],
+                previous_prioritized_tools: vec!["bash".into()],
                 previous_deprioritized_tools: vec![],
             },
         );

@@ -14,7 +14,7 @@ The current codebase has two prompt paths that diverged during evolution:
 |---|---|---|
 | System prompt | DB `agents` table → versioned | Hardcoded string |
 | Context enrichment | ContextManager (5 sections, budget-capped) | Simplified `_enrich_system_prompt` |
-| Skill selection | ToolRegistry (pinned/dynamic + embedding) | Edge tools passed through, no selection |
+| Skill selection | ToolRegistry (always-load/deferred + explicit activation) | Edge tools passed through, no selection |
 | Cross-session memory | Continuity + Observer | Observer only |
 | Scratchpad | ✅ | ❌ |
 | Prompt versioning | PromptManager (DB, rollback, feedback) | None |
