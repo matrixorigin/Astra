@@ -836,22 +836,18 @@ impl SessionAuditService for DatabaseSessionAuditService {
     ) -> AuditResult<SessionAuditSummary> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        // Single round-trip: session row + owner check (replaces verify_session_owner + session SELECT).
         let sess_row = query(
-            "SELECT user_id, status, created_at, ended_at FROM agent_sessions WHERE session_id = ?",
+            "SELECT status, created_at, ended_at \
+             FROM agent_sessions WHERE session_id = ? AND user_id = ?",
         )
         .bind(session_id)
+        .bind(user_id)
         .fetch_optional(&pool)
         .await
         .map_err(internal_error)?;
 
         let sess_row =
             sess_row.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Session not found"))?;
-        let owner: String = sess_row.try_get("user_id").map_err(internal_error)?;
-        if owner != user_id {
-            return Err(error_response(StatusCode::NOT_FOUND, "Session not found"));
-        }
-
         let status: String = sess_row.try_get("status").unwrap_or_default();
         let created_at: String = sess_row
             .try_get::<String, _>("created_at")

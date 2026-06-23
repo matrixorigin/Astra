@@ -3023,12 +3023,14 @@ async fn session_owned_services_reject_non_owner_side_effects_on_live_matrixone(
         .await;
     cleanup_agent_sessions_and_events(&pool, std::slice::from_ref(&session_id), &[], &[]).await;
 
+    let owner_metadata = serde_json::json!({"owner": true, "branch": "main"}).to_string();
     sqlx::query(
-        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'owner-bound-side-effects-it', 'active', 0)",
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count, metadata) \
+         VALUES (?, ?, 'owner-bound-side-effects-it', 'active', 0, CAST(? AS JSON))",
     )
     .bind(&session_id)
     .bind(&owner_user_id)
+    .bind(&owner_metadata)
     .execute(&pool)
     .await
     .expect("insert owner session");
@@ -3090,13 +3092,32 @@ async fn session_owned_services_reject_non_owner_side_effects_on_live_matrixone(
         axum::http::StatusCode::NOT_FOUND
     );
     let compare_result = replay_service
-        .compare_replay(other_user_id, session_id.clone())
+        .compare_replay(other_user_id.clone(), session_id.clone())
         .await;
     assert_eq!(
         compare_result
             .expect_err("non-owner cannot compare replay")
             .0,
         axum::http::StatusCode::NOT_FOUND
+    );
+
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let sync_service = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
+    let sync_result = sync_service
+        .push_session_state(
+            &session_id,
+            &other_user_id,
+            None,
+            None,
+            None,
+            0,
+            Some("non-owner-branch"),
+            Some("gpt-5.4"),
+        )
+        .await;
+    assert!(
+        sync_result.is_err(),
+        "non-owner cannot push session restore metadata"
     );
 
     let snapshot_count =
@@ -3118,6 +3139,27 @@ async fn session_owned_services_reject_non_owner_side_effects_on_live_matrixone(
             .try_get::<i64, _>("c")
             .expect("decode decision count");
     assert_eq!(decision_count, 0, "rejected decision must not write rows");
+
+    let metadata_after: Option<String> = sqlx::query(
+        "SELECT CAST(metadata AS CHAR) AS metadata_json FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load owner session metadata")
+    .try_get("metadata_json")
+    .expect("decode owner session metadata");
+    let metadata_after: serde_json::Value =
+        serde_json::from_str(metadata_after.as_deref().unwrap_or("{}"))
+            .expect("parse owner metadata");
+    assert_eq!(
+        metadata_after
+            .get("branch")
+            .and_then(serde_json::Value::as_str),
+        Some("main"),
+        "rejected non-owner session sync must not mutate owner metadata"
+    );
 
     cleanup_agent_sessions_and_events(&pool, &[session_id], &[], &[]).await;
 }

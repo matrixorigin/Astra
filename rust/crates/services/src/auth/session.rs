@@ -125,10 +125,11 @@ impl DatabaseSessionService {
         }
     }
 
-    async fn fetch_session_by_id(
+    async fn fetch_session_for_user(
         &self,
         pool: &sqlx::Pool<MySql>,
         session_id: &str,
+        user_id: &str,
     ) -> Result<Option<SessionRecord>, (StatusCode, Json<ErrorResponse>)> {
         query(
             "SELECT session_id, user_id, agent_id, title, status, event_count, \
@@ -136,9 +137,10 @@ impl DatabaseSessionService {
              DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s') AS updated_at, \
              DATE_FORMAT(ended_at, '%Y-%m-%dT%H:%i:%s') AS ended_at, \
              IFNULL(CAST(`metadata` AS CHAR), '{}') AS metadata_json \
-             FROM agent_sessions WHERE session_id = ? LIMIT 1",
+             FROM agent_sessions WHERE session_id = ? AND user_id = ? LIMIT 1",
         )
         .bind(session_id)
+        .bind(user_id)
         .fetch_optional(pool)
         .await
         .map_err(internal_error)?
@@ -188,7 +190,7 @@ impl SessionService for DatabaseSessionService {
         .map_err(internal_error)?;
 
         let record = self
-            .fetch_session_by_id(&pool, &session_id)
+            .fetch_session_for_user(&pool, &session_id, &user_id)
             .await?
             .ok_or_else(|| internal_error("failed to read created session"))?;
         let details = serde_json::json!({
@@ -274,7 +276,7 @@ impl SessionService for DatabaseSessionService {
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let session = self
-            .fetch_session_by_id(&pool, &session_id)
+            .fetch_session_for_user(&pool, &session_id, &user_id)
             .await?
             .ok_or_else(|| {
                 error_response(
@@ -282,13 +284,6 @@ impl SessionService for DatabaseSessionService {
                     format!("Session {session_id} 不存在"),
                 )
             })?;
-
-        if session.user_id != user_id {
-            return Err(error_response(
-                StatusCode::NOT_FOUND,
-                format!("无权限访问 Session {session_id}"),
-            ));
-        }
 
         Ok(session)
     }
@@ -301,7 +296,7 @@ impl SessionService for DatabaseSessionService {
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let existing = self
-            .fetch_session_by_id(&pool, &session_id)
+            .fetch_session_for_user(&pool, &session_id, &user_id)
             .await?
             .ok_or_else(|| {
                 error_response(
@@ -309,13 +304,6 @@ impl SessionService for DatabaseSessionService {
                     format!("Session {session_id} 不存在"),
                 )
             })?;
-
-        if existing.user_id != user_id {
-            return Err(error_response(
-                StatusCode::NOT_FOUND,
-                format!("无权限修改 Session {session_id}"),
-            ));
-        }
 
         let SessionUpdateRequestData {
             title,
@@ -346,15 +334,24 @@ impl SessionService for DatabaseSessionService {
         }
         update_query.push(" WHERE session_id = ");
         update_query.push_bind(&session_id);
+        update_query.push(" AND user_id = ");
+        update_query.push_bind(&user_id);
 
-        update_query
+        let rows_affected = update_query
             .build()
             .execute(&pool)
             .await
-            .map_err(internal_error)?;
+            .map_err(internal_error)?
+            .rows_affected();
+        if rows_affected == 0 {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                format!("Session {session_id} 不存在"),
+            ));
+        }
 
         let updated = self
-            .fetch_session_by_id(&pool, &session_id)
+            .fetch_session_for_user(&pool, &session_id, &user_id)
             .await?
             .ok_or_else(|| internal_error("failed to read updated session"))?;
         let details = serde_json::json!({
@@ -373,7 +370,7 @@ impl SessionService for DatabaseSessionService {
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let existing = self
-            .fetch_session_by_id(&pool, &session_id)
+            .fetch_session_for_user(&pool, &session_id, &user_id)
             .await?
             .ok_or_else(|| {
                 error_response(
@@ -381,13 +378,6 @@ impl SessionService for DatabaseSessionService {
                     format!("Session {session_id} 不存在"),
                 )
             })?;
-
-        if existing.user_id != user_id {
-            return Err(error_response(
-                StatusCode::NOT_FOUND,
-                format!("无权限删除 Session {session_id}"),
-            ));
-        }
 
         let mut tx = pool.begin().await.map_err(internal_error)?;
         hard_delete_session_rows(&mut tx, &session_id, &user_id)
@@ -408,8 +398,7 @@ impl SessionService for DatabaseSessionService {
         offset: u32,
     ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
-        let existing = self
-            .fetch_session_by_id(&pool, &session_id)
+        self.fetch_session_for_user(&pool, &session_id, &user_id)
             .await?
             .ok_or_else(|| {
                 error_response(
@@ -417,12 +406,6 @@ impl SessionService for DatabaseSessionService {
                     format!("Session {session_id} 不存在"),
                 )
             })?;
-        if existing.user_id != user_id {
-            return Err(error_response(
-                StatusCode::NOT_FOUND,
-                format!("无权限查看 Session {session_id}"),
-            ));
-        }
         let limit = limit.min(MAX_SESSION_ACTIVITY_ROWS);
         let offset = offset.min(MAX_API_LIST_OFFSET);
 

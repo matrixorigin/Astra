@@ -1705,9 +1705,10 @@ impl crate::state_sync::MatrixOneSyncService {
 
         let existing_metadata_json = sqlx::query(
             "SELECT CAST(metadata AS CHAR) AS metadata_json \
-             FROM agent_sessions WHERE session_id = ? LIMIT 1",
+             FROM agent_sessions WHERE session_id = ? AND user_id = ? LIMIT 1",
         )
         .bind(session_id)
+        .bind(user_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| format!("load session metadata: {e}"))?
@@ -1731,15 +1732,29 @@ impl crate::state_sync::MatrixOneSyncService {
         let result = sqlx::query(
             "INSERT INTO agent_sessions \
              (session_id, user_id, status, metadata, created_at, updated_at, last_active_at) \
-             VALUES (?, ?, 'active', ?, NOW(), NOW(), NOW()) \
-             ON DUPLICATE KEY UPDATE metadata = ?, updated_at = NOW(), last_active_at = NOW()",
+             SELECT ?, ?, 'active', ?, NOW(6), NOW(6), NOW(6) \
+             FROM DUAL \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM agent_sessions \
+                 WHERE session_id = ? AND user_id <> ? \
+                 LIMIT 1 \
+             ) \
+             ON DUPLICATE KEY UPDATE metadata = VALUES(metadata), updated_at = NOW(6), last_active_at = NOW(6)",
         )
         .bind(session_id)
         .bind(user_id)
         .bind(&metadata_json)
-        .bind(&metadata_json)
+        .bind(session_id)
+        .bind(user_id)
         .execute(&self.pool)
         .await
+        .and_then(|result| {
+            if result.rows_affected() == 0 {
+                Err(sqlx::Error::RowNotFound)
+            } else {
+                Ok(result)
+            }
+        })
         .map(|_| ())
         .map_err(|e| format!("push_session_state: {e}"));
 
