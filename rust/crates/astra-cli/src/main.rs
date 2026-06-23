@@ -1196,9 +1196,9 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-async fn resume_local_restore_rejects_unowned_session() {
-    let _creds = isolate_credentials();
-    use session_journal::JournalWriter;
+    async fn resume_local_restore_rejects_unowned_session() {
+        let _creds = isolate_credentials();
+        use session_journal::JournalWriter;
 
         // Create a session with both journal AND workspace (what restore_session needs)
         let sid = format!("test-unowned-{}", uuid::Uuid::new_v4());
@@ -1246,8 +1246,8 @@ total_tokens_out: 3
         std::fs::write(ws_dir.join("workspace.yaml"), ws_content).unwrap();
 
         // Now restore_session should find it
-    let svc = astra_services::session_restore::HybridRestoreService::local_only();
-    let result = svc.restore_local_session(&sid).await.unwrap();
+        let svc = astra_services::session_restore::HybridRestoreService::local_only();
+        let result = svc.restore_local_session(&sid).await.unwrap();
         assert!(
             result.is_some(),
             "local restore should find session with workspace.yaml"
@@ -1265,8 +1265,8 @@ total_tokens_out: 3
 
     #[serial_test::serial]
     #[tokio::test]
-async fn resume_handles_malformed_workspace_yaml() {
-    let _creds = isolate_credentials();
+    async fn resume_handles_malformed_workspace_yaml() {
+        let _creds = isolate_credentials();
 
         let sid = format!("test-malformed-{}", uuid::Uuid::new_v4());
 
@@ -1305,8 +1305,8 @@ async fn resume_handles_malformed_workspace_yaml() {
 
     #[serial_test::serial]
     #[tokio::test]
-async fn resume_handles_missing_workspace() {
-    let _creds = isolate_credentials();
+    async fn resume_handles_missing_workspace() {
+        let _creds = isolate_credentials();
 
         // Only journal, no workspace → local journal-only restore should still work.
         let sid = format!("test-no-ws-{}", uuid::Uuid::new_v4());
@@ -1336,8 +1336,8 @@ async fn resume_handles_missing_workspace() {
 
     #[serial_test::serial]
     #[tokio::test]
-async fn resume_lists_checkpoints_for_session() {
-    let _creds = isolate_credentials();
+    async fn resume_lists_checkpoints_for_session() {
+        let _creds = isolate_credentials();
 
         let sid = format!("test-checkpoints-{}", uuid::Uuid::new_v4());
 

@@ -26,7 +26,8 @@ use astra_services::session_restore::{
     persist_remote_composite_snapshot_index, pull_step_checkpoint_from_cloud,
 };
 use astra_services::session_workspace::{
-    ContextTraceSignal, ContextTraceToolSelection, WorkspaceMetadata, persist_remote_workspace,
+    ContextTraceSignal, ContextTraceToolSelection, WORKSPACE_METADATA_ARTIFACT_KIND,
+    WorkspaceMetadata, persist_remote_workspace,
 };
 use astra_services::{
     AdminAuditFilter, AdminAuditReader, ContextService, DatabaseAdminAuditReader,
@@ -2200,21 +2201,23 @@ async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matr
     });
 
     let artifact_store = DatabaseSessionArtifactStore::new(settings.clone()).with_pool(shared);
-    persist_remote_workspace(&workspace, &user_id, &artifact_store)
+    let stored_artifact = persist_remote_workspace(&workspace, &user_id, &artifact_store)
         .await
         .expect("persist remote workspace");
+    assert_eq!(stored_artifact.session_id, session_id);
+    assert_eq!(stored_artifact.user_id, user_id);
+    assert_eq!(
+        stored_artifact.artifact_kind,
+        WORKSPACE_METADATA_ARTIFACT_KIND
+    );
+    assert_eq!(stored_artifact.turn, Some(1));
 
-    let artifact_count: i64 = sqlx::query(
-        "SELECT COUNT(*) AS c FROM session_artifacts WHERE session_id = ? AND user_id = ? AND artifact_kind = 'workspace_metadata'",
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load session_artifacts count")
-    .try_get("c")
-    .expect("session_artifacts count");
-    assert_eq!(artifact_count, 1);
+    let latest_artifact = artifact_store
+        .load_latest_json_artifact(&user_id, &session_id, WORKSPACE_METADATA_ARTIFACT_KIND)
+        .await
+        .expect("load latest remote workspace artifact")
+        .expect("remote workspace artifact exists");
+    assert_eq!(latest_artifact.artifact_id, stored_artifact.artifact_id);
 
     let restore = HybridRestoreService::new(pool.clone());
     let restored = restore
