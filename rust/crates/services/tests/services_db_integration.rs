@@ -3898,6 +3898,161 @@ async fn session_delete_blocks_mixed_owner_core_rows_on_live_matrixone() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_delete_removes_owner_scoped_transcript_pages_and_todo_counter_on_live_matrixone() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let owner_user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+
+    let _ = sqlx::query("DELETE FROM transcript_pages WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM session_todo_counters WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    cleanup_agent_sessions_and_events(&pool, std::slice::from_ref(&session_id), &[], &[]).await;
+
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'owner-delete-it', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .execute(&pool)
+    .await
+    .expect("insert owner session");
+    sqlx::query(
+        "INSERT INTO transcript_pages \
+         (user_id, session_id, page_seq, start_item_seq, end_item_seq, item_count, page_hash) \
+         VALUES (?, ?, 1, 1, 2, 2, 'page-owner')",
+    )
+    .bind(&owner_user_id)
+    .bind(&session_id)
+    .execute(&pool)
+    .await
+    .expect("insert owner transcript page");
+    sqlx::query("INSERT INTO session_todo_counters (session_id, next_id) VALUES (?, 42)")
+        .bind(&session_id)
+        .execute(&pool)
+        .await
+        .expect("insert todo counter");
+
+    let session_service = DatabaseSessionService::new(settings).with_pool(shared);
+    session_service
+        .delete_session(session_id.clone(), owner_user_id.clone())
+        .await
+        .expect("owner-only session delete");
+
+    for (label, sql) in [
+        (
+            "agent_sessions",
+            "SELECT COUNT(*) AS c FROM agent_sessions WHERE session_id = ?",
+        ),
+        (
+            "transcript_pages",
+            "SELECT COUNT(*) AS c FROM transcript_pages WHERE session_id = ?",
+        ),
+        (
+            "session_todo_counters",
+            "SELECT COUNT(*) AS c FROM session_todo_counters WHERE session_id = ?",
+        ),
+    ] {
+        let remaining = sqlx::query(sql)
+            .bind(&session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("count {label}: {error}"))
+            .try_get::<i64, _>("c")
+            .expect("decode remaining count");
+        assert_eq!(remaining, 0, "{label} must be removed by hard delete");
+    }
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_delete_blocks_mixed_owner_transcript_pages_on_live_matrixone() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let owner_user_id = Uuid::new_v4().to_string();
+    let other_user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+
+    let _ = sqlx::query("DELETE FROM transcript_pages WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    cleanup_agent_sessions_and_events(&pool, std::slice::from_ref(&session_id), &[], &[]).await;
+
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'mixed-page-delete-it', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .execute(&pool)
+    .await
+    .expect("insert owner session");
+    sqlx::query(
+        "INSERT INTO transcript_pages \
+         (user_id, session_id, page_seq, start_item_seq, end_item_seq, item_count, page_hash) \
+         VALUES (?, ?, 7, 301, 350, 50, 'page-stray')",
+    )
+    .bind(&other_user_id)
+    .bind(&session_id)
+    .execute(&pool)
+    .await
+    .expect("insert stray transcript page");
+
+    let session_service = DatabaseSessionService::new(settings).with_pool(shared);
+    let delete_result = session_service
+        .delete_session(session_id.clone(), owner_user_id.clone())
+        .await;
+    assert_eq!(
+        delete_result
+            .expect_err("mixed-owner transcript page delete must fail closed")
+            .0,
+        axum::http::StatusCode::CONFLICT
+    );
+
+    let remaining_session = sqlx::query(
+        "SELECT COUNT(*) AS c FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count remaining session")
+    .try_get::<i64, _>("c")
+    .expect("decode remaining session count");
+    assert_eq!(remaining_session, 1, "blocked delete must keep session");
+    let remaining_pages = sqlx::query(
+        "SELECT COUNT(*) AS c FROM transcript_pages WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&other_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count remaining stray page")
+    .try_get::<i64, _>("c")
+    .expect("decode remaining page count");
+    assert_eq!(
+        remaining_pages, 1,
+        "blocked delete must not partially remove stray page"
+    );
+
+    let _ = sqlx::query("DELETE FROM transcript_pages WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    cleanup_agent_sessions_and_events(&pool, &[session_id], &[], &[]).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn event_write_paths_reconcile_event_count_on_live_matrixone() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();

@@ -664,8 +664,7 @@ async fn load_transcript_page_refs(
     let rows = sqlx::query(
         "SELECT tp.page_seq, tp.start_item_seq, tp.end_item_seq, tp.item_count, tp.page_hash
          FROM transcript_pages tp
-         JOIN agent_sessions s ON s.session_id = tp.session_id AND s.user_id = ?
-         WHERE tp.session_id = ? AND tp.end_item_seq >= ? AND tp.start_item_seq <= ?
+         WHERE tp.user_id = ? AND tp.session_id = ? AND tp.end_item_seq >= ? AND tp.start_item_seq <= ?
          ORDER BY tp.page_seq ASC",
     )
     .bind(user_id)
@@ -696,8 +695,7 @@ async fn load_session_projection_observability(
     let transcript_page_row = sqlx::query(
         "SELECT COUNT(*) AS page_count, COALESCE(MAX(tp.end_item_seq), 0) AS page_high_watermark
          FROM transcript_pages tp
-         JOIN agent_sessions s ON s.session_id = tp.session_id AND s.user_id = ?
-         WHERE tp.session_id = ?",
+         WHERE tp.user_id = ? AND tp.session_id = ?",
     )
     .bind(user_id)
     .bind(session_id)

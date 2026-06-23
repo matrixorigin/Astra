@@ -458,6 +458,24 @@ async fn phase2_web_hydration_schema_contract() {
         ["session_id", "item_seq"],
         "session_transcript_items must page by stable (session_id,item_seq) primary key"
     );
+    let transcript_page_columns = column_names(&pool, &schema, "transcript_pages").await;
+    assert!(
+        transcript_page_columns
+            .iter()
+            .any(|column| column == "user_id"),
+        "transcript_pages must carry physical owner scope"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "transcript_pages",
+            "idx_transcript_pages_owner_session_end"
+        )
+        .await,
+        ["user_id", "session_id", "end_item_seq"],
+        "transcript page lookups must use owner/session/end index"
+    );
     assert_eq!(
         index_columns(
             &pool,

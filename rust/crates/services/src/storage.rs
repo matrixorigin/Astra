@@ -1126,6 +1126,7 @@ pub async fn ensure_core_schema(
 
     query(
         "CREATE TABLE IF NOT EXISTS transcript_pages (
+            user_id VARCHAR(64) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
             page_seq BIGINT NOT NULL,
             start_item_seq BIGINT NOT NULL,
@@ -1135,12 +1136,34 @@ pub async fn ensure_core_schema(
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (session_id, page_seq),
+            INDEX idx_transcript_pages_owner_session_end (user_id, session_id, end_item_seq),
+            INDEX idx_transcript_pages_owner_session_updated (user_id, session_id, updated_at),
             INDEX idx_transcript_pages_session_end (session_id, end_item_seq),
             INDEX idx_transcript_pages_session_updated (session_id, updated_at)
         )",
     )
     .execute(&pool)
     .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "transcript_pages",
+        "user_id",
+        "ALTER TABLE transcript_pages ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT ''",
+    )
+    .await?;
+    for (index, ddl) in [
+        (
+            "idx_transcript_pages_owner_session_end",
+            "ALTER TABLE transcript_pages ADD INDEX idx_transcript_pages_owner_session_end (user_id, session_id, end_item_seq)",
+        ),
+        (
+            "idx_transcript_pages_owner_session_updated",
+            "ALTER TABLE transcript_pages ADD INDEX idx_transcript_pages_owner_session_updated (user_id, session_id, updated_at)",
+        ),
+    ] {
+        add_index_if_missing(&pool, &settings.database, "transcript_pages", index, ddl).await?;
+    }
 
     query(
         "CREATE TABLE IF NOT EXISTS prompt_request_records (

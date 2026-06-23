@@ -467,21 +467,6 @@ async fn delete_session_rows_1(
         .map_err(|source| format!("delete_session.{label}: {source}"))
 }
 
-async fn delete_session_rows_2(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    label: &'static str,
-    statement: &'static str,
-    session_id: &str,
-) -> Result<u64, String> {
-    query(statement)
-        .bind(session_id)
-        .bind(session_id)
-        .execute(&mut **tx)
-        .await
-        .map(|result| result.rows_affected())
-        .map_err(|source| format!("delete_session.{label}: {source}"))
-}
-
 async fn delete_session_rows_session_user(
     tx: &mut sqlx::Transaction<'_, MySql>,
     label: &'static str,
@@ -490,6 +475,24 @@ async fn delete_session_rows_session_user(
     user_id: &str,
 ) -> Result<u64, String> {
     query(statement)
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(|source| format!("delete_session.{label}: {source}"))
+}
+
+async fn delete_session_rows_session_user_twice(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    label: &'static str,
+    statement: &'static str,
+    session_id: &str,
+    user_id: &str,
+) -> Result<u64, String> {
+    query(statement)
+        .bind(session_id)
+        .bind(user_id)
         .bind(session_id)
         .bind(user_id)
         .execute(&mut **tx)
@@ -523,6 +526,118 @@ async fn ensure_session_delete_owner_consistency(
         (
             "run_display_projections",
             "SELECT COUNT(*) AS c FROM run_display_projections WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "session_tool_output_batches",
+            "SELECT COUNT(*) AS c FROM session_tool_output_batches WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "session_tool_outputs",
+            "SELECT COUNT(*) AS c FROM session_tool_outputs WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "session_device_lease_events",
+            "SELECT COUNT(*) AS c FROM session_device_lease_events WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "session_device_leases",
+            "SELECT COUNT(*) AS c FROM session_device_leases WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "session_transcript_items",
+            "SELECT COUNT(*) AS c FROM session_transcript_items WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "transcript_pages",
+            "SELECT COUNT(*) AS c FROM transcript_pages WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "prompt_request_records",
+            "SELECT COUNT(*) AS c FROM prompt_request_records WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "session_state_revisions",
+            "SELECT COUNT(*) AS c FROM session_state_revisions WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "context_manifests",
+            "SELECT COUNT(*) AS c FROM context_manifests WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "session_artifacts_grants",
+            "SELECT COUNT(*) AS c FROM session_artifacts_grants WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "session_artifacts",
+            "SELECT COUNT(*) AS c FROM session_artifacts WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "session_state_item_events",
+            "SELECT COUNT(*) AS c FROM session_state_item_events WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "session_state_items",
+            "SELECT COUNT(*) AS c FROM session_state_items WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "session_delegations",
+            "SELECT COUNT(*) AS c FROM session_delegations WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "session_plan_todos",
+            "SELECT COUNT(*) AS c FROM session_plan_todos WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "session_history_chunks",
+            "SELECT COUNT(*) AS c FROM session_history_chunks WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "harness_snapshots",
+            "SELECT COUNT(*) AS c FROM harness_snapshots WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "skill_selection_events",
+            "SELECT COUNT(*) AS c FROM skill_selection_events WHERE session_id = ? AND COALESCE(user_id, '') <> ?",
+        ),
+        (
+            "session_sync_log",
+            "SELECT COUNT(*) AS c FROM session_sync_log WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "agent_tasks",
+            "SELECT COUNT(*) AS c FROM agent_tasks WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "plans",
+            "SELECT COUNT(*) AS c FROM plans WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "session_checkpoints",
+            "SELECT COUNT(*) AS c FROM session_checkpoints WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "session_todos",
+            "SELECT COUNT(*) AS c FROM session_todos WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "task_contracts",
+            "SELECT COUNT(*) AS c FROM task_contracts WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "skill_installations",
+            "SELECT COUNT(*) AS c FROM skill_installations WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "wf_triggers",
+            "SELECT COUNT(*) AS c FROM wf_triggers WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "eval_user_feedback",
+            "SELECT COUNT(*) AS c FROM eval_user_feedback WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "team_snapshots",
+            "SELECT COUNT(*) AS c FROM team_snapshots WHERE session_id = ? AND user_id <> ?",
         ),
     ] {
         let row = query(statement)
@@ -576,92 +691,180 @@ async fn hard_delete_session_rows(
         (
             "session_state_item_events",
             "DELETE FROM session_state_item_events
-             WHERE session_id = ?
-                OR item_id IN (SELECT item_id FROM session_state_items WHERE origin_session_id = ?)",
+             WHERE (session_id = ? AND user_id = ?)
+                OR item_id IN (
+                    SELECT item_id FROM session_state_items
+                    WHERE origin_session_id = ? AND user_id = ?
+                )",
         ),
         (
             "session_state_items",
             "DELETE FROM session_state_items
-             WHERE session_id = ? OR origin_session_id = ?",
+             WHERE (session_id = ? AND user_id = ?)
+                OR (origin_session_id = ? AND user_id = ?)",
         ),
         (
             "session_history_chunks",
             "DELETE FROM session_history_chunks
-             WHERE session_id = ? OR source_session_id = ?",
+             WHERE (session_id = ? AND user_id = ?)
+                OR (source_session_id = ? AND user_id = ?)",
         ),
     ] {
-        deleted += delete_session_rows_2(tx, label, statement, session_id).await?;
+        deleted +=
+            delete_session_rows_session_user_twice(tx, label, statement, session_id, user_id)
+                .await?;
     }
 
     for (label, statement) in [
         (
             "context_manifest_items",
-            "DELETE FROM context_manifest_items WHERE session_id = ?",
-        ),
-        (
-            "context_manifests",
-            "DELETE FROM context_manifests WHERE session_id = ?",
-        ),
-        (
-            "session_artifacts_grants",
-            "DELETE FROM session_artifacts_grants WHERE session_id = ?",
-        ),
-        (
-            "session_artifacts",
-            "DELETE FROM session_artifacts WHERE session_id = ?",
-        ),
-        (
-            "session_tool_outputs",
-            "DELETE FROM session_tool_outputs WHERE session_id = ?",
-        ),
-        (
-            "session_tool_output_batches",
-            "DELETE FROM session_tool_output_batches WHERE session_id = ?",
-        ),
-        (
-            "session_device_lease_events",
-            "DELETE FROM session_device_lease_events WHERE session_id = ?",
-        ),
-        (
-            "session_device_leases",
-            "DELETE FROM session_device_leases WHERE session_id = ?",
-        ),
-        (
-            "session_transcript_items",
-            "DELETE FROM session_transcript_items WHERE session_id = ?",
-        ),
-        (
-            "transcript_pages",
-            "DELETE FROM transcript_pages WHERE session_id = ?",
+            "DELETE FROM context_manifest_items
+             WHERE manifest_id IN (
+                 SELECT manifest_id FROM context_manifests
+                 WHERE session_id = ? AND user_id = ?
+             )",
         ),
         (
             "prompt_deltas",
-            "DELETE FROM prompt_deltas WHERE request_id IN (SELECT request_id FROM prompt_request_records WHERE session_id = ?)",
+            "DELETE FROM prompt_deltas
+             WHERE request_id IN (
+                 SELECT request_id FROM prompt_request_records
+                 WHERE session_id = ? AND user_id = ?
+             )",
+        ),
+        (
+            "plan_step_runs",
+            "DELETE FROM plan_step_runs
+             WHERE plan_id IN (
+                 SELECT plan_id FROM plans
+                 WHERE session_id = ? AND user_id = ?
+             )",
+        ),
+        (
+            "task_verification_results",
+            "DELETE FROM task_verification_results
+             WHERE contract_id IN (
+                 SELECT contract_id FROM task_contracts
+                 WHERE session_id = ? AND user_id = ?
+             )",
+        ),
+    ] {
+        deleted +=
+            delete_session_rows_session_user(tx, label, statement, session_id, user_id).await?;
+    }
+
+    for (label, statement) in [
+        (
+            "context_manifests",
+            "DELETE FROM context_manifests WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "session_artifacts_grants",
+            "DELETE FROM session_artifacts_grants WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "session_artifacts",
+            "DELETE FROM session_artifacts WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "session_tool_outputs",
+            "DELETE FROM session_tool_outputs WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "session_tool_output_batches",
+            "DELETE FROM session_tool_output_batches WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "session_device_lease_events",
+            "DELETE FROM session_device_lease_events WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "session_device_leases",
+            "DELETE FROM session_device_leases WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "session_transcript_items",
+            "DELETE FROM session_transcript_items WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "transcript_pages",
+            "DELETE FROM transcript_pages WHERE session_id = ? AND user_id = ?",
         ),
         (
             "prompt_request_records",
-            "DELETE FROM prompt_request_records WHERE session_id = ?",
+            "DELETE FROM prompt_request_records WHERE session_id = ? AND user_id = ?",
         ),
         (
             "session_state_revisions",
-            "DELETE FROM session_state_revisions WHERE session_id = ?",
+            "DELETE FROM session_state_revisions WHERE session_id = ? AND user_id = ?",
         ),
         (
             "session_delegations",
-            "DELETE FROM session_delegations WHERE session_id = ?",
+            "DELETE FROM session_delegations WHERE session_id = ? AND user_id = ?",
         ),
         (
             "session_todos",
-            "DELETE FROM session_todos WHERE session_id = ?",
+            "DELETE FROM session_todos WHERE session_id = ? AND user_id = ?",
         ),
         (
             "session_plan_todos",
-            "DELETE FROM session_plan_todos WHERE session_id = ?",
+            "DELETE FROM session_plan_todos WHERE session_id = ? AND user_id = ?",
         ),
         (
             "harness_snapshots",
-            "DELETE FROM harness_snapshots WHERE session_id = ?",
+            "DELETE FROM harness_snapshots WHERE session_id = ? AND user_id = ?",
         ),
+        (
+            "skill_selection_events",
+            "DELETE FROM skill_selection_events WHERE session_id = ? AND user_id = ?",
+        ),
+        // skill_selector_turn_metrics — table was removed in PR #337
+        // (tool selector subsystem deletion); the cleanup statement
+        // remained and started failing with "no such table" once a
+        // session deletion ran against a fresh schema. Drop the
+        // stale cleanup entry.
+        (
+            "session_sync_log",
+            "DELETE FROM session_sync_log WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "agent_tasks",
+            "DELETE FROM agent_tasks WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "plans",
+            "DELETE FROM plans WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "session_checkpoints",
+            "DELETE FROM session_checkpoints WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "task_contracts",
+            "DELETE FROM task_contracts WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "skill_installations",
+            "DELETE FROM skill_installations WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "wf_triggers",
+            "DELETE FROM wf_triggers WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "eval_user_feedback",
+            "DELETE FROM eval_user_feedback WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "team_snapshots",
+            "DELETE FROM team_snapshots WHERE session_id = ? AND user_id = ?",
+        ),
+    ] {
+        deleted +=
+            delete_session_rows_session_user(tx, label, statement, session_id, user_id).await?;
+    }
+
+    for (label, statement) in [
         (
             "ctx_snapshots",
             "DELETE FROM ctx_snapshots WHERE session_id = ?",
@@ -671,54 +874,8 @@ async fn hard_delete_session_rows(
             "DELETE FROM ctx_decision_audits WHERE session_id = ?",
         ),
         (
-            "skill_selection_events",
-            "DELETE FROM skill_selection_events WHERE session_id = ?",
-        ),
-        // skill_selector_turn_metrics — table was removed in PR #337
-        // (tool selector subsystem deletion); the cleanup statement
-        // remained and started failing with "no such table" once a
-        // session deletion ran against a fresh schema. Drop the
-        // stale cleanup entry.
-        (
-            "session_sync_log",
-            "DELETE FROM session_sync_log WHERE session_id = ?",
-        ),
-        (
-            "agent_tasks",
-            "DELETE FROM agent_tasks WHERE session_id = ?",
-        ),
-        ("plans", "DELETE FROM plans WHERE session_id = ?"),
-        (
-            "plan_step_runs",
-            "DELETE FROM plan_step_runs WHERE session_id = ?",
-        ),
-        (
-            "session_checkpoints",
-            "DELETE FROM session_checkpoints WHERE session_id = ?",
-        ),
-        (
-            "task_contracts",
-            "DELETE FROM task_contracts WHERE session_id = ?",
-        ),
-        (
-            "task_verification_results",
-            "DELETE FROM task_verification_results WHERE session_id = ?",
-        ),
-        (
-            "skill_installations",
-            "DELETE FROM skill_installations WHERE session_id = ?",
-        ),
-        (
-            "wf_triggers",
-            "DELETE FROM wf_triggers WHERE session_id = ?",
-        ),
-        (
-            "eval_user_feedback",
-            "DELETE FROM eval_user_feedback WHERE session_id = ?",
-        ),
-        (
-            "team_snapshots",
-            "DELETE FROM team_snapshots WHERE session_id = ?",
+            "session_todo_counters",
+            "DELETE FROM session_todo_counters WHERE session_id = ?",
         ),
         (
             "conversation_log",
