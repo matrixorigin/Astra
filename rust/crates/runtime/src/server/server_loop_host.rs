@@ -509,7 +509,7 @@ pub struct CapturedLlmRequest {
     pub system_primary: Value,
     /// The optional per-turn dynamic system message (OpenAI split only).
     pub system_dynamic: Option<Value>,
-    /// Tool schemas after pruning + `annotate_tool_schemas_for_caching`.
+    /// Tool schemas after pruning + `annotate_tool_schemas_for_caching_with_pinned`.
     pub tools: Vec<Value>,
     /// Conversation messages after `add_message_cache_breakpoint` was applied
     /// (for Anthropic) or a clone of `state.messages` (otherwise).

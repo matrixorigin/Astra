@@ -695,7 +695,12 @@ function terminalToolStatus(
   event: Record<string, unknown>,
   isFailure: boolean,
 ): ToolSurfaceItem["status"] {
-  // Error conditions take priority (consistent with SDK toolTerminalStatus)
+  // A user cancellation is terminal, but it is not a tool failure.
+  if (eventIsCancelled(event)) {
+    return "cancelled";
+  }
+
+  // Error conditions take priority after explicit cancellations.
   if (isFailure) return "error";
 
   const rawStatus = extractEventStatus(
@@ -707,11 +712,6 @@ function terminalToolStatus(
     rawStatus === "timed_out"
   ) {
     return "error";
-  }
-
-  // Cancelled is a user-initiated status (work-surface specific)
-  if (eventIsCancelled(event)) {
-    return "cancelled";
   }
 
   // Skipped is a protective dedup status, not an error
@@ -1242,6 +1242,10 @@ function applyMaybeBlockedToolFailure(
   state: WorkSurfaceState,
   event: Record<string, unknown>,
 ): WorkSurfaceState {
+  if (eventIsCancelled(event)) {
+    return state;
+  }
+
   const reason = blockedReasonFromEvent(event);
   if (!reason) {
     return state;

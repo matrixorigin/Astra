@@ -576,15 +576,18 @@ fn pinned_schemas_are_sorted_alphabetically() {
 
 #[test]
 fn cache_control_sits_on_last_pinned_tool_schema() {
-    use crate::turn::prompt_cache::{PromptCacheConfig, annotate_tool_schemas_for_caching};
+    use crate::turn::prompt_cache::{
+        PromptCacheConfig, annotate_tool_schemas_for_caching_with_pinned,
+    };
     let cfg = ToolSurfaceConfig::default();
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
     let mut tools = surface.pinned_schemas();
+    let pinned_names = surface.pinned_names().into_iter().collect();
     let cache_cfg = PromptCacheConfig {
         cache_enabled: true,
         is_anthropic: true,
     };
-    annotate_tool_schemas_for_caching(&mut tools, &cache_cfg);
+    annotate_tool_schemas_for_caching_with_pinned(&mut tools, &cache_cfg, &pinned_names);
 
     let last = tools.last().expect("non-empty");
     assert!(

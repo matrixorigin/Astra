@@ -4632,7 +4632,7 @@ pub mod bridge_inprocess_test_helpers {
 mod tests {
     use super::*;
     use crate::turn::bridge::sse_helpers::apply_forward_llm_sse_event;
-    use crate::turn::prompt_cache::{default_pinned_tool_names, runtime_pinned_tool_names};
+    use crate::turn::prompt_cache::runtime_pinned_tool_names;
     use astra_services::SessionArtifactStore;
     use astra_services::{
         SessionArtifactJsonRecord, SessionArtifactJsonStore, StoredSessionArtifact,
@@ -4644,6 +4644,12 @@ mod tests {
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    fn default_test_pinned_tool_names() -> std::collections::HashSet<String> {
+        crate::turn::prompt_cache::resolve_pinned_tool_names_for_config(
+            &astra_config::ToolSurfaceConfig::default(),
+        )
+    }
 
     /// RAII guard that restores an environment variable on drop (panic-safe).
     ///
@@ -5382,7 +5388,7 @@ mod tests {
         annotate_tool_schemas_for_caching(
             &mut tools,
             &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-            &default_pinned_tool_names(),
+            &default_test_pinned_tool_names(),
         );
 
         // Only last tool should have cache_control
@@ -5407,7 +5413,7 @@ mod tests {
         annotate_tool_schemas_for_caching(
             &mut tools,
             &PromptCacheConfig::latch("openai", "gpt-4"),
-            &default_pinned_tool_names(),
+            &default_test_pinned_tool_names(),
         );
         assert!(
             tools[0].get("cache_control").is_none(),
@@ -5433,7 +5439,7 @@ mod tests {
         annotate_tool_schemas_for_caching(
             &mut tools,
             &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-            &default_pinned_tool_names(),
+            &default_test_pinned_tool_names(),
         );
 
         assert!(
@@ -5600,7 +5606,7 @@ mod tests {
             json!({"function": {"name": "bash"}}),
             json!({"function": {"name": "read_file"}}),
         ];
-        annotate_tool_schemas_for_caching(&mut tools, &cfg, &default_pinned_tool_names());
+        annotate_tool_schemas_for_caching(&mut tools, &cfg, &default_test_pinned_tool_names());
 
         for (i, tool) in tools.iter().enumerate() {
             assert!(
@@ -5821,7 +5827,7 @@ mod tests {
         annotate_tool_schemas_for_caching(
             &mut tools,
             &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-            &default_pinned_tool_names(),
+            &default_test_pinned_tool_names(),
         );
         assert!(tools.is_empty());
     }

@@ -61,10 +61,11 @@
 //! ## Tool Schema Pinning
 //!
 //! For Anthropic, tool schemas in the request body also participate in caching.
-//! [`annotate_tool_schemas_for_caching`] pins a predefined set of high-frequency tools
-//! (read, write, edit, search, shell, task management) at the start of the tool list with
-//! `cache_control` markers. Lower-frequency tools follow without markers — when the tool
-//! list changes, only the tail is invalidated while the pinned prefix remains cached.
+//! [`annotate_tool_schemas_for_caching_with_pinned`] pins a predefined set of
+//! high-frequency tools (read, write, edit, search, shell, task management) at the start
+//! of the tool list with `cache_control` markers. Lower-frequency tools follow without
+//! markers — when the tool list changes, only the tail is invalidated while the pinned
+//! prefix remains cached.
 //!
 //! ## Cache Key Design
 //!
@@ -90,7 +91,7 @@
 //! |---|---|---|
 //! | [`assemble_bridge_pipeline_outcome`] | Bridge proxy, agentic loop | Full assembly: prompt + tool schemas + cache strategy |
 //! | [`assemble_system_message_via_pipeline`] | Bridge proxy | Build Anthropic multi-block or OpenAI split message |
-//! | [`annotate_tool_schemas_for_caching`] | Request build | Add `cache_control` to tool definitions |
+//! | [`annotate_tool_schemas_for_caching_with_pinned`] | Request build | Add `cache_control` to tool definitions |
 //! | [`add_message_cache_breakpoint`] | Request build | Insert breakpoint into final message array |
 //! | [`apply_anthropic_cache_metadata`] | Anthropic adapter | Emit Anthropic-specific cache metadata response fields |
 //!
@@ -639,15 +640,7 @@ pub(crate) fn section_cache_key(
 /// dynamic tools sitting after it don't invalidate the cached prefix. If no
 /// pinned tools are present (e.g. caller opted into full-dynamic), falls
 /// back to the last tool.
-pub(crate) fn annotate_tool_schemas_for_caching(
-    tools: &mut [Value],
-    cache_cfg: &PromptCacheConfig,
-) {
-    annotate_tool_schemas_for_caching_with_pinned(tools, cache_cfg, &default_pinned_tool_names());
-}
-
-/// Variant of [`annotate_tool_schemas_for_caching`] that takes an explicit
-/// pinned set — used by tests and callers that need to override the default.
+/// Annotate tool schemas using an explicit pinned set.
 ///
 /// Runtime-side adapter: decides whether to annotate (`cache_cfg.should_annotate`),
 /// logs the fallback path for triage, then delegates to the pure
@@ -683,15 +676,6 @@ pub(crate) fn annotate_tool_schemas_for_caching_with_pinned(
     astra_turn_core::context_serializer::annotate_pinned_tool_schema(tools, pinned_names);
 }
 
-/// Default pinned tool names — the static-lib set that should appear in every
-/// tool-bearing turn when no user tool-surface override is active.
-///
-/// Returning a fresh `HashSet` per call keeps the API safe across threads
-/// without a static — the set is small, so this is cheap.
-pub(crate) fn default_pinned_tool_names() -> std::collections::HashSet<String> {
-    resolve_pinned_tool_names_for_config(&ToolSurfaceConfig::default())
-}
-
 /// Runtime-configured pinned tool names for fallback paths that do not receive
 /// edge metadata.
 ///
@@ -712,7 +696,8 @@ pub(crate) fn runtime_pinned_tool_names() -> std::collections::HashSet<String> {
 ///
 /// This is the single source of truth for "which tools are cache-pinned under
 /// this config?". All callers that need cache markers or edge metadata should
-/// route through this (or the two convenience wrappers above) rather than
+/// route through this (or [`runtime_pinned_tool_names`] when the runtime
+/// singleton is intentionally needed) rather than
 /// rebuilding DEFAULT_PINNED + TOML override rules locally.
 ///
 /// **Cold path**: this rebuilds `all_tool_schemas()` + `ToolSurface::build()`
@@ -791,6 +776,18 @@ mod tests {
         unsafe { std::env::remove_var(key) }
     }
 
+    fn default_test_pinned_tool_names() -> std::collections::HashSet<String> {
+        resolve_pinned_tool_names_for_config(&ToolSurfaceConfig::default())
+    }
+
+    fn annotate_test_tool_schemas_for_caching(tools: &mut [Value], cache_cfg: &PromptCacheConfig) {
+        annotate_tool_schemas_for_caching_with_pinned(
+            tools,
+            cache_cfg,
+            &default_test_pinned_tool_names(),
+        );
+    }
+
     #[test]
     fn section_cache_key_varies_by_tools_and_task() {
         let key1 = section_cache_key(&["bash"], Some("implementation"), 0.8);
@@ -853,7 +850,7 @@ mod tests {
     // cache prefix.
     #[test]
     fn default_pinned_tool_names_tracks_runtime_surface_not_deferred_catalog() {
-        let pinned = super::default_pinned_tool_names();
+        let pinned = default_test_pinned_tool_names();
         for name in crate::tool_registry::surface::DEFAULT_PINNED {
             assert!(
                 pinned.contains(*name),
@@ -914,7 +911,7 @@ mod tests {
             json!({"type": "function", "function": {"name": "a"}}),
             json!({"type": "function", "function": {"name": "b"}}),
         ];
-        annotate_tool_schemas_for_caching(
+        annotate_test_tool_schemas_for_caching(
             &mut tools,
             &PromptCacheConfig {
                 cache_enabled: true,
@@ -946,7 +943,7 @@ mod tests {
             json!({"type": "function", "function": {"name": "memory"}}), // pinned
             json!({"type": "function", "function": {"name": "git_log"}}), // dynamic
         ];
-        annotate_tool_schemas_for_caching(
+        annotate_test_tool_schemas_for_caching(
             &mut tools,
             &PromptCacheConfig {
                 cache_enabled: true,
@@ -960,7 +957,7 @@ mod tests {
     #[test]
     fn tool_schemas_empty_list_noop() {
         let mut tools: Vec<Value> = vec![];
-        annotate_tool_schemas_for_caching(
+        annotate_test_tool_schemas_for_caching(
             &mut tools,
             &PromptCacheConfig {
                 cache_enabled: true,
@@ -1591,7 +1588,7 @@ mod tests {
         );
         // cache_cfg.cache_enabled=false ⇒ no cache_control on any block even
         // though the pipeline's provider_policy is still anthropic-shaped.
-        // Legacy behaviour: annotate_tool_schemas_for_caching gated on
+        // Legacy behaviour: annotate_tool_schemas_for_caching_with_pinned gated on
         // cache_cfg.should_annotate(); the pipeline must honour the same.
         let content = primary
             .get("content")
@@ -1600,7 +1597,7 @@ mod tests {
         // Pipeline currently emits markers based on provider_policy, not
         // cache_cfg.cache_enabled. Document that invariant: if this assertion
         // fails, the caller-facing `cache_enabled=false` semantic has been
-        // silently re-enabled and the downstream `annotate_tool_schemas_for_caching`
+        // silently re-enabled and the downstream `annotate_tool_schemas_for_caching_with_pinned`
         // no longer acts as the cache on/off kill switch.
         //
         // For now the test guards the shape: even with cache_enabled=false,
@@ -2038,7 +2035,6 @@ mod cache_stability_regression {
     use crate::turn::llm::client::build_provider_request_body;
     use astra_turn_core::thinking_config::ThinkingConfig;
     use serde_json::json;
-    use std::collections::HashSet;
 
     /// Synthetic schema factory — deterministic bytes keyed only by `name`.
     fn schema(name: &str) -> Value {
@@ -2053,7 +2049,7 @@ mod cache_stability_regression {
     }
 
     /// The tool list for these tests intentionally uses names that overlap
-    /// `default_pinned_tool_names()` so the marker-placement logic exercises
+    /// `default_test_pinned_tool_names()` so the marker-placement logic exercises
     /// the real pinned set, not a local override.
     fn pinned_prefix_fixture() -> Vec<Value> {
         vec![
@@ -2081,6 +2077,18 @@ mod cache_stability_regression {
         }
     }
 
+    fn default_test_pinned_tool_names() -> std::collections::HashSet<String> {
+        resolve_pinned_tool_names_for_config(&ToolSurfaceConfig::default())
+    }
+
+    fn annotate_test_tool_schemas_for_caching(tools: &mut [Value], cache_cfg: &PromptCacheConfig) {
+        annotate_tool_schemas_for_caching_with_pinned(
+            tools,
+            cache_cfg,
+            &default_test_pinned_tool_names(),
+        );
+    }
+
     /// Core invariant: adding, removing, or reordering tools AFTER the pinned
     /// prefix must leave the pinned prefix bytes completely unchanged and keep
     /// the cache marker on the same pinned tool.
@@ -2092,7 +2100,7 @@ mod cache_stability_regression {
     /// demotes one, cache hit rate drops proportional to its token cost.
     #[test]
     fn default_pinned_set_contains_static_lib() {
-        let pinned = default_pinned_tool_names();
+        let pinned = default_test_pinned_tool_names();
         // TOOL_CATALOG-declared pinned tools
         for name in [
             "bash",
@@ -2119,14 +2127,14 @@ mod cache_stability_regression {
         );
     }
 
-    /// `default_pinned_tool_names()` must return the same set across calls —
+    /// `default_test_pinned_tool_names()` must return the same set across calls —
     /// downstream logic caches the handle per request, but new callers assume
     /// it's stable.
     #[test]
     fn default_pinned_set_is_deterministic() {
-        let first = default_pinned_tool_names();
+        let first = default_test_pinned_tool_names();
         for _ in 0..20 {
-            assert_eq!(default_pinned_tool_names(), first);
+            assert_eq!(default_test_pinned_tool_names(), first);
         }
     }
 
@@ -2149,7 +2157,7 @@ mod cache_stability_regression {
             // Deliberately DIFFERENT dynamic tools each call — the test
             // asserts the pinned portion is unaffected.
             tools.extend([schema("git_log"), schema("mo")]);
-            annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
+            annotate_test_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
             build_provider_request_body(
                 &[json!({"role": "user", "content": "hi"})],
                 &tools,
@@ -2165,7 +2173,7 @@ mod cache_stability_regression {
         let b_tools_churned = {
             let mut tools = pinned_prefix_fixture();
             tools.extend([schema("web_fetch"), schema("github_list_prs"), schema("mo")]);
-            annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
+            annotate_test_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
             build_provider_request_body(
                 &[json!({"role": "user", "content": "hi"})],
                 &tools,
@@ -2206,7 +2214,7 @@ mod cache_stability_regression {
         let build = |extra: Vec<Value>| {
             let mut tools = pinned_prefix_fixture();
             tools.extend(extra);
-            annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
+            annotate_test_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
             build_provider_request_body(
                 &[json!({"role": "user", "content": "hi"})],
                 &tools,
@@ -2248,12 +2256,12 @@ mod cache_stability_regression {
     fn runtime_dynamic_addition_does_not_touch_pinned_cache() {
         let mut without = pinned_prefix_fixture();
         without.push(schema("git_log"));
-        annotate_tool_schemas_for_caching(&mut without, &cfg_anthropic());
+        annotate_test_tool_schemas_for_caching(&mut without, &cfg_anthropic());
 
         let mut with_new_mcp = pinned_prefix_fixture();
         with_new_mcp.push(schema("git_log"));
         with_new_mcp.push(schema("mcp_new_runtime_tool")); // discovered mid-session
-        annotate_tool_schemas_for_caching(&mut with_new_mcp, &cfg_anthropic());
+        annotate_test_tool_schemas_for_caching(&mut with_new_mcp, &cfg_anthropic());
 
         let pinned_count = pinned_prefix_fixture().len();
         for i in 0..pinned_count {
@@ -2300,7 +2308,7 @@ mod cache_stability_regression {
         let build = |dynamic_tail: Vec<Value>| {
             let mut tools = pinned_prefix_fixture();
             tools.extend(dynamic_tail);
-            annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
+            annotate_test_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
             crate::turn::llm::client::build_provider_request_body(
                 &[system_msg.clone(), user_msg.clone()],
                 &tools,
@@ -2354,7 +2362,7 @@ mod cache_stability_regression {
         let build = |tail: Vec<Value>| {
             let mut tools = pinned_prefix_fixture();
             tools.extend(tail);
-            annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
+            annotate_test_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
             crate::turn::llm::client::build_provider_request_body(
                 &[system_msg.clone(), user_msg.clone()],
                 &tools,
@@ -2397,7 +2405,7 @@ mod cache_stability_regression {
         let build = |tail: Vec<Value>| {
             let mut tools = pinned_prefix_fixture();
             tools.extend(tail);
-            annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
+            annotate_test_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
             crate::turn::llm::client::build_provider_request_body(
                 &[system_msg.clone(), user_msg.clone()],
                 &tools,

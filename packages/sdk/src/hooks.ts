@@ -13,6 +13,7 @@ import type {
 import { AstraClient } from "./client";
 import {
   extractBlockedReason,
+  extractEventStatus,
   projectRunWaitingState,
 } from "./lifecycle-utils";
 
@@ -114,18 +115,6 @@ function executionFieldsFromEvent(event: StreamEvent): Partial<ToolCall> {
   if (source.blocked !== undefined) fields.blocked = source.blocked;
   if (source.duration_ms !== undefined) fields.durationMs = source.duration_ms;
   return fields;
-}
-
-/** Extract a normalized status string from a stream event.
- *  Only the direct `status` field on the event is authoritative.
- *  The `result` field is tool output text — it is NOT parsed for metadata.
- *  Exported for use by both SDK hooks and web work-surface. */
-export function extractEventStatus(event: StreamEvent): string | undefined {
-  const e = event as Record<string, unknown>;
-  if (typeof e.status === "string" && e.status.length > 0) {
-    return e.status.trim().toLowerCase();
-  }
-  return undefined;
 }
 
 /** Shared: resolve a stream event's tool terminal status with a consistent

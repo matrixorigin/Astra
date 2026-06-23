@@ -14,6 +14,8 @@
  *   TOOL_ERROR_KIND_WORKSPACE_EXECUTOR_UNAVAILABLE = "workspace_executor_unavailable"
  */
 
+import type { StreamEvent } from "./types";
+
 export const EXECUTION_BOUNDARY_WAIT_REASONS = new Set([
   "executor_offline",
   "transport_disconnected",
@@ -23,6 +25,20 @@ export const EXECUTION_BOUNDARY_WAIT_REASONS = new Set([
 
 export function isExecutionBoundaryWait(reason: string): boolean {
   return EXECUTION_BOUNDARY_WAIT_REASONS.has(reason);
+}
+
+/**
+ * Extract a normalized status string from a stream event.
+ *
+ * Only the direct `status` field on the event is authoritative. Tool result
+ * text is output payload and is not parsed for metadata.
+ */
+export function extractEventStatus(event: StreamEvent): string | undefined {
+  const source = event as Record<string, unknown>;
+  if (typeof source.status === "string" && source.status.length > 0) {
+    return source.status.trim().toLowerCase();
+  }
+  return undefined;
 }
 
 /**

@@ -1171,6 +1171,29 @@ describe('work surface reducer', () => {
     });
   });
 
+  it('does not project cancelled transport hints as blocked run state', () => {
+    const state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
+      type: 'tool_transport_failed',
+      call_id: 'call-cancelled-blocked',
+      tool: 'bash',
+      success: false,
+      error: "Tool 'bash' cancelled before completion",
+      error_kind: 'cancelled',
+      reason: 'cancelled',
+      cancelled: true,
+      blocked: true,
+    });
+
+    expect(state.runStatus).toBeNull();
+    expect(state.blocked).toBeNull();
+    expect(state.tools[0]).toMatchObject({
+      callId: 'call-cancelled-blocked',
+      status: 'cancelled',
+      errorKind: 'cancelled',
+      blocked: true,
+    });
+  });
+
   it('projects workspace path mismatches as actionable blocked state', () => {
     const state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
       type: 'tool_transport_failed',

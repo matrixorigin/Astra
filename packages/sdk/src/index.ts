@@ -148,13 +148,12 @@ export { AstraClient, AstraApiError, chatRequestToWire } from "./client";
 export {
   EXECUTION_BOUNDARY_WAIT_REASONS,
   isExecutionBoundaryWait,
+  extractEventStatus,
   extractWaitingReason,
   extractBlockedReason,
   projectRunWaitingState,
   type RunWaitingProjection,
 } from "./lifecycle-utils";
-
-export { extractEventStatus } from "./hooks";
 
 export {
   ASTRA_EDGE_ID_HEADER,
