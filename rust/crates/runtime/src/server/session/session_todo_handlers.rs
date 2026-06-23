@@ -385,6 +385,25 @@ fn parse_next_task_counter(raw: i64, session_id: &str) -> Result<(u32, i64), Str
     Ok((current, next_stored as i64))
 }
 
+async fn ensure_session_todo_counter_owner_available(
+    executor: &mut sqlx::MySqlConnection,
+    session_id: &str,
+    user_id: &str,
+) -> Result<(), String> {
+    let existing: Option<(String,)> =
+        sqlx::query_as("SELECT user_id FROM session_todo_counters WHERE session_id = ? FOR UPDATE")
+            .bind(session_id)
+            .fetch_optional(&mut *executor)
+            .await
+            .map_err(|e| e.to_string())?;
+    match existing {
+        Some((existing_user_id,)) if existing_user_id != user_id => Err(format!(
+            "session_todo_counters owner mismatch for {session_id}"
+        )),
+        _ => Ok(()),
+    }
+}
+
 async fn adopt_task_into_session_atomic(
     shared: &astra_core::SharedPool,
     user_id: &str,
@@ -426,19 +445,25 @@ async fn adopt_task_into_session_atomic(
         None => None,
     };
 
+    ensure_session_todo_counter_owner_available(&mut tx, target_session, user_id)
+        .await
+        .map_err(|e| format!("initialize target task counter failed: {e}"))?;
+
     sqlx::query(
-        "INSERT INTO session_todo_counters (session_id, next_id, version) VALUES (?, 1, 0) \
+        "INSERT INTO session_todo_counters (session_id, user_id, next_id, version) VALUES (?, ?, 1, 0) \
          ON DUPLICATE KEY UPDATE next_id = next_id",
     )
     .bind(target_session)
+    .bind(user_id)
     .execute(&mut *tx)
     .await
     .map_err(|e| format!("initialize target task counter failed: {e}"))?;
 
     let raw_next: i64 = sqlx::query_as::<_, (i64,)>(
-        "SELECT next_id FROM session_todo_counters WHERE session_id = ? FOR UPDATE",
+        "SELECT next_id FROM session_todo_counters WHERE session_id = ? AND user_id = ? FOR UPDATE",
     )
     .bind(target_session)
+    .bind(user_id)
     .fetch_one(&mut *tx)
     .await
     .map(|(next,)| next)
@@ -530,10 +555,12 @@ async fn adopt_task_into_session_atomic(
     .map_err(|e| format!("insert adopted target task failed: {e}"))?;
 
     sqlx::query(
-        "UPDATE session_todo_counters SET next_id = ?, version = version + 1 WHERE session_id = ?",
+        "UPDATE session_todo_counters SET next_id = ?, version = version + 1 \
+         WHERE session_id = ? AND user_id = ?",
     )
     .bind(next_stored)
     .bind(target_session)
+    .bind(user_id)
     .execute(&mut *tx)
     .await
     .map_err(|e| format!("advance target task counter failed: {e}"))?;

@@ -187,6 +187,29 @@ fn locked_counter_advance(raw: i64, session_id: &str) -> Result<(u32, u64), Stri
     Ok((current, next_stored))
 }
 
+fn counter_owner_mismatch_error(session_id: &str) -> String {
+    format!("session_todo_counters owner mismatch for {session_id}")
+}
+
+async fn ensure_counter_owner_available(
+    executor: &mut MySqlConnection,
+    session_id: &str,
+    user_id: &str,
+) -> Result<(), String> {
+    let existing: Option<(String,)> =
+        sqlx::query_as("SELECT user_id FROM session_todo_counters WHERE session_id = ? FOR UPDATE")
+            .bind(session_id)
+            .fetch_optional(&mut *executor)
+            .await
+            .map_err(|e| e.to_string())?;
+    match existing {
+        Some((existing_user_id,)) if existing_user_id != user_id => {
+            Err(counter_owner_mismatch_error(session_id))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn peek_task_id_from_counter(row: Option<i64>, session_id: &str) -> Result<u32, String> {
     let Some(raw) = row else {
         return Ok(1);
@@ -273,10 +296,11 @@ impl MatrixOneTaskStore {
                     CAST(created_at AS CHAR) AS created_at, \
                     CAST(updated_at AS CHAR) AS updated_at \
              FROM session_todos \
-             WHERE session_id = ? \
+             WHERE session_id = ? AND user_id = ? \
              ORDER BY ordinal ASC",
         )
         .bind(session_id)
+        .bind(&self.user_id)
         .fetch_all(&self.pool)
         .await?;
 
@@ -442,10 +466,12 @@ impl TaskStore for MatrixOneTaskStore {
                     CAST(updated_at AS CHAR) AS updated_at \
              FROM session_todos \
              WHERE session_id = ? \
+               AND user_id = ? \
                AND status IN (?, ?, ?) \
              ORDER BY ordinal ASC",
         )
         .bind(session_id)
+        .bind(&self.user_id)
         .bind(SESSION_TASK_STATUS_PENDING.to_string())
         .bind(SESSION_TASK_STATUS_IN_PROGRESS.to_string())
         .bind(SESSION_TASK_STATUS_PAUSED.to_string())
@@ -466,11 +492,19 @@ impl TaskStore for MatrixOneTaskStore {
         // on the other node never see a partial update.
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
 
+        if let Err(e) = ensure_counter_owner_available(&mut tx, session_id, &self.user_id).await {
+            if let Err(rollback_err) = tx.rollback().await {
+                return Err(format!("{e}; rollback failed: {rollback_err}"));
+            }
+            return Err(e);
+        }
+
         if let Err(e) = sqlx::query(
-            "INSERT INTO session_todo_counters (session_id, next_id, version) VALUES (?, 1, 0) \
+            "INSERT INTO session_todo_counters (session_id, user_id, next_id, version) VALUES (?, ?, 1, 0) \
              ON DUPLICATE KEY UPDATE next_id = next_id",
         )
         .bind(session_id)
+        .bind(&self.user_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())
@@ -481,11 +515,13 @@ impl TaskStore for MatrixOneTaskStore {
             return Err(e);
         }
 
-        if let Err(e) = sqlx::query("DELETE FROM session_todos WHERE session_id = ?")
-            .bind(session_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())
+        if let Err(e) =
+            sqlx::query("DELETE FROM session_todos WHERE session_id = ? AND user_id = ?")
+                .bind(session_id)
+                .bind(&self.user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())
         {
             if let Err(rollback_err) = tx.rollback().await {
                 return Err(format!("{e}; rollback failed: {rollback_err}"));
@@ -511,9 +547,10 @@ impl TaskStore for MatrixOneTaskStore {
         }
 
         if let Err(e) = sqlx::query(
-            "UPDATE session_todo_counters SET version = version + 1 WHERE session_id = ?",
+            "UPDATE session_todo_counters SET version = version + 1 WHERE session_id = ? AND user_id = ?",
         )
         .bind(session_id)
+        .bind(&self.user_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())
@@ -532,11 +569,19 @@ impl TaskStore for MatrixOneTaskStore {
     async fn mutate(&self, session_id: &str, mutation: TaskMutation) -> Result<String, String> {
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
 
+        if let Err(e) = ensure_counter_owner_available(&mut tx, session_id, &self.user_id).await {
+            if let Err(rollback_err) = tx.rollback().await {
+                return Err(format!("{e}; rollback failed: {rollback_err}"));
+            }
+            return Err(e);
+        }
+
         if let Err(e) = sqlx::query(
-            "INSERT INTO session_todo_counters (session_id, next_id, version) VALUES (?, 1, 0) \
+            "INSERT INTO session_todo_counters (session_id, user_id, next_id, version) VALUES (?, ?, 1, 0) \
              ON DUPLICATE KEY UPDATE next_id = next_id",
         )
         .bind(session_id)
+        .bind(&self.user_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())
@@ -548,9 +593,10 @@ impl TaskStore for MatrixOneTaskStore {
         }
 
         let raw_next: i64 = match sqlx::query_as::<_, (i64,)>(
-            "SELECT next_id FROM session_todo_counters WHERE session_id = ? FOR UPDATE",
+            "SELECT next_id FROM session_todo_counters WHERE session_id = ? AND user_id = ? FOR UPDATE",
         )
         .bind(session_id)
+        .bind(&self.user_id)
         .fetch_one(&mut *tx)
         .await
         .map(|(next,)| next)
@@ -587,11 +633,12 @@ impl TaskStore for MatrixOneTaskStore {
                     CAST(created_at AS CHAR) AS created_at, \
                     CAST(updated_at AS CHAR) AS updated_at \
              FROM session_todos \
-             WHERE session_id = ? \
+             WHERE session_id = ? AND user_id = ? \
              ORDER BY ordinal ASC \
              FOR UPDATE",
         )
         .bind(session_id)
+        .bind(&self.user_id)
         .fetch_all(&mut *tx)
         .await
         {
@@ -628,13 +675,15 @@ impl TaskStore for MatrixOneTaskStore {
         };
 
         if let Some(next_task_id) = result.next_task_id
-            && let Err(e) =
-                sqlx::query("UPDATE session_todo_counters SET next_id = ? WHERE session_id = ?")
-                    .bind(counter_bind_value(next_task_id))
-                    .bind(session_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())
+            && let Err(e) = sqlx::query(
+                "UPDATE session_todo_counters SET next_id = ? WHERE session_id = ? AND user_id = ?",
+            )
+            .bind(counter_bind_value(next_task_id))
+            .bind(session_id)
+            .bind(&self.user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())
         {
             if let Err(rollback_err) = tx.rollback().await {
                 return Err(format!("{e}; rollback failed: {rollback_err}"));
@@ -642,11 +691,13 @@ impl TaskStore for MatrixOneTaskStore {
             return Err(e);
         }
 
-        if let Err(e) = sqlx::query("DELETE FROM session_todos WHERE session_id = ?")
-            .bind(session_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())
+        if let Err(e) =
+            sqlx::query("DELETE FROM session_todos WHERE session_id = ? AND user_id = ?")
+                .bind(session_id)
+                .bind(&self.user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())
         {
             if let Err(rollback_err) = tx.rollback().await {
                 return Err(format!("{e}; rollback failed: {rollback_err}"));
@@ -664,9 +715,10 @@ impl TaskStore for MatrixOneTaskStore {
         }
 
         if let Err(e) = sqlx::query(
-            "UPDATE session_todo_counters SET version = version + 1 WHERE session_id = ?",
+            "UPDATE session_todo_counters SET version = version + 1 WHERE session_id = ? AND user_id = ?",
         )
         .bind(session_id)
+        .bind(&self.user_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())
@@ -708,8 +760,8 @@ impl TaskStore for MatrixOneTaskStore {
         // an id.
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
 
-        let existing: Option<(i64,)> = match sqlx::query_as(
-            "SELECT next_id FROM session_todo_counters WHERE session_id = ? FOR UPDATE",
+        let existing: Option<(String, i64)> = match sqlx::query_as(
+            "SELECT user_id, next_id FROM session_todo_counters WHERE session_id = ? FOR UPDATE",
         )
         .bind(session_id)
         .fetch_optional(&mut *tx)
@@ -729,9 +781,10 @@ impl TaskStore for MatrixOneTaskStore {
             None => {
                 // First allocation: seed counter to 2 (reserves id 1).
                 if let Err(e) = sqlx::query(
-                    "INSERT INTO session_todo_counters (session_id, next_id, version) VALUES (?, 2, 1)",
+                    "INSERT INTO session_todo_counters (session_id, user_id, next_id, version) VALUES (?, ?, 2, 1)",
                 )
                 .bind(session_id)
+                .bind(&self.user_id)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| e.to_string())
@@ -743,7 +796,7 @@ impl TaskStore for MatrixOneTaskStore {
                 }
                 1
             }
-            Some((raw,)) => {
+            Some((existing_user_id, raw)) if existing_user_id == self.user_id => {
                 let (current, next_stored) = match locked_counter_advance(raw, session_id) {
                     Ok(v) => v,
                     Err(e) => {
@@ -755,13 +808,16 @@ impl TaskStore for MatrixOneTaskStore {
                 };
                 // Persist the bump (may store the exhausted sentinel;
                 // `allocated_task_id_from_counter` rejects it on next read).
-                if let Err(e) =
-                    sqlx::query("UPDATE session_todo_counters SET next_id = ?, version = version + 1 WHERE session_id = ?")
-                        .bind(next_stored as i64)
-                        .bind(session_id)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| e.to_string())
+                if let Err(e) = sqlx::query(
+                    "UPDATE session_todo_counters SET next_id = ?, version = version + 1 \
+                         WHERE session_id = ? AND user_id = ?",
+                )
+                .bind(next_stored as i64)
+                .bind(session_id)
+                .bind(&self.user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())
                 {
                     if let Err(rollback_err) = tx.rollback().await {
                         return Err(format!("{e}; rollback failed: {rollback_err}"));
@@ -770,21 +826,37 @@ impl TaskStore for MatrixOneTaskStore {
                 }
                 current
             }
+            Some(_) => {
+                let err = counter_owner_mismatch_error(session_id);
+                if let Err(rollback_err) = tx.rollback().await {
+                    return Err(format!("{err}; rollback failed: {rollback_err}"));
+                }
+                return Err(err);
+            }
         };
         tx.commit().await.map_err(|e| e.to_string())?;
         Ok(current)
     }
 
     async fn set_next_task_id(&self, session_id: &str, next: u32) -> Result<(), String> {
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+        if let Err(e) = ensure_counter_owner_available(&mut tx, session_id, &self.user_id).await {
+            if let Err(rollback_err) = tx.rollback().await {
+                return Err(format!("{e}; rollback failed: {rollback_err}"));
+            }
+            return Err(e);
+        }
         sqlx::query(
-            "INSERT INTO session_todo_counters (session_id, next_id, version) VALUES (?, ?, 1) \
+            "INSERT INTO session_todo_counters (session_id, user_id, next_id, version) VALUES (?, ?, ?, 1) \
              ON DUPLICATE KEY UPDATE next_id = VALUES(next_id), version = version + 1",
         )
         .bind(session_id)
+        .bind(&self.user_id)
         .bind(counter_bind_value(next))
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -797,14 +869,22 @@ impl TaskStore for MatrixOneTaskStore {
     ) -> Result<(), String> {
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
 
+        if let Err(e) = ensure_counter_owner_available(&mut tx, session_id, &self.user_id).await {
+            if let Err(rollback_err) = tx.rollback().await {
+                return Err(format!("{e}; rollback failed: {rollback_err}"));
+            }
+            return Err(e);
+        }
+
         if expected_version > 0 {
             // CAS: atomically verify the session version hasn't changed since
             // the snapshot was captured.  Without this, a concurrent sweeper
             // auto-pause or plan-mirror mutation could be silently overwritten.
             let row: Option<(i64,)> = sqlx::query_as(
-                "SELECT version FROM session_todo_counters WHERE session_id = ? FOR UPDATE",
+                "SELECT version FROM session_todo_counters WHERE session_id = ? AND user_id = ? FOR UPDATE",
             )
             .bind(session_id)
+            .bind(&self.user_id)
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| format!("restore_snapshot_state: version check failed: {e}"))?;
@@ -819,21 +899,24 @@ impl TaskStore for MatrixOneTaskStore {
         }
 
         sqlx::query(
-            "INSERT INTO session_todo_counters (session_id, next_id, version) VALUES (?, ?, ?) \
+            "INSERT INTO session_todo_counters (session_id, user_id, next_id, version) VALUES (?, ?, ?, ?) \
              ON DUPLICATE KEY UPDATE next_id = VALUES(next_id), version = version + 1",
         )
         .bind(session_id)
+        .bind(&self.user_id)
         .bind(counter_bind_value(next_task_id))
         .bind(expected_version as i64)
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("restore_snapshot_state: counter upsert failed: {e}"))?;
 
-        if let Err(e) = sqlx::query("DELETE FROM session_todos WHERE session_id = ?")
-            .bind(session_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())
+        if let Err(e) =
+            sqlx::query("DELETE FROM session_todos WHERE session_id = ? AND user_id = ?")
+                .bind(session_id)
+                .bind(&self.user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())
         {
             if let Err(rollback_err) = tx.rollback().await {
                 return Err(format!("{e}; rollback failed: {rollback_err}"));
@@ -855,9 +938,10 @@ impl TaskStore for MatrixOneTaskStore {
         }
 
         if let Err(e) = sqlx::query(
-            "UPDATE session_todo_counters SET version = version + 1 WHERE session_id = ?",
+            "UPDATE session_todo_counters SET version = version + 1 WHERE session_id = ? AND user_id = ?",
         )
         .bind(session_id)
+        .bind(&self.user_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())
@@ -880,26 +964,37 @@ impl TaskStore for MatrixOneTaskStore {
         // 0/negative, fail loudly so try_snapshot_state falls back to
         // max(existing task id) + 1 instead of capturing a corrupt
         // counter and later restoring it.
-        let row: Option<(i64,)> =
-            sqlx::query_as("SELECT next_id FROM session_todo_counters WHERE session_id = ?")
-                .bind(session_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| e.to_string())?;
-        peek_task_id_from_counter(row.map(|(v,)| v), session_id)
+        let row: Option<(String, i64)> = sqlx::query_as(
+            "SELECT user_id, next_id FROM session_todo_counters WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        match row {
+            Some((existing_user_id, next_id)) if existing_user_id == self.user_id => {
+                peek_task_id_from_counter(Some(next_id), session_id)
+            }
+            Some(_) => Err(counter_owner_mismatch_error(session_id)),
+            None => peek_task_id_from_counter(None, session_id),
+        }
     }
 
     async fn get_session_version(&self, session_id: &str) -> Result<u64, String> {
-        let row: Option<(i64,)> =
-            sqlx::query_as("SELECT version FROM session_todo_counters WHERE session_id = ?")
-                .bind(session_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| e.to_string())?;
+        let row: Option<(String, i64)> = sqlx::query_as(
+            "SELECT user_id, version FROM session_todo_counters WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
         match row {
-            Some((version,)) if version >= 0 => u64::try_from(version)
+            Some((existing_user_id, _)) if existing_user_id != self.user_id => {
+                Err(counter_owner_mismatch_error(session_id))
+            }
+            Some((_, version)) if version >= 0 => u64::try_from(version)
                 .map_err(|_| format!("session_todo_counters.version overflow for {session_id}")),
-            Some((version,)) => Err(format!(
+            Some((_, version)) => Err(format!(
                 "session_todo_counters.version out of range for {session_id}: {version}"
             )),
             None => Ok(0),

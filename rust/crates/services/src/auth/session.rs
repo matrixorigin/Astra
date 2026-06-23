@@ -628,6 +628,10 @@ async fn ensure_session_delete_owner_consistency(
             "SELECT COUNT(*) AS c FROM session_todos WHERE session_id = ? AND user_id <> ?",
         ),
         (
+            "session_todo_counters",
+            "SELECT COUNT(*) AS c FROM session_todo_counters WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
             "task_contracts",
             "SELECT COUNT(*) AS c FROM task_contracts WHERE session_id = ? AND user_id <> ?",
         ),
@@ -823,6 +827,10 @@ async fn hard_delete_session_rows(
             "DELETE FROM session_todos WHERE session_id = ? AND user_id = ?",
         ),
         (
+            "session_todo_counters",
+            "DELETE FROM session_todo_counters WHERE session_id = ? AND user_id = ?",
+        ),
+        (
             "session_plan_todos",
             "DELETE FROM session_plan_todos WHERE session_id = ? AND user_id = ?",
         ),
@@ -880,16 +888,10 @@ async fn hard_delete_session_rows(
             delete_session_rows_session_user(tx, label, statement, session_id, user_id).await?;
     }
 
-    for (label, statement) in [
-        (
-            "session_todo_counters",
-            "DELETE FROM session_todo_counters WHERE session_id = ?",
-        ),
-        (
-            "conversation_log",
-            "DELETE FROM conversation_log WHERE session_id = ?",
-        ),
-    ] {
+    for (label, statement) in [(
+        "conversation_log",
+        "DELETE FROM conversation_log WHERE session_id = ?",
+    )] {
         deleted += delete_session_rows_1(tx, label, statement, session_id).await?;
     }
 

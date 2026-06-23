@@ -2784,11 +2784,39 @@ pub async fn ensure_core_schema(
     // but its id must never be reused for the session.
     query(
         "CREATE TABLE IF NOT EXISTS session_todo_counters (
-            session_id VARCHAR(64) PRIMARY KEY,
-            next_id BIGINT NOT NULL
+            user_id VARCHAR(64) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            next_id BIGINT NOT NULL,
+            version BIGINT NOT NULL DEFAULT 0,
+            PRIMARY KEY (session_id),
+            INDEX idx_session_todo_counters_owner_session (user_id, session_id)
         )",
     )
     .execute(&pool)
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "session_todo_counters",
+        "user_id",
+        "ALTER TABLE session_todo_counters ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT ''",
+    )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "session_todo_counters",
+        "version",
+        "ALTER TABLE session_todo_counters ADD COLUMN version BIGINT NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_index_if_missing(
+        &pool,
+        &settings.database,
+        "session_todo_counters",
+        "idx_session_todo_counters_owner_session",
+        "ALTER TABLE session_todo_counters ADD INDEX idx_session_todo_counters_owner_session (user_id, session_id)",
+    )
     .await?;
 
     // ── Durable Task System ─────────────────────────────────────────────────

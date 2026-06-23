@@ -4136,11 +4136,14 @@ async fn session_delete_removes_owner_scoped_transcript_pages_and_todo_counter_o
     .execute(&pool)
     .await
     .expect("insert owner transcript page");
-    sqlx::query("INSERT INTO session_todo_counters (session_id, next_id) VALUES (?, 42)")
-        .bind(&session_id)
-        .execute(&pool)
-        .await
-        .expect("insert todo counter");
+    sqlx::query(
+        "INSERT INTO session_todo_counters (session_id, user_id, next_id) VALUES (?, ?, 42)",
+    )
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .execute(&pool)
+    .await
+    .expect("insert todo counter");
     sqlx::query(
         "INSERT INTO ctx_snapshots \
          (context_capture_id, user_id, session_id, event_id, context_data) \
@@ -4388,6 +4391,98 @@ async fn session_delete_blocks_mixed_owner_context_decision_rows_on_live_matrixo
         .execute(&pool)
         .await;
     let _ = sqlx::query("DELETE FROM ctx_snapshots WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    cleanup_agent_sessions_and_events(&pool, &[session_id], &[], &[]).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_delete_blocks_mixed_owner_todo_counter_on_live_matrixone() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let owner_user_id = Uuid::new_v4().to_string();
+    let other_user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+
+    let _ = sqlx::query("DELETE FROM session_todo_counters WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
+    cleanup_agent_sessions_and_events(&pool, std::slice::from_ref(&session_id), &[], &[]).await;
+
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'mixed-counter-delete-it', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .execute(&pool)
+    .await
+    .expect("insert owner session");
+    sqlx::query(
+        "INSERT INTO session_todo_counters (session_id, user_id, next_id, version) \
+         VALUES (?, ?, 7, 3)",
+    )
+    .bind(&session_id)
+    .bind(&other_user_id)
+    .execute(&pool)
+    .await
+    .expect("insert stray todo counter");
+
+    let visible_mismatch = sqlx::query(
+        "SELECT COUNT(*) AS c FROM session_todo_counters WHERE session_id = ? AND user_id <> ?",
+    )
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count preflight-visible todo counter")
+    .try_get::<i64, _>("c")
+    .expect("decode preflight-visible todo counter count");
+    assert_eq!(
+        visible_mismatch, 1,
+        "test fixture must be visible to delete_session owner preflight"
+    );
+
+    let session_service = DatabaseSessionService::new(settings).with_pool(shared);
+    let delete_result = session_service
+        .delete_session(session_id.clone(), owner_user_id.clone())
+        .await;
+    assert_eq!(
+        delete_result
+            .expect_err("mixed-owner todo counter delete must fail closed")
+            .0,
+        axum::http::StatusCode::CONFLICT
+    );
+
+    let remaining_session = sqlx::query(
+        "SELECT COUNT(*) AS c FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count owner session")
+    .try_get::<i64, _>("c")
+    .expect("decode owner session count");
+    assert_eq!(remaining_session, 1, "blocked delete must keep session");
+    let remaining_counter_rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT user_id, next_id, version FROM session_todo_counters WHERE session_id = ?",
+    )
+    .bind(&session_id)
+    .fetch_all(&pool)
+    .await
+    .expect("load remaining todo counter rows");
+    assert_eq!(
+        remaining_counter_rows,
+        vec![(other_user_id.clone(), 7, 3)],
+        "blocked delete must not remove or rewrite stray counter"
+    );
+
+    let _ = sqlx::query("DELETE FROM session_todo_counters WHERE session_id = ?")
         .bind(&session_id)
         .execute(&pool)
         .await;

@@ -707,6 +707,25 @@ async fn phase4_state_projection_schema_contract() {
     let pool = common::setup_pool().await;
     let schema = current_schema(&pool).await;
 
+    let todo_counter_columns = column_names(&pool, &schema, "session_todo_counters").await;
+    for expected in ["user_id", "session_id", "next_id", "version"] {
+        assert!(
+            todo_counter_columns.iter().any(|column| column == expected),
+            "session_todo_counters missing {expected}"
+        );
+    }
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "session_todo_counters",
+            "idx_session_todo_counters_owner_session"
+        )
+        .await,
+        ["user_id", "session_id"],
+        "session todo counter lookups must use owner/session index"
+    );
+
     let state_items = column_names(&pool, &schema, "session_state_items").await;
     for expected in [
         "scope",

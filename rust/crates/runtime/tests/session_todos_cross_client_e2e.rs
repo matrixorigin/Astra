@@ -60,14 +60,13 @@ async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str) {
 async fn edge_created_task_visible_on_cloud() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-x-client-{}", uuid::Uuid::new_v4());
+    let user_id = format!("u-{}", session_id);
     cleanup(&pool, &session_id).await;
 
-    let edge_store: Arc<dyn TaskStore> = Arc::new(
-        MatrixOneTaskStore::new_for_user(pool.clone(), format!("u-{}", session_id)).unwrap(),
-    );
-    let cloud_store: Arc<dyn TaskStore> = Arc::new(
-        MatrixOneTaskStore::new_for_user(pool.clone(), format!("u-{}", session_id)).unwrap(),
-    );
+    let edge_store: Arc<dyn TaskStore> =
+        Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), user_id.clone()).unwrap());
+    let cloud_store: Arc<dyn TaskStore> =
+        Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), user_id.clone()).unwrap());
     let edge = TaskManager::new(session_id.clone(), edge_store);
     let cloud = TaskManager::new(session_id.clone(), cloud_store);
 
@@ -81,6 +80,90 @@ async fn edge_created_task_visible_on_cloud() {
         list.contains("shared task"),
         "cloud TaskManager did not see edge-created task: {list}"
     );
+    let counter_owner: String =
+        sqlx::query_scalar("SELECT user_id FROM session_todo_counters WHERE session_id = ?")
+            .bind(&session_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load counter owner");
+    assert_eq!(
+        counter_owner, user_id,
+        "task id counter must carry the same owner as session_todos"
+    );
+
+    cleanup(&pool, &session_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
+async fn matrixone_task_store_refuses_mixed_owner_counter_without_overwrite() {
+    let pool = bootstrap_pool().await;
+    let session_id = format!("s-mixed-counter-store-{}", uuid::Uuid::new_v4());
+    let owner_user_id = format!("u-owner-{}", uuid::Uuid::new_v4());
+    let other_user_id = format!("u-other-{}", uuid::Uuid::new_v4());
+    cleanup(&pool, &session_id).await;
+
+    sqlx::query(
+        "INSERT INTO session_todo_counters (session_id, user_id, next_id, version) \
+         VALUES (?, ?, 7, 3)",
+    )
+    .bind(&session_id)
+    .bind(&other_user_id)
+    .execute(&pool)
+    .await
+    .expect("insert other-owner counter");
+
+    let store = MatrixOneTaskStore::new_for_user(pool.clone(), owner_user_id.clone()).unwrap();
+    let set_err = store
+        .set_next_task_id(&session_id, 99)
+        .await
+        .expect_err("set_next_task_id must reject a counter owned by another user");
+    assert!(
+        set_err.contains("session_todo_counters owner mismatch"),
+        "unexpected set_next_task_id error: {set_err}"
+    );
+
+    let restore_err = store
+        .restore_snapshot_state(&session_id, Vec::new(), 99, 0)
+        .await
+        .expect_err("restore_snapshot_state must reject a counter owned by another user");
+    assert!(
+        restore_err.contains("session_todo_counters owner mismatch"),
+        "unexpected restore_snapshot_state error: {restore_err}"
+    );
+
+    let manager = TaskManager::new(
+        session_id.clone(),
+        Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), owner_user_id.clone()).unwrap()),
+    );
+    let create = manager
+        .create(&json!({"title": "must not overwrite"}))
+        .await;
+    assert!(
+        create.starts_with("Error:") && create.contains("session_todo_counters owner mismatch"),
+        "create must fail closed on mixed-owner counter: {create}"
+    );
+
+    let (actual_owner, next_id, version): (String, i64, i64) = sqlx::query_as(
+        "SELECT user_id, next_id, version FROM session_todo_counters WHERE session_id = ?",
+    )
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load counter after rejected writes");
+    assert_eq!(actual_owner, other_user_id);
+    assert_eq!(next_id, 7);
+    assert_eq!(version, 3);
+
+    let owner_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_todos WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count owner todos");
+    assert_eq!(owner_rows, 0, "failed create must not insert task rows");
 
     cleanup(&pool, &session_id).await;
 }
@@ -229,20 +312,21 @@ async fn snapshot_restore_roundtrips_through_mo() {
 async fn snapshot_restore_uses_existing_rows_when_matrixone_counter_is_zero() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-zero-counter-snapshot-{}", uuid::Uuid::new_v4());
+    let user_id = format!("u-{}", session_id);
     cleanup(&pool, &session_id).await;
 
-    let store: Arc<dyn TaskStore> = Arc::new(
-        MatrixOneTaskStore::new_for_user(pool.clone(), format!("u-{}", session_id)).unwrap(),
-    );
+    let store: Arc<dyn TaskStore> =
+        Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), user_id.clone()).unwrap());
     let mgr = TaskManager::new(session_id.clone(), store);
 
     let create = mgr.create(&json!({"title": "surviving task"})).await;
     assert!(create.contains("task-1"), "{create}");
     sqlx::query(
         "UPDATE session_todo_counters SET next_id = 0 \
-         WHERE session_id = ?",
+         WHERE session_id = ? AND user_id = ?",
     )
     .bind(&session_id)
+    .bind(&user_id)
     .execute(&pool)
     .await
     .expect("corrupt counter to zero");
