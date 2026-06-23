@@ -139,7 +139,6 @@ async fn find_task_by_query_scenarios() {
 #[tokio::test]
 async fn resume_local_restore_rejects_unowned_session() {
     let _creds = isolate_credentials();
-    use astra_services::session_restore::SessionRestoreService;
     use session_journal::JournalWriter;
 
     let sid = format!("test-unowned-{}", uuid::Uuid::new_v4());
@@ -180,7 +179,7 @@ async fn resume_local_restore_rejects_unowned_session() {
     std::fs::write(ws_dir.join("workspace.yaml"), ws_content).unwrap();
 
     let svc = astra_services::session_restore::HybridRestoreService::local_only();
-    let result = svc.restore_session(&sid).await.unwrap();
+    let result = svc.restore_local_session(&sid).await.unwrap();
     assert!(
         result.is_some(),
         "local restore should find session with workspace.yaml"
@@ -282,7 +281,6 @@ async fn initialize_session_state_marks_workspace_session_as_pending_recovery() 
 #[tokio::test]
 async fn resume_handles_workspace_edge_cases() {
     let _creds = isolate_credentials();
-    use astra_services::session_restore::SessionRestoreService;
 
     for (label, workspace_yaml) in [
         ("malformed", Some("invalid: yaml: content: [")),
@@ -311,7 +309,7 @@ async fn resume_handles_workspace_edge_cases() {
 
         let svc = astra_services::session_restore::HybridRestoreService::local_only();
         let result = svc
-            .restore_session(&sid)
+            .restore_local_session(&sid)
             .await
             .unwrap()
             .unwrap_or_else(|| panic!("{label}: journal-only session should restore"));
@@ -330,7 +328,6 @@ async fn resume_handles_workspace_edge_cases() {
 async fn resume_lists_checkpoints_for_session() {
     let _creds = isolate_credentials();
     use astra_services::session_journal;
-    use astra_services::session_restore::SessionRestoreService;
 
     let sid = format!("test-checkpoints-{}", uuid::Uuid::new_v4());
 
@@ -365,7 +362,7 @@ total_tokens_out: 500
     .unwrap();
 
     let svc = astra_services::session_restore::HybridRestoreService::local_only();
-    let ckpts = svc.list_checkpoints(&sid).await.unwrap();
+    let ckpts = svc.list_local_checkpoints(&sid).await.unwrap();
     assert!(ckpts.is_empty(), "no checkpoints created yet");
 }
 

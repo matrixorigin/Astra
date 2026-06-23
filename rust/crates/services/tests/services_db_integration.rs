@@ -1620,7 +1620,7 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
 
     let restore = HybridRestoreService::new(pool.clone());
     let restored_a = restore
-        .restore_session(&session_a)
+        .restore_session(&user_id, &session_a)
         .await
         .expect("restore session A")
         .expect("session A restored");
@@ -1652,7 +1652,7 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
     assert_eq!(restored_a.plan_execution_rounds, 0);
 
     let restored_b = restore
-        .restore_session(&session_b)
+        .restore_session(&user_id, &session_b)
         .await
         .expect("restore session B")
         .expect("session B restored");
@@ -1911,6 +1911,15 @@ async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matr
     let session_id = Uuid::new_v4().to_string();
 
     cleanup_restore_fixture(&pool, std::slice::from_ref(&session_id)).await;
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'remote-workspace-restore-it', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("insert owner session for remote workspace restore");
 
     let mut workspace = WorkspaceMetadata::with_context(
         &session_id,
@@ -1946,9 +1955,10 @@ async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matr
         .expect("persist remote workspace");
 
     let artifact_count: i64 = sqlx::query(
-        "SELECT COUNT(*) AS c FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'workspace_metadata'",
+        "SELECT COUNT(*) AS c FROM session_artifacts WHERE session_id = ? AND user_id = ? AND artifact_kind = 'workspace_metadata'",
     )
     .bind(&session_id)
+    .bind(&user_id)
     .fetch_one(&pool)
     .await
     .expect("load session_artifacts count")
@@ -1958,7 +1968,7 @@ async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matr
 
     let restore = HybridRestoreService::new(pool.clone());
     let restored = restore
-        .restore_session(&session_id)
+        .restore_session(&user_id, &session_id)
         .await
         .expect("restore session")
         .expect("session restored from remote workspace artifact");
@@ -2081,7 +2091,7 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
 
     let restore = HybridRestoreService::new(pool.clone());
     let listed = restore
-        .list_composite_snapshots(&session_id)
+        .list_composite_snapshots(&user_id, &session_id)
         .await
         .expect("list composite snapshots");
     assert_eq!(listed.snapshots.len(), 1);
@@ -2098,6 +2108,7 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
 
     let restored = restore
         .restore_to_composite_snapshot(
+            &user_id,
             &session_id,
             &composite_snapshot.snapshot_id,
             &astra_core::composite_snapshot::RestoreSelector::default(),
@@ -2211,7 +2222,7 @@ async fn restore_recent_tools_falls_back_to_legacy_turn_complete_metadata_on_liv
 
     let restore = HybridRestoreService::new(pool.clone());
     let restored = restore
-        .restore_session(&session_id)
+        .restore_session(&user_id, &session_id)
         .await
         .expect("restore session")
         .expect("session restored");
@@ -2287,7 +2298,7 @@ async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
 
     let restore = HybridRestoreService::new(pool.clone());
     let restored = restore
-        .restore_session(&session_id)
+        .restore_session(&user_id, &session_id)
         .await
         .expect("restore session")
         .expect("session restored");
@@ -2642,7 +2653,7 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
             .as_deref(),
         Some(r#"["step-two"]"#)
     );
-    let pulled_step = pull_step_checkpoint_from_cloud(&pool, &session_id)
+    let pulled_step = pull_step_checkpoint_from_cloud(&pool, &user_id, &session_id)
         .await
         .expect("pull heavy step checkpoint");
     assert_eq!(
@@ -2661,7 +2672,7 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
 
     let restore = HybridRestoreService::new(pool.clone());
     let checkpoints = restore
-        .list_checkpoints(&session_id)
+        .list_checkpoints(&user_id, &session_id)
         .await
         .expect("list checkpoints");
     assert_eq!(
@@ -2673,7 +2684,7 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
     assert_eq!(checkpoints[0].title, "session-ckpt");
 
     let restored = restore
-        .restore_session(&session_id)
+        .restore_session(&user_id, &session_id)
         .await
         .expect("restore checkpoint session")
         .expect("checkpoint session restored");
@@ -2712,7 +2723,7 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
     );
 
     let restored_heavy_only = restore
-        .restore_session(&heavy_only_session)
+        .restore_session(&user_id, &heavy_only_session)
         .await
         .expect("restore heavy-only session")
         .expect("heavy-only session restored");
@@ -2734,7 +2745,7 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
     );
 
     let restored_legacy_heavy = restore
-        .restore_session(&legacy_heavy_session)
+        .restore_session(&user_id, &legacy_heavy_session)
         .await
         .expect("restore legacy-heavy session")
         .expect("legacy-heavy session restored");
@@ -3022,6 +3033,10 @@ async fn session_owned_services_reject_non_owner_side_effects_on_live_matrixone(
         .bind(&session_id)
         .execute(&pool)
         .await;
+    let _ = sqlx::query("DELETE FROM session_checkpoints WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
     cleanup_agent_sessions_and_events(&pool, std::slice::from_ref(&session_id), &[], &[]).await;
 
     let owner_metadata = serde_json::json!({"owner": true, "branch": "main"}).to_string();
@@ -3121,6 +3136,97 @@ async fn session_owned_services_reject_non_owner_side_effects_on_live_matrixone(
         "non-owner cannot push session restore metadata"
     );
 
+    sync_service
+        .push_checkpoint(
+            &session_id,
+            &owner_user_id,
+            &astra_services::session_checkpoint::Checkpoint {
+                number: 1,
+                turn: 1,
+                title: "owner-checkpoint".into(),
+                summary: "owner checkpoint must survive".into(),
+                tools_used: vec!["owner_tool".into()],
+                total_tokens: 10,
+                had_stalls: false,
+                error_count: 0,
+                contract_state_json: None,
+            },
+        )
+        .await
+        .expect("owner can push checkpoint");
+    let restore = HybridRestoreService::new(pool.clone());
+    assert!(
+        restore
+            .restore_session(&other_user_id, &session_id)
+            .await
+            .expect("non-owner restore should not error")
+            .is_none(),
+        "non-owner cannot restore another user's session"
+    );
+    assert!(
+        restore
+            .list_checkpoints(&other_user_id, &session_id)
+            .await
+            .expect("non-owner checkpoint list should not error")
+            .is_empty(),
+        "non-owner cannot list another user's checkpoints"
+    );
+    assert_eq!(
+        restore
+            .list_checkpoints(&owner_user_id, &session_id)
+            .await
+            .expect("owner checkpoint list")
+            .len(),
+        1
+    );
+    let non_owner_checkpoint_result = sync_service
+        .push_checkpoint(
+            &session_id,
+            &other_user_id,
+            &astra_services::session_checkpoint::Checkpoint {
+                number: 1,
+                turn: 99,
+                title: "non-owner-checkpoint".into(),
+                summary: "must not overwrite".into(),
+                tools_used: vec!["other_tool".into()],
+                total_tokens: 999,
+                had_stalls: true,
+                error_count: 9,
+                contract_state_json: None,
+            },
+        )
+        .await;
+    assert!(
+        non_owner_checkpoint_result.is_err(),
+        "non-owner cannot overwrite owner checkpoint"
+    );
+    let checkpoint_row = sqlx::query(
+        "SELECT user_id, title, total_tokens FROM session_checkpoints WHERE session_id = ? AND number = 1",
+    )
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load checkpoint after non-owner overwrite attempt");
+    assert_eq!(
+        checkpoint_row
+            .try_get::<String, _>("user_id")
+            .expect("checkpoint user"),
+        owner_user_id
+    );
+    assert_eq!(
+        checkpoint_row
+            .try_get::<Option<String>, _>("title")
+            .expect("checkpoint title")
+            .as_deref(),
+        Some("owner-checkpoint")
+    );
+    assert_eq!(
+        checkpoint_row
+            .try_get::<i64, _>("total_tokens")
+            .expect("checkpoint tokens"),
+        10
+    );
+
     let snapshot_count =
         sqlx::query("SELECT COUNT(*) AS c FROM ctx_snapshots WHERE session_id = ?")
             .bind(&session_id)
@@ -3162,6 +3268,10 @@ async fn session_owned_services_reject_non_owner_side_effects_on_live_matrixone(
         "rejected non-owner session sync must not mutate owner metadata"
     );
 
+    let _ = sqlx::query("DELETE FROM session_checkpoints WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&pool)
+        .await;
     cleanup_agent_sessions_and_events(&pool, &[session_id], &[], &[]).await;
 }
 

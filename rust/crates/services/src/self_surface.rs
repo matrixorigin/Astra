@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::durable_task::{ContractStatus, SubtaskStage, TaskContract};
 use crate::session_journal::{self, JournalEvent, JournalEventType};
-use crate::session_restore::{HybridRestoreService, RestoredSession, SessionRestoreService};
+use crate::session_restore::{HybridRestoreService, RestoredSession};
 use crate::session_workspace::{self, ContextTraceSignal, WorkspaceMetadata};
 
 #[cfg(test)]
@@ -569,7 +569,7 @@ async fn load_local_artifacts(session_id: &str) -> Result<LoadedSelfSurfaceArtif
         .map_err(|error| format!("failed to read workspace for session {session_id}: {error}"))?;
     let journal_events = read_journal_events(session_id)?;
     let restore_service = HybridRestoreService::local_only();
-    let restored = restore_service.restore_session(session_id).await?;
+    let restored = restore_service.restore_local_session(session_id).await?;
     if workspace.is_none() && restored.is_none() && journal_events.is_empty() {
         return Err(format!(
             "no persistent local state found for session {session_id}"

@@ -8,7 +8,7 @@ use astra_services::self_surface::{
     SelfSurfaceRuntimeSupport, SelfSurfaceService, SurfaceConstraints,
 };
 use astra_services::session_journal;
-use astra_services::session_restore::{HybridRestoreService, SessionRestoreService};
+use astra_services::session_restore::HybridRestoreService;
 use astra_services::session_workspace;
 use async_trait::async_trait;
 use serde::Serialize;
@@ -146,7 +146,7 @@ impl SelfSurfaceArtifactLoader for CliSelfSurfaceArtifactLoader {
             Some(restored) => Some(restored),
             None => {
                 HybridRestoreService::local_only()
-                    .restore_session(session_id)
+                    .restore_local_session(session_id)
                     .await?
             }
         };

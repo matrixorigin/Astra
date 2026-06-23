@@ -1,5 +1,5 @@
 use astra_services::session_restore::{
-    HybridRestoreService, RestoredSession, ResumableSessionsResponse, SessionRestoreService,
+    HybridRestoreService, RestoredSession, ResumableSessionsResponse,
 };
 
 use crate::cli::cli_config::cli_utils;
@@ -56,7 +56,7 @@ pub(crate) async fn restore_session_snapshot_with_client(
 ) -> Result<Option<RestoredSession>, String> {
     validate_remote_session_id(session_id)?;
     let local = HybridRestoreService::local_only()
-        .restore_session(session_id)
+        .restore_local_session(session_id)
         .await?;
     if local.is_some() {
         return Ok(local);
@@ -106,7 +106,7 @@ pub(crate) async fn restore_session_snapshot(
 ) -> Result<Option<RestoredSession>, String> {
     validate_remote_session_id(session_id)?;
     let local = HybridRestoreService::local_only()
-        .restore_session(session_id)
+        .restore_local_session(session_id)
         .await?;
     if local.is_some() {
         return Ok(local);

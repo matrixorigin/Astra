@@ -1196,10 +1196,9 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn resume_local_restore_rejects_unowned_session() {
-        let _creds = isolate_credentials();
-        use astra_services::session_restore::SessionRestoreService;
-        use session_journal::JournalWriter;
+async fn resume_local_restore_rejects_unowned_session() {
+    let _creds = isolate_credentials();
+    use session_journal::JournalWriter;
 
         // Create a session with both journal AND workspace (what restore_session needs)
         let sid = format!("test-unowned-{}", uuid::Uuid::new_v4());
@@ -1247,8 +1246,8 @@ total_tokens_out: 3
         std::fs::write(ws_dir.join("workspace.yaml"), ws_content).unwrap();
 
         // Now restore_session should find it
-        let svc = astra_services::session_restore::HybridRestoreService::local_only();
-        let result = svc.restore_session(&sid).await.unwrap();
+    let svc = astra_services::session_restore::HybridRestoreService::local_only();
+    let result = svc.restore_local_session(&sid).await.unwrap();
         assert!(
             result.is_some(),
             "local restore should find session with workspace.yaml"
@@ -1266,9 +1265,8 @@ total_tokens_out: 3
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn resume_handles_malformed_workspace_yaml() {
-        let _creds = isolate_credentials();
-        use astra_services::session_restore::SessionRestoreService;
+async fn resume_handles_malformed_workspace_yaml() {
+    let _creds = isolate_credentials();
 
         let sid = format!("test-malformed-{}", uuid::Uuid::new_v4());
 
@@ -1294,7 +1292,7 @@ total_tokens_out: 3
         // Malformed workspace now falls back to journal-only local restore.
         let svc = astra_services::session_restore::HybridRestoreService::local_only();
         let result = svc
-            .restore_session(&sid)
+            .restore_local_session(&sid)
             .await
             .unwrap()
             .expect("malformed workspace should still restore from journal");
@@ -1307,9 +1305,8 @@ total_tokens_out: 3
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn resume_handles_missing_workspace() {
-        let _creds = isolate_credentials();
-        use astra_services::session_restore::SessionRestoreService;
+async fn resume_handles_missing_workspace() {
+    let _creds = isolate_credentials();
 
         // Only journal, no workspace → local journal-only restore should still work.
         let sid = format!("test-no-ws-{}", uuid::Uuid::new_v4());
@@ -1324,7 +1321,7 @@ total_tokens_out: 3
 
         let svc = astra_services::session_restore::HybridRestoreService::local_only();
         let result = svc
-            .restore_session(&sid)
+            .restore_local_session(&sid)
             .await
             .unwrap()
             .expect("journal-only session should restore");
@@ -1339,9 +1336,8 @@ total_tokens_out: 3
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn resume_lists_checkpoints_for_session() {
-        let _creds = isolate_credentials();
-        use astra_services::session_restore::SessionRestoreService;
+async fn resume_lists_checkpoints_for_session() {
+    let _creds = isolate_credentials();
 
         let sid = format!("test-checkpoints-{}", uuid::Uuid::new_v4());
 
@@ -1379,7 +1375,7 @@ total_tokens_out: 500
 
         // List checkpoints should return empty (no checkpoints created yet)
         let svc = astra_services::session_restore::HybridRestoreService::local_only();
-        let ckpts = svc.list_checkpoints(&sid).await.unwrap();
+        let ckpts = svc.list_local_checkpoints(&sid).await.unwrap();
         assert!(ckpts.is_empty(), "no checkpoints created yet");
     }
 

@@ -1259,11 +1259,12 @@ pub(crate) async fn resume_session_handler(
 ) -> Result<Json<astra_services::session_restore::RestoredSession>, (StatusCode, Json<ErrorResponse>)>
 {
     let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id.clone();
     let session = state
         .session_service
         .update_session(
             session_id,
-            user.user_id,
+            user_id.clone(),
             SessionUpdateRequestData {
                 title: None,
                 metadata: None,
@@ -1276,7 +1277,7 @@ pub(crate) async fn resume_session_handler(
     };
     let svc = astra_services::session_restore::HybridRestoreService::new(shared_pool.get().clone());
     let restored = svc
-        .restore_session(&session.session_id)
+        .restore_session(&user_id, &session.session_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| {

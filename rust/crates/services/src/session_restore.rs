@@ -3,15 +3,15 @@
 //! # Architecture
 //!
 //! ```text
-//! restore_session(session_id)
-//!   ├─ 1. Pull workspace metadata (local → fallback to MatrixOne)
-//!   ├─ 2. Pull events (agent_events → reconstruct turn_count, recent_tools)
-//!   ├─ 3. Pull checkpoints (session_checkpoints → optional rewind target)
+//! restore_session(user_id, session_id)
+//!   ├─ 1. Prove the MatrixOne session belongs to user_id
+//!   ├─ 2. Pull local workspace metadata when present
+//!   ├─ 3. Pull owner-bound cloud artifacts/events/checkpoints
 //!   └─ 4. Return RestoredSession for the REPL to continue
 //! ```
 //!
-//! The restore is local-first: tries local files first, falls back to MatrixOne
-//! for data that may have been created on a different device.
+//! Local-only restore is a separate API path and intentionally never reads MatrixOne.
+//! Cloud restore is always owner-bound.
 
 use astra_core::is_duplicate_key_error;
 use async_trait::async_trait;
@@ -173,15 +173,24 @@ pub struct RestoredCompositeState {
 /// Abstraction for restoring session state from various backends.
 #[async_trait]
 pub trait SessionRestoreService: Send + Sync {
-    /// Restore a session by ID. Returns None if session not found.
-    async fn restore_session(&self, session_id: &str) -> Result<Option<RestoredSession>, String>;
+    /// Restore a session owned by a user. Returns None if the session is missing or not owned.
+    async fn restore_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Option<RestoredSession>, String>;
 
     /// List available checkpoints for a session.
-    async fn list_checkpoints(&self, session_id: &str) -> Result<Vec<RestoredCheckpoint>, String>;
+    async fn list_checkpoints(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Vec<RestoredCheckpoint>, String>;
 
     /// Restore session state to a specific checkpoint.
     async fn restore_to_checkpoint(
         &self,
+        user_id: &str,
         session_id: &str,
         checkpoint_number: u32,
     ) -> Result<Option<RestoredSession>, String>;
@@ -193,20 +202,22 @@ pub trait SessionRestoreService: Send + Sync {
     /// Uses the `RestoreSelector` to determine which dimensions to restore.
     async fn restore_to_composite_snapshot(
         &self,
+        user_id: &str,
         session_id: &str,
         snapshot_id: &str,
         selector: &astra_core::composite_snapshot::RestoreSelector,
     ) -> Result<Option<RestoredCompositeState>, String> {
-        let _ = (session_id, snapshot_id, selector);
+        let _ = (user_id, session_id, snapshot_id, selector);
         Ok(None)
     }
 
     /// List composite snapshots for a session.
     async fn list_composite_snapshots(
         &self,
+        user_id: &str,
         session_id: &str,
     ) -> Result<astra_core::composite_snapshot::CompositeSnapshotIndex, String> {
-        let _ = session_id;
+        let _ = (user_id, session_id);
         Ok(astra_core::composite_snapshot::CompositeSnapshotIndex::default())
     }
 }
@@ -229,6 +240,240 @@ impl HybridRestoreService {
         Self { pool: None }
     }
 
+    /// Restore only local filesystem state. This intentionally never reads MatrixOne.
+    pub async fn restore_local_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<RestoredSession>, String> {
+        self.restore_session_inner(None, session_id).await
+    }
+
+    /// List only local filesystem checkpoints. This intentionally never reads MatrixOne.
+    pub async fn list_local_checkpoints(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<RestoredCheckpoint>, String> {
+        self.list_checkpoints_inner(None, session_id).await
+    }
+
+    /// Restore only local filesystem state to a checkpoint.
+    pub async fn restore_local_to_checkpoint(
+        &self,
+        session_id: &str,
+        checkpoint_number: u32,
+    ) -> Result<Option<RestoredSession>, String> {
+        let session = match self.restore_local_session(session_id).await? {
+            Some(session) => session,
+            None => return Ok(None),
+        };
+        let checkpoints = self.list_local_checkpoints(session_id).await?;
+        Self::apply_checkpoint(session_id, session, &checkpoints, checkpoint_number)
+    }
+
+    async fn require_owned_cloud_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<bool, String> {
+        let pool = self.pool.as_ref().ok_or_else(|| {
+            "owner-bound session restore requires a MatrixOne pool; use local-only restore for local files"
+                .to_string()
+        })?;
+        crate::storage::agent_session_exists_for_user(pool, session_id, user_id)
+            .await
+            .map_err(|error| format!("session owner check: {error}"))
+    }
+
+    fn apply_checkpoint(
+        session_id: &str,
+        session: RestoredSession,
+        checkpoints: &[RestoredCheckpoint],
+        checkpoint_number: u32,
+    ) -> Result<Option<RestoredSession>, String> {
+        let Some(ckpt) = checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.number == checkpoint_number)
+        else {
+            return Err(format!(
+                "checkpoint {} not found for session {}",
+                checkpoint_number, session_id
+            ));
+        };
+        let contract_json = session
+            .contract_json
+            .or_else(|| ckpt.contract_state_json.clone());
+        Ok(Some(RestoredSession {
+            turn_count: ckpt.turn,
+            total_tokens_in: ckpt.total_tokens,
+            total_tokens_out: 0,
+            checkpoint_count: checkpoint_number,
+            contract_json,
+            ..session
+        }))
+    }
+
+    async fn restore_session_inner(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+    ) -> Result<Option<RestoredSession>, String> {
+        if let Some(user_id) = user_id
+            && !self
+                .require_owned_cloud_session(user_id, session_id)
+                .await?
+        {
+            return Ok(None);
+        }
+
+        let local_journal = summarize_local_journal(session_id)?;
+        let mut local_workspace_error = None;
+        let local_workspace = match self.restore_local_workspace(session_id) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                local_workspace_error = Some(error);
+                None
+            }
+        };
+
+        if let Some(ws) = local_workspace {
+            let mut recent_tools = if let Some(user_id) = user_id {
+                self.restore_recent_tools(user_id, session_id)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if recent_tools.is_empty() {
+                recent_tools = recent_tools_from_context_trace(ws.last_context_trace.as_ref());
+            }
+            if recent_tools.is_empty()
+                && let Some(summary) = local_journal.as_ref()
+            {
+                recent_tools = summary.recent_tools.clone();
+            }
+
+            let ckpt_count = super::session_checkpoint::read_checkpoint_index(session_id)
+                .map(|v| v.len() as u32)
+                .unwrap_or(0);
+
+            return Ok(Some(restored_session_from_workspace(
+                ws,
+                local_journal.as_ref(),
+                recent_tools,
+                ckpt_count,
+                false,
+            )));
+        }
+
+        if let Some(user_id) = user_id
+            && let Some(ws) = self.restore_cloud_workspace(user_id, session_id).await?
+        {
+            let mut recent_tools = self
+                .restore_recent_tools(user_id, session_id)
+                .await
+                .unwrap_or_default();
+            if recent_tools.is_empty() {
+                recent_tools =
+                    recent_tools_from_context_trace(ws.metadata.last_context_trace.as_ref());
+            }
+            if recent_tools.is_empty()
+                && let Some(summary) = local_journal.as_ref()
+            {
+                recent_tools = summary.recent_tools.clone();
+            }
+
+            let local_ckpt_count = super::session_checkpoint::read_checkpoint_index(session_id)
+                .map(|v| v.len() as u32)
+                .unwrap_or(0);
+            let cloud_ckpt_count = self
+                .cloud_checkpoints(user_id, session_id)
+                .await
+                .map(|v| v.len() as u32)
+                .unwrap_or(local_ckpt_count);
+
+            return Ok(Some(restored_session_from_workspace(
+                ws.metadata,
+                local_journal.as_ref(),
+                recent_tools,
+                cloud_ckpt_count.max(local_ckpt_count),
+                true,
+            )));
+        }
+
+        if let Some(summary) = local_journal {
+            let ckpt_count = super::session_checkpoint::read_checkpoint_index(session_id)
+                .map(|v| v.len() as u32)
+                .unwrap_or(0);
+
+            return Ok(Some(RestoredSession {
+                session_id: session_id.to_string(),
+                turn_count: summary.turn_count,
+                total_tokens_in: summary.total_tokens_in,
+                total_tokens_out: summary.total_tokens_out,
+                total_cache_read_tokens: summary.total_cache_read_tokens,
+                total_cache_creation_tokens: summary.total_cache_creation_tokens,
+                recent_tools: summary.recent_tools,
+                checkpoint_count: ckpt_count,
+                last_status: summary.last_status,
+                model: summary.model,
+                permission_mode: summary.permission_mode,
+                restored_from_cloud: false,
+                ..Default::default()
+            }));
+        }
+
+        if let Some(user_id) = user_id {
+            let cloud_result = self.restore_cloud_session(user_id, session_id).await?;
+            if cloud_result.is_some() {
+                return Ok(cloud_result);
+            }
+        }
+
+        if let Some(error) = local_workspace_error {
+            return Err(error);
+        }
+
+        Ok(None)
+    }
+
+    async fn list_checkpoints_inner(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+    ) -> Result<Vec<RestoredCheckpoint>, String> {
+        if let Some(user_id) = user_id
+            && !self
+                .require_owned_cloud_session(user_id, session_id)
+                .await?
+        {
+            return Ok(Vec::new());
+        }
+
+        let local_entries = super::session_checkpoint::read_checkpoint_index(session_id)
+            .unwrap_or_else(|e| {
+                astra_core::agent_warn!(
+                    "restore",
+                    "failed to read checkpoint index for {session_id}: {e}"
+                );
+                Vec::new()
+            });
+        let local = parse_local_checkpoint_entries(&local_entries);
+        let cloud = if let Some(user_id) = user_id {
+            self.cloud_checkpoints(user_id, session_id)
+                .await
+                .unwrap_or_else(|e| {
+                    astra_core::agent_warn!(
+                        "restore",
+                        "failed to read cloud checkpoints for {session_id}: {e}"
+                    );
+                    Vec::new()
+                })
+        } else {
+            Vec::new()
+        };
+        Ok(merge_checkpoints(local, cloud))
+    }
+
     /// Try restoring workspace metadata from local YAML file.
     fn restore_local_workspace(
         &self,
@@ -244,6 +489,7 @@ impl HybridRestoreService {
     /// Try restoring workspace metadata from remote session artifacts.
     async fn restore_cloud_workspace(
         &self,
+        user_id: &str,
         session_id: &str,
     ) -> Result<Option<CloudWorkspaceArtifact>, String> {
         let pool = match &self.pool {
@@ -256,10 +502,11 @@ impl HybridRestoreService {
         let row = sqlx::query(
             "SELECT content_json \
              FROM session_artifacts \
-             WHERE session_id = ? AND artifact_kind = ? \
+             WHERE session_id = ? AND user_id = ? AND artifact_kind = ? \
              ORDER BY created_at DESC LIMIT 1",
         )
         .bind(session_id)
+        .bind(user_id)
         .bind(super::session_workspace::WORKSPACE_METADATA_ARTIFACT_KIND)
         .fetch_optional(pool)
         .await
@@ -281,6 +528,7 @@ impl HybridRestoreService {
 
     async fn restore_cloud_composite_snapshot_index(
         &self,
+        user_id: &str,
         session_id: &str,
     ) -> Result<Option<astra_core::composite_snapshot::CompositeSnapshotIndex>, String> {
         let pool = match &self.pool {
@@ -293,10 +541,11 @@ impl HybridRestoreService {
         let row = sqlx::query(
             "SELECT content_json \
              FROM session_artifacts \
-             WHERE session_id = ? AND artifact_kind = ? \
+             WHERE session_id = ? AND user_id = ? AND artifact_kind = ? \
              ORDER BY created_at DESC LIMIT 1",
         )
         .bind(session_id)
+        .bind(user_id)
         .bind(COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND)
         .fetch_optional(pool)
         .await
@@ -320,6 +569,7 @@ impl HybridRestoreService {
     /// Restore from MatrixOne agent_sessions table.
     async fn restore_cloud_session(
         &self,
+        user_id: &str,
         session_id: &str,
     ) -> Result<Option<RestoredSession>, String> {
         let pool = match &self.pool {
@@ -329,20 +579,22 @@ impl HybridRestoreService {
 
         let row = sqlx::query(
             "SELECT session_id, user_id, title, status, event_count, CAST(metadata AS CHAR) AS metadata_json, \
-             (SELECT COUNT(*) FROM agent_events ae WHERE ae.session_id = agent_sessions.session_id AND event_type = 'user_query') AS turn_count, \
+             (SELECT COUNT(*) FROM agent_events ae WHERE ae.session_id = agent_sessions.session_id AND ae.user_id = agent_sessions.user_id AND event_type = 'user_query') AS turn_count, \
              (SELECT COALESCE(SUM(CASE WHEN event_type = 'user_query' AND token_usage IS NOT NULL \
                  THEN COALESCE(token_input, 0) ELSE 0 END), 0) \
-               FROM agent_events ae WHERE ae.session_id = agent_sessions.session_id) AS total_tokens_in, \
+               FROM agent_events ae WHERE ae.session_id = agent_sessions.session_id AND ae.user_id = agent_sessions.user_id) AS total_tokens_in, \
              (SELECT COALESCE(SUM(CASE WHEN event_type = 'user_query' AND token_usage IS NOT NULL \
                 THEN COALESCE(token_output, 0) ELSE 0 END), 0) \
-               FROM agent_events ae WHERE ae.session_id = agent_sessions.session_id) AS total_tokens_out, \
-             (SELECT COUNT(*) FROM session_checkpoints sc WHERE sc.session_id = agent_sessions.session_id AND state_json IS NULL) AS checkpoint_count, \
+               FROM agent_events ae WHERE ae.session_id = agent_sessions.session_id AND ae.user_id = agent_sessions.user_id) AS total_tokens_out, \
+             (SELECT COUNT(*) FROM session_checkpoints sc WHERE sc.session_id = agent_sessions.session_id AND sc.user_id = agent_sessions.user_id AND state_json IS NULL) AS checkpoint_count, \
              (SELECT e.llm_model_used FROM agent_events e WHERE e.session_id = agent_sessions.session_id \
+               AND e.user_id = agent_sessions.user_id \
                AND e.llm_model_used IS NOT NULL AND e.llm_model_used != '' ORDER BY e.created_at DESC LIMIT 1) AS latest_model, \
              created_at, updated_at \
-              FROM agent_sessions WHERE session_id = ?",
+              FROM agent_sessions WHERE session_id = ? AND user_id = ?",
         )
         .bind(session_id)
+        .bind(user_id)
         .fetch_optional(pool)
         .await
         .map_err(|e| format!("restore_cloud_session: {e}"))?;
@@ -366,25 +618,25 @@ impl HybridRestoreService {
                     .unwrap_or_default();
 
                 let heavy_state = self
-                    .restore_latest_heavy_checkpoint_state(session_id)
+                    .restore_latest_heavy_checkpoint_state(user_id, session_id)
                     .await
                     .ok()
                     .flatten();
                 let transcript_messages = match heavy_state.as_ref() {
                     Some(heavy) if !heavy.messages.is_empty() => Vec::new(),
                     _ => self
-                        .restore_cloud_transcript_messages(session_id)
+                        .restore_cloud_transcript_messages(user_id, session_id)
                         .await
                         .unwrap_or_default(),
                 };
 
                 let last_context_trace = self
-                    .restore_latest_context_trace_signal(session_id)
+                    .restore_latest_context_trace_signal(user_id, session_id)
                     .await
                     .ok()
                     .flatten();
                 let mut recent_tools = self
-                    .restore_recent_tools(session_id)
+                    .restore_recent_tools(user_id, session_id)
                     .await
                     .unwrap_or_default();
                 if recent_tools.is_empty()
@@ -404,14 +656,14 @@ impl HybridRestoreService {
                 let model = metadata_state.model.clone().or(latest_model);
 
                 // Load active contract from task_contracts table
-                let mut contract_json = Self::load_cloud_contract(pool, session_id)
+                let mut contract_json = Self::load_cloud_contract(pool, user_id, session_id)
                     .await
                     .ok()
                     .flatten();
 
                 // Fallback: try latest checkpoint's contract state
                 if contract_json.is_none()
-                    && let Ok(ckpts) = self.cloud_checkpoints(session_id).await
+                    && let Ok(ckpts) = self.cloud_checkpoints(user_id, session_id).await
                 {
                     contract_json = ckpts
                         .iter()
@@ -470,6 +722,7 @@ impl HybridRestoreService {
     /// Returns the contract as serialized JSON (matching local workspace format).
     async fn load_cloud_contract(
         pool: &sqlx::Pool<sqlx::MySql>,
+        user_id: &str,
         session_id: &str,
     ) -> Result<Option<String>, String> {
         let row = sqlx::query(
@@ -481,10 +734,11 @@ impl HybridRestoreService {
              CAST(created_at AS CHAR) AS created_at, \
              CAST(updated_at AS CHAR) AS updated_at \
              FROM task_contracts \
-             WHERE session_id = ? AND status = 'active' \
+             WHERE session_id = ? AND user_id = ? AND status = 'active' \
              ORDER BY updated_at DESC LIMIT 1",
         )
         .bind(session_id)
+        .bind(user_id)
         .fetch_optional(pool)
         .await
         .map_err(|e| format!("load_cloud_contract: {e}"))?;
@@ -536,7 +790,11 @@ impl HybridRestoreService {
     }
 
     /// Restore recent tools from recent cloud checkpoints, with a legacy turn-complete fallback.
-    async fn restore_recent_tools(&self, session_id: &str) -> Result<Vec<String>, String> {
+    async fn restore_recent_tools(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Vec<String>, String> {
         let pool = match &self.pool {
             Some(p) => p,
             None => return Ok(Vec::new()),
@@ -546,10 +804,11 @@ impl HybridRestoreService {
 
         let checkpoint_rows = sqlx::query(
             "SELECT CAST(tools_json AS CHAR) AS tools_json FROM session_checkpoints \
-             WHERE session_id = ? AND state_json IS NULL \
+             WHERE session_id = ? AND user_id = ? AND state_json IS NULL \
              ORDER BY number DESC LIMIT 5",
         )
         .bind(session_id)
+        .bind(user_id)
         .fetch_all(pool)
         .await
         .map_err(|e| format!("restore_recent_tools: {e}"))?;
@@ -569,10 +828,11 @@ impl HybridRestoreService {
 
         let legacy_rows = sqlx::query(
             "SELECT CAST(metadata AS CHAR) AS metadata_json FROM agent_events \
-             WHERE session_id = ? AND event_type = 'turn_complete' \
+             WHERE session_id = ? AND user_id = ? AND event_type = 'turn_complete' \
              ORDER BY created_at DESC LIMIT 5",
         )
         .bind(session_id)
+        .bind(user_id)
         .fetch_all(pool)
         .await
         .map_err(|e| format!("restore_recent_tools: {e}"))?;
@@ -591,6 +851,7 @@ impl HybridRestoreService {
     /// Restore the latest structured context-trace signal from cloud events.
     async fn restore_latest_context_trace_signal(
         &self,
+        user_id: &str,
         session_id: &str,
     ) -> Result<Option<super::session_workspace::ContextTraceSignal>, String> {
         let pool = match &self.pool {
@@ -600,10 +861,11 @@ impl HybridRestoreService {
 
         let row = sqlx::query(
             "SELECT CAST(metadata AS CHAR) AS metadata_json FROM agent_events \
-             WHERE session_id = ? AND event_type = 'context_trace_signal' \
+             WHERE session_id = ? AND user_id = ? AND event_type = 'context_trace_signal' \
              ORDER BY created_at DESC LIMIT 1",
         )
         .bind(session_id)
+        .bind(user_id)
         .fetch_optional(pool)
         .await
         .map_err(|e| format!("restore_latest_context_trace_signal: {e}"))?;
@@ -619,6 +881,7 @@ impl HybridRestoreService {
 
     async fn restore_latest_heavy_checkpoint_state(
         &self,
+        user_id: &str,
         session_id: &str,
     ) -> Result<Option<CloudHeavyCheckpointState>, String> {
         let pool = match &self.pool {
@@ -626,7 +889,8 @@ impl HybridRestoreService {
             None => return Ok(None),
         };
 
-        let Some(state_json) = pull_step_checkpoint_from_cloud(pool, session_id).await? else {
+        let Some(state_json) = pull_step_checkpoint_from_cloud(pool, user_id, session_id).await?
+        else {
             return Ok(None);
         };
         parse_cloud_heavy_checkpoint_state(&state_json)
@@ -634,6 +898,7 @@ impl HybridRestoreService {
 
     async fn restore_cloud_transcript_messages(
         &self,
+        user_id: &str,
         session_id: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
         let pool = match &self.pool {
@@ -643,9 +908,10 @@ impl HybridRestoreService {
 
         let rows = sqlx::query(
             "SELECT role, content FROM session_transcript_items \
-             WHERE session_id = ? ORDER BY item_seq",
+             WHERE session_id = ? AND user_id = ? ORDER BY item_seq",
         )
         .bind(session_id)
+        .bind(user_id)
         .fetch_all(pool)
         .await
         .map_err(|e| format!("restore_cloud_transcript_messages: {e}"))?;
@@ -690,7 +956,11 @@ impl HybridRestoreService {
     }
 
     /// List checkpoints from MatrixOne.
-    async fn cloud_checkpoints(&self, session_id: &str) -> Result<Vec<RestoredCheckpoint>, String> {
+    async fn cloud_checkpoints(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Vec<RestoredCheckpoint>, String> {
         let pool = match &self.pool {
             Some(p) => p,
             None => return Ok(Vec::new()),
@@ -699,10 +969,11 @@ impl HybridRestoreService {
         let rows = sqlx::query(
             "SELECT number, turn, title, summary, total_tokens, contract_state_json \
              FROM session_checkpoints \
-             WHERE session_id = ? AND state_json IS NULL \
+             WHERE session_id = ? AND user_id = ? AND state_json IS NULL \
              ORDER BY number",
         )
         .bind(session_id)
+        .bind(user_id)
         .fetch_all(pool)
         .await
         .map_err(|e| format!("cloud_checkpoints: {e}"))?;
@@ -1120,174 +1391,34 @@ pub fn parse_cloud_heavy_checkpoint_state(
 
 #[async_trait]
 impl SessionRestoreService for HybridRestoreService {
-    async fn restore_session(&self, session_id: &str) -> Result<Option<RestoredSession>, String> {
-        // Step 1: Try local workspace metadata first
-        let local_journal = summarize_local_journal(session_id)?;
-        let mut local_workspace_error = None;
-        let local_workspace = match self.restore_local_workspace(session_id) {
-            Ok(workspace) => workspace,
-            Err(error) => {
-                local_workspace_error = Some(error);
-                None
-            }
-        };
-        if let Some(ws) = local_workspace {
-            let mut recent_tools = if self.pool.is_some() {
-                self.restore_recent_tools(session_id)
-                    .await
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            if recent_tools.is_empty() {
-                recent_tools = recent_tools_from_context_trace(ws.last_context_trace.as_ref());
-            }
-            if recent_tools.is_empty()
-                && let Some(summary) = local_journal.as_ref()
-            {
-                recent_tools = summary.recent_tools.clone();
-            }
-
-            let ckpt_count = super::session_checkpoint::read_checkpoint_index(session_id)
-                .map(|v| v.len() as u32)
-                .unwrap_or(0);
-
-            return Ok(Some(restored_session_from_workspace(
-                ws,
-                local_journal.as_ref(),
-                recent_tools,
-                ckpt_count,
-                false,
-            )));
-        }
-
-        if let Some(ws) = self.restore_cloud_workspace(session_id).await? {
-            let mut recent_tools = self
-                .restore_recent_tools(session_id)
-                .await
-                .unwrap_or_default();
-            if recent_tools.is_empty() {
-                recent_tools =
-                    recent_tools_from_context_trace(ws.metadata.last_context_trace.as_ref());
-            }
-            if recent_tools.is_empty()
-                && let Some(summary) = local_journal.as_ref()
-            {
-                recent_tools = summary.recent_tools.clone();
-            }
-
-            let local_ckpt_count = super::session_checkpoint::read_checkpoint_index(session_id)
-                .map(|v| v.len() as u32)
-                .unwrap_or(0);
-            let cloud_ckpt_count = self
-                .cloud_checkpoints(session_id)
-                .await
-                .map(|v| v.len() as u32)
-                .unwrap_or(local_ckpt_count);
-
-            return Ok(Some(restored_session_from_workspace(
-                ws.metadata,
-                local_journal.as_ref(),
-                recent_tools,
-                cloud_ckpt_count.max(local_ckpt_count),
-                true,
-            )));
-        }
-
-        if let Some(summary) = local_journal {
-            let ckpt_count = super::session_checkpoint::read_checkpoint_index(session_id)
-                .map(|v| v.len() as u32)
-                .unwrap_or(0);
-
-            return Ok(Some(RestoredSession {
-                session_id: session_id.to_string(),
-                turn_count: summary.turn_count,
-                total_tokens_in: summary.total_tokens_in,
-                total_tokens_out: summary.total_tokens_out,
-                total_cache_read_tokens: summary.total_cache_read_tokens,
-                total_cache_creation_tokens: summary.total_cache_creation_tokens,
-                recent_tools: summary.recent_tools,
-                checkpoint_count: ckpt_count,
-                last_status: summary.last_status,
-                model: summary.model,
-                permission_mode: summary.permission_mode,
-                restored_from_cloud: false,
-                ..Default::default()
-            }));
-        }
-
-        // Step 2: Fall back to MatrixOne
-        let cloud_result = self.restore_cloud_session(session_id).await?;
-        if cloud_result.is_some() {
-            return Ok(cloud_result);
-        }
-
-        if let Some(error) = local_workspace_error {
-            return Err(error);
-        }
-
-        Ok(None)
+    async fn restore_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Option<RestoredSession>, String> {
+        self.restore_session_inner(Some(user_id), session_id).await
     }
 
-    async fn list_checkpoints(&self, session_id: &str) -> Result<Vec<RestoredCheckpoint>, String> {
-        let local_entries = super::session_checkpoint::read_checkpoint_index(session_id)
-            .unwrap_or_else(|e| {
-                astra_core::agent_warn!(
-                    "restore",
-                    "failed to read checkpoint index for {session_id}: {e}"
-                );
-                Vec::new()
-            });
-        let local = parse_local_checkpoint_entries(&local_entries);
-        let cloud = self
-            .cloud_checkpoints(session_id)
-            .await
-            .unwrap_or_else(|e| {
-                astra_core::agent_warn!(
-                    "restore",
-                    "failed to read cloud checkpoints for {session_id}: {e}"
-                );
-                Vec::new()
-            });
-        Ok(merge_checkpoints(local, cloud))
+    async fn list_checkpoints(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Vec<RestoredCheckpoint>, String> {
+        self.list_checkpoints_inner(Some(user_id), session_id).await
     }
 
     async fn restore_to_checkpoint(
         &self,
+        user_id: &str,
         session_id: &str,
         checkpoint_number: u32,
     ) -> Result<Option<RestoredSession>, String> {
-        // First restore the full session
-        let session = match self.restore_session(session_id).await? {
+        let session = match self.restore_session(user_id, session_id).await? {
             Some(s) => s,
             None => return Ok(None),
         };
-
-        // Find the checkpoint
-        let checkpoints = self.list_checkpoints(session_id).await?;
-        let target = checkpoints.iter().find(|c| c.number == checkpoint_number);
-
-        match target {
-            Some(ckpt) => {
-                // Use contract state from checkpoint if the session doesn't have one
-                let contract_json = session
-                    .contract_json
-                    .or_else(|| ckpt.contract_state_json.clone());
-
-                Ok(Some(RestoredSession {
-                    turn_count: ckpt.turn,
-                    total_tokens_in: ckpt.total_tokens,
-                    total_tokens_out: 0,
-                    checkpoint_count: checkpoint_number,
-                    contract_json,
-                    ..session
-                }))
-            }
-            None => Err(format!(
-                "checkpoint {} not found for session {}",
-                checkpoint_number, session_id
-            )),
-        }
+        let checkpoints = self.list_checkpoints(user_id, session_id).await?;
+        Self::apply_checkpoint(session_id, session, &checkpoints, checkpoint_number)
     }
 
     async fn list_resumable_sessions(&self, user_id: &str) -> Result<Vec<RestoredSession>, String> {
@@ -1298,8 +1429,8 @@ impl SessionRestoreService for HybridRestoreService {
 
         let rows = sqlx::query(
             "SELECT s.session_id, s.title, s.status, CAST(s.metadata AS CHAR) AS metadata_json, \
-         (SELECT COUNT(*) FROM agent_events WHERE session_id = s.session_id AND event_type = 'user_query') AS turn_count, \
-         (SELECT e.llm_model_used FROM agent_events e WHERE e.session_id = s.session_id AND e.llm_model_used IS NOT NULL AND e.llm_model_used != '' ORDER BY e.created_at DESC LIMIT 1) AS latest_model \
+         (SELECT COUNT(*) FROM agent_events WHERE session_id = s.session_id AND user_id = s.user_id AND event_type = 'user_query') AS turn_count, \
+         (SELECT e.llm_model_used FROM agent_events e WHERE e.session_id = s.session_id AND e.user_id = s.user_id AND e.llm_model_used IS NOT NULL AND e.llm_model_used != '' ORDER BY e.created_at DESC LIMIT 1) AS latest_model \
          FROM agent_sessions s \
          WHERE s.user_id = ? AND s.status IN ('active', 'paused') \
          ORDER BY s.updated_at DESC LIMIT 20",
@@ -1333,36 +1464,37 @@ impl SessionRestoreService for HybridRestoreService {
                 row.try_get("latest_model").ok().flatten(),
             );
             let model = metadata_state.model.clone().or(latest_model);
-            let mut restored =
-                if let Some(workspace) = self.restore_cloud_workspace(&session_id).await? {
-                    let mut recent_tools = self
-                        .restore_recent_tools(&session_id)
-                        .await
-                        .unwrap_or_default();
-                    if recent_tools.is_empty() {
-                        recent_tools = recent_tools_from_context_trace(
-                            workspace.metadata.last_context_trace.as_ref(),
-                        );
-                    }
-                    let checkpoint_count = self
-                        .cloud_checkpoints(&session_id)
-                        .await
-                        .map(|checkpoints| checkpoints.len() as u32)
-                        .unwrap_or(0);
-                    restored_session_from_workspace(
-                        workspace.metadata,
-                        None,
-                        recent_tools,
-                        checkpoint_count,
-                        true,
-                    )
-                } else {
-                    RestoredSession {
-                        session_id: session_id.clone(),
-                        restored_from_cloud: true,
-                        ..Default::default()
-                    }
-                };
+            let mut restored = if let Some(workspace) =
+                self.restore_cloud_workspace(user_id, &session_id).await?
+            {
+                let mut recent_tools = self
+                    .restore_recent_tools(user_id, &session_id)
+                    .await
+                    .unwrap_or_default();
+                if recent_tools.is_empty() {
+                    recent_tools = recent_tools_from_context_trace(
+                        workspace.metadata.last_context_trace.as_ref(),
+                    );
+                }
+                let checkpoint_count = self
+                    .cloud_checkpoints(user_id, &session_id)
+                    .await
+                    .map(|checkpoints| checkpoints.len() as u32)
+                    .unwrap_or(0);
+                restored_session_from_workspace(
+                    workspace.metadata,
+                    None,
+                    recent_tools,
+                    checkpoint_count,
+                    true,
+                )
+            } else {
+                RestoredSession {
+                    session_id: session_id.clone(),
+                    restored_from_cloud: true,
+                    ..Default::default()
+                }
+            };
             restored.turn_count = restored.turn_count.max(turn_count.max(0) as u32);
             restored.last_status = status;
             restored.title = restored.title.or(title);
@@ -1383,11 +1515,12 @@ impl SessionRestoreService for HybridRestoreService {
 
     async fn restore_to_composite_snapshot(
         &self,
+        user_id: &str,
         session_id: &str,
         snapshot_id: &str,
         selector: &astra_core::composite_snapshot::RestoreSelector,
     ) -> Result<Option<RestoredCompositeState>, String> {
-        let index = self.list_composite_snapshots(session_id).await?;
+        let index = self.list_composite_snapshots(user_id, session_id).await?;
         let Some(snapshot) = index
             .snapshots
             .iter()
@@ -1411,7 +1544,10 @@ impl SessionRestoreService for HybridRestoreService {
             && let Some(ref_str) = snapshot.session_state()
             && let Some(ckpt_num) = parse_heavy_checkpoint_number(ref_str)
         {
-            match self.restore_to_checkpoint(session_id, ckpt_num).await {
+            match self
+                .restore_to_checkpoint(user_id, session_id, ckpt_num)
+                .await
+            {
                 Ok(Some(s)) => {
                     session = Some(s);
                     restored_dimensions.push("session".to_string());
@@ -1444,11 +1580,18 @@ impl SessionRestoreService for HybridRestoreService {
 
     async fn list_composite_snapshots(
         &self,
+        user_id: &str,
         session_id: &str,
     ) -> Result<astra_core::composite_snapshot::CompositeSnapshotIndex, String> {
+        if !self
+            .require_owned_cloud_session(user_id, session_id)
+            .await?
+        {
+            return Ok(astra_core::composite_snapshot::CompositeSnapshotIndex::default());
+        }
         let local = read_composite_snapshot_index_local(session_id)?;
         let remote = self
-            .restore_cloud_composite_snapshot_index(session_id)
+            .restore_cloud_composite_snapshot_index(user_id, session_id)
             .await
             .unwrap_or_else(|error| {
                 astra_core::agent_warn!(
@@ -1501,7 +1644,7 @@ impl crate::state_sync::MatrixOneSyncService {
             "UPDATE session_checkpoints SET \
                 turn = ?, title = ?, summary = ?, tools_json = ?, total_tokens = ?, \
                 had_stalls = ?, error_count = ?, contract_state_json = ? \
-             WHERE session_id = ? AND number = ?",
+             WHERE session_id = ? AND user_id = ? AND number = ?",
         )
         .bind(checkpoint.turn as i32)
         .bind(&checkpoint.title)
@@ -1512,6 +1655,7 @@ impl crate::state_sync::MatrixOneSyncService {
         .bind(checkpoint.error_count as i32)
         .bind(&checkpoint.contract_state_json)
         .bind(session_id)
+        .bind(user_id)
         .bind(checkpoint.number as i32)
         .execute(&self.pool)
         .await
@@ -1548,11 +1692,11 @@ impl crate::state_sync::MatrixOneSyncService {
 
             if let Err(e) = inserted {
                 if is_duplicate_key_error(&e) {
-                    if let Err(e) = sqlx::query(
+                    let retry = sqlx::query(
                         "UPDATE session_checkpoints SET \
                             turn = ?, title = ?, summary = ?, tools_json = ?, total_tokens = ?, \
                             had_stalls = ?, error_count = ?, contract_state_json = ? \
-                         WHERE session_id = ? AND number = ?",
+             WHERE session_id = ? AND user_id = ? AND number = ?",
                     )
                     .bind(checkpoint.turn as i32)
                     .bind(&checkpoint.title)
@@ -1563,13 +1707,22 @@ impl crate::state_sync::MatrixOneSyncService {
                     .bind(checkpoint.error_count as i32)
                     .bind(&checkpoint.contract_state_json)
                     .bind(session_id)
+                    .bind(user_id)
                     .bind(checkpoint.number as i32)
                     .execute(&self.pool)
-                    .await
-                    {
-                        let err = format!("push_checkpoint retry update: {e}");
-                        log_result("error", Some(&err));
-                        return Err(err);
+                    .await;
+                    match retry {
+                        Ok(updated) if updated.rows_affected() > 0 => {}
+                        Ok(_) => {
+                            let err = "push_checkpoint owner mismatch".to_string();
+                            log_result("error", Some(&err));
+                            return Err(err);
+                        }
+                        Err(e) => {
+                            let err = format!("push_checkpoint retry update: {e}");
+                            log_result("error", Some(&err));
+                            return Err(err);
+                        }
                     }
                 } else {
                     let err = format!("push_checkpoint insert: {e}");
@@ -1616,7 +1769,7 @@ impl crate::state_sync::MatrixOneSyncService {
         let updated = match sqlx::query(
             "UPDATE session_checkpoints SET \
                 turn = ?, title = ?, summary = ?, tools_json = ?, state_json = ? \
-             WHERE session_id = ? AND number = ?",
+	             WHERE session_id = ? AND user_id = ? AND number = ?",
         )
         .bind(turn as i32)
         .bind(title)
@@ -1624,6 +1777,7 @@ impl crate::state_sync::MatrixOneSyncService {
         .bind(tools_json)
         .bind(state_json)
         .bind(session_id)
+        .bind(user_id)
         .bind(cloud_number)
         .execute(&self.pool)
         .await
@@ -1657,10 +1811,10 @@ impl crate::state_sync::MatrixOneSyncService {
 
             if let Err(e) = inserted {
                 if is_duplicate_key_error(&e) {
-                    if let Err(err) = sqlx::query(
+                    let retry = sqlx::query(
                         "UPDATE session_checkpoints SET \
                             turn = ?, title = ?, summary = ?, tools_json = ?, state_json = ? \
-                         WHERE session_id = ? AND number = ?",
+                         WHERE session_id = ? AND user_id = ? AND number = ?",
                     )
                     .bind(turn as i32)
                     .bind(title)
@@ -1668,13 +1822,22 @@ impl crate::state_sync::MatrixOneSyncService {
                     .bind(tools_json)
                     .bind(state_json)
                     .bind(session_id)
+                    .bind(user_id)
                     .bind(cloud_number)
                     .execute(&self.pool)
-                    .await
-                    {
-                        let err = format!("push_step_checkpoint retry update: {err}");
-                        log_result("error", Some(&err));
-                        return Err(err);
+                    .await;
+                    match retry {
+                        Ok(updated) if updated.rows_affected() > 0 => {}
+                        Ok(_) => {
+                            let err = "push_step_checkpoint owner mismatch".to_string();
+                            log_result("error", Some(&err));
+                            return Err(err);
+                        }
+                        Err(error) => {
+                            let err = format!("push_step_checkpoint retry update: {error}");
+                            log_result("error", Some(&err));
+                            return Err(err);
+                        }
                     }
                 } else {
                     let err = format!("push_step_checkpoint insert: {e}");
@@ -1900,16 +2063,18 @@ fn log_checkpoint_sync(
 /// Returns the raw state_json string — caller deserializes to StepCheckpoint.
 pub async fn pull_step_checkpoint_from_cloud(
     pool: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
     session_id: &str,
 ) -> Result<Option<String>, String> {
     use sqlx::Row;
 
     let row = sqlx::query(
         "SELECT CAST(state_json AS CHAR) AS state_json_json FROM session_checkpoints \
-         WHERE session_id = ? AND summary = 'heavy' AND state_json IS NOT NULL \
+         WHERE session_id = ? AND user_id = ? AND summary = 'heavy' AND state_json IS NOT NULL \
          ORDER BY number DESC LIMIT 1",
     )
     .bind(session_id)
+    .bind(user_id)
     .fetch_optional(pool)
     .await
     .map_err(|e| format!("pull_step_checkpoint: {e}"))?;
@@ -2171,14 +2336,20 @@ mod tests {
     #[tokio::test]
     async fn local_only_restore_nonexistent_returns_none() {
         let svc = HybridRestoreService::local_only();
-        let result = svc.restore_session("nonexistent-session").await.unwrap();
+        let result = svc
+            .restore_local_session("nonexistent-session")
+            .await
+            .unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn local_only_list_checkpoints_empty() {
         let svc = HybridRestoreService::local_only();
-        let ckpts = svc.list_checkpoints("nonexistent-session").await.unwrap();
+        let ckpts = svc
+            .list_local_checkpoints("nonexistent-session")
+            .await
+            .unwrap();
         assert!(ckpts.is_empty());
     }
 
@@ -2192,7 +2363,7 @@ mod tests {
     #[tokio::test]
     async fn restore_to_nonexistent_checkpoint_errors() {
         let svc = HybridRestoreService::local_only();
-        let result = svc.restore_to_checkpoint("nonexistent", 5).await;
+        let result = svc.restore_local_to_checkpoint("nonexistent", 5).await;
         // Either None (session not found) or Error (checkpoint not found)
         match result {
             Ok(None) => {} // session not found → ok
@@ -2211,7 +2382,7 @@ mod tests {
 
         // Use a UUID that doesn't exist → should return None
         let result = svc
-            .restore_session("00000000-0000-0000-0000-000000000000")
+            .restore_local_session("00000000-0000-0000-0000-000000000000")
             .await
             .unwrap();
         assert!(result.is_none());
@@ -2230,7 +2401,7 @@ mod tests {
 
         let svc = HybridRestoreService::local_only();
         let restored = svc
-            .restore_session(sid)
+            .restore_local_session(sid)
             .await
             .unwrap()
             .expect("journal-only session should restore");
@@ -2261,7 +2432,7 @@ mod tests {
 
         let svc = HybridRestoreService::local_only();
         let restored = svc
-            .restore_session(sid)
+            .restore_local_session(sid)
             .await
             .unwrap()
             .expect("workspace-backed session should restore");
@@ -2305,7 +2476,7 @@ mod tests {
 
         let svc = HybridRestoreService::local_only();
         let restored = svc
-            .restore_session(&sid)
+            .restore_local_session(&sid)
             .await
             .unwrap()
             .expect("corrupt workspace should still restore from journal");
@@ -2360,7 +2531,7 @@ mod tests {
 
         let svc = HybridRestoreService::local_only();
         let restored = svc
-            .restore_session(&sid)
+            .restore_local_session(&sid)
             .await
             .unwrap()
             .expect("journal-only session should restore");
@@ -2400,7 +2571,7 @@ mod tests {
 
         let svc = HybridRestoreService::local_only();
         let restored = svc
-            .restore_session(&sid)
+            .restore_local_session(&sid)
             .await
             .unwrap()
             .expect("workspace-backed session should restore");
@@ -2418,7 +2589,7 @@ mod tests {
 
         let svc = HybridRestoreService::local_only();
         let error = svc
-            .restore_session(&sid)
+            .restore_local_session(&sid)
             .await
             .expect_err("unreadable journal should fail local restore");
 
@@ -2581,7 +2752,9 @@ mod tests {
     async fn local_only_restore_to_checkpoint_session_not_found() {
         let svc = HybridRestoreService::local_only();
         // Session doesn't exist → returns Ok(None)
-        let result = svc.restore_to_checkpoint("nonexistent-session-id", 1).await;
+        let result = svc
+            .restore_local_to_checkpoint("nonexistent-session-id", 1)
+            .await;
         assert!(matches!(result, Ok(None)));
     }
 
@@ -2643,14 +2816,17 @@ mod tests {
     #[tokio::test]
     async fn local_only_recent_tools_returns_empty() {
         let svc = HybridRestoreService::local_only();
-        let tools = svc.restore_recent_tools("nonexistent").await.unwrap();
+        let tools = svc
+            .restore_recent_tools("user1", "nonexistent")
+            .await
+            .unwrap();
         assert!(tools.is_empty());
     }
 
     #[tokio::test]
     async fn local_only_cloud_checkpoints_returns_empty() {
         let svc = HybridRestoreService::local_only();
-        let ckpts = svc.cloud_checkpoints("nonexistent").await.unwrap();
+        let ckpts = svc.cloud_checkpoints("user1", "nonexistent").await.unwrap();
         assert!(ckpts.is_empty());
     }
 
