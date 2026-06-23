@@ -42,6 +42,7 @@ use crate::{
 use crate::cli::chat_stream::ChatTurnParams;
 use crate::cli::chat_stream::explain_reports;
 use crate::cli::chat_stream::params::StreamEvent;
+use crate::cli::session::session_runtime::{self, ServerDefaultModel};
 use agentic_sse_loop::{
     StreamLoopSidecarEprint, StreamResultBuild, build_stream_result, eprint_stream_loop_sidecars,
     resolved_tool_metrics,
@@ -184,6 +185,22 @@ pub(crate) async fn stream_chat_sse(
 ) -> Result<StreamResult, crate::TurnFailure> {
     let start = Instant::now();
     p.model = normalize_turn_model(p.model);
+    let default_model = if p.model.is_none() {
+        match session_runtime::resolve_server_default_model(p.api, p.token).await {
+            ServerDefaultModel::Selected(model) => Some(model),
+            ServerDefaultModel::NoModels | ServerDefaultModel::Unavailable => None,
+        }
+    } else {
+        None
+    };
+    if let Some(model) = default_model.as_deref() {
+        tracing::info!(
+            target: "astra_cli::model_selection",
+            model,
+            "selected default model from server model list for stream turn"
+        );
+        p.model = Some(model);
+    }
     let Some(selected_model) = require_selected_turn_model(p.model, p.session_id, p.turn_index)
     else {
         record_missing_model_selection_failure(
@@ -1250,6 +1267,25 @@ mod tests {
             Some("sess-missing-model")
         );
         assert!(failure.error.contains("default_model"), "{}", failure.error);
+    }
+
+    #[test]
+    fn stream_chat_sse_resolves_server_default_before_missing_model_preflight() {
+        let source = include_str!("mod.rs");
+        let fn_start = source
+            .find("pub(crate) async fn stream_chat_sse")
+            .expect("stream_chat_sse should exist");
+        let default_idx = source[fn_start..]
+            .find("resolve_server_default_model")
+            .expect("stream_chat_sse should resolve server default model");
+        let preflight_idx = source[fn_start..]
+            .find("require_selected_turn_model")
+            .expect("stream_chat_sse should keep missing-model preflight");
+
+        assert!(
+            default_idx < preflight_idx,
+            "server default model must be resolved before missing-model preflight"
+        );
     }
 
     #[test]

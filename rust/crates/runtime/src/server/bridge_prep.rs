@@ -1,4 +1,5 @@
 use super::*;
+use astra_services::runs::SelectedModelRequest;
 
 // ─── Typed request body ──────────────────────────────────────────────────────
 
@@ -90,10 +91,6 @@ impl ChatTurnRequestBody {
         self.session_id = Some(serde_json::Value::String(id.to_string()));
     }
 
-    fn model_str(&self) -> Option<&str> {
-        self.model.as_ref()?.as_str()
-    }
-
     fn selected_model_obj(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
         self.selected_model.as_ref()?.as_object()
     }
@@ -106,12 +103,6 @@ impl ChatTurnRequestBody {
         self.selected_model_obj()?
             .get("gateway")
             .and_then(serde_json::Value::as_str)
-    }
-
-    fn set_bridge_model_from_selected_model(&mut self) {
-        if let Some(model) = self.selected_model_name() {
-            self.model = Some(serde_json::Value::String(model.to_string()));
-        }
     }
 
     fn execution_state_obj(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
@@ -272,14 +263,13 @@ fn validate_selected_model_shape(
             "selected_model_invalid",
         ));
     };
-    for key in obj.keys() {
-        if key != "model" && key != "gateway" {
-            return Err(error_response_coded(
-                StatusCode::BAD_REQUEST,
-                format!("selected_model contains unsupported field `{key}`"),
-                "selected_model_invalid",
-            ));
-        }
+    // Delegate field whitelist to SelectedModelRequest's deny_unknown_fields.
+    if serde_json::from_value::<SelectedModelRequest>(selected_model.clone()).is_err() {
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "selected_model must match {model: string, gateway?: string}",
+            "selected_model_invalid",
+        ));
     }
     let Some(model) = request.selected_model_name() else {
         return Err(error_response_coded(
@@ -353,7 +343,6 @@ pub(super) async fn prepare_chat_turn_bridge_body(
         return Ok(PreparedChatTurnBridgeRequest::passthrough(body));
     };
     validate_selected_model_shape(&request)?;
-    request.set_bridge_model_from_selected_model();
     validate_session_id_shape(&request)?;
     let explicit_turn_identity = validate_explicit_turn_identity(&request)?;
 
@@ -449,8 +438,8 @@ pub(super) async fn prepare_chat_turn_bridge_body(
     // ── Metadata extraction ─────────────────────────────────────────────
     let task_hint = request.classify_task();
     let user_query_b64 = Some(URL_SAFE.encode(user_query.as_bytes()));
-    let routing_meta_b64 = request.model_str().map(|_| {
-        let meta = serde_json::Value::Object(build_skipped_routing_metadata("model_override"));
+    let routing_meta_b64 = request.selected_model_name().map(|_| {
+        let meta = serde_json::Value::Object(build_skipped_routing_metadata("selected_model"));
         URL_SAFE.encode(serde_json::to_string(&meta).unwrap_or_default().as_bytes())
     });
     let force_intent = detect_correction(&user_query).then_some("question".to_string());
@@ -993,7 +982,7 @@ mod tests {
             payload["selected_model"]["model"],
             "deepseek-v4-pro-official"
         );
-        assert_eq!(payload["model"], "deepseek-v4-pro-official");
+        assert!(payload.get("model").is_none());
     }
 
     #[tokio::test]
@@ -1356,7 +1345,7 @@ mod tests {
             "custom_field": "preserved"
         });
 
-        let mut request: ChatTurnRequestBody = serde_json::from_value(json.clone()).unwrap();
+        let request: ChatTurnRequestBody = serde_json::from_value(json.clone()).unwrap();
         let serialized = serde_json::to_value(&request).unwrap();
 
         assert_eq!(request.session_id_str(), Some("sess-123"));
@@ -1365,8 +1354,7 @@ mod tests {
         assert!(request.has_tool_results());
         assert_eq!(request.edge_tools_vec().unwrap().len(), 2);
         assert_eq!(request.selected_model_name(), Some("gpt-4"));
-        request.set_bridge_model_from_selected_model();
-        assert_eq!(request.model_str(), Some("gpt-4"));
+        assert!(serialized.get("model").is_none());
         assert!(request.execution_state_obj().is_some());
 
         // Forward-compat: unknown fields preserved

@@ -442,6 +442,10 @@ function backendSessionIdForChat(chat: ChatRecord) {
   return chat.backendSessionId ?? chat.id;
 }
 
+function persistedBackendSessionIdForChat(chat: ChatRecord) {
+  return chat.backendSessionId ?? (chat.id.startsWith("web-") ? null : chat.id);
+}
+
 function publicActiveRun(
   activeRun?: ChatActiveRunRecord,
 ): ChatDetail["activeRun"] {
@@ -2200,7 +2204,10 @@ async function updateBackendSessionModel(
   chat: ChatRecord,
   model: string,
 ): Promise<void> {
-  const sessionId = backendSessionIdForChat(chat);
+  const sessionId = persistedBackendSessionIdForChat(chat);
+  if (!sessionId) {
+    return;
+  }
   const client = await requireRuntimeClient({
     auth: "required",
     operation: `update persisted session ${sessionId} model`,

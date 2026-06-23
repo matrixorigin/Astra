@@ -9,6 +9,7 @@ use crate::cli::session::session_adaptation::{finalize_turn_adaptation, prepare_
 use crate::cli::session::session_input::{
     build_effective_line, clear_pending_recovery_for_ordinary_chat_input, finalize_effective_line,
 };
+use crate::cli::session::session_runtime;
 use crate::cli::session::session_state::SessionState;
 
 /// Decision returned by `classify_shell_passthrough`.
@@ -145,6 +146,7 @@ async fn run_chat_turn(
     session_id: Option<&str>,
     semantic_query_override: Option<&str>,
 ) -> TurnAttempt {
+    ensure_default_turn_model(state, api, token).await;
     if let Some(failure) = model_selection_preflight_failure(
         state.model.as_deref(),
         session_id,
@@ -165,6 +167,24 @@ async fn run_chat_turn(
     .await;
     finalize_turn_adaptation(state, matches!(attempt, TurnAttempt::Interrupted(_))).await;
     attempt
+}
+
+async fn ensure_default_turn_model(
+    state: &mut SessionState,
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+) {
+    let had_model =
+        astra_core::model_override::normalize_model_override(state.model.as_deref()).is_some();
+    if let Some(model) = session_runtime::ensure_state_default_model(api, token, state).await
+        && !had_model
+    {
+        tracing::info!(
+            target: "astra_cli::model_selection",
+            model = %model,
+            "selected default model from server model list for CLI turn"
+        );
+    }
 }
 
 fn model_selection_preflight_failure(
@@ -363,6 +383,25 @@ mod tests {
             )
             .is_none(),
             "thinking selectors are concrete model choices and must reach payload assembly"
+        );
+    }
+
+    #[test]
+    fn run_chat_turn_resolves_default_model_before_missing_model_preflight() {
+        let source = include_str!("turn_entry.rs");
+        let fn_start = source
+            .find("async fn run_chat_turn")
+            .expect("run_chat_turn should exist");
+        let default_idx = source[fn_start..]
+            .find("ensure_default_turn_model")
+            .expect("run_chat_turn should resolve default turn model");
+        let preflight_idx = source[fn_start..]
+            .find("model_selection_preflight_failure")
+            .expect("run_chat_turn should keep missing-model preflight");
+
+        assert!(
+            default_idx < preflight_idx,
+            "default model must be resolved before missing-model preflight"
         );
     }
 

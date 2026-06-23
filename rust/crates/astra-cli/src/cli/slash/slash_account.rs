@@ -4,7 +4,7 @@ use crate::cli::cli_config::cli_utils::{
     load_credentials, persist_profile_memoria_api_key, profile_name, prompt_or,
     prompt_password_masked,
 };
-use crate::cli::session::session_runtime::current_access_token;
+use crate::cli::session::session_runtime::{current_access_token, ensure_state_default_model};
 use crate::cli::session::session_state::SessionState;
 use crate::post_auth_cloud_resync;
 use crate::{cli_dim, cli_err, cli_ok, cli_section};
@@ -47,9 +47,15 @@ pub(crate) async fn handle_account_command(
             let email = prompt_or("Email   ", None)?;
             let password = prompt_password_masked("Password", None)?;
             match do_register(api, profile, &username, &email, &password).await {
-                Ok(_) => {
+                Ok(token) => {
                     cli_ok!("Registered and logged in");
                     post_auth_cloud_resync(profile, state).await;
+                    if let Some(model) = ensure_state_default_model(api, &token, state).await {
+                        crate::cli::slash::slash_config::set_active_model_for_display(Some(
+                            model.clone(),
+                        ));
+                        cli_ok!("Default model: {}", model);
+                    }
                     refresh_auth_runtime(api, profile, state).await;
                 }
                 Err(e) => cli_err!("Register failed: {}", e),
@@ -60,9 +66,15 @@ pub(crate) async fn handle_account_command(
             let username = prompt_or("Username", None)?;
             let password = prompt_password_masked("Password", None)?;
             match do_login(api, profile, &username, &password).await {
-                Ok(_) => {
+                Ok(token) => {
                     cli_ok!("Logged in");
                     post_auth_cloud_resync(profile, state).await;
+                    if let Some(model) = ensure_state_default_model(api, &token, state).await {
+                        crate::cli::slash::slash_config::set_active_model_for_display(Some(
+                            model.clone(),
+                        ));
+                        cli_ok!("Default model: {}", model);
+                    }
                     refresh_auth_runtime(api, profile, state).await;
                 }
                 Err(e) => cli_err!("Login failed: {}", e),

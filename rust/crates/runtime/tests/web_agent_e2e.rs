@@ -5348,15 +5348,15 @@ async fn context_meta_exposes_builder_supplied_context_signals() {
     );
 }
 
-/// Regression: `model` override must NOT strip `active_skills` from the system prompt.
+/// Regression: explicit `selected_model` must NOT strip `active_skills` from the system prompt.
 ///
-/// The bridge marks `routing_meta.status = "skipped"` with reason `model_override`
-/// whenever the caller pins a model (`bridge_prep.rs:350`). That metadata is
+/// The bridge marks `routing_meta.status = "skipped"` with reason `selected_model`
+/// whenever the caller selects a model. That metadata is
 /// trace-only — it must not gate skill injection, which runs unconditionally from
 /// `edge_profile.active_skills` (`bridge_inprocess.rs:1141`, `1739`). This test
 /// asserts both the hint section (`active_output_skills` signal) and the
 /// `skills_injected` breakdown survive the override path, so users reporting
-/// "skill lost when MiniMax-M2.7 set as model_override" get a durable guardrail.
+/// "skill lost when MiniMax-M2.7 is selected" get a durable guardrail.
 #[tokio::test]
 async fn context_meta_active_skills_survive_model_override() {
     // Guard against hangs from deadlocked channels or unresponsive mock paths:
@@ -5389,13 +5389,13 @@ async fn context_meta_active_skills_survive_model_override() {
         let context_metas = find_events(&events, "context_meta");
         assert!(
             !context_metas.is_empty(),
-            "context_meta must be emitted even with model_override set"
+            "context_meta must be emitted even with selected_model set"
         );
-        // The turn must complete — model override should not break execution.
+        // The turn must complete — explicit model selection should not break execution.
         let turn_complete = find_events(&events, "turn_complete");
         assert!(
             !turn_complete.is_empty(),
-            "turn must complete with model_override + active_skills"
+            "turn must complete with selected_model + active_skills"
         );
     })
     .await
@@ -5454,7 +5454,7 @@ async fn context_meta_surfaces_unknown_active_skills_for_debugging() {
 }
 
 /// Realistic production-like scenario mirroring the reported "session 9474cce1"
-/// case: a MiniMax-M2.7 request with `model_override` set, multiple
+/// case: a MiniMax-M2.7 request with `selected_model` set, multiple
 /// `active_skills` pinned in `edge_profile`, AND the model actively invoking
 /// the `skill` tool mid-conversation. The original report conflated two
 /// distinct things ("skill lost" vs "model manually re-loads skill each turn")
@@ -5462,7 +5462,7 @@ async fn context_meta_surfaces_unknown_active_skills_for_debugging() {
 /// without needing to reproduce the full session.
 ///
 /// What this scenario exercises in one turn:
-///   1. `model` override is set (routing metadata will be marked "skipped")
+///   1. `selected_model` is set (routing metadata will be marked "skipped")
 ///   2. Two `active_skills` are pre-injected into the system prompt
 ///   3. Model calls the `skill` tool to load a different skill mid-turn
 ///   4. Resolved skill instructions flow back as a tool_result
@@ -5511,7 +5511,7 @@ async fn complex_scenario_model_override_plus_active_skills_plus_skill_invocatio
 
         let events = chat_stream_collect(&app, payload).await;
 
-        // ── Invariant 1: context_meta is emitted even with model_override ──
+        // ── Invariant 1: context_meta is emitted even with selected_model ──
         // With pipeline-based assembly, context_signals and skills_injected
         // are not individually populated in the breakdown. Verify that
         // context_meta is emitted and the turn proceeds.
@@ -5587,7 +5587,7 @@ async fn complex_scenario_model_override_plus_active_skills_plus_skill_invocatio
 }
 
 /// Multi-turn variant of the complex scenario: same `session_id` across two
-/// user messages, both under `model_override` with `active_skills` pinned.
+/// user messages, both under `selected_model` with `active_skills` pinned.
 /// Catches drift in cross-turn invariants that the single-turn test can't:
 ///   * Does the skill hint consistently appear in BOTH turns' system prompts?
 ///   * Does `state.skills.invoked` persist across the turn boundary so the

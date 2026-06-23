@@ -333,6 +333,23 @@ fn effective_one_shot_model<'a>(
         .or_else(|| fallback_model.filter(|model| !model.trim().is_empty()))
 }
 
+async fn resolve_one_shot_model(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    explicit_model: Option<&str>,
+    restored_model: Option<&str>,
+    fallback_model: Option<&str>,
+) -> Option<String> {
+    if let Some(model) = effective_one_shot_model(explicit_model, restored_model, fallback_model) {
+        return Some(model.to_string());
+    }
+    match session_runtime::resolve_server_default_model(api, token).await {
+        session_runtime::ServerDefaultModel::Selected(model) => Some(model),
+        session_runtime::ServerDefaultModel::NoModels
+        | session_runtime::ServerDefaultModel::Unavailable => None,
+    }
+}
+
 fn effective_one_shot_permission_mode(
     explicit_mode: Option<&str>,
     explicit_auto: bool,
@@ -441,10 +458,18 @@ async fn execute_headless_task_body(
     } = input;
     use astra_services::TaskStatus;
     let (_creds, profile_name, _, token) = get_profile_and_token(profile)?;
+    let token = session_runtime::fresh_access_token(api, profile)
+        .await
+        .unwrap_or(token);
     let session_id = session_routing.server_session_id.clone();
-    let effective_model =
-        effective_one_shot_model(None, session_routing.restored_model(), global_model)
-            .map(str::to_owned);
+    let effective_model = resolve_one_shot_model(
+        api,
+        &token,
+        None,
+        session_routing.restored_model(),
+        global_model,
+    )
+    .await;
     let effective_permission_mode = effective_one_shot_permission_mode(
         None,
         false,
@@ -1156,6 +1181,9 @@ async fn execute_cli_command_impl(
             let raw_message = words.join(" ");
             let message = apply_system_prompt(&raw_message, system_prompt.as_deref());
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let token = session_runtime::fresh_access_token(api, profile.as_deref())
+                .await
+                .unwrap_or(token);
             let session_routing = resolve_one_shot_session_routing(
                 api,
                 profile.as_deref(),
@@ -1164,12 +1192,14 @@ async fn execute_cli_command_impl(
             )
             .await?;
             let session_id = session_routing.server_session_id.clone();
-            let effective_model = effective_one_shot_model(
+            let effective_model = resolve_one_shot_model(
+                api,
+                &token,
                 None,
                 session_routing.restored_model(),
                 global_model.as_deref(),
             )
-            .map(str::to_owned);
+            .await;
             let effective_permission_mode = effective_one_shot_permission_mode(
                 None,
                 auto_approve,
@@ -1643,6 +1673,9 @@ async fn execute_cli_command_impl(
             };
 
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let token = session_runtime::fresh_access_token(api, profile.as_deref())
+                .await
+                .unwrap_or(token);
             let explicit_session_id = args.session_id.clone();
             let session_routing = resolve_one_shot_session_routing(
                 api,
@@ -1655,12 +1688,14 @@ async fn execute_cli_command_impl(
             )
             .await?;
             let session_id = session_routing.server_session_id.clone();
-            let effective_model = effective_one_shot_model(
+            let effective_model = resolve_one_shot_model(
+                api,
+                &token,
                 args.model.as_deref(),
                 session_routing.restored_model(),
                 global_model.as_deref(),
             )
-            .map(str::to_owned);
+            .await;
             let effective_permission_mode = effective_one_shot_permission_mode(
                 args.permission_mode.as_deref(),
                 args.auto_approve || auto_approve,
@@ -2433,12 +2468,15 @@ pub(crate) async fn run_print_mode(
     let message = apply_system_prompt(&raw_message, system_prompt);
 
     let (_, _, _, token) = get_profile_and_token(profile)?;
+    let token = session_runtime::fresh_access_token(api, profile)
+        .await
+        .unwrap_or(token);
     let session_routing =
         resolve_one_shot_session_routing(api, profile, cli_context.session_id.clone(), true)
             .await?;
     let session_id = session_routing.server_session_id.clone();
     let effective_model =
-        effective_one_shot_model(None, session_routing.restored_model(), model).map(str::to_owned);
+        resolve_one_shot_model(api, &token, None, session_routing.restored_model(), model).await;
     let effective_permission_mode = effective_one_shot_permission_mode(
         None,
         false,

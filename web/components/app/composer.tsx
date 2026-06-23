@@ -207,7 +207,7 @@ export function Composer({
   const [webSearch, setWebSearch] = useState(false);
   const [thinking, setThinking] = useState(true);
   const [model, setModel] = useState(initialModel ?? 'sonnet-4.6-adaptive');
-  const [modelAvailable, setModelAvailable] = useState(true);
+  const [modelAvailable, setModelAvailable] = useState(false);
   const [activeSkills, setActiveSkills] = useState<string[]>([]);
   const [slashQuery, setSlashQuery] = useState<string | null>(null);
   const [activeSlashIndex, setActiveSlashIndex] = useState(0);
@@ -436,7 +436,7 @@ export function Composer({
 
   async function submit() {
     const trimmed = text.trim();
-    if (!trimmed || submitting || disabled) {
+    if (!trimmed || submitting || disabled || !modelAvailable) {
       return;
     }
     const editor = editorRef.current;

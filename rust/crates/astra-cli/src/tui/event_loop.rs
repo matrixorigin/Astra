@@ -76,6 +76,19 @@ fn set_bash_background_hint_enabled(
     status_indicator.set_bash_background_hint_enabled(enabled);
 }
 
+async fn sync_default_model_after_auth(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    state: &mut crate::cli::session::session_state::SessionState,
+    bottom_pane: &mut BottomPane,
+) -> Option<String> {
+    let model =
+        crate::cli::session::session_runtime::ensure_state_default_model(api, token, state).await?;
+    crate::cli::slash::slash_config::set_active_model_for_display(Some(model.clone()));
+    bottom_pane.footer.model = Some(model.clone());
+    Some(model)
+}
+
 async fn install_bash_detach_listener(
     slot: &astra_tools::detach::DetachShellSlot,
     chat_widget: &mut chat_widget::ChatWidget,
@@ -3143,9 +3156,23 @@ pub(crate) async fn run_tui_session(
                                         let username = parts.next().unwrap_or("").to_string();
                                         let password = parts.next().unwrap_or("").to_string();
                                         match crate::cli::auth_flow::do_login(api, profile, &username, &password).await {
-                                            Ok(_) => {
+                                            Ok(token) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
                                                 crate::post_auth_cloud_resync(profile, &mut state).await;
+                                                if let Some(model) = sync_default_model_after_auth(
+                                                    api,
+                                                    &token,
+                                                    &mut state,
+                                                    &mut bottom_pane,
+                                                )
+                                                .await
+                                                {
+                                                    chat_widget.commit_system(
+                                                        history_cell::system::SystemCell::response(
+                                                            format!("Default model: {model}"),
+                                                        ),
+                                                    );
+                                                }
                                             }
                                             Err(e) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Login failed: {e}")));
@@ -3167,9 +3194,23 @@ pub(crate) async fn run_tui_session(
                                             Ok(_) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response("Registered — logging in…"));
                                                 match crate::cli::auth_flow::do_login(api, profile, &username, &password).await {
-                                                    Ok(_) => {
+                                                    Ok(token) => {
                                                         chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
                                                         crate::post_auth_cloud_resync(profile, &mut state).await;
+                                                        if let Some(model) = sync_default_model_after_auth(
+                                                            api,
+                                                            &token,
+                                                            &mut state,
+                                                            &mut bottom_pane,
+                                                        )
+                                                        .await
+                                                        {
+                                                            chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::response(
+                                                                    format!("Default model: {model}"),
+                                                                ),
+                                                            );
+                                                        }
                                                     }
                                                     Err(e) => {
                                                         chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Auto-login failed: {e}")));

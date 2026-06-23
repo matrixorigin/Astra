@@ -94,4 +94,75 @@ describe("ModelSwitcher", () => {
 
     expect(onChange).toHaveBeenCalledWith("deepseek-v4-pro-official");
   });
+
+  it("selects the first loaded model when no concrete model is set", async () => {
+    mockListModels.mockResolvedValue({
+      items: [
+        {
+          id: "deepseek-v4-flash-anthropic",
+          name: "deepseek-v4-flash-anthropic",
+          subtitle: "anthropic",
+          tier: "included",
+        },
+        {
+          id: "deepseek-v4-pro-official",
+          name: "deepseek-v4-pro-official",
+          subtitle: "openai",
+          tier: "included",
+        },
+      ],
+    });
+    const onChange = vi.fn();
+    const onModelAvailabilityChange = vi.fn();
+
+    render(
+      <ModelSwitcher
+        value=""
+        onChange={onChange}
+        onModelAvailabilityChange={onModelAvailabilityChange}
+        thinking={false}
+        onThinkingChange={vi.fn()}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(onChange).toHaveBeenCalledWith("deepseek-v4-flash-anthropic"),
+    );
+    expect(
+      screen.getByRole("button", { name: /deepseek-v4-flash-anthropic/i }),
+    ).not.toHaveAttribute("aria-invalid");
+    await waitFor(() =>
+      expect(onModelAvailabilityChange).toHaveBeenCalledWith(true),
+    );
+  });
+
+  it("replaces the static web fallback with the first runtime model", async () => {
+    mockListModels.mockResolvedValue({
+      items: [
+        {
+          id: "deepseek-v4-flash-anthropic",
+          name: "deepseek-v4-flash-anthropic",
+          subtitle: "anthropic",
+          tier: "included",
+        },
+      ],
+    });
+    const onChange = vi.fn();
+
+    render(
+      <ModelSwitcher
+        value="sonnet-4.6-adaptive"
+        onChange={onChange}
+        thinking={false}
+        onThinkingChange={vi.fn()}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(onChange).toHaveBeenCalledWith("deepseek-v4-flash-anthropic"),
+    );
+    expect(
+      screen.getByRole("button", { name: /deepseek-v4-flash-anthropic/i }),
+    ).not.toHaveAttribute("aria-invalid");
+  });
 });

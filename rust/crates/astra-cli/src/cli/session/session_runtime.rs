@@ -377,30 +377,99 @@ fn create_pipeline_modules_inner(
     }
 }
 
-/// Quick check whether the server has at least one LLM model configured.
-/// Returns `true` on network errors (optimistic — don't block startup).
-pub(crate) async fn check_server_has_models(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ServerDefaultModel {
+    Selected(String),
+    NoModels,
+    Unavailable,
+}
+
+fn model_list_entry_is_active(entry: &serde_json::Value) -> bool {
+    if let Some(value) = entry.get("is_active") {
+        if let Some(active) = value.as_bool() {
+            return active;
+        }
+        if let Some(active) = value.as_i64() {
+            return active != 0;
+        }
+        if let Some(active) = value.as_u64() {
+            return active != 0;
+        }
+    }
+    if let Some(value) = entry.get("active") {
+        if let Some(active) = value.as_bool() {
+            return active;
+        }
+        if let Some(active) = value.as_i64() {
+            return active != 0;
+        }
+        if let Some(active) = value.as_u64() {
+            return active != 0;
+        }
+    }
+    true
+}
+
+fn model_list_entry_name(entry: &serde_json::Value) -> Option<&str> {
+    entry
+        .get("name")
+        .or_else(|| entry.get("model_name"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
+pub(crate) fn default_model_from_models_response(body: &serde_json::Value) -> Option<String> {
+    let models = body.as_array().or_else(|| {
+        body.get("models")
+            .or_else(|| body.get("items"))
+            .and_then(|value| value.as_array())
+    })?;
+    models
+        .iter()
+        .filter(|entry| model_list_entry_is_active(entry))
+        .find_map(|entry| model_list_entry_name(entry).map(str::to_string))
+}
+
+/// Resolve the model the CLI should preselect when the user did not explicitly
+/// choose one. `Unavailable` preserves the old optimistic startup behavior for
+/// transient API/model-list failures.
+pub(crate) async fn resolve_server_default_model(
     api: &astra_thin_client::ThinClient,
     token: &str,
-) -> bool {
+) -> ServerDefaultModel {
     let resp = match api
         .get_models_response_timeout(token, std::time::Duration::from_secs(3))
         .await
     {
         Ok(r) if r.status().is_success() => r,
-        _ => return true,
+        _ => return ServerDefaultModel::Unavailable,
     };
     let body: serde_json::Value = match resp.json().await {
         Ok(v) => v,
-        Err(_) => return true,
+        Err(_) => return ServerDefaultModel::Unavailable,
     };
-    if let Some(arr) = body.as_array() {
-        return !arr.is_empty();
+    match default_model_from_models_response(&body) {
+        Some(model) => ServerDefaultModel::Selected(model),
+        None => ServerDefaultModel::NoModels,
     }
-    if let Some(arr) = body.get("models").and_then(|v| v.as_array()) {
-        return !arr.is_empty();
+}
+
+pub(crate) async fn ensure_state_default_model(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    state: &mut SessionState,
+) -> Option<String> {
+    if let Some(model) = normalize_model_override(state.model.as_deref()) {
+        return Some(model.to_string());
     }
-    true
+    match resolve_server_default_model(api, token).await {
+        ServerDefaultModel::Selected(model) => {
+            state.model = Some(model.clone());
+            Some(model)
+        }
+        ServerDefaultModel::NoModels | ServerDefaultModel::Unavailable => None,
+    }
 }
 
 /// Outcome of `try_refresh_token` for deciding whether on-disk credentials may still be valid.
@@ -1276,9 +1345,9 @@ mod tests {
     use super::{
         ACCESS_TOKEN_REFRESH_SKEW_SECS, RestoredSessionState, SilentRefreshError,
         access_token_needs_refresh, banner_session_display, banner_welcome_text,
-        current_access_token, current_git_root, fresh_access_token, initialize_session_state,
-        pending_recovery_status_line, restore_history_from_journal,
-        restore_session_state_from_journal, restored_journal_state,
+        current_access_token, current_git_root, default_model_from_models_response,
+        fresh_access_token, initialize_session_state, pending_recovery_status_line,
+        restore_history_from_journal, restore_session_state_from_journal, restored_journal_state,
         should_keep_credentials_on_refresh_error,
     };
     use crate::cli::cli_config::cli_utils::{
@@ -1327,6 +1396,62 @@ mod tests {
         let payload =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp}}}"#));
         format!("{header}.{payload}.sig")
+    }
+
+    #[test]
+    fn default_model_from_models_response_uses_first_active_name() {
+        let body = serde_json::json!([
+            {"name": "inactive-model", "is_active": false},
+            {"name": "  deepseek-v4-flash-anthropic  ", "is_active": true},
+            {"name": "deepseek-v4-pro-official", "is_active": true}
+        ]);
+
+        assert_eq!(
+            default_model_from_models_response(&body).as_deref(),
+            Some("deepseek-v4-flash-anthropic")
+        );
+    }
+
+    #[test]
+    fn default_model_from_models_response_accepts_wrapped_legacy_shape() {
+        let body = serde_json::json!({
+            "models": [
+                {"model_name": "legacy-inactive", "active": 0},
+                {"model_name": "legacy-active", "active": 1}
+            ]
+        });
+
+        assert_eq!(
+            default_model_from_models_response(&body).as_deref(),
+            Some("legacy-active")
+        );
+    }
+
+    #[test]
+    fn default_model_from_models_response_accepts_items_shape() {
+        let body = serde_json::json!({
+            "items": [
+                {"id": "row-without-name", "is_active": true},
+                {"name": "items-active-model", "is_active": true}
+            ]
+        });
+
+        assert_eq!(
+            default_model_from_models_response(&body).as_deref(),
+            Some("items-active-model")
+        );
+    }
+
+    #[test]
+    fn default_model_from_models_response_returns_none_without_active_names() {
+        let body = serde_json::json!({
+            "models": [
+                {"name": "inactive", "is_active": false},
+                {"model_id": "row-without-name", "is_active": true}
+            ]
+        });
+
+        assert_eq!(default_model_from_models_response(&body), None);
     }
 
     #[test]

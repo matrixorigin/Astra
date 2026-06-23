@@ -783,9 +783,16 @@ pub(crate) async fn complete_session_startup(
     let startup_token = session_runtime::fresh_access_token(api, profile).await;
 
     if let Some(token) = startup_token.as_deref() {
-        let has_models = session_runtime::check_server_has_models(api, &token).await;
-        if !has_models {
-            state.model = Some("⚠ none".to_string());
+        match session_runtime::resolve_server_default_model(api, token).await {
+            session_runtime::ServerDefaultModel::Selected(model) => {
+                if state.model.is_none() {
+                    state.model = Some(model);
+                }
+            }
+            session_runtime::ServerDefaultModel::NoModels => {
+                state.model = Some("⚠ none".to_string());
+            }
+            session_runtime::ServerDefaultModel::Unavailable => {}
         }
     }
     tracer.phase("model_check");

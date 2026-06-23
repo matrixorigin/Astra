@@ -87,6 +87,7 @@ describe("Composer model selection", () => {
     expect(send).toBeDisabled();
 
     fireEvent.click(send);
+    fireEvent.keyDown(editor, { key: "Enter", code: "Enter" });
     expect(onSubmit).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: /unavailable model/i }));

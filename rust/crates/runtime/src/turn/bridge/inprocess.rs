@@ -69,6 +69,15 @@ use astra_turn_core::tool_schema_prune::prune_tool_schemas;
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
 const ROOT_TURN_JOURNAL_HEADER: &str = "x-mo-root-turn-journal";
 
+fn selected_model_name_from_payload(payload: &Value) -> Option<String> {
+    payload
+        .get("selected_model")
+        .and_then(Value::as_object)
+        .and_then(|selected_model| selected_model.get("model"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
 fn rewrite_bridge_runtime_manifest_model_resolution(
     trace: &mut Value,
     requested_model: Option<&str>,
@@ -1327,10 +1336,7 @@ impl InProcessChatTurnBridge {
             .cloned()
             .unwrap_or_default();
         let explain = explain_requested(&payload);
-        let model_override = payload
-            .get("model")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
+        let selected_model_name = selected_model_name_from_payload(&payload);
         let round_index = payload
             .get("round_index")
             .and_then(Value::as_i64)
@@ -1501,7 +1507,7 @@ impl InProcessChatTurnBridge {
             // Also capture fallback_chain for rate-limit-triggered fallback.
             let pool_ref = shared_pool.as_ref().map(SharedPool::get);
             let requested_model_override =
-                astra_core::model_override::normalize_model_override(model_override.as_deref());
+                astra_core::model_override::normalize_model_override(selected_model_name.as_deref());
             let requested_model_name = requested_model_override.map(str::to_string);
             let mut rate_limit_fallback_trace: Option<Value> = None;
             if !use_e2e_llm && requested_model_override.is_none() {
@@ -1511,8 +1517,8 @@ impl InProcessChatTurnBridge {
                     run_id = %run_id,
                     turn = trace_turn,
                     round = round_index,
-                    reason = "missing_model_override",
-                    "missing explicit model override; refusing implicit model fallback"
+                    reason = "missing_model_selection",
+                    "missing selected_model.model; refusing implicit model fallback"
                 );
             }
             let (mut model_name, mut wire_model_name, mut api_key, mut base_url, mut provider, mut request_body_overrides, mut cache_capability, fallback_chain) = if use_e2e_llm {
@@ -4485,8 +4491,8 @@ impl InProcessChatTurnBridge {
                     "tier": 0,
                     "latency_ms": 0,
                     "estimated_tokens": final_usage.total_tokens() as i64,
-                    "skipped": model_override.is_some(),
-                    "reason": model_override.as_ref().map(|_| "model_override").unwrap_or(""),
+                    "skipped": selected_model_name.is_some(),
+                    "reason": selected_model_name.as_ref().map(|_| "selected_model").unwrap_or(""),
                     "cloud_loop_turns": cloud_loop_turns,
                 }));
                 let explain_event = build_explain_event(
@@ -4735,6 +4741,24 @@ mod tests {
         crate::turn::prompt_cache::resolve_pinned_tool_names_for_config(
             &astra_config::ToolSurfaceConfig::default(),
         )
+    }
+
+    #[test]
+    fn selected_model_name_from_payload_ignores_legacy_top_level_model() {
+        assert_eq!(
+            selected_model_name_from_payload(&json!({
+                "selected_model": {"model": "deepseek-v4-pro-official"},
+                "model": "deepseek-v4-flash",
+            }))
+            .as_deref(),
+            Some("deepseek-v4-pro-official")
+        );
+        assert_eq!(
+            selected_model_name_from_payload(&json!({
+                "model": "deepseek-v4-flash",
+            })),
+            None
+        );
     }
 
     #[test]
