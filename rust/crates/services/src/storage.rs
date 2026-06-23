@@ -1309,7 +1309,7 @@ pub async fn ensure_core_schema(
             trace_id VARCHAR(128) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_session_device (session_id, device_id),
+            UNIQUE KEY uq_session_device (user_id, session_id, device_id),
             INDEX idx_device_leases_user_session (user_id, session_id, status, updated_at),
             INDEX idx_device_leases_fingerprint (user_id, device_fingerprint, status),
             INDEX idx_device_leases_expiry (status, expires_at)
@@ -1603,7 +1603,7 @@ pub async fn ensure_core_schema(
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             CONSTRAINT chk_session_state_items_scope CHECK (scope IN ('session', 'user', 'project', 'workspace')),
-            UNIQUE KEY uq_state_current (session_id, scope, category, item_key),
+            UNIQUE KEY uq_state_current (user_id, session_id, scope, category, item_key),
             INDEX idx_state_owner_session_status_category (user_id, session_id, status, category),
             INDEX idx_state_session_category (session_id, category, status, priority),
             INDEX idx_state_user_category (user_id, category, status, updated_at),

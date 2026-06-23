@@ -4611,7 +4611,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         #[cfg(feature = "harness")]
         loop_state.harness.set_user_id(&user_id);
 
-        loop_state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
+        loop_state.session_turn =
+            infer_session_turn(self.shared_pool.as_ref(), &user_id, &session_id).await;
         let fresh_session_current_date = loop_state
             .pipeline_session
             .as_ref()
@@ -5292,7 +5293,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         #[cfg(feature = "harness")]
         state.harness.set_user_id(&user_id);
 
-        state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
+        state.session_turn =
+            infer_session_turn(self.shared_pool.as_ref(), &user_id, &session_id).await;
         let fresh_session_current_date = state
             .pipeline_session
             .as_ref()

@@ -372,8 +372,9 @@ async fn persist_server_loop_projection_state(
 
     let post_compaction_count = sqlx::query(
         "SELECT COUNT(*) AS count FROM context_manifests \
-         WHERE session_id = ? AND run_id = ? AND reason = 'post_compaction'",
+         WHERE user_id = ? AND session_id = ? AND run_id = ? AND reason = 'post_compaction'",
     )
+    .bind(user_id)
     .bind(session_id)
     .bind(run_id)
     .fetch_one(pool.get())
@@ -382,7 +383,10 @@ async fn persist_server_loop_projection_state(
     .and_then(|row| row.try_get::<i64, _>("count").ok())
     .unwrap_or(0);
     if post_compaction_count > 0 {
-        match store.run_compaction_assertions(session_id, run_id).await {
+        match store
+            .run_compaction_assertions(user_id, session_id, run_id)
+            .await
+        {
             Ok(results) if results.iter().all(|(_, violations)| *violations == 0) => {
                 let result = store
                     .upsert_state_item(StateItemUpsert {
@@ -676,13 +680,18 @@ async fn persist_trace_degraded_event(
     }
 }
 
-pub(crate) async fn infer_session_turn(shared_pool: Option<&SharedPool>, session_id: &str) -> u32 {
+pub(crate) async fn infer_session_turn(
+    shared_pool: Option<&SharedPool>,
+    user_id: &str,
+    session_id: &str,
+) -> u32 {
     let Some(shared_pool) = shared_pool else {
         return 1;
     };
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND event_type = 'user_query'",
+        "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND event_type = 'user_query'",
     )
+    .bind(user_id)
     .bind(session_id)
     .fetch_one(shared_pool.get())
     .await

@@ -64,23 +64,27 @@ async fn stream_chat_full(app: &axum::Router, auth: &str, payload: Value) -> (St
 /// Poll until `agent_events` has at least `min_count` rows for the session.
 async fn wait_for_agent_events_count(
     pool: &sqlx::MySqlPool,
+    user_id: &str,
     session_id: &str,
     min_count: i64,
     timeout: std::time::Duration,
 ) {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE session_id = ?")
-            .bind(session_id)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(0);
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
         if n >= min_count {
             return;
         }
         if tokio::time::Instant::now() >= deadline {
             panic!(
-                "timeout ({timeout:?}) waiting for >= {min_count} agent_events for session_id={session_id} (got {n})"
+                "timeout ({timeout:?}) waiting for >= {min_count} agent_events for user_id={user_id} session_id={session_id} (got {n})"
             );
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -94,6 +98,7 @@ pub async fn run_stream_session_and_run_status() {
     let app = &ctx.app;
     let auth = &b.auth_header;
     let pool = &ctx.pool;
+    let user_id = &ctx.user_id;
     let user_id = &ctx.user_id;
 
     // Create a fresh session for isolation.
@@ -216,13 +221,21 @@ pub async fn run_stream_context_trace_persistence() {
     );
 
     // Wait for events to be persisted (user_query + llm_response + context_trace_signal = 3).
-    wait_for_agent_events_count(pool, &session_id, 3, std::time::Duration::from_secs(15)).await;
+    wait_for_agent_events_count(
+        pool,
+        user_id,
+        &session_id,
+        3,
+        std::time::Duration::from_secs(15),
+    )
+    .await;
 
     let recs = sqlx::query(
         "SELECT event_id, event_type, content, causal_chain_id, agent_id, \
                 llm_model_used, token_usage, parent_event_id \
-         FROM agent_events WHERE session_id = ? ORDER BY created_at ASC",
+         FROM agent_events WHERE user_id = ? AND session_id = ? ORDER BY created_at ASC",
     )
+    .bind(user_id)
     .bind(&session_id)
     .fetch_all(pool)
     .await
@@ -337,6 +350,7 @@ pub async fn run_stream_multi_turn_persistence() {
     let app = &ctx.app;
     let auth = &b.auth_header;
     let pool = &ctx.pool;
+    let user_id = &ctx.user_id;
 
     let (st_sess, sess) = post_json(
         app,
@@ -366,14 +380,23 @@ pub async fn run_stream_multi_turn_persistence() {
     );
 
     // Wait for Turn 1 events (user_query + llm_response + context_trace_signal = 3).
-    wait_for_agent_events_count(pool, &session_id, 3, std::time::Duration::from_secs(15)).await;
+    wait_for_agent_events_count(
+        pool,
+        user_id,
+        &session_id,
+        3,
+        std::time::Duration::from_secs(15),
+    )
+    .await;
 
-    let count_after_turn1: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE session_id = ?")
-            .bind(&session_id)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(0);
+    let count_after_turn1: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(user_id)
+    .bind(&session_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
     assert!(
         count_after_turn1 >= 3,
         "turn 1 should have >= 3 events (user_query + llm_response + context_trace_signal), got {count_after_turn1}"
@@ -381,8 +404,9 @@ pub async fn run_stream_multi_turn_persistence() {
 
     // Verify turn 1 has user_query with the right content.
     let uq1_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND event_type = 'user_query'",
+        "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND event_type = 'user_query'",
     )
+    .bind(user_id)
     .bind(&session_id)
     .fetch_one(pool)
     .await
@@ -409,18 +433,21 @@ pub async fn run_stream_multi_turn_persistence() {
     // Wait for Turn 2 events (3 more events).
     wait_for_agent_events_count(
         pool,
+        user_id,
         &session_id,
         count_after_turn1 + 3,
         std::time::Duration::from_secs(15),
     )
     .await;
 
-    let count_after_turn2: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE session_id = ?")
-            .bind(&session_id)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(0);
+    let count_after_turn2: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(user_id)
+    .bind(&session_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
     assert!(
         count_after_turn2 >= count_after_turn1 + 3,
         "turn 2 should add >= 3 events: after_turn1={count_after_turn1}, after_turn2={count_after_turn2}"
@@ -428,8 +455,9 @@ pub async fn run_stream_multi_turn_persistence() {
 
     // ── Verify event types across both turns ──
     let uq_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND event_type = 'user_query'",
+        "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND event_type = 'user_query'",
     )
+    .bind(user_id)
     .bind(&session_id)
     .fetch_one(pool)
     .await
@@ -440,8 +468,9 @@ pub async fn run_stream_multi_turn_persistence() {
     );
 
     let lr_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND event_type = 'llm_response'",
+        "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND event_type = 'llm_response'",
     )
+    .bind(user_id)
     .bind(&session_id)
     .fetch_one(pool)
     .await
@@ -455,8 +484,9 @@ pub async fn run_stream_multi_turn_persistence() {
     // and each turn's context_trace gets a context-trace chain.
     let chains: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT causal_chain_id FROM agent_events \
-         WHERE session_id = ? AND causal_chain_id IS NOT NULL",
+         WHERE user_id = ? AND session_id = ? AND causal_chain_id IS NOT NULL",
     )
+    .bind(user_id)
     .bind(&session_id)
     .fetch_all(pool)
     .await

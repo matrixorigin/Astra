@@ -353,7 +353,7 @@ async fn perf_benchmark_4_compaction_assertions_under_100ms() {
     let store = DatabaseStateProjectionStore::new(pool.clone());
     let started = Instant::now();
     let results = store
-        .run_compaction_assertions(&session_id, &run_id)
+        .run_compaction_assertions(&user_id, &session_id, &run_id)
         .await
         .expect("PERF-4 compaction invariant SQL must execute");
     let elapsed_ms = millis(started);

@@ -434,6 +434,11 @@ async fn phase2_web_hydration_schema_contract() {
             "session_device_leases missing {expected}"
         );
     }
+    assert_eq!(
+        unique_key_columns(&pool, &schema, "session_device_leases", "uq_session_device").await,
+        ["user_id", "session_id", "device_id"],
+        "device leases must enforce owner/session/device uniqueness"
+    );
 
     let lease_events = column_names(&pool, &schema, "session_device_lease_events").await;
     for expected in [
@@ -661,6 +666,10 @@ async fn phase3_context_manifest_schema_contract() {
             "context_manifest_items missing {expected}"
         );
     }
+    assert!(
+        !items.iter().any(|column| column == "user_id"),
+        "context_manifest_items must inherit owner scope through context_manifests, not store a second owner column"
+    );
 
     let render_modes = sqlx::query(
         "SELECT COUNT(*) AS count FROM context_manifest_items
@@ -774,8 +783,8 @@ async fn phase4_state_projection_schema_contract() {
     }
     assert_eq!(
         unique_key_columns(&pool, &schema, "session_state_items", "uq_state_current").await,
-        ["session_id", "scope", "category", "item_key"],
-        "state current projection must upsert by semantic key"
+        ["user_id", "session_id", "scope", "category", "item_key"],
+        "state current projection must upsert by owner/session semantic key"
     );
     assert_eq!(
         index_columns(

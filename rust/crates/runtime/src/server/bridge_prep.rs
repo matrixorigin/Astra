@@ -400,7 +400,7 @@ pub(super) async fn prepare_chat_turn_bridge_body(
         trusted_session_id.as_deref(),
         trusted_session_created_at.as_deref(),
     ) {
-        seed_bridge_session_created_at(state, session_id, created_at).await;
+        seed_bridge_session_created_at(state, &user.user_id, session_id, created_at).await;
     }
     // ── Turn identifiers ────────────────────────────────────────────────
     let (turn_chain_id, user_query_event_id, session_turn) =
@@ -409,6 +409,7 @@ pub(super) async fn prepare_chat_turn_bridge_body(
             let has_tool_results = request.has_tool_results();
             let (chain_id, event_id, session_turn) = prepare_chat_turn_bridge_identifiers(
                 state,
+                &user.user_id,
                 session_id,
                 messages,
                 has_tool_results,
@@ -426,7 +427,10 @@ pub(super) async fn prepare_chat_turn_bridge_body(
 
     // ── Cached inputs + tool trimming ───────────────────────────────────
     let tools_changed = if let Some(session_id) = trusted_session_id.as_deref() {
-        Some(prepare_chat_turn_bridge_cached_inputs(state, session_id, &mut request).await)
+        Some(
+            prepare_chat_turn_bridge_cached_inputs(state, &user.user_id, session_id, &mut request)
+                .await,
+        )
     } else {
         None
     };
@@ -469,13 +473,18 @@ pub(super) async fn prepare_chat_turn_bridge_body(
         .map_err(internal_error)
 }
 
-async fn infer_bridge_session_turn(state: &AppState, session_id: &str) -> u32 {
+fn bridge_cache_key(user_id: &str, session_id: &str) -> String {
+    format!("{user_id}\x1f{session_id}")
+}
+
+async fn infer_bridge_session_turn(state: &AppState, user_id: &str, session_id: &str) -> u32 {
     let Some(shared_pool) = state.shared_pool.as_ref() else {
         return 1;
     };
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND event_type = 'user_query'",
+        "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND event_type = 'user_query'",
     )
+    .bind(user_id)
     .bind(session_id)
     .fetch_one(shared_pool.get())
     .await
@@ -483,17 +492,23 @@ async fn infer_bridge_session_turn(state: &AppState, session_id: &str) -> u32 {
     (count.max(0) as u32).saturating_add(1)
 }
 
-async fn seed_bridge_session_created_at(state: &AppState, session_id: &str, created_at: &str) {
+async fn seed_bridge_session_created_at(
+    state: &AppState,
+    user_id: &str,
+    session_id: &str,
+    created_at: &str,
+) {
     if created_at.is_empty() {
         return;
     }
     let now = current_unix_seconds();
+    let cache_key = bridge_cache_key(user_id, session_id);
     let mut cache = state.chat_turn_bridge_cache.lock().await;
-    let mut entry = cache.get(session_id, now).unwrap_or_default();
+    let mut entry = cache.get(&cache_key, now).unwrap_or_default();
     entry
         .entry("created_at".to_string())
         .or_insert_with(|| serde_json::Value::String(created_at.to_string()));
-    cache.insert(session_id.to_string(), entry, now);
+    cache.insert(cache_key, entry, now);
 }
 
 fn normalize_session_created_at_for_bridge(created_at: &str) -> Option<String> {
@@ -529,6 +544,7 @@ pub(super) fn normalize_chat_turn_session_error(
 
 async fn prepare_chat_turn_bridge_identifiers(
     state: &AppState,
+    user_id: &str,
     session_id: &str,
     messages: &[serde_json::Value],
     has_tool_results: bool,
@@ -536,8 +552,9 @@ async fn prepare_chat_turn_bridge_identifiers(
 ) -> (String, String, u32) {
     if let Some(identity) = explicit_identity {
         let now = current_unix_seconds();
+        let cache_key = bridge_cache_key(user_id, session_id);
         let mut cache = state.chat_turn_bridge_cache.lock().await;
-        let mut updated_entry = cache.get(session_id, now).unwrap_or_default();
+        let mut updated_entry = cache.get(&cache_key, now).unwrap_or_default();
         updated_entry.insert(
             "turn_chain_id".to_string(),
             serde_json::Value::String(identity.turn_chain_id.clone()),
@@ -550,17 +567,18 @@ async fn prepare_chat_turn_bridge_identifiers(
             "session_turn".to_string(),
             serde_json::json!(identity.session_turn),
         );
-        cache.insert(session_id.to_string(), updated_entry, now);
+        cache.insert(cache_key, updated_entry, now);
         return (
             identity.turn_chain_id.clone(),
             identity.user_query_event_id.clone(),
             identity.session_turn,
         );
     }
-    let inferred_session_turn = infer_bridge_session_turn(state, session_id).await;
+    let inferred_session_turn = infer_bridge_session_turn(state, user_id, session_id).await;
     let now = current_unix_seconds();
+    let cache_key = bridge_cache_key(user_id, session_id);
     let mut cache = state.chat_turn_bridge_cache.lock().await;
-    let mut prev_entry = cache.get(session_id, now);
+    let mut prev_entry = cache.get(&cache_key, now);
     let is_continuation = bridge_turn_is_continuation(messages, has_tool_results);
     let new_turn_chain_id = Uuid::now_v7().to_string();
     let new_user_query_event_id = Uuid::now_v7().to_string();
@@ -592,7 +610,7 @@ async fn prepare_chat_turn_bridge_identifiers(
         serde_json::Value::String(user_query_event_id.clone()),
     );
     updated_entry.insert("session_turn".to_string(), serde_json::json!(session_turn));
-    cache.insert(session_id.to_string(), updated_entry, now);
+    cache.insert(cache_key, updated_entry, now);
     (turn_chain_id, user_query_event_id, session_turn)
 }
 
@@ -610,12 +628,14 @@ fn bridge_turn_is_continuation(messages: &[serde_json::Value], has_tool_results:
 
 async fn prepare_chat_turn_bridge_cached_inputs(
     state: &AppState,
+    user_id: &str,
     session_id: &str,
     request: &mut ChatTurnRequestBody,
 ) -> bool {
     let now = current_unix_seconds();
+    let cache_key = bridge_cache_key(user_id, session_id);
     let mut cache = state.chat_turn_bridge_cache.lock().await;
-    let mut entry = cache.get(session_id, now).unwrap_or_default();
+    let mut entry = cache.get(&cache_key, now).unwrap_or_default();
     let cached_tools = entry
         .get("tools")
         .and_then(serde_json::Value::as_array)
@@ -638,7 +658,7 @@ async fn prepare_chat_turn_bridge_cached_inputs(
     sync_opt_field_with_cache(&mut entry, "edge_profile", &mut request.edge_profile);
     inject_bridge_cache_state_into(&entry, request);
 
-    cache.insert(session_id.to_string(), entry, now);
+    cache.insert(cache_key, entry, now);
     tools_changed
 }
 
@@ -763,10 +783,14 @@ mod tests {
     }
 
     fn test_user() -> AuthUserRecord {
+        test_user_with_id("u1")
+    }
+
+    fn test_user_with_id(user_id: &str) -> AuthUserRecord {
         AuthUserRecord {
-            user_id: "u1".to_string(),
-            username: "test-user".to_string(),
-            email: "u1@example.test".to_string(),
+            user_id: user_id.to_string(),
+            username: format!("test-{user_id}"),
+            email: format!("{user_id}@example.test"),
             display_name: None,
         }
     }
@@ -1049,7 +1073,7 @@ mod tests {
             entry.insert("turn_chain_id".to_string(), json!("chain-6"));
             entry.insert("user_query_event_id".to_string(), json!("query-6"));
             entry.insert("session_turn".to_string(), json!(6));
-            cache.insert("bound-session".to_string(), entry, now);
+            cache.insert(bridge_cache_key("u1", "bound-session"), entry, now);
         }
         let body = Bytes::from(
             serde_json::to_vec(&json!({
@@ -1074,6 +1098,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_body_does_not_reuse_cached_identity_from_another_owner() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let now = current_unix_seconds();
+        {
+            let mut cache = state.chat_turn_bridge_cache.lock().await;
+            let mut entry = serde_json::Map::new();
+            entry.insert("turn_chain_id".to_string(), json!("other-chain"));
+            entry.insert("user_query_event_id".to_string(), json!("other-query"));
+            entry.insert("session_turn".to_string(), json!(8));
+            cache.insert(bridge_cache_key("other-user", "bound-session"), entry, now);
+        }
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "selected_model": selected_model(),
+                "messages": [
+                    {"role": "assistant", "content": null, "tool_calls": [{"id": "call-1"}]},
+                    {"role": "tool", "tool_call_id": "call-1", "content": "done"}
+                ],
+                "tool_results": [{"name": "bash", "output": "done"}]
+            }))
+            .expect("body should serialize"),
+        );
+
+        let prepared = prepare_chat_turn_bridge_body(
+            &state,
+            &test_user_with_id("current-user"),
+            body,
+            Some("bound-session"),
+        )
+        .await
+        .expect("continuation should prepare");
+
+        assert_eq!(prepared.session_turn.as_deref(), Some("1"));
+        assert_ne!(prepared.turn_chain_id.as_deref(), Some("other-chain"));
+        assert_ne!(prepared.user_query_event_id.as_deref(), Some("other-query"));
+    }
+
+    #[tokio::test]
     async fn prepare_body_prefers_explicit_payload_turn_identity() {
         let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
         let now = current_unix_seconds();
@@ -1083,7 +1145,7 @@ mod tests {
             entry.insert("turn_chain_id".to_string(), json!("cached-chain"));
             entry.insert("user_query_event_id".to_string(), json!("cached-query"));
             entry.insert("session_turn".to_string(), json!(9));
-            cache.insert("bound-session".to_string(), entry, now);
+            cache.insert(bridge_cache_key("u1", "bound-session"), entry, now);
         }
         let body = Bytes::from(
             serde_json::to_vec(&json!({

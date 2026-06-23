@@ -611,11 +611,12 @@ impl DatabaseContextManifestStore {
             if let Some(artifact_id) = referenced_artifact_id {
                 sqlx::query(
                     "UPDATE session_artifacts
-                     SET referenced_by_manifest_count = referenced_by_manifest_count + 1,
-                         updated_at = NOW(6)
-                     WHERE artifact_id = ?",
+	                     SET referenced_by_manifest_count = referenced_by_manifest_count + 1,
+	                         updated_at = NOW(6)
+	                     WHERE artifact_id = ? AND user_id = ?",
                 )
                 .bind(&artifact_id)
+                .bind(&manifest.user_id)
                 .execute(&mut *tx)
                 .await
                 .map_err(|source| ContextManifestError::Database {
