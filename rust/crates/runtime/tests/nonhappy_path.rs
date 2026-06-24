@@ -80,9 +80,7 @@ mod turn_limits {
     use astra_turn_core::loop_circuit_breaker::BreakerConfig;
 
     /// Proves the circuit breaker's absolute_max_rounds default is a reasonable
-    /// infrastructure ceiling. This replaces the old MAX_TOOL_ROUNDS constant
-    /// (deprecated compat shim) — the circuit breaker config is now the
-    /// single source of truth for the hard round cap.
+    /// infrastructure ceiling and the single source of truth for the hard round cap.
     #[test]
     fn absolute_max_rounds_default_is_bounded() {
         let cap = BreakerConfig::default().absolute_max_rounds;
@@ -412,7 +410,7 @@ mod multi_file_edit_regression {
         guard.record_tool_result("read_file", r#"fn tool_done_inline..."#);
         guard.record_tool_result("read_file", r#"CJK_DOMAIN_MAP..."#);
         guard.record_tool_result("read_file", r#"const { assert!..."#);
-        guard.record_tool_result("read_file", r#"MAX_TOOL_ROUNDS..."#);
+        guard.record_tool_result("read_file", r#"absolute_max_rounds..."#);
         let v1 = guard.evaluate();
         assert_eq!(v1.severity, VerdictSeverity::Healthy);
 

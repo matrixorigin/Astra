@@ -24,7 +24,7 @@ pub use astra_turn_core::tool_registry_state::ConversationState;
 pub use plugin::{PluginRegistry, PluginToolEntry};
 pub use registry::ToolRegistry;
 
-pub const DEFAULT_TOOL_BUDGET_TOKENS: u32 = 800;
+pub const DEFAULT_TOOL_SCHEMA_BUDGET_TOKENS: u32 = 800;
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
@@ -388,7 +388,7 @@ mod tests {
         );
     }
 
-    // ── Budgeted surface assembly ──
+    // ── Schema-budget report assembly ──
 
     #[test]
     fn report_budget_total_does_not_change_visible_tools() {
@@ -622,10 +622,10 @@ mod tests {
     // ── Phase 6: Testing gap coverage ──
 
     #[test]
-    fn budget_edge_exactly_one_tool_fits() {
-        // Phase 6.2: Budget exhaustion boundary
+    fn tiny_schema_budget_does_not_hide_always_load_tools() {
+        // Phase 6.2: schema-budget exhaustion boundary
         let reg = ToolRegistry::new(mock_schemas());
-        // Use a very small budget — always_load tools remain budget-exempt.
+        // Use a very small schema budget — always_load tools remain budget-exempt.
         let (schemas, report) = reg.build_initial_surface_with_report("list PRs", 1, 1);
         assert!(
             schemas.len() >= reg.always_load_tool_names_sorted().len(),

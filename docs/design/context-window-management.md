@@ -3,9 +3,9 @@
 > **Status**: Core Design  
 > **Last Updated**: 2026-03-03  
 > **Builds On**: [context-overflow-optimization.md](../implementation/context-overflow-optimization.md) (tool result handling via memory system)  
-> **Related**: [prompt-lifecycle.md](prompt-lifecycle.md), [memory/README.md](memory/README.md), [edge-cloud-execution.md](edge-cloud-execution.md), [agent-loop-reliability-v1-python.md](agent-loop-reliability-v1-python.md), [token-efficient-llm-routing.md](token-efficient-llm-routing.md), [memory/intent-driven-loading.md](memory/intent-driven-loading.md)
+> **Related**: [prompt-lifecycle.md](prompt-lifecycle.md), [memory/README.md](memory/README.md), [edge-cloud-execution.md](edge-cloud-execution.md), [session-observability.md](session-observability.md), [token-efficient-llm-routing.md](token-efficient-llm-routing.md), [memory/intent-driven-loading.md](memory/intent-driven-loading.md)
 >
-> ⚠️ **2026-03-03 Update**: Eager output compression is now unconditional — `tool_output_handler.py` is called without the `_memory_store` guard. See [agent-loop-reliability-v1-python.md](agent-loop-reliability-v1-python.md) for the ChatLoop restructuring that enables this. `compaction.py` remains as the history-level safety net.
+> ⚠️ **2026-03-03 Update**: Eager output compression is now unconditional in the current Rust turn pipeline. `ContextBudget`, tool-result compression, and `LoopCircuitBreaker` are the runtime safety net; observability is captured by [session-observability.md](session-observability.md).
 
 ---
 

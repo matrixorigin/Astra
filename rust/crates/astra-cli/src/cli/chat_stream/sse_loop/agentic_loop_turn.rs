@@ -516,7 +516,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     let (turn_schemas, surface_report, surface_latency_ms) = {
         let sel_start = Instant::now();
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Loading schemas…");
-        let budget = ctx.registry.default_budget();
+        let budget = ctx.registry.default_schema_budget();
         let (mut schemas, mut report) = ctx.registry.build_initial_surface_with_report_ctx(
             semantic_query_str,
             ctx.history.len() as u32,
@@ -1880,7 +1880,7 @@ mod tests {
             schema("enter_plan_mode"),
             schema("exit_plan_mode"),
         ];
-        let registry = ToolRegistry::new(all_schemas.clone()).with_budget(100);
+        let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(100);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
         let messages = vec![json!({"role": "user", "content": "inspect the repo state"})];
         let tool_results = Vec::new();
@@ -2057,7 +2057,7 @@ mod tests {
         // leaving plan-mode escape hatches absent naturally. This makes the test
         // meaningful: if the `plan_mode_active` guard is accidentally removed, the
         // injection would add them and the assertion below would fail.
-        let registry = ToolRegistry::new(all_schemas.clone()).with_budget(2);
+        let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(2);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
         let messages = vec![json!({"role": "user", "content": "inspect the repo state"})];
         let tool_results = Vec::new();
@@ -2388,7 +2388,7 @@ mod tests {
         );
         executor.clear_current_tool_surface_for_tests();
 
-        let registry = ToolRegistry::new(all_schemas.clone()).with_budget(0);
+        let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(0);
         let messages = vec![json!({"role": "user", "content": "inspect the repository"})];
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
@@ -2492,7 +2492,7 @@ mod tests {
             schema("task_stop"),
             schema("read_file"),
         ];
-        let registry = ToolRegistry::new(all_schemas.clone()).with_budget(1);
+        let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(1);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
         let messages = vec![json!({"role": "user", "content": "run make check"})];
         let tool_results = Vec::new();
@@ -2596,7 +2596,7 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let all_schemas = vec![schema("read_file"), schema("write_file")];
-        let registry = ToolRegistry::new(all_schemas.clone()).with_budget(2);
+        let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(2);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
         let message = "修复 timeout handling";
         let messages = vec![json!({"role": "user", "content": message})];
@@ -2719,7 +2719,7 @@ mod tests {
             schema("bash"),
             schema("str_replace"),
         ];
-        let registry = ToolRegistry::new(all_schemas.clone()).with_budget(1);
+        let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(1);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
         executor.debug_stage_pending_round_tool_boost_for_test(&[
             "bash",
@@ -2824,7 +2824,7 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let all_schemas = vec![schema("read_file"), schema("tool_search"), schema("memory")];
-        let registry = ToolRegistry::new(all_schemas.clone()).with_budget(1);
+        let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(1);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
         executor.set_current_visible_tool_schemas(&[schema("tool_search")]);
         executor.set_current_activatable_tool_names(HashSet::from(["memory".to_string()]));
@@ -2952,7 +2952,7 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let all_schemas = vec![schema("tool_search")];
-        let registry = ToolRegistry::new(all_schemas.clone()).with_budget(1);
+        let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(1);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
         executor.set_current_visible_tool_schemas(&[schema("tool_search")]);
         executor.set_current_activatable_tool_names(HashSet::from(["memory".to_string()]));
@@ -3054,7 +3054,7 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let all_schemas = vec![schema("tool_search"), schema("agent_fanout")];
-        let registry = ToolRegistry::new(all_schemas.clone()).with_budget(1);
+        let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(1);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
 
         let messages =
@@ -3163,7 +3163,7 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let all_schemas = vec![schema("tool_search"), schema("agent_fanout")];
-        let registry = ToolRegistry::new(all_schemas.clone()).with_budget(1);
+        let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(1);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
         executor.debug_stage_pending_round_tool_boost_for_test(&["agent_fanout"]);
 
@@ -3267,7 +3267,7 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let all_schemas = vec![schema("read_file"), schema("write_file")];
-        let registry = ToolRegistry::new(all_schemas.clone()).with_budget(2);
+        let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(2);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
         let messages = vec![json!({"role": "user", "content": "update the file"})];
         let tool_results = Vec::new();

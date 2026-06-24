@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use astra_config::ToolSurfaceConfig;
 
-use super::DEFAULT_TOOL_BUDGET_TOKENS;
+use super::DEFAULT_TOOL_SCHEMA_BUDGET_TOKENS;
 use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_registry_meta::{TOOL_CATALOG, ToolMeta};
 use astra_turn_core::tool_registry_report::ToolSurfaceReport;
@@ -25,7 +25,7 @@ fn sort_schemas_by_name(schemas: &mut [Value]) {
 /// ```
 pub struct ToolRegistry {
     all_schemas: Vec<Value>,
-    budget_tokens: u32,
+    schema_budget_tokens: u32,
     /// Real token costs measured from actual schemas (schema JSON bytes / 4).
     /// Maps tool name → measured token cost.
     measured_costs: std::collections::HashMap<String, u32>,
@@ -80,7 +80,7 @@ impl ToolRegistry {
             .collect();
         Self {
             all_schemas,
-            budget_tokens: DEFAULT_TOOL_BUDGET_TOKENS,
+            schema_budget_tokens: DEFAULT_TOOL_SCHEMA_BUDGET_TOKENS,
             measured_costs,
             schema_index,
             always_load_schemas,
@@ -89,14 +89,14 @@ impl ToolRegistry {
         }
     }
 
-    pub fn with_budget(mut self, budget: u32) -> Self {
-        self.budget_tokens = budget;
+    pub fn with_schema_budget(mut self, budget: u32) -> Self {
+        self.schema_budget_tokens = budget;
         self
     }
 
-    /// Get the configured default token budget.
-    pub fn default_budget(&self) -> u32 {
-        self.budget_tokens
+    /// Get the configured default schema-token budget used for surface telemetry.
+    pub fn default_schema_budget(&self) -> u32 {
+        self.schema_budget_tokens
     }
 
     /// Access the full list of tool schemas.
@@ -197,18 +197,18 @@ impl ToolRegistry {
     /// deferred and must be activated explicitly through `tool_search`.
     pub fn build_initial_surface(&self, query: &str, turn_count: u32) -> Vec<Value> {
         let (schemas, _report) =
-            self.build_initial_surface_with_report(query, turn_count, self.budget_tokens);
+            self.build_initial_surface_with_report(query, turn_count, self.schema_budget_tokens);
         schemas
     }
 
-    /// Build a tool surface with a custom token budget, returning both schemas and a report.
+    /// Build a tool surface with a custom schema-token budget, returning both schemas and a report.
     pub fn build_initial_surface_with_report(
         &self,
         query: &str,
         turn_count: u32,
-        budget: u32,
+        schema_budget: u32,
     ) -> (Vec<Value>, ToolSurfaceReport) {
-        self.build_initial_surface_with_report_ctx(query, turn_count, budget, &[])
+        self.build_initial_surface_with_report_ctx(query, turn_count, schema_budget, &[])
     }
 
     /// Build a tool surface with context from recent turns.
@@ -216,7 +216,7 @@ impl ToolRegistry {
         &self,
         query: &str,
         turn_count: u32,
-        budget: u32,
+        schema_budget: u32,
         recent_tools: &[String],
     ) -> (Vec<Value>, ToolSurfaceReport) {
         let state = ConversationState::from_message_with_context(query, turn_count, recent_tools);
@@ -236,7 +236,7 @@ impl ToolRegistry {
                 visible_tools: Vec::new(),
                 visible_count: 0,
                 budget_used: 0,
-                budget_total: budget,
+                budget_total: schema_budget,
             };
             return (Vec::new(), report);
         }
@@ -248,7 +248,7 @@ impl ToolRegistry {
             visible_count: schemas.len() as u32,
             visible_tools: names,
             budget_used: 0,
-            budget_total: budget,
+            budget_total: schema_budget,
         };
 
         (schemas, report)
@@ -259,7 +259,7 @@ impl ToolRegistry {
     /// Routing decides whether this is a tool-bearing turn. The built-in
     /// surface is deterministic: only always_load schemas are returned. Deferred
     /// tools stay deferred until explicitly activated via `tool_search`.
-    pub fn build_routed_surface(&self, budget: u32) -> (Vec<Value>, ToolSurfaceReport) {
+    pub fn build_routed_surface(&self, schema_budget: u32) -> (Vec<Value>, ToolSurfaceReport) {
         let schemas = self.always_load_only();
         let names = Self::visible_names(&schemas);
         (
@@ -268,7 +268,7 @@ impl ToolRegistry {
                 visible_count: names.len() as u32,
                 visible_tools: names,
                 budget_used: 0,
-                budget_total: budget,
+                budget_total: schema_budget,
             },
         )
     }
