@@ -3401,7 +3401,11 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
     .expect("decode ordinary checkpoint sync log count");
     assert_eq!(checkpoint_sync_successes, 1);
 
-    cleanup_restore_fixture(&pool, &[session_id, heavy_only_session, legacy_heavy_session]).await;
+    cleanup_restore_fixture(
+        &pool,
+        &[session_id, heavy_only_session, legacy_heavy_session],
+    )
+    .await;
 }
 
 #[tokio::test]

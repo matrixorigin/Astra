@@ -324,6 +324,75 @@ async fn ensure_matrixone_database_exists(
     Ok(())
 }
 
+fn validate_schema_identifier(raw: &str, kind: &str) -> Result<(), sqlx::Error> {
+    use std::error::Error;
+
+    crate::snapshot_sql::validate_sql_identifier(raw, kind).map_err(|e| {
+        sqlx::Error::Configuration(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            e,
+        )) as Box<dyn Error + Send + Sync>)
+    })
+}
+
+async fn add_column_if_missing(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+    table: &str,
+    column: &str,
+    ddl: &str,
+) -> Result<(), sqlx::Error> {
+    validate_schema_identifier(database, "matrixone database")?;
+    validate_schema_identifier(table, "matrixone table")?;
+    validate_schema_identifier(column, "matrixone column")?;
+
+    let exists = query(
+        "SELECT 1 FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ? LIMIT 1",
+    )
+    .bind(database)
+    .bind(table)
+    .bind(column)
+    .fetch_optional(pool)
+    .await?
+    .is_some();
+    if exists {
+        return Ok(());
+    }
+
+    query(ddl).execute(pool).await?;
+    Ok(())
+}
+
+async fn add_index_if_missing(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+    table: &str,
+    index: &str,
+    ddl: &str,
+) -> Result<(), sqlx::Error> {
+    validate_schema_identifier(database, "matrixone database")?;
+    validate_schema_identifier(table, "matrixone table")?;
+    validate_schema_identifier(index, "matrixone index")?;
+
+    let exists = query(
+        "SELECT 1 FROM information_schema.STATISTICS \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = ? LIMIT 1",
+    )
+    .bind(database)
+    .bind(table)
+    .bind(index)
+    .fetch_optional(pool)
+    .await?
+    .is_some();
+    if exists {
+        return Ok(());
+    }
+
+    query(ddl).execute(pool).await?;
+    Ok(())
+}
+
 pub async fn ensure_core_schema(
     settings: &MatrixOneSettings,
     bootstrap_catalog: &str,

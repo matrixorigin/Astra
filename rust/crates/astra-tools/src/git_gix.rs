@@ -1790,11 +1790,12 @@ fn score_commits(query: &str, commits: &[CommitDoc]) -> Vec<(usize, f64)> {
             let density = repeated_hits as f64 / doc.tokens.len().max(1) as f64;
             let phrase_bonus =
                 if query_phrase.len() > 1 && doc.message.to_lowercase().contains(&query_phrase) {
-                    0.25
+                    1.0
                 } else {
                     0.0
                 };
-            let score = coverage + density + phrase_bonus;
+            let score =
+                (coverage * 0.70 + density.min(1.0) * 0.20 + phrase_bonus * 0.10).clamp(0.0, 1.0);
             Some((i, score))
         })
         .collect();
@@ -3567,6 +3568,24 @@ mod tests {
         }];
         let result = score_commits("", &commits);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn score_commits_normalizes_exact_match_to_unit_interval() {
+        let commits = vec![CommitDoc {
+            hash: "abc".into(),
+            author: "test".into(),
+            date: "2024".into(),
+            message: "feat".into(),
+            tokens: vec!["feat".into()],
+        }];
+        let result = score_commits("feat", &commits);
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].1 > 0.0 && result[0].1 <= 1.0,
+            "score must stay in the documented 0..1 range: {}",
+            result[0].1
+        );
     }
 
     // ─── parse_since_to_epoch tests ─────────────────────────────────────────
