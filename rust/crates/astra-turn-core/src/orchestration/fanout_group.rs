@@ -64,6 +64,7 @@ pub struct AgentFanoutGroupProjection {
     pub title: String,
     pub target_count: usize,
     pub created_by_tool_use_id: Option<String>,
+    pub parent_run_id: Option<String>,
     pub budget_adjustment: Option<String>,
     pub slots: Vec<AgentFanoutSlot>,
     pub status: AgentFanoutStatus,
@@ -92,6 +93,18 @@ pub enum AgentFanoutStatus {
     Running,
     Finished,
     Incomplete,
+}
+
+impl AgentFanoutStatus {
+    /// Lowercase snake_case label for JSON/API output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Running => "running",
+            Self::Finished => "finished",
+            Self::Incomplete => "incomplete",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +174,7 @@ impl AgentFanoutGroupProjection {
             title: title.into(),
             target_count,
             created_by_tool_use_id: None,
+            parent_run_id: None,
             budget_adjustment: None,
             slots,
             status: AgentFanoutStatus::Planned,
@@ -181,8 +195,10 @@ impl AgentFanoutGroupProjection {
         self.last_touched = SystemTime::now();
     }
 
-    /// True when the group has no active slots (all started slots have
-    /// reached a terminal status).  Used to identify safe eviction candidates.
+    /// True when the fixed-size group is settled: every slot has either
+    /// reached a terminal status or the group can no longer make progress.
+    /// Planned slots are not terminal; they still belong to the launch
+    /// contract and must be allowed to transition.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.status,
@@ -374,7 +390,7 @@ impl AgentFanoutGroupProjection {
         let summary = self.summary_cache;
         self.status = if summary.terminal == self.target_count {
             AgentFanoutStatus::Finished
-        } else if summary.active > 0 {
+        } else if summary.active > 0 || (summary.terminal > 0 && summary.planned > 0) {
             AgentFanoutStatus::Running
         } else if summary.terminal > 0 {
             AgentFanoutStatus::Incomplete
@@ -399,6 +415,9 @@ fn adjust_summary_for_status(
     result_collected: bool,
     delta: i8,
 ) {
+    if matches!(status, AgentFanoutSlotStatus::Planned) {
+        adjust_summary_value(&mut summary.planned, delta);
+    }
     if matches!(
         status,
         AgentFanoutSlotStatus::Running | AgentFanoutSlotStatus::SpawnAccepted
@@ -515,15 +534,24 @@ mod tests {
         let mut group = AgentFanoutGroupProjection::new("review-1", "Review fanout", 3);
 
         group.record_spawn_rejected(1, "model denied").unwrap();
-        assert_eq!(group.summary().spawn_rejected, 1);
+        let summary = group.summary();
+        assert_eq!(summary.spawn_rejected, 1);
+        assert_eq!(summary.planned, 2);
+        assert_eq!(summary.terminal, 1);
         assert_eq!(group.target_count, 3);
         assert_eq!(group.slots.len(), 3);
+        assert_eq!(group.status, AgentFanoutStatus::Running);
+        assert!(
+            !group.is_terminal(),
+            "unattempted planned slots mean the fixed fanout group is still launchable"
+        );
 
         group.record_spawn_accepted(1, "storage@abc").unwrap();
         let summary = group.summary();
         assert_eq!(summary.target_count, 3);
         assert_eq!(summary.accepted, 1);
         assert_eq!(summary.spawn_rejected, 0);
+        assert_eq!(summary.planned, 2);
         assert_eq!(group.slots[1].agent_id.as_deref(), Some("storage@abc"));
     }
 
@@ -669,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_planned_slots_without_active_workers_make_group_incomplete() {
+    fn pending_planned_slots_keep_group_launchable_after_terminal_slot() {
         let mut group = AgentFanoutGroupProjection::new("review-1", "Review fanout", 2);
         group.record_spawn_accepted(0, "auth@aaa").unwrap();
         group
@@ -679,12 +707,16 @@ mod tests {
         let summary = group.summary();
         assert_eq!(summary.terminal, 1);
         assert_eq!(summary.active, 0);
-        assert_eq!(summary.planned, 2);
-        assert_eq!(group.status, AgentFanoutStatus::Incomplete);
+        assert_eq!(summary.planned, 1);
+        assert_eq!(group.status, AgentFanoutStatus::Running);
         assert!(
-            group.is_terminal(),
-            "a group with no active workers cannot make forward progress"
+            !group.is_terminal(),
+            "planned slots have not been attempted, so the group must still accept them"
         );
+
+        group.record_spawn_accepted(1, "storage@bbb").unwrap();
+        assert_eq!(group.summary().planned, 0);
+        assert_eq!(group.summary().active, 1);
     }
 
     #[test]

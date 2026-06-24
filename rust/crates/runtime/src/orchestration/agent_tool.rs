@@ -20,7 +20,7 @@ use astra_turn_core::orchestration::agent_result_wire::{
     render_wait_for_agent_status, render_wait_timeout_outcome,
 };
 use astra_turn_core::orchestration_fanout_group::{
-    AgentFanoutGroupProjection, AgentFanoutSlotStatus, AgentFanoutStatus,
+    AgentFanoutGroupProjection, AgentFanoutSlotStatus,
 };
 
 use super::{
@@ -695,6 +695,19 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
     let budget_notice = fanout_budget_adjustment_notice(&input);
     let slots = std::mem::take(&mut input.slots);
     let tool_call_id = input._tool_call_id.clone();
+    if let Err(error) = ctx
+        .spawner
+        .declare_fanout_group(
+            &group_id,
+            &title,
+            input.target_count,
+            tool_call_id.as_deref(),
+            &ctx.run_id,
+        )
+        .await
+    {
+        return render_agent_tool_error(None, &error.to_string());
+    }
 
     // Spawn all slots concurrently — no head-of-line blocking.
     let futs: Vec<_> = slots
@@ -1032,6 +1045,13 @@ async fn render_agent_fanout_results(
              Work with the results you have, or ask the user how to proceed."
         ),
         );
+    } else if summary.active == 0 && summary.terminal == summary.target_count {
+        obj.insert(
+            "instruction".into(),
+            json!(
+                "Fanout target_count is complete. Do not call agent(action='spawn') to add, retry, or replace agents in this turn. Present the collected results; ask the user before starting any additional fanout."
+            ),
+        );
     }
     serde_json::to_string_pretty(&response).unwrap_or_else(|_| response.to_string())
 }
@@ -1347,7 +1367,7 @@ fn fanout_group_to_json(group: &AgentFanoutGroupProjection) -> Value {
         "group_id": group.group_id,
         "title": group.title,
         "target_count": summary.target_count,
-        "status": fanout_group_status_label(group.status),
+        "status": group.status.as_str(),
         "summary": group.summary_sentence(),
         "accepted": summary.accepted,
         "active": summary.active,
@@ -1394,15 +1414,6 @@ fn fanout_get_results_status_label(group: &AgentFanoutGroupProjection) -> &'stat
         "finished"
     } else {
         "completed"
-    }
-}
-
-fn fanout_group_status_label(status: AgentFanoutStatus) -> &'static str {
-    match status {
-        AgentFanoutStatus::Planned => "planned",
-        AgentFanoutStatus::Running => "running",
-        AgentFanoutStatus::Finished => "finished",
-        AgentFanoutStatus::Incomplete => "incomplete",
     }
 }
 
@@ -2041,6 +2052,13 @@ mod tests {
         Arc::new(DynamicAgentSpawner::new(router).with_executor(executor))
     }
 
+    fn test_spawner_without_executor() -> Arc<DynamicAgentSpawner> {
+        let transport = Arc::new(astra_messaging::InProcessTransport::new());
+        let tracker = Arc::new(DelegationTracker::new());
+        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
+        Arc::new(DynamicAgentSpawner::new(router))
+    }
+
     fn test_spawn_context(
         spawner: Arc<DynamicAgentSpawner>,
         current_model: Option<&str>,
@@ -2212,8 +2230,141 @@ mod tests {
         assert_eq!(groups[0].group_id, "review-atomic");
         assert_eq!(groups[0].title, "review fanout");
         assert_eq!(groups[0].target_count, 2);
+        assert_eq!(groups[0].parent_run_id.as_deref(), Some("run-parent"));
         assert_eq!(groups[0].slots[0].slot_id.as_deref(), Some("storage"));
         assert_eq!(groups[0].slots[1].slot_id.as_deref(), Some("ui"));
+    }
+
+    #[tokio::test]
+    async fn completed_fanout_blocks_same_turn_direct_spawn_but_not_next_turn() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "analysis-atomic",
+                "title": "analysis fanout",
+                "target_count": 3,
+                "slots": [
+                    {"id": "storage", "description": "Inspect storage", "prompt": "Inspect storage changes."},
+                    {"id": "runtime", "description": "Inspect runtime", "prompt": "Inspect runtime changes."},
+                    {"id": "tests", "description": "Inspect tests", "prompt": "Inspect test coverage."}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["target_count"], 3);
+        assert_eq!(value["completed"], 3);
+        assert_eq!(value["results"].as_array().unwrap().len(), 3);
+        assert!(
+            value["instruction"]
+                .as_str()
+                .is_some_and(|text| text.contains("target_count is complete")
+                    && text.contains("Do not call agent(action='spawn')")),
+            "{value}"
+        );
+        let _ = executor.take_captured_model();
+
+        let blocked = handle_agent_spawn_action(
+            &json!({
+                "description": "Extra analysis",
+                "prompt": "Run one more analysis.",
+                "agent_type": "general-purpose"
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let blocked_value: Value = serde_json::from_str(&blocked).unwrap();
+        assert_eq!(blocked_value["status"], "failed");
+        let error = blocked_value["error"].as_str().unwrap_or_default();
+        assert!(error.contains("already used agent_fanout"), "{error}");
+        assert!(error.contains("target_count 3"), "{error}");
+        assert!(error.contains("get_results"), "{error}");
+        assert_eq!(
+            executor.take_captured_model(),
+            None,
+            "blocked same-turn direct spawn must not launch a child"
+        );
+
+        let mut next_ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        next_ctx.run_id = "run-next-parent".to_string();
+        let allowed = handle_agent_spawn_action(
+            &json!({
+                "description": "Fresh analysis",
+                "prompt": "Analyze in the next user turn.",
+                "agent_type": "general-purpose"
+            }),
+            Some(&next_ctx),
+        )
+        .await;
+        let allowed_value: Value = serde_json::from_str(&allowed).unwrap();
+        assert_eq!(allowed_value["status"], "completed");
+        assert_eq!(
+            executor.take_captured_model().as_deref(),
+            Some("MiniMax-M2.7")
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_executor_unavailable_records_rejected_slot_and_blocks_direct_replacement() {
+        let spawner = test_spawner_without_executor();
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "startup-unavailable",
+                "target_count": 1,
+                "slots": [
+                    {"id": "startup", "description": "Inspect startup", "prompt": "Inspect startup path."}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(value["status"], "failed_to_start");
+        assert_eq!(value["spawn_rejected"], 1);
+        assert!(
+            value["instruction"]
+                .as_str()
+                .is_some_and(|text| text.contains("Do not retry")),
+            "{value}"
+        );
+
+        let groups = spawner.list_fanout_groups().await;
+        assert_eq!(groups.len(), 1);
+        let summary = groups[0].summary();
+        assert_eq!(summary.spawn_rejected, 1);
+        assert_eq!(summary.terminal, 1);
+        assert_eq!(summary.active, 0);
+        assert_eq!(
+            groups[0].slots[0].terminal_reason.as_deref(),
+            Some("agent executor unavailable")
+        );
+
+        let blocked = handle_agent_spawn_action(
+            &json!({
+                "description": "Replacement",
+                "prompt": "Try to replace the failed slot.",
+                "agent_type": "general-purpose"
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let blocked_value: Value = serde_json::from_str(&blocked).unwrap();
+        assert_eq!(blocked_value["status"], "failed");
+        assert!(
+            blocked_value["error"]
+                .as_str()
+                .is_some_and(|text| text.contains("already used agent_fanout")),
+            "{blocked_value}"
+        );
     }
 
     #[tokio::test]
@@ -2588,12 +2739,16 @@ mod tests {
             &json!({
                 "action": "start",
                 "group_id": "review-atomic",
-                "target_count": 1,
+                "target_count": 2,
                 "slots": [
                     {
                         "description": "Review storage",
                         "prompt": "Review storage changes",
                         "agent_type": "not-a-real-agent-type"
+                    },
+                    {
+                        "description": "Review runtime",
+                        "prompt": "Review runtime changes"
                     }
                 ]
             }),
@@ -2611,7 +2766,7 @@ mod tests {
         let value: Value = serde_json::from_str(&result).unwrap();
 
         assert_eq!(value["status"], "failed_to_start");
-        assert_eq!(value["results"].as_array().unwrap().len(), 1);
+        assert_eq!(value["results"].as_array().unwrap().len(), 2);
         assert_eq!(value["results"][0]["slot_index"], 0);
         assert_eq!(value["results"][0]["status"], "spawn_rejected");
         assert!(
@@ -2620,6 +2775,9 @@ mod tests {
                 .is_some_and(|error| error.contains("unknown agent type")),
             "rejected slot result should preserve the rejection reason: {value}"
         );
+        assert_eq!(value["results"][1]["slot_index"], 1);
+        assert_eq!(value["results"][1]["result"]["status"], "completed");
+        assert_eq!(value["completed"], 1);
         assert_eq!(value["spawn_rejected"], 1);
     }
 
@@ -2653,6 +2811,24 @@ mod tests {
         assert_eq!(value["results"][0]["slot_index"], 0);
         assert_eq!(value["results"][0]["result"]["status"], "failed");
         assert_eq!(value["failed"], 1);
+
+        let blocked = handle_agent_spawn_action(
+            &json!({
+                "description": "Replacement",
+                "prompt": "Try to replace the failed slot.",
+                "agent_type": "general-purpose"
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let blocked_value: Value = serde_json::from_str(&blocked).unwrap();
+        assert_eq!(blocked_value["status"], "failed");
+        assert!(
+            blocked_value["error"]
+                .as_str()
+                .is_some_and(|text| text.contains("already used agent_fanout")),
+            "{blocked_value}"
+        );
     }
 
     #[tokio::test]

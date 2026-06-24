@@ -715,13 +715,12 @@ pub struct DynamicAgentSpawner {
     /// the pure fanout projection so runtime queries avoid scanning every
     /// group and slot.
     fanout_agent_index: Arc<RwLock<HashMap<String, String>>>,
-    /// Cached count of active fanout slots (Running status).  Derived
-    /// from fanout_groups state — never drifts because there is no
-    /// separate increment/decrement path to keep in sync.
+    /// Cached count of active fanout slots (Running status). Derived from
+    /// `fanout_groups`; state-transition paths update it for cheap telemetry.
     ///
-    /// Updated atomically on every state transition for O(1) spawn-gate
-    /// checks.  Call `repair_fanout_slot_count` to recompute from
-    /// authoritative state (e.g. after crash recovery or poison).
+    /// Updated atomically on every state transition for cheap fanout
+    /// telemetry. Call `repair_fanout_slot_count` to recompute from
+    /// authoritative state after crash recovery or poison.
     cached_active_fanout_slots: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -846,6 +845,34 @@ impl DynamicAgentSpawner {
         let mut groups: Vec<_> = self.fanout_groups.read().await.values().cloned().collect();
         groups.sort_by(|a, b| a.group_id.cmp(&b.group_id));
         groups
+    }
+
+    pub async fn declare_fanout_group(
+        &self,
+        group_id: &str,
+        title: &str,
+        target_count: usize,
+        created_by_tool_use_id: Option<&str>,
+        parent_run_id: &str,
+    ) -> Result<(), SpawnError> {
+        let identity = AgentFanoutSlotIdentity::new(group_id, target_count, 0, None)
+            .map_err(SpawnError::InvalidInput)?;
+        let (mut groups, evicted_agent_ids) = self
+            .get_or_validate_fanout_group(
+                &identity,
+                Some(title),
+                created_by_tool_use_id,
+                parent_run_id,
+            )
+            .await?;
+        let mut index = self.fanout_agent_index.write().await;
+        for evicted_agent_id in &evicted_agent_ids {
+            index.remove(evicted_agent_id);
+        }
+        if let Some(group) = groups.get_mut(group_id) {
+            group.touch();
+        }
+        Ok(())
     }
 
     pub async fn set_fanout_group_budget_adjustment(
@@ -987,6 +1014,7 @@ impl DynamicAgentSpawner {
         identity: &AgentFanoutSlotIdentity,
         group_title: Option<&str>,
         created_by_tool_use_id: Option<&str>,
+        parent_run_id: &str,
     ) -> Result<
         (
             tokio::sync::RwLockWriteGuard<'_, HashMap<String, AgentFanoutGroupProjection>>,
@@ -1008,8 +1036,21 @@ impl DynamicAgentSpawner {
                 identity.target_count,
             );
             group.created_by_tool_use_id = created_by_tool_use_id.map(ToString::to_string);
+            group.parent_run_id = Some(parent_run_id.to_string());
             group
         });
+        match group.parent_run_id.as_deref() {
+            Some(existing_parent_run_id) if existing_parent_run_id != parent_run_id => {
+                return Err(SpawnError::InvalidInput(format!(
+                    "fanout group '{}' belongs to parent_run_id '{}', not '{}'",
+                    identity.group_id, existing_parent_run_id, parent_run_id
+                )));
+            }
+            None => {
+                group.parent_run_id = Some(parent_run_id.to_string());
+            }
+            Some(_) => {}
+        }
         if group.target_count != identity.target_count {
             return Err(SpawnError::InvalidInput(format!(
                 "fanout group '{}' target_count changed from {} to {}",
@@ -1045,9 +1086,15 @@ impl DynamicAgentSpawner {
         agent_type: &str,
         description: &str,
         created_by_tool_use_id: Option<&str>,
+        parent_run_id: &str,
     ) -> Result<(), SpawnError> {
         let (mut groups, evicted_agent_ids) = self
-            .get_or_validate_fanout_group(identity, group_title, created_by_tool_use_id)
+            .get_or_validate_fanout_group(
+                identity,
+                group_title,
+                created_by_tool_use_id,
+                parent_run_id,
+            )
             .await?;
         // Acquire the index lock while still holding `groups` to close the
         // TOCTOU window: no concurrent eviction can race between our group
@@ -1088,9 +1135,15 @@ impl DynamicAgentSpawner {
         description: &str,
         reason: impl Into<String>,
         created_by_tool_use_id: Option<&str>,
+        parent_run_id: &str,
     ) -> Result<(), SpawnError> {
         let (mut groups, evicted_agent_ids) = self
-            .get_or_validate_fanout_group(identity, group_title, created_by_tool_use_id)
+            .get_or_validate_fanout_group(
+                identity,
+                group_title,
+                created_by_tool_use_id,
+                parent_run_id,
+            )
             .await?;
         // Acquire index lock while still holding `groups` to close the
         // TOCTOU window (see `record_fanout_spawn_accepted`).
@@ -1133,9 +1186,21 @@ impl DynamicAgentSpawner {
                     &input.description,
                     reason,
                     context.spawn_tool_call_id.as_deref(),
+                    &context.parent_run_id,
                 )
                 .await;
         }
+    }
+
+    async fn fanout_group_for_parent_run(
+        &self,
+        parent_run_id: &str,
+    ) -> Option<(String, usize, AgentFanoutStatus)> {
+        let groups = self.fanout_groups.read().await;
+        groups
+            .values()
+            .find(|group| group.parent_run_id.as_deref() == Some(parent_run_id))
+            .map(|group| (group.group_id.clone(), group.target_count, group.status))
     }
 
     async fn record_fanout_terminal_state(&self, state: &SpawnedAgentState) {
@@ -1425,24 +1490,37 @@ impl DynamicAgentSpawner {
         input: SpawnAgentInput,
         context: &SpawnContext,
     ) -> Result<SpawnAgentOutput, SpawnError> {
-        if context.parent_is_fork_child && input.inherit_prefix.is_some() {
-            return Err(SpawnError::NestedForkInheritanceRejected);
-        }
-
         let fanout_slot = input
             .fanout_slot_identity()
             .map_err(SpawnError::InvalidInput)?;
+        if context.parent_is_fork_child && input.inherit_prefix.is_some() {
+            self.record_fanout_spawn_rejected_for_input(
+                fanout_slot.as_ref(),
+                &input,
+                context,
+                "nested fork inheritance is rejected",
+            )
+            .await;
+            return Err(SpawnError::NestedForkInheritanceRejected);
+        }
 
-        // Enforce fanout boundary: if parent has active fanout groups,
-        // all spawns MUST declare fanout metadata. This prevents the LLM
-        // from spawning "orphan" agents that bypass the fixed-size group
-        // contract and corrupt accounting.
+        // Enforce fanout boundary: once a parent run uses a fixed-size
+        // fanout group, bare spawns in that run are replacement/retry
+        // attempts that bypass the group contract. A later user turn has
+        // a new parent_run_id and is unaffected.
         if fanout_slot.is_none() {
-            let active_fanout_slots = self.repair_fanout_slot_count().await;
-            if active_fanout_slots > 0 {
-                return Err(SpawnError::InvalidInput(
-                    "parent has active fanout group(s); all spawns must declare fanout_group_id, fanout_target_count, and fanout_slot_index. Use agent_fanout(action='start', ...) for new fanouts, or wait for existing fanouts to complete.".to_string()
-                ));
+            if let Some((group_id, target_count, status)) = self
+                .fanout_group_for_parent_run(&context.parent_run_id)
+                .await
+            {
+                return Err(SpawnError::InvalidInput(format!(
+                    "parent run '{}' already used agent_fanout group '{}' with fixed target_count {} (status: {}). Do not call agent(action='spawn') to add, retry, or replace agents in the same turn. Present the fanout results, use agent_fanout(action='get_results', group_id='{}') if needed, or ask the user before starting another fanout.",
+                    context.parent_run_id,
+                    group_id,
+                    target_count,
+                    status.as_str(),
+                    group_id
+                )));
             }
         }
 
@@ -1550,6 +1628,13 @@ impl DynamicAgentSpawner {
             });
         }
         let Some(executor) = self.executor.as_ref().cloned() else {
+            self.record_fanout_spawn_rejected_for_input(
+                fanout_slot.as_ref(),
+                &input,
+                context,
+                "agent executor unavailable",
+            )
+            .await;
             return Err(SpawnError::ExecutorUnavailable);
         };
 
@@ -1591,6 +1676,7 @@ impl DynamicAgentSpawner {
                                 &input.description,
                                 format!("concurrency limit reached: {active}/{limit} active"),
                                 context.spawn_tool_call_id.as_deref(),
+                                &context.parent_run_id,
                             )
                             .await;
                     }
@@ -1682,6 +1768,13 @@ impl DynamicAgentSpawner {
                         let _ = self.mailbox_router.unregister(addr).await;
                     }
                     cleanup_agent_worktree(worktree_path.as_ref(), &agent_id);
+                    self.record_fanout_spawn_rejected_for_input(
+                        fanout_slot.as_ref(),
+                        &input,
+                        context,
+                        format!("agent {agent_id} was cancelled before spawn completed"),
+                    )
+                    .await;
                     return Err(SpawnError::Race(format!(
                         "agent {agent_id} was cancelled before spawn completed"
                     )));
@@ -1700,6 +1793,7 @@ impl DynamicAgentSpawner {
                     &input.agent_type,
                     &input.description,
                     context.spawn_tool_call_id.as_deref(),
+                    &context.parent_run_id,
                 )
                 .await
         {
@@ -4297,24 +4391,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_gate_repairs_stale_fanout_slot_cache_before_rejecting() {
+    async fn direct_spawn_is_blocked_only_for_parent_run_that_declared_fanout() {
         let spawner = DynamicAgentSpawner::new(mock_router())
             .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
+
         spawner
-            .cached_active_fanout_slots
-            .store(1, std::sync::atomic::Ordering::SeqCst);
+            .declare_fanout_group("fanout-a", "fanout A", 2, Some("call-a"), "parent-a")
+            .await
+            .expect("declaring a fanout group should succeed");
 
-        let result = spawner.spawn(make_bg_input(), &make_bg_context()).await;
+        let mut same_parent = make_bg_context();
+        same_parent.parent_run_id = "parent-a".to_string();
+        let blocked = spawner.spawn(make_bg_input(), &same_parent).await;
+        let err = blocked.expect_err("same parent run must not bypass fanout with direct spawn");
+        let message = err.to_string();
+        assert!(message.contains("already used agent_fanout"), "{message}");
+        assert!(message.contains("fanout-a"), "{message}");
 
+        let cross_parent_reuse = spawner
+            .declare_fanout_group("fanout-a", "fanout A", 2, Some("call-b"), "parent-b")
+            .await;
+        let err = cross_parent_reuse.expect_err("group ids must not be reused across parent runs");
+        let message = err.to_string();
         assert!(
-            result.is_ok(),
-            "stale cache with no authoritative active fanout slots must be repaired before spawn gate rejects: {result:?}"
+            message.contains("belongs to parent_run_id 'parent-a'"),
+            "{message}"
         );
-        assert_eq!(
-            spawner
-                .cached_active_fanout_slots
-                .load(std::sync::atomic::Ordering::SeqCst),
-            0
+
+        let mut other_parent = make_bg_context();
+        other_parent.parent_run_id = "parent-b".to_string();
+        let allowed = spawner.spawn(make_bg_input(), &other_parent).await;
+        assert!(
+            matches!(allowed, Ok(SpawnAgentOutput::Launched { .. })),
+            "a different parent run must not inherit another run's fanout gate: {allowed:?}"
         );
         spawner
             .shutdown_and_wait(std::time::Duration::from_secs(2))
@@ -4336,6 +4445,7 @@ mod tests {
                 "explore",
                 "review storage",
                 Some("call-1"),
+                "parent-123",
             )
             .await
             .unwrap();
