@@ -65,17 +65,13 @@ ASTRA_API_HOST=0.0.0.0 ASTRA_API_PORT=8000 astra-server
 
 Features: structured JSON logging, JWT auth, rate limiting (60 req/min), health checks, Prometheus metrics.
 
-## Skill Selector Removal Rollout
+## Skill Surfacing
 
-The Rust runtime no longer uses the legacy skill selector. Skills are surfaced
-through the full session-scoped `<available_skills>` catalog; `SkillSearchSettings`
-is retained only for API/config compatibility and is ignored by runtime
-surfacing.
-
-Before rollout, update dashboards and alerts that read selector telemetry. The
-runtime no longer writes `skill_selector_turn_metrics`; existing production
-tables should be retained or archived by deployment tooling if historical
-analysis is still required.
+The Rust runtime no longer exposes legacy dynamic skill-surfacing knobs. Skills
+are surfaced through the session-scoped `<available_skills>` catalog,
+`discover_skills`, explicit `skill` activation, and request-scoped
+`allow_skills` / `allow_skill_sources` constraints. Requests that send the
+removed `skill_search` wire field are rejected by the typed API boundary.
 
 ## Docker
 

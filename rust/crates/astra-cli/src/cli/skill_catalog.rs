@@ -6,11 +6,9 @@ const SUPPORTED_SKILL_SOURCE_FILTERS: &[&str] = astra_skills::SkillSourceKind::S
 /// Hard upper bound on a single `skill list` page. The registry loads every
 /// matching manifest into memory before slicing, so an attacker (or a careless
 /// `--limit 4_294_967_295`) can no longer drag the CLI process into a multi-GB
-/// allocation by setting an absurdly large limit. This is intentionally larger
-/// than the legacy wire-level `SkillSearchSettings::default().surface_cap` (20)
-/// because CLI listing is an explicit operator action rather than prompt
-/// surfacing, but still bounded tightly enough to avoid pathological memory
-/// use from absurd page sizes.
+/// allocation by setting an absurdly large limit. CLI listing is an explicit
+/// operator action rather than prompt surfacing, but still bounded tightly
+/// enough to avoid pathological memory use from absurd page sizes.
 pub(crate) const SKILL_CATALOG_MAX_LIMIT: u32 = 500;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

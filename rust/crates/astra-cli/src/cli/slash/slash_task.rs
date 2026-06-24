@@ -323,7 +323,6 @@ pub(crate) async fn handle_task_command(
             let bg_history = state.history.clone();
             let bg_cli_context = state.cli_context.clone();
             let bg_unified_skill_registry = state.unified_skill_registry.clone();
-            let bg_skill_search = state.skill_search.clone();
             let bg_messaging_metrics = state.messaging_metrics.clone();
             let bg_agent_spawner = state.agent_spawner.clone();
             let bg_delegation_engine = state.delegation_engine.clone();
@@ -408,7 +407,6 @@ pub(crate) async fn handle_task_command(
                     ask_user_request_tx: None,
                     plan_review_request_tx: None,
                     mcp_manager: None,
-                    skill_search: &bg_skill_search,
                     skill_quality_tracker: &mut skill_qt,
                     discovered_skills: None,
                     messaging_metrics: bg_messaging_metrics.clone(),

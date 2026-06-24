@@ -37,7 +37,6 @@ pub(crate) async fn build_one_shot_spawner(
     api: &astra_thin_client::ThinClient,
     token: String,
     unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
-    skill_search: astra_core::SkillSearchSettings,
     session_id: Option<String>,
     default_model: Option<String>,
 ) -> std::sync::Arc<astra_runtime::orchestration::DynamicAgentSpawner> {
@@ -57,8 +56,7 @@ pub(crate) async fn build_one_shot_spawner(
     let mut spawn_executor =
         spawn_subrun::CliSpawnAgentExecutor::new(api.clone(), token, project_root, None)
             .with_default_model(default_model)
-            .with_skill_resolver(skill_resolver)
-            .with_skill_search(skill_search);
+            .with_skill_resolver(skill_resolver);
     // One-shot `chat -m` uses the captured token only — no profile to
     // re-read from. The token-provider wiring lives on the REPL path
     // (`initialize_multi_agent_runtime`) where token rotation is real.
@@ -199,7 +197,6 @@ pub(crate) async fn initialize_multi_agent_runtime(
         None,
     )
     .with_skill_resolver(skill_resolver.clone())
-    .with_skill_search(state.skill_search.clone())
     .with_progress_broadcaster(progress_broadcaster.clone());
     if let Some(sink) = delegate_fork_cache_sink.clone() {
         delegate_executor = delegate_executor.with_fork_cache_sink(sink);
@@ -229,7 +226,6 @@ pub(crate) async fn initialize_multi_agent_runtime(
         spawn_subrun::CliSpawnAgentExecutor::new(api.clone(), token, project_root, None)
             .with_default_model(state.model.clone())
             .with_skill_resolver(skill_resolver)
-            .with_skill_search(state.skill_search.clone())
             .with_bg_task_commands(state.bg_task_commands.clone())
             .with_bg_task_list_cache(state.bg_task_list_cache.clone());
     // Wire a token provider so each spawn reads the freshest access

@@ -219,7 +219,6 @@ struct PrepareChatTurnRequest<'a> {
     file_context: &'a [String],
     assembly_start: Instant,
     telem: PrepareTurnTelemetry<'a>,
-    skill_search: &'a astra_core::SkillSearchSettings,
     is_plan_subtask: bool,
     plan_subtask_id: Option<&'a str>,
     /// When true, emit `[chat-turn timing] …` lines to stderr (see `chat_turn_timing_stderr_enabled`).
@@ -790,7 +789,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     inject_runtime_turn_overrides(
         &mut payload,
-        ctx.skill_search,
         ctx.is_plan_subtask,
         ctx.plan_subtask_id,
         ctx.skill_effort.as_deref(),
@@ -992,7 +990,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
 fn inject_runtime_turn_overrides(
     payload: &mut Value,
-    skill_search: &astra_core::SkillSearchSettings,
     is_plan_subtask: bool,
     plan_subtask_id: Option<&str>,
     skill_effort: Option<&str>,
@@ -1001,11 +998,6 @@ fn inject_runtime_turn_overrides(
     let Some(root) = payload.as_object_mut() else {
         return;
     };
-
-    root.insert(
-        "skill_search".into(),
-        serde_json::to_value(skill_search).unwrap_or_else(|_| json!({})),
-    );
 
     if is_plan_subtask {
         root.insert("is_plan_subtask".into(), json!(true));
@@ -1088,7 +1080,6 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub assembly_start: Instant,
     pub telem: PrepareTurnTelemetry<'a>,
     pub perm_manager: &'a mut PermissionManager,
-    pub skill_search: &'a astra_core::SkillSearchSettings,
     /// Lines from the previous headless tool round that must be cleared
     /// before the next SSE stream starts rendering.
     pub pre_clear_lines: usize,
@@ -1241,7 +1232,6 @@ pub(crate) async fn fetch_chat_turn_sse(
         assembly_start,
         telem,
         perm_manager,
-        skill_search,
         pre_clear_lines,
         is_plan_subtask,
         plan_subtask_id,
@@ -1304,7 +1294,6 @@ pub(crate) async fn fetch_chat_turn_sse(
             file_context,
             assembly_start,
             telem,
-            skill_search,
             is_plan_subtask,
             plan_subtask_id,
             timing_phases: ui.timing,
@@ -1430,24 +1419,17 @@ mod tests {
     }
 
     #[test]
-    fn inject_runtime_turn_overrides_adds_skill_search_and_plan_fields() {
+    fn inject_runtime_turn_overrides_adds_plan_fields() {
         let mut payload = json!({});
         inject_runtime_turn_overrides(
             &mut payload,
-            &astra_core::SkillSearchSettings {
-                dynamic_surface: false,
-                min_catalog_size: 12,
-                surface_cap: 20,
-            },
             true,
             Some("sub-1"),
             Some("high"),
             Some("coder"),
         );
 
-        assert_eq!(payload["skill_search"]["dynamic_surface"], json!(false));
-        assert_eq!(payload["skill_search"]["min_catalog_size"], json!(12));
-        assert_eq!(payload["skill_search"]["surface_cap"], json!(20));
+        assert!(payload.get("skill_search").is_none());
         assert_eq!(payload["is_plan_subtask"], json!(true));
         assert_eq!(payload["rollback_on_failure"], json!(true));
         assert_eq!(payload["rollback_boundary"], json!("turn"));
@@ -1923,7 +1905,6 @@ mod tests {
         let mut widen_surface_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
-        let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
         let mut first_surface_report = None;
@@ -1962,7 +1943,6 @@ mod tests {
                 all_selected_skills: &mut all_selected_skills,
                 trace_collector: None,
             },
-            skill_search: &skill_search,
             is_plan_subtask: false,
             plan_subtask_id: None,
             timing_phases: false,
@@ -2102,7 +2082,6 @@ mod tests {
         let mut widen_surface_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
-        let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
         let mut first_surface_report = None;
@@ -2141,7 +2120,6 @@ mod tests {
                 all_selected_skills: &mut all_selected_skills,
                 trace_collector: None,
             },
-            skill_search: &skill_search,
             is_plan_subtask: false,
             plan_subtask_id: None,
             timing_phases: false,
@@ -2222,7 +2200,6 @@ mod tests {
         let mut step_recorder =
             StepRecorder::new("test-user", "session-empty-selector", "task-empty-selector");
         let turn_guard = TurnGuard::default();
-        let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
         let mut first_surface_report = None;
@@ -2261,7 +2238,6 @@ mod tests {
                 all_selected_skills: &mut all_selected_skills,
                 trace_collector: None,
             },
-            skill_search: &skill_search,
             is_plan_subtask: false,
             plan_subtask_id: None,
             timing_phases: false,
@@ -2376,7 +2352,6 @@ mod tests {
                 all_selected_skills: &mut all_selected_skills,
                 trace_collector: None,
             },
-            skill_search: &skill_search,
             is_plan_subtask: false,
             plan_subtask_id: None,
             timing_phases: false,
@@ -2470,7 +2445,6 @@ mod tests {
                 all_selected_skills: &mut all_selected_skills,
                 trace_collector: None,
             },
-            skill_search: &skill_search,
             is_plan_subtask: false,
             plan_subtask_id: None,
             timing_phases: false,
@@ -2543,7 +2517,6 @@ mod tests {
         let mut widen_surface_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
-        let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
         let mut first_surface_report = None;
@@ -2582,7 +2555,6 @@ mod tests {
                 all_selected_skills: &mut all_selected_skills,
                 trace_collector: None,
             },
-            skill_search: &skill_search,
             is_plan_subtask: false,
             plan_subtask_id: None,
             timing_phases: false,
@@ -2653,7 +2625,6 @@ mod tests {
         let mut widen_surface_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
-        let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
         let mut first_surface_report = None;
@@ -2695,7 +2666,6 @@ mod tests {
                 all_selected_skills: &mut all_selected_skills,
                 trace_collector: Some(&trace_collector),
             },
-            skill_search: &skill_search,
             is_plan_subtask: false,
             plan_subtask_id: None,
             timing_phases: false,
@@ -2780,7 +2750,6 @@ mod tests {
         let mut widen_surface_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
-        let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
         let mut first_surface_report = None;
@@ -2819,7 +2788,6 @@ mod tests {
                 all_selected_skills: &mut all_selected_skills,
                 trace_collector: None,
             },
-            skill_search: &skill_search,
             is_plan_subtask: false,
             plan_subtask_id: None,
             timing_phases: false,
@@ -2904,7 +2872,6 @@ mod tests {
         let mut widen_surface_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
-        let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
         let mut first_surface_report = None;
@@ -2943,7 +2910,6 @@ mod tests {
                 all_selected_skills: &mut all_selected_skills,
                 trace_collector: None,
             },
-            skill_search: &skill_search,
             is_plan_subtask: false,
             plan_subtask_id: None,
             timing_phases: false,
@@ -3014,7 +2980,6 @@ mod tests {
         let mut widen_surface_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
-        let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
         let mut first_surface_report = None;
@@ -3053,7 +3018,6 @@ mod tests {
                 all_selected_skills: &mut all_selected_skills,
                 trace_collector: None,
             },
-            skill_search: &skill_search,
             is_plan_subtask: false,
             plan_subtask_id: None,
             timing_phases: false,
@@ -3117,7 +3081,6 @@ mod tests {
         let mut widen_surface_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
-        let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
         let mut first_surface_report = None;
@@ -3156,7 +3119,6 @@ mod tests {
                 all_selected_skills: &mut all_selected_skills,
                 trace_collector: None,
             },
-            skill_search: &skill_search,
             is_plan_subtask: false,
             plan_subtask_id: None,
             timing_phases: false,
@@ -3228,7 +3190,6 @@ mod tests {
         let mut widen_surface_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
-        let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
         let mut first_surface_report = None;
@@ -3267,7 +3228,6 @@ mod tests {
                 all_selected_skills: &mut all_selected_skills,
                 trace_collector: None,
             },
-            skill_search: &skill_search,
             is_plan_subtask: false,
             plan_subtask_id: None,
             timing_phases: false,
@@ -3335,7 +3295,6 @@ mod tests {
         turn_guard.health.record_failure("write_file");
         turn_guard.health.record_failure("write_file");
         turn_guard.health.record_failure("write_file");
-        let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
         let mut first_surface_report = None;
@@ -3374,7 +3333,6 @@ mod tests {
                 all_selected_skills: &mut all_selected_skills,
                 trace_collector: None,
             },
-            skill_search: &skill_search,
             is_plan_subtask: false,
             plan_subtask_id: None,
             timing_phases: false,
@@ -3437,7 +3395,6 @@ mod tests {
                 all_selected_skills: &mut all_selected_skills,
                 trace_collector: None,
             },
-            skill_search: &skill_search,
             is_plan_subtask: false,
             plan_subtask_id: None,
             timing_phases: false,

@@ -157,7 +157,6 @@ fn build_turn_stream_params<'a>(
         ask_user_request_tx: state.tui_ask_user_request_tx.clone(),
         plan_review_request_tx: state.tui_plan_review_request_tx.clone(),
         mcp_manager: Some(state.mcp_manager.clone()),
-        skill_search: &state.skill_search,
         skill_quality_tracker: &mut state.skill_quality_tracker,
         discovered_skills: Some(&mut state.discovered_skills),
         messaging_metrics: state.messaging_metrics.clone(),

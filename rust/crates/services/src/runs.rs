@@ -437,7 +437,6 @@ pub struct ChatRequestData {
     pub runtime_auth: Option<RuntimeAuthRequest>,
     pub runtime_profile: Option<RuntimeProfileRequest>,
     pub llm_token_service: Option<LlmTokenServiceConfig>,
-    pub skill_search: Option<astra_core::SkillSearchSettings>,
     pub allow_skills: Option<Vec<String>>,
     pub allow_skill_sources: Option<Vec<String>>,
     pub allow_tools: Option<Vec<String>>,
@@ -490,7 +489,6 @@ impl std::fmt::Debug for ChatRequestData {
             .field("runtime_auth", &self.runtime_auth)
             .field("runtime_profile", &self.runtime_profile)
             .field("llm_token_service", &self.llm_token_service)
-            .field("skill_search", &self.skill_search)
             .field("allow_skills", &self.allow_skills)
             .field("allow_skill_sources", &self.allow_skill_sources)
             .field("allow_tools", &self.allow_tools)
@@ -4182,7 +4180,6 @@ mod tests {
             runtime_auth: None,
             runtime_profile: None,
             llm_token_service: None,
-            skill_search: None,
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
@@ -4243,7 +4240,6 @@ mod tests {
             }),
             runtime_profile: None,
             llm_token_service: None,
-            skill_search: None,
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
@@ -4318,7 +4314,6 @@ mod tests {
                     runtime_auth: None,
                     runtime_profile: None,
                     llm_token_service: None,
-                    skill_search: None,
                     allow_skills: None,
                     allow_skill_sources: None,
                     allow_tools: None,

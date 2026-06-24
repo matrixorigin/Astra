@@ -247,8 +247,8 @@ skill_eval（v7 + v4 或 v6，取决于 recency policy）。
 也看看，给我对齐一下两版的结构。」
 
 **SQL 写入**：**关键点**——A15 要求这里走 structured query，不走
-RAG。UI 侧发 `intent.skill_search{owner_user_id=老陈, skill_name_
-prefix='rust'}` → server `SELECT source_id, skill_name, created_at
+RAG。UI 侧发 `intent.skill_catalog_lookup{owner_user_id=老陈,
+skill_name_prefix='rust'}` → server `SELECT source_id, skill_name, created_at
 FROM user_skill_sources WHERE user_id=老陈 AND skill_name LIKE 'rust%'
 AND status='active'`，命中 1 行 `src-rust-code-review`；再
 `SELECT version, version_id, content_hash FROM user_skill_versions

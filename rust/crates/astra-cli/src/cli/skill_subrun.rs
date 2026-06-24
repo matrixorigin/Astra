@@ -10,7 +10,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use astra_core::SkillSearchSettings;
 use astra_runtime::{
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
@@ -235,9 +234,6 @@ impl AgenticLoopHost for SubRunHost {
         if let Some(ref agent_type) = self.agent_type {
             payload["agent_type"] = json!(agent_type);
         }
-        payload["skill_search"] =
-            serde_json::to_value(&state.skills.search).unwrap_or_else(|_| json!({}));
-
         // Attach tool schemas. In fork mode, prefer the parent's frozen
         // canonical schemas so the tool-schema hash matches the parent's
         // cached prefix (cache key alignment). Falls back to live
@@ -446,8 +442,6 @@ pub(crate) struct CliSkillSubRunExecutor {
     cancel_token: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
     /// Skill resolver inherited from parent — enables nested skill invocations.
     skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
-    /// Same surfacing policy as the parent loop / session state.
-    skill_search: SkillSearchSettings,
     /// Parent interactive session id for self-introspection persistence.
     active_session_id: Option<String>,
 }
@@ -470,7 +464,6 @@ impl CliSkillSubRunExecutor {
             inherited_permissions,
             cancel_token,
             skill_resolver: None,
-            skill_search: SkillSearchSettings::default(),
             active_session_id: None,
         }
     }
@@ -481,11 +474,6 @@ impl CliSkillSubRunExecutor {
         resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     ) -> Self {
         self.skill_resolver = resolver;
-        self
-    }
-
-    pub fn with_skill_search(mut self, skill_search: SkillSearchSettings) -> Self {
-        self.skill_search = skill_search;
         self
     }
 
@@ -681,7 +669,6 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
                 resolver: self.skill_resolver.clone(),
                 quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
                 improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
-                search: self.skill_search.clone(),
                 tool_event_hooks: astra_skills::hooks::load_tool_event_hooks(&self.project_root),
                 session_event_hooks: astra_skills::hooks::load_session_event_hooks(
                     &self.project_root,

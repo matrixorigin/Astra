@@ -544,43 +544,6 @@ impl ServerConfig {
     }
 }
 
-/// Legacy skill catalog surfacing knobs.
-///
-/// Skill search surface configuration.
-///
-/// Currently a pass-through container — the runtime surfaces the full skill
-/// catalog and these values are forwarded as-is to downstream consumers.
-/// Reserved for future re-enablement of selector-based capped surfacing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SkillSearchSettings {
-    /// Dynamic surface flag (reserved).
-    #[serde(default = "default_dynamic_surface")]
-    pub dynamic_surface: bool,
-    /// Minimum catalog size (reserved).
-    #[serde(default)]
-    pub min_catalog_size: usize,
-    /// Surface cap (reserved).
-    #[serde(default = "default_surface_cap")]
-    pub surface_cap: usize,
-}
-
-fn default_dynamic_surface() -> bool {
-    true
-}
-fn default_surface_cap() -> usize {
-    20
-}
-
-impl Default for SkillSearchSettings {
-    fn default() -> Self {
-        Self {
-            dynamic_surface: true,
-            min_catalog_size: 0,
-            surface_cap: 20,
-        }
-    }
-}
-
 #[derive(Clone, PartialEq, Eq)]
 pub struct AppSettings {
     pub matrixone: MatrixOneSettings,

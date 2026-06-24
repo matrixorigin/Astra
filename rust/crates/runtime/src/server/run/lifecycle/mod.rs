@@ -760,16 +760,6 @@ fn flush_turn_observability(state: &mut AgenticLoopState, session_id: &str, inte
     }
 }
 
-fn skill_search_from_context(
-    context: &std::collections::HashMap<String, serde_json::Value>,
-) -> astra_core::SkillSearchSettings {
-    context
-        .get("skill_search")
-        .cloned()
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_default()
-}
-
 fn build_runtime_evaluation_service(
     matrixone: &MatrixOneSettings,
     shared_pool: &SharedPool,
@@ -3190,7 +3180,6 @@ impl AgenticRunLifecycleService {
             })
             .unwrap_or_default();
         let workspace_root_hint = project_root_buf.map(|p| p.to_string_lossy().into_owned());
-        let skill_search = request.skill_search.clone().unwrap_or_default();
         let (tool_event_hooks, session_event_hooks) = workspace_root_hint
             .as_ref()
             .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
@@ -3314,7 +3303,6 @@ impl AgenticRunLifecycleService {
                 request_constraints,
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
                 improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
-                search: skill_search,
                 tool_event_hooks,
                 session_event_hooks,
                 ..Default::default()
@@ -7188,7 +7176,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 request_constraints: config.request_constraints.clone(),
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
                 improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
-                search: skill_search_from_context(&config.context),
                 tool_event_hooks,
                 session_event_hooks,
                 ..Default::default()
@@ -9014,7 +9001,6 @@ mod tests {
             runtime_auth: None,
             runtime_profile: None,
             llm_token_service: None,
-            skill_search: None,
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
@@ -11681,7 +11667,6 @@ mod tests {
             runtime_auth: None,
             runtime_profile: None,
             llm_token_service: None,
-            skill_search: None,
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
@@ -11840,7 +11825,6 @@ mod tests {
             runtime_auth: None,
             runtime_profile: None,
             llm_token_service: None,
-            skill_search: None,
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,

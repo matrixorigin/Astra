@@ -393,8 +393,6 @@ pub(crate) struct ChatTurnParams<'a> {
     /// MCP client manager for external tool servers.
     pub(crate) mcp_manager:
         Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
-    /// Session-scoped skill surfacing policy for this REPL / plan execution.
-    pub(crate) skill_search: &'a astra_core::SkillSearchSettings,
     /// Session-scoped skill quality tracker for learning loop.
     pub(crate) skill_quality_tracker: &'a mut astra_skills::quality::SkillQualityTracker,
     /// Session-scoped discover cache so surfaced skills survive across user turns.
@@ -510,7 +508,6 @@ pub(crate) struct BasicCliChatContext<'a> {
     pub cli_context: Option<&'a CliContext>,
 
     pub unified_skill_registry: &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
-    pub skill_search: &'a astra_core::SkillSearchSettings,
     /// Optional agent spawner so `astra chat -m` (non-REPL one-shot)
     /// can trigger `agent(action='spawn', ...)` just like the interactive
     /// REPL does. When `None`, agent spawning returns "not available" —
@@ -598,7 +595,6 @@ impl<'a> ChatTurnParams<'a> {
             ask_user_request_tx: None,
             plan_review_request_tx: None,
             mcp_manager: None,
-            skill_search: ctx.skill_search,
             skill_quality_tracker,
             discovered_skills: None,
             messaging_metrics: None,

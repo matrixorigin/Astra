@@ -345,8 +345,6 @@ pub(crate) struct SessionState {
     pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     /// Session-scoped skill quality tracker for learning loop.
     pub skill_quality_tracker: astra_skills::quality::SkillQualityTracker,
-    /// Session-scoped skill surfacing config for dynamic tuning.
-    pub skill_search: astra_core::SkillSearchSettings,
     /// Skill auto-improvement tracker — detects user corrections and proposes SKILL.md rewrites.
     pub skill_improvement_tracker: astra_skills::improvement::ImprovementTracker,
     /// Skills surfaced by `discover_skills` during this CLI session.
@@ -649,7 +647,6 @@ impl Default for SessionState {
             runtime_idempotency_cache: None,
             unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
             skill_quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
-            skill_search: astra_core::SkillSearchSettings::default(),
             skill_improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
             discovered_skills: std::collections::HashSet::new(),
             mcp_manager: std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -1003,7 +1000,6 @@ mod default_tests {
     #[test]
     fn reset_for_new_session_preserves_user_preferences() {
         let runtime_config = astra_config::runtime_config::RuntimeConfig::load();
-        let skill_search = astra_core::SkillSearchSettings::default();
         let mut state = SessionState {
             model: Some("gpt-5".into()),
             explain: ExplainMode::Verbose,
@@ -1015,7 +1011,6 @@ mod default_tests {
             max_budget_limit: 12.5,
             project_instructions: Some("follow repo policy".into()),
             runtime_config: runtime_config.clone(),
-            skill_search: skill_search.clone(),
             ..Default::default()
         };
 
@@ -1040,7 +1035,6 @@ mod default_tests {
             serde_json::to_value(&state.runtime_config.tool_policy).unwrap(),
             serde_json::to_value(&runtime_config.tool_policy).unwrap()
         );
-        assert_eq!(state.skill_search, skill_search);
     }
 
     #[test]

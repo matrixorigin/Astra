@@ -1007,7 +1007,6 @@ fn chat_request_into_data_maps_all_fields() {
             url: "http://catalog:8081/api/v1/llm-token".into(),
             timeout_ms: Some(2500),
         }),
-        skill_search: Some(astra_core::SkillSearchSettings::default()),
         allow_skills: None,
         allow_skill_sources: None,
         allow_tools: None,
@@ -1051,10 +1050,6 @@ fn chat_request_into_data_maps_all_fields() {
     assert_eq!(
         data.llm_token_service.as_ref().and_then(|v| v.timeout_ms),
         Some(2500)
-    );
-    assert_eq!(
-        data.skill_search,
-        Some(astra_core::SkillSearchSettings::default())
     );
     assert_eq!(data.runtime_mcp_bindings.len(), 1);
     assert_eq!(data.runtime_mcp_bindings[0].id, "external_nl2sql");
@@ -1112,7 +1107,6 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         workspace_binding: None,
         executor_binding: None,
         llm_token_service: None,
-        skill_search: None,
         allow_skills: None,
         allow_skill_sources: None,
         allow_tools: None,

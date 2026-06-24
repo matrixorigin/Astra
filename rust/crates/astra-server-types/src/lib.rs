@@ -98,8 +98,6 @@ pub struct ChatRequest {
     #[serde(default)]
     pub llm_token_service: Option<astra_services::LlmTokenServiceRequest>,
     #[serde(default)]
-    pub skill_search: Option<astra_core::SkillSearchSettings>,
-    #[serde(default)]
     pub allow_skills: Option<Vec<String>>,
     #[serde(default)]
     pub allow_skill_sources: Option<Vec<String>>,
@@ -572,8 +570,6 @@ pub enum WsClientMessage {
         #[serde(default)]
         agent_id: Option<String>,
         selected_model: astra_services::runs::SelectedModelRequest,
-        #[serde(default)]
-        skill_search: Option<astra_core::SkillSearchSettings>,
         #[serde(default)]
         context: Option<serde_json::Map<String, serde_json::Value>>,
         #[serde(default)]
@@ -1077,7 +1073,6 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         runtime_auth: request.runtime_auth,
         runtime_profile: request.runtime_profile,
         llm_token_service: request.llm_token_service.map(Into::into),
-        skill_search: request.skill_search,
         allow_skills: request.allow_skills,
         allow_skill_sources: request.allow_skill_sources,
         allow_tools: request.allow_tools,

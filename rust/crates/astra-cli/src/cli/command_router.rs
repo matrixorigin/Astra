@@ -528,7 +528,6 @@ async fn execute_headless_task_body(
         .await?;
 
     let pipeline_modules = session_runtime::create_pipeline_modules_quiet(api, profile);
-    let skill_search = astra_core::SkillSearchSettings::default();
     let project_root = std::env::current_dir().unwrap_or_default();
     let mut pm = PermissionManager::with_load_policy(
         effective_permission_mode,
@@ -541,7 +540,6 @@ async fn execute_headless_task_body(
         api,
         token.clone(),
         pipeline_modules.unified_skill_registry.clone(),
-        skill_search.clone(),
         session_id.clone(),
         effective_model.clone(),
     )
@@ -582,7 +580,6 @@ async fn execute_headless_task_body(
         render_policy,
         cli_context: Some(cli_context),
         unified_skill_registry: &pipeline_modules.unified_skill_registry,
-        skill_search: &skill_search,
         agent_spawner: Some(spawner),
         root_agent_id: Some(&root_agent_id),
         task_manager: Some(task_manager),
@@ -1311,7 +1308,6 @@ async fn execute_cli_command_impl(
                 &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
             );
             let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-            let skill_search = astra_core::SkillSearchSettings::default();
             let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
                 api,
                 auth_profile: profile.as_deref(),
@@ -1324,7 +1320,6 @@ async fn execute_cli_command_impl(
                 render_policy: crate::cli::stream::stream_render::RenderPolicy::Stream,
                 cli_context: Some(cli_context),
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
-                skill_search: &skill_search,
                 agent_spawner: None,
                 root_agent_id: None,
                 task_manager: None,
@@ -1816,7 +1811,6 @@ async fn execute_cli_command_impl(
             let render_md = is_tty && !quiet;
 
             let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-            let skill_search = astra_core::SkillSearchSettings::default();
             let render_policy = if quiet {
                 crate::cli::stream::stream_render::RenderPolicy::Silent
             } else {
@@ -1830,7 +1824,6 @@ async fn execute_cli_command_impl(
                 api,
                 token.clone(),
                 astra_runtime::skills::default_unified_registry().clone(),
-                skill_search.clone(),
                 session_id.clone(),
                 effective_model.clone(),
             )
@@ -1879,7 +1872,6 @@ async fn execute_cli_command_impl(
                 render_policy,
                 cli_context: Some(cli_context),
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
-                skill_search: &skill_search,
                 agent_spawner: Some(one_shot_spawner),
                 root_agent_id: Some(&root_agent_id),
                 task_manager: Some(chat_task_manager),
@@ -2600,7 +2592,6 @@ pub(crate) async fn run_print_mode(
         return Ok(ExitCode::ToolFailure);
     }
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-    let skill_search = astra_core::SkillSearchSettings::default();
 
     // Print mode wires an MO-backed TaskManager when available so that the
     // `task` tool's writes land in `session_todos` the same way the REPL
@@ -2626,7 +2617,6 @@ pub(crate) async fn run_print_mode(
         render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
         cli_context: Some(cli_context),
         unified_skill_registry: astra_runtime::skills::default_unified_registry(),
-        skill_search: &skill_search,
         agent_spawner: None,
         root_agent_id: None,
         task_manager: Some(print_task_manager),

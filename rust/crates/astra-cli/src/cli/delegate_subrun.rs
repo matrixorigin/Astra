@@ -11,7 +11,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use astra_core::SkillSearchSettings;
 use astra_runtime::{
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
@@ -103,7 +102,6 @@ pub(crate) struct CliDelegateSubRunExecutor {
     inherited_permissions: astra_runtime::orchestration::InheritedPermissions,
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     skill_resolver: Option<Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
-    skill_search: SkillSearchSettings,
     progress_tx:
         Option<tokio::sync::mpsc::UnboundedSender<super::skill_subrun::SubRunProgressEvent>>,
     /// Global progress broadcaster for emitting events visible in /agent watch.
@@ -141,7 +139,6 @@ impl CliDelegateSubRunExecutor {
             inherited_permissions,
             cancel_token,
             skill_resolver: None,
-            skill_search: SkillSearchSettings::default(),
             progress_tx: None,
             progress_broadcaster: None,
             fork_cache_sink: None,
@@ -166,11 +163,6 @@ impl CliDelegateSubRunExecutor {
         resolver: Option<Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     ) -> Self {
         self.skill_resolver = resolver;
-        self
-    }
-
-    pub fn with_skill_search(mut self, skill_search: SkillSearchSettings) -> Self {
-        self.skill_search = skill_search;
         self
     }
 
@@ -436,7 +428,6 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 resolver: self.skill_resolver.clone(),
                 quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
                 improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
-                search: self.skill_search.clone(),
                 tool_event_hooks: astra_skills::hooks::load_tool_event_hooks(&effective_root),
                 session_event_hooks: astra_skills::hooks::load_session_event_hooks(&effective_root),
                 ..Default::default()

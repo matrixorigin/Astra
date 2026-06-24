@@ -102,7 +102,6 @@ impl<'a> CompactCtx<'a> {
             ask_user_request_tx: None,
             plan_review_request_tx: None,
             mcp_manager: Some(self.state.mcp_manager.clone()),
-            skill_search: &self.state.skill_search,
             skill_quality_tracker: &mut self.state.skill_quality_tracker,
             discovered_skills: None,
             messaging_metrics: self.state.messaging_metrics.clone(),

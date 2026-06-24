@@ -480,7 +480,6 @@ mod tests {
             runtime_auth: None,
             runtime_profile: None,
             llm_token_service: None,
-            skill_search: None,
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,

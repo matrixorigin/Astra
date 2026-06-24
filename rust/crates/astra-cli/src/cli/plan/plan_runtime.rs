@@ -60,7 +60,6 @@ fn take_plan_context(
         recent_tools: state.recent_tools.clone(),
         tool_health_entries: state.tool_health_entries.clone(),
         unified_skill_registry: state.unified_skill_registry.clone(),
-        skill_search: state.skill_search.clone(),
         delegation_engine: state.delegation_engine.clone(),
         messaging_metrics: state.messaging_metrics.clone(),
         agent_spawner: state.agent_spawner.clone(),

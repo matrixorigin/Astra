@@ -46,7 +46,6 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
     let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-    let skill_search = astra_core::SkillSearchSettings::default();
 
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
@@ -84,7 +83,6 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
         ask_user_request_tx: None,
         plan_review_request_tx: None,
         mcp_manager: None,
-        skill_search: &skill_search,
         skill_quality_tracker: &mut skill_qt,
         discovered_skills: None,
         messaging_metrics: None,
@@ -172,7 +170,6 @@ async fn stream_chat_sse_simple_text_response() {
     let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-    let skill_search = astra_core::SkillSearchSettings::default();
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
@@ -209,7 +206,6 @@ async fn stream_chat_sse_simple_text_response() {
         ask_user_request_tx: None,
         plan_review_request_tx: None,
         mcp_manager: None,
-        skill_search: &skill_search,
         skill_quality_tracker: &mut skill_qt,
         discovered_skills: None,
         messaging_metrics: None,
@@ -284,7 +280,6 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
     let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-    let skill_search = astra_core::SkillSearchSettings::default();
 
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
@@ -322,7 +317,6 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         ask_user_request_tx: None,
         plan_review_request_tx: None,
         mcp_manager: None,
-        skill_search: &skill_search,
         skill_quality_tracker: &mut skill_qt,
         discovered_skills: None,
         messaging_metrics: None,
@@ -398,7 +392,6 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             .await
             .unwrap(),
     );
-    let skill_search = astra_core::SkillSearchSettings::default();
 
     for session_id in [None, Some("sess-override")] {
         let mut pm = PermissionManager::new(true);
@@ -439,7 +432,6 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             ask_user_request_tx: None,
             plan_review_request_tx: None,
             mcp_manager: None,
-            skill_search: &skill_search,
             skill_quality_tracker: &mut skill_qt,
             discovered_skills: None,
             messaging_metrics: None,
@@ -508,7 +500,6 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
     let spawner = std::sync::Arc::new(astra_runtime::orchestration::DynamicAgentSpawner::new(
         router.clone(),
     ));
-    let skill_search = astra_core::SkillSearchSettings::default();
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
 
@@ -548,7 +539,6 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
         ask_user_request_tx: None,
         plan_review_request_tx: None,
         mcp_manager: None,
-        skill_search: &skill_search,
         skill_quality_tracker: &mut skill_qt,
         discovered_skills: None,
         messaging_metrics: None,
@@ -648,7 +638,6 @@ async fn stream_chat_sse_api_error_propagated() {
     let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-    let skill_search = astra_core::SkillSearchSettings::default();
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
@@ -685,7 +674,6 @@ async fn stream_chat_sse_api_error_propagated() {
         ask_user_request_tx: None,
         plan_review_request_tx: None,
         mcp_manager: None,
-        skill_search: &skill_search,
         skill_quality_tracker: &mut skill_qt,
         discovered_skills: None,
         messaging_metrics: None,
@@ -761,7 +749,6 @@ async fn stream_chat_sse_with_tool_call_loop() {
     let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true); // auto-approve
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-    let skill_search = astra_core::SkillSearchSettings::default();
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
@@ -798,7 +785,6 @@ async fn stream_chat_sse_with_tool_call_loop() {
         ask_user_request_tx: None,
         plan_review_request_tx: None,
         mcp_manager: None,
-        skill_search: &skill_search,
         skill_quality_tracker: &mut skill_qt,
         discovered_skills: None,
         messaging_metrics: None,
@@ -897,7 +883,6 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
     let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-    let skill_search = astra_core::SkillSearchSettings::default();
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
@@ -934,7 +919,6 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         ask_user_request_tx: None,
         plan_review_request_tx: None,
         mcp_manager: None,
-        skill_search: &skill_search,
         skill_quality_tracker: &mut skill_qt,
         discovered_skills: None,
         messaging_metrics: None,
@@ -1076,7 +1060,6 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
     let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-    let skill_search = astra_core::SkillSearchSettings::default();
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
@@ -1113,7 +1096,6 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
         ask_user_request_tx: None,
         plan_review_request_tx: None,
         mcp_manager: None,
-        skill_search: &skill_search,
         skill_quality_tracker: &mut skill_qt,
         discovered_skills: None,
         messaging_metrics: None,
@@ -1237,7 +1219,6 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
     let mcp_arc = std::sync::Arc::new(tokio::sync::RwLock::new(manager));
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-    let skill_search = astra_core::SkillSearchSettings::default();
 
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
@@ -1275,7 +1256,6 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
         ask_user_request_tx: None,
         plan_review_request_tx: None,
         mcp_manager: Some(mcp_arc),
-        skill_search: &skill_search,
         skill_quality_tracker: &mut skill_qt,
         discovered_skills: None,
         messaging_metrics: None,

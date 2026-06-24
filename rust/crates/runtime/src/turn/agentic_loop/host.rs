@@ -482,8 +482,6 @@ pub struct SkillState {
     pub discovered: HashSet<String>,
     /// Scoring thresholds for deterministic pre-turn skill auto-routing.
     pub auto_routing: crate::turn::skill_tool::AutoRoutingConfig,
-    /// Skill catalog surfacing for this request / session.
-    pub search: astra_core::SkillSearchSettings,
     /// Skill listing message (available skill names + descriptions).
     /// Stored here instead of in `messages` so hosts can inject it ephemerally
     /// into each LLM request without bloating the persistent conversation history.
@@ -516,7 +514,6 @@ impl Default for SkillState {
             improvement_tracker: Default::default(),
             discovered: HashSet::new(),
             auto_routing: Default::default(),
-            search: Default::default(),
             listing_message: None,
             invoked: HashMap::new(),
             tool_event_hooks: Default::default(),

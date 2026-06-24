@@ -210,7 +210,6 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
             &state.hooks.forward_headers,
             state.hooks.llm_token_service.as_ref(),
             &state.skills.request_constraints,
-            &state.skills.search,
             adaptive_delegation_context.as_ref(),
             &state.delegation_chain,
         )
@@ -352,7 +351,6 @@ pub(crate) fn parse_delegation_request(
     parent_run_id: &str,
     session_id: &str,
     recursion_depth: u8,
-    skill_search: &astra_core::SkillSearchSettings,
     adaptive_context: Option<&DelegationAdaptiveContext>,
 ) -> Result<astra_services::coordination::DelegationRequest, String> {
     let args_str = tool_call
@@ -383,11 +381,6 @@ pub(crate) fn parse_delegation_request(
     context.insert(
         "session_id".to_string(),
         Value::String(session_id.to_string()),
-    );
-    context.insert(
-        "skill_search".to_string(),
-        serde_json::to_value(skill_search)
-            .map_err(|e| format!("failed to encode skill_search config: {e}"))?,
     );
     if let Some(ctx) = args.get("context").and_then(Value::as_object) {
         for (k, v) in ctx {
@@ -779,7 +772,6 @@ pub(crate) async fn partition_and_execute_delegations(
     forward_headers: &std::collections::HashMap<String, String>,
     llm_token_service: Option<&astra_services::LlmTokenServiceConfig>,
     request_constraints: &RequestConstraints,
-    skill_search: &astra_core::SkillSearchSettings,
     adaptive_context: Option<&DelegationAdaptiveContext>,
     parent_delegation_chain: &[String],
 ) -> (Vec<DelegationExecutionResult>, Vec<Value>) {
@@ -800,7 +792,6 @@ pub(crate) async fn partition_and_execute_delegations(
                 parent_run_id,
                 session_id,
                 recursion_depth,
-                skill_search,
                 adaptive_context,
             ) {
                 Ok(mut request) => {
@@ -1192,20 +1183,11 @@ mod tests {
                 "arguments": "{\"task\": \"write tests\", \"agents\": [\"coder\"], \"pattern\": \"sequential\", \"context\": {\"repo\": \"my-repo\"}}"
             }
         });
-        let req = parse_delegation_request(
-            &tool_call,
-            "run-123",
-            "session-456",
-            2,
-            &astra_core::SkillSearchSettings::default(),
-            None,
-        )
-        .unwrap();
+        let req = parse_delegation_request(&tool_call, "run-123", "session-456", 2, None).unwrap();
         assert_eq!(req.task, "write tests");
         assert_eq!(req.parent_run_id, "run-123");
         assert_eq!(req.depth, 2);
         assert!(req.context.contains_key("session_id"));
-        assert!(req.context.contains_key("skill_search"));
         assert!(req.context.contains_key("repo"));
     }
 
@@ -1219,15 +1201,7 @@ mod tests {
                 "arguments": "{\"task\": \"write tests\", \"agents\": [\"coder\"], \"context\": {\"__astra_forward_headers\": {\"x-workspace-id\": \"evil\"}}}"
             }
         });
-        let req = parse_delegation_request(
-            &tool_call,
-            "run-123",
-            "session-456",
-            2,
-            &astra_core::SkillSearchSettings::default(),
-            None,
-        )
-        .unwrap();
+        let req = parse_delegation_request(&tool_call, "run-123", "session-456", 2, None).unwrap();
         assert!(
             !req.context.contains_key(FORWARD_HEADERS_CONTEXT_KEY),
             "forwarded headers should stay in trusted sideband state"
@@ -1244,15 +1218,7 @@ mod tests {
                 "arguments": "{\"task\": \"write tests\", \"agents\": [\"coder\"], \"context\": {\"__astra_forward_headers\": {\"x-workspace-id\": \"evil\"}}}"
             }
         });
-        let req = parse_delegation_request(
-            &tool_call,
-            "run-123",
-            "session-456",
-            2,
-            &astra_core::SkillSearchSettings::default(),
-            None,
-        )
-        .unwrap();
+        let req = parse_delegation_request(&tool_call, "run-123", "session-456", 2, None).unwrap();
         assert!(
             !req.context.contains_key(FORWARD_HEADERS_CONTEXT_KEY),
             "trusted state should clear any user-supplied forward headers"
@@ -1268,14 +1234,7 @@ mod tests {
                 "name": "delegate"
             }
         });
-        let result = parse_delegation_request(
-            &tool_call,
-            "run-1",
-            "sess-1",
-            0,
-            &astra_core::SkillSearchSettings::default(),
-            None,
-        );
+        let result = parse_delegation_request(&tool_call, "run-1", "sess-1", 0, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("missing arguments"));
     }
@@ -1295,7 +1254,6 @@ mod tests {
             "run-1",
             "sess-1",
             astra_turn_core::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH,
-            &astra_core::SkillSearchSettings::default(),
             None,
         );
         assert!(result.is_err());
@@ -1325,7 +1283,6 @@ mod tests {
             "run-123",
             "session-456",
             0,
-            &astra_core::SkillSearchSettings::default(),
             Some(&adaptive_context),
         )
         .unwrap();
@@ -1359,7 +1316,6 @@ mod tests {
             "run-123",
             "session-456",
             0,
-            &astra_core::SkillSearchSettings::default(),
             Some(&adaptive_context),
         )
         .unwrap();
@@ -1752,7 +1708,6 @@ mod tests {
             &std::collections::HashMap::new(),
             None,
             &RequestConstraints::default(),
-            &astra_core::SkillSearchSettings::default(),
             None,
             &[],
         )
@@ -1790,7 +1745,6 @@ mod tests {
             &std::collections::HashMap::new(),
             None,
             &RequestConstraints::default(),
-            &astra_core::SkillSearchSettings::default(),
             None,
             &[],
         )
@@ -1819,7 +1773,6 @@ mod tests {
             &std::collections::HashMap::new(),
             None,
             &RequestConstraints::default(),
-            &astra_core::SkillSearchSettings::default(),
             None,
             &[],
         )
@@ -1853,7 +1806,6 @@ mod tests {
             &std::collections::HashMap::new(),
             None,
             &RequestConstraints::default(),
-            &astra_core::SkillSearchSettings::default(),
             None,
             &[],
         )

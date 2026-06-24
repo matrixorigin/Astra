@@ -651,8 +651,7 @@ pub(crate) async fn stream_chat_sse(
             child_permissions,
             parent_cancel_token,
         )
-        .with_skill_resolver(skill_resolver.clone())
-        .with_skill_search(p.skill_search.clone());
+        .with_skill_resolver(skill_resolver.clone());
         if let Some(session_id) = p.session_id {
             subrun_exec = subrun_exec.with_active_session_id(session_id.to_string());
         }
@@ -799,7 +798,6 @@ pub(crate) async fn stream_chat_sse(
             quality_tracker: p.skill_quality_tracker.clone(),
             improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
             discovered: discovered_skills,
-            search: p.skill_search.clone(),
             tool_event_hooks: astra_skills::hooks::load_tool_event_hooks(&project_root),
             session_event_hooks: astra_skills::hooks::load_session_event_hooks(&project_root),
             listing_message: None,

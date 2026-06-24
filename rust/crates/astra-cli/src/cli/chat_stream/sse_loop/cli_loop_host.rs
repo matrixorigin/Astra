@@ -589,7 +589,6 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 trace_collector: state.telemetry.turn_trace_collector.as_ref(),
             },
             perm_manager: self.perm_manager,
-            skill_search: &state.skills.search,
             pre_clear_lines: pre_clear,
             is_plan_subtask: self.is_plan_subtask,
             plan_subtask_id: self.plan_subtask_id,

@@ -398,14 +398,12 @@ async fn run_turn(
         &PermissionLoadPolicy::HeadlessSafe,
     );
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-    let skill_search = astra_core::SkillSearchSettings::default();
     let explain_mode = explain_mode_from_params(&params)?;
     let unified_skill_registry = astra_runtime::skills::default_unified_registry();
     let agent_spawner = crate::cli::agent_runtime::build_one_shot_spawner(
         &ctx.api,
         token.clone(),
         unified_skill_registry.clone(),
-        skill_search.clone(),
         Some(thread_id.clone()),
         model.clone(),
     )
@@ -432,7 +430,6 @@ async fn run_turn(
         render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
         cli_context: None,
         unified_skill_registry,
-        skill_search: &skill_search,
         agent_spawner: Some(agent_spawner),
         root_agent_id: Some("gateway-root"),
         task_manager: Some(chat_task_manager),
