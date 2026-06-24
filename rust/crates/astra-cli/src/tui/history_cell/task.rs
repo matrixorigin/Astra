@@ -548,11 +548,11 @@ mod tests {
     }
 
     #[test]
-    fn push_child_completed_rejects_noncanonical_ok_alias() {
+    fn push_child_completed_accepts_success_aliases_from_tool_output() {
         let mut t = TaskCell::new_running("tu_parent", "wrap");
         t.push_child_started("tu_a", "bash", "ls");
         t.push_child_completed("tu_a", "ok", 55);
-        assert_eq!(t.children[0].status, ChildStatus::Failed);
+        assert_eq!(t.children[0].status, ChildStatus::Success);
     }
 
     #[test]
@@ -609,10 +609,10 @@ mod tests {
     }
 
     #[test]
-    fn complete_rejects_noncanonical_ok_alias() {
+    fn complete_accepts_success_aliases_from_tool_output() {
         let mut t = TaskCell::new_running("tu_parent", "do work");
         t.complete("ok", 2500, Some("3 files changed".into()), None);
-        assert_eq!(t.status, TaskStatus::Failed);
+        assert_eq!(t.status, TaskStatus::Completed);
     }
 
     #[test]

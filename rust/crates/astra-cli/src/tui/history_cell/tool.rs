@@ -1085,10 +1085,10 @@ mod tests {
     }
 
     #[test]
-    fn complete_rejects_noncanonical_ok_alias() {
+    fn complete_accepts_success_aliases_from_tool_output() {
         let mut t = ToolCell::new_running("bash", "ls");
         t.complete("ok", 42, String::new(), Some("3 entries".into()), None);
-        assert_eq!(t.status, ToolStatus::Failed);
+        assert_eq!(t.status, ToolStatus::Success);
     }
 
     #[test]

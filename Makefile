@@ -714,6 +714,12 @@ test-online:
 		CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
 			--lib --bins --run-ignored only $(NEXTEST_ONLINE_FLAGS) \
 			|| FAILED="$$FAILED astra-runtime-ignored"; \
+	echo "Running astra-turn-core db-store ignored tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
+	ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+		ASTRA_TEST_DB_IT=1 \
+		CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-turn-core \
+			--features db-store --lib --run-ignored only $(NEXTEST_ONLINE_FLAGS) \
+			|| FAILED="$$FAILED astra-turn-core-db-store"; \
 	echo "Running ignored integration suites (live DB=$$INTEGRATION_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
 	ASTRA_DATABASE=$$INTEGRATION_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 		ASTRA_TEST_DATABASE=$$INTEGRATION_DB \

@@ -16,16 +16,18 @@ pub enum ToolResultStatusKind {
 }
 
 impl ToolResultStatusKind {
-    /// Parse a canonical status string into a `ToolResultStatusKind`.
+    /// Parse a tool-result status string into a `ToolResultStatusKind`.
     ///
-    /// Accepts only the exact canonical values: `"completed"`, `"skipped"`.
-    /// Everything else (including aliases like `"ok"`, `"success"`, `"done"`)
-    /// is treated as `Failed`, signaling that the producer should emit the
-    /// canonical value rather than relying on ambiguous aliases.
+    /// Producers should emit canonical values (`completed`, `failed`, `skipped`),
+    /// but consumers must tolerate common success aliases seen in tool and agent
+    /// outputs. Unknown values remain failed so malformed status channels fail
+    /// closed instead of looking successful.
     pub fn from_status_str(status: &str) -> Self {
         let normalized = status.trim().to_lowercase();
         match normalized.as_str() {
-            "completed" => Self::Completed,
+            "completed" | "complete" | "ok" | "success" | "succeeded" | "passed" | "done" => {
+                Self::Completed
+            }
             "skipped" => Self::Skipped,
             _ => Self::Failed,
         }
@@ -69,8 +71,7 @@ mod tests {
     };
 
     #[test]
-    fn from_status_str_exact_completed_and_skipped() {
-        // Only exact canonical values are accepted as Completed
+    fn from_status_str_accepts_canonical_statuses_and_success_aliases() {
         assert_eq!(
             ToolResultStatusKind::from_status_str("completed"),
             ToolResultStatusKind::Completed
@@ -78,15 +79,19 @@ mod tests {
         assert!(ToolResultStatusKind::from_status_str("completed").is_success());
         assert!(!ToolResultStatusKind::from_status_str("completed").is_failure());
 
-        // Aliases like "ok", "success", "done" now return Failed
         for alias in ["ok", "success", "succeeded", "complete", "passed", "done"] {
             let kind = ToolResultStatusKind::from_status_str(alias);
             assert_eq!(
                 kind,
-                ToolResultStatusKind::Failed,
-                "alias '{alias}' should NOT parse as Completed under strict first-principles parsing"
+                ToolResultStatusKind::Completed,
+                "success alias '{alias}' should not render successful tool output as failed"
             );
         }
+
+        assert_eq!(
+            ToolResultStatusKind::from_status_str("skipped"),
+            ToolResultStatusKind::Skipped
+        );
     }
 
     #[test]
@@ -100,10 +105,9 @@ mod tests {
             );
             assert!(kind.is_success());
         }
-        // Non-canonical even with correct case → Failed
         assert_eq!(
             ToolResultStatusKind::from_status_str("OK"),
-            ToolResultStatusKind::Failed
+            ToolResultStatusKind::Completed
         );
     }
 
@@ -117,10 +121,9 @@ mod tests {
             ToolResultStatusKind::from_status_str("\tcompleted\n"),
             ToolResultStatusKind::Completed
         );
-        // Trimming does NOT make aliases canonical
         assert_eq!(
             ToolResultStatusKind::from_status_str("  ok  "),
-            ToolResultStatusKind::Failed
+            ToolResultStatusKind::Completed
         );
     }
 
@@ -139,7 +142,7 @@ mod tests {
 
     // Regression: free functions still work (but with new semantics)
     #[test]
-    fn free_functions_with_new_semantics() {
+    fn free_functions_share_parser_semantics() {
         // "completed" and "skipped" work as expected
         assert!(tool_result_status_is_success("completed"));
         assert!(!tool_result_status_is_success("err"));
@@ -149,9 +152,10 @@ mod tests {
             tool_result_status_kind("completed"),
             ToolResultStatusKind::Completed
         );
-        // "ok" is NO longer considered success
-        assert!(!tool_result_status_is_success("ok"));
-        assert!(tool_result_status_is_failure("ok"));
+        assert!(tool_result_status_is_success("ok"));
+        assert!(tool_result_status_is_success("success"));
+        assert!(tool_result_status_is_success("done"));
+        assert!(!tool_result_status_is_failure("ok"));
         // "skipped" is neither success nor failure
         assert!(!tool_result_status_is_success("skipped"));
         assert!(!tool_result_status_is_failure("skipped"));

@@ -87,33 +87,20 @@ impl DbCslStore {
         pool: &sqlx::Pool<sqlx::MySql>,
         session_id: &str,
     ) -> Result<(), CslStoreError> {
-        let session_owner: Option<String> =
-            sqlx::query_scalar("SELECT user_id FROM agent_sessions WHERE session_id = ? LIMIT 1")
-                .bind(session_id)
-                .fetch_optional(pool)
-                .await
-                .map_err(|e| CslStoreError::Other(format!("session owner check: {e}")))?;
-        if session_owner.as_deref() != Some(self.user_id.as_str()) {
+        let owned: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM agent_sessions \
+             WHERE session_id = ? AND user_id = ? LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(&self.user_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| CslStoreError::Other(format!("session owner check: {e}")))?;
+        if owned.is_none() {
             return Err(owner_mismatch_error(
                 session_id,
                 &self.user_id,
                 "agent_sessions owner root missing or belongs to another user",
-            ));
-        }
-        let foreign_rows: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM conversation_log \
-             WHERE session_id = ? AND user_id <> ?",
-        )
-        .bind(session_id)
-        .bind(&self.user_id)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| CslStoreError::Other(format!("owner check: {e}")))?;
-        if foreign_rows > 0 {
-            return Err(owner_mismatch_error(
-                session_id,
-                &self.user_id,
-                "conversation_log contains rows for another owner",
             ));
         }
         Ok(())
@@ -601,6 +588,70 @@ mod tests {
             rows,
             vec![(owner_user_id.clone(), 0)],
             "failed cross-owner operations must not rewrite owner rows"
+        );
+
+        cleanup(&owner_store, sid).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live DB"]
+    async fn db_owner_reads_ignore_foreign_csl_rows_after_session_owner_check() {
+        let owner_user_id = format!("u-csl-owner-{}", uuid::Uuid::new_v4());
+        let other_user_id = format!("u-csl-other-{}", uuid::Uuid::new_v4());
+        let owner_store = test_store_for(&owner_user_id).await;
+        let other_store = test_store_for(&other_user_id).await;
+        let sid = &format!("db-test-owner-noise-{}", uuid::Uuid::new_v4());
+        cleanup(&owner_store, sid).await;
+        create_session_for(&owner_store, sid, &owner_user_id).await;
+
+        owner_store
+            .append(sid, &make_snapshot(0, 1, vec![user_msg("owner")]), &meta())
+            .await
+            .unwrap();
+
+        let foreign_payload =
+            serde_json::to_string(&make_snapshot(0, 1, vec![user_msg("foreign")])).unwrap();
+        query(
+            "INSERT INTO conversation_log \
+             (user_id, session_id, seq, turn, entry_type, payload) \
+             VALUES (?, ?, 0, 1, 0, ?)",
+        )
+        .bind(&other_user_id)
+        .bind(sid)
+        .bind(&foreign_payload)
+        .execute(&owner_store.get_pool().await.unwrap())
+        .await
+        .expect("insert foreign CSL noise row");
+
+        owner_store
+            .append(
+                sid,
+                &make_delta(1, 2, vec![assistant_msg("owner delta")]),
+                &meta(),
+            )
+            .await
+            .expect("foreign CSL noise must not block owner append");
+
+        let entries = owner_store
+            .load_from_latest_snapshot(sid)
+            .await
+            .expect("owner load should use owner-scoped CSL rows only");
+        assert_eq!(entries.len(), 2);
+        let materialized = materialize(&entries).unwrap();
+        assert_eq!(
+            materialized.messages,
+            vec![user_msg("owner"), assistant_msg("owner delta")]
+        );
+
+        let other_err = other_store
+            .load_from_latest_snapshot(sid)
+            .await
+            .expect_err("foreign CSL row must not grant session ownership");
+        assert!(
+            other_err
+                .to_string()
+                .contains("conversation_log owner mismatch"),
+            "unexpected other-owner error: {other_err}"
         );
 
         cleanup(&owner_store, sid).await;
