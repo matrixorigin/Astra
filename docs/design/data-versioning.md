@@ -434,8 +434,8 @@ CREATE PUBLICATION my_skills DATABASE skill_db TABLE skills_registry ACCOUNT ALL
 CREATE DATABASE team_skills FROM publisher_acct PUBLICATION my_skills;
 -- Done. Skills available. Updates automatic. Read-only. Isolated.
 
--- Want to pin a version instead?
-CREATE CLONE pinned_skills FROM publisher_acct.skill_db;
+-- Want a frozen copy instead?
+CREATE CLONE frozen_skills FROM publisher_acct.skill_db;
 -- Writable copy, frozen in time. Upgrade when ready.
 ```
 

@@ -115,7 +115,7 @@ shared restore helper 的职责：
 5. 恢复 workspace-level state：
    - `session_goal`
    - `goal_progress`
-   - `pinned_skills`
+   - `active_skills`
    - `discovered_skills`
    - adaptive tuning state
 6. 恢复：

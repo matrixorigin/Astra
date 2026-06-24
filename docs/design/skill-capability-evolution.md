@@ -483,9 +483,11 @@ pub struct SkillExecutionResult {
 
 **Rationale**: Backward compatibility is critical for adoption. Zero-config baseline must work.
 
-### Q5: How does this relate to the Pin mechanism?
+### Q5: How does this relate to skill surfacing?
 
-**Answer**: Orthogonal. Pin controls **whether** a skill is in the context. Quality controls **where** it ranks within the budget. A pinned skill with poor quality still appears (it's pinned) but gets a warning. An unpinned skill with great quality ranks higher in budget allocation.
+**Answer**: Orthogonal. Visibility controls whether a skill is available in the
+catalog for this request. Quality controls how it is ranked and recommended
+inside that visible catalog.
 
 ---
 

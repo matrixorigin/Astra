@@ -430,9 +430,9 @@ fn format_skill_description(s: &SkillToolInfo) -> String {
 // Production no longer calls `format_skills_within_budget` — it was the
 // budget-aware formatter for `skill_listing_system_message`, both gone.
 // Retained under `#[cfg(test)]` because a body of tests exercises its
-// budget-pressure edge cases (truncation thresholds, bundled priority,
-// pinned-skills policy). Those tests guard logic invariants that might
-// be resurrected if a future iteration needs budget-shaped listings; the
+// budget-pressure edge cases (truncation thresholds and bundled priority).
+// Those tests guard logic invariants that might be resurrected if a future
+// iteration needs budget-shaped listings; the
 // current `build_skill_listing_section` renderer trusts upstream callers
 // to keep the list bounded and doesn't truncate in-renderer.
 #[cfg(test)]

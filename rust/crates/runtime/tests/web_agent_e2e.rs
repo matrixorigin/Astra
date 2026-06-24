@@ -5445,7 +5445,7 @@ async fn context_meta_surfaces_unknown_active_skills_for_debugging() {
 
 /// Realistic production-like scenario mirroring the reported "session 9474cce1"
 /// case: a MiniMax-M2.7 request with `selected_model` set, multiple
-/// `active_skills` pinned in `edge_profile`, AND the model actively invoking
+/// request-active skills in `edge_profile`, AND the model actively invoking
 /// the `skill` tool mid-conversation. The original report conflated two
 /// distinct things ("skill lost" vs "model manually re-loads skill each turn")
 /// — this test pins the *actual* invariants so future regressions are caught
@@ -5477,7 +5477,7 @@ async fn complex_scenario_model_override_plus_active_skills_plus_skill_invocatio
         let (app, _hook_writer, observer_worker, _tool_writer) = build_test_app_with_hooks_and_skills();
 
         let payload = json!({
-            "message": "Review this commit under the pinned output skills.",
+            "message": "Review this commit with the active output skills.",
             "model": "MiniMax-M2.7",
             "context": {
                 "edge_profile": {
@@ -5577,7 +5577,7 @@ async fn complex_scenario_model_override_plus_active_skills_plus_skill_invocatio
 }
 
 /// Multi-turn variant of the complex scenario: same `session_id` across two
-/// user messages, both under `selected_model` with `active_skills` pinned.
+/// user messages, both under `selected_model` with request-active skills.
 /// Catches drift in cross-turn invariants that the single-turn test can't:
 ///   * Does the skill hint consistently appear in BOTH turns' system prompts?
 ///   * Does `state.skills.invoked` persist across the turn boundary so the
@@ -5633,7 +5633,7 @@ async fn complex_scenario_multi_turn_preserves_active_skills_and_invoked_state()
             &app,
             json!({
                 "session_id": &sid,
-                "message": "second request: keep the pinned skill",
+                "message": "second request: keep the active skill",
                 "model": "MiniMax-M2.7",
                 "context": {
                     "edge_profile": {

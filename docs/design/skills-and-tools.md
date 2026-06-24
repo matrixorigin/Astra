@@ -9,8 +9,8 @@
 > CLI commands (/skill list|info|search|new|dev|test|doctor|validate|config|system),
 > non-blocking permission checks, skill tool schema injection.
 >
-> 🔵 **Design Target**: Pin/Unpin mechanism (§4), Registered skills via DB (§3.2),
-> Marketplace via MatrixOne Stage (§3.3), cloud skill publishing.
+> 🔵 **Design Target**: Registered skills via DB (§3.2), Marketplace via MatrixOne
+> Stage (§3.3), cloud skill publishing.
 
 ---
 
@@ -244,13 +244,13 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
 
 ### 3.1 Layer 1: Local Skills [IMPLEMENTED]
 
-**Lifecycle**: Create → Discover → Auto-Pin → Use → Edit → Hot-reload → Delete
+**Lifecycle**: Create → Discover → Use → Edit → Hot-reload → Delete
 
 **Characteristics**:
 - **No registration required** — drop SKILL.md file, immediately available
 - **Weak constraints** — no version control, no permission management, no audit
 - **Hot-reload** — file watcher detects changes within 500ms
-- **Auto-pinned** — always in candidate list (budget-exempt)
+- **Auto-discovered** — metadata enters the visible catalog immediately
 - **Best for** — personal development, rapid iteration, project-specific skills
 
 **File Watcher** (`skills/watcher.rs`):
@@ -262,12 +262,12 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
 
 ### 3.2 Layer 2: Registered Skills [DESIGN TARGET]
 
-**Lifecycle**: Create/Upload → Register → Discover → Manual Pin → Use → Update → Deregister
+**Lifecycle**: Create/Upload → Register → Discover → Filter/Activate → Use → Update → Deregister
 
 **Characteristics**:
 - **Stored in MatrixOne** — `skills_registry` table
 - **Strong constraints** — version control, scope-based access (org/user), audit trail
-- **Default unpinned** — discovered via search/budget, manually pinned
+- **Catalog-scoped** — discovered through the visible catalog and filtered by request policy
 - **Best for** — team sharing, production environments, compliance
 
 **Proposed Schema**:
@@ -280,7 +280,6 @@ CREATE TABLE skills_registry (
     owner        VARCHAR(128) NOT NULL,
     manifest     JSON NOT NULL,          -- SkillManifest serialized
     content      TEXT NOT NULL,           -- SKILL.md instruction body
-    pinned       BOOLEAN DEFAULT FALSE,
     enabled      BOOLEAN DEFAULT TRUE,
     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -290,13 +289,13 @@ CREATE TABLE skills_registry (
 
 **CLI Commands**:
 ```bash
-/skill register <name> [--scope=org|user] [--pin]
+/skill register <name> [--scope=org|user]
 /skill deregister <name>
 ```
 
 ### 3.3 Layer 3: Cloud Marketplace [DESIGN TARGET]
 
-**Lifecycle**: Browse → Preview → Install → Register (auto) → Pin (optional) → Use
+**Lifecycle**: Browse → Preview → Install → Register (auto) → Use
 
 **Characteristics**:
 - **Stored in MatrixOne Stage** — S3/MinIO backed object storage
@@ -338,7 +337,7 @@ SELECT manifest INTO OUTFILE 'stage://mo_skill_marketplace/private/<account>/my-
 **CLI Commands**:
 ```bash
 /skill browse [category]
-/skill install <name>[@version] [--pin]
+/skill install <name>[@version]
 /skill uninstall <name>
 /skill publish <name> [--scope=private|community]
 /skill update <name>
@@ -346,73 +345,39 @@ SELECT manifest INTO OUTFILE 'stage://mo_skill_marketplace/private/<account>/my-
 
 ---
 
-## 4. Pin Mechanism [DESIGN TARGET]
+## 4. Skill Catalog Surface [IMPLEMENTED]
 
-### 4.1 What is Pin?
+### 4.1 First Principles
 
-**Pin = always in candidate list, budget-exempt.**
+Skills have no persistent always-include preference. The runtime has one
+coherent surfacing model:
 
-Pinned skills are always included in the skill listing sent to the LLM, regardless
-of token budget pressure. Unpinned skills are subject to budget-based truncation
-and require `/skill search` or trigger-based activation to surface.
+- `available_skills` lists bounded metadata for the visible catalog.
+- `active_skills` is a request-scoped hint from a user selection, composer token,
+  or sub-agent inheritance.
+- `discover_skills` searches the same catalog when the model needs a skill that
+  is not already obvious from the metadata.
+- `skill` loads the full `SKILL.md` only when the model chooses a specific skill.
 
-Analogy to Claude Code: `alwaysLoad: true` ≈ our Pin.
+This keeps skill surfacing declarative and per request. There is no mutable
+session-level always-include preference and no second budget exemption path.
 
-### 4.2 Pin Rules by Source
+### 4.2 Source Rules
 
-| Source          | Default  | Can Change?     | Notes                        |
-|-----------------|----------|-----------------|------------------------------|
-| Bundled         | Always   | No (permanent)  | Core functionality           |
-| Local (project) | Pinned   | Yes (unpin)     | Zero-config best experience  |
-| Local (user)    | Pinned   | Yes (unpin)     | User's global skills         |
-| Registered      | Unpinned | Yes (pin/unpin) | Discovered via search/budget |
-| Marketplace     | Unpinned | Yes (pin/unpin) | Pin on install with `--pin`  |
-| MCP             | Unpinned | Yes (pin/unpin) | Discovered via search/budget |
+| Source          | Visible When                                     | Notes                         |
+|-----------------|--------------------------------------------------|-------------------------------|
+| Bundled         | Runtime catalog includes it                      | Core functionality            |
+| Local (project) | CLI-local resolver includes project paths        | CLI-only until imported       |
+| Local (user)    | CLI/server resolver includes the user's home dir | User-scoped filesystem skills |
+| Registered      | DB visibility predicate admits it                | Filtered by `allow_skills`    |
+| Marketplace     | Installed or imported into a visible catalog     | Versioned source package      |
+| MCP             | Connected server exports it                      | Catalog metadata only         |
 
 ### 4.3 Budget Interaction
 
-```
-Skill Listing Budget: ~2000 tokens (1% of 200K context)
-┌──────────────────────────────────────────┐
-│ Pinned skills (always shown, full desc)  │ ← Fixed cost
-│  bundled:  16 × ~30 tokens = 480        │
-│  local:     4 × ~30 tokens = 120        │
-│  user-pin:  N × ~30 tokens              │
-├──────────────────────────────────────────┤
-│ Remaining budget for unpinned            │ ← Dynamic
-│  (truncated descriptions → names-only)   │
-└──────────────────────────────────────────┘
-```
-
-**Warning Threshold**: When pinned skills consume >70% of listing budget:
-```
-⚠ 45 pinned skills using 1400/2000 tokens of skill listing budget.
-  Consider: /skill unpin <name>  or  /config skill_listing_budget 4000
-```
-
-### 4.4 SkillManifest Pin Field
-
-```rust
-// Addition to SkillManifest
-pub struct SkillManifest {
-    // ... existing fields ...
-    pub pinned: PinState,  // Always | Pinned | Unpinned
-}
-
-pub enum PinState {
-    Always,    // Bundled — cannot be unpinned
-    Pinned,    // User/auto pinned — budget-exempt
-    Unpinned,  // Subject to budget truncation
-}
-```
-
-### 4.5 CLI Commands
-
-```bash
-/skill pin <name>           # Pin a skill (registered/marketplace/MCP)
-/skill unpin <name>         # Unpin (bundled cannot be unpinned)
-/skill pinned               # Show all pinned skills with budget usage
-```
+The always-visible payload is metadata, not full instructions. Full skill bodies
+enter context only after `skill` activation. Large catalogs should be handled by
+catalog filtering and `discover_skills`, not by long-lived inclusion flags.
 
 ---
 
@@ -618,9 +583,7 @@ impl From<std::io::Error> for SkillError {
 /skill                          # Show subcommand help
 /skill list [query] [--source=local|bundled|mcp] [--category=X]
 /skill search <query>           # Keyword match on catalog (not vector search)
-/skill surfacing …              # Agent catalog listing vs discover_skills thresholds
 /skill info <name> [--raw]      # Manifest + preview; --raw = YAML frontmatter
-/skill pinned                   # [DESIGN] Show pinned skills + budget
 ```
 
 ### Skill Development
@@ -638,12 +601,10 @@ impl From<std::io::Error> for SkillError {
 
 ### Registration & Marketplace [DESIGN TARGET]
 ```bash
-/skill register <name> [--scope=org|user] [--pin]
+/skill register <name> [--scope=org|user]
 /skill deregister <name>
-/skill pin <name>
-/skill unpin <name>
 /skill browse [category]
-/skill install <name>[@version] [--pin]
+/skill install <name>[@version]
 /skill uninstall <name>
 /skill publish <name> [--scope=private|community]
 /skill update <name>
@@ -712,8 +673,7 @@ CREATE STAGE marketplace_private  URL = 'stage://mo_skill_marketplace/private/';
   ├─ 2. Download: LOAD DATA INFILE 'stage://marketplace_official/code-review/1.1.0/*'
   ├─ 3. Cache: Store in ~/.astra/cache/skills/code-review/1.1.0/
   ├─ 4. Register: INSERT INTO skills_registry (name, version, manifest, content, ...)
-  ├─ 5. Optional Pin: if --pin flag specified
-  └─ 6. Discover: registry.discover_all() picks up new skill
+  └─ 5. Discover: registry.discover_all() picks up new skill
 ```
 
 ### 12.4 Publish Flow
@@ -748,17 +708,17 @@ CREATE STAGE marketplace_private  URL = 'stage://mo_skill_marketplace/private/';
 **No.** Local skills are weak-constraint, zero-config. Drop file → use immediately.
 Matches Claude Code behavior and provides best development experience.
 
-### Q2: Is Pin a weight or a switch?
-**Switch.** Pin = always in list (budget-exempt). Unpinned = subject to budget
-truncation + search discovery. Simple, predictable, no weight-tuning complexity.
+### Q2: Are active skills a ranking weight?
+**No.** Active skills are request intent. Catalog ranking remains separate and
+`discover_skills` handles search when the model needs more candidates.
 
 ### Q3: What happens after marketplace install?
 **Becomes a Registered skill (Layer 2).** Downloaded to local cache + registered in DB.
 Works offline via cache. Updates check marketplace for newer versions.
 
-### Q4: How many pinned skills are reasonable?
-**~30-40 under default budget.** 16 bundled + 4-5 local + 10-20 user-pinned.
-Warning at 70% budget usage. User can increase budget via config.
+### Q4: How many active skills are reasonable?
+Per-turn active skills should stay small: they are user intent, not catalog
+storage. Large catalogs should rely on metadata plus `discover_skills`.
 
 ### Q5: How do MCP tools differ from MCP skills?
 **MCP tools** are JSON schemas → direct function calling.
@@ -783,7 +743,7 @@ Both come from same MCP server but enter different systems.
 | File watcher hot-reload      | ✅ Done     | `runtime/src/skills/watcher.rs`           | 3     |
 | CLI /skill commands          | ✅ Done     | `rust/crates/astra-cli/src/cli/slash_skill.rs`    | 12    |
 | Non-blocking permission      | ✅ Done     | `rust/crates/astra-cli/src/cli/stream_render.rs`  | —     |
-| Pin/Unpin mechanism          | 🔵 Design  | —                                          | —     |
+| Per-turn active skill hints  | ✅ Done    | `edge_profile.active_skills`, `allow_skills` | 10+ |
 | Registered skills (DB)       | 🔵 Design  | —                                          | —     |
 | Marketplace (Stage)          | 🔵 Design  | —                                          | —     |
 | Skill sandbox mode           | 🔵 Design  | —                                          | —     |

@@ -2719,10 +2719,10 @@ Runtime visibility contract:
   list/detail/version endpoints and the runtime resolver.
 - Runtime turns build the resolver by default from that visible catalog.
   `allow_skills` is only a request-scoped filter over the visible catalog. The
-  LLM still receives only pinned/active skills plus the shared
+  LLM still receives request-active skills plus the shared
   `visible_skills_for_host_turn(...)` selector shortlist; full `SKILL.md`
   content is injected only after the model calls the `skill` tool.
-- Web composer skill tokens are per-turn selections, not session pins. The
+- Web composer skill tokens are per-turn selections. The
   composer clears the submitted skill tokens as soon as the turn is submitted;
   failures restore them so the same request can be retried.
 - The composer exposes the same per-turn skill selection through both the `+`

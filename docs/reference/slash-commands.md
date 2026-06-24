@@ -386,8 +386,6 @@ Skill management and marketplace.
 | `test <name>`    | Run skill test              |
 | `dev <name>`     | Enter dev mode              |
 | `health`         | Catalog health              |
-| `surfacing`      | Agent catalog surfacing     |
-| `pin <name>`     | Pin skill to always load    |
 | `create`         | Generate skill from session |
 | `system`         | System skill helpers        |
 | `stats`          | Learning summary            |

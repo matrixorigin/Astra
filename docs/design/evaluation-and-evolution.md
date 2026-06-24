@@ -327,7 +327,7 @@ Meta-learning generalizes improvement across all versioned inputs:
 
 | Input | Current | Meta-Learning |
 |-------|---------|---------------|
-| Tool surface | ToolRegistry | ✅ Pinned/deferred surface with explicit activation |
+| Tool surface | ToolRegistry | ✅ Always-load/deferred surface with explicit activation |
 | Prompt | PromptOptimizer | ✅ Auto-diagnose + improve via InputFaceLearner |
 | Context budget | _BUDGET_RATIOS | ✅ Task-aware dynamic adjustment via InputFaceLearner |
 | Knowledge | MemoryGovernanceEngine | ✅ Stale detection + targeted quarantine via InputFaceLearner |
