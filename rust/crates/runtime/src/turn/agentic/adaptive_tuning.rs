@@ -108,6 +108,48 @@ fn resolve_scenario_from_routing(
     }
 }
 
+fn apply_scenario_to_config(
+    config: &mut astra_config::runtime_config::RuntimeConfig,
+    scenario: Scenario,
+) {
+    let strategy = scenario.strategy_hints();
+
+    // `max_tools_per_turn` is the execution limit per headless round.
+    // Scenario routing must not change `max_tools`, which is only the
+    // visible-schema selection count.
+    config.tool_policy.max_tools_per_turn = strategy.max_tools_per_turn as u32;
+
+    match strategy.detail_level {
+        astra_config::user_profile::Verbosity::Debug => {
+            config.compression.max_history_tokens =
+                config.compression.max_history_tokens.max(60_000);
+            config.token_budget.max_turn_input_tokens =
+                config.token_budget.max_turn_input_tokens.max(100_000);
+        }
+        astra_config::user_profile::Verbosity::Verbose => {
+            config.compression.max_history_tokens =
+                config.compression.max_history_tokens.max(50_000);
+            config.token_budget.max_turn_input_tokens =
+                config.token_budget.max_turn_input_tokens.max(90_000);
+        }
+        _ => {}
+    }
+
+    if let Some(top_k) = strategy.memory_top_k {
+        config.memory.retrieval_top_k = top_k.clamp(
+            config.memory_pressure.retrieval_min,
+            config.memory_pressure.retrieval_max,
+        );
+    }
+
+    if let Some(strictness) = strategy.verification_strictness {
+        config.verification.strictness = strictness.clamp(
+            config.verification.min_strictness,
+            config.verification.max_strictness,
+        );
+    }
+}
+
 pub(crate) fn apply_tactical_actions(
     state: &mut AgenticLoopState,
     step_actions: &[astra_turn_core::liquid_tactical::TacticalAction],
@@ -222,11 +264,11 @@ pub(crate) fn apply_adaptive_execution_profile_with_intent(
     state: &mut AgenticLoopState,
     turn_intent: Option<&TurnIntent>,
 ) {
-    let (hub, session) = match (
+    let session = match (
         &state.telemetry.observability_hub,
         &state.telemetry.observability_session,
     ) {
-        (Some(hub), Some(session)) => (hub, session),
+        (Some(_), Some(session)) => session,
         _ => return,
     };
 
@@ -262,15 +304,13 @@ pub(crate) fn apply_adaptive_execution_profile_with_intent(
         &[],
         Vec::new(),
     );
-    let user_id = session_guard.user_id.clone();
-    let _ = hub;
-
     // Snapshot config before profile application for attribution.
     let old_config = session_guard.config.clone();
     let old_scenario = session_guard.profile.current_scenario;
 
-    let mut profile =
-        astra_config::execution_profile::ExecutionProfile::from_base(session_guard.config.clone());
+    let mut profile_config = session_guard.config.clone();
+    let mut profile_scenario = None;
+    let mut profile_confidence = 1.0;
 
     let detected = detector.detect();
     let resolved_scenario = resolve_scenario_from_routing(
@@ -281,35 +321,28 @@ pub(crate) fn apply_adaptive_execution_profile_with_intent(
     );
 
     if let Some(scenario) = resolved_scenario {
-        profile.apply_scenario(scenario);
+        profile_scenario = Some(scenario);
+        apply_scenario_to_config(&mut profile_config, scenario);
         if let Some((detected_scenario, confidence)) = detected
             && detected_scenario == scenario
         {
-            profile.confidence = profile.confidence.min(confidence.lower);
+            profile_confidence = f64::min(profile_confidence, confidence.lower);
         }
     }
 
-    let mut boosts = routing.boost_terms.clone();
-    if !boosts.is_empty() {
-        boosts.sort();
-        boosts.dedup();
-        profile.merge_boosts(boosts);
-    }
-
-    profile.confidence = profile.confidence.min(routing.confidence);
-    let _ = user_id;
+    profile_confidence = f64::min(profile_confidence, routing.confidence);
 
     // ── Anti-flap: scenario change cooldown ──
     // Suppress scenario changes within cooldown period of the last change
     // to prevent rapid oscillation between scenarios.
     let scenario_cooldown = session_guard.config.adaptive_tuning.scenario_cooldown_turns;
-    let scenario_suppressed = if profile.scenario != old_scenario && profile.scenario.is_some() {
+    let scenario_suppressed = if profile_scenario != old_scenario && profile_scenario.is_some() {
         if let Some(last_change) = session_guard.last_scenario_change_turn {
             let turns_since = session_guard.turn_number.saturating_sub(last_change);
             if turns_since < scenario_cooldown {
                 // Revert to old scenario and config
-                profile.scenario = old_scenario;
-                profile.config = old_config.clone();
+                profile_scenario = old_scenario;
+                profile_config = old_config.clone();
                 true
             } else {
                 session_guard.last_scenario_change_turn = Some(session_guard.turn_number);
@@ -324,14 +357,14 @@ pub(crate) fn apply_adaptive_execution_profile_with_intent(
         false
     };
 
-    if let Some(scenario) = profile.scenario {
+    if let Some(scenario) = profile_scenario {
         session_guard.profile.set_scenario(scenario);
     }
 
-    carry_forward_tactical_runtime_mutations(state, &old_config, &mut profile.config);
+    carry_forward_tactical_runtime_mutations(state, &old_config, &mut profile_config);
 
     if !scenario_suppressed {
-        session_guard.config = profile.config.clone();
+        session_guard.config = profile_config.clone();
     }
     state.max_turn_input_tokens = session_guard.config.token_budget.max_turn_input_tokens as u64;
 
@@ -345,70 +378,67 @@ pub(crate) fn apply_adaptive_execution_profile_with_intent(
     // Use the session-level turn number for journal events (not the
     // observability session's internal counter which can diverge).
     let turn = state.session_turn;
-    let scenario_name = profile
-        .scenario
+    let scenario_name = profile_scenario
         .map(|s| format!("{s:?}"))
         .unwrap_or_default();
-    let confidence = profile.confidence;
-    let scenario_changed = profile.scenario != old_scenario;
+    let confidence = profile_confidence;
+    let scenario_changed = profile_scenario != old_scenario;
     let adaptive_enabled = session_guard.config.context_window.adaptive;
     let turn_token_budget = session_guard.config.token_budget.max_turn_input_tokens as u64;
 
     // Compute config deltas for journal.
     let mut config_changes = Vec::new();
     if old_config.token_budget.max_turn_input_tokens
-        != profile.config.token_budget.max_turn_input_tokens
+        != profile_config.token_budget.max_turn_input_tokens
     {
         config_changes.push((
             "token_budget.max_turn_input_tokens".to_string(),
             old_config.token_budget.max_turn_input_tokens.to_string(),
-            profile
-                .config
+            profile_config
                 .token_budget
                 .max_turn_input_tokens
                 .to_string(),
         ));
     }
-    if old_config.memory.retrieval_top_k != profile.config.memory.retrieval_top_k {
+    if old_config.memory.retrieval_top_k != profile_config.memory.retrieval_top_k {
         config_changes.push((
             "memory.retrieval_top_k".to_string(),
             old_config.memory.retrieval_top_k.to_string(),
-            profile.config.memory.retrieval_top_k.to_string(),
+            profile_config.memory.retrieval_top_k.to_string(),
         ));
     }
-    if (old_config.verification.strictness - profile.config.verification.strictness).abs() > 0.001 {
+    if (old_config.verification.strictness - profile_config.verification.strictness).abs() > 0.001 {
         config_changes.push((
             "verification.strictness".to_string(),
             format!("{:.3}", old_config.verification.strictness),
-            format!("{:.3}", profile.config.verification.strictness),
+            format!("{:.3}", profile_config.verification.strictness),
         ));
     }
-    if old_config.tool_policy.max_tools_per_turn != profile.config.tool_policy.max_tools_per_turn {
+    if old_config.tool_policy.max_tools_per_turn != profile_config.tool_policy.max_tools_per_turn {
         config_changes.push((
             "tool_policy.max_tools_per_turn".to_string(),
             old_config
                 .tool_policy
                 .effective_max_tools_per_turn()
                 .to_string(),
-            profile
-                .config
+            profile_config
                 .tool_policy
                 .effective_max_tools_per_turn()
                 .to_string(),
         ));
     }
     if (old_config.compression.compression_threshold
-        - profile.config.compression.compression_threshold)
+        - profile_config.compression.compression_threshold)
         .abs()
         > 0.001
     {
         config_changes.push((
             "compression.compression_threshold".to_string(),
             format!("{:.3}", old_config.compression.compression_threshold),
-            format!("{:.3}", profile.config.compression.compression_threshold),
+            format!("{:.3}", profile_config.compression.compression_threshold),
         ));
     }
-    let baseline_applied = profile.baseline_applied;
+    let baseline_applied = false;
 
     // Release session lock before writing journal.
     drop(session_guard);
@@ -1015,7 +1045,9 @@ fn write_session_journal_event(
 #[cfg(test)]
 mod tests {
     use super::should_emit_acceptance;
-    use super::{fallback_scenario_from_task, resolve_scenario_from_routing};
+    use super::{
+        apply_scenario_to_config, fallback_scenario_from_task, resolve_scenario_from_routing,
+    };
 
     // ── Acceptance signal routes through shared correction classifier ──
 
@@ -1072,6 +1104,28 @@ mod tests {
     use crate::pipeline::routing::TaskType;
     use astra_config::user_profile::{Scenario, TurnContinuationMode, TurnIntent};
     use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
+
+    #[test]
+    fn scenario_config_code_review_updates_execution_limits_not_surface_size() {
+        let mut config = astra_config::runtime_config::RuntimeConfig::default();
+        let original_max_tools = config.tool_policy.max_tools;
+
+        apply_scenario_to_config(&mut config, Scenario::CodeReview);
+
+        assert_eq!(config.tool_policy.max_tools, original_max_tools);
+        assert_eq!(config.tool_policy.effective_max_tools_per_turn(), 10);
+        assert!((config.verification.strictness - 0.7).abs() < 0.01);
+    }
+
+    #[test]
+    fn scenario_config_clamps_memory_expansion_to_runtime_bounds() {
+        let mut config = astra_config::runtime_config::RuntimeConfig::default();
+        config.memory_pressure.retrieval_max = 8;
+
+        apply_scenario_to_config(&mut config, Scenario::Exploration);
+
+        assert_eq!(config.memory.retrieval_top_k, 8);
+    }
 
     #[test]
     fn typed_intent_request_selects_semantic_scenario() {

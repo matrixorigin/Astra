@@ -22,9 +22,7 @@
 //!    write-back goes through `apply_edit`, the two ends close a loop
 //!    that's regression-guarded by `every_catalog_item_is_editable_via_apply_edit`.
 
-use crate::runtime_config::{
-    RuntimeConfig, TraceCategory, TraceLevelSerde, TraceProfile, TraceSink,
-};
+use crate::runtime_config::{RuntimeConfig, TraceCategory, TraceLevel, TraceProfile, TraceSink};
 use astra_core::runtime_limits::{RuntimeLimits, context_window_for_model};
 use serde_json::Value;
 use std::path::Path;
@@ -550,11 +548,11 @@ pub fn apply_edit(
         "trace.min_level" => {
             if let Some(s) = new_value.as_str() {
                 config.trace.min_level = match s {
-                    "error" => TraceLevelSerde::Error,
-                    "warn" => TraceLevelSerde::Warn,
-                    "info" => TraceLevelSerde::Info,
-                    "debug" => TraceLevelSerde::Debug,
-                    "trace" => TraceLevelSerde::Trace,
+                    "error" => TraceLevel::Error,
+                    "warn" => TraceLevel::Warn,
+                    "info" => TraceLevel::Info,
+                    "debug" => TraceLevel::Debug,
+                    "trace" => TraceLevel::Trace,
                     _ => return Ok(config),
                 };
                 mark_trace_custom(&mut config);

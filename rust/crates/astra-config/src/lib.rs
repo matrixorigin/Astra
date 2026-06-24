@@ -5,7 +5,6 @@
 pub mod config_overlay;
 pub mod config_version_cli;
 pub mod config_versions;
-pub mod execution_profile;
 pub mod lock_ext;
 pub mod runtime_config;
 pub mod user_profile;

@@ -1186,7 +1186,7 @@ pub struct SessionTraceConfig {
     /// Serialized as a lowercase string: `"error"`, `"warn"`, `"info"`,
     /// `"debug"`, `"trace"`.
     #[serde(default = "default_trace_level")]
-    pub min_level: TraceLevelSerde,
+    pub min_level: TraceLevel,
 
     /// Which event categories to emit. `All` means every category.
     #[serde(default = "default_trace_categories")]
@@ -1204,9 +1204,6 @@ pub struct SessionTraceConfig {
 
 // Re-export shared trace types from astra-core
 pub use astra_core::TraceLevel;
-
-// Backward-compatible type alias for serde deserialization
-pub type TraceLevelSerde = TraceLevel;
 
 fn default_trace_level() -> TraceLevel {
     TraceLevel::Info
@@ -2009,11 +2006,7 @@ impl RuntimeConfig {
             sampling_rate,
         } = trace.normalize();
         merge_if_non_default(&mut self.trace.profile, profile, TraceProfile::default());
-        merge_if_non_default(
-            &mut self.trace.min_level,
-            min_level,
-            TraceLevelSerde::default(),
-        );
+        merge_if_non_default(&mut self.trace.min_level, min_level, TraceLevel::default());
         merge_if_non_default(
             &mut self.trace.enabled_categories,
             enabled_categories,
@@ -2486,7 +2479,7 @@ mod tests {
             },
             trace: SessionTraceConfig {
                 profile: TraceProfile::Custom,
-                min_level: TraceLevelSerde::Debug,
+                min_level: TraceLevel::Debug,
                 enabled_categories: vec![
                     TraceCategory::ToolCalls,
                     TraceCategory::LlmExchanges,
@@ -2565,7 +2558,7 @@ mod tests {
         assert_eq!(merged.tool_policy.max_tool_schema_tokens, 22000);
 
         assert_eq!(merged.trace.profile, TraceProfile::Custom);
-        assert_eq!(merged.trace.min_level, TraceLevelSerde::Debug);
+        assert_eq!(merged.trace.min_level, TraceLevel::Debug);
         assert!(merged.trace.category_enabled(TraceCategory::ToolCalls));
         assert!(merged.trace.category_enabled(TraceCategory::LlmExchanges));
         assert!(
@@ -3370,12 +3363,12 @@ mod tests {
 
     #[test]
     fn from_cli_levels() {
-        let cases: &[(&str, TraceLevelSerde)] = &[
-            ("error", TraceLevelSerde::Error),
-            ("warn", TraceLevelSerde::Warn),
-            ("info", TraceLevelSerde::Info),
-            ("debug", TraceLevelSerde::Debug),
-            ("trace", TraceLevelSerde::Trace),
+        let cases: &[(&str, TraceLevel)] = &[
+            ("error", TraceLevel::Error),
+            ("warn", TraceLevel::Warn),
+            ("info", TraceLevel::Info),
+            ("debug", TraceLevel::Debug),
+            ("trace", TraceLevel::Trace),
         ];
         for (name, expected) in cases {
             let cfg = SessionTraceConfig::from_cli(None, Some(name), None)
@@ -3424,7 +3417,7 @@ mod tests {
             SessionTraceConfig::from_cli(Some("dev"), Some("debug"), Some("tool_calls,budget"))
                 .expect("combined overrides");
         assert_eq!(cfg.profile, TraceProfile::Custom);
-        assert_eq!(cfg.min_level, TraceLevelSerde::Debug);
+        assert_eq!(cfg.min_level, TraceLevel::Debug);
         assert_eq!(cfg.enabled_categories.len(), 2);
         assert!(cfg.enabled_categories.contains(&TraceCategory::ToolCalls));
         assert!(cfg.enabled_categories.contains(&TraceCategory::Budget));
@@ -3455,7 +3448,7 @@ mod tests {
             .with_cli_overrides(None, Some("debug"), None)
             .expect("level-only override should succeed");
         assert_eq!(cfg.profile, TraceProfile::Custom);
-        assert_eq!(cfg.min_level, TraceLevelSerde::Debug);
+        assert_eq!(cfg.min_level, TraceLevel::Debug);
         assert_eq!(
             cfg.enabled_categories,
             TraceCategory::individual_categories().to_vec()
