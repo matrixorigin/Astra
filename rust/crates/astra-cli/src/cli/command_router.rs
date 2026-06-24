@@ -62,7 +62,7 @@ use crate::cli::{
 use astra_thin_client::paths;
 use clap::CommandFactory;
 use crossterm::{style::Stylize, terminal};
-use std::{fs, io::Read};
+use std::io::Read;
 
 async fn start_http_server(host: &str, port: u16) -> Result<(), String> {
     let addr: std::net::SocketAddr = format!("{host}:{port}")
@@ -2182,44 +2182,6 @@ async fn execute_cli_command_impl(
             let q = vec![("per_group", args.per_group.to_string())];
             let body = api
                 .get_skills_status_query_text(&token, &q)
-                .await
-                .map_err(map_thin_err)?;
-            print_json_or_raw(&body);
-            Ok(ExitCode::Success)
-        }
-
-        Some(Command::Skill(SkillCmd::Register(args))) => {
-            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let skill_code = match (args.code, args.code_file) {
-                (Some(code), None) => code,
-                (None, Some(path)) => fs::read_to_string(path).map_err(|e| e.to_string())?,
-                (Some(_), Some(_)) => {
-                    return Err("provide either --code or --code-file, not both".to_string());
-                }
-                (None, None) => {
-                    return Err("missing skill code: set --code or --code-file".to_string());
-                }
-            };
-            let metadata = if let Some(raw) = args.metadata_json {
-                Some(serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| e.to_string())?)
-            } else {
-                None
-            };
-            let skill_id = args
-                .skill_id
-                .unwrap_or_else(|| format!("{}@{}", args.name, args.version));
-            let body = api
-                .post_skills_register_json(
-                    &token,
-                    &serde_json::json!({
-                        "skill_id": skill_id,
-                        "skill_name": args.name,
-                        "skill_version": args.version,
-                        "skill_code": skill_code,
-                        "description": args.description,
-                        "metadata": metadata
-                    }),
-                )
                 .await
                 .map_err(map_thin_err)?;
             print_json_or_raw(&body);

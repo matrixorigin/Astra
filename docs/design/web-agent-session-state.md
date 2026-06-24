@@ -2698,7 +2698,7 @@ Publish flow:
 1. User edits a skill in web UI.
 2. Server validates `SKILL.md` manifest and content.
 3. Server creates an immutable `user_skill_versions` row.
-4. Active version is registered into `skills_registry` with `created_by`,
+4. Active version is indexed in `skills_registry` with `created_by`,
    `source='user'`, `is_public`, and `content_hash`.
 5. `skill_installations` marks it installed for the same user.
 6. Skill selection uses the same selector, but filters by user ownership,

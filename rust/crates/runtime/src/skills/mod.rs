@@ -43,8 +43,7 @@ pub mod handlers;
 pub mod registry;
 pub mod watcher;
 
-// Re-export HTTP handlers at the module root for backward compatibility
-// with `crate::skills::register_skill_handler` etc. used in router_builder.rs.
+// Re-export HTTP handlers at the module root for router_builder.rs.
 pub use handlers::*;
 
 // Re-export key framework types for convenience.

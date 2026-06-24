@@ -51,7 +51,7 @@ Three related paths:
 
 2. **Edge `UnifiedSkillRegistry`** — The interactive CLI (`session_runtime.rs`) registers **`LocalSkillProvider::standard()`** and **`BundledSkillProvider`**, runs **`discover_all()`**, and may add MCP skills. This includes project-local cwd walk-up skills that are intentionally not visible to Web unless published. Server-backed CLI/Web turns should instead use the API server catalog boundary.
 
-3. **HTTP catalog** — `GET /skills` (via `ThinClient`) supports slash commands, marketplace version checks, registration flows, and the Web composer picker. It returns the same server-visible catalog used by runtime selection: `~/.astra/skills`, `~/.claude/skills`, and `skills_registry` rows where `created_by = user OR is_public = 1`.
+3. **HTTP catalog** — `GET /skills` (via `ThinClient`) supports slash commands, marketplace version checks, published/user skill flows, and the Web composer picker. It returns the same server-visible catalog used by runtime selection: `~/.astra/skills`, `~/.claude/skills`, and `skills_registry` rows where `created_by = user OR is_public = 1`.
 
 For sync-oriented diagrams and resume/checkpoint behavior, see [`rust/docs/edge-cloud-sync-architecture.md`](../../rust/docs/edge-cloud-sync-architecture.md) §8.5.
 

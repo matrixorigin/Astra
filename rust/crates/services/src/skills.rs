@@ -9,21 +9,8 @@ use astra_core::{
 };
 
 use crate::pagination::clamp_api_list_pagination;
-use sha2::Digest;
 
 // ── Data types ───────────────────────────────────────────────────────────────
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct SkillRegisterRequestData {
-    pub skill_id: String,
-    pub skill_name: String,
-    pub skill_version: String,
-    pub skill_code: String,
-    pub skill_type: String,
-    pub remote_url: Option<String>,
-    pub description: Option<String>,
-    pub metadata: Option<serde_json::Value>,
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SkillPublishRequestData {
@@ -109,12 +96,12 @@ const SKILL_TYPE_LOCAL: &str = "local";
 const SKILL_TYPE_REMOTE: &str = "remote";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RegisteredSkillType {
+enum PublishedSkillType {
     Local,
     Remote,
 }
 
-impl RegisteredSkillType {
+impl PublishedSkillType {
     fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "" | SKILL_TYPE_LOCAL => Some(Self::Local),
@@ -184,71 +171,6 @@ const USER_OWNED_SKILL_FIRST_ORDER: &str =
 
 // ── Idempotency classifiers ───────────────────────────────────────────────────
 
-/// Row fetched from `skills_registry` when checking for a duplicate before register.
-pub(crate) struct ExistingRegisterRow {
-    pub skill_name: String,
-    pub version: String,
-    pub description: Option<String>,
-    pub skill_definition: String,
-    pub code_hash: String,
-    pub created_by: Option<String>,
-    pub created_at: Option<String>,
-}
-
-/// Decision returned by [`classify_register_duplicate`].
-#[derive(Debug, PartialEq)]
-pub(crate) enum RegisterDuplicateDecision {
-    /// No existing row; proceed with INSERT.
-    Insert,
-    /// Existing row is identical to the incoming request; return it as idempotent success.
-    IdempotentReplay(SkillRecord),
-    /// Existing row differs; return 409 Conflict.
-    Conflict,
-}
-
-/// Classify whether a duplicate `register_skill` call is an idempotent retry or a real conflict.
-///
-/// Compares `skill_definition` JSON and `code_hash` of the stored row against the values
-/// that would be produced by the incoming request.  Identical → idempotent success; different → 409.
-///
-/// JSON is compared **structurally** (parse-then-compare via [`serde_json::Value`]) because
-/// MatrixOne — like many JSON-typed columns — does not guarantee that the read-back textual form
-/// preserves the on-write key ordering or whitespace. A textual `==` would falsely return
-/// `Conflict` on identical retries when the storage engine canonicalised the JSON on insert.
-pub(crate) fn classify_register_duplicate(
-    existing: Option<ExistingRegisterRow>,
-    request_user_id: &str,
-    skill_id: &str,
-    new_definition_json: &str,
-    new_code_hash: &str,
-) -> RegisterDuplicateDecision {
-    let Some(row) = existing else {
-        return RegisterDuplicateDecision::Insert;
-    };
-    // A duplicate owned by another user must not become an idempotent replay,
-    // even if the incoming bytes happen to match. Replay is an ownership-scoped
-    // retry contract, not a cross-user dedupe API; returning the stored row here
-    // would leak metadata for a skill the caller did not create.
-    if row.created_by.as_deref() != Some(request_user_id) {
-        return RegisterDuplicateDecision::Conflict;
-    }
-    let same_def = json_structurally_equal(&row.skill_definition, new_definition_json);
-    let same_hash = row.code_hash == new_code_hash;
-    if same_def && same_hash {
-        let metadata: Option<serde_json::Value> = serde_json::from_str(&row.skill_definition).ok();
-        RegisterDuplicateDecision::IdempotentReplay(SkillRecord {
-            skill_id: skill_id.to_string(),
-            skill_name: row.skill_name,
-            version: row.version,
-            description: row.description,
-            metadata,
-            created_at: row.created_at,
-        })
-    } else {
-        RegisterDuplicateDecision::Conflict
-    }
-}
-
 /// Row fetched from `skills_registry` when a duplicate key fires during publish.
 pub(crate) struct ExistingPublishRow {
     pub skill_name: String,
@@ -270,7 +192,8 @@ pub(crate) enum PublishDuplicateDecision {
 /// Classify whether a duplicate `publish_skill` call is an idempotent retry or a real conflict.
 ///
 /// Compares `skill_definition` and `manifest` of the stored row against what was being inserted,
-/// using structural JSON equality (see [`classify_register_duplicate`] for rationale).
+/// using structural JSON equality because MatrixOne — like many JSON-typed columns — does not
+/// guarantee that read-back text preserves on-write key ordering or whitespace.
 pub(crate) fn classify_publish_duplicate(
     existing: Option<ExistingPublishRow>,
     request_user_id: &str,
@@ -319,12 +242,6 @@ pub(crate) fn json_structurally_equal(a: &str, b: &str) -> bool {
 
 #[async_trait]
 pub trait SkillService: Send + Sync {
-    async fn register_skill(
-        &self,
-        user_id: String,
-        request: SkillRegisterRequestData,
-    ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)>;
-
     async fn list_skills(
         &self,
         user_id: String,
@@ -397,172 +314,6 @@ impl DatabaseSkillService {
 
 #[async_trait]
 impl SkillService for DatabaseSkillService {
-    async fn register_skill(
-        &self,
-        user_id: String,
-        request: SkillRegisterRequestData,
-    ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
-
-        let skill_type = RegisteredSkillType::parse(&request.skill_type).ok_or_else(|| {
-            error_response(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "invalid skill_type '{}'; expected '{}' or '{}'",
-                    request.skill_type, SKILL_TYPE_LOCAL, SKILL_TYPE_REMOTE
-                ),
-            )
-        })?;
-        let remote_url = request
-            .remote_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|url| !url.is_empty())
-            .map(str::to_string);
-        match skill_type {
-            RegisteredSkillType::Local => {
-                if request.skill_code.trim().is_empty() {
-                    return Err(error_response(
-                        StatusCode::BAD_REQUEST,
-                        "local skills require non-empty skill_code",
-                    ));
-                }
-                if remote_url.is_some() {
-                    return Err(error_response(
-                        StatusCode::BAD_REQUEST,
-                        "local skills must not provide remote_url",
-                    ));
-                }
-            }
-            RegisteredSkillType::Remote => {
-                let Some(url) = remote_url.as_deref() else {
-                    return Err(error_response(
-                        StatusCode::BAD_REQUEST,
-                        "remote skills require remote_url",
-                    ));
-                };
-                if !request.skill_code.trim().is_empty() {
-                    return Err(error_response(
-                        StatusCode::BAD_REQUEST,
-                        "remote skills must not provide skill_code",
-                    ));
-                }
-                validate_remote_url(url)
-                    .map_err(|msg| error_response(StatusCode::BAD_REQUEST, msg))?;
-            }
-        }
-
-        let skill_id = if request.skill_id.is_empty() {
-            format!("{}@{}", request.skill_name, request.skill_version)
-        } else {
-            request.skill_id.clone()
-        };
-
-        // Build skill_definition and code_hash before the duplicate-check SELECT so the
-        // classifier can compare them against the stored row.
-        let mut skill_definition = match request.metadata.clone() {
-            Some(serde_json::Value::Object(mut map)) => {
-                strip_reserved_skill_definition_keys(&mut map);
-                map
-            }
-            Some(value) => {
-                let mut map = serde_json::Map::new();
-                map.insert("metadata".to_string(), value);
-                map
-            }
-            None => serde_json::Map::new(),
-        };
-        skill_definition.insert(
-            "skill_type".to_string(),
-            serde_json::Value::String(skill_type.as_str().to_string()),
-        );
-        if !request.skill_code.trim().is_empty() {
-            skill_definition.insert(
-                "instructions".to_string(),
-                serde_json::Value::String(request.skill_code.clone()),
-            );
-        }
-        if let Some(url) = remote_url.clone() {
-            skill_definition.insert("remote_url".to_string(), serde_json::Value::String(url));
-        }
-        let definition_value = serde_json::Value::Object(skill_definition);
-        let definition_json =
-            serde_json::to_string(&definition_value).unwrap_or_else(|_| "{}".to_string());
-        let code_hash = format!("{:x}", sha2::Sha256::digest(request.skill_code.as_bytes()));
-
-        // Idempotency check: fetch existing row to compare definition + code_hash.
-        let existing_row = query(
-            "SELECT skill_name, version, description, \
-             IFNULL(CAST(skill_definition AS CHAR), '') AS skill_definition, \
-             IFNULL(code_hash, '') AS code_hash, \
-             created_by, \
-             DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-             FROM skills_registry WHERE skill_id = ?",
-        )
-        .bind(&skill_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(internal_error)?
-        .map(|row| ExistingRegisterRow {
-            skill_name: row.try_get::<String, _>("skill_name").unwrap_or_default(),
-            version: row.try_get::<String, _>("version").unwrap_or_default(),
-            description: row.try_get::<String, _>("description").ok(),
-            skill_definition: row
-                .try_get::<String, _>("skill_definition")
-                .unwrap_or_default(),
-            code_hash: row.try_get::<String, _>("code_hash").unwrap_or_default(),
-            created_by: row.try_get::<String, _>("created_by").ok(),
-            created_at: row.try_get::<String, _>("created_at").ok(),
-        });
-
-        match classify_register_duplicate(
-            existing_row,
-            &user_id,
-            &skill_id,
-            &definition_json,
-            &code_hash,
-        ) {
-            RegisterDuplicateDecision::Insert => {
-                // Proceed to INSERT below.
-            }
-            RegisterDuplicateDecision::IdempotentReplay(record) => {
-                return Ok(record);
-            }
-            RegisterDuplicateDecision::Conflict => {
-                return Err(error_response(
-                    StatusCode::CONFLICT,
-                    format!("Skill '{}' already exists", skill_id),
-                ));
-            }
-        }
-
-        query(
-            "INSERT INTO skills_registry \
-             (skill_id, skill_name, version, description, skill_definition, code_hash, \
-              is_active, status, source, created_by, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, 1, 'active', 'user', ?, NOW(), NOW())",
-        )
-        .bind(&skill_id)
-        .bind(&request.skill_name)
-        .bind(&request.skill_version)
-        .bind(&request.description)
-        .bind(&definition_json)
-        .bind(&code_hash)
-        .bind(&user_id)
-        .execute(&pool)
-        .await
-        .map_err(internal_error)?;
-
-        Ok(SkillRecord {
-            skill_id,
-            skill_name: request.skill_name,
-            version: request.skill_version,
-            description: request.description,
-            metadata: Some(definition_value),
-            created_at: Some(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string()),
-        })
-    }
-
     async fn list_skills(
         &self,
         user_id: String,
@@ -846,7 +597,7 @@ impl SkillService for DatabaseSkillService {
     ) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        let skill_type = RegisteredSkillType::parse(&request.skill_type).ok_or_else(|| {
+        let skill_type = PublishedSkillType::parse(&request.skill_type).ok_or_else(|| {
             error_response(
                 StatusCode::BAD_REQUEST,
                 format!(
@@ -862,7 +613,7 @@ impl SkillService for DatabaseSkillService {
             .filter(|url| !url.is_empty())
             .map(str::to_string);
         match skill_type {
-            RegisteredSkillType::Local => {
+            PublishedSkillType::Local => {
                 if remote_url.is_some() {
                     return Err(error_response(
                         StatusCode::BAD_REQUEST,
@@ -870,7 +621,7 @@ impl SkillService for DatabaseSkillService {
                     ));
                 }
             }
-            RegisteredSkillType::Remote => {
+            PublishedSkillType::Remote => {
                 let Some(url) = remote_url.as_deref() else {
                     return Err(error_response(
                         StatusCode::BAD_REQUEST,
@@ -1063,13 +814,6 @@ pub struct UnconfiguredSkillService;
 
 #[async_trait]
 impl SkillService for UnconfiguredSkillService {
-    async fn register_skill(
-        &self,
-        _: String,
-        _: SkillRegisterRequestData,
-    ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
-        Err(internal_error("skill service not configured"))
-    }
     async fn list_skills(
         &self,
         _: String,
@@ -1124,22 +868,6 @@ impl SkillService for UnconfiguredSkillService {
 }
 
 // ── HTTP types ───────────────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-pub struct RegisterSkillRequest {
-    #[serde(default)]
-    pub skill_id: String,
-    pub skill_name: String,
-    pub skill_version: String,
-    #[serde(default)]
-    pub skill_code: String,
-    #[serde(default = "default_skill_type")]
-    pub skill_type: String,
-    #[serde(default)]
-    pub remote_url: Option<String>,
-    pub description: Option<String>,
-    pub metadata: Option<serde_json::Value>,
-}
 
 fn default_skill_type() -> String {
     SKILL_TYPE_LOCAL.to_string()
@@ -1239,46 +967,20 @@ mod tests {
     }
 
     #[test]
-    fn register_request_defaults_local_mode() {
-        let json = r#"{"skill_name":"s","skill_version":"1.0.0"}"#;
-        let req: RegisterSkillRequest = serde_json::from_str(json).unwrap();
-        assert!(req.skill_id.is_empty());
-        assert!(req.skill_code.is_empty());
-        assert_eq!(req.skill_type, "local");
-        assert!(req.remote_url.is_none());
-    }
-
-    #[test]
-    fn register_request_remote_mode_fields() {
-        let json = r#"{
-            "skill_name":"s",
-            "skill_version":"1.0.0",
-            "skill_type":"remote",
-            "remote_url":"http://127.0.0.1:8080/skills/run"
-        }"#;
-        let req: RegisterSkillRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.skill_type, "remote");
+    fn published_skill_type_parse() {
         assert_eq!(
-            req.remote_url.as_deref(),
-            Some("http://127.0.0.1:8080/skills/run")
-        );
-    }
-
-    #[test]
-    fn registered_skill_type_parse() {
-        assert_eq!(
-            RegisteredSkillType::parse("local"),
-            Some(RegisteredSkillType::Local)
+            PublishedSkillType::parse("local"),
+            Some(PublishedSkillType::Local)
         );
         assert_eq!(
-            RegisteredSkillType::parse(""),
-            Some(RegisteredSkillType::Local)
+            PublishedSkillType::parse(""),
+            Some(PublishedSkillType::Local)
         );
         assert_eq!(
-            RegisteredSkillType::parse("remote"),
-            Some(RegisteredSkillType::Remote)
+            PublishedSkillType::parse("remote"),
+            Some(PublishedSkillType::Remote)
         );
-        assert!(RegisteredSkillType::parse("invalid").is_none());
+        assert!(PublishedSkillType::parse("invalid").is_none());
     }
 
     #[test]
@@ -1341,95 +1043,6 @@ mod tests {
         assert!(
             !SKILL_REGISTRY_LIST_SELECT.contains("skill_definition"),
             "list_skills must not read skill_definition (use get_skill for full record)"
-        );
-    }
-
-    // ── classify_register_duplicate unit tests ────────────────────────────────
-
-    fn make_existing_register_row(def: &str, hash: &str) -> ExistingRegisterRow {
-        ExistingRegisterRow {
-            skill_name: "my-skill".to_string(),
-            version: "1.0.0".to_string(),
-            description: Some("desc".to_string()),
-            skill_definition: def.to_string(),
-            code_hash: hash.to_string(),
-            created_by: Some("owner-1".to_string()),
-            created_at: Some("2024-01-01T00:00:00".to_string()),
-        }
-    }
-
-    #[test]
-    fn classify_register_duplicate_none_returns_insert() {
-        let decision = classify_register_duplicate(
-            None,
-            "owner-1",
-            "my-skill@1.0.0",
-            r#"{"skill_type":"local"}"#,
-            "abc",
-        );
-        assert_eq!(decision, RegisterDuplicateDecision::Insert);
-    }
-
-    #[test]
-    fn classify_register_duplicate_identical_returns_idempotent_replay() {
-        let def = r#"{"skill_type":"local","instructions":"fn run() {}"}"#;
-        let hash = "deadbeef";
-        let row = make_existing_register_row(def, hash);
-        let decision =
-            classify_register_duplicate(Some(row), "owner-1", "my-skill@1.0.0", def, hash);
-        assert!(
-            matches!(decision, RegisterDuplicateDecision::IdempotentReplay(_)),
-            "identical payload must return IdempotentReplay, got {decision:?}"
-        );
-        if let RegisterDuplicateDecision::IdempotentReplay(record) = decision {
-            assert_eq!(record.skill_id, "my-skill@1.0.0");
-            assert_eq!(record.skill_name, "my-skill");
-        }
-    }
-
-    #[test]
-    fn classify_register_duplicate_different_definition_returns_conflict() {
-        let stored_def = r#"{"skill_type":"local","instructions":"fn run() {}"}"#;
-        let new_def = r#"{"skill_type":"local","instructions":"fn run() { panic!() }"}"#;
-        let row = make_existing_register_row(stored_def, "abc");
-        let decision =
-            classify_register_duplicate(Some(row), "owner-1", "my-skill@1.0.0", new_def, "abc");
-        assert_eq!(decision, RegisterDuplicateDecision::Conflict);
-    }
-
-    #[test]
-    fn classify_register_duplicate_different_hash_returns_conflict() {
-        let def = r#"{"skill_type":"local","instructions":"fn run() {}"}"#;
-        let row = make_existing_register_row(def, "old-hash");
-        let decision =
-            classify_register_duplicate(Some(row), "owner-1", "my-skill@1.0.0", def, "new-hash");
-        assert_eq!(decision, RegisterDuplicateDecision::Conflict);
-    }
-
-    #[test]
-    fn classify_register_duplicate_same_payload_different_private_owner_conflicts() {
-        let def = r#"{"skill_type":"local","instructions":"fn run() {}"}"#;
-        let row = make_existing_register_row(def, "abc");
-        let decision =
-            classify_register_duplicate(Some(row), "other-user", "my-skill@1.0.0", def, "abc");
-        assert_eq!(decision, RegisterDuplicateDecision::Conflict);
-    }
-
-    /// Regression: MatrixOne (and most JSON-typed columns) reorders object
-    /// keys on persist/read-back. The classifier must compare structurally,
-    /// not byte-for-byte, otherwise an identical retry returns 409 instead
-    /// of the idempotent 200. Caught by
-    /// `it_register_skill_idempotent_retry_returns_200`.
-    #[test]
-    fn classify_register_duplicate_reordered_keys_returns_idempotent_replay() {
-        let new_def = r#"{"skill_type":"local","instructions":"fn run() {}"}"#;
-        let stored_def = r#"{"instructions":"fn run() {}","skill_type":"local"}"#;
-        let row = make_existing_register_row(stored_def, "abc");
-        let decision =
-            classify_register_duplicate(Some(row), "owner-1", "my-skill@1.0.0", new_def, "abc");
-        assert!(
-            matches!(decision, RegisterDuplicateDecision::IdempotentReplay(_)),
-            "reordered-keys retry must be idempotent replay, got {decision:?}"
         );
     }
 
@@ -1505,8 +1118,9 @@ mod tests {
         assert_eq!(decision, PublishDuplicateDecision::Conflict);
     }
 
-    /// Regression: same as `classify_register_duplicate_reordered_keys_*`,
-    /// but on the publish path. Caught by
+    /// Regression: MatrixOne can reorder JSON object keys on persist/read-back.
+    /// Publish retries compare structurally so identical retries remain idempotent.
+    /// Caught by
     /// `it_publish_skill_idempotent_retry_returns_200`.
     #[test]
     fn classify_publish_duplicate_reordered_keys_returns_idempotent_replay() {

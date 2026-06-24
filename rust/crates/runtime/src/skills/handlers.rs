@@ -1,7 +1,4 @@
-//! HTTP handlers for the skill REST API (register, list, publish, etc.).
-//!
-//! These are the original handlers from `skills.rs`, preserved for backward
-//! compatibility with the server router.
+//! HTTP handlers for the skill catalog REST API.
 
 pub use astra_services::skills::*;
 
@@ -12,31 +9,6 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
-
-pub async fn register_skill_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<RegisterSkillRequest>,
-) -> Result<(StatusCode, Json<SkillRecord>), (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let skill = state
-        .skill_service
-        .register_skill(
-            user.user_id,
-            SkillRegisterRequestData {
-                skill_id: request.skill_id,
-                skill_name: request.skill_name,
-                skill_version: request.skill_version,
-                skill_code: request.skill_code,
-                skill_type: request.skill_type,
-                remote_url: request.remote_url,
-                description: request.description,
-                metadata: request.metadata,
-            },
-        )
-        .await?;
-    Ok((StatusCode::CREATED, Json(skill)))
-}
 
 pub async fn list_skills_handler(
     State(state): State<AppState>,

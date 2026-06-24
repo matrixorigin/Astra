@@ -291,8 +291,8 @@ pub use skill_config::{
     DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,
 };
 pub use skills::{
-    DatabaseSkillService, SkillPublishRequestData, SkillRecord, SkillRegisterRequestData,
-    SkillService, UnconfiguredSkillService,
+    DatabaseSkillService, SkillPublishRequestData, SkillRecord, SkillService,
+    UnconfiguredSkillService,
 };
 pub use state_projection::{
     BubbleUpTarget, COMPACTION_INVARIANT_SQL, CompactionInvariant, DatabasePlanTodoSink,

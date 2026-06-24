@@ -24,7 +24,7 @@ const ADMIN_COMMANDS: &[(&str, &str)] = &[
     ("logout", "Logout and clear tokens"),
     ("audit", "List audit log  (e.g. audit 50)"),
     ("token list", "List API tokens"),
-    ("skill list", "List registered skills"),
+    ("skill list", "List visible skills"),
     (
         "prompt optimize",
         "Optimize agent prompt  (e.g. prompt optimize <agent_id>)",

@@ -24,7 +24,7 @@ use astra_runtime::{
 };
 use astra_services::skills::{
     SkillInfoRecord, SkillListItem, SkillListRecord, SkillPublishRequestData, SkillRecord,
-    SkillRegisterRequestData, SkillService, SkillStatusRecord, SkillVersionRecord,
+    SkillService, SkillStatusRecord, SkillVersionRecord,
 };
 use astra_services::{
     ModelCreateRequestData, ModelListItem, ModelRecord, ModelService, ModelUpdateRequestData,
@@ -250,14 +250,6 @@ struct TestSkillService;
 
 #[async_trait]
 impl SkillService for TestSkillService {
-    async fn register_skill(
-        &self,
-        _: String,
-        _: SkillRegisterRequestData,
-    ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
-    }
-
     async fn list_skills(
         &self,
         _user_id: String,

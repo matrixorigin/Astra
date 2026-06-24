@@ -10461,7 +10461,7 @@ mod tests {
     async fn build_initial_state_includes_database_skill_provider_when_wired() {
         use astra_services::skills::{
             SkillInfoRecord, SkillListItem, SkillListRecord, SkillPublishRequestData, SkillRecord,
-            SkillRegisterRequestData, SkillService, SkillStatusRecord, SkillVersionRecord,
+            SkillService, SkillStatusRecord, SkillVersionRecord,
         };
         use async_trait::async_trait;
 
@@ -10488,14 +10488,6 @@ mod tests {
 
         #[async_trait]
         impl SkillService for MockSkillService {
-            async fn register_skill(
-                &self,
-                _: String,
-                _: SkillRegisterRequestData,
-            ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
-                self.unsupported("register_skill")
-            }
-
             async fn list_skills(
                 &self,
                 _user_id: String,

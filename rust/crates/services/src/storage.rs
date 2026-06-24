@@ -1620,7 +1620,6 @@ pub async fn ensure_core_schema(
             version VARCHAR(64) NOT NULL,
             description TEXT NULL,
             skill_definition JSON NULL,
-            code_hash VARCHAR(128) NULL,
             dependencies JSON NULL,
             manifest JSON NULL,
             publisher_id VARCHAR(255) NULL,

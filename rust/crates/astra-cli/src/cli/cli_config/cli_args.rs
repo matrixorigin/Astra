@@ -1032,12 +1032,10 @@ pub(crate) struct ModelShowArgs {
     after_help = "Examples:\n  astra skill list\n  astra skill show memory-search\n  astra skill status"
 )]
 pub(crate) enum SkillCmd {
-    /// List registered skills
+    /// List visible skills
     List(SkillListArgs),
     /// Show skill details
     Show(SkillShowArgs),
-    /// Register a skill
-    Register(SkillRegisterArgs),
     /// Show skill group status
     Status(SkillStatusArgs),
 }
@@ -1067,24 +1065,6 @@ pub(crate) struct SkillShowArgs {
 pub(crate) struct SkillStatusArgs {
     #[arg(long, default_value_t = 50)]
     pub per_group: u32,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct SkillRegisterArgs {
-    #[arg(long)]
-    pub name: String,
-    #[arg(long)]
-    pub version: String,
-    #[arg(long)]
-    pub code: Option<String>,
-    #[arg(long)]
-    pub code_file: Option<String>,
-    #[arg(long)]
-    pub skill_id: Option<String>,
-    #[arg(long)]
-    pub description: Option<String>,
-    #[arg(long)]
-    pub metadata_json: Option<String>,
 }
 
 #[derive(Args, Debug)]

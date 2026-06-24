@@ -9,7 +9,7 @@
 > CLI commands (/skill list|info|search|new|dev|test|doctor|validate|config|system),
 > non-blocking permission checks, skill tool schema injection.
 >
-> 🔵 **Design Target**: Registered skills via DB (§3.2), Marketplace via MatrixOne
+> 🔵 **Design Target**: Catalog-backed published skills via DB (§3.2), Marketplace via MatrixOne
 > Stage (§3.3), cloud skill publishing.
 
 ---
@@ -128,7 +128,7 @@ pub struct LoadedSkill {
 │  └──────────────┘  └──────────────┘  └──────────────┘          │
 │  Storage: stage://mo_skills/   Download → local cache           │
 ├─────────────────────────────────────────────────────────────────┤
-│  Layer 2: Registered Skills (MatrixOne Database)  [DESIGN]      │
+│  Layer 2: Catalog-backed Skills (MatrixOne DB)    [DESIGN]      │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
 │  │ Team shared  │  │ User private │  │ Installed    │          │
 │  │ (org scope)  │  │ (account)    │  │ (from market)│          │
@@ -201,7 +201,7 @@ UnifiedSkillRegistry::discover_all()
   ├─ Apply metadata_budget (skip if exceeds token limit)
   ├─ Separate unconditional vs conditional (paths-based) skills
   ├─ Cache manifests (metadata only, instructions lazy-loaded)
-  └─ Return registered skill names
+  └─ Return visible skill names
 ```
 
 ### 2.6 Local Skill Search Paths
@@ -260,9 +260,9 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
 - Triggers `discover_all()` on SKILL.md / manifest.yaml changes
 - Handle stored in session state, dropped on exit
 
-### 3.2 Layer 2: Registered Skills [DESIGN TARGET]
+### 3.2 Layer 2: Catalog-backed Published Skills [DESIGN TARGET]
 
-**Lifecycle**: Create/Upload → Register → Discover → Filter/Activate → Use → Update → Deregister
+**Lifecycle**: Author/Import → Publish → Discover → Filter/Activate → Use → Update → Unpublish
 
 **Characteristics**:
 - **Stored in MatrixOne** — `skills_registry` table
@@ -289,17 +289,18 @@ CREATE TABLE skills_registry (
 
 **CLI Commands**:
 ```bash
-/skill register <name> [--scope=org|user]
-/skill deregister <name>
+/skill publish <name> [--scope=private|community]
+/skill installed
+/skill upgrade <name>
 ```
 
 ### 3.3 Layer 3: Cloud Marketplace [DESIGN TARGET]
 
-**Lifecycle**: Browse → Preview → Install → Register (auto) → Use
+**Lifecycle**: Browse → Preview → Install → Cache/Index → Use
 
 **Characteristics**:
 - **Stored in MatrixOne Stage** — S3/MinIO backed object storage
-- **Install = Download + Register** — cached locally, registered in DB
+- **Install = Download + local cache** — server tracks marketplace installation state separately
 - **Versioned** — directory-based versioning in Stage
 - **Best for** — community sharing, enterprise skill stores
 
@@ -369,7 +370,7 @@ session-level always-include preference and no second budget exemption path.
 | Bundled         | Runtime catalog includes it                      | Core functionality            |
 | Local (project) | CLI-local resolver includes project paths        | CLI-only until imported       |
 | Local (user)    | CLI/server resolver includes the user's home dir | User-scoped filesystem skills |
-| Registered      | DB visibility predicate admits it                | Filtered by `allow_skills`    |
+| Catalog DB      | DB visibility predicate admits it                | Filtered by `allow_skills`    |
 | Marketplace     | Installed or imported into a visible catalog     | Versioned source package      |
 | MCP             | Connected server exports it                      | Catalog metadata only         |
 
@@ -616,15 +617,14 @@ impl From<std::io::Error> for SkillError {
 /skill health                   # Catalog + on-disk SKILL.md checks (API when logged in)
 ```
 
-### Registration & Marketplace [DESIGN TARGET]
+### Marketplace [DESIGN TARGET]
 ```bash
-/skill register <name> [--scope=org|user]
-/skill deregister <name>
 /skill browse [category]
 /skill install <name>[@version]
+/skill installed
 /skill uninstall <name>
 /skill publish <name> [--scope=private|community]
-/skill update <name>
+/skill upgrade <name>
 ```
 
 ---
@@ -689,7 +689,7 @@ CREATE STAGE marketplace_private  URL = 'stage://mo_skill_marketplace/private/';
   ├─ 1. Resolve: Query skill_marketplace_index for package URL
   ├─ 2. Download: LOAD DATA INFILE 'stage://marketplace_official/code-review/1.1.0/*'
   ├─ 3. Cache: Store in ~/.astra/cache/skills/code-review/1.1.0/
-  ├─ 4. Register: INSERT INTO skills_registry (name, version, manifest, content, ...)
+  ├─ 4. Index: record installation state and visible catalog metadata
   └─ 5. Discover: registry.discover_all() picks up new skill
 ```
 
@@ -721,7 +721,7 @@ CREATE STAGE marketplace_private  URL = 'stage://mo_skill_marketplace/private/';
 
 ## 13. Design Decisions
 
-### Q1: Do local skills need database registration?
+### Q1: Do local skills need a database catalog row?
 **No.** Local skills are weak-constraint, zero-config. Drop file → use immediately.
 Matches Claude Code behavior and provides best development experience.
 
@@ -730,8 +730,10 @@ Matches Claude Code behavior and provides best development experience.
 `discover_skills` handles search when the model needs more candidates.
 
 ### Q3: What happens after marketplace install?
-**Becomes a Registered skill (Layer 2).** Downloaded to local cache + registered in DB.
-Works offline via cache. Updates check marketplace for newer versions.
+**Becomes a cached marketplace skill visible through the catalog.** Downloaded
+to local cache while server-side marketplace state tracks installation and
+version availability. Works offline via cache. Updates check marketplace for
+newer versions.
 
 ### Q4: How many active skills are reasonable?
 Per-turn active skills should stay small: they are user intent, not catalog
@@ -761,7 +763,7 @@ Both come from same MCP server but enter different systems.
 | CLI /skill commands          | ✅ Done     | `rust/crates/astra-cli/src/cli/slash_skill.rs`    | 12    |
 | Non-blocking permission      | ✅ Done     | `rust/crates/astra-cli/src/cli/stream_render.rs`  | —     |
 | Per-turn active skill hints  | ✅ Done    | `edge_profile.active_skills`, `allow_skills` | 10+ |
-| Registered skills (DB)       | 🔵 Design  | —                                          | —     |
+| Catalog-backed skills (DB)   | 🔵 Design  | —                                          | —     |
 | Marketplace (Stage)          | 🔵 Design  | —                                          | —     |
 | Skill sandbox mode           | 🔵 Design  | —                                          | —     |
 

@@ -220,17 +220,6 @@ mod tests {
 
     #[async_trait]
     impl SkillService for MockSkillService {
-        async fn register_skill(
-            &self,
-            _: String,
-            _: SkillRegisterRequestData,
-        ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
-            Err((
-                StatusCode::NOT_IMPLEMENTED,
-                Json(ErrorResponse::new("register_skill not available")),
-            ))
-        }
-
         async fn list_skills(
             &self,
             _user_id: String,

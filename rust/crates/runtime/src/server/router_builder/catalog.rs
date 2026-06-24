@@ -21,10 +21,7 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             "/models/{model_name}/check",
             post(data_layer::models::check_model_handler),
         )
-        .route(
-            "/skills",
-            post(skills::register_skill_handler).get(skills::list_skills_handler),
-        )
+        .route("/skills", get(skills::list_skills_handler))
         .route("/skills/status", get(skills::get_skill_status_handler))
         .route("/skills/publish", post(skills::publish_skill_handler))
         .route(

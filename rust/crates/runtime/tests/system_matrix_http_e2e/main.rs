@@ -47,9 +47,6 @@
 //! - **`e2e_matrix_trusted_moi_user_system_integration`** — run server in `trusted_moi` mode,
 //!   authenticate via external JWT claims, verify local auth endpoints are disabled, and assert
 //!   session/memory ownership maps to upstream user id.
-//! - **`e2e_matrix_remote_skill_registration_user_system_integration`** — register remote skill via
-//!   `/skills` with mode-aware bootstrap (`local_jwt` or `trusted_moi`), verify validation behavior,
-//!   list/get/version discoverability, and `skills_registry.created_by` ownership mapping.
 //! - **`e2e_matrix_stream_session_and_run_status`** — `POST /chat/stream` with mock LLM → verify
 //!   `agent_sessions` row persisted, run transitions to `completed`, `events_count > 0`.
 //! - **`e2e_matrix_stream_context_trace_persistence`** — `POST /chat/stream` → verify
@@ -125,7 +122,6 @@ mod journey_extended;
 mod journey_full;
 mod journey_full_capture_matrix;
 mod journey_meta_matrix;
-mod journey_remote_skills;
 mod journey_saas_negative_matrix;
 mod journey_saas_platform_matrix;
 mod journey_session_artifacts_matrix;
@@ -274,13 +270,6 @@ async fn e2e_matrix_models_admin_crud() {
 async fn e2e_matrix_trusted_moi_user_system_integration() {
     require_system_e2e_env();
     journey_trusted_moi::run_trusted_moi_user_system_integration().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_remote_skill_registration_user_system_integration() {
-    require_system_e2e_env();
-    journey_remote_skills::run_remote_skill_registration_user_system_integration().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -8644,8 +8644,7 @@ async fn a5_persist_activity_writer_called() {
 /// is the same, so this test pins the rules rather than the heading.
 #[tokio::test]
 async fn b1_think_before_act_directive_in_system_prompt() {
-    let prompt =
-        astra_runtime::prompts::build_main_system_prompt(&["read_file", "grep"], "", 1.0, None);
+    let prompt = astra_runtime::prompts::build_main_system_prompt(&["read_file", "grep"], "", None);
     assert!(
         prompt.contains("Plan, Batch, Execute") || prompt.contains("Think-Before-Act"),
         "system prompt should carry the planning directive (current heading: \
@@ -8749,13 +8748,8 @@ async fn b2_round_index_defaults_to_zero() {
 /// note: "Think-Before-Act" was consolidated into "Plan, Batch, Execute".
 #[tokio::test]
 async fn b1_think_before_act_in_sections_builder() {
-    let sections = astra_runtime::prompts::build_system_prompt_sections_with_style(
-        &["bash"],
-        "",
-        1.0,
-        None,
-        None,
-    );
+    let sections =
+        astra_runtime::prompts::build_system_prompt_sections_with_style(&["bash"], "", None, None);
     let full_text = astra_runtime::prompts::sections_to_string(&sections);
     assert!(
         full_text.contains("Plan, Batch, Execute") || full_text.contains("Think-Before-Act"),

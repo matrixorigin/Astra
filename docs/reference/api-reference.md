@@ -190,26 +190,17 @@ Compare original session with replay results.
 
 ## Skills
 
-### POST /skills
-
-```json
-// Request
-{
-  "skill_name": "code_review",
-  "version": "1.0.0",
-  "definition": {"description": "Reviews code", "parameters": {...}},
-  "side_effect_profile": {"category": "read", "idempotent": true}
-}
-
-// Response 201
-{"skill_id": "uuid", "skill_name": "code_review", "version": "1.0.0"}
-```
-
 ### GET /skills
 
 ### GET /skills/{skill_id}
 
 ### GET /skills/{skill_id}/versions
+
+### GET /skills/user
+
+### POST /skills/user
+
+### POST /skills/user/{skill_name}/versions
 
 ---
 

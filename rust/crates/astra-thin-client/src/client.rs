@@ -699,22 +699,6 @@ impl ThinClient {
         Self::text_or_api(resp).await
     }
 
-    pub async fn post_skills_register_json(
-        &self,
-        token: &str,
-        body: &Value,
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(paths::SKILLS)?;
-        let resp = self
-            .http
-            .post(url)
-            .headers(Self::bearer_headers(token)?)
-            .json(body)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
     pub async fn post_skills_test_json(
         &self,
         token: &str,
