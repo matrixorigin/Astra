@@ -2112,7 +2112,7 @@ mod tests {
             "bash",
             "str_replace",
             "github",
-            "mo_snapshot",
+            "rollback_database_snapshots",
             "some_future_tool",
         ] {
             assert_eq!(

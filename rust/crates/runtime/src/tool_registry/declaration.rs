@@ -10,9 +10,6 @@ pub enum ToolLoadPolicy {
     AlwaysLoad,
     /// Advertised through the deferred catalog and activated with `tool_search`.
     Deferred,
-    /// Callable only through a narrower control-plane path, not via the public
-    /// schema catalog.
-    ExplicitOnly,
     /// Runtime implementation detail. The model should not see this as a
     /// standalone public schema.
     Internal,
@@ -21,7 +18,7 @@ pub enum ToolLoadPolicy {
 impl ToolLoadPolicy {
     #[cfg(test)]
     pub const fn is_public_schema_policy(self) -> bool {
-        matches!(self, Self::AlwaysLoad | Self::Deferred | Self::ExplicitOnly)
+        matches!(self, Self::AlwaysLoad | Self::Deferred)
     }
 }
 
@@ -44,14 +41,6 @@ const fn deferred(name: &'static str, note: &'static str) -> ToolDeclaration {
     ToolDeclaration {
         name,
         load_policy: ToolLoadPolicy::Deferred,
-        note,
-    }
-}
-
-const fn explicit_only(name: &'static str, note: &'static str) -> ToolDeclaration {
-    ToolDeclaration {
-        name,
-        load_policy: ToolLoadPolicy::ExplicitOnly,
         note,
     }
 }
@@ -94,6 +83,7 @@ static TOOL_DECLARATIONS: &[ToolDeclaration] = &[
     deferred("prioritize_tool", "session tool preference"),
     deferred("publish_artifact", "artifact publishing"),
     deferred("rollback_database_snapshots", "database snapshot rollback"),
+    deferred("rollback_file_edits", "file edit rollback"),
     deferred("rollback_session_state", "session-state rollback"),
     deferred("run_script", "server-side RPC script execution"),
     deferred("session", "session state operations"),
@@ -103,14 +93,31 @@ static TOOL_DECLARATIONS: &[ToolDeclaration] = &[
     deferred("task_stop", "background task cancellation"),
     deferred("web_fetch", "network fetch"),
     deferred("web_search", "network search"),
+    internal(
+        "adjust_config",
+        "configuration mutation behind session/config",
+    ),
+    internal("brief", "local context briefing helper"),
+    internal("call_graph", "code-intel operation behind lsp"),
+    internal("config", "configuration tool behind session/config"),
+    internal("context_analysis", "local context diagnostics helper"),
+    internal("dead_code", "code-intel operation behind lsp"),
     internal("delete_file", "file-delete operation behind write_file"),
+    internal("diagnose", "local diagnostics helper"),
+    internal("env", "local environment management helper"),
+    internal("extract_members", "code-intel operation behind lsp"),
     internal("find_definition", "code-intel operation behind lsp"),
     internal("find_references", "code-intel operation behind lsp"),
+    internal("hover_info", "code-intel operation behind lsp"),
     internal("multi_edit", "batch-edit operation behind str_replace"),
-    explicit_only(
-        "rollback_file_edits",
-        "file edit rollback is routed through server/session internals",
-    ),
+    internal("notebook_edit", "notebook mutation helper"),
+    internal("query_context", "context exchange helper"),
+    internal("reflect", "local reflection helper"),
+    internal("rename_symbol", "code-intel write operation behind lsp"),
+    internal("run_build_test", "local build/test helper"),
+    internal("share_context", "context exchange helper"),
+    internal("symbol_search", "code-intel operation behind symbols"),
+    internal("type_hierarchy", "code-intel operation behind lsp"),
     internal("background_shell", "user-controlled background shell task"),
     internal("git_clone", "deployment/runtime clone helper"),
 ];

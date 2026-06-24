@@ -25,15 +25,6 @@ pub(crate) async fn execute_agent_tool(
         );
     }
     match action {
-        // `agent(action='delegate')` was never intercepted by the real
-        // delegation engine, which matches on the standalone tool name.
-        "delegate" => astra_tools::ToolResult::error(
-            "Error: agent.delegate has been removed because action-shaped \
-             delegation was not intercepted by the delegation engine. Use \
-             agent(action='spawn', description='...', prompt='...', run_in_background: true) \
-             instead."
-                .to_string(),
-        ),
         "run_chain" => default_executor.execute("run_chain", args).await,
         "spawn" | "get_result" | "send_message" => agent_tool_result_from_output(
             crate::orchestration::handle_agent_tool(args, agent_tool_context).await,

@@ -488,16 +488,16 @@ mod tests {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["spawn","delegate"]},
+                        "action": {"type": "string", "enum": ["spawn","get_result"]},
                         "description": {"type": "string"},
                         "prompt": {"type": "string"},
-                        "task": {"type": "string"},
-                        "run_in_background": {"type": "boolean"}
+                        "agent_id": {"type": "string"},
+                        "name": {"type": "string"}
                     },
                     "required": ["action"],
                     "x-astra-per-action-required": {
                         "spawn": ["description", "prompt"],
-                        "delegate": ["task"]
+                        "get_result": ["agent_id"]
                     }
                 }
             }
@@ -512,8 +512,8 @@ mod tests {
         );
         assert!(props.get("prompt").is_some(), "prompt must survive");
         assert!(
-            props.get("task").is_some(),
-            "task (delegate required) must survive"
+            props.get("agent_id").is_some(),
+            "agent_id (get_result required) must survive"
         );
         assert!(
             props.get("action").is_some(),
@@ -521,7 +521,7 @@ mod tests {
         );
         // Pure optional stays stripped.
         assert!(
-            props.get("run_in_background").is_none(),
+            props.get("name").is_none(),
             "purely-optional props still get pruned"
         );
     }

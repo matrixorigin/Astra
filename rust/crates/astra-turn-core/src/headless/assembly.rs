@@ -1036,8 +1036,6 @@ mod tests {
             "git_checkout_file",
             "github",
             "mo_query",
-            "mo_snapshot",
-            "mo_branch",
             "memory", // action-aware; conservatively classified as Mutating
         ];
         for &tool in READ_ONLY_TOOLS.iter() {

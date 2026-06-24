@@ -433,10 +433,6 @@ fn session_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: 
         "timeline" => "Session timeline".to_string(),
         "summary" => "Session summary".to_string(),
         "history" => "Session history".to_string(),
-        "rollback_edits" => match args.get("scope").and_then(Value::as_str) {
-            Some(s) => format!("Revert file edits: {}", trunc(s, 19)),
-            None => "Revert file edits".to_string(),
-        },
         "ask_user" => {
             let q = args.get("question").and_then(Value::as_str).unwrap_or("");
             format!("Asking user: \"{}\"", trunc(q, 15))

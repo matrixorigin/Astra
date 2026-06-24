@@ -940,19 +940,22 @@ mod chat_stream_turnguard_e2e {
         let mut guard = TurnGuard::new();
         let mut restricted = HashSet::new();
 
-        guard.record_tool_result("mo_snapshot", "Error: connection refused");
-        guard.record_tool_result("mo_snapshot", "Error: connection refused");
-        guard.record_tool_result("mo_snapshot", "Error: connection refused");
+        guard.record_tool_result("rollback_database_snapshots", "Error: connection refused");
+        guard.record_tool_result("rollback_database_snapshots", "Error: connection refused");
+        guard.record_tool_result("rollback_database_snapshots", "Error: connection refused");
 
-        assert!(guard.health.is_deprioritized("mo_snapshot"));
+        assert!(guard.health.is_deprioritized("rollback_database_snapshots"));
 
         let v = guard.evaluate();
-        assert!(v.avoid_tools.contains(&"mo_snapshot".to_string()));
+        assert!(
+            v.avoid_tools
+                .contains(&"rollback_database_snapshots".to_string())
+        );
 
         // Apply verdict
         apply_verdict(&v, 25, &mut restricted);
         assert!(
-            !restricted.contains("mo_snapshot"),
+            !restricted.contains("rollback_database_snapshots"),
             "deprioritized tool must not become a hard schema restriction"
         );
     }
@@ -1379,12 +1382,15 @@ mod chat_stream_turnguard_e2e {
 
         // Turn 1: deprioritize one tool
         for _ in 0..3 {
-            guard.record_tool_result("mo_snapshot", "Error: fail");
+            guard.record_tool_result("rollback_database_snapshots", "Error: fail");
         }
         let v = guard.evaluate();
-        assert!(v.avoid_tools.contains(&"mo_snapshot".to_string()));
+        assert!(
+            v.avoid_tools
+                .contains(&"rollback_database_snapshots".to_string())
+        );
         apply_verdict(&v, 25, &mut restricted);
-        assert!(!restricted.contains("mo_snapshot"));
+        assert!(!restricted.contains("rollback_database_snapshots"));
 
         // Turn 2: deprioritize another tool
         for _ in 0..3 {
@@ -1647,7 +1653,7 @@ mod chat_stream_turnguard_e2e {
                 recent_outcomes: vec![],
             },
             ToolHealthEntry {
-                name: "mo_snapshot".to_string(),
+                name: "rollback_database_snapshots".to_string(),
                 total_calls: 8,
                 total_failures: 6,
                 failure_rate: 0.75,
@@ -1669,7 +1675,8 @@ mod chat_stream_turnguard_e2e {
             v.avoid_tools
         );
         assert!(
-            v.avoid_tools.contains(&"mo_snapshot".to_string()),
+            v.avoid_tools
+                .contains(&"rollback_database_snapshots".to_string()),
             "75% failure tool should be avoided: {:?}",
             v.avoid_tools
         );
@@ -1679,6 +1686,6 @@ mod chat_stream_turnguard_e2e {
         let (_, _, force_stop) = apply_verdict(&v, 20, &mut restricted);
         assert!(!force_stop, "health-only issues should not force stop");
         assert!(!restricted.contains("mo_query"));
-        assert!(!restricted.contains("mo_snapshot"));
+        assert!(!restricted.contains("rollback_database_snapshots"));
     }
 }

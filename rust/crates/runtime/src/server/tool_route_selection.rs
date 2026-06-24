@@ -56,6 +56,7 @@ pub(crate) const SERVER_LOCAL_RUNTIME_TOOL_NAMES: &[&str] = &[
     "list_dir",
     "publish_artifact",
     "read_file",
+    "rollback_file_edits",
     "run_script",
     "str_replace",
     "symbols",

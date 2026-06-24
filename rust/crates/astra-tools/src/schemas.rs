@@ -255,6 +255,24 @@ fn all_tool_schemas_core() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "rollback_file_edits",
+                "description": "List or restore file edits recorded by write_file and str_replace. Use scope=current_turn to undo this turn's recorded file edits, scope=file with path to restore the latest recorded edit for one file, scope=turn with turn_index to restore a previous turn, or scope=list to inspect available file edit rollback entries.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "scope": {"type": "string", "enum": ["current_turn","turn","file","list"], "description": "Rollback scope. Defaults to current_turn; path implies file scope."},
+                        "path": {"type": "string", "description": "File path for scope=file."},
+                        "turn_index": {"type": "integer", "description": "Turn index for scope=turn."},
+                        "file_after_sequence": {"type": "integer", "description": "Only restore file edits recorded after this journal sequence."},
+                        "after_sequence": {"type": "integer", "description": "Alias for file_after_sequence."}
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "list_dir",
                 "description": "List directory contents. Use to explore project structure or find files. For pattern-based file search (e.g. '**/*.rs'), use glob instead.",
                 "parameters": {
@@ -626,17 +644,15 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "session",
-                "description": "Session lifecycle and history. Actions: config(path+value), rollback_edits, sleep, history_page, history_search, history_around. Use dedicated tools for tool preferences (`prioritize_tool`/`deprioritize_tool`), context compression (`compress_context`), plan mode (`enter_plan_mode`/`exit_plan_mode`), and user questions (`ask_user`).",
+                "description": "Session lifecycle and history. Actions: config(path+value), sleep, history_page, history_search, history_around. Use dedicated tools for file rollback (`rollback_file_edits`), session-state rollback (`rollback_session_state`), tool preferences (`prioritize_tool`/`deprioritize_tool`), context compression (`compress_context`), plan mode (`enter_plan_mode`/`exit_plan_mode`), and user questions (`ask_user`).",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "action": {"type": "string", "enum": ["config","rollback_edits","sleep","history_page","history_search","history_around"]},
-                        "path": {"type": "string", "description": "Config path for action=config, or file path for rollback_edits scope=file."},
+                        "action": {"type": "string", "enum": ["config","sleep","history_page","history_search","history_around"]},
+                        "path": {"type": "string", "description": "Config path for action=config."},
                         "value": {"type": "string", "description": "Config value"},
                         "force": {"type": "boolean", "description": "Override config drift/mutation governor for action=config."},
-                        "scope": {"type": "string", "enum": ["current_turn","turn","file","list"], "description": "Rollback scope"},
-                        "turn_index": {"type": "integer", "description": "Turn index (rollback scope=turn)"},
                         "duration_ms": {"type": "integer", "description": "Sleep ms, max 300000"},
                         "reason": {"type": "string", "description": "Reason (sleep)"},
                         "pattern": {"type": "string", "description": "history_search search text: compact topic, phrase, filename, error text, decision, or Chinese/English keyword."},
@@ -1891,7 +1907,6 @@ mod tests {
         }
         for current in [
             "config",
-            "rollback_edits",
             "sleep",
             "history_page",
             "history_search",

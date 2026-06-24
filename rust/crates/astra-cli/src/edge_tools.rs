@@ -2,8 +2,7 @@
 //!
 //! Tools: bash, read_file (with outline mode), write_file, str_replace (with fuzzy matching),
 //!        list_dir, grep (with context_lines/max_matches), glob,
-//!        git(action=...), github(action=...), web_fetch,
-//!        mo_query, mo_snapshot, mo_branch
+//!        git(action=...), github(action=...), web_fetch, mo_query.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -118,7 +117,6 @@ const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "config",
     "context_analysis",
     "dead_code",
-    "delegate",
     "deprioritize_tool",
     "diagnose",
     "enter_plan_mode",
@@ -131,9 +129,7 @@ const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "hover_info",
     "introspect",
     "lsp",
-    "mo_branch",
     "mo_query",
-    "mo_snapshot",
     "notebook_edit",
     "notify",
     "prioritize_tool",
@@ -141,8 +137,8 @@ const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "reflect",
     "rename_symbol",
     "rollback_database_snapshots",
+    "rollback_file_edits",
     "rollback_session_state",
-    "rollback_turn_actions",
     "run_build_test",
     "session",
     "share_context",
@@ -4377,8 +4373,8 @@ impl ToolExecutor {
                     }
                 }
                 "rollback_database_snapshots" => self.rollback_database_snapshots(args),
+                "rollback_file_edits" => self.rollback_file_edits(args),
                 "rollback_session_state" => self.rollback_session_state(args).await,
-                "rollback_turn_actions" => self.rollback_turn_actions(args).await,
                 "str_replace" => {
                     let args = match astra_tools::fs_ops::normalize_str_replace_args(args) {
                         Ok(args) => args,
@@ -4448,8 +4444,6 @@ impl ToolExecutor {
                 "run_build_test" => self.run_build_test(args),
                 "symbols" => self.symbols(args),
                 "mo_query" => self.mo_query(args),
-                "mo_snapshot" => self.mo_snapshot(args),
-                "mo_branch" => self.mo_branch(args),
                 "github" => {
                     let action = args.get("action").and_then(Value::as_str).unwrap_or("");
                     match action {
@@ -4529,32 +4523,6 @@ impl ToolExecutor {
                 "agent" => {
                     let action = args.get("action").and_then(Value::as_str).unwrap_or("");
                     match action {
-                        // `delegate` was a placeholder action that returned a
-                        // fake-success acknowledgement string while spawning
-                        // nothing — the CLI never wired a delegation engine,
-                        // and `agentic_delegate_interception` only matches on
-                        // tool NAME == "delegate", so `agent(action='delegate')`
-                        // was never intercepted and never spawned a sub-agent.
-                        // Models trusted the "Delegation request acknowledged"
-                        // string and reported success to the user (observed in
-                        // session f3c4b457: 5 fake delegations in 0 ms each).
-                        //
-                        // Defense in depth: the schema enum no longer advertises
-                        // "delegate", so this branch is unreachable from the
-                        // model. Kept for two reasons: (1) old session journals
-                        // may replay tool_calls with the legacy action; (2) a
-                        // sharp Error: result is far better than the silent
-                        // success the placeholder produced. The error names
-                        // the agent spawn action so the model has a working alternative
-                        // — agent_fanout is the correct fan-out shape.
-                        "delegate" => {
-                            "Error: agent.delegate has been removed because it had no execution \
-                             backend in CLI mode and silently no-op'd. Use agent(action='spawn', \
-                             description='...', prompt='...') instead. \
-                             To run N sub-agents in parallel, use agent_fanout(action='start', \
-                             target_count=N, slots=[...])."
-                                .to_string()
-                        }
                         "run_chain" => {
                             match serde_json::from_value::<astra_runtime::tool_registry::ToolChain>(
                                 args.clone(),
@@ -4632,12 +4600,11 @@ impl ToolExecutor {
                     let action = args.get("action").and_then(Value::as_str).unwrap_or("");
                     match action {
                         "config" => self.adjust_config(args),
-                        "rollback_edits" => self.rollback_file_edits(args),
                         "sleep" => self.sleep_tool(args).await,
                         "history_page" | "history_search" => self.render_session_history(args),
                         "history_around" => self.render_session_history_around(args),
-                        "" => "Missing required parameter: action. Use: config, rollback_edits, sleep, history_page, history_search, history_around. Use dedicated tools: prioritize_tool, deprioritize_tool, compress_context, ask_user, enter_plan_mode, exit_plan_mode.".to_string(),
-                        other => format!("Error: unknown `session` action '{other}'. Valid: config, rollback_edits, sleep, history_page, history_search, history_around. Use dedicated tools: prioritize_tool, deprioritize_tool, compress_context, ask_user, enter_plan_mode, exit_plan_mode."),
+                        "" => "Missing required parameter: action. Use: config, sleep, history_page, history_search, history_around. Use dedicated tools: rollback_file_edits, rollback_session_state, prioritize_tool, deprioritize_tool, compress_context, ask_user, enter_plan_mode, exit_plan_mode.".to_string(),
+                        other => format!("Error: unknown `session` action '{other}'. Valid: config, sleep, history_page, history_search, history_around. Use dedicated tools: rollback_file_edits, rollback_session_state, prioritize_tool, deprioritize_tool, compress_context, ask_user, enter_plan_mode, exit_plan_mode."),
                     }
                 }
                 // Task management (unified tool with action param)
@@ -4740,11 +4707,6 @@ impl ToolExecutor {
                 }
                 "share_context" => self.share_context(args),
                 "query_context" => self.query_context(args),
-                astra_runtime::turn::agentic_loop::host::DELEGATE_TOOL_NAME => {
-                    "Delegation request acknowledged. The delegation engine will execute \
-                this request and provide results in the next round."
-                        .to_string()
-                }
                 "introspect" => self.handle_introspect(args),
                 "diagnose" => self.diagnose(args).await,
                 "lsp" => self.lsp(args),
@@ -4988,7 +4950,7 @@ impl ToolExecutor {
                                 || session_state_entries_added > 0
                             {
                                 let rollback_output = self
-                                    .rollback_turn_actions(&serde_json::json!({
+                                    .rollback_recorded_turn_mutations(&serde_json::json!({
                                         "scope": "turn",
                                         "turn_index": rollback_turn_index,
                                         "file_after_sequence": file_checkpoint,
@@ -5004,7 +4966,7 @@ impl ToolExecutor {
                                         |error| {
                                             serde_json::json!({
                                                 "success": false,
-                                                "error": format!("invalid rollback_turn_actions output: {error}"),
+                                                "error": format!("invalid recorded turn rollback output: {error}"),
                                                 "raw_output": rollback_output,
                                             })
                                         },

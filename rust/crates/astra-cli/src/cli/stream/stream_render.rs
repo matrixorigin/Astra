@@ -574,8 +574,6 @@ fn edge_tool_is_cacheable_read(tool: &str, args: &Value) -> bool {
             | "task"
             | "agent"
             | "mo_query"
-            | "mo_snapshot"
-            | "mo_branch"
     ) {
         return false;
     }
@@ -1555,7 +1553,7 @@ impl<'a> CliSseStreamHost<'a> {
 
         let rollback_output = self
             .executor
-            .rollback_turn_actions(&serde_json::json!({
+            .rollback_recorded_turn_mutations(&serde_json::json!({
                 "scope": "turn",
                 "turn_index": turn_index,
                 "file_after_sequence": file_checkpoint,
@@ -1571,7 +1569,7 @@ impl<'a> CliSseStreamHost<'a> {
                 serde_json::json!({
                     "ok": false,
                     "error": format!(
-                        "Failed to parse rollback_turn_actions output: {error}"
+                        "Failed to parse recorded turn rollback output: {error}"
                     ),
                     "raw_output": rollback_output,
                 })
@@ -3372,20 +3370,15 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     "Error: skill resolver not available".to_string()
                 }
             } else if tool == astra_runtime::turn::agentic_loop::host::DELEGATE_TOOL_NAME {
-                // Delegate calls are intercepted at Step 3b of the agentic loop
-                // (partition_and_execute_delegations) where the delegation engine
-                // runs sub-agents. Return a deferred acknowledgment so the server
-                // sees a success (not an error) and the model doesn't give up.
-                //
-                // D-9 dedup guard: if a speculative execution was somehow started
-                // for this call_id, discard it so the delegation result wins.
+                // Delegate calls must be intercepted by the agentic runtime.
+                // If a standalone delegate reaches edge execution, fail closed
+                // instead of manufacturing a success result.
                 if let Some(exec) = self.streaming_tool_exec.clone() {
                     exec.discard(request_id).await;
                 }
-                "Delegation request acknowledged. The delegation engine will execute \
-                 this request now, the parent agent will pause while sub-agents \
-                 run and aggregate, and the summarized results will be injected \
-                 before the parent agent finishes."
+                "Error: delegate must be handled by the delegation runtime before \
+                 local tool execution. Use agent(action='spawn', description='...', \
+                 prompt='...', run_in_background=true) for direct agent spawning."
                     .to_string()
             } else if tool == astra_turn_core::interaction_types::ASK_USER_TOOL_NAME {
                 self.ask_user_via_tui(args).await
@@ -6178,7 +6171,6 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "run_chain" => format!("Running chain: {preview}"),
         "rollback_file_edits" => format!("Revert file edits: {preview}"),
         "rollback_database_snapshots" => format!("Revert DB snapshots: {preview}"),
-        "rollback_turn_actions" => format!("Rollback turn actions: {preview}"),
         "send_message" => format!("Send message: {preview}"),
         "diagnose" => format!("Diagnose: {preview}"),
         "env" => format!("Env: {preview}"),
@@ -6200,8 +6192,6 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "exit_plan_mode" => "Exit plan mode".to_string(),
         "task" => format_task_display_from_preview(preview),
         "mo_query" => format!("MatrixOne query: \"{preview}\""),
-        "mo_snapshot" => format!("MatrixOne snapshot: {preview}"),
-        "mo_branch" => format!("MatrixOne branch: {preview}"),
         // `memory` is action-aware; when we only have the preview string (not the
         // parsed args), surface it generically. Callers that have the full args
         // object should use the richer `format_tool_description_with_output`
@@ -8264,10 +8254,6 @@ mod tests {
             format_tool_display_from_preview("rollback_database_snapshots", Some("snap_123")),
             "Revert DB snapshots: snap_123"
         );
-        assert_eq!(
-            format_tool_display_from_preview("rollback_turn_actions", Some("turn 7")),
-            "Rollback turn actions: turn 7"
-        );
         // task
         assert_eq!(
             format_tool_display_from_preview("task", Some("create \"Fix renderer drift\"")),
@@ -8304,14 +8290,6 @@ mod tests {
         assert_eq!(
             format_tool_display_from_preview("mo_query", Some("select * from users")),
             "MatrixOne query: \"select * from users\""
-        );
-        assert_eq!(
-            format_tool_display_from_preview("mo_snapshot", Some("create pre-migration")),
-            "MatrixOne snapshot: create pre-migration"
-        );
-        assert_eq!(
-            format_tool_display_from_preview("mo_branch", Some("create exp-a")),
-            "MatrixOne branch: create exp-a"
         );
         // code navigation
         assert_eq!(

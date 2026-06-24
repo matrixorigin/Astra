@@ -43,6 +43,7 @@ pub const SERVER_BUILTIN_TOOL_NAMES: &[&str] = &[
     "task",
     "mo_query",
     "rollback_database_snapshots",
+    "rollback_file_edits",
     "rollback_session_state",
     // AgentDelegation
     "agent",

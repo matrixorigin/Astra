@@ -6,9 +6,7 @@ fn friendly_tool_name(tool_name: &str) -> &str {
         "read_file" | "view_file" => "Reading",
         "run_build_test" => "Running build/test",
         "powershell" => "PowerShell",
-        "rollback_database_snapshots" | "rollback_file_edits" | "rollback_turn_actions" => {
-            "Reverting"
-        }
+        "rollback_database_snapshots" | "rollback_file_edits" => "Reverting",
         "rollback_session_state" => "Reverting session state",
         "git_status" => "Git status",
         "git_log" => "Git log",
@@ -55,8 +53,6 @@ fn friendly_tool_name(tool_name: &str) -> &str {
         "set_goal" => "Setting goal",
         "compress_context" => "Compressing context",
         "mo_query" => "MatrixOne query",
-        "mo_snapshot" => "MatrixOne snapshot",
-        "mo_branch" => "MatrixOne branch",
         "memory" => "Memory",
         "find_definition" => "Finding definition",
         "find_references" => "Finding references",

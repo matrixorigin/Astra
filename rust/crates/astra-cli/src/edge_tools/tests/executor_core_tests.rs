@@ -100,22 +100,18 @@ async fn consolidated_github_create_issue_error_does_not_leak_retired_alias() {
     );
 }
 
-/// Standalone `delegate` tool (the engine-managed delegation flow).
-/// In server mode the runtime intercepts this call upstream in
-/// `agentic_delegate_interception.rs` and runs real sub-agents — the
-/// executor placeholder is only seen if interception was bypassed.
-/// CLI mode wires no engine, but the tool name is reserved for
-/// server-mode parity. Keep the deferred-acknowledgement contract
-/// here; the broken path was the OTHER one (agent action='delegate'),
-/// which is now removed entirely.
+/// Standalone `delegate` is not a CLI executor tool. Server/runtime
+/// interception must happen before local tool execution; if it reaches
+/// this executor, it must fail closed.
 #[tokio::test]
-async fn execute_delegate_tool_returns_deferred_acknowledgment_for_interception_fallback() {
+async fn execute_delegate_tool_does_not_return_fake_acknowledgment() {
     let executor = test_executor();
     let result = executor.execute("delegate", &json!({})).await;
     assert!(
-        result.contains("Delegation request acknowledged"),
-        "got: {result}"
+        result.starts_with("Error"),
+        "delegate must fail closed in the CLI executor: {result}"
     );
+    assert!(!result.contains("acknowledged"), "got: {result}");
 }
 
 #[tokio::test]
@@ -237,14 +233,8 @@ async fn execute_with_metadata_bash_domain_negative_is_structured_non_error() {
     );
 }
 
-/// REGRESSION: the consolidated `agent` tool MUST NOT accept
-/// `action='delegate'`. The CLI never wires a delegation engine, and
-/// `agentic_delegate_interception` only intercepts calls whose tool
-/// NAME is "delegate" — it ignores `agent(action='delegate')`. So the
-/// old executor branch returned a "Delegation request acknowledged"
-/// string while spawning nothing, and the model believed it had queued
-/// real sub-agents. Bug observed: session f3c4b457-... shipped 5 fake
-/// "Task done Delegating" rows in 0 ms each.
+/// REGRESSION: the consolidated `agent` tool must reject the retired
+/// delegate action instead of returning a successful placeholder.
 ///
 /// The fix is twofold: (1) the schema enum drops "delegate" so the
 /// model can't pick it, and (2) defence-in-depth — the executor
@@ -263,20 +253,18 @@ async fn agent_action_delegate_is_rejected_with_redirect_to_spawn() {
         .await;
     assert!(
         result.starts_with("Error"),
-        "agent.delegate must return an Error: prefix so the TUI renders \
+        "retired delegate action must return an Error: prefix so the TUI renders \
          it as a failure (red banner), not as a normal tool result. Got: {result}"
     );
     assert!(
         result.contains("spawn"),
-        "agent.delegate's error must name the `agent` spawn action as the \
+        "retired delegate action error must name the `agent` spawn action as the \
          alternative — without that, the model has no path to recovery. \
          Got: {result}"
     );
     assert!(
-        !result.contains("Delegation request acknowledged"),
-        "the old fake-success placeholder must be gone — its presence \
-         is what tricked the model into believing 5 sub-agents were \
-         queued when none had spawned. Got: {result}"
+        !result.contains("acknowledged"),
+        "delegate-shaped calls must not return success-style placeholder text. Got: {result}"
     );
     // End-to-end UX assertion: the Error: prefix must classify through
     // tool_result_semantics::is_tool_error → cloud_tool_result_status_label

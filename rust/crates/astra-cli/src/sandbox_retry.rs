@@ -112,9 +112,6 @@ pub(crate) fn explicit_file_tool_path_args<'a>(tool: &str, args: &'a Value) -> V
         "rollback_file_edits" => {
             push_explicit_arg_path(&mut paths, args, "path");
         }
-        "session" if args.get("action").and_then(Value::as_str) == Some("rollback_edits") => {
-            push_explicit_arg_path(&mut paths, args, "path");
-        }
         _ => {}
     }
     paths

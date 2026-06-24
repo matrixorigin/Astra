@@ -517,7 +517,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
     },
     ToolMeta {
         name: "session",
-        description: "Session lifecycle and history operations: config, rollback_edits, sleep, history_page, history_search, history_around.",
+        description: "Session lifecycle and history operations: config, sleep, history_page, history_search, history_around.",
         triggers: &[
             "config",
             "adjust",
@@ -651,11 +651,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         intents: &[IntentType::CodeEdit],
         scope: Scope::External,
         requires: &[Capability::AgentSpawner],
-        binding_validation: RuntimeBindingValidation::ActionAllowlist(&[
-            "",
-            "delegate",
-            "run_chain",
-        ]),
+        binding_validation: RuntimeBindingValidation::ActionAllowlist(&["", "run_chain"]),
         schema_tokens: 40,
     },
     ToolMeta {
@@ -1063,7 +1059,7 @@ mod tests {
             "agent",
             Some("run_chain")
         ));
-        assert!(tool_allows_validation_without_runtime_binding(
+        assert!(!tool_allows_validation_without_runtime_binding(
             "agent",
             Some("delegate")
         ));

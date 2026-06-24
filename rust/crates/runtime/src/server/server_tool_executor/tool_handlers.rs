@@ -16,8 +16,9 @@ use crate::server::tool_agent_runtime::{execute_agent_fanout_tool, execute_agent
 use crate::server::tool_database_snapshots::{execute_mo_query, rollback_database_snapshots};
 use crate::server::tool_execution_result::tool_result_from_output;
 use crate::server::tool_file_runtime::{
-    execute_publish_artifact, execute_server_delete_file, execute_server_multi_edit,
-    execute_server_run_script, execute_server_str_replace, execute_server_write_file,
+    execute_publish_artifact, execute_rollback_file_edits, execute_server_delete_file,
+    execute_server_multi_edit, execute_server_run_script, execute_server_str_replace,
+    execute_server_write_file,
 };
 use crate::server::tool_introspect::handle_introspect;
 use crate::server::tool_local_execution::memory_args_with_context;
@@ -62,6 +63,7 @@ pub(super) fn server_tool_engine() -> ToolEngine<ServerToolExecutor> {
 
     register_handler_or_log!(engine, "write_file", WriteFileToolHandler);
     register_handler_or_log!(engine, "str_replace", StrReplaceToolHandler);
+    register_handler_or_log!(engine, "rollback_file_edits", RollbackFileEditsToolHandler);
     register_handler_or_log!(engine, "bash", BashToolHandler);
     register_handler_or_log!(engine, "git", DefaultExecutorToolHandler { name: "git" });
     register_handler_or_log!(
@@ -490,6 +492,31 @@ impl ToolHandler<ServerToolExecutor> for StrReplaceToolHandler {
                 context.file_journal.as_ref(),
             ))
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RollbackFileEditsToolHandler;
+
+#[async_trait]
+impl ToolHandler<ServerToolExecutor> for RollbackFileEditsToolHandler {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::ToolResult::error(
+                "File rollback not executed: run was cancelled".to_string(),
+            );
+        }
+        tool_result_from_output(execute_rollback_file_edits(
+            &context.workspace_root,
+            args,
+            context.journal_turn_index.load(Ordering::Relaxed),
+            context.file_journal.as_ref(),
+        ))
     }
 }
 

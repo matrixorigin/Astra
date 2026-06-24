@@ -267,12 +267,8 @@ static TOOL_TABLE: &[ToolMeta] = &[
     // ── Mutating — rollback ──────────────────────────────────────────
     tool("rollback_file_edits", MU, A.union(OR)),
     tool("rollback_database_snapshots", MU, A.union(OR)),
-    tool("rollback_turn_actions", MU, A.union(OR)),
     tool("rollback_session_state", MU, OR),
     // (memory/git/github entries consolidated above into action-aware rows)
-    // ── Mutating — MatrixOne writes ──────────────────────────────────
-    tool("mo_snapshot", MU, MO),
-    tool("mo_branch", MU, MO),
     // ── Mutating — code intelligence writes ──────────────────────────
     tool("rename_symbol", MU, ToolFlags::CODE_INTEL),
     // ── Mutating — orchestration ─────────────────────────────────────
@@ -1195,7 +1191,6 @@ mod tests {
             "multi_edit",
             "rollback_database_snapshots",
             "rollback_file_edits",
-            "rollback_turn_actions",
             "run_command",
             "shell",
             "str_replace",
@@ -2388,13 +2383,7 @@ mod tests {
     #[test]
     fn display_category_mo_tools() {
         let r = registry();
-        for name in ["mo_query", "mo_snapshot", "mo_branch"] {
-            assert_eq!(
-                r.display_category(name),
-                ToolDisplayCategory::Mo,
-                "{name} should be Mo category"
-            );
-        }
+        assert_eq!(r.display_category("mo_query"), ToolDisplayCategory::Mo);
     }
 
     #[test]
@@ -2426,7 +2415,6 @@ mod tests {
             "diagnose",
             "rollback_file_edits",
             "rollback_database_snapshots",
-            "rollback_turn_actions",
             "rollback_session_state",
             "prioritize_tool",
             "deprioritize_tool",

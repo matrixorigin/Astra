@@ -9699,7 +9699,7 @@ mod tests {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["spawn", "delegate"]},
+                        "action": {"type": "string", "enum": ["spawn", "get_result"]},
                         "description": {"type": "string"},
                         "prompt": {"type": "string"}
                     },

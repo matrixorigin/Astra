@@ -185,7 +185,9 @@ async fn git_worktree_enter_records_rollback_handle() {
     );
     assert!(exe.in_worktree_session(), "should enter worktree session");
 
-    let listed = exe.rollback_turn_actions(&json!({"scope": "list"})).await;
+    let listed = exe
+        .rollback_recorded_turn_mutations(&json!({"scope": "list"}))
+        .await;
     let listed_json: serde_json::Value = serde_json::from_str(&listed).unwrap();
     assert_eq!(listed_json["total_git_worktree_entries"].as_u64(), Some(1));
 

@@ -4112,7 +4112,9 @@ esac
             .await;
         assert!(delegate.is_error, "{delegate:?}");
         assert!(
-            delegate.output.contains("agent.delegate has been removed"),
+            delegate
+                .output
+                .contains("Tool `agent` action `delegate` is not available"),
             "{delegate:?}"
         );
         assert!(
@@ -5162,12 +5164,10 @@ esac
         assert!(second.contains("Successfully wrote"));
 
         let rollback = exec
-            .execute(
-                "session",
-                &json!({"action": "rollback_edits", "scope": "current_turn"}),
-            )
+            .execute("rollback_file_edits", &json!({"scope": "current_turn"}))
             .await;
-        let rollback_json: Value = serde_json::from_str(&rollback).unwrap();
+        let rollback_json: Value = serde_json::from_str(&rollback)
+            .unwrap_or_else(|error| panic!("rollback output should be JSON: {error}; {rollback}"));
         assert_eq!(
             rollback_json["success"].as_bool(),
             Some(true),
@@ -5204,12 +5204,10 @@ esac
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "AAA bbb CCC\n");
 
         let rollback = exec
-            .execute(
-                "session",
-                &json!({"action": "rollback_edits", "scope": "current_turn"}),
-            )
+            .execute("rollback_file_edits", &json!({"scope": "current_turn"}))
             .await;
-        let rollback_json: Value = serde_json::from_str(&rollback).unwrap();
+        let rollback_json: Value = serde_json::from_str(&rollback)
+            .unwrap_or_else(|error| panic!("rollback output should be JSON: {error}; {rollback}"));
         assert_eq!(
             rollback_json["success"].as_bool(),
             Some(true),
@@ -5233,11 +5231,12 @@ esac
 
         let rollback = exec
             .execute(
-                "session",
-                &json!({"action": "rollback_edits", "scope": "file", "path": "gone.txt"}),
+                "rollback_file_edits",
+                &json!({"scope": "file", "path": "gone.txt"}),
             )
             .await;
-        let rollback_json: Value = serde_json::from_str(&rollback).unwrap();
+        let rollback_json: Value = serde_json::from_str(&rollback)
+            .unwrap_or_else(|error| panic!("rollback output should be JSON: {error}; {rollback}"));
         assert_eq!(
             rollback_json["success"].as_bool(),
             Some(true),

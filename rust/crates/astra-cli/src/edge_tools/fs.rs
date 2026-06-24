@@ -1340,7 +1340,7 @@ impl ToolExecutor {
         }
     }
 
-    pub(crate) async fn rollback_turn_actions(&self, args: &Value) -> String {
+    pub(crate) async fn rollback_recorded_turn_mutations(&self, args: &Value) -> String {
         let scope = args
             .get("scope")
             .and_then(Value::as_str)

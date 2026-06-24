@@ -456,44 +456,6 @@ fn fmt_mo_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
             .get("sql")
             .and_then(|v| v.as_str())
             .map(|s| truncate_str(s, 60)),
-        "mo_snapshot" => {
-            let action = obj.get("action").and_then(|v| v.as_str());
-            let name = obj.get("name").and_then(|v| v.as_str());
-            let database = obj.get("database").and_then(|v| v.as_str());
-            match (action, name, database) {
-                (Some(action), Some(name), Some(database)) => Some(format!(
-                    "{} {} @ {}",
-                    truncate_str(action, 16),
-                    truncate_str(name, 24),
-                    truncate_str(database, 20)
-                )),
-                (Some(action), Some(name), None) => Some(format!(
-                    "{} {}",
-                    truncate_str(action, 16),
-                    truncate_str(name, 30)
-                )),
-                (Some(action), None, Some(database)) => Some(format!(
-                    "{} @ {}",
-                    truncate_str(action, 16),
-                    truncate_str(database, 24)
-                )),
-                (Some(action), None, None) => Some(action.to_string()),
-                _ => None,
-            }
-        }
-        "mo_branch" => {
-            let action = obj.get("action").and_then(|v| v.as_str());
-            let name = obj.get("name").and_then(|v| v.as_str());
-            match (action, name) {
-                (Some(action), Some(name)) => Some(format!(
-                    "{} {}",
-                    truncate_str(action, 16),
-                    truncate_str(name, 30)
-                )),
-                (Some(action), None) => Some(action.to_string()),
-                _ => None,
-            }
-        }
         _ => None,
     }
 }
@@ -744,15 +706,6 @@ fn fmt_utility_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
                 (Some("turn"), Some(turn_index), _) => Some(format!("turn {turn_index}")),
                 (Some("snapshot"), _, Some(snapshot_id)) => Some(truncate_str(snapshot_id, 40)),
                 (Some(scope), _, _) => Some(scope.to_string()),
-                _ => None,
-            }
-        }
-        "rollback_turn_actions" => {
-            let scope = obj.get("scope").and_then(|v| v.as_str());
-            let turn_index = obj.get("turn_index").and_then(|v| v.as_i64());
-            match (scope, turn_index) {
-                (Some("turn"), Some(turn_index)) => Some(format!("turn {turn_index}")),
-                (Some(scope), _) => Some(scope.to_string()),
                 _ => None,
             }
         }
@@ -1377,15 +1330,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_detail_rollback_turn_actions_shows_turn_scope() {
-        let detail = tool_call_detail(
-            "rollback_turn_actions",
-            &json!({"scope": "turn", "turn_index": 7}),
-        );
-        assert_eq!(detail.as_deref(), Some("turn 7"));
-    }
-
-    #[test]
     fn tool_call_detail_adjust_config_shows_path() {
         let detail = tool_call_detail(
             "adjust_config",
@@ -1401,21 +1345,6 @@ mod tests {
             &json!({"scope": "turn", "turn_index": 5}),
         );
         assert_eq!(detail.as_deref(), Some("turn 5"));
-    }
-
-    #[test]
-    fn tool_call_detail_mo_snapshot_shows_action_and_name() {
-        let detail = tool_call_detail(
-            "mo_snapshot",
-            &json!({"action": "create", "name": "pre-migration"}),
-        );
-        assert_eq!(detail.as_deref(), Some("create pre-migration"));
-    }
-
-    #[test]
-    fn tool_call_detail_mo_branch_shows_action_and_name() {
-        let detail = tool_call_detail("mo_branch", &json!({"action": "create", "name": "exp-a"}));
-        assert_eq!(detail.as_deref(), Some("create exp-a"));
     }
 
     #[test]

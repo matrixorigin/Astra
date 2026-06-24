@@ -9,15 +9,15 @@ use super::ToolExecutor;
 
 // Standalone git operations live in astra-tools; the CLI layer re-exports only
 // the API it intentionally wraps or dispatches.
-#[cfg(test)]
-use astra_tools::git_gix::git_commit;
 pub use astra_tools::git_gix::{
     GitCommitRollbackEntry, GitCommitRollbackJournal, GitStashRollbackEntry,
-    GitStashRollbackJournal, current_branch, git_blame, git_commit_with_metadata, git_contributors,
-    git_diff, git_file_history, git_log, git_log_search, git_push, git_revert_commit_with_metadata,
-    git_show, git_stash, git_stash_with_metadata, git_status, git_worktree_is_clean,
-    head_first_parent_tail, head_short, short_commit_sha,
+    GitStashRollbackJournal, git_blame, git_commit_with_metadata, git_contributors, git_diff,
+    git_file_history, git_log, git_log_search, git_push, git_revert_commit_with_metadata, git_show,
+    git_stash, git_stash_with_metadata, git_status, git_worktree_is_clean, head_first_parent_tail,
+    head_short, short_commit_sha,
 };
+#[cfg(test)]
+use astra_tools::git_gix::{current_branch, git_commit};
 
 fn tool_output_limit() -> usize {
     super::tool_output_limit()

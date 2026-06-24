@@ -95,7 +95,7 @@ const TOOL_GROUPS: &[&[&str]] = &[
     &["write_file", "str_replace", "multi_edit"],
     // Memory tool is single-row and action-aware; no peer alternatives.
     // MatrixOne tools
-    &["mo_query", "mo_snapshot", "mo_branch"],
+    &["mo_query"],
 ];
 
 /// Suggest alternative tools when a tool fails.

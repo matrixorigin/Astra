@@ -502,10 +502,10 @@ async fn rename_symbol_changes_can_be_rolled_back_by_turn() {
         "rename should touch both files: {result}"
     );
     let rollback = executor
-        .rollback_turn_actions(&json!({"scope": "current_turn"}))
+        .rollback_recorded_turn_mutations(&json!({"scope": "current_turn"}))
         .await;
     let rollback_json: serde_json::Value =
-        serde_json::from_str(&rollback).expect("rollback_turn_actions json");
+        serde_json::from_str(&rollback).expect("recorded turn rollback json");
     assert_eq!(
         rollback_json["success"].as_bool(),
         Some(true),
