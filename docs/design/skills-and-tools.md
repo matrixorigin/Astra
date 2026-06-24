@@ -389,7 +389,7 @@ catalog filtering and `discover_skills`, not by long-lived inclusion flags.
 // rust/crates/runtime/src/tool_registry/registry.rs
 pub struct ToolRegistry {
     all_schemas: Vec<Value>,                // All tool JSON schemas
-    budget_tokens: u32,                     // Report/compatibility budget
+    budget_tokens: u32,                     // Tool-surface report budget total
     measured_costs: HashMap<String, u32>,   // Real token costs per tool
     schema_index: HashMap<String, usize>,   // O(1) name→index lookup
     always_load_schemas: Vec<(String, Value)>,   // Always-included (budget-exempt)
@@ -752,7 +752,7 @@ Both come from same MCP server but enter different systems.
 
 ## 15. References
 
-- [Claude Code skill system](~/claudecode) — reference implementation for CC compatibility
+- [Claude Code skill system](~/claudecode) — reference implementation for skill loading and tool discovery behavior
 - [skill-system-review-2026-03-31.md](../../plans/skill-system-review-2026-03-31.md) — authoritative audit
 - [tool-discovery-claude-code.md](tool-discovery-claude-code.md) — CC tool selection gap analysis
 - [context-window-management.md](context-window-management.md) — context budget architecture

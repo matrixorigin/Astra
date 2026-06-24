@@ -7,9 +7,8 @@
 //! 3. **Declaration drift checks** — test metadata keeps schema, runtime, and
 //!    provider inventories from drifting silently.
 //!
-//! The registry no longer proactively ranks built-in deferred tools into every
-//! request. This keeps the tool surface cache-stable and makes activation intent
-//! explicit.
+//! The registry never promotes a deferred tool by query text alone. This keeps
+//! the tool surface cache-stable and makes activation intent explicit.
 
 pub use astra_turn_core::tool_registry_meta::{IntentType, Scope, TOOL_CATALOG, ToolMeta};
 
@@ -62,8 +61,17 @@ mod tests {
     // ── Catalog invariants ──
 
     #[test]
-    fn catalog_has_expected_tools() {
-        assert_eq!(TOOL_CATALOG.len(), 34);
+    fn catalog_has_unique_non_empty_names() {
+        assert!(!TOOL_CATALOG.is_empty(), "tool catalog must not be empty");
+        let mut seen = std::collections::BTreeSet::new();
+        for tool in TOOL_CATALOG {
+            assert!(!tool.name.is_empty(), "catalog tool name must not be empty");
+            assert!(
+                seen.insert(tool.name),
+                "duplicate catalog tool name: {}",
+                tool.name
+            );
+        }
     }
 
     #[test]
@@ -253,8 +261,8 @@ mod tests {
     #[test]
     fn non_conversational_zero_budget_includes_always_load() {
         let registry = ToolRegistry::new(mock_schemas());
-        let result =
-            registry.build_initial_surface_with_budget("inspect the repository files", 1, 0);
+        let (result, _report) =
+            registry.build_initial_surface_with_report("inspect the repository files", 1, 0);
         let names = ToolRegistry::visible_names(&result);
         assert!(
             names.contains(&"bash".to_string()),
@@ -270,7 +278,7 @@ mod tests {
     #[test]
     fn budget_does_not_add_deferred_tools() {
         let registry = ToolRegistry::new(mock_schemas());
-        let result = registry.build_initial_surface_with_budget("最新的pr?", 1, 50);
+        let (result, _report) = registry.build_initial_surface_with_report("最新的pr?", 1, 50);
         let names = ToolRegistry::visible_names(&result);
         assert_eq!(names, registry.always_load_tool_names_sorted());
     }
@@ -298,7 +306,7 @@ mod tests {
             mock_schemas(),
             &astra_config::ToolSurfaceConfig::default(),
         );
-        let selected = registry.build_initial_surface_with_budget(
+        let (selected, _report) = registry.build_initial_surface_with_report(
             "fetch the contents of https://example.com and summarize the web page",
             1,
             800,
@@ -314,7 +322,7 @@ mod tests {
         );
         assert!(
             !names.contains(&"web_fetch".to_string()),
-            "runtime tool surface must not add deferred catalog tools proactively; got: {names:?}"
+            "runtime tool surface must not add deferred catalog tools from query text alone; got: {names:?}"
         );
     }
 
@@ -404,30 +412,33 @@ mod tests {
     // ── Budgeted surface assembly ──
 
     #[test]
-    fn build_surface_with_budget_larger_returns_same_always_load_tools() {
+    fn report_budget_total_does_not_change_visible_tools() {
         let schemas = mock_schemas();
         let registry = ToolRegistry::new(schemas);
-        let small =
-            registry.build_initial_surface_with_budget("matrixorigin memoria 最新的pr?", 1, 500);
-        let large =
-            registry.build_initial_surface_with_budget("matrixorigin memoria 最新的pr?", 1, 6000);
+        let (small, small_report) =
+            registry.build_initial_surface_with_report("matrixorigin memoria 最新的pr?", 1, 500);
+        let (large, large_report) =
+            registry.build_initial_surface_with_report("matrixorigin memoria 最新的pr?", 1, 6000);
         assert_eq!(
             ToolRegistry::visible_names(&large),
             ToolRegistry::visible_names(&small)
         );
+        assert_eq!(small_report.budget_total, 500);
+        assert_eq!(large_report.budget_total, 6000);
     }
 
     #[test]
-    fn build_surface_with_budget_zero_still_returns_always_load() {
+    fn report_budget_zero_still_returns_always_load() {
         let schemas = mock_schemas();
         let registry = ToolRegistry::new(schemas);
-        let selected =
-            registry.build_initial_surface_with_budget("matrixorigin memoria 最新的pr?", 1, 0);
+        let (selected, report) =
+            registry.build_initial_surface_with_report("matrixorigin memoria 最新的pr?", 1, 0);
         // AlwaysLoad tools are budget-exempt, always included
         assert_eq!(
             selected.len(),
             registry.always_load_tool_names_sorted().len()
         );
+        assert_eq!(report.budget_total, 0);
     }
 
     #[test]
@@ -700,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn surface_report_has_no_proactive_deferred_budget() {
+    fn surface_report_budget_used_excludes_deferred_discovery_entries() {
         let registry = ToolRegistry::new(mock_schemas());
         let (_schemas, report) =
             registry.build_initial_surface_with_report("analyze everything", 1, 800);

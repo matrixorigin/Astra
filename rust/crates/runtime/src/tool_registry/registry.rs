@@ -196,7 +196,9 @@ impl ToolRegistry {
     /// AlwaysLoad tools are included deterministically. Non-always_load built-ins are
     /// deferred and must be activated explicitly through `tool_search`.
     pub fn build_initial_surface(&self, query: &str, turn_count: u32) -> Vec<Value> {
-        self.build_initial_surface_with_budget(query, turn_count, self.budget_tokens)
+        let (schemas, _report) =
+            self.build_initial_surface_with_report(query, turn_count, self.budget_tokens);
+        schemas
     }
 
     /// Build a tool surface with a custom token budget, returning both schemas and a report.
@@ -250,17 +252,6 @@ impl ToolRegistry {
         };
 
         (schemas, report)
-    }
-
-    /// Build a tool surface with a custom token budget.
-    pub fn build_initial_surface_with_budget(
-        &self,
-        query: &str,
-        turn_count: u32,
-        budget: u32,
-    ) -> Vec<Value> {
-        let (schemas, _report) = self.build_initial_surface_with_report(query, turn_count, budget);
-        schemas
     }
 
     /// Pipeline-integrated tool surface using a pre-computed RoutingDecision.
@@ -336,12 +327,11 @@ impl ToolRegistry {
 
     /// Register plugin tools from a PluginRegistry.
     ///
-    /// Post-Phase-5 contract:
-    /// plugin schemas become **lookup-able** (the executor can dispatch
-    /// them, `tool_search(select:NAME)` can return them), but they do
-    /// NOT join any proactive surface candidate set. Plugins default
-    /// to the deferred listing. Callers that need a plugin in `tools[]`
-    /// must build the visible surface with that plugin explicitly always_load.
+    /// Plugin schemas become **lookup-able** (the executor can dispatch them
+    /// and `tool_search(select:NAME)` can return them), but lookup alone does
+    /// not place them in the visible `tools[]` surface. Plugins default to the
+    /// deferred listing. Callers that need a plugin in `tools[]` must build the
+    /// visible surface with that plugin explicitly always_load.
     ///
     /// This keeps the Anthropic prompt-cache prefix byte-stable across
     /// plugin registration: schemas are added to lookup/execution indexes,
@@ -529,7 +519,7 @@ mod tests {
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             !names.contains(&"skill".to_string()),
-            "deferred injected tools must not be proactively selected"
+            "deferred injected tools must not enter the visible surface by lookup alone"
         );
         assert_eq!(report.budget_used, 0);
     }
