@@ -1248,7 +1248,7 @@ mod tests {
 
         assert!(tracker.is_deprioritized("bash"));
         assert!(!tracker.is_deprioritized("read_file"));
-        assert!(!tracker.is_deprioritized("git_log")); // never called
+        assert!(!tracker.is_deprioritized("git")); // never called
     }
 
     #[test]
@@ -1260,7 +1260,7 @@ mod tests {
         for _ in 0..3 {
             tracker.record_failure("read_file");
         }
-        tracker.record_success("git_log");
+        tracker.record_success("git");
 
         let mut blocked = tracker.deprioritized_tools();
         blocked.sort();

@@ -1568,9 +1568,9 @@ mod tests {
                     100,
                 )
                 .with_tool_surface(
-                    vec!["github_ci_status".into()],
+                    vec!["github".into()],
                     vec![],
-                    vec!["github_ci_status".into()],
+                    vec!["github".into()],
                     30,
                 ),
             )
@@ -1590,9 +1590,9 @@ mod tests {
                 )
                 .with_cache_tokens(80, 10)
                 .with_tool_surface(
-                    vec!["github_list_prs".into()],
+                    vec!["github".into()],
                     vec![],
-                    vec!["github_list_prs".into()],
+                    vec!["github".into()],
                     35,
                 ),
             )
@@ -1607,7 +1607,7 @@ mod tests {
         assert_eq!(restored.total_completion_tokens, 50);
         assert_eq!(restored.total_cache_read_tokens, 80);
         assert_eq!(restored.total_cache_creation_tokens, 10);
-        assert_eq!(restored.recent_tools, vec!["github_list_prs".to_string()]);
+        assert_eq!(restored.recent_tools, vec!["github".to_string()]);
         assert_eq!(restored.history.len(), 2);
     }
 
@@ -1637,9 +1637,9 @@ mod tests {
                     10,
                 )
                 .with_tool_surface(
-                    vec!["git_log".into()],
+                    vec!["git".into()],
                     vec![],
-                    vec!["git_log".into()],
+                    vec!["git".into()],
                     10,
                 ),
             )
@@ -1667,9 +1667,9 @@ mod tests {
                     10,
                 )
                 .with_tool_surface(
-                    vec!["github_ci_status".into()],
+                    vec!["github".into()],
                     vec![],
-                    vec!["github_ci_status".into()],
+                    vec!["github".into()],
                     20,
                 ),
             )
@@ -1683,7 +1683,7 @@ mod tests {
         assert_eq!(restored.turn, 1);
         assert_eq!(restored.total_prompt_tokens, 80);
         assert_eq!(restored.total_completion_tokens, 20);
-        assert_eq!(restored.recent_tools, vec!["github_ci_status".to_string()]);
+        assert_eq!(restored.recent_tools, vec!["github".to_string()]);
     }
 
     #[test]
@@ -1744,9 +1744,9 @@ mod tests {
                     10,
                 )
                 .with_tool_surface(
-                    vec!["github_ci_status".into()],
+                    vec!["github".into()],
                     vec![],
-                    vec!["github_ci_status".into()],
+                    vec!["github".into()],
                     20,
                 ),
             )
@@ -1757,7 +1757,7 @@ mod tests {
         assert_eq!(restored.turn, 3);
         assert_eq!(restored.total_prompt_tokens, 30);
         assert_eq!(restored.total_completion_tokens, 8);
-        assert_eq!(restored.recent_tools, vec!["github_ci_status".to_string()]);
+        assert_eq!(restored.recent_tools, vec!["github".to_string()]);
     }
 
     #[test]

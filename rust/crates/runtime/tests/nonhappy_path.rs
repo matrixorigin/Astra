@@ -110,12 +110,15 @@ mod turn_guard_integration {
         let mut guard = TurnGuard::new();
 
         // Turn 1: productive tool call (not exploration-only)
-        guard.record_tool_calls(&[tool_call("github_list_prs", r#"{"state":"open"}"#)]);
-        guard.record_tool_result("github_list_prs", r#"[{"id": 1, "title": "fix bug"}]"#);
+        guard.record_tool_calls(&[tool_call(
+            "github",
+            r#"{"action":"list_prs","state":"open"}"#,
+        )]);
+        guard.record_tool_result("github", r#"[{"id": 1, "title": "fix bug"}]"#);
 
         // Turn 2: different productive tool
-        guard.record_tool_calls(&[tool_call("git_log", r#"{"limit":5}"#)]);
-        guard.record_tool_result("git_log", r#"{"commits": [{"sha": "abc"}]}"#);
+        guard.record_tool_calls(&[tool_call("git", r#"{"action":"log","n":5}"#)]);
+        guard.record_tool_result("git", r#"{"commits": [{"sha": "abc"}]}"#);
 
         let verdict = guard.evaluate();
         assert_eq!(verdict.severity, VerdictSeverity::Healthy);
@@ -229,7 +232,7 @@ mod turn_guard_integration {
     fn error_classification_integration() {
         let mut guard = TurnGuard::new();
 
-        guard.record_tool_result("github_list_prs", "Error: 401 Unauthorized");
+        guard.record_tool_result("github", "Error: 401 Unauthorized");
         guard.record_tool_result("bash", "Error: connection timed out");
         guard.record_tool_result("read_file", "Error: no such file or directory");
 
@@ -313,23 +316,22 @@ mod multi_file_edit_regression {
     }
 
     /// Reproduces the exact scenario from session c98e2e7e turn 5:
-    /// - Skill activates review-changes, agent calls git_diff 12 times
-    /// - Continuation turn sends 12 tool_results for git_diff
+    /// - Skill activates review-changes, agent calls git 12 times
+    /// - Continuation turn sends 12 tool_results for git
     /// - retain_invoked_tool_schemas must NOT duplicate the schema
     ///
-    /// Before fix: 12 git_diff schemas → kimi-k2.5 returns 400
-    /// After fix: 1 git_diff schema
+    /// Before fix: 12 git schemas → kimi-k2.5 returns 400
+    /// After fix: 1 git schema
     #[test]
     fn continuation_turn_with_12_git_diff_results_no_duplicate_schemas() {
         let all_schemas = vec![
             tool_schema("bash"),
             tool_schema("read_file"),
-            tool_schema("git_diff"),
-            tool_schema("git_status"),
+            tool_schema("git"),
             tool_schema("skill"),
         ];
 
-        // Initial selection: bash + read_file (git_diff NOT selected)
+        // Initial selection: bash + read_file (git NOT selected)
         let mut selected = vec![tool_schema("bash"), tool_schema("read_file")];
         let mut report = ToolSurfaceReport {
             visible_tools: vec!["bash".into(), "read_file".into()],
@@ -338,7 +340,7 @@ mod multi_file_edit_regression {
             budget_total: 1000,
         };
 
-        // 12 tool_results for git_diff (different file paths, same tool)
+        // 12 tool_results for git (different file paths, same tool)
         let tool_results: Vec<Value> = [
             "HEAD -- stall.rs",
             "HEAD -- chain.rs",
@@ -354,14 +356,14 @@ mod multi_file_edit_regression {
             "HEAD --stat",
         ]
         .iter()
-        .map(|_| json!({"name": "git_diff"}))
+        .map(|_| json!({"name": "git"}))
         .collect();
 
         let retained =
             retain_invoked_tool_schemas(&mut selected, &mut report, &tool_results, &all_schemas);
 
-        assert_eq!(retained, 1, "git_diff should be retained exactly once");
-        assert_eq!(selected.len(), 3, "bash + read_file + git_diff");
+        assert_eq!(retained, 1, "git should be retained exactly once");
+        assert_eq!(selected.len(), 3, "bash + read_file + git");
 
         // Verify no duplicate function names in the final schema list
         let names: Vec<&str> = selected
@@ -447,16 +449,13 @@ mod multi_file_edit_regression {
     fn full_review_edit_verify_session_stays_healthy() {
         let mut guard = TurnGuard::new();
 
-        // Turn 1: skill activation + git_diff (review phase)
+        // Turn 1: skill activation + git (review phase)
         guard.record_tool_calls(&[
             tool_call_fn("skill", r#"{"name":"review-changes"}"#),
-            tool_call_fn("git_diff", r#"{"ref":"HEAD","stat":true}"#),
+            tool_call_fn("git", r#"{"action":"diff","ref":"HEAD","stat_only":true}"#),
         ]);
         guard.record_tool_result("skill", "# Skill: review-changes\n...");
-        guard.record_tool_result(
-            "git_diff",
-            " stall.rs | 178 ++++\n stream_render.rs | 52 +-",
-        );
+        guard.record_tool_result("git", " stall.rs | 178 ++++\n stream_render.rs | 52 +-");
         let v1 = guard.evaluate();
         assert_eq!(v1.severity, VerdictSeverity::Healthy);
 
@@ -744,9 +743,9 @@ mod chat_stream_turnguard_e2e {
         let mut restricted = HashSet::new();
         let max_turns = 25usize;
 
-        // Turn 1: git_log → success
-        guard.record_tool_calls(&[tc("git_log", r#"{"limit":10}"#)]);
-        let q = guard.record_tool_result("git_log", r#"[{"sha":"abc","msg":"fix"}]"#);
+        // Turn 1: git → success
+        guard.record_tool_calls(&[tc("git", r#"{"action":"log","n":10}"#)]);
+        let q = guard.record_tool_result("git", r#"[{"sha":"abc","msg":"fix"}]"#);
         assert_eq!(q, ResultQuality::Success);
         let v = guard.evaluate();
         let (remaining, events, stop) = apply_verdict(&v, max_turns, &mut restricted);
@@ -755,8 +754,8 @@ mod chat_stream_turnguard_e2e {
         assert!(!stop);
 
         // Turn 2: different tool
-        guard.record_tool_calls(&[tc("github_list_prs", r#"{"state":"open"}"#)]);
-        guard.record_tool_result("github_list_prs", r#"[{"id":1}]"#);
+        guard.record_tool_calls(&[tc("github", r#"{"action":"list_prs","state":"open"}"#)]);
+        guard.record_tool_result("github", r#"[{"id":1}]"#);
         let v = guard.evaluate();
         assert_eq!(v.severity, VerdictSeverity::Healthy);
 
@@ -767,13 +766,13 @@ mod chat_stream_turnguard_e2e {
         )]);
         guard.record_tool_result("write_file", r#"{"written":true}"#);
 
-        // Turn 4: git_status
-        guard.record_tool_calls(&[tc("git_status", r#"{}"#)]);
-        guard.record_tool_result("git_status", r#"{"modified":["x.rs"]}"#);
+        // Turn 4: git
+        guard.record_tool_calls(&[tc("git", r#"{"action":"status"}"#)]);
+        guard.record_tool_result("git", r#"{"modified":["x.rs"]}"#);
 
-        // Turn 5: git_diff
-        guard.record_tool_calls(&[tc("git_diff", r#"{"cached":false}"#)]);
-        guard.record_tool_result("git_diff", r#"+fn main(){}\n-fn old(){}"#);
+        // Turn 5: git
+        guard.record_tool_calls(&[tc("git", r#"{"action":"diff"}"#)]);
+        guard.record_tool_result("git", r#"+fn main(){}\n-fn old(){}"#);
 
         let v = guard.evaluate();
         assert_eq!(v.severity, VerdictSeverity::Healthy);
@@ -1298,9 +1297,9 @@ mod chat_stream_turnguard_e2e {
         let mut restricted = HashSet::new();
         let mut budget = 25usize;
 
-        // Turn 1: successful git_log
-        guard.record_tool_calls(&[tc("git_log", r#"{"limit":5}"#)]);
-        guard.record_tool_result("git_log", r#"[{"sha":"a1b2c3"}]"#);
+        // Turn 1: successful git
+        guard.record_tool_calls(&[tc("git", r#"{"action":"log","n":5}"#)]);
+        guard.record_tool_result("git", r#"[{"sha":"a1b2c3"}]"#);
         let v = guard.evaluate();
         assert_eq!(v.severity, VerdictSeverity::Healthy);
 
@@ -1331,8 +1330,8 @@ mod chat_stream_turnguard_e2e {
         budget = b;
 
         // Turn 4: recovery — different tool, success
-        guard.record_tool_calls(&[tc("github_list_prs", r#"{"state":"open"}"#)]);
-        guard.record_tool_result("github_list_prs", r#"[{"id":42}]"#);
+        guard.record_tool_calls(&[tc("github", r#"{"action":"list_prs","state":"open"}"#)]);
+        guard.record_tool_result("github", r#"[{"id":42}]"#);
         let v = guard.evaluate();
         // May still have escalation warning from nudge_count=1, but no new stall
         let has_stall = v.injections.iter().any(|m| m.contains("REFLECTION"));
@@ -1485,10 +1484,10 @@ mod chat_stream_turnguard_e2e {
             tc("bash", r#"{"command":"ls"}"#),
             tc("read_file", r#"{"path":"a.rs"}"#),
             tc("grep", r#"{"pattern":"fn main"}"#),
-            tc("git_status", r#"{}"#),
-            tc("git_diff", r#"{"cached":false}"#),
+            tc("git", r#"{"action":"status"}"#),
+            tc("git", r#"{"action":"diff"}"#),
         ]);
-        for name in &["bash", "read_file", "grep", "git_status", "git_diff"] {
+        for name in &["bash", "read_file", "grep", "git", "git"] {
             guard.record_tool_result(name, r#"{"data":"ok"}"#);
         }
         let v = guard.evaluate();
@@ -1573,7 +1572,7 @@ mod chat_stream_turnguard_e2e {
     #[test]
     fn cross_session_rehabilitation_clears_restriction() {
         let entries = vec![ToolHealthEntry {
-            name: "github_list_prs".to_string(),
+            name: "github".to_string(),
             total_calls: 10,
             total_failures: 8,
             failure_rate: 0.8,
@@ -1584,12 +1583,12 @@ mod chat_stream_turnguard_e2e {
         let mut guard = TurnGuard::with_health(tracker);
 
         // Initially deprioritized from prior session
-        assert!(guard.health.is_deprioritized("github_list_prs"));
+        assert!(guard.health.is_deprioritized("github"));
 
         // Tool succeeds in new session → rehabilitated
-        guard.record_tool_result("github_list_prs", r#"[{"number":42,"title":"Fix"}]"#);
+        guard.record_tool_result("github", r#"[{"number":42,"title":"Fix"}]"#);
         assert!(
-            !guard.health.is_deprioritized("github_list_prs"),
+            !guard.health.is_deprioritized("github"),
             "success should rehabilitate the tool"
         );
 
@@ -1600,7 +1599,7 @@ mod chat_stream_turnguard_e2e {
             .map(|s| s.to_string())
             .collect();
         assert!(
-            !restricted.contains(&"github_list_prs".to_string()),
+            !restricted.contains(&"github".to_string()),
             "rehabilitated tool should not be in restricted list"
         );
     }
@@ -1618,7 +1617,7 @@ mod chat_stream_turnguard_e2e {
             guard.record_tool_result("write_file", "Error: operation failed");
         }
         for _ in 0..7 {
-            guard.record_tool_result("git_log", r#"[{"sha":"abc"}]"#);
+            guard.record_tool_result("git", r#"[{"sha":"abc"}]"#);
         }
 
         let exported = guard.health.export();
@@ -1630,14 +1629,14 @@ mod chat_stream_turnguard_e2e {
         assert_eq!(write_file_entry.total_failures, 3);
         assert!((write_file_entry.failure_rate - 3.0 / 8.0).abs() < 0.01);
 
-        let git_entry = exported.iter().find(|e| e.name == "git_log").unwrap();
+        let git_entry = exported.iter().find(|e| e.name == "git").unwrap();
         assert_eq!(git_entry.total_calls, 7);
         assert_eq!(git_entry.total_failures, 0);
 
         // write_file: 37.5% failure < 50% threshold → not deprioritized
         assert!(!restored.is_deprioritized("write_file"));
-        // git_log: 0% → definitely not deprioritized
-        assert!(!restored.is_deprioritized("git_log"));
+        // git: 0% → definitely not deprioritized
+        assert!(!restored.is_deprioritized("git"));
     }
 
     /// Verdict from restored guard correctly populates avoid_tools for schema exclusion.

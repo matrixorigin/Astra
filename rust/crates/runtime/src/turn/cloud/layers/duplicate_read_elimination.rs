@@ -24,21 +24,29 @@ impl DuplicateReadElimination {
     }
 }
 
-/// Tool names recognized as read operations whose duplicate results
-/// can be safely stubbed. Expanded beyond `read_file` to cover
-/// common read-only tools that produce large, repeatable output.
-const FILE_READ_TOOLS: &[&str] = &[
-    "read_file",
-    "list_dir",
-    "grep",
-    "glob",
-    "symbols",
-    "git_log",
-    "git_show",
-    "git_diff",
-    "git_blame",
-    "git_file_history",
-];
+/// Tool calls recognized as read operations whose duplicate results
+/// can be safely stubbed. Action-shaped tools must inspect arguments so
+/// mutating actions are never treated as repeatable reads.
+fn is_duplicate_read_tool_call(tool_name: &str, args: &str) -> bool {
+    match tool_name {
+        "read_file" | "list_dir" | "grep" | "glob" | "symbols" => true,
+        "git" => serde_json::from_str::<serde_json::Value>(args)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("action")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .is_some_and(|action| {
+                matches!(
+                    action.as_str(),
+                    "status" | "diff" | "log" | "show" | "blame" | "file_history"
+                )
+            }),
+        _ => false,
+    }
+}
 
 impl CompressionLayer for DuplicateReadElimination {
     compression_layer_boilerplate!("duplicate_read_elimination", DuplicateReadElimination);
@@ -54,7 +62,9 @@ impl CompressionLayer for DuplicateReadElimination {
             }
             if let Some(calls) = &msg.tool_calls {
                 for tc in calls {
-                    if tc.id.is_empty() || !FILE_READ_TOOLS.contains(&tc.function.name.as_str()) {
+                    if tc.id.is_empty()
+                        || !is_duplicate_read_tool_call(&tc.function.name, &tc.function.arguments)
+                    {
                         continue;
                     }
                     if let Some(target) =
@@ -148,6 +158,15 @@ fn extract_read_target(tool_name: &str, args: &str) -> Option<ReadTarget> {
             v.get("pattern")
                 .and_then(|p| p.as_str())
                 .map(str::to_string)
+        })
+        .or_else(|| {
+            if tool_name == "git" {
+                v.get("action")
+                    .and_then(|action| action.as_str())
+                    .map(|action| format!("git:{action}"))
+            } else {
+                None
+            }
         })
         .unwrap_or_else(|| tool_name.to_string());
     Some(ReadTarget { key, label })

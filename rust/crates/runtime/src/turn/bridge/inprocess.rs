@@ -5487,13 +5487,13 @@ mod tests {
             std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
-        // bash and read_file are always_load (static lib); github_list_prs is dynamic.
+        // bash and read_file are always_load (static lib); github is dynamic.
         // The marker must sit on the last always_load tool so dynamic churn after
         // it doesn't invalidate the cached prefix.
         let mut tools = vec![
             json!({"function": {"name": "bash"}}),
             json!({"function": {"name": "read_file"}}),
-            json!({"function": {"name": "github_list_prs"}}),
+            json!({"function": {"name": "github"}}),
         ];
         annotate_tool_schemas_for_caching(
             &mut tools,
@@ -5511,7 +5511,7 @@ mod tests {
         );
         assert!(
             tools[2].get("cache_control").is_none(),
-            "dynamic tool (github_list_prs) must not carry the marker"
+            "dynamic tool (github) must not carry the marker"
         );
         assert_eq!(
             tools[1]["cache_control"]["type"].as_str(),
@@ -5698,7 +5698,7 @@ mod tests {
         let loop_text = "draft review text";
         let loop_tool_calls = [json!({
             "id": "call_1", "type": "function",
-            "function": {"name": "git_show", "arguments": "{\"rev\":\"HEAD\"}"}
+            "function": {"name": "git", "arguments": "{\"action\":\"show\",\"revision\":\"HEAD\"}"}
         })];
         let should_emit = !loop_text.trim().is_empty() && loop_tool_calls.is_empty();
         assert!(
@@ -8049,7 +8049,7 @@ mod tests {
             Some(""),
             "empty-object output must not be surfaced as bare '{{}}'"
         );
-        // Must NOT contain the old sentinel marker
+        // Must NOT contain the debug sentinel marker
         assert!(
             !records[0]
                 .result_preview

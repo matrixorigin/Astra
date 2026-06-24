@@ -457,14 +457,14 @@ mod tests {
             session_id: Some(sid.clone()),
             model: Some("gpt-5".into()),
             turn: 1,
-            recent_tools: vec!["git_status".into()],
+            recent_tools: vec!["git".into()],
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("Workspace is clean.");
-        result.tools_used = vec!["git_status".into()];
+        result.tools_used = vec!["git".into()];
         result.tool_calls_count = 1;
         result.tool_call_records = vec![session_journal::ToolCallRecord {
-            name: "git_status".into(),
+            name: "git".into(),
             ok: true,
             ms: 12,
             error: None,
@@ -603,7 +603,7 @@ mod tests {
         };
         trace.tools.visible_tools = vec![
             astra_turn_core::context_assembly_trace::VisibleTool {
-                tool_name: "git_diff".into(),
+                tool_name: "git".into(),
                 tokens: 0,
             },
             astra_turn_core::context_assembly_trace::VisibleTool {

@@ -135,7 +135,7 @@ impl ToolExecutor {
             let mut untracked = 0usize;
             let mut renamed = 0usize;
             for line in porcelain.lines() {
-                if line.starts_with(super::git_status::UNTRACKED_PREFIX) {
+                if line.starts_with(super::porcelain_status::UNTRACKED_PREFIX) {
                     untracked += 1;
                     continue;
                 }
@@ -143,10 +143,10 @@ impl ToolExecutor {
                 let y = line.chars().nth(1).unwrap_or(' ');
                 for status in [x, y] {
                     match status {
-                        super::git_status::MODIFIED => modified += 1,
-                        super::git_status::ADDED => added += 1,
-                        super::git_status::DELETED => deleted += 1,
-                        super::git_status::RENAMED => renamed += 1,
+                        super::porcelain_status::MODIFIED => modified += 1,
+                        super::porcelain_status::ADDED => added += 1,
+                        super::porcelain_status::DELETED => deleted += 1,
+                        super::porcelain_status::RENAMED => renamed += 1,
                         _ => {}
                     }
                 }

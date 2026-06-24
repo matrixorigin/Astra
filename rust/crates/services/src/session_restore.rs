@@ -2243,7 +2243,7 @@ mod tests {
             turn_count: 15,
             total_tokens_in: 5000,
             total_tokens_out: 3000,
-            recent_tools: vec!["git_status".into(), "grep".into()],
+            recent_tools: vec!["git".into(), "grep".into()],
             checkpoint_count: 3,
             last_status: "active".into(),
             git_branch: Some("main".into()),
@@ -2355,7 +2355,7 @@ mod tests {
         assert_eq!(restored.turn_count, 1);
         assert_eq!(restored.total_tokens_in, 33_659);
         assert_eq!(restored.total_tokens_out, 2_855);
-        assert_eq!(restored.recent_tools, vec!["git_show", "read_file", "grep"]);
+        assert_eq!(restored.recent_tools, vec!["git", "read_file", "grep"]);
         assert_eq!(restored.model.as_deref(), Some("glm-5.1"));
         assert_eq!(restored.last_status, "completed");
         assert!(!restored.restored_from_cloud);
@@ -2380,7 +2380,7 @@ mod tests {
             .unwrap()
             .expect("workspace-backed session should restore");
 
-        assert_eq!(restored.recent_tools, vec!["git_show", "read_file", "grep"]);
+        assert_eq!(restored.recent_tools, vec!["git", "read_file", "grep"]);
         assert_eq!(restored.turn_count, 1);
         assert_eq!(restored.total_tokens_in, 33_659);
         assert_eq!(restored.total_tokens_out, 2_855);

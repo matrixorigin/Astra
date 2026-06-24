@@ -1,13 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use serde_json::{Map, Value};
 
 use astra_text_utils::str_preview::prefix_chars;
-use astra_text_utils::text_tokenize::{build_tf, tokenize};
+use astra_text_utils::text_tokenize::tokenize;
 
 // ── Type aliases ─────────────────────────────────────────────────────────────
 
-type DocEntry<'a> = (usize, &'a Map<String, Value>, HashMap<String, f64>);
+type DocEntry<'a> = (usize, &'a Map<String, Value>, Vec<String>);
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -21,55 +21,29 @@ fn max_retrieved() -> usize {
     astra_core::RuntimeLimits::global().max_retrieved
 }
 
-// ── TF-IDF helpers ───────────────────────────────────────────────────────────
+// ── Lexical relevance helpers ────────────────────────────────────────────────
 
-/// Compute smoothed inverse-document-frequency for every term across a corpus.
-/// IDF(t) = ln(1 + N / df(t)), which is always positive even when every
-/// document contains the term (avoids the zero-IDF problem of the classic formula).
-fn build_idf(doc_tfs: &[HashMap<String, f64>]) -> HashMap<String, f64> {
-    let n = doc_tfs.len() as f64;
-    let mut df: HashMap<String, f64> = HashMap::new();
-    for tf in doc_tfs {
-        for key in tf.keys() {
-            *df.entry(key.clone()).or_insert(0.0) += 1.0;
-        }
-    }
-    df.into_iter()
-        .map(|(term, count)| (term, (1.0 + n / count).ln()))
-        .collect()
-}
-
-/// Cosine similarity between a query TF-IDF vector and a document TF-IDF vector.
-fn tfidf_cosine(
-    query_tf: &HashMap<String, f64>,
-    doc_tf: &HashMap<String, f64>,
-    idf: &HashMap<String, f64>,
-) -> f64 {
-    let mut dot = 0.0f64;
-    let mut norm_q = 0.0f64;
-    let mut norm_d = 0.0f64;
-
-    for (term, &q_count) in query_tf {
-        let idf_val = idf.get(term).copied().unwrap_or(0.0);
-        let q_w = q_count * idf_val;
-        norm_q += q_w * q_w;
-
-        if let Some(&d_count) = doc_tf.get(term) {
-            let d_w = d_count * idf_val;
-            dot += q_w * d_w;
-        }
-    }
-    for (term, &d_count) in doc_tf {
-        let idf_val = idf.get(term).copied().unwrap_or(0.0);
-        let d_w = d_count * idf_val;
-        norm_d += d_w * d_w;
+fn lexical_relevance_score(query_tokens: &[String], doc_tokens: &[String]) -> f64 {
+    if query_tokens.is_empty() || doc_tokens.is_empty() {
+        return 0.0;
     }
 
-    if norm_q == 0.0 || norm_d == 0.0 {
-        0.0
-    } else {
-        dot / (norm_q.sqrt() * norm_d.sqrt())
+    let query_terms: HashSet<&str> = query_tokens.iter().map(String::as_str).collect();
+    let doc_terms: HashSet<&str> = doc_tokens.iter().map(String::as_str).collect();
+    let matched_unique = query_terms.intersection(&doc_terms).count();
+    if matched_unique == 0 {
+        return 0.0;
     }
+
+    let repeated_matches = doc_tokens
+        .iter()
+        .filter(|token| query_terms.contains(token.as_str()))
+        .count();
+    let coverage = matched_unique as f64 / query_terms.len() as f64;
+    let density = repeated_matches as f64 / doc_tokens.len() as f64;
+    let specificity = matched_unique as f64 / doc_terms.len() as f64;
+
+    (coverage * 0.70) + (density * 0.20) + (specificity * 0.10)
 }
 
 // ── Adaptive budget ──────────────────────────────────────────────────────────
@@ -97,7 +71,7 @@ pub fn adaptive_budget_chars(query: &str) -> usize {
     }
 }
 
-// ── format_retrieved_events (unchanged signature) ────────────────────────────
+// ── format_retrieved_events ──────────────────────────────────────────────────
 
 pub fn format_retrieved_events(
     events: &[Map<String, Value>],
@@ -144,7 +118,7 @@ pub fn format_retrieved_events(
     }
 }
 
-// ── rule_based_extraction (signature unchanged, uses TF-IDF + decay) ─────────
+// ── rule_based_extraction ────────────────────────────────────────────────────
 
 pub fn rule_based_extraction(
     full_history: &[Map<String, Value>],
@@ -181,21 +155,17 @@ pub fn rule_based_extraction(
             if tokens.is_empty() {
                 return None;
             }
-            Some((idx, msg, build_tf(&tokens)))
+            Some((idx, msg, tokens))
         })
         .collect();
     if doc_data.is_empty() {
         return None;
     }
 
-    let all_tfs: Vec<HashMap<String, f64>> = doc_data.iter().map(|(_, _, tf)| tf.clone()).collect();
-    let idf = build_idf(&all_tfs);
-    let query_tf = build_tf(&query_tokens);
-
     let mut scored: Vec<(f64, &Map<String, Value>)> = doc_data
         .iter()
-        .filter_map(|(idx, msg, tf)| {
-            let sim = tfidf_cosine(&query_tf, tf, &idf);
+        .filter_map(|(idx, msg, tokens)| {
+            let sim = lexical_relevance_score(&query_tokens, tokens);
             if sim <= 0.0 {
                 return None;
             }
@@ -212,11 +182,10 @@ pub fn rule_based_extraction(
     assemble_parts(&scored, budget_chars)
 }
 
-// ── enhanced_extraction (new public API with TF-IDF + freshness + adaptive) ──
+// ── enhanced_extraction ──────────────────────────────────────────────────────
 
-/// Enhanced retrieval combining TF-IDF cosine similarity, freshness decay,
-/// and adaptive budget sizing.  Prefer this over `rule_based_extraction` for
-/// new call-sites.
+/// Enhanced retrieval combining lexical relevance, freshness decay, and adaptive
+/// budget sizing. Prefer this over `rule_based_extraction` for new call-sites.
 pub fn enhanced_extraction(
     full_history: &[Map<String, Value>],
     recent_messages: &[Map<String, Value>],
@@ -358,7 +327,7 @@ pub fn extract_entity_boost_terms(
         }
     }
 
-    // Remove terms that are already in the query (they'd be redundant in TF-IDF)
+    // Remove terms that are already in the query.
     for qt in &query_tokens {
         boost_set.remove(qt);
     }
@@ -386,38 +355,29 @@ pub fn extract_boost_terms_from_pairs(
 
 // ── Memory result re-ranking ─────────────────────────────────────────────────
 
-/// Minimum TF-IDF cosine similarity for a memory result to contribute
-/// boost terms. Results below this threshold are filtered as irrelevant.
+/// Minimum lexical relevance for a memory result to contribute boost terms.
+/// Results below this threshold are filtered as irrelevant.
 const MEMORY_RELEVANCE_THRESHOLD: f64 = 0.05;
 
-/// Re-rank memory results by TF-IDF cosine similarity to the query.
+/// Re-rank memory results by lexical relevance to the query.
 /// Returns (content, score) pairs sorted by descending score, filtered
 /// by MEMORY_RELEVANCE_THRESHOLD. This prevents noisy/irrelevant memories
 /// from polluting tool surface boost terms.
-///
-/// Uses the same CJK-aware tokenizer and TF-IDF engine as conversation
-/// history retrieval — no new dependencies.
 pub fn rank_memory_results(query: &str, memory_contents: &[String]) -> Vec<(String, f64)> {
     if memory_contents.is_empty() || query.trim().is_empty() {
         return vec![];
     }
 
-    let query_tf = build_tf(&tokenize(query));
-    let doc_tfs: Vec<HashMap<String, f64>> = memory_contents
-        .iter()
-        .map(|content| build_tf(&tokenize(content)))
-        .collect();
-
-    // Build IDF from query + memory docs (the mini-corpus)
-    let mut all_tfs = vec![query_tf.clone()];
-    all_tfs.extend(doc_tfs.iter().cloned());
-    let idf = build_idf(&all_tfs);
+    let query_tokens = tokenize(query);
+    if query_tokens.is_empty() {
+        return vec![];
+    }
 
     let mut scored: Vec<(String, f64)> = memory_contents
         .iter()
-        .zip(doc_tfs.iter())
-        .map(|(content, doc_tf)| {
-            let score = tfidf_cosine(&query_tf, doc_tf, &idf);
+        .map(|content| {
+            let doc_tokens = tokenize(content);
+            let score = lexical_relevance_score(&query_tokens, &doc_tokens);
             (content.clone(), score)
         })
         .filter(|(_, score)| *score >= adaptive_threshold(query))
@@ -469,7 +429,7 @@ pub fn merge_boost_terms_unique(
     }
 }
 
-/// TF-IDF-ranked memory snippets → virtual `("memory", content)` history → entity boost terms,
+/// Ranked memory snippets → virtual `("memory", content)` history → entity boost terms,
 /// merged into `boost_terms`. No-op when `ranked` is empty.
 pub fn append_boost_terms_from_ranked_memory(
     boost_terms: &mut Vec<String>,
@@ -540,54 +500,42 @@ mod tests {
         assert_eq!(tokenize("我"), vec!["我".to_string()]);
     }
 
-    // ── TF-IDF scoring tests ────────────────────────────────────────────
+    // ── lexical relevance tests ─────────────────────────────────────────
 
     #[test]
-    fn tfidf_identical_documents_score_one() {
+    fn lexical_relevance_identical_documents_score_high() {
         let tokens = tokenize("hello world");
-        let tf = build_tf(&tokens);
-        let idf = build_idf(std::slice::from_ref(&tf));
-        // Cosine similarity of a vector with itself = 1.0
-        let sim = tfidf_cosine(&tf, &tf, &idf);
-        assert!((sim - 1.0).abs() < 1e-9, "expected ~1.0, got {sim}");
+        let score = lexical_relevance_score(&tokens, &tokens);
+        assert!(score > 0.9, "expected high relevance, got {score}");
     }
 
     #[test]
-    fn tfidf_disjoint_documents_score_zero() {
-        let tf_a = build_tf(&tokenize("hello world"));
-        let tf_b = build_tf(&tokenize("foo bar"));
-        let idf = build_idf(&[tf_a.clone(), tf_b.clone()]);
-        let sim = tfidf_cosine(&tf_a, &tf_b, &idf);
-        assert!(sim.abs() < 1e-9, "expected ~0.0, got {sim}");
+    fn lexical_relevance_disjoint_documents_score_zero() {
+        let score = lexical_relevance_score(&tokenize("hello world"), &tokenize("foo bar"));
+        assert_eq!(score, 0.0);
     }
 
     #[test]
-    fn tfidf_partial_overlap() {
-        let tf_q = build_tf(&tokenize("rust memory"));
-        let tf_a = build_tf(&tokenize("rust memory management"));
-        let tf_b = build_tf(&tokenize("python web server"));
-        let idf = build_idf(&[tf_a.clone(), tf_b.clone()]);
-        let sim_a = tfidf_cosine(&tf_q, &tf_a, &idf);
-        let sim_b = tfidf_cosine(&tf_q, &tf_b, &idf);
+    fn lexical_relevance_partial_overlap() {
+        let query = tokenize("rust memory");
+        let relevant = lexical_relevance_score(&query, &tokenize("rust memory management"));
+        let unrelated = lexical_relevance_score(&query, &tokenize("python web server"));
         assert!(
-            sim_a > sim_b,
-            "relevant doc should score higher: {sim_a} vs {sim_b}"
+            relevant > unrelated,
+            "relevant doc should score higher: {relevant} vs {unrelated}"
         );
     }
 
     #[test]
-    fn tfidf_cjk_query_matches_cjk_document() {
-        let tf_q = build_tf(&tokenize("分析仓库"));
-        let tf_a = build_tf(&tokenize("帮我分析这个仓库的结构"));
-        let tf_b = build_tf(&tokenize("hello world rust code"));
-        let idf = build_idf(&[tf_a.clone(), tf_b.clone()]);
-        let sim_a = tfidf_cosine(&tf_q, &tf_a, &idf);
-        let sim_b = tfidf_cosine(&tf_q, &tf_b, &idf);
+    fn lexical_relevance_cjk_query_matches_cjk_document() {
+        let query = tokenize("分析仓库");
+        let relevant = lexical_relevance_score(&query, &tokenize("帮我分析这个仓库的结构"));
+        let unrelated = lexical_relevance_score(&query, &tokenize("hello world rust code"));
         assert!(
-            sim_a > sim_b,
-            "CJK match should score higher: {sim_a} vs {sim_b}"
+            relevant > unrelated,
+            "CJK match should score higher: {relevant} vs {unrelated}"
         );
-        assert!(sim_a > 0.0, "CJK match should be positive: {sim_a}");
+        assert!(relevant > 0.0, "CJK match should be positive: {relevant}");
     }
 
     // ── freshness decay tests ───────────────────────────────────────────
@@ -694,7 +642,7 @@ mod tests {
         }
     }
 
-    // ── format_retrieved_events backward compat ─────────────────────────
+    // ── format_retrieved_events tests ───────────────────────────────────
 
     #[test]
     fn format_retrieved_events_basic() {
@@ -745,7 +693,7 @@ mod tests {
         assert!(enhanced_extraction(&[], &[], "anything").is_none());
     }
 
-    // ── backward compatibility: constant value ──────────────────────────
+    // ── retrieval budget constant ───────────────────────────────────────
 
     #[test]
     fn retrieval_budget_constant_unchanged() {
@@ -765,7 +713,7 @@ mod tests {
         assert!(rule_based_extraction(std::slice::from_ref(&m), &[], "hello", 8000).is_none());
     }
 
-    // ── Phase 6.3: Memory retrieval budget enforcement ──
+    // ── Memory retrieval budget enforcement ─────────────────────────────
 
     #[test]
     fn budget_enforcement_truncates_at_limit() {

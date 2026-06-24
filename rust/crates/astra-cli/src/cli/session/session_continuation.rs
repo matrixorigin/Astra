@@ -277,9 +277,9 @@ mod tests {
             json!({"role": "user", "content": "check status"}),
             json!({"role": "assistant", "content": "Here is the status."}),
             json!({"role": "user", "content": "hi"}),
-            json!({"role": "assistant", "tool_calls": [{"id": "1", "type": "function", "function": {"name": "git_status", "arguments": "{}"}}]}),
+            json!({"role": "assistant", "tool_calls": [{"id": "1", "type": "function", "function": {"name": "git", "arguments": "{\"action\":\"status\"}"}}]}),
             json!({"role": "tool", "content": "M file.rs", "tool_call_id": "1"}),
-            json!({"role": "assistant", "tool_calls": [{"id": "2", "type": "function", "function": {"name": "git_diff", "arguments": "{}"}}]}),
+            json!({"role": "assistant", "tool_calls": [{"id": "2", "type": "function", "function": {"name": "git", "arguments": "{\"action\":\"diff\"}"}}]}),
             json!({"role": "tool", "content": "+line", "tool_call_id": "2"}),
         ];
         let result = super::sanitize_continuation_messages(msgs);

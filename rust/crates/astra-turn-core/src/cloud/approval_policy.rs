@@ -564,12 +564,17 @@ mod tests {
 
     #[test]
     fn read_only_tools_skip_approval_gate() {
-        for name in ["read_file", "list_dir", "grep", "glob", "git_status"] {
+        for name in ["read_file", "list_dir", "grep", "glob"] {
             assert!(
                 !edge_tool_requires_cloud_approval(name),
                 "{name} should not require cloud approval"
             );
         }
+        let status_args = serde_json::json!({"action": "status"});
+        assert!(!edge_tool_requires_cloud_approval_with_args(
+            "git",
+            Some(&status_args)
+        ));
     }
 
     #[test]
@@ -1050,10 +1055,10 @@ mod tests {
             cloud_gated_tool_kind_with_args("write_file", Some(&write_args)),
             Some(CloudGatedToolKind::Write)
         );
-        let git_status = serde_json::json!({"action": "status"});
+        let status_args = serde_json::json!({"action": "status"});
         assert!(!edge_tool_requires_cloud_approval_with_args(
             "git",
-            Some(&git_status)
+            Some(&status_args)
         ));
         let git_commit = serde_json::json!({"action": "commit", "message": "ship"});
         assert_eq!(
@@ -1169,7 +1174,7 @@ mod tests {
     }
 
     #[test]
-    fn args_aware_backward_compatible_with_name_only() {
+    fn args_aware_name_only_defaults_remain_conservative() {
         // Every tool that required approval without args still requires it
         for &name in CLOUD_APPROVAL_REQUIRED_TOOLS.iter() {
             assert!(
@@ -1178,11 +1183,16 @@ mod tests {
             );
         }
         // Every tool that didn't require approval without args still doesn't
-        for name in ["read_file", "grep", "glob", "git_status"] {
+        for name in ["read_file", "grep", "glob"] {
             assert!(
                 !edge_tool_requires_cloud_approval_with_args(name, None),
                 "{name} should still skip approval when called without args"
             );
         }
+        let status_args = serde_json::json!({"action": "status"});
+        assert!(!edge_tool_requires_cloud_approval_with_args(
+            "git",
+            Some(&status_args)
+        ));
     }
 }

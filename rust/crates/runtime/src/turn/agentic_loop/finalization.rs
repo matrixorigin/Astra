@@ -1155,8 +1155,7 @@ mod tests {
         state.stall.forced_exploration_family_corrective = true;
         state.stall.forced_exploration_family_lockout = true;
         state.stall.exploration_family_corrective_family = Some("diff".into());
-        state.restricted_tools.insert("git_diff".into());
-        state.restricted_tools.insert("git_log".into());
+        state.restricted_tools.insert("git".into());
         state.turn_guard.nudge_count = 5;
         state
             .turn_guard

@@ -695,18 +695,18 @@ mod tests {
     }
 
     #[test]
-    fn select_unique_prefix_activates_resolved_canonical_name() {
+    fn select_result_activates_resolved_canonical_name() {
         let out = json!({
             "mode": "select",
-            "query": "select:github_list",
-            "requested": ["github_list"],
-            "resolved": ["github_list_prs"],
+            "query": "select:github",
+            "requested": ["github"],
+            "resolved": ["github"],
             "matches": [
                 {
-                    "name": "github_list_prs",
+                    "name": "github",
                     "description": "full",
-                    "matched_by": "unique_prefix",
-                    "requested": "github_list",
+                    "matched_by": "exact",
+                    "requested": "github",
                     "parameters": {"type": "object"}
                 }
             ],
@@ -716,7 +716,7 @@ mod tests {
 
         assert_eq!(
             activated_tool_names_from_tool_search_output(&out),
-            vec!["github_list_prs".to_string()]
+            vec!["github".to_string()]
         );
     }
 

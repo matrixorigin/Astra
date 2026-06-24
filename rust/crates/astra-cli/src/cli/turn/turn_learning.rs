@@ -180,14 +180,14 @@ mod tests {
             event
         };
         let mut result = crate::tests::stub_stream_result("");
-        result.tools_used = vec!["git_diff".into()];
+        result.tools_used = vec!["git".into()];
         result.tool_calls_count = 1;
         result.prompt_tokens = 136_947;
         result.llm_rounds = Some(9);
         result.turn_observability_events =
             vec![llm_round_event(0, 9_401), llm_round_event(7, 20_954)];
         result.tool_call_records = vec![session_journal::ToolCallRecord {
-            name: "git_diff".into(),
+            name: "git".into(),
             ok: true,
             ms: 12,
             error: None,

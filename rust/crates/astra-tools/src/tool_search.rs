@@ -1,4 +1,4 @@
-//! Tool search — semantic search over available tool schemas.
+//! Tool search over available tool schemas.
 //!
 //! Takes a set of tool schemas and a query, returning ranked matches.
 //! Extracted from edge_tools as a standalone function.
@@ -515,8 +515,8 @@ mod tests {
             json!({
                 "type": "function",
                 "function": {
-                    "name": "github_list_prs",
-                    "description": "List pull requests on a GitHub repository"
+                    "name": "github",
+                    "description": "GitHub operations: list pull requests, inspect PRs, issues, CI status, and repository stats"
                 }
             }),
         ]
@@ -674,28 +674,19 @@ mod tests {
     #[test]
     fn select_mode_unique_prefix_resolves_canonical_tool_name() {
         let schemas = sample_schemas();
-        let result = tool_search(&schemas, &json!({"query": "select:github_list"}));
+        let result = tool_search(&schemas, &json!({"query": "select:gitHub"}));
         let parsed = parse_result(&result);
 
         assert_eq!(parsed["status"].as_str(), Some("completed"));
         assert_eq!(parsed["selection_status"].as_str(), Some("ok"));
-        assert_eq!(
-            field_strings(&parsed, "requested"),
-            strings(&["github_list"])
-        );
-        assert_eq!(
-            field_strings(&parsed, "resolved"),
-            strings(&["github_list_prs"])
-        );
-        assert_eq!(match_names(&parsed), strings(&["github_list_prs"]));
+        assert_eq!(field_strings(&parsed, "requested"), strings(&["gitHub"]));
+        assert_eq!(field_strings(&parsed, "resolved"), strings(&["github"]));
+        assert_eq!(match_names(&parsed), strings(&["github"]));
         assert_eq!(
             parsed["matches"][0]["matched_by"].as_str(),
             Some("unique_prefix")
         );
-        assert_eq!(
-            parsed["matches"][0]["requested"].as_str(),
-            Some("github_list")
-        );
+        assert_eq!(parsed["matches"][0]["requested"].as_str(), Some("gitHub"));
         assert!(field_strings(&parsed, "missing").is_empty());
     }
 

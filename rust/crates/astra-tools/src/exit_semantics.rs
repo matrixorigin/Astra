@@ -1,10 +1,9 @@
 //! Semantic classification for process exit codes.
 //!
 //! POSIX exit codes are not a boolean success/failure API. Tools like
-//! `grep`, `diff`, and `test` intentionally use non-zero exits for
-//! domain-negative answers. This module centralizes that knowledge so
-//! executors and harnesses stop treating every non-zero as an execution
-//! failure.
+//! `grep`, `diff`, and `test` intentionally use non-zero exits for semantic
+//! non-success answers. This module centralizes that knowledge so executors
+//! and harnesses stop treating every non-zero as an execution failure.
 
 use serde::{Deserialize, Serialize};
 
@@ -12,11 +11,11 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum ExitSemantics {
     Success,
-    /// Command completed normally but answered "no" in its domain
-    /// (e.g. `grep` no matches).
+    /// Command completed normally but did not find a requested informational
+    /// target (e.g. `grep`/`rg` no matches, `pgrep` no processes).
     InformationalFailure,
-    /// Command completed normally and found a negative/different
-    /// domain state (e.g. `diff` found differences, `test` false).
+    /// Command completed normally and found a negative/different domain state
+    /// (e.g. `diff`/`cmp` found differences, `test` false).
     DomainNegative,
     /// Command was terminated because the tool timeout elapsed.
     TimedOut,
@@ -453,7 +452,13 @@ mod tests {
 
     #[test]
     fn grep_no_match_is_informational_failure() {
-        for cmd in &["grep needle missing", "grep missing src/main.rs"] {
+        for cmd in &[
+            "grep needle missing",
+            "grep missing src/main.rs",
+            "rg needle src",
+            "ripgrep needle src",
+            "ag needle src",
+        ] {
             let sem = classify_exit(cmd, 1);
             assert_eq!(sem, ExitSemantics::InformationalFailure, "cmd={cmd}");
             assert!(!sem.is_tool_error(), "cmd={cmd}");
@@ -535,7 +540,9 @@ mod tests {
     fn diff_test_false_and_false_are_domain_negative() {
         for command in [
             "diff a b",
+            "cmp a b",
             "git diff --quiet",
+            "git diff --exit-code",
             "test -f missing",
             "[ -f missing ]",
             "false",
@@ -600,7 +607,9 @@ mod tests {
         assert_eq!(class, CommandResultClass::TestFailure);
         assert!(!class.is_tool_error());
 
-        // grep no match is domain negative
+        // grep no-match is a semantic non-error outcome. The coarse result
+        // class stays domain_negative; exit_semantics keeps the finer
+        // informational_failure distinction.
         let class = classify_command_result("grep needle missing", "", "", Some(1));
         assert_eq!(class, CommandResultClass::DomainNegative);
         assert!(!class.is_tool_error());
@@ -619,8 +628,9 @@ mod tests {
     }
 
     #[test]
-    fn command_result_keeps_grep_no_match_domain_negative() {
+    fn command_result_keeps_grep_no_match_non_error() {
         let class = classify_command_result("grep needle missing", "", "", Some(1));
         assert_eq!(class, CommandResultClass::DomainNegative);
+        assert!(!class.is_tool_error());
     }
 }

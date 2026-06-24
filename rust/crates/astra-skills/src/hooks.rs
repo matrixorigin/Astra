@@ -1936,8 +1936,8 @@ mod tests {
             ("*", "", true),
             // complex patterns
             ("*file*", "read_file_contents", true),
-            ("git_*_*", "git_log_search", true),
-            ("git_*_*", "git_status", false),
+            ("tool_*_*", "tool_read_file", true),
+            ("tool_*_*", "tool_status", false),
         ] {
             assert_eq!(
                 glob_match(pattern, text),

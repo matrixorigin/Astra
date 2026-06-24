@@ -16,12 +16,12 @@ const NON_CLOUD_MUTATION_TOOLS: &[&str] = &[
 ];
 
 /// True for tools whose mutation status depends on arguments rather than the
-/// tool name alone, e.g. `bash` command text or `git_worktree` action.
+/// tool name alone, e.g. `bash` command text or consolidated `git` action.
 pub(crate) fn tool_classified_from_arguments(name: &str) -> bool {
     matches!(
         cloud_gated_tool_kind(name),
         Some(CloudGatedToolKind::Execute)
-    ) || matches!(name, "git" | "github" | "git_worktree")
+    ) || matches!(name, "git" | "github")
 }
 
 /// True when a successful call with this tool name is known to invalidate
@@ -43,8 +43,8 @@ pub fn tool_call_invalidates_read_cache(name: &str, args: Option<&Value>) -> boo
     if !tool_classified_from_arguments(name) {
         return false;
     }
-    if name == "git_worktree" {
-        return git_worktree_invalidates_read_cache(args);
+    if name == "git" && git_action_is(args, "worktree") {
+        return git_worktree_action_invalidates_read_cache(args);
     }
     match cloud_gated_tool_kind_with_args(name, args) {
         Some(CloudGatedToolKind::Write) => return true,
@@ -62,8 +62,14 @@ pub fn tool_call_invalidates_read_cache(name: &str, args: Option<&Value>) -> boo
     false
 }
 
-fn git_worktree_invalidates_read_cache(args: Option<&Value>) -> bool {
-    let Some(action) = args
+fn git_action_is(args: Option<&Value>, expected: &str) -> bool {
+    args.and_then(|args| args.get("action"))
+        .and_then(Value::as_str)
+        == Some(expected)
+}
+
+fn git_worktree_action_invalidates_read_cache(args: Option<&Value>) -> bool {
+    let Some(sub_action) = args
         .and_then(|args| args.get("action"))
         .and_then(Value::as_str)
     else {
@@ -71,7 +77,16 @@ fn git_worktree_invalidates_read_cache(args: Option<&Value>) -> bool {
         // extra cache misses over serving stale read-only results.
         return true;
     };
-    !matches!(action, "list" | "ls")
+    if sub_action != "worktree" {
+        return false;
+    }
+    let Some(sub_action) = args
+        .and_then(|args| args.get("sub_action"))
+        .and_then(Value::as_str)
+    else {
+        return true;
+    };
+    !matches!(sub_action, "list" | "ls")
 }
 
 #[cfg(test)]
@@ -307,14 +322,16 @@ mod tests {
             "bash",
             Some(&serde_json::json!({"command": "sed -n '1,20p' a.txt"}))
         ));
-        assert!(tool_classified_from_arguments("git_worktree"));
+        assert!(tool_classified_from_arguments("git"));
         assert!(tool_call_invalidates_read_cache(
-            "git_worktree",
-            Some(&serde_json::json!({"action": "add", "branch": "feature"}))
+            "git",
+            Some(
+                &serde_json::json!({"action": "worktree", "sub_action": "add", "branch": "feature"})
+            )
         ));
         assert!(!tool_call_invalidates_read_cache(
-            "git_worktree",
-            Some(&serde_json::json!({"action": "list"}))
+            "git",
+            Some(&serde_json::json!({"action": "worktree", "sub_action": "list"}))
         ));
     }
 }

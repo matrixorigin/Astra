@@ -14,7 +14,7 @@
 //! allowed_tools:
 //!   - bash
 //!   - read_file
-//!   - git_log
+//!   - git
 //! when_to_use: "Use when the user reports a bug, error, or unexpected behavior"
 //! model: "claude-sonnet-4-20250514"
 //! max_tokens: 8192

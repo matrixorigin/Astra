@@ -952,7 +952,7 @@ description: "Perform a comprehensive code review"
 user_invocable: true
 allowed_tools:
   - read_file
-  - git_diff
+  - git
 when_to_use: "Use for code review, audit, or PR feedback"
 ---
 # Code Review
@@ -1039,7 +1039,7 @@ tools: []
         assert_eq!(skill.description(), "Perform a comprehensive code review");
 
         // allowed_tools() returns SKILL.md allowed_tools
-        assert_eq!(skill.allowed_tools(), vec!["read_file", "git_diff"]);
+        assert_eq!(skill.allowed_tools(), vec!["read_file", "git"]);
 
         // instruction_text() returns markdown body
         let text = skill.instruction_text().unwrap();

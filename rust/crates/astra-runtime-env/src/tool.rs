@@ -849,36 +849,50 @@ mod tests {
     }
 
     #[test]
-    fn retired_git_and_github_helper_aliases_are_unknown_tools() {
+    fn git_and_github_helper_style_names_are_unknown_tools() {
         let registry = registry();
         let binding = RunBinding::edge_developer("/repo", &registry);
 
-        for tool in [
-            "delegate",
-            "git_status",
-            "git_diff",
-            "git_log",
-            "git_show",
-            "git_blame",
-            "git_file_history",
-            "git_log_search",
-            "git_contributors",
-            "git_commit",
-            "git_stash",
-            "git_revert_commit",
-            "git_push",
-            "github_list_prs",
-            "github_get_pr",
-            "github_ci_status",
-            "github_list_issues",
-            "github_get_issue",
-            "github_repo_stats",
-            "github_create_issue",
-        ] {
+        let git_actions = [
+            "status",
+            "diff",
+            "log",
+            "show",
+            "blame",
+            "file_history",
+            "log_search",
+            "contributors",
+            "commit",
+            "stash",
+            "revert_commit",
+            "push",
+        ];
+        let github_actions = [
+            "list_prs",
+            "get_pr",
+            "ci_status",
+            "list_issues",
+            "get_issue",
+            "repo_stats",
+            "create_issue",
+        ];
+        let tools = std::iter::once("delegate".to_string())
+            .chain(
+                git_actions
+                    .into_iter()
+                    .map(|action| format!("git_{action}")),
+            )
+            .chain(
+                github_actions
+                    .into_iter()
+                    .map(|action| format!("github_{action}")),
+            );
+
+        for tool in tools {
             assert_eq!(
                 CapabilityResolver.check_tool_call(
                     &registry,
-                    tool,
+                    tool.as_str(),
                     &serde_json::json!({}),
                     &binding.capabilities,
                 ),

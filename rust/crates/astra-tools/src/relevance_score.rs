@@ -154,7 +154,7 @@ mod tests {
         let score_cases: &[(&str, &str, Option<&str>, &[&str], usize)] = &[
             ("bash", "Execute commands", None, &["bash"], 28), // exact name(20)+exact part(8)
             ("read_file", "Read file contents", None, &["read"], 20), // name contains(10)+part exact(8)+desc(2)
-            ("git_log_search", "Search git log", None, &["log"], 20), // name contains(10)+part exact(8)+desc(2)
+            ("git", "Git operations", None, &["git"], 30), // exact name(20)+part exact(8)+desc(2)
             ("readFile", "Read file contents", None, &["file"], 20), // camelCase part exact(8)+name contains(10)+desc(2)
             (
                 "xyz",
@@ -201,7 +201,7 @@ mod tests {
             item("bash", "Execute commands"),
             item("read_file", "Read file contents"),
             item("write_file", "Write file contents"),
-            item("git_log", "Show git log"),
+            item("git", "Show git log"),
         ];
 
         // sorted and capped

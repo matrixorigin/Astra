@@ -8,23 +8,7 @@ fn friendly_tool_name(tool_name: &str) -> &str {
         "powershell" => "PowerShell",
         "rollback_database_snapshots" | "rollback_file_edits" => "Reverting",
         "rollback_session_state" => "Reverting session state",
-        "git_status" => "Git status",
-        "git_log" => "Git log",
-        "git_show" => "Git show",
-        "git_diff" => "Git diff",
-        "git_blame" => "Git blame",
-        "git_file_history" => "Git history",
-        "git_log_search" => "Git log search",
-        "git_contributors" => "Git contributors",
         "git" => "Git",
-        "git_checkout_file" => "Git checkout file",
-        "git_worktree" => "Git worktree",
-        "github_get_pr" => "Getting PR",
-        "github_list_prs" => "Listing PRs",
-        "github_get_issue" => "Getting issue",
-        "github_list_issues" => "Listing issues",
-        "github_repo_stats" => "GitHub stats",
-        "github_ci_status" => "GitHub CI",
         "github" => "GitHub",
         "tool_search" => "Searching tools",
         "lsp" => "LSP",
@@ -185,8 +169,8 @@ mod tests {
     #[test]
     fn ok_line_summary_only() {
         assert_eq!(
-            headless_stderr_tool_ok_line("git_status", "5ms", None, Some("3 files")),
-            "  ✓ Git status  3 files (5ms)"
+            headless_stderr_tool_ok_line("git", "5ms", None, Some("3 files")),
+            "  ✓ Git  3 files (5ms)"
         );
     }
 

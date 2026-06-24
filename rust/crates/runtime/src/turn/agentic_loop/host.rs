@@ -3820,7 +3820,7 @@ pub(crate) mod tests {
         );
         let large_structured_diff = format!(
             "diff --git a/src/lib.rs b/src/lib.rs\n{}",
-            "+ changed from structured git_diff\n".repeat(4_000)
+            "+ changed from structured git(action=diff)\n".repeat(4_000)
         );
         let mut host = MockHost::new(vec![
             tool_preamble_result(
@@ -3845,16 +3845,16 @@ pub(crate) mod tests {
             tool_preamble_result(
                 "Everything appears fixed after the diff.",
                 vec![json!({
-                    "id": "req-git_diff",
+                    "id": "req-git",
                     "type": "function",
                     "function": {
-                        "name": "git_diff",
-                        "arguments": "{\"path\":\"src\",\"ref\":\"HEAD\"}"
+                        "name": "git",
+                        "arguments": "{\"action\":\"diff\",\"path\":\"src\",\"ref\":\"HEAD\"}"
                     }
                 })],
                 vec![make_edge_tool_with_args(
-                    "git_diff",
-                    json!({"path": "src", "ref": "HEAD"}),
+                    "git",
+                    json!({"action": "diff", "path": "src", "ref": "HEAD"}),
                     &large_structured_diff,
                 )],
                 95_000,
@@ -3863,7 +3863,7 @@ pub(crate) mod tests {
             ),
             text_result("should never run", 10, 5, Some(20)),
         ])
-        .with_valid_tools(&["bash", "git_diff"]);
+        .with_valid_tools(&["bash", "git"]);
         let mut state = make_state();
         state.max_turns = 2;
         state.remaining_turns = 2;
@@ -7216,7 +7216,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     "Deferred: skill was invoked in this turn. Read the skill instructions above.",
                 ),
             ),
-            tool_record("git_show", true, Some("diff")),
+            tool_record("git", true, Some("diff")),
             tool_record("read_file", true, Some("contents")),
         ];
 
@@ -7421,8 +7421,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
             "grep".into(),
             "view".into(),
             "read_file".into(),
-            "git_show".into(),
-            "git_show".into(),
+            "git".into(),
+            "git".into(),
             "view".into(),
             "grep".into(),
         ];
@@ -9350,10 +9350,10 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     make_edge_tool("read_file", &big_output),
                     make_edge_tool("grep", &big_output),
                     make_edge_tool("glob", &big_output),
-                    make_edge_tool("git_show", &big_output),
-                    make_edge_tool("git_diff", &big_output),
-                    make_edge_tool("git_log", &big_output),
-                    make_edge_tool("git_status", &big_output),
+                    make_edge_tool("git", &big_output),
+                    make_edge_tool("git", &big_output),
+                    make_edge_tool("git", &big_output),
+                    make_edge_tool("git", &big_output),
                 ],
                 100,
                 50,
@@ -9395,10 +9395,10 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     make_edge_tool("read_file", &big),
                     make_edge_tool("grep", &big),
                     make_edge_tool("glob", &big),
-                    make_edge_tool("git_show", &big),
-                    make_edge_tool("git_diff", &big),
-                    make_edge_tool("git_log", &big),
-                    make_edge_tool("git_status", &big),
+                    make_edge_tool("git", &big),
+                    make_edge_tool("git", &big),
+                    make_edge_tool("git", &big),
+                    make_edge_tool("git", &big),
                 ],
                 100,
                 50,
@@ -9767,6 +9767,8 @@ mod parallel_execution_tests {
     fn tool_call_json_named(name: &str, id: &str) -> Value {
         let arguments = if name == "bash" {
             json!({"command": "true"})
+        } else if name == "git" {
+            json!({"action": "diff", "path": format!("/tmp/{name}.txt")})
         } else {
             json!({"path": format!("/tmp/{name}.txt")})
         };
@@ -9815,15 +9817,15 @@ mod parallel_execution_tests {
             ("read_file", "c1"),
             ("grep", "c2"),
             ("glob", "c3"),
-            ("git_status", "c4"),
-            ("git_diff", "c5"),
+            ("git", "c4"),
+            ("git", "c5"),
             ("read_file", "c6"),
         ];
         let mut host = MockHost::new(vec![
             turn_with_named_tools(&tools, ""),
             turn_with_named_tools(&[], "done"),
         ])
-        .with_valid_tools(&["read_file", "grep", "glob", "git_status", "git_diff"]);
+        .with_valid_tools(&["read_file", "grep", "glob", "git"]);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state)
             .await
@@ -9874,13 +9876,13 @@ mod parallel_execution_tests {
             ("glob", "c3"),
             ("bash", "c4"), // write tool — breaks the concurrent batch
             ("read_file", "c5"),
-            ("git_diff", "c6"),
+            ("git", "c6"),
         ];
         let mut host = MockHost::new(vec![
             turn_with_named_tools(&tools, ""),
             turn_with_named_tools(&[], "all done"),
         ])
-        .with_valid_tools(&["read_file", "grep", "glob", "bash", "git_diff"]);
+        .with_valid_tools(&["read_file", "grep", "glob", "bash", "git"]);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state)
             .await
@@ -9904,7 +9906,7 @@ mod parallel_execution_tests {
         let names: Vec<&str> = records.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["read_file", "grep", "glob", "bash", "read_file", "git_diff"],
+            vec!["read_file", "grep", "glob", "bash", "read_file", "git"],
             "tools should be in original order"
         );
 
@@ -9925,7 +9927,7 @@ mod parallel_execution_tests {
             json!({"function": {"name": "grep"}}),
             json!({"function": {"name": "bash"}}),
             json!({"function": {"name": "glob"}}),
-            json!({"function": {"name": "git_diff"}}),
+            json!({"function": {"name": "git", "arguments": "{\"action\":\"diff\"}"}}),
         ];
         let indices: Vec<HeadlessRoundToolIdx> =
             (0..5).map(HeadlessRoundToolIdx::ServerToolCall).collect();

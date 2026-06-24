@@ -10913,7 +10913,7 @@ mod tests {
             None,
             None,
         );
-        state.recent_tools = vec!["git_status".into()];
+        state.recent_tools = vec!["git".into()];
         state.telemetry.first_budget_pressure = 0.27;
         state.stall.events.push(("repetition_stall".into(), 1));
         state.stall.verdict_events.push(
@@ -10921,7 +10921,7 @@ mod tests {
                 turn: 1,
                 severity: "warning".into(),
                 injections: vec!["stall detected".into()],
-                avoid_tools: vec!["git_status".into()],
+                avoid_tools: vec!["git".into()],
                 deprioritized_tools: vec![],
                 force_stop: false,
                 nudge_count: 1,
@@ -10938,7 +10938,7 @@ mod tests {
             },
         );
         state.stall.tool_call_records.push(ToolCallRecord {
-            name: "git_status".into(),
+            name: "git".into(),
             ok: true,
             ms: 14,
             error: None,

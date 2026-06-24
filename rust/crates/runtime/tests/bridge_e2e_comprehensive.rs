@@ -7307,8 +7307,8 @@ async fn round_efficiency_parallel_tools_single_round() {
 /// Phase 2c: Multi-round review flow (suboptimal sequential pattern).
 ///
 /// Simulates the SUBOPTIMAL pattern where the model calls tools sequentially:
-///   Round 1: user → LLM calls git_log → tool_request
-///   Round 2: tool_result → LLM calls git_show → tool_request
+///   Round 1: user -> LLM calls git(action=log) -> tool_request
+///   Round 2: tool_result -> LLM calls git(action=show) -> tool_request
 ///   Round 3: tool_result → LLM returns review text
 ///
 /// This is the 3-round pattern we observe with less capable models.
@@ -7319,18 +7319,17 @@ async fn round_efficiency_review_commit_three_rounds_suboptimal() {
     let cap = AllCaptures::default();
     let app = build_test_app(cap.clone());
 
-    // ── Round 1: User asks to review → LLM calls git_log ──
+    // ── Round 1: User asks to review → LLM calls git ──
     let round1 = json!({
         "agent_id": "re-review-agent",
         "messages": [{ "role": "user", "content": "review the latest commit" }],
         "edge_tools": [
-            tool_schema("git_log"),
-            tool_schema("git_show"),
+            tool_schema("git"),
             tool_schema("read_file"),
         ],
         "test_llm_rounds": [{
             "tool_calls": [
-                tool_call("tc-r1", "git_log", json!({"max_count": 1}))
+                tool_call("tc-r1", "git", json!({"action": "log", "n": 1}))
             ]
         }]
     });
@@ -7344,10 +7343,10 @@ async fn round_efficiency_review_commit_three_rounds_suboptimal() {
     assert_eq!(tc1.len(), 1);
     assert_eq!(tc1[0]["has_tool_calls"].as_bool(), Some(true));
     let tr1 = events_of_type(&ev1, "tool_request");
-    assert_eq!(tr1.len(), 1, "round 1: 1 tool_request (git_log)");
-    assert_eq!(tr1[0]["tool"].as_str(), Some("git_log"));
+    assert_eq!(tr1.len(), 1, "round 1: 1 tool_request (git)");
+    assert_eq!(tr1[0]["tool"].as_str(), Some("git"));
 
-    // ── Round 2: CLI provides git_log result → LLM calls git_show ──
+    // ── Round 2: CLI provides git result → LLM calls git ──
     let round2 = json!({
         "agent_id": "re-review-agent",
         "session_id": session_id,
@@ -7355,15 +7354,14 @@ async fn round_efficiency_review_commit_three_rounds_suboptimal() {
             { "role": "user", "content": "review the latest commit" },
             { "role": "assistant", "content": "", "tool_calls": [
                 { "id": "tc-r1", "type": "function", "function": {
-                    "name": "git_log", "arguments": "{\"max_count\":1}"
+                    "name": "git", "arguments": "{\"action\":\"log\",\"n\":1}"
                 }}
             ]},
             { "role": "tool", "tool_call_id": "tc-r1",
               "content": "abc1234 feat: add new feature (2 hours ago)" },
         ],
         "edge_tools": [
-            tool_schema("git_log"),
-            tool_schema("git_show"),
+            tool_schema("git"),
             tool_schema("read_file"),
         ],
         "tool_results": [{
@@ -7372,7 +7370,7 @@ async fn round_efficiency_review_commit_three_rounds_suboptimal() {
         }],
         "test_llm_rounds": [{
             "tool_calls": [
-                tool_call("tc-r2", "git_show", json!({"commit": "abc1234"}))
+                tool_call("tc-r2", "git", json!({"action": "show", "revision": "abc1234"}))
             ]
         }]
     });
@@ -7385,10 +7383,10 @@ async fn round_efficiency_review_commit_three_rounds_suboptimal() {
     assert_eq!(tc2.len(), 1);
     assert_eq!(tc2[0]["has_tool_calls"].as_bool(), Some(true));
     let tr2 = events_of_type(&ev2, "tool_request");
-    assert_eq!(tr2.len(), 1, "round 2: 1 tool_request (git_show)");
-    assert_eq!(tr2[0]["tool"].as_str(), Some("git_show"));
+    assert_eq!(tr2.len(), 1, "round 2: 1 tool_request (git)");
+    assert_eq!(tr2[0]["tool"].as_str(), Some("git"));
 
-    // ── Round 3: CLI provides git_show result → LLM returns review text ──
+    // ── Round 3: CLI provides git result → LLM returns review text ──
     let round3 = json!({
         "agent_id": "re-review-agent",
         "session_id": session_id,
@@ -7396,22 +7394,21 @@ async fn round_efficiency_review_commit_three_rounds_suboptimal() {
             { "role": "user", "content": "review the latest commit" },
             { "role": "assistant", "content": "", "tool_calls": [
                 { "id": "tc-r1", "type": "function", "function": {
-                    "name": "git_log", "arguments": "{\"max_count\":1}"
+                    "name": "git", "arguments": "{\"action\":\"log\",\"n\":1}"
                 }}
             ]},
             { "role": "tool", "tool_call_id": "tc-r1",
               "content": "abc1234 feat: add new feature (2 hours ago)" },
             { "role": "assistant", "content": "", "tool_calls": [
                 { "id": "tc-r2", "type": "function", "function": {
-                    "name": "git_show", "arguments": "{\"commit\":\"abc1234\"}"
+                    "name": "git", "arguments": "{\"action\":\"show\",\"revision\":\"abc1234\"}"
                 }}
             ]},
             { "role": "tool", "tool_call_id": "tc-r2",
               "content": "+fn new_feature() {\n+    println!(\"Hello\");\n+}" },
         ],
         "edge_tools": [
-            tool_schema("git_log"),
-            tool_schema("git_show"),
+            tool_schema("git"),
             tool_schema("read_file"),
         ],
         "tool_results": [{
@@ -7459,11 +7456,11 @@ async fn round_efficiency_review_commit_three_rounds_suboptimal() {
     );
 }
 
-/// Phase 2d: Optimal review flow — model batches git_log + git_show in 1 round.
+/// Phase 2d: Optimal review flow — model batches git log + show actions in 1 round.
 ///
 /// Simulates the OPTIMAL pattern (like reference-agent):
-///   Round 1: user → LLM calls git_log AND git_show together → 2 tool_requests
-///   Round 2: tool_results → LLM returns review text
+///   Round 1: user -> LLM calls git(action=log) and git(action=show) together
+///   Round 2: tool_results -> LLM returns review text
 ///
 /// 2 rounds instead of 3. This is the target for Phase 4 prompt optimization.
 #[tokio::test]
@@ -7472,19 +7469,18 @@ async fn round_efficiency_review_commit_two_rounds_optimal() {
     let cap = AllCaptures::default();
     let app = build_test_app(cap.clone());
 
-    // ── Round 1: User asks to review → LLM calls git_log + git_show in parallel ──
+    // ── Round 1: User asks to review → LLM calls git log + show in parallel ──
     let round1 = json!({
         "agent_id": "re-optimal-agent",
         "messages": [{ "role": "user", "content": "review the latest commit" }],
         "edge_tools": [
-            tool_schema("git_log"),
-            tool_schema("git_show"),
+            tool_schema("git"),
             tool_schema("read_file"),
         ],
         "test_llm_rounds": [{
             "tool_calls": [
-                tool_call("tc-opt1", "git_log", json!({"max_count": 1})),
-                tool_call("tc-opt2", "git_show", json!({"commit": "HEAD"})),
+                tool_call("tc-opt1", "git", json!({"action": "log", "n": 1})),
+                tool_call("tc-opt2", "git", json!({"action": "show", "revision": "HEAD"})),
             ]
         }]
     });
@@ -7501,11 +7497,11 @@ async fn round_efficiency_review_commit_two_rounds_optimal() {
     assert_eq!(
         tr1.len(),
         2,
-        "optimal round 1: 2 tool_requests (git_log + git_show)"
+        "optimal round 1: 2 tool_requests (git log + show)"
     );
 
     let tool_names: Vec<&str> = tr1.iter().filter_map(|r| r["tool"].as_str()).collect();
-    assert_eq!(tool_names, vec!["git_log", "git_show"]);
+    assert_eq!(tool_names, vec!["git", "git"]);
 
     // ── Round 2: CLI provides both results → LLM returns final review ──
     let round2 = json!({
@@ -7515,10 +7511,10 @@ async fn round_efficiency_review_commit_two_rounds_optimal() {
             { "role": "user", "content": "review the latest commit" },
             { "role": "assistant", "content": "", "tool_calls": [
                 { "id": "tc-opt1", "type": "function", "function": {
-                    "name": "git_log", "arguments": "{\"max_count\":1}"
+                    "name": "git", "arguments": "{\"action\":\"log\",\"n\":1}"
                 }},
                 { "id": "tc-opt2", "type": "function", "function": {
-                    "name": "git_show", "arguments": "{\"commit\":\"HEAD\"}"
+                    "name": "git", "arguments": "{\"action\":\"show\",\"revision\":\"HEAD\"}"
                 }}
             ]},
             { "role": "tool", "tool_call_id": "tc-opt1",
@@ -7527,8 +7523,7 @@ async fn round_efficiency_review_commit_two_rounds_optimal() {
               "content": "diff --git a/src/main.rs\n+fn new_feature() { println!(\"Hello\"); }" },
         ],
         "edge_tools": [
-            tool_schema("git_log"),
-            tool_schema("git_show"),
+            tool_schema("git"),
             tool_schema("read_file"),
         ],
         "tool_results": [
@@ -7780,9 +7775,9 @@ async fn tool_call_full_args_emitted_before_tool_request() {
     let payload = json!({
         "agent_id": "tc-full-args-agent",
         "messages": [{ "role": "user", "content": "show recent commits" }],
-        "edge_tools": [tool_schema("git_log")],
+        "edge_tools": [tool_schema("git")],
         "test_llm_rounds": [{
-            "tool_calls": [tool_call("tc-gl-1", "git_log", json!({"n": 5}))]
+            "tool_calls": [tool_call("tc-gl-1", "git", json!({"action": "log", "n": 5}))]
         }]
     });
 
@@ -7793,11 +7788,11 @@ async fn tool_call_full_args_emitted_before_tool_request() {
     // Must have tool_call events with full args
     let tool_calls = events_of_type(&events, "tool_call");
     assert!(!tool_calls.is_empty(), "must emit tool_call events");
-    assert_eq!(tool_calls[0]["name"], "git_log");
+    assert_eq!(tool_calls[0]["name"], "git");
     // Arguments should be the FULL parsed object, not empty
     let args = &tool_calls[0]["arguments"];
     assert!(
-        args.get("n").is_some() || args.get("path").is_some(),
+        args.get("action").is_some() && (args.get("n").is_some() || args.get("path").is_some()),
         "tool_call arguments must contain full parsed args, got: {args}"
     );
 
@@ -7825,9 +7820,9 @@ async fn tool_call_and_tool_request_ids_match() {
     let payload = json!({
         "agent_id": "tc-id-match-agent",
         "messages": [{ "role": "user", "content": "diff HEAD" }],
-        "edge_tools": [tool_schema("git_diff")],
+        "edge_tools": [tool_schema("git")],
         "test_llm_rounds": [{
-            "tool_calls": [tool_call("tc-gd-1", "git_diff", json!({"ref": "HEAD"}))]
+            "tool_calls": [tool_call("tc-gd-1", "git", json!({"action": "diff", "ref": "HEAD"}))]
         }]
     });
 
@@ -7862,12 +7857,12 @@ async fn tool_call_full_args_parallel_tool_calls() {
     let payload = json!({
         "agent_id": "tc-parallel-args-agent",
         "messages": [{ "role": "user", "content": "review the latest commit" }],
-        "edge_tools": [tool_schema("git_log"), tool_schema("git_diff"), tool_schema("git_show")],
+        "edge_tools": [tool_schema("git")],
         "test_llm_rounds": [{
             "tool_calls": [
-                tool_call("tc-p1", "git_log", json!({"n": 3})),
-                tool_call("tc-p2", "git_diff", json!({"ref": "HEAD~1"})),
-                tool_call("tc-p3", "git_show", json!({"ref": "HEAD", "stat": true})),
+                tool_call("tc-p1", "git", json!({"action": "log", "n": 3})),
+                tool_call("tc-p2", "git", json!({"action": "diff", "ref": "HEAD~1"})),
+                tool_call("tc-p3", "git", json!({"action": "show", "revision": "HEAD", "stat_only": true})),
             ]
         }]
     });

@@ -652,14 +652,14 @@ mod tests {
     }
 
     /// Regression: when the same tool appears in multiple tool_results (e.g.
-    /// git_diff called 12 times), retain_invoked_tool_schemas must add the schema
+    /// git called 12 times), retain_invoked_tool_schemas must add the schema
     /// only once. Previously, `visible_names` was a snapshot that was never
     /// updated, causing N duplicate schemas → LLM 400 "function name duplicated".
     #[test]
     fn retain_deduplicates_same_tool_in_multiple_results() {
         let all = vec![
             make_tool_schema("bash", "run", false),
-            make_tool_schema("git_diff", "diff", false),
+            make_tool_schema("git", "version control", false),
         ];
         let mut selected = vec![make_tool_schema("bash", "run", false)];
         let mut report = ToolSurfaceReport {
@@ -669,20 +669,16 @@ mod tests {
             budget_total: 100,
         };
         // 12 tool results for the same tool (different args, but same name)
-        let results: Vec<Value> = (0..12).map(|_| json!({"name": "git_diff"})).collect();
+        let results: Vec<Value> = (0..12).map(|_| json!({"name": "git"})).collect();
 
         let retained = retain_invoked_tool_schemas(&mut selected, &mut report, &results, &all);
 
-        assert_eq!(retained, 1, "should retain git_diff exactly once");
-        assert_eq!(selected.len(), 2, "bash + git_diff");
+        assert_eq!(retained, 1, "should retain git exactly once");
+        assert_eq!(selected.len(), 2, "bash + git");
         assert_eq!(
-            report
-                .visible_tools
-                .iter()
-                .filter(|n| *n == "git_diff")
-                .count(),
+            report.visible_tools.iter().filter(|n| *n == "git").count(),
             1,
-            "git_diff should appear once in report"
+            "git should appear once in report"
         );
     }
 

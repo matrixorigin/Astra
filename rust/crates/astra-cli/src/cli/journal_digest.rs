@@ -1165,9 +1165,9 @@ mod tests {
             turn.tool_groups.iter().any(|group| {
                 group.round == Some(0)
                     && group.call_count == 1
-                    && group.tools.iter().any(|tool| tool == "Git show b273c589")
+                    && group.tools.iter().any(|tool| tool == "Git")
             }),
-            "digest should preserve the first repeated git_show round"
+            "digest should preserve the first repeated git round"
         );
         assert!(
             turn.tool_groups.iter().any(|group| {
@@ -1306,7 +1306,7 @@ mod tests {
         fs::write(
             journal_path_for_test(sid),
             concat!(
-                r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tokens_in":38000,"tokens_out":500,"duration_ms":30000,"user_input":"/review latest 2 commits","tool_calls":[{"name":"git_show","ok":true,"ms":10},{"name":"git_show","ok":true,"ms":8}],"llm_rounds":3,"total_llm_ms":29900,"total_tool_ms":100}"#,
+                r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tokens_in":38000,"tokens_out":500,"duration_ms":30000,"user_input":"/review latest 2 commits","tool_calls":[{"name":"git","ok":true,"ms":10},{"name":"git","ok":true,"ms":8}],"llm_rounds":3,"total_llm_ms":29900,"total_tool_ms":100}"#,
                 "\n",
             ),
         )

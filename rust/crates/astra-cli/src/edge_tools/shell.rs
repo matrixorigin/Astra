@@ -4160,7 +4160,7 @@ impl ToolExecutor {
             eprintln!("  {}", warning);
         }
 
-        // Nudge: redirect `git diff <range>` to the built-in git_diff/git_show tools.
+        // Nudge: redirect `git diff <range>` to the built-in git(action=diff/show) tool.
         // Large multi-commit diffs via bash can timeout or produce huge uncontrolled output,
         // while built-in tools have output budgets and pressure-scaling.
         // We don't hard-block — instead, auto-pipe through `head -c` to prevent the
@@ -8205,8 +8205,11 @@ mod tests {
     fn interpret_exit_code_rules() {
         let cases: &[(&str, i32, bool, Option<&str>)] = &[
             ("grep -r foo .", 1, false, Some("No matches found")),
+            ("rg foo .", 1, false, Some("No matches found")),
+            ("git grep foo -- src", 1, false, Some("No matches found")),
             ("grep -r foo .", 2, true, None),
             ("diff a b", 1, false, None),
+            ("cmp a b", 1, false, None),
             ("test -f /tmp/x", 1, false, None),
             (
                 "cat file | grep pattern",

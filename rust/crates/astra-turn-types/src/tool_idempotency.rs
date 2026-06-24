@@ -7,11 +7,11 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolIdempotency {
-    /// Safe to re-execute (no side effects): read_file, grep, git_log, etc.
+    /// Safe to re-execute (no side effects): read_file, grep, git, etc.
     PureRead,
     /// Overwrite-style write (safe if file unchanged): write_file
     IdempotentWrite,
-    /// Must check cache, never blindly re-execute: bash, github_create_issue
+    /// Must check cache, never blindly re-execute: bash, github(action=create_issue)
     NonIdempotent,
 }
 
@@ -95,16 +95,8 @@ pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolI
         | "list_files"
         | "find_files"
         | "search_code"
-        | "git_status"
-        | "git_log"
-        | "git_diff"
-        | "git_show"
-        | "git_blame"
-        | "git_file_history"
-        | "git_contributors"
         | "task_output"
         | "task_list"
-        | "git_log_search"
         | "symbols"
         | "find_definition"
         | "find_references"
@@ -114,12 +106,6 @@ pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolI
         | "type_hierarchy"
         | "dead_code"
         | "extract_members"
-        | "github_list_prs"
-        | "github_get_pr"
-        | "github_ci_status"
-        | "github_list_issues"
-        | "github_get_issue"
-        | "github_repo_stats"
         | "web_fetch"
         | "WebFetchTool"
         | "web_search"
@@ -177,19 +163,6 @@ mod tests {
             "list_dir",
             "View",
             "view",
-            "git_status",
-            "git_log",
-            "git_diff",
-            "git_blame",
-            "git_file_history",
-            "git_contributors",
-            "git_log_search",
-            "github_list_prs",
-            "github_get_pr",
-            "github_list_issues",
-            "github_get_issue",
-            "github_ci_status",
-            "github_repo_stats",
             "mo_query",
             "task_output",
             "task_list",

@@ -666,12 +666,12 @@ impl DefaultToolExecutor {
             }
         };
         let output = match action {
-            "list_prs" => client.github_list_prs(args).await,
-            "get_pr" => client.github_get_pr(args).await,
-            "ci_status" => client.github_ci_status(args).await,
-            "list_issues" => client.github_list_issues(args).await,
-            "get_issue" => client.github_get_issue(args).await,
-            "repo_stats" => client.github_repo_stats(args).await,
+            "list_prs" => client.list_prs(args).await,
+            "get_pr" => client.get_pr(args).await,
+            "ci_status" => client.ci_status(args).await,
+            "list_issues" => client.list_issues(args).await,
+            "get_issue" => client.get_issue(args).await,
+            "repo_stats" => client.repo_stats(args).await,
             "create_issue" => client.create_issue(args).await,
             _ => return ToolResult::error(format!("Error: Unknown github action '{action}'")),
         };
@@ -1647,8 +1647,8 @@ mod tests {
             result.output
         );
         assert!(
-            !result.output.contains("github_list_prs"),
-            "error must not leak legacy helper tool names: {}",
+            !result.output.contains("github_"),
+            "error must not leak helper-style tool names: {}",
             result.output
         );
         assert!(
@@ -1701,17 +1701,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_github_helper_names_are_unknown_tools() {
+    async fn dispatch_github_helper_style_names_are_unknown_tools() {
         let (_tmp, exec) = test_executor();
-        for name in [
-            "github_list_prs",
-            "github_get_pr",
-            "github_ci_status",
-            "github_list_issues",
-            "github_get_issue",
-            "github_repo_stats",
-        ] {
-            let result = exec.execute(name, &serde_json::json!({})).await;
+        let actions = [
+            "list_prs",
+            "get_pr",
+            "ci_status",
+            "list_issues",
+            "get_issue",
+            "repo_stats",
+        ];
+        for name in actions.into_iter().map(|action| format!("github_{action}")) {
+            let result = exec.execute(&name, &serde_json::json!({})).await;
             assert!(result.is_error, "{name}: {}", result.output);
             assert!(
                 result

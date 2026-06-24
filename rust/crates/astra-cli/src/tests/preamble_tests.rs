@@ -98,11 +98,11 @@ fn dispatch_thinking_delta_accumulates_across_events() {
 /// "thinking is enabled but reasoning_content is missing in assistant tool call message"
 #[test]
 fn assistant_tc_msg_includes_reasoning_content_when_present() {
-    let reasoning = "I should call github_list_prs.".to_string();
+    let reasoning = "I should call github(action=list_prs).".to_string();
     let tool_call = serde_json::json!({
         "id": "tc-1",
-        "name": "github_list_prs",
-        "arguments": {"owner": "matrixorigin", "repo": "matrixone"}
+        "name": "github",
+        "arguments": {"action": "list_prs", "owner": "matrixorigin", "repo": "matrixone"}
     });
 
     let mut assistant_tc_msg = serde_json::json!({

@@ -164,14 +164,14 @@ impl ToolExecutor {
     )
     .unwrap();
     std::fs::write(
-        root.join("src/git_helpers.rs"),
+        root.join("src/repo_helpers.rs"),
         r#"
-pub enum Language { Rust, Python }
+	pub enum Language { Rust, Python }
 
-pub fn git_status() {}
-pub fn git_stash() {}
-pub fn git_staged() {}
-"#,
+	pub fn repo_status() {}
+	pub fn repo_stash() {}
+	pub fn repo_staged() {}
+	"#,
     )
     .unwrap();
     let executor = ToolExecutor::new(root);
@@ -193,13 +193,13 @@ async fn find_definition_in_repo() {
 #[tokio::test]
 async fn find_definition_regex_pattern() {
     let (_dir, executor) = find_definition_fixture();
-    // git_st.* should match git_status, git_stash, git_staged
+    // repo_st.* should match repo_status, repo_stash, repo_staged
     let result = executor
-        .execute("find_definition", &json!({"symbol": "git_st.*"}))
+        .execute("find_definition", &json!({"symbol": "repo_st.*"}))
         .await;
     assert!(
-        result.contains("git_st"),
-        "regex should match git_st* symbols: {result}"
+        result.contains("repo_st"),
+        "regex should match repo_st* symbols: {result}"
     );
 }
 

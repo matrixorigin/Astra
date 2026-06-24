@@ -1197,8 +1197,8 @@ async fn phase6_artifact_retention_preview_schema_contract() {
     let required_templates = sqlx::query(
         "SELECT tool_name FROM preview_template_registry
          WHERE tool_name IN ('pg_dump', 'fetch_url', 'parse_pdf', 'SKILL.md', 'cargo', 'rustc',
-          'clippy', 'pg_schema_structurize', 'slow_query_analyzer', 'curl',
-          'git_log', 'docker_logs', 'kubectl', 'python_stdout', 'npm_build', 'csv_head',
+          'clippy', 'sql_compat_scan', 'pg_schema_structurize', 'slow_query_analyzer', 'curl',
+          'git', 'docker_logs', 'kubectl', 'python_stdout', 'npm_build', 'csv_head',
           'json_preview', 'markdown_preview')
          AND status = 'active'",
     )

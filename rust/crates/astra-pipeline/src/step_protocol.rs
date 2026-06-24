@@ -2396,7 +2396,7 @@ mod tests {
             payload: None,
             created_at: 100,
         });
-        for (i, tool) in ["grep", "read_file", "git_log"].iter().enumerate() {
+        for (i, tool) in ["grep", "read_file", "git"].iter().enumerate() {
             let _ = store.append(StepEvent {
                 event_id: format!("tool_start_{i}"),
                 canonical_event_id: None,

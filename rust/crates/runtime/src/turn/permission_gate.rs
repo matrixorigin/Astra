@@ -869,21 +869,7 @@ mod tests {
         };
         let ctx = PermissionSyncContext::shared(inherited);
 
-        for tool in &[
-            "read_file",
-            "grep",
-            "glob",
-            "list_dir",
-            "git_status",
-            "git_diff",
-            "git_log",
-            "git_file_history",
-            "git_contributors",
-            "git_log_search",
-            "git_show",
-            "git_blame",
-            "symbols",
-        ] {
+        for tool in &["read_file", "grep", "glob", "list_dir", "symbols"] {
             let result = check_tool_permission_in_plan_mode(
                 tool,
                 None,
@@ -897,6 +883,32 @@ mod tests {
                 is_allowed(&result),
                 "`{tool}` is read-only — plan mode must allow it so the model \
                  can explore the codebase before writing the plan. Got: {result:?}"
+            );
+        }
+
+        for action in [
+            "status",
+            "diff",
+            "log",
+            "file_history",
+            "contributors",
+            "log_search",
+            "show",
+            "blame",
+        ] {
+            let args = serde_json::json!({"action": action}).to_string();
+            let result = check_tool_permission_in_plan_mode(
+                "git",
+                Some(args.as_str()),
+                Some(&ctx),
+                None,
+                Duration::from_secs(1),
+                true,
+            )
+            .await;
+            assert!(
+                is_allowed(&result),
+                "git(action={action}) is read-only — plan mode must allow it. Got: {result:?}"
             );
         }
     }

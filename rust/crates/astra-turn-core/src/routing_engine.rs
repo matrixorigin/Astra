@@ -569,7 +569,7 @@ mod tests {
 
     #[test]
     fn short_followup_does_not_inherit_fetch_from_recent_github_tools() {
-        let d = analyze_with_recent("pr呢？", 2, &["github_ci_status"]);
+        let d = analyze_with_recent("pr呢？", 2, &["github"]);
         assert_eq!(d.task_type, TaskType::Unknown);
         assert_eq!(d.domain_hint, Some(DomainHint::GitHub));
         assert_eq!(d.tool_filter, ToolFilter::Wide);
@@ -577,7 +577,7 @@ mod tests {
 
     #[test]
     fn short_fetch_without_domain_does_not_inherit_recent_github_tools() {
-        let d = analyze_with_recent("最新的", 2, &["github_ci_status"]);
+        let d = analyze_with_recent("最新的", 2, &["github"]);
         assert_eq!(d.task_type, TaskType::Fetch);
         assert_eq!(d.domain_hint, None);
     }

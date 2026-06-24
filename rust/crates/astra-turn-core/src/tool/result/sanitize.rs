@@ -89,7 +89,7 @@ pub fn truncate_tool_result_for_model(tool_name: &str, sanitized_content: &str) 
 fn model_result_char_budget(tool_name: &str, content: &str) -> usize {
     match tool_name {
         "read_file" | "view" => READ_FILE_MODEL_RESULT_CHARS,
-        "git_diff" | "git_show" | "str_replace" | "multi_edit" => HIGH_CHURN_DIFF_RESULT_CHARS,
+        "git" | "str_replace" | "multi_edit" => HIGH_CHURN_DIFF_RESULT_CHARS,
         // Shell output is too varied to cap as aggressively as structured read
         // tools, but huge diffs/build logs should not dominate the next round.
         "bash" | "powershell" if content.chars().count() > HIGH_CHURN_SHELL_RESULT_CHARS => {

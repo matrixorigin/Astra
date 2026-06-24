@@ -938,7 +938,7 @@ mod tests {
     fn always_enabled_for_untrusted_workspace_benign_request() {
         let cell = ApprovalCell::new(
             1,
-            "git_show".into(),
+            "git".into(),
             "Git show HEAD".into(),
             None,
             "This command needs your approval before it runs.".into(),

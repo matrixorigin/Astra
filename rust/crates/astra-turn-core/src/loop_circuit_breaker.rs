@@ -1079,7 +1079,7 @@ mod tests {
             stall_threshold: 100, // isolate read_only_stall
             ..Default::default()
         });
-        // Simulate: skill, git_diff(stat), git_diff(full), bash(diff file1),
+        // Simulate: skill, git(action=diff stat), git(action=diff full), bash(diff file1),
         // read_file(a), read_file(b), read_file(c), bash(diff file2), ...
         let tools: Vec<String> = (0..15).map(|i| format!("read_file:file{i}.rs")).collect();
         for (i, tool) in tools.iter().enumerate() {

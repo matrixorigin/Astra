@@ -794,8 +794,8 @@ mod tests {
         let t2_text = "## Code Review\n\n**permission_manager.rs:978** — boundary check incomplete\n**safety_middleware.rs:8** — missing UPDATE keyword\n**journal_digest.rs:241** — use enum instead of String";
         let t2_records = vec![
             make_record("skill", true, None),
-            make_record("git_diff", true, None),
-            make_record("git_diff", true, None),
+            make_record("git", true, None),
+            make_record("git", true, None),
             make_record(
                 "read_file",
                 true,
@@ -847,7 +847,7 @@ mod tests {
 
         let t1_records = vec![
             make_record("skill", true, None),
-            make_record("git_diff", true, None),
+            make_record("git", true, None),
             make_record("read_file", true, Some("src/cli/permission_manager.rs")),
             make_record("read_file", false, Some("src/safety_middleware.rs")),
             make_record("grep", true, None),
@@ -876,7 +876,7 @@ mod tests {
 
         let t3_records = vec![
             make_record("skill", true, None),
-            make_record("git_diff", true, None),
+            make_record("git", true, None),
         ];
         history.push((
             "review changes".into(),

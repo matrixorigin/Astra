@@ -771,9 +771,7 @@ fn tools_relate_to_intent(
             || query_lower.contains("review")
             || query_lower.contains("diff")
             || query_lower.contains("blame"))
-            && tool_names
-                .iter()
-                .any(|n| n.starts_with("git_") || n == "bash")
+            && tool_names.iter().any(|n| n == "git" || n == "bash")
     }
 }
 
@@ -1016,7 +1014,7 @@ mod tests {
 
     #[test]
     fn divergence_healthy_productive() {
-        let sigs = make_sigs(&[&["github_list_prs"], &["memory"]]);
+        let sigs = make_sigs(&[&["github"], &["memory"]]);
         assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
@@ -1078,7 +1076,7 @@ mod tests {
         let sigs = make_sigs(&[
             &["bash"],
             &["list_dir"],
-            &["github_list_prs"],
+            &["github"],
             &["bash"],
             &["list_dir"],
         ]);
@@ -1240,13 +1238,9 @@ mod tests {
 
     #[test]
     fn reflection_non_exploration_stall() {
-        let sigs = make_sigs(&[
-            &["github_list_prs"],
-            &["github_list_prs"],
-            &["github_list_prs"],
-        ]);
+        let sigs = make_sigs(&[&["github"], &["github"], &["github"]]);
         let reflection = build_stall_reflection(&sigs, &[], 0);
-        assert!(reflection.what_happened.contains("github_list_prs"));
+        assert!(reflection.what_happened.contains("github"));
         assert!(reflection.what_to_try.contains("different"));
         assert!(reflection.confidence >= 0.6);
     }
@@ -1305,15 +1299,15 @@ mod tests {
     #[test]
     fn reflection_includes_error_tools() {
         let sigs = make_sigs(&[&["read_file"], &["bash"], &["read_file"]]);
-        let reflection = build_stall_reflection(&sigs, &["bash", "git_log"], 0);
+        let reflection = build_stall_reflection(&sigs, &["bash", "git"], 0);
         assert!(reflection.avoid_tools.contains(&"bash".to_string()));
-        assert!(reflection.avoid_tools.contains(&"git_log".to_string()));
+        assert!(reflection.avoid_tools.contains(&"git".to_string()));
     }
 
     #[test]
     fn reflection_to_nudge_message_format() {
         let sigs = make_sigs(&[&["bash"], &["bash"], &["bash"]]);
-        let reflection = build_stall_reflection(&sigs, &["git_log"], 0);
+        let reflection = build_stall_reflection(&sigs, &["git"], 0);
         let msg = reflection.to_nudge_message();
         assert!(msg.contains("REFLECTION"));
         assert!(msg.contains("What happened:"));
@@ -1339,7 +1333,7 @@ mod tests {
 
     #[test]
     fn nudge_ignored_detects_violation() {
-        let avoid = vec!["bash".to_string(), "git_log".to_string()];
+        let avoid = vec!["bash".to_string(), "git".to_string()];
         let mut used = std::collections::HashSet::new();
         used.insert("bash".to_string());
         used.insert("memory".to_string());
@@ -1382,9 +1376,9 @@ mod tests {
     #[test]
     fn intent_drift_on_task_when_tools_match_query() {
         let turns = make_intent_turns(&[
-            (&["git_log"], ""),
-            (&["git_show"], r#"{"commit":"abc123"}"#),
-            (&["git_diff"], r#"{"commit":"abc123"}"#),
+            (&["git"], r#"{"action":"log"}"#),
+            (&["git"], r#"{"action":"show","revision":"abc123"}"#),
+            (&["git"], r#"{"action":"diff","ref":"abc123"}"#),
         ]);
         let result = detect_intent_drift("review 最新的commit", &turns);
         assert_eq!(result, IntentDrift::OnTask);
@@ -1394,7 +1388,7 @@ mod tests {
     fn intent_drift_detected_when_unrelated_tools() {
         // User asked to review a commit, but agent writes a skill file
         let turns = make_intent_turns(&[
-            (&["git_log"], ""),
+            (&["git"], r#"{"action":"log"}"#),
             (&["write_file"], r#"{"path":"skills/web_search.py"}"#),
             (&["list_dir"], r#"{"path":"skills/"}"#),
             (&["write_file"], r#"{"path":"skills/test.py"}"#),
@@ -1407,7 +1401,7 @@ mod tests {
     fn intent_drift_not_triggered_below_window() {
         // Only 2 off-task turns (below INTENT_DRIFT_WINDOW=3)
         let turns = make_intent_turns(&[
-            (&["git_log"], ""),
+            (&["git"], r#"{"action":"log"}"#),
             (&["write_file"], r#"{"path":"random.txt"}"#),
             (&["list_dir"], r#"{"path":"random/"}"#),
         ]);
@@ -1421,7 +1415,7 @@ mod tests {
         let turns = make_intent_turns(&[
             (&["write_file"], r#"{"path":"random.txt"}"#),
             (&["list_dir"], r#"{"path":"random/"}"#),
-            (&["git_show"], r#"{"commit":"abc"}"#), // on-task: resets counter
+            (&["git"], r#"{"action":"show","revision":"abc"}"#), // on-task: resets counter
             (&["write_file"], r#"{"path":"random2.txt"}"#),
             (&["list_dir"], r#"{"path":"random2/"}"#),
         ]);
@@ -1994,11 +1988,7 @@ mod tests {
 
     #[test]
     fn reflection_non_exploration_escalation_with_nudge() {
-        let sigs = make_sigs(&[
-            &["github_list_prs"],
-            &["github_list_prs"],
-            &["github_list_prs"],
-        ]);
+        let sigs = make_sigs(&[&["github"], &["github"], &["github"]]);
         let r = build_stall_reflection(&sigs, &[], 1);
         assert!(
             r.what_to_try.contains("STOP"),
@@ -2119,9 +2109,9 @@ mod tests {
     #[test]
     fn intent_drift_all_on_task_git_tools() {
         let turns = make_intent_turns(&[
-            (&["git_log"], ""),
-            (&["git_diff"], "abc"),
-            (&["git_show"], "def"),
+            (&["git"], r#"{"action":"log"}"#),
+            (&["git"], r#"{"action":"diff","ref":"abc"}"#),
+            (&["git"], r#"{"action":"show","revision":"def"}"#),
             (&["bash"], r#"git blame file.rs"#),
         ]);
         assert_eq!(

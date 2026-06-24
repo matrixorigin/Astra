@@ -754,7 +754,7 @@ impl ExplorationFamily {
 fn classify_exploration_family(record: &ToolCallRecord) -> Option<ExplorationFamily> {
     let args = record.args_full.as_deref().unwrap_or("");
     match record.name.as_str() {
-        "git_diff" => Some(ExplorationFamily::Diff),
+        "git" if tool_action_is(args, "diff") => Some(ExplorationFamily::Diff),
         "read_file" | "view" => Some(ExplorationFamily::Read),
         "grep" | "rg" | "glob" => Some(ExplorationFamily::Search),
         "bash" if is_search_like_tool_call(&record.name, args) => Some(ExplorationFamily::Search),
@@ -763,6 +763,14 @@ fn classify_exploration_family(record: &ToolCallRecord) -> Option<ExplorationFam
         }
         _ => None,
     }
+}
+
+fn tool_action_is(args: &str, expected: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .is_some_and(|value| {
+            value.get("action").and_then(serde_json::Value::as_str) == Some(expected)
+        })
 }
 
 fn longest_exploration_family_round_streak(
@@ -1554,7 +1562,7 @@ mod tests {
     fn evaluate_tool_call_records_reuses_live_query_heuristic() {
         let eval = evaluate_tool_call_records(
             "Check the latest git status",
-            &["git_status".to_string()],
+            &["git".to_string()],
             &[],
             0,
             false,
@@ -1652,10 +1660,10 @@ mod tests {
 
     #[test]
     fn build_turn_evaluation_journal_event_serializes_normalized_signals() {
-        let records = vec![journal_ok_call("git_status")];
+        let records = vec![journal_ok_call("git")];
         let eval = evaluate_tool_call_records(
             "Check the latest git status",
-            &["git_status".to_string()],
+            &["git".to_string()],
             &records,
             0,
             false,
@@ -1667,7 +1675,7 @@ mod tests {
             Some(2),
             "cli_repl",
             "Check the latest git status",
-            &["git_status".to_string()],
+            &["git".to_string()],
             &records,
             0,
             false,
@@ -1709,7 +1717,7 @@ mod tests {
         // error_rate = 3/4 = 0.75 and quality collapse. With filtering,
         // only the real success is counted and the turn scores as healthy.
         let records = vec![
-            rec("git_show", true, Some("diff contents here")),
+            rec("git", true, Some("diff contents here")),
             rec(
                 SURGICAL_REMOVAL_TOOL_NAME,
                 true,
@@ -1721,7 +1729,7 @@ mod tests {
 
         let eval = evaluate_tool_call_records(
             "review commit 179afcb",
-            &["git_show".to_string()],
+            &["git".to_string()],
             &records,
             0,
             false,
@@ -1779,7 +1787,7 @@ mod tests {
                 ..Default::default()
             })
             .chain(std::iter::once(ToolCallRecord {
-                name: "git_show".to_string(),
+                name: "git".to_string(),
                 ok: true,
                 ms: 20,
                 error: None,
@@ -1850,15 +1858,15 @@ mod tests {
             eval.signals
         );
 
-        let repeated_git_show = vec![
-            record("git_show", "6f2f96e"),
-            record("git_show", "6f2f96e"),
-            record("git_show", "6f2f96e"),
+        let repeated_git_action_show = vec![
+            record("git", r#"{"action":"show","revision":"6f2f96e"}"#),
+            record("git", r#"{"action":"show","revision":"6f2f96e"}"#),
+            record("git", r#"{"action":"show","revision":"6f2f96e"}"#),
         ];
         let eval = evaluate_tool_call_records(
             "review latest commit",
-            &["git_show".to_string()],
-            &repeated_git_show,
+            &["git".to_string()],
+            &repeated_git_action_show,
             0,
             false,
             0.1,
@@ -1866,8 +1874,8 @@ mod tests {
         assert!(
             eval.signals
                 .iter()
-                .any(|s| matches!(s, EvalSignal::RepeatToolCall(name) if name == "git_show")),
-            "identical git_show targets should still surface as repeat loops: {:?}",
+                .any(|s| matches!(s, EvalSignal::RepeatToolCall(name) if name == "git")),
+            "identical git(action=show) targets should still surface as repeat loops: {:?}",
             eval.signals
         );
     }
@@ -1958,7 +1966,7 @@ mod tests {
     }
 
     #[test]
-    fn real_session_0ac769_pattern_surfaces_git_show_and_read_file_repeats() {
+    fn real_session_0ac769_pattern_surfaces_git_action_show_and_read_file_repeats() {
         use astra_services::session_journal::ToolCallRecord;
 
         let record = |name: &str, args_preview: &str| ToolCallRecord {
@@ -1977,17 +1985,18 @@ mod tests {
         };
 
         // Real session 0ac7696c had 7 LLM rounds with this 12-tool pattern:
-        // git_show, git_show, read_file x3 + grep, grep x3 + read_file, git_show, git_show.
+        // git(action=show), git(action=show), read_file x3 + grep, grep x3 + read_file,
+        // git(action=show), git(action=show).
         // The persisted turn_evaluation surfaced repeat loops for read_file and
-        // git_show, while distinct grep queries stayed healthy.
+        // git(action=show), while distinct grep queries stayed healthy.
         let records = vec![
             record(
-                "git_show",
-                r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
+                "git",
+                r#"{"action":"show","revision":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
             ),
             record(
-                "git_show",
-                r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
+                "git",
+                r#"{"action":"show","revision":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
             ),
             record(
                 "read_file",
@@ -2009,12 +2018,12 @@ mod tests {
                 r#"{"path":"rust/crates/runtime/src/server/run_lifecycle.rs"}"#,
             ),
             record(
-                "git_show",
-                r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
+                "git",
+                r#"{"action":"show","revision":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
             ),
             record(
-                "git_show",
-                r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
+                "git",
+                r#"{"action":"show","revision":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
             ),
             record("grep", r#"/turn_evaluation/ in rust/crates/runtime/src"#),
         ];
@@ -2022,7 +2031,7 @@ mod tests {
         let eval = evaluate_tool_call_records(
             "review b273c589a73799070a71f4cfc6d55349b534d8d1",
             &[
-                "git_show".to_string(),
+                "git".to_string(),
                 "read_file".to_string(),
                 "grep".to_string(),
             ],
@@ -2056,8 +2065,8 @@ mod tests {
         assert!(
             eval.signals
                 .iter()
-                .any(|s| matches!(s, EvalSignal::RepeatToolCall(name) if name == "git_show")),
-            "expected git_show repeat signal, got {:?}",
+                .any(|s| matches!(s, EvalSignal::RepeatToolCall(name) if name == "git")),
+            "expected git repeat signal, got {:?}",
             eval.signals
         );
         assert!(
@@ -2075,7 +2084,7 @@ mod tests {
             "cli_repl",
             "review b273c589a73799070a71f4cfc6d55349b534d8d1",
             &[
-                "git_show".to_string(),
+                "git".to_string(),
                 "read_file".to_string(),
                 "grep".to_string(),
             ],
@@ -2102,10 +2111,10 @@ mod tests {
 
     #[test]
     fn llm_round_churn_surfaces_even_when_tool_calls_succeed() {
-        let records = vec![journal_ok_call("git_diff")];
+        let records = vec![journal_ok_call("git")];
         let eval = evaluate_tool_call_records_with_thresholds_and_telemetry(
             "review local changes",
-            &["git_diff".to_string()],
+            &["git".to_string()],
             &records,
             0,
             false,
@@ -2164,7 +2173,7 @@ mod tests {
             Some(2),
             "cli_repl",
             "review local changes",
-            &["git_diff".to_string()],
+            &["git".to_string()],
             &records,
             0,
             false,
@@ -2195,17 +2204,17 @@ mod tests {
     #[test]
     fn high_cost_low_yield_downgrades_expensive_exploration_churn() {
         let records = vec![
-            record_in_round("git_diff", 0, Some("b-0")),
-            record_in_round("git_diff", 0, Some("b-0")),
-            record_in_round("git_diff", 1, Some("b-1")),
-            record_in_round("git_diff", 1, Some("b-1")),
-            record_in_round("git_diff", 2, Some("b-2")),
-            record_in_round("git_diff", 2, Some("b-2")),
+            record_in_round("git", 0, Some("b-0")),
+            record_in_round("git", 0, Some("b-0")),
+            record_in_round("git", 1, Some("b-1")),
+            record_in_round("git", 1, Some("b-1")),
+            record_in_round("git", 2, Some("b-2")),
+            record_in_round("git", 2, Some("b-2")),
         ];
 
         let eval = evaluate_tool_call_records_with_thresholds_and_telemetry(
             "review local changes",
-            &["git_diff".to_string()],
+            &["git".to_string()],
             &records,
             0,
             false,
@@ -2380,7 +2389,7 @@ mod tests {
     fn is_synthetic_placeholder_via_flag() {
         use astra_services::session_journal::{SURGICAL_REMOVAL_TOOL_NAME, ToolCallRecord};
 
-        // New-style: surgically_removed flag set
+        // Current contract: surgically_removed flag set
         let flagged = ToolCallRecord {
             name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
             ok: true,
@@ -2397,8 +2406,8 @@ mod tests {
         };
         assert!(flagged.is_synthetic_placeholder());
 
-        // Backward-compat: legacy sentinel name only (no flag)
-        let legacy = ToolCallRecord {
+        // Sentinel name alone is not a supported synthetic marker.
+        let unflagged_sentinel = ToolCallRecord {
             name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
             ok: true,
             ms: 0,
@@ -2412,7 +2421,7 @@ mod tests {
             original_tool_name: None,
             ..Default::default()
         };
-        assert!(legacy.is_synthetic_placeholder());
+        assert!(!unflagged_sentinel.is_synthetic_placeholder());
 
         // Normal tool call: neither flag nor sentinel name
         let normal = ToolCallRecord {
@@ -2458,17 +2467,17 @@ mod tests {
             batch_id: batch.map(str::to_string),
             parallel: Some(batch.is_some()),
             round: Some(round),
-            args_full: None,
+            args_full: (name == "git").then(|| r#"{"action":"diff"}"#.to_string()),
             ..Default::default()
         }
     }
     #[test]
-    fn exploration_family_churn_flags_repeated_git_diff_rounds() {
-        let mut records = vec![record_in_round("git_diff", 0, None)];
+    fn exploration_family_churn_flags_repeated_git_action_diff_rounds() {
+        let mut records = vec![record_in_round("git", 0, None)];
         for round in 1..4 {
             let batch = format!("b-{round}-0");
             for _ in 0..5 {
-                records.push(record_in_round("git_diff", round, Some(batch.as_str())));
+                records.push(record_in_round("git", round, Some(batch.as_str())));
             }
         }
 
@@ -2653,7 +2662,7 @@ mod tests {
             record_with_args("bash", 1, r#"{"command":"sed -n '1,20p' src/b.rs"}"#),
             record_with_args("view", 2, r#"{"path":"src/c.rs","view_range":[1,20]}"#),
             record_with_args("read_file", 3, r#"{"path":"src/d.rs"}"#),
-            record_with_args("git_show", 4, r#"{"commit":"HEAD"}"#),
+            record_with_args("git", 4, r#"{"action":"show","revision":"HEAD"}"#),
         ];
         let eval = evaluate_tool_call_records("investigate", &[], &records, 0, false, 0.3);
         assert!(

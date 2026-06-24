@@ -454,7 +454,7 @@ fn show_tools(view: Option<&TurnMessagesView>, summary: &TurnSummary) {
                 .get("name")
                 .and_then(|v| v.as_str())
                 .or_else(|| {
-                    // Fall back to tool_call_id (e.g. "git_status:0" → "git_status")
+                    // Fall back to tool_call_id (e.g. "git:0" → "git")
                     m.get("tool_call_id")
                         .and_then(|v| v.as_str())
                         .and_then(|id| id.split(':').next())
@@ -1164,7 +1164,7 @@ mod tests {
     fn tool_name_from_tool_call_id() {
         let msg = serde_json::json!({
             "role": "tool",
-            "tool_call_id": "git_status:0",
+            "tool_call_id": "git:0",
             "content": "## main"
         });
         // Simulate the extraction logic from show_tools
@@ -1177,7 +1177,7 @@ mod tests {
                     .and_then(|id| id.split(':').next())
             })
             .unwrap_or("?");
-        assert_eq!(name, "git_status");
+        assert_eq!(name, "git");
     }
 
     #[test]

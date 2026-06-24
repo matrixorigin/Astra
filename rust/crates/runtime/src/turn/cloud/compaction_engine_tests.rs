@@ -53,13 +53,18 @@ fn make_agentic_session_msgs(
                 let name = match j % 3 {
                     0 => "read_file",
                     1 => "grep",
-                    _ => "git_diff",
+                    _ => "git",
+                };
+                let arguments = if name == "git" {
+                    format!("{{\"action\": \"diff\", \"path\": \"src/module_{t}/file_{j}.rs\"}}")
+                } else {
+                    format!("{{\"path\": \"src/module_{t}/file_{j}.rs\"}}")
                 };
                 json!({
                     "id": format!("call_{call_id}"),
                     "function": {
                         "name": name,
-                        "arguments": format!("{{\"path\": \"src/module_{t}/file_{j}.rs\"}}")
+                        "arguments": arguments
                     }
                 })
             })
@@ -628,13 +633,13 @@ fn duplicate_read_recognizes_path_less_git_log() {
         json!({"role": "user", "content": "git log"}),
         json!({
             "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c1", "function": {"name": "git_log", "arguments": "{\"n\": 5}"}}]
+            "tool_calls": [{"id": "c1", "function": {"name": "git", "arguments": "{\"action\":\"log\",\"n\":5}"}}]
         }),
         json!({"role": "tool", "tool_call_id": "c1", "content": "commit abc123"}),
         json!({"role": "user", "content": "Again"}),
         json!({
             "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c2", "function": {"name": "git_log", "arguments": "{\"n\": 5}"}}]
+            "tool_calls": [{"id": "c2", "function": {"name": "git", "arguments": "{\"action\":\"log\",\"n\":5}"}}]
         }),
         json!({"role": "tool", "tool_call_id": "c2", "content": "commit abc123"}),
     ];
@@ -656,13 +661,13 @@ fn duplicate_read_does_not_dedupe_different_path_less_args() {
         json!({"role": "user", "content": "git log"}),
         json!({
             "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c1", "function": {"name": "git_log", "arguments": "{\"n\": 5}"}}]
+            "tool_calls": [{"id": "c1", "function": {"name": "git", "arguments": "{\"action\":\"log\",\"n\":5}"}}]
         }),
         json!({"role": "tool", "tool_call_id": "c1", "content": "5 commits"}),
         json!({"role": "user", "content": "Now 10"}),
         json!({
             "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c2", "function": {"name": "git_log", "arguments": "{\"n\": 10}"}}]
+            "tool_calls": [{"id": "c2", "function": {"name": "git", "arguments": "{\"action\":\"log\",\"n\":10}"}}]
         }),
         json!({"role": "tool", "tool_call_id": "c2", "content": "10 commits"}),
     ];
@@ -742,60 +747,60 @@ fn duplicate_read_recognizes_list_dir_glob_symbols() {
 }
 
 #[test]
-fn duplicate_read_recognizes_git_show_diff_blame_file_history() {
+fn duplicate_read_recognizes_git_action_reads() {
     // Test git/path tools with semantic dedup keys.
     let mut msgs = vec![
         json!({"role": "system", "content": "S"}),
-        // git_show
+        // git(action=show)
         json!({"role": "user", "content": "Show"}),
         json!({
             "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c1", "function": {"name": "git_show", "arguments": "{\"commit\": \"abc123\"}"}}]
+            "tool_calls": [{"id": "c1", "function": {"name": "git", "arguments": "{\"action\": \"show\", \"revision\": \"abc123\"}"}}]
         }),
         json!({"role": "tool", "tool_call_id": "c1", "content": "commit abc123 Author: alice Date: 2025-01-01 Fix the widget parsing logic in the parser module"}),
         json!({"role": "user", "content": "Again"}),
         json!({
             "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c2", "function": {"name": "git_show", "arguments": "{\"commit\": \"abc123\"}"}}]
+            "tool_calls": [{"id": "c2", "function": {"name": "git", "arguments": "{\"action\": \"show\", \"revision\": \"abc123\"}"}}]
         }),
         json!({"role": "tool", "tool_call_id": "c2", "content": "commit abc123 Author: alice Date: 2025-01-01 Fix the widget parsing logic in the parser module"}),
-        // git_diff
+        // git(action=diff)
         json!({"role": "user", "content": "Diff"}),
         json!({
             "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c3", "function": {"name": "git_diff", "arguments": "{\"base\": \"main\"}"}}]
+            "tool_calls": [{"id": "c3", "function": {"name": "git", "arguments": "{\"action\": \"diff\", \"base_ref\": \"main\"}"}}]
         }),
         json!({"role": "tool", "tool_call_id": "c3", "content": "diff --git a/src/main.rs b/src/main.rs --- before +++ after @@ removed old code and added new implementation @@"}),
         json!({"role": "user", "content": "Diff again"}),
         json!({
             "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c4", "function": {"name": "git_diff", "arguments": "{\"base\": \"main\"}"}}]
+            "tool_calls": [{"id": "c4", "function": {"name": "git", "arguments": "{\"action\": \"diff\", \"base_ref\": \"main\"}"}}]
         }),
         json!({"role": "tool", "tool_call_id": "c4", "content": "diff --git a/src/main.rs b/src/main.rs --- before +++ after @@ removed old code and added new implementation @@"}),
-        // git_blame
+        // git(action=blame)
         json!({"role": "user", "content": "Blame"}),
         json!({
             "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c5", "function": {"name": "git_blame", "arguments": "{\"file\": \"src/main.rs\"}"}}]
+            "tool_calls": [{"id": "c5", "function": {"name": "git", "arguments": "{\"action\": \"blame\", \"path\": \"src/main.rs\"}"}}]
         }),
         json!({"role": "tool", "tool_call_id": "c5", "content": "line 1: alice 2025-01-01 initial commit line 2: bob 2025-01-02 added error handling line 3: alice refactor"}),
         json!({"role": "user", "content": "Blame again"}),
         json!({
             "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c6", "function": {"name": "git_blame", "arguments": "{\"file\": \"src/main.rs\"}"}}]
+            "tool_calls": [{"id": "c6", "function": {"name": "git", "arguments": "{\"action\": \"blame\", \"path\": \"src/main.rs\"}"}}]
         }),
         json!({"role": "tool", "tool_call_id": "c6", "content": "line 1: alice 2025-01-01 initial commit line 2: bob 2025-01-02 added error handling line 3: alice refactor"}),
-        // git_file_history
+        // git(action=file_history)
         json!({"role": "user", "content": "History"}),
         json!({
             "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c7", "function": {"name": "git_file_history", "arguments": "{\"path\": \"src/main.rs\"}"}}]
+            "tool_calls": [{"id": "c7", "function": {"name": "git", "arguments": "{\"action\": \"file_history\", \"file\": \"src/main.rs\"}"}}]
         }),
         json!({"role": "tool", "tool_call_id": "c7", "content": "3 commits: abc123 fix parsing def456 add tests ghi789 initial implementation of the main entry point"}),
         json!({"role": "user", "content": "History again"}),
         json!({
             "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c8", "function": {"name": "git_file_history", "arguments": "{\"path\": \"src/main.rs\"}"}}]
+            "tool_calls": [{"id": "c8", "function": {"name": "git", "arguments": "{\"action\": \"file_history\", \"file\": \"src/main.rs\"}"}}]
         }),
         json!({"role": "tool", "tool_call_id": "c8", "content": "3 commits: abc123 fix parsing def456 add tests ghi789 initial implementation of the main entry point"}),
     ];
@@ -803,20 +808,20 @@ fn duplicate_read_recognizes_git_show_diff_blame_file_history() {
     let _ = compress_layer_values(&DuplicateReadElimination::new(0.0), &mut msgs, &b);
     // Algorithm stubs the EARLIER duplicate, keeps the LATEST intact.
     // Indices 3, 9, 15, 21 get stubbed; 6, 12, 18, 24 remain as latest.
-    // git_show/git_diff are path-less here, so the human-facing stub falls back
-    // to the tool name; git_blame/git_file_history show the file path.
+    // git show/diff are path-less here, so the human-facing stub falls back
+    // to the action label; git blame/file_history show the file path.
     // NOTE: see comment above about estimated_tokens_freed for short content.
     assert!(
         msgs[3]["content"]
             .as_str()
             .unwrap()
-            .contains("[duplicate read of `git_show`")
+            .contains("[duplicate read of `git:show`")
     );
     assert!(
         msgs[9]["content"]
             .as_str()
             .unwrap()
-            .contains("[duplicate read of `git_diff`")
+            .contains("[duplicate read of `git:diff`")
     );
     assert!(
         msgs[15]["content"]
@@ -833,19 +838,19 @@ fn duplicate_read_recognizes_git_show_diff_blame_file_history() {
 }
 
 #[test]
-fn duplicate_read_does_not_conflate_git_show_same_file_different_commit() {
+fn duplicate_read_does_not_conflate_git_action_show_same_file_different_revision() {
     let mut msgs = vec![
         json!({"role": "system", "content": "S"}),
         json!({"role": "user", "content": "Show commit A"}),
         json!({
             "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c1", "function": {"name": "git_show", "arguments": "{\"commit\": \"aaa111\", \"file\": \"src/main.rs\"}"}}]
+            "tool_calls": [{"id": "c1", "function": {"name": "git", "arguments": "{\"action\": \"show\", \"revision\": \"aaa111\", \"path\": \"src/main.rs\"}"}}]
         }),
         json!({"role": "tool", "tool_call_id": "c1", "content": "COMMIT_A_CONTENT"}),
         json!({"role": "user", "content": "Show commit B"}),
         json!({
             "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c2", "function": {"name": "git_show", "arguments": "{\"commit\": \"bbb222\", \"file\": \"src/main.rs\"}"}}]
+            "tool_calls": [{"id": "c2", "function": {"name": "git", "arguments": "{\"action\": \"show\", \"revision\": \"bbb222\", \"path\": \"src/main.rs\"}"}}]
         }),
         json!({"role": "tool", "tool_call_id": "c2", "content": "COMMIT_B_CONTENT"}),
     ];

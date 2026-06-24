@@ -732,60 +732,6 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
                 "git action is unknown or not yet modeled for automatic rollback",
             ),
         },
-        "git_worktree" => match string_arg(&normalized_args, "action")
-            .map(|action| action.to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("list" | "ls") => ActionCompensationProfile::read(true),
-            Some("enter") => ActionCompensationProfile::compensated(
-                true,
-                ActionCategory::Execute,
-                false,
-                CompensationKind::GitRestoreWorktree,
-                "leave the worktree with `git_worktree` action=`exit`; remove the recorded worktree path manually only after confirming it is clean".to_string(),
-            ),
-            Some("add" | "create") => ActionCompensationProfile::compensated(
-                true,
-                ActionCategory::Execute,
-                false,
-                CompensationKind::GitRestoreWorktree,
-                "remove the recorded clean worktree with `git_worktree` action=`remove` and the recorded path; if it has changed, inspect it before removal".to_string(),
-            ),
-            Some("exit") => {
-                let exit_action = string_arg(&normalized_args, "exit_action")
-                    .map(|value| value.to_ascii_lowercase());
-                if exit_action.as_deref() == Some("remove") {
-                    ActionCompensationProfile::manual(
-                        false,
-                        ActionCategory::Destructive,
-                        "git_worktree exit with exit_action=remove can delete the worktree and discard work; use action=`enter` or recreate the worktree manually if you need to return",
-                    )
-                } else {
-                    ActionCompensationProfile::manual(
-                        false,
-                        ActionCategory::Execute,
-                        "git_worktree exit restores the original session root; re-enter the worktree or recreate it manually if you need to return",
-                    )
-                }
-            }
-            Some("remove" | "rm" | "delete") => ActionCompensationProfile::manual(
-                false,
-                ActionCategory::Destructive,
-                "git_worktree remove can delete the worktree and optionally its branch; restore it by recreating the worktree or branch manually if needed",
-            ),
-            _ => ActionCompensationProfile::manual(
-                false,
-                ActionCategory::Execute,
-                "git_worktree action is unknown or not yet modeled for automatic rollback",
-            ),
-        },
-        "git_checkout_file" => ActionCompensationProfile::compensated(
-            true,
-            ActionCategory::Destructive,
-            true,
-            CompensationKind::RestoreOrDeleteFile,
-            restore_file_compensation_summary(string_arg(&normalized_args, "path"), true),
-        ),
         "notebook_edit" => ActionCompensationProfile::compensated(
             true,
             ActionCategory::Write,
@@ -1169,17 +1115,17 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_compensation() {
+    fn git_action_worktree_compensation() {
         // list: read-only
-        let p = tool_action_profile("git_worktree", &json!({"action": "list"}));
+        let p = tool_action_profile("git", &json!({"action": "worktree", "sub_action": "list"}));
         assert!(p.bounded);
         assert_eq!(p.category, ActionCategory::Read);
         assert_eq!(p.compensation_kind, None);
 
         // enter: reversible via GitRestoreWorktree
         let p = tool_action_profile(
-            "git_worktree",
-            &json!({"action": "enter", "branch": "demo"}),
+            "git",
+            &json!({"action": "worktree", "sub_action": "enter", "branch": "demo"}),
         );
         assert!(p.bounded);
         assert_eq!(p.category, ActionCategory::Execute);
@@ -1192,11 +1138,14 @@ mod tests {
             p.compensation_summary
                 .as_deref()
                 .unwrap_or_default()
-                .contains("git_worktree")
+                .contains("action=`worktree`")
         );
 
         // add: same compensation
-        let p = tool_action_profile("git_worktree", &json!({"action": "add", "branch": "demo"}));
+        let p = tool_action_profile(
+            "git",
+            &json!({"action": "worktree", "sub_action": "add", "branch": "demo"}),
+        );
         assert!(p.bounded);
         assert_eq!(p.category, ActionCategory::Execute);
         assert!(p.reversible);
@@ -1232,7 +1181,10 @@ mod tests {
         );
 
         // checkout file: destructive but bounded + reversible
-        let p = tool_action_profile("git_checkout_file", &json!({"path": "src/lib.rs"}));
+        let p = tool_action_profile(
+            "git",
+            &json!({"action": "checkout_file", "path": "src/lib.rs"}),
+        );
         assert!(p.bounded);
         assert_eq!(p.category, ActionCategory::Destructive);
         assert!(p.reversible);
@@ -1274,18 +1226,19 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_list_is_read_only() {
-        let profile = tool_action_profile("git_worktree", &json!({"action": "list"}));
+    fn git_action_worktree_list_is_read_only() {
+        let profile =
+            tool_action_profile("git", &json!({"action": "worktree", "sub_action": "list"}));
         assert!(profile.bounded);
         assert_eq!(profile.category, ActionCategory::Read);
         assert_eq!(profile.compensation_kind, None);
     }
 
     #[test]
-    fn git_worktree_enter_is_compensated() {
+    fn git_action_worktree_enter_is_compensated() {
         let profile = tool_action_profile(
-            "git_worktree",
-            &json!({"action": "enter", "branch": "demo"}),
+            "git",
+            &json!({"action": "worktree", "sub_action": "enter", "branch": "demo"}),
         );
         assert!(profile.bounded);
         assert_eq!(profile.category, ActionCategory::Execute);
@@ -1299,7 +1252,7 @@ mod tests {
                 .compensation_summary
                 .as_deref()
                 .unwrap_or_default()
-                .contains("git_worktree")
+                .contains("action=`worktree`")
         );
     }
 

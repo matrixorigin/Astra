@@ -655,7 +655,7 @@ arguments:
     description: "File to review"
     required: true
 depends_on:
-  - name: git_status
+  - name: git
     version: ">=1.0"
     type: tool
   - name: knowledge

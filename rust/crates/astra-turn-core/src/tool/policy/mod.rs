@@ -82,6 +82,27 @@ pub fn is_tool_concurrency_safe(tool: &str, args: Option<&serde_json::Value>) ->
             Some("spawn") | Some("get_result")
         );
     }
+    if tool == "git" {
+        return matches!(
+            args.and_then(|a| a.get("action")).and_then(|v| v.as_str()),
+            Some(
+                "status"
+                    | "diff"
+                    | "log"
+                    | "show"
+                    | "blame"
+                    | "file_history"
+                    | "log_search"
+                    | "contributors"
+            )
+        );
+    }
+    if tool == "github" {
+        return matches!(
+            args.and_then(|a| a.get("action")).and_then(|v| v.as_str()),
+            Some("list_prs" | "get_pr" | "ci_status" | "repo_stats" | "list_issues" | "get_issue")
+        );
+    }
     matches!(
         tool,
         // Local read-only (sync).
@@ -89,14 +110,6 @@ pub fn is_tool_concurrency_safe(tool: &str, args: Option<&serde_json::Value>) ->
             | "list_dir"
             | "grep"
             | "glob"
-            | "git_status"
-            | "git_diff"
-            | "git_log"
-            | "git_show"
-            | "git_blame"
-            | "git_file_history"
-            | "git_contributors"
-            | "git_log_search"
             | "find_definition"
             | "find_references"
             | "call_graph"
@@ -116,13 +129,6 @@ pub fn is_tool_concurrency_safe(tool: &str, args: Option<&serde_json::Value>) ->
             | "web_search"
             | "share_context"
             | "query_context"
-            // GitHub read-only (async - benefits from join_all).
-            | "github_list_prs"
-            | "github_get_pr"
-            | "github_ci_status"
-            | "github_list_issues"
-            | "github_get_issue"
-            | "github_repo_stats"
     )
 }
 
@@ -195,5 +201,28 @@ mod tests {
             Some(&json!({"action": "send_message"}))
         ));
         assert!(!is_tool_concurrency_safe("agent", None));
+    }
+
+    #[test]
+    fn concurrency_safety_is_action_aware_for_git_and_github() {
+        assert!(is_tool_concurrency_safe(
+            "git",
+            Some(&json!({"action": "diff"}))
+        ));
+        assert!(!is_tool_concurrency_safe(
+            "git",
+            Some(&json!({"action": "commit"}))
+        ));
+        assert!(!is_tool_concurrency_safe("git", None));
+
+        assert!(is_tool_concurrency_safe(
+            "github",
+            Some(&json!({"action": "get_pr"}))
+        ));
+        assert!(!is_tool_concurrency_safe(
+            "github",
+            Some(&json!({"action": "create_issue"}))
+        ));
+        assert!(!is_tool_concurrency_safe("github", None));
     }
 }

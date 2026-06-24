@@ -71,7 +71,7 @@ pub struct ToolResult {
     /// Whether this result represents an error condition.
     pub is_error: bool,
     /// Semantic meaning of a process exit code when the tool surfaced
-    /// one. This keeps domain-negative outcomes (grep no-match, diff
+    /// one. This keeps semantic non-error outcomes (grep no-match, diff
     /// differs, test false) distinct from execution failures.
     pub exit_semantics: Option<exit_semantics::ExitSemantics>,
 }
@@ -722,7 +722,7 @@ pub fn categorize_reference(line: &str, _symbol: &str) -> &'static str {
 }
 
 /// Git porcelain status codes for git status --porcelain output parsing.
-pub mod git_status_codes {
+pub mod porcelain_status_codes {
     pub const MODIFIED: char = 'M';
     pub const ADDED: char = 'A';
     pub const DELETED: char = 'D';
@@ -984,14 +984,19 @@ mod tests {
     }
 
     #[test]
-    fn approval_required_tools_does_not_keep_retired_action_aliases() {
-        for retired in [
-            "git_commit",
-            "git_revert_commit",
-            "git_stash",
-            "github_create_issue",
-        ] {
-            assert!(!APPROVAL_REQUIRED_TOOLS.contains(&retired));
+    fn approval_required_tools_does_not_keep_helper_style_names() {
+        let git_actions = ["commit", "revert_commit", "stash"];
+        let github_actions = ["create_issue"];
+        for name in git_actions
+            .into_iter()
+            .map(|action| format!("git_{action}"))
+            .chain(
+                github_actions
+                    .into_iter()
+                    .map(|action| format!("github_{action}")),
+            )
+        {
+            assert!(!APPROVAL_REQUIRED_TOOLS.contains(&name.as_str()));
         }
     }
 
@@ -1188,14 +1193,14 @@ mod tests {
         assert!(result.contains("<persisted-output>"));
     }
 
-    // ── git_status_codes ───────────────────────────────────────────────
+    // ── porcelain_status_codes ─────────────────────────────────────────
 
     #[test]
-    fn git_status_codes_constants() {
-        assert_eq!(git_status_codes::MODIFIED, 'M');
-        assert_eq!(git_status_codes::ADDED, 'A');
-        assert_eq!(git_status_codes::DELETED, 'D');
-        assert_eq!(git_status_codes::RENAMED, 'R');
-        assert_eq!(git_status_codes::UNTRACKED_PREFIX, "??");
+    fn porcelain_status_codes_constants() {
+        assert_eq!(porcelain_status_codes::MODIFIED, 'M');
+        assert_eq!(porcelain_status_codes::ADDED, 'A');
+        assert_eq!(porcelain_status_codes::DELETED, 'D');
+        assert_eq!(porcelain_status_codes::RENAMED, 'R');
+        assert_eq!(porcelain_status_codes::UNTRACKED_PREFIX, "??");
     }
 }

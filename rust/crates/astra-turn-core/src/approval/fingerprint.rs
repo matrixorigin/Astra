@@ -719,8 +719,8 @@ mod tests {
     #[test]
     fn prefix_matching_respects_word_boundary() {
         let git = ApprovalFingerprint::shell("bash", "git commit", false);
-        let git_status = ApprovalFingerprint::shell("bash", "git status", false);
-        assert!(!git.matches(&git_status)); // "git commit" doesn't match "git status"
+        let status_cmd = ApprovalFingerprint::shell("bash", "git status", false);
+        assert!(!git.matches(&status_cmd)); // "git commit" doesn't match "git status"
     }
 
     #[test]
@@ -812,13 +812,13 @@ mod tests {
         let git = ApprovalFingerprint::shell("bash", "git commit", false);
         overrides.insert(git, true);
 
-        let git_status = ApprovalFingerprint::shell("bash", "git status", true);
+        let status_cmd = ApprovalFingerprint::shell("bash", "git status", true);
         // "git commit" override doesn't match "git status"
-        assert_eq!(overrides.check(&git_status), None);
+        assert_eq!(overrides.check(&status_cmd), None);
 
         // But if we add a broad bash override...
         overrides.insert(ApprovalFingerprint::bare("bash"), true);
-        assert_eq!(overrides.check(&git_status), Some(true));
+        assert_eq!(overrides.check(&status_cmd), Some(true));
     }
 
     #[test]

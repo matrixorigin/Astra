@@ -1192,7 +1192,7 @@ impl VerificationRunner {
         parts.push(format!("Work directory: {}", dir.display()));
 
         // 1. Git diff (uncommitted changes) — most relevant for "did the code change correctly?"
-        if let Ok(diff) = Self::git_diff(&dir).await
+        if let Ok(diff) = Self::uncommitted_worktree_diff(&dir).await
             && !diff.is_empty()
         {
             parts.push(format!(
@@ -1231,8 +1231,8 @@ impl VerificationRunner {
         parts.join("\n\n")
     }
 
-    /// Get git diff for uncommitted changes.
-    async fn git_diff(dir: &std::path::Path) -> Result<String, String> {
+    /// Get the worktree diff for uncommitted changes.
+    async fn uncommitted_worktree_diff(dir: &std::path::Path) -> Result<String, String> {
         let dir = dir.to_path_buf();
         tokio::task::spawn_blocking(move || {
             let output = std::process::Command::new("git")

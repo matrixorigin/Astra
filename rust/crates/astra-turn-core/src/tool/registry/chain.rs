@@ -406,16 +406,23 @@ mod tests {
     fn git_investigation_chain_pattern() {
         // Pattern: blame a file → get contributor → search related commits
         let chain = ToolChain::new("git_investigate", "Deep-dive a suspicious file change")
-            .named_step("blame", "git_blame", json!({"file": "$input.file"}))
+            .named_step(
+                "blame",
+                "git",
+                json!({"action": "blame", "file": "$input.file"}),
+            )
             .named_step(
                 "history",
-                "git_file_history",
-                json!({"file": "$input.file"}),
+                "git",
+                json!({"action": "file_history", "file": "$input.file"}),
             )
-            .step("git_log_search", json!({"query": "$input.concern"}));
+            .step(
+                "git",
+                json!({"action": "log_search", "query": "$input.concern"}),
+            );
 
         assert_eq!(chain.steps.len(), 3);
-        let known_tools = vec!["git_blame", "git_file_history", "git_log_search"];
+        let known_tools = vec!["git"];
         assert!(chain.validate(&known_tools).is_ok());
     }
 }

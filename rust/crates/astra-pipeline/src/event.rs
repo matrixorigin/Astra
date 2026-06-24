@@ -531,7 +531,7 @@ mod tests {
         let e1 = log
             .emit(
                 EventKind::ToolsSelected {
-                    tools: vec!["github_list_prs".into()],
+                    tools: vec!["github".into()],
                     confidence: 0.7,
                     boost_terms: vec![],
                 },
@@ -542,7 +542,7 @@ mod tests {
             .emit(
                 EventKind::ToolCallStarted {
                     call_id: "c1".into(),
-                    tool_name: "github_list_prs".into(),
+                    tool_name: "github".into(),
                 },
                 Some(e1),
             )
@@ -551,7 +551,7 @@ mod tests {
             .emit(
                 EventKind::ToolCallCompleted {
                     call_id: "c1".into(),
-                    tool_name: "github_list_prs".into(),
+                    tool_name: "github".into(),
                     duration_ms: 150,
                     success: false,
                     error: Some("404 Not Found".into()),

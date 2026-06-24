@@ -845,29 +845,48 @@ mod tests {
     }
 
     #[test]
-    fn retired_git_github_helper_names_are_not_registered() {
+    fn git_and_github_helper_style_names_are_not_registered() {
         let r = registry();
-        for name in [
-            "git_status",
-            "git_diff",
-            "git_log",
-            "git_show",
-            "git_blame",
-            "git_file_history",
-            "git_contributors",
-            "git_log_search",
-            "git_checkout_file",
-            "git_worktree",
-            "github_list_prs",
-            "github_get_pr",
-            "github_ci_status",
-            "github_list_issues",
-            "github_get_issue",
-            "github_repo_stats",
-        ] {
-            assert!(r.get(name).is_none(), "{name} should not be registered");
-            assert_eq!(r.category(name), ToolCategory::Mutating);
-            assert_eq!(r.display_category(name), ToolDisplayCategory::Other);
+
+        for name in r.canonical_names() {
+            assert!(
+                !name.starts_with("git_") && !name.starts_with("github_"),
+                "canonical tool names must use consolidated git/github action surfaces: {name}"
+            );
+        }
+
+        let git_actions = [
+            "status",
+            "diff",
+            "log",
+            "show",
+            "blame",
+            "file_history",
+            "contributors",
+            "log_search",
+            "checkout_file",
+            "worktree",
+        ];
+        let github_actions = [
+            "list_prs",
+            "get_pr",
+            "ci_status",
+            "list_issues",
+            "get_issue",
+            "repo_stats",
+        ];
+        for name in git_actions
+            .into_iter()
+            .map(|action| format!("git_{action}"))
+            .chain(
+                github_actions
+                    .into_iter()
+                    .map(|action| format!("github_{action}")),
+            )
+        {
+            assert!(r.get(&name).is_none(), "{name} should not be registered");
+            assert_eq!(r.category(&name), ToolCategory::Mutating);
+            assert_eq!(r.display_category(&name), ToolDisplayCategory::Other);
         }
     }
 
@@ -1203,16 +1222,21 @@ mod tests {
     }
 
     #[test]
-    fn retired_mutating_git_github_aliases_are_not_registered() {
+    fn mutating_git_github_helper_style_names_are_not_registered() {
         let r = registry();
-        for name in [
-            "git_commit",
-            "git_revert_commit",
-            "git_stash",
-            "github_create_issue",
-        ] {
+        let git_actions = ["commit", "revert_commit", "stash"];
+        let github_actions = ["create_issue"];
+        for name in git_actions
+            .into_iter()
+            .map(|action| format!("git_{action}"))
+            .chain(
+                github_actions
+                    .into_iter()
+                    .map(|action| format!("github_{action}")),
+            )
+        {
             assert!(
-                r.get(name).is_none(),
+                r.get(&name).is_none(),
                 "{name} must not remain in TOOL_TABLE"
             );
         }
@@ -2181,7 +2205,7 @@ mod tests {
     }
 
     /// Full consistency: static and action-aware tools map to the correct
-    /// retry/idempotency semantics without retired helper names.
+    /// retry/idempotency semantics through consolidated action surfaces.
     #[test]
     fn scenario_action_aware_idempotency_contract() {
         let r = registry();

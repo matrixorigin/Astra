@@ -11,13 +11,12 @@ use super::ToolExecutor;
 // the API it intentionally wraps or dispatches.
 pub use astra_tools::git_gix::{
     GitCommitRollbackEntry, GitCommitRollbackJournal, GitStashRollbackEntry,
-    GitStashRollbackJournal, git_blame, git_commit_with_metadata, git_contributors, git_diff,
-    git_file_history, git_log, git_log_search, git_push, git_revert_commit_with_metadata, git_show,
-    git_stash, git_stash_with_metadata, git_status, git_worktree_is_clean, head_first_parent_tail,
-    head_short, short_commit_sha,
+    GitStashRollbackJournal, blame, commit_with_metadata, contributors, diff, file_history,
+    git_worktree_is_clean, head_first_parent_tail, head_short, log, log_search, push,
+    revert_commit_with_metadata, short_commit_sha, show, stash, stash_with_metadata, status,
 };
 #[cfg(test)]
-use astra_tools::git_gix::{current_branch, git_commit};
+use astra_tools::git_gix::{commit, current_branch};
 
 fn tool_output_limit() -> usize {
     super::tool_output_limit()
@@ -212,7 +211,7 @@ impl ToolExecutor {
                         head_first_parent_tail(&self.project_root, expected_tail.len())
                             .unwrap_or_default();
                     if actual_tail != expected_tail {
-                        let error = "recorded git commits are no longer the current HEAD tail; use git_revert_commit manually".to_string();
+                        let error = "recorded git commits are no longer the current HEAD tail; use revert_commit manually".to_string();
                         failed = plan
                             .iter()
                             .map(|entry| {
@@ -230,7 +229,7 @@ impl ToolExecutor {
 
                 if failed.is_empty() {
                     for entry in &plan {
-                        let outcome = crate::edge_tools::git_gix::git_revert_commit_with_metadata(
+                        let outcome = crate::edge_tools::git_gix::revert_commit_with_metadata(
                             &self.project_root,
                             &serde_json::json!({
                                 "commit_sha": entry.commit_sha,
@@ -307,13 +306,12 @@ impl ToolExecutor {
         }
     }
 
-    pub(crate) fn git_commit(&self, args: &Value) -> String {
-        self.git_commit_with_metadata(args).output
+    pub(crate) fn commit(&self, args: &Value) -> String {
+        self.commit_with_metadata(args).output
     }
 
-    pub(crate) fn git_commit_with_metadata(&self, args: &Value) -> super::ToolExecutionOutcome {
-        let outcome =
-            crate::edge_tools::git_gix::git_commit_with_metadata(&self.project_root, args);
+    pub(crate) fn commit_with_metadata(&self, args: &Value) -> super::ToolExecutionOutcome {
+        let outcome = crate::edge_tools::git_gix::commit_with_metadata(&self.project_root, args);
         if let Some(commit_sha) = outcome
             .tool_result_fields
             .as_ref()
@@ -330,16 +328,13 @@ impl ToolExecutor {
         outcome
     }
 
-    pub(crate) fn git_revert_commit(&self, args: &Value) -> String {
-        self.git_revert_commit_with_metadata(args).output
+    pub(crate) fn revert_commit(&self, args: &Value) -> String {
+        self.revert_commit_with_metadata(args).output
     }
 
-    pub(crate) fn git_revert_commit_with_metadata(
-        &self,
-        args: &Value,
-    ) -> super::ToolExecutionOutcome {
+    pub(crate) fn revert_commit_with_metadata(&self, args: &Value) -> super::ToolExecutionOutcome {
         let outcome =
-            crate::edge_tools::git_gix::git_revert_commit_with_metadata(&self.project_root, args);
+            crate::edge_tools::git_gix::revert_commit_with_metadata(&self.project_root, args);
         if !outcome.output.starts_with("Error:") {
             self.clear_file_state();
         }
@@ -471,7 +466,7 @@ impl ToolExecutor {
                 let mut restored = Vec::new();
                 let mut failed = Vec::new();
                 for entry in &plan {
-                    let apply_output = git_stash(
+                    let apply_output = stash(
                         &self.project_root,
                         &serde_json::json!({
                             "action": "apply",
@@ -528,17 +523,17 @@ impl ToolExecutor {
         }
     }
 
-    pub(crate) fn git_stash(&self, args: &Value) -> String {
-        self.git_stash_with_metadata(args).output
+    pub(crate) fn stash(&self, args: &Value) -> String {
+        self.stash_with_metadata(args).output
     }
 
-    pub(crate) fn git_stash_with_metadata(&self, args: &Value) -> super::ToolExecutionOutcome {
+    pub(crate) fn stash_with_metadata(&self, args: &Value) -> super::ToolExecutionOutcome {
         let action = args
             .get("action")
             .and_then(Value::as_str)
             .map(|action| action.trim().to_ascii_lowercase())
             .unwrap_or_default();
-        let outcome = git_stash_with_metadata(&self.project_root, args);
+        let outcome = stash_with_metadata(&self.project_root, args);
         if matches!(action.as_str(), "push" | "save")
             && let Some(stash_ref) = outcome
                 .tool_result_fields
@@ -567,7 +562,7 @@ impl ToolExecutor {
 /// Parameters:
 /// - `path` (required): file path relative to project root
 /// - `ref` (optional): restore from a specific commit/ref (default: HEAD)
-pub fn git_checkout_file(project_root: &Path, args: &Value) -> String {
+pub fn checkout_file(project_root: &Path, args: &Value) -> String {
     let file_path = match args.get("path").and_then(Value::as_str) {
         Some(p) if !p.is_empty() => p,
         _ => return "Error: 'path' is required".to_string(),
@@ -609,10 +604,10 @@ pub fn git_checkout_file(project_root: &Path, args: &Value) -> String {
 }
 
 impl ToolExecutor {
-    pub(crate) fn git_checkout_file(&self, args: &Value) -> String {
+    pub(crate) fn checkout_file(&self, args: &Value) -> String {
         let file_arg = match args.get("path").and_then(Value::as_str) {
             Some(path) if !path.is_empty() => path,
-            _ => return crate::edge_tools::git_gix::git_checkout_file(&self.project_root, args),
+            _ => return crate::edge_tools::git_gix::checkout_file(&self.project_root, args),
         };
         let path = match self.resolve_checked(file_arg) {
             Ok(path) => path,
@@ -622,7 +617,7 @@ impl ToolExecutor {
         let turn_idx = self
             .journal_turn_index
             .load(std::sync::atomic::Ordering::Relaxed);
-        let journal_call_id = format!("git_checkout_file:{}", path.display());
+        let journal_call_id = format!("checkout_file:{}", path.display());
         match self.file_journal.lock() {
             Ok(mut journal) => journal.record_before(&path, &journal_call_id, turn_idx),
             Err(poisoned) => poisoned
@@ -630,7 +625,7 @@ impl ToolExecutor {
                 .record_before(&path, &journal_call_id, turn_idx),
         }
 
-        let output = crate::edge_tools::git_gix::git_checkout_file(&self.project_root, args);
+        let output = crate::edge_tools::git_gix::checkout_file(&self.project_root, args);
         if output.starts_with("Error:") {
             return output;
         }
@@ -661,7 +656,7 @@ impl ToolExecutor {
 // ─── Git Worktree Management ────────────────────────────────────────────────
 
 /// Create, list, or remove git worktrees for isolated parallel work.
-pub fn git_worktree(project_root: &Path, args: &Value) -> String {
+pub fn worktree(project_root: &Path, args: &Value) -> String {
     let action = match args.get("action").and_then(Value::as_str) {
         Some(a) => a,
         None => return "Error: 'action' is required (add, list, remove)".to_string(),
@@ -953,10 +948,9 @@ pub(crate) fn worktree_remove(project_root: &Path, args: &Value) -> String {
 mod tests {
     use super::super::ToolExecutor;
     use super::{
-        current_branch, git_blame, git_checkout_file, git_commit, git_commit_with_metadata,
-        git_contributors, git_diff, git_file_history, git_log, git_log_search,
-        git_revert_commit_with_metadata, git_show, git_stash, git_status, git_worktree, head_short,
-        short_commit_sha, worktree_add_with_metadata, worktree_remove,
+        blame, checkout_file, commit, commit_with_metadata, contributors, current_branch, diff,
+        file_history, head_short, log, log_search, revert_commit_with_metadata, short_commit_sha,
+        show, stash, status, worktree, worktree_add_with_metadata, worktree_remove,
     };
     use astra_text_utils::str_preview::prefix_chars;
     use serde_json::{Value, json};
@@ -1055,9 +1049,9 @@ mod tests {
     }
 
     #[test]
-    fn git_status_returns_output() {
+    fn git_action_status_returns_output() {
         let root = repo_root();
-        let result = git_status(&root, &json!({}));
+        let result = status(&root, &json!({}));
         assert!(
             result.contains("##")
                 || result.contains("nothing to commit")
@@ -1067,9 +1061,9 @@ mod tests {
     }
 
     #[test]
-    fn git_log_returns_commits() {
+    fn git_action_log_returns_commits() {
         let root = repo_root();
-        let result = git_log(&root, &json!({"n": 5}));
+        let result = log(&root, &json!({"n": 5}));
         let lines: Vec<&str> = result.lines().collect();
         assert!(!lines.is_empty(), "log should return commits");
         let first = lines[0];
@@ -1081,17 +1075,17 @@ mod tests {
     }
 
     #[test]
-    fn git_log_default_n() {
+    fn git_action_log_default_n() {
         let root = repo_root();
-        let result = git_log(&root, &json!({}));
+        let result = log(&root, &json!({}));
         let lines: Vec<&str> = result.lines().filter(|l| !l.is_empty()).collect();
         assert!(lines.len() <= 10, "default should be at most 10 commits");
     }
 
     #[test]
-    fn git_show_missing_commit_defaults_to_head() {
+    fn git_action_show_missing_revision_defaults_to_head() {
         let root = repo_root();
-        let result = git_show(&root, &json!({}), 0.0, 0);
+        let result = show(&root, &json!({}), 0.0, 0);
         assert!(
             result.contains("commit ") || result.contains("Author:"),
             "empty args should default to HEAD, got: {result}"
@@ -1099,24 +1093,29 @@ mod tests {
     }
 
     #[test]
-    fn git_show_invalid_ref() {
+    fn git_action_show_invalid_ref() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "abc;rm -rf /"}), 0.0, 0);
+        let result = show(&root, &json!({"revision": "abc;rm -rf /"}), 0.0, 0);
         assert!(result.contains("Error: invalid commit reference"));
     }
 
     #[test]
-    fn git_show_head() {
+    fn git_action_show_head() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "HEAD"}), 0.0, 0);
+        let result = show(&root, &json!({"revision": "HEAD"}), 0.0, 0);
         assert!(result.contains("commit "), "should show commit: {result}");
         assert!(result.contains("Author:"), "should show author");
     }
 
     #[test]
-    fn git_show_stat_only() {
+    fn git_action_show_stat_only() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "HEAD", "stat_only": true}), 0.0, 0);
+        let result = show(
+            &root,
+            &json!({"revision": "HEAD", "stat_only": true}),
+            0.0,
+            0,
+        );
         assert!(result.contains("commit "));
         assert!(
             result.contains("files changed") || result.contains("root commit"),
@@ -1125,16 +1124,16 @@ mod tests {
     }
 
     #[test]
-    fn git_blame_missing_file_param() {
+    fn git_action_blame_missing_file_param() {
         let root = repo_root();
-        let result = git_blame(&root, &json!({}));
+        let result = blame(&root, &json!({}));
         assert!(result.contains("Error: missing 'file'"));
     }
 
     #[test]
-    fn git_blame_known_file() {
+    fn git_action_blame_known_file() {
         let root = repo_root();
-        let result = git_blame(&root, &json!({"file": "README.md"}));
+        let result = blame(&root, &json!({"file": "README.md"}));
         assert!(
             result.contains("L1") || result.contains("Error") || result.contains("No blame"),
             "unexpected blame: {result}"
@@ -1142,9 +1141,9 @@ mod tests {
     }
 
     #[test]
-    fn git_blame_with_line_range() {
+    fn git_action_blame_with_line_range() {
         let root = repo_root();
-        let result = git_blame(
+        let result = blame(
             &root,
             &json!({"file": "README.md", "line_start": 1, "line_end": 3}),
         );
@@ -1158,9 +1157,9 @@ mod tests {
     }
 
     #[test]
-    fn git_diff_no_crash() {
+    fn git_action_diff_no_crash() {
         let root = repo_root();
-        let result = git_diff(&root, &json!({}), 0.0, 0);
+        let result = diff(&root, &json!({}), 0.0, 0);
         assert!(
             !result.contains("Error: cannot open"),
             "should open repo: {result}"
@@ -1168,16 +1167,16 @@ mod tests {
     }
 
     #[test]
-    fn git_file_history_missing_file() {
+    fn git_action_file_history_missing_file() {
         let root = repo_root();
-        let result = git_file_history(&root, &json!({}));
+        let result = file_history(&root, &json!({}));
         assert!(result.contains("Error: missing 'file'"));
     }
 
     #[test]
-    fn git_file_history_known_file() {
+    fn git_action_file_history_known_file() {
         let root = repo_root();
-        let result = git_file_history(&root, &json!({"file": "README.md"}));
+        let result = file_history(&root, &json!({"file": "README.md"}));
         assert!(
             result.contains("File: README.md") || result.contains("No history"),
             "unexpected: {result}"
@@ -1185,9 +1184,9 @@ mod tests {
     }
 
     #[test]
-    fn git_file_history_limits_n() {
+    fn git_action_file_history_limits_n() {
         let root = repo_root();
-        let result = git_file_history(&root, &json!({"file": "README.md", "n": 3}));
+        let result = file_history(&root, &json!({"file": "README.md", "n": 3}));
         if result.contains("Commits:")
             && let Some(line) = result.lines().find(|l| l.starts_with("Commits:"))
         {
@@ -1200,13 +1199,13 @@ mod tests {
         }
     }
 
-    // ─── git_diff enhanced tests ────────────────────────────────────────────
+    // ─── diff enhanced tests ────────────────────────────────────────────
 
     #[test]
-    fn git_diff_staged_param_accepted() {
+    fn git_action_diff_staged_param_accepted() {
         let root = repo_root();
         // staged=true should not crash (may return "No staged changes" or file list)
-        let result = git_diff(&root, &json!({"staged": true}), 0.0, 0);
+        let result = diff(&root, &json!({"staged": true}), 0.0, 0);
         assert!(
             !result.contains("Error: cannot open"),
             "staged diff should not fail to open repo: {result}"
@@ -1214,10 +1213,10 @@ mod tests {
     }
 
     #[test]
-    fn git_diff_ref_param_uses_tree_diff() {
+    fn git_action_diff_ref_param_uses_tree_diff() {
         let root = repo_root();
         // Diff HEAD against HEAD~1 should produce actual file changes
-        let result = git_diff(&root, &json!({"ref": "HEAD~1"}), 0.0, 0);
+        let result = diff(&root, &json!({"ref": "HEAD~1"}), 0.0, 0);
         assert!(
             result.contains("diff --git")
                 || result.contains("No changes")
@@ -1227,9 +1226,9 @@ mod tests {
     }
 
     #[test]
-    fn git_diff_default_shows_worktree() {
+    fn git_action_diff_default_shows_worktree() {
         let root = repo_root();
-        let result = git_diff(&root, &json!({}), 0.0, 0);
+        let result = diff(&root, &json!({}), 0.0, 0);
         // Should not error — either shows changes or "No changes"
         assert!(
             !result.starts_with("Error:"),
@@ -1238,9 +1237,9 @@ mod tests {
     }
 
     #[test]
-    fn git_diff_stat_only_smoke() {
+    fn git_action_diff_stat_only_smoke() {
         let root = repo_root();
-        let result = git_diff(&root, &json!({"stat_only": true}), 0.0, 0);
+        let result = diff(&root, &json!({"stat_only": true}), 0.0, 0);
         assert!(
             !result.starts_with("Error:"),
             "stat_only should use git CLI without repo open errors: {result}"
@@ -1254,9 +1253,9 @@ mod tests {
     }
 
     #[test]
-    fn git_diff_stat_only_rejects_staged_with_ref() {
+    fn git_action_diff_stat_only_rejects_staged_with_ref() {
         let root = repo_root();
-        let result = git_diff(
+        let result = diff(
             &root,
             &json!({"stat_only": true, "staged": true, "ref": "HEAD~1"}),
             0.0,
@@ -1266,9 +1265,9 @@ mod tests {
     }
 
     #[test]
-    fn git_diff_base_ref_range() {
+    fn git_action_diff_base_ref_range() {
         let root = repo_root();
-        let result = git_diff(&root, &json!({"base_ref": "HEAD~3", "ref": "HEAD"}), 0.0, 0);
+        let result = diff(&root, &json!({"base_ref": "HEAD~3", "ref": "HEAD"}), 0.0, 0);
         assert!(
             result.contains("diff --git") || result == "No changes",
             "range diff should produce output: {result}"
@@ -1276,9 +1275,9 @@ mod tests {
     }
 
     #[test]
-    fn git_diff_base_ref_defaults_tip_to_head() {
+    fn git_action_diff_base_ref_defaults_tip_to_head() {
         let root = repo_root();
-        let result = git_diff(&root, &json!({"base_ref": "HEAD~1"}), 0.0, 0);
+        let result = diff(&root, &json!({"base_ref": "HEAD~1"}), 0.0, 0);
         assert!(
             !result.starts_with("Error:"),
             "base_ref without ref should default tip to HEAD: {result}"
@@ -1286,9 +1285,9 @@ mod tests {
     }
 
     #[test]
-    fn git_diff_base_ref_with_path() {
+    fn git_action_diff_base_ref_with_path() {
         let root = repo_root();
-        let result = git_diff(
+        let result = diff(
             &root,
             &json!({"base_ref": "HEAD~2", "ref": "HEAD", "path": "Cargo.toml"}),
             0.0,
@@ -1301,9 +1300,9 @@ mod tests {
     }
 
     #[test]
-    fn git_diff_base_ref_stat_only() {
+    fn git_action_diff_base_ref_stat_only() {
         let root = repo_root();
-        let result = git_diff(
+        let result = diff(
             &root,
             &json!({"base_ref": "HEAD~3", "ref": "HEAD", "stat_only": true}),
             0.0,
@@ -1316,22 +1315,22 @@ mod tests {
     }
 
     #[test]
-    fn git_diff_base_ref_rejects_shell_injection() {
+    fn git_action_diff_base_ref_rejects_shell_injection() {
         let root = repo_root();
-        let result = git_diff(&root, &json!({"base_ref": "HEAD; rm -rf /"}), 0.0, 0);
+        let result = diff(&root, &json!({"base_ref": "HEAD; rm -rf /"}), 0.0, 0);
         assert!(
             result.contains("disallowed"),
             "shell meta in base_ref should be rejected: {result}"
         );
     }
 
-    // ─── git_show enhanced tests ────────────────────────────────────────────
+    // ─── show enhanced tests ────────────────────────────────────────────
 
     #[test]
-    fn git_show_allows_reflog_syntax() {
+    fn git_action_show_allows_reflog_syntax() {
         let root = repo_root();
         // HEAD@{0} should not be rejected by validation — it should reach rev_parse
-        let result = git_show(&root, &json!({"commit": "HEAD@{0}"}), 0.0, 0);
+        let result = show(&root, &json!({"revision": "HEAD@{0}"}), 0.0, 0);
         // Should show a commit (passes validation), not be rejected outright
         assert!(
             result.starts_with("commit ") || result.starts_with("Error: cannot resolve"),
@@ -1340,16 +1339,16 @@ mod tests {
     }
 
     #[test]
-    fn git_show_rejects_shell_metachar() {
+    fn git_action_show_rejects_shell_metachar() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "HEAD;rm -rf /"}), 0.0, 0);
+        let result = show(&root, &json!({"revision": "HEAD;rm -rf /"}), 0.0, 0);
         assert!(result.contains("Error: invalid commit reference"));
     }
 
     #[test]
-    fn git_show_head_has_diff_content() {
+    fn git_action_show_head_has_diff_content() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "HEAD"}), 0.0, 0);
+        let result = show(&root, &json!({"revision": "HEAD"}), 0.0, 0);
         assert!(result.contains("commit "), "should show commit header");
         assert!(result.contains("Author:"), "should show author");
         // Should contain actual diff markers or root commit marker
@@ -1360,9 +1359,14 @@ mod tests {
     }
 
     #[test]
-    fn git_show_stat_only_has_stats() {
+    fn git_action_show_stat_only_has_stats() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "HEAD", "stat_only": true}), 0.0, 0);
+        let result = show(
+            &root,
+            &json!({"revision": "HEAD", "stat_only": true}),
+            0.0,
+            0,
+        );
         assert!(result.contains("commit "));
         assert!(
             result.contains("files changed") || result.contains("[root commit]"),
@@ -1371,11 +1375,11 @@ mod tests {
     }
 
     #[test]
-    fn git_show_merge_commit_stat_only_has_stats() {
+    fn git_action_show_merge_commit_stat_only_has_stats() {
         let dir = init_temp_repo_with_ours_merge();
-        let result = git_show(
+        let result = show(
             dir.path(),
-            &json!({"commit": "HEAD", "stat_only": true}),
+            &json!({"revision": "HEAD", "stat_only": true}),
             0.0,
             0,
         );
@@ -1394,9 +1398,9 @@ mod tests {
     }
 
     #[test]
-    fn git_show_merge_commit_has_diff_content() {
+    fn git_action_show_merge_commit_has_diff_content() {
         let dir = init_temp_repo_with_ours_merge();
-        let result = git_show(dir.path(), &json!({"commit": "HEAD"}), 0.0, 0);
+        let result = show(dir.path(), &json!({"revision": "HEAD"}), 0.0, 0);
         assert!(
             result.contains("commit "),
             "should show commit header: {result}"
@@ -1408,11 +1412,11 @@ mod tests {
     }
 
     #[test]
-    fn git_show_file_filter() {
+    fn git_action_show_file_filter() {
         let root = repo_root();
-        let result = git_show(
+        let result = show(
             &root,
-            &json!({"commit": "HEAD", "file": "README.md"}),
+            &json!({"revision": "HEAD", "file": "README.md"}),
             0.0,
             0,
         );
@@ -1420,12 +1424,12 @@ mod tests {
         assert!(result.contains("commit "), "should show header: {result}");
     }
 
-    // ─── git_blame enhanced tests ───────────────────────────────────────────
+    // ─── blame enhanced tests ───────────────────────────────────────────
 
     #[test]
-    fn git_blame_nonexistent_file() {
+    fn git_action_blame_nonexistent_file() {
         let root = repo_root();
-        let result = git_blame(&root, &json!({"file": "nonexistent_file_xyz.rs"}));
+        let result = blame(&root, &json!({"file": "nonexistent_file_xyz.rs"}));
         assert!(
             result.contains("Error"),
             "should error on nonexistent file: {result}"
@@ -1433,9 +1437,9 @@ mod tests {
     }
 
     #[test]
-    fn git_blame_output_format() {
+    fn git_action_blame_output_format() {
         let root = repo_root();
-        let result = git_blame(&root, &json!({"file": "README.md"}));
+        let result = blame(&root, &json!({"file": "README.md"}));
         if result.contains("L1") {
             // Should have structured format: L<n> <commit> <date> [<author>] <content>
             let first_line = result.lines().next().unwrap_or("");
@@ -1451,9 +1455,9 @@ mod tests {
     }
 
     #[test]
-    fn git_blame_summary_footer() {
+    fn git_action_blame_summary_footer() {
         let root = repo_root();
-        let result = git_blame(&root, &json!({"file": "README.md"}));
+        let result = blame(&root, &json!({"file": "README.md"}));
         if !result.contains("Error") && !result.contains("No blame") {
             assert!(
                 result.contains("lines,")
@@ -1464,12 +1468,12 @@ mod tests {
         }
     }
 
-    // ─── git_status enhanced tests ──────────────────────────────────────────
+    // ─── status enhanced tests ──────────────────────────────────────────
 
     #[test]
-    fn git_status_shows_branch() {
+    fn git_action_status_shows_branch() {
         let root = repo_root();
-        let result = git_status(&root, &json!({}));
+        let result = status(&root, &json!({}));
         // Should show branch info or be clean
         assert!(
             result.contains("##")
@@ -1479,12 +1483,12 @@ mod tests {
         );
     }
 
-    // ─── git_log enhanced tests ─────────────────────────────────────────────
+    // ─── log enhanced tests ─────────────────────────────────────────────
 
     #[test]
-    fn git_log_custom_n() {
+    fn git_action_log_custom_n() {
         let root = repo_root();
-        let result = git_log(&root, &json!({"n": 3}));
+        let result = log(&root, &json!({"n": 3}));
         let lines: Vec<&str> = result.lines().filter(|l| !l.is_empty()).collect();
         assert!(
             lines.len() <= 3,
@@ -1495,9 +1499,9 @@ mod tests {
     }
 
     #[test]
-    fn git_log_format_consistent() {
+    fn git_action_log_format_consistent() {
         let root = repo_root();
-        let result = git_log(&root, &json!({"n": 5}));
+        let result = log(&root, &json!({"n": 5}));
         for line in result.lines().filter(|l| !l.is_empty()) {
             // Each line should start with a 7-char hex hash
             let hash_prefix = prefix_chars(line, 7);
@@ -1517,9 +1521,9 @@ mod tests {
     // ─── Diff with actual content verification ──────────────────────────────
 
     #[test]
-    fn git_diff_ref_produces_line_content() {
+    fn git_action_diff_ref_produces_line_content() {
         let root = repo_root();
-        let result = git_diff(&root, &json!({"ref": "HEAD~1"}), 0.0, 0);
+        let result = diff(&root, &json!({"ref": "HEAD~1"}), 0.0, 0);
         if result.contains("diff --git") {
             // If there are changes, we should see actual +/- lines
             assert!(
@@ -1532,9 +1536,9 @@ mod tests {
     // ─── Edge cases ─────────────────────────────────────────────────────────
 
     #[test]
-    fn git_file_history_nonexistent_file() {
+    fn git_action_file_history_nonexistent_file() {
         let root = repo_root();
-        let result = git_file_history(&root, &json!({"file": "this/does/not/exist.xyz"}));
+        let result = file_history(&root, &json!({"file": "this/does/not/exist.xyz"}));
         assert!(
             result.contains("No history"),
             "should say no history: {result}"
@@ -1542,35 +1546,35 @@ mod tests {
     }
 
     #[test]
-    fn git_show_parent_ref() {
+    fn git_action_show_parent_ref() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "HEAD~1"}), 0.0, 0);
+        let result = show(&root, &json!({"revision": "HEAD~1"}), 0.0, 0);
         assert!(
             result.contains("commit ") || result.contains("Error: cannot resolve"),
             "HEAD~1 should work: {result}"
         );
     }
 
-    // ─── git_log_search tests ───────────────────────────────────────────────
+    // ─── log_search tests ───────────────────────────────────────────────
 
     #[test]
-    fn git_log_search_missing_query() {
+    fn git_action_log_search_missing_query() {
         let root = repo_root();
-        let result = git_log_search(&root, &json!({}));
+        let result = log_search(&root, &json!({}));
         assert!(result.contains("Error: missing or empty"));
     }
 
     #[test]
-    fn git_log_search_empty_query() {
+    fn git_action_log_search_empty_query() {
         let root = repo_root();
-        let result = git_log_search(&root, &json!({"query": "  "}));
+        let result = log_search(&root, &json!({"query": "  "}));
         assert!(result.contains("Error: missing or empty"));
     }
 
     #[test]
-    fn git_log_search_finds_commits() {
+    fn git_action_log_search_finds_commits() {
         let root = repo_root();
-        let result = git_log_search(&root, &json!({"query": "fix"}));
+        let result = log_search(&root, &json!({"query": "fix"}));
         // Should find some commits with "fix" in the message
         assert!(
             result.contains("Search:") || result.contains("No commits matching"),
@@ -1579,9 +1583,9 @@ mod tests {
     }
 
     #[test]
-    fn git_log_search_respects_n() {
+    fn git_action_log_search_respects_n() {
         let root = repo_root();
-        let result = git_log_search(&root, &json!({"query": "fix", "n": 10}));
+        let result = log_search(&root, &json!({"query": "fix", "n": 10}));
         if result.contains("commits searched") {
             // Extract the number of commits searched
             if let Some(start) = result.find('(')
@@ -1595,9 +1599,9 @@ mod tests {
     }
 
     #[test]
-    fn git_log_search_score_format() {
+    fn git_action_log_search_score_format() {
         let root = repo_root();
-        let result = git_log_search(&root, &json!({"query": "feat"}));
+        let result = log_search(&root, &json!({"query": "feat"}));
         if result.contains("[score:") {
             // Scores should be between 0 and 1
             for line in result.lines() {
@@ -1612,12 +1616,12 @@ mod tests {
         }
     }
 
-    // ─── git_contributors tests ─────────────────────────────────────────────
+    // ─── contributors tests ─────────────────────────────────────────────
 
     #[test]
-    fn git_contributors_shows_authors() {
+    fn git_action_contributors_shows_authors() {
         let root = repo_root();
-        let result = git_contributors(&root, &json!({}));
+        let result = contributors(&root, &json!({}));
         assert!(
             result.contains("## Top Contributors") || result.contains("No git history"),
             "should show contributors: {result}"
@@ -1625,9 +1629,9 @@ mod tests {
     }
 
     #[test]
-    fn git_contributors_shows_hot_files() {
+    fn git_action_contributors_shows_hot_files() {
         let root = repo_root();
-        let result = git_contributors(&root, &json!({}));
+        let result = contributors(&root, &json!({}));
         if result.contains("## Top Contributors") {
             assert!(
                 result.contains("## Hot Files") || result.contains("## Recent"),
@@ -1637,9 +1641,9 @@ mod tests {
     }
 
     #[test]
-    fn git_contributors_shows_recent() {
+    fn git_action_contributors_shows_recent() {
         let root = repo_root();
-        let result = git_contributors(&root, &json!({}));
+        let result = contributors(&root, &json!({}));
         if !result.contains("No git history") {
             assert!(
                 result.contains("## Recent Activity"),
@@ -1649,9 +1653,9 @@ mod tests {
     }
 
     #[test]
-    fn git_contributors_with_path_filter() {
+    fn git_action_contributors_with_path_filter() {
         let root = repo_root();
-        let result = git_contributors(&root, &json!({"path": "README.md"}));
+        let result = contributors(&root, &json!({"path": "README.md"}));
         // Either shows filtered results or no history
         assert!(
             result.contains("## Top Contributors") || result.contains("No git history"),
@@ -1660,9 +1664,9 @@ mod tests {
     }
 
     #[test]
-    fn git_contributors_with_since() {
+    fn git_action_contributors_with_since() {
         let root = repo_root();
-        let result = git_contributors(&root, &json!({"since": "2020-01-01"}));
+        let result = contributors(&root, &json!({"since": "2020-01-01"}));
         assert!(
             result.contains("## Top Contributors") || result.contains("No git history"),
             "since filter should work: {result}"
@@ -1709,10 +1713,10 @@ mod tests {
     // ─── Robustness regression tests ────────────────────────────────────────
 
     #[test]
-    fn git_diff_staged_detects_no_staged() {
+    fn git_action_diff_staged_detects_no_staged() {
         // In a clean repo, staged diff should say "No staged changes"
         let root = repo_root();
-        let result = git_diff(&root, &json!({"staged": true}), 0.0, 0);
+        let result = diff(&root, &json!({"staged": true}), 0.0, 0);
         // Either "No staged changes" or actual staged content — no panic/error
         assert!(
             result.contains("staged") || result.contains("diff --git"),
@@ -1721,10 +1725,10 @@ mod tests {
     }
 
     #[test]
-    fn git_log_n_capped_at_500() {
+    fn git_action_log_n_capped_at_500() {
         // Even with n=99999, should not produce huge output
         let root = repo_root();
-        let result = git_log(&root, &json!({"n": 99999}));
+        let result = log(&root, &json!({"n": 99999}));
         let line_count = result.lines().count();
         assert!(
             line_count <= 501,
@@ -1733,20 +1737,20 @@ mod tests {
     }
 
     #[test]
-    fn git_log_output_truncated() {
-        // git_log should apply truncation
+    fn git_action_log_output_truncated() {
+        // log should apply truncation
         let root = repo_root();
-        let result = git_log(&root, &json!({"n": 500}));
+        let result = log(&root, &json!({"n": 500}));
         // Just verify it doesn't panic and produces output
         assert!(!result.is_empty());
     }
 
     #[test]
-    fn git_file_history_nonexistent_file_bounded() {
+    fn git_action_file_history_nonexistent_file_bounded() {
         // For a nonexistent file, the walk should be bounded (not traverse all history)
         let root = repo_root();
         let start = std::time::Instant::now();
-        let result = git_file_history(&root, &json!({"file": "this/does/not/exist.xyz"}));
+        let result = file_history(&root, &json!({"file": "this/does/not/exist.xyz"}));
         let elapsed = start.elapsed();
         assert!(
             result.contains("No history"),
@@ -1761,11 +1765,11 @@ mod tests {
     }
 
     #[test]
-    fn git_contributors_bounded_walk() {
+    fn git_action_contributors_bounded_walk() {
         // Even without path filter, walk should complete in bounded time
         let root = repo_root();
         let start = std::time::Instant::now();
-        let result = git_contributors(&root, &json!({}));
+        let result = contributors(&root, &json!({}));
         let elapsed = start.elapsed();
         assert!(
             !result.contains("Error: cannot open"),
@@ -1778,11 +1782,11 @@ mod tests {
     }
 
     #[test]
-    fn git_contributors_path_filter_bounded() {
+    fn git_action_contributors_path_filter_bounded() {
         // Path filter with nonexistent file should still be bounded
         let root = repo_root();
         let start = std::time::Instant::now();
-        let _result = git_contributors(
+        let _result = contributors(
             &root,
             &json!({"path": "nonexistent/deeply/nested/file.xyz"}),
         );
@@ -1794,7 +1798,7 @@ mod tests {
     }
 
     #[test]
-    fn git_show_root_commit_lists_files() {
+    fn git_action_show_root_commit_lists_files() {
         // Find the root commit and verify it lists actual file paths
         let root = repo_root();
         let repo = gix::discover(&root).unwrap();
@@ -1812,7 +1816,7 @@ mod tests {
             }
         }
         if let Some(oid) = root_oid {
-            let result = git_show(&root, &json!({"commit": oid}), 0.0, 0);
+            let result = show(&root, &json!({"revision": oid}), 0.0, 0);
             assert!(
                 result.contains("[root commit]"),
                 "should mark as root: {result}"
@@ -1845,20 +1849,20 @@ mod tests {
     }
 
     #[test]
-    fn git_show_and_diff_truncate_under_high_pressure() {
+    fn git_action_show_and_diff_truncate_under_high_pressure() {
         let root = std::env::current_dir().unwrap();
-        // git_show
-        let normal = git_show(&root, &json!({"commit": "HEAD"}), 0.0, 0);
-        let pressed = git_show(&root, &json!({"commit": "HEAD"}), 0.9, 0);
+        // show
+        let normal = show(&root, &json!({"revision": "HEAD"}), 0.0, 0);
+        let pressed = show(&root, &json!({"revision": "HEAD"}), 0.9, 0);
         assert!(
             pressed.len() <= normal.len(),
             "high-pressure show ({}) should not exceed normal ({})",
             pressed.len(),
             normal.len()
         );
-        // git_diff
-        let normal = git_diff(&root, &json!({}), 0.0, 0);
-        let pressed = git_diff(&root, &json!({}), 0.9, 0);
+        // diff
+        let normal = diff(&root, &json!({}), 0.0, 0);
+        let pressed = diff(&root, &json!({}), 0.9, 0);
         assert!(
             pressed.len() <= normal.len(),
             "high-pressure diff ({}) should not exceed normal ({})",
@@ -1867,34 +1871,34 @@ mod tests {
         );
     }
 
-    // ─── git_commit tests ───────────────────────────────────────────────────
+    // ─── commit tests ───────────────────────────────────────────────────
 
     #[test]
-    fn git_commit_rejects_invalid_messages() {
+    fn git_action_commit_rejects_invalid_messages() {
         let root = repo_root();
         // Missing or blank message
         assert!(
-            git_commit(&root, &json!({})).starts_with("Error:"),
+            commit(&root, &json!({})).starts_with("Error:"),
             "should reject missing message"
         );
         assert!(
-            git_commit(&root, &json!({"message": "  "})).starts_with("Error:"),
+            commit(&root, &json!({"message": "  "})).starts_with("Error:"),
             "should reject blank message"
         );
         // Over-long message
         let long_msg = "x".repeat(5001);
         assert!(
-            git_commit(&root, &json!({"message": long_msg})).contains("too long"),
+            commit(&root, &json!({"message": long_msg})).contains("too long"),
             "should reject over-long message"
         );
     }
 
     #[test]
-    fn git_commit_clean_tree_says_nothing() {
+    fn git_action_commit_clean_tree_says_nothing() {
         // In a clean repo with nothing staged, commit should say "Nothing to commit"
         // or succeed if there are pending changes — either is fine, just no panic
         let root = repo_root();
-        let result = git_commit(
+        let result = commit(
             &root,
             &json!({"message": "test commit", "files": ["nonexistent_file_xyz.txt"]}),
         );
@@ -1903,12 +1907,12 @@ mod tests {
     }
 
     #[test]
-    fn git_commit_with_metadata_returns_commit_sha_and_revert_tool_restores_state() {
+    fn git_action_commit_with_metadata_returns_commit_sha_and_revert_tool_restores_state() {
         let repo = init_temp_repo();
         let tracked_path = repo.path().join("tracked.txt");
         std::fs::write(&tracked_path, "two\n").expect("update tracked file");
 
-        let outcome = git_commit_with_metadata(repo.path(), &json!({"message": "update tracked"}));
+        let outcome = commit_with_metadata(repo.path(), &json!({"message": "update tracked"}));
         assert!(
             !outcome.output.starts_with("Error:"),
             "commit should succeed: {}",
@@ -1917,7 +1921,7 @@ mod tests {
         let commit_fields = outcome
             .tool_result_fields
             .as_ref()
-            .expect("git_commit should return commit metadata");
+            .expect("commit should return commit metadata");
         let commit_sha = commit_fields
             .get("commit_sha")
             .and_then(Value::as_str)
@@ -1933,7 +1937,7 @@ mod tests {
         );
 
         let revert_outcome =
-            git_revert_commit_with_metadata(repo.path(), &json!({"commit_sha": commit_sha}));
+            revert_commit_with_metadata(repo.path(), &json!({"commit_sha": commit_sha}));
         assert!(
             !revert_outcome.output.starts_with("Error:"),
             "revert should succeed: {}",
@@ -1942,7 +1946,7 @@ mod tests {
         let revert_fields = revert_outcome
             .tool_result_fields
             .as_ref()
-            .expect("git_revert_commit should return metadata");
+            .expect("revert_commit should return metadata");
         assert_eq!(
             revert_fields
                 .get("reverted_commit_sha")
@@ -1963,11 +1967,11 @@ mod tests {
     }
 
     #[test]
-    fn git_revert_commit_conflict_is_aborted() {
+    fn git_action_revert_commit_conflict_is_aborted() {
         let repo = init_temp_repo();
         let tracked_path = repo.path().join("tracked.txt");
         std::fs::write(&tracked_path, "two\n").expect("write second version");
-        let second = git_commit_with_metadata(repo.path(), &json!({"message": "second"}));
+        let second = commit_with_metadata(repo.path(), &json!({"message": "second"}));
         let second_sha = second
             .tool_result_fields
             .as_ref()
@@ -1977,15 +1981,14 @@ mod tests {
             .to_string();
 
         std::fs::write(&tracked_path, "three\n").expect("write third version");
-        let third = git_commit_with_metadata(repo.path(), &json!({"message": "third"}));
+        let third = commit_with_metadata(repo.path(), &json!({"message": "third"}));
         assert!(
             !third.output.starts_with("Error:"),
             "third commit should succeed: {}",
             third.output
         );
 
-        let revert =
-            git_revert_commit_with_metadata(repo.path(), &json!({"commit_sha": second_sha}));
+        let revert = revert_commit_with_metadata(repo.path(), &json!({"commit_sha": second_sha}));
         assert!(
             revert.output.starts_with("Error:"),
             "reverting a non-HEAD conflicting commit should fail: {}",
@@ -2006,25 +2009,25 @@ mod tests {
         );
     }
 
-    // ─── git_stash tests ────────────────────────────────────────────────────
+    // ─── stash tests ────────────────────────────────────────────────────
 
     #[test]
-    fn git_stash_rejects_missing_or_unknown_action() {
+    fn git_action_stash_rejects_missing_or_unknown_action() {
         let root = repo_root();
         assert!(
-            git_stash(&root, &json!({})).starts_with("Error:"),
+            stash(&root, &json!({})).starts_with("Error:"),
             "should require action"
         );
         assert!(
-            git_stash(&root, &json!({"action": "fly"})).contains("unknown stash action"),
+            stash(&root, &json!({"action": "fly"})).contains("unknown stash action"),
             "should reject unknown action"
         );
     }
 
     #[test]
-    fn git_stash_list_works() {
+    fn git_action_stash_list_works() {
         let root = repo_root();
-        let result = git_stash(&root, &json!({"action": "list"}));
+        let result = stash(&root, &json!({"action": "list"}));
         // Should return stash list or "No stashes found"
         assert!(
             result.contains("stash@") || result.contains("No stashes") || result.is_empty(),
@@ -2072,7 +2075,7 @@ mod tests {
             "one\n"
         );
 
-        let apply = git_stash(
+        let apply = stash(
             repo.path(),
             &json!({"action": "apply", "stash_ref": stash_ref}),
         );
@@ -2083,29 +2086,29 @@ mod tests {
         );
     }
 
-    // ─── git_checkout_file tests ────────────────────────────────────────────
+    // ─── git action checkout_file tests ────────────────────────────────────────────
 
     #[test]
-    fn git_checkout_file_rejects_invalid_inputs() {
+    fn git_action_checkout_file_rejects_invalid_inputs() {
         let root = repo_root();
         // Missing / empty path
         assert!(
-            git_checkout_file(&root, &json!({})).starts_with("Error:"),
+            checkout_file(&root, &json!({})).starts_with("Error:"),
             "should require path"
         );
         assert!(
-            git_checkout_file(&root, &json!({"path": ""})).starts_with("Error:"),
+            checkout_file(&root, &json!({"path": ""})).starts_with("Error:"),
             "should reject empty path"
         );
         // Path traversal
         assert!(
-            git_checkout_file(&root, &json!({"path": "../../../etc/passwd"}))
+            checkout_file(&root, &json!({"path": "../../../etc/passwd"}))
                 .contains("path traversal"),
             "should reject traversal"
         );
         // Dangerous ref injection
         assert!(
-            git_checkout_file(
+            checkout_file(
                 &root,
                 &json!({"path": "README.md", "ref": "HEAD; rm -rf /"})
             )
@@ -2113,7 +2116,7 @@ mod tests {
             "should reject shell injection in ref"
         );
         assert!(
-            git_checkout_file(
+            checkout_file(
                 &root,
                 &json!({"path": "README.md", "ref": "main|cat /etc/passwd"})
             )
@@ -2123,10 +2126,10 @@ mod tests {
     }
 
     #[test]
-    fn git_checkout_file_known_file() {
+    fn git_action_checkout_file_known_file() {
         let root = repo_root();
         // Checkout a known file at HEAD — should succeed (idempotent)
-        let result = git_checkout_file(&root, &json!({"path": "README.md"}));
+        let result = checkout_file(&root, &json!({"path": "README.md"}));
         assert!(
             result.contains("Restored") || result.contains("Error"),
             "should restore or report error: {result}"
@@ -2138,22 +2141,22 @@ mod tests {
     // ── Git Worktree Tests ──────────────────────────────────────────────
 
     #[test]
-    fn git_worktree_rejects_missing_or_unknown_action() {
+    fn git_action_worktree_rejects_missing_or_unknown_action() {
         let root = repo_root();
         assert!(
-            git_worktree(&root, &json!({})).contains("action"),
+            worktree(&root, &json!({})).contains("action"),
             "should require action"
         );
         assert!(
-            git_worktree(&root, &json!({"action": "teleport"})).contains("unknown"),
+            worktree(&root, &json!({"action": "teleport"})).contains("unknown"),
             "should reject unknown action"
         );
     }
 
     #[test]
-    fn git_worktree_add_missing_branch() {
+    fn git_action_worktree_add_missing_branch() {
         let root = repo_root();
-        let result = git_worktree(&root, &json!({"action": "add"}));
+        let result = worktree(&root, &json!({"action": "add"}));
         assert!(
             result.contains("Error") && result.contains("branch"),
             "should require branch: {result}"
@@ -2161,7 +2164,7 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_add_rejects_shell_injection() {
+    fn git_action_worktree_add_rejects_shell_injection() {
         let root = repo_root();
         for dangerous in &[
             "test;rm -rf /",
@@ -2172,7 +2175,7 @@ mod tests {
             "test()",
             "test{}",
         ] {
-            let result = git_worktree(&root, &json!({"action": "add", "branch": dangerous}));
+            let result = worktree(&root, &json!({"action": "add", "branch": dangerous}));
             assert!(
                 result.contains("Error") && result.contains("invalid branch name"),
                 "should reject '{dangerous}': {result}"
@@ -2181,15 +2184,15 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_list_and_ls_alias() {
+    fn git_action_worktree_list_and_ls_alias() {
         let root = repo_root();
-        let list = git_worktree(&root, &json!({"action": "list"}));
+        let list = worktree(&root, &json!({"action": "list"}));
         assert!(
             !list.contains("Error: git") || list.contains("worktree"),
             "list should succeed: {list}"
         );
         // "ls" is an alias for "list"
-        let ls = git_worktree(&root, &json!({"action": "ls"}));
+        let ls = worktree(&root, &json!({"action": "ls"}));
         assert!(
             !(ls.contains("Error") && ls.contains("unknown action")),
             "ls should be accepted as alias: {ls}"
@@ -2197,9 +2200,9 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_remove_missing_path() {
+    fn git_action_worktree_remove_missing_path() {
         let root = repo_root();
-        let result = git_worktree(&root, &json!({"action": "remove"}));
+        let result = worktree(&root, &json!({"action": "remove"}));
         assert!(
             result.contains("Error") && result.contains("path"),
             "should require path for remove: {result}"
@@ -2207,9 +2210,9 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_remove_nonexistent() {
+    fn git_action_worktree_remove_nonexistent() {
         let root = repo_root();
-        let result = git_worktree(
+        let result = worktree(
             &root,
             &json!({"action": "remove", "path": "/tmp/nonexistent-worktree-xyz"}),
         );
@@ -2220,10 +2223,10 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_add_existing_path_fails() {
+    fn git_action_worktree_add_existing_path_fails() {
         let root = repo_root();
         // Use /tmp which always exists — should fail with "already exists"
-        let result = git_worktree(
+        let result = worktree(
             &root,
             &json!({"action": "add", "branch": "test-existing", "path": "/tmp"}),
         );
@@ -2283,17 +2286,17 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_action_aliases() {
+    fn git_action_worktree_action_aliases() {
         let root = repo_root();
         // "create" should alias to "add" (needs branch param, so will error on missing branch)
-        let r1 = git_worktree(&root, &json!({"action": "create"}));
+        let r1 = worktree(&root, &json!({"action": "create"}));
         assert!(r1.contains("branch"), "create should route to add: {r1}");
 
         // "rm" and "delete" should alias to "remove" (needs path param)
-        let r2 = git_worktree(&root, &json!({"action": "rm"}));
+        let r2 = worktree(&root, &json!({"action": "rm"}));
         assert!(r2.contains("path"), "rm should route to remove: {r2}");
 
-        let r3 = git_worktree(&root, &json!({"action": "delete"}));
+        let r3 = worktree(&root, &json!({"action": "delete"}));
         assert!(r3.contains("path"), "delete should route to remove: {r3}");
     }
 }

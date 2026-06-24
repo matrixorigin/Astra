@@ -1653,7 +1653,7 @@ mod tests {
                 ("c1", "read_file"),
                 ("c2", "read_file"),
                 ("c3", "grep"),
-                ("c4", "git_diff"),
+                ("c4", "git"),
             ]),
             tool_result("c1", &content),
             tool_result("c2", &content),
@@ -1858,7 +1858,7 @@ mod tests {
                             if iter % 3 == 0 {
                                 "bash"
                             } else {
-                                "git_diff"
+                                "git"
                             }
                         }
                         _ => "glob",

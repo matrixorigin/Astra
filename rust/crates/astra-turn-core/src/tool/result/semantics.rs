@@ -464,8 +464,22 @@ pub fn tool_dedup_signature(name: &str, args: &Value) -> String {
 }
 
 fn canonical_read_only_tool_signature(name: &str, args: &Value) -> Option<(String, Value)> {
-    if name == "git_diff" {
+    if name == "git"
+        && args
+            .get("action")
+            .and_then(Value::as_str)
+            .is_some_and(|action| action == "status")
+    {
+        return Some(("git".to_string(), serde_json::json!({"action": "status"})));
+    }
+    if name == "git"
+        && args
+            .get("action")
+            .and_then(Value::as_str)
+            .is_some_and(|action| action == "diff")
+    {
         let mut canonical = serde_json::Map::new();
+        canonical.insert("action".to_string(), Value::String("diff".to_string()));
         if args.get("staged").and_then(Value::as_bool).unwrap_or(false) {
             canonical.insert("staged".to_string(), Value::Bool(true));
         }
@@ -500,7 +514,7 @@ fn canonical_read_only_tool_signature(name: &str, args: &Value) -> Option<(Strin
         {
             canonical.insert("path".to_string(), Value::String(path));
         }
-        return Some(("git_diff".to_string(), Value::Object(canonical)));
+        return Some(("git".to_string(), Value::Object(canonical)));
     }
     if name != "bash" {
         return None;
@@ -518,20 +532,21 @@ fn canonical_read_only_tool_signature(name: &str, args: &Value) -> Option<(Strin
     }
     match parts.as_slice() {
         ["git", "status"] | ["git", "status", "--short"] | ["git", "status", "--porcelain"] => {
-            Some(("git_status".to_string(), serde_json::json!({})))
+            Some(("git".to_string(), serde_json::json!({"action": "status"})))
         }
-        ["git", "diff"] => Some(("git_diff".to_string(), serde_json::json!({}))),
+        ["git", "diff"] => Some(("git".to_string(), serde_json::json!({"action": "diff"}))),
         ["git", "diff", "--stat"] => Some((
-            "git_diff".to_string(),
-            serde_json::json!({"stat_only": true}),
+            "git".to_string(),
+            serde_json::json!({"action": "diff", "stat_only": true}),
         )),
-        ["git", "diff", "--cached"] | ["git", "diff", "--staged"] => {
-            Some(("git_diff".to_string(), serde_json::json!({"staged": true})))
-        }
-        ["git", "diff", "HEAD"] => Some(("git_diff".to_string(), serde_json::json!({}))),
+        ["git", "diff", "--cached"] | ["git", "diff", "--staged"] => Some((
+            "git".to_string(),
+            serde_json::json!({"action": "diff", "staged": true}),
+        )),
+        ["git", "diff", "HEAD"] => Some(("git".to_string(), serde_json::json!({"action": "diff"}))),
         ["git", "diff", "--", path] => Some((
-            "git_diff".to_string(),
-            serde_json::json!({"path": normalize_tool_arguments(&Value::String((*path).to_string()))}),
+            "git".to_string(),
+            serde_json::json!({"action": "diff", "path": normalize_tool_arguments(&Value::String((*path).to_string()))}),
         )),
         _ => None,
     }
@@ -544,13 +559,13 @@ mod tests {
 
     #[test]
     fn tool_error_success_with_null_error_is_not_error() {
-        let result = r#"{"ok":true,"tool":"github_list_prs","error":null,"count":6}"#;
+        let result = r#"{"ok":true,"tool":"github","action":"list_prs","error":null,"count":6}"#;
         assert!(!is_tool_error(result));
     }
 
     #[test]
     fn tool_error_ok_false_is_error() {
-        let result = r#"{"ok":false,"tool":"github_ci_status","error":"missing repo"}"#;
+        let result = r#"{"ok":false,"tool":"github","action":"ci_status","error":"missing repo"}"#;
         assert!(is_tool_error(result));
     }
 
@@ -891,22 +906,25 @@ if let Err(e) = writeln!(file, "{line}") {
     }
 
     #[test]
-    fn tool_dedup_signature_canonicalizes_simple_bash_git_diff() {
+    fn tool_dedup_signature_canonicalizes_simple_bash_git_diff_command() {
         assert_eq!(
             tool_dedup_signature("bash", &json!({"command": "git diff"})),
-            tool_dedup_signature("git_diff", &json!({}))
+            tool_dedup_signature("git", &json!({"action": "diff"}))
         );
         assert_eq!(
             tool_dedup_signature("bash", &json!({"command": "git diff HEAD"})),
-            tool_dedup_signature("git_diff", &json!({}))
+            tool_dedup_signature("git", &json!({"action": "diff"}))
         );
         assert_eq!(
             tool_dedup_signature("bash", &json!({"command": "git --no-pager diff --stat"})),
-            tool_dedup_signature("git_diff", &json!({"stat_only": true}))
+            tool_dedup_signature("git", &json!({"action": "diff", "stat_only": true}))
         );
         assert_eq!(
             tool_dedup_signature("bash", &json!({"command": "git diff -- src/"})),
-            tool_dedup_signature("git_diff", &json!({"path": "src", "ref": "HEAD"}))
+            tool_dedup_signature(
+                "git",
+                &json!({"action": "diff", "path": "src", "ref": "HEAD"})
+            )
         );
     }
 
@@ -914,7 +932,7 @@ if let Err(e) = writeln!(file, "{line}") {
     fn tool_dedup_signature_does_not_canonicalize_compound_bash_commands() {
         assert_ne!(
             tool_dedup_signature("bash", &json!({"command": "git diff | head"})),
-            tool_dedup_signature("git_diff", &json!({}))
+            tool_dedup_signature("git", &json!({"action": "diff"}))
         );
     }
 

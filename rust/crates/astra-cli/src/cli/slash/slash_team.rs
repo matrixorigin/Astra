@@ -108,8 +108,8 @@ impl TeamRegistry {
                 members: vec![
                     TeamMember {
                         role: "producer".to_string(),
-                        description: "Performs code review. Use git_log to find recent commits, \
-                            git_show to read commit diffs, and read_file/grep to understand \
+                        description: "Performs code review. Use git(action=log) to find recent commits, \
+                            git(action=show) to read commit diffs, and read_file/grep to understand \
                             context. Produce a detailed review covering correctness, security, \
                             and edge cases."
                             .into(),
@@ -119,7 +119,7 @@ impl TeamRegistry {
                     TeamMember {
                         role: "reviewer".to_string(),
                         description: "Critiques the producer's review for completeness. \
-                            Use git_show and read_file to independently verify claims. \
+                            Use git(action=show) and read_file to independently verify claims. \
                             Check if the producer missed bugs, security issues, or edge cases."
                             .into(),
                         skills: vec![],

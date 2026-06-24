@@ -3908,10 +3908,6 @@ mod tests {
         assert_eq!(PermissionManager::classify("read_file"), SideEffect::Read);
         assert_eq!(PermissionManager::classify("grep"), SideEffect::Read);
         assert_eq!(PermissionManager::classify("list_dir"), SideEffect::Read);
-        assert_eq!(
-            PermissionManager::classify("github_ci_status"),
-            SideEffect::Read
-        );
     }
 
     // ── is_dangerous ──────────────────────────────────────────────────────────
@@ -3976,9 +3972,9 @@ mod tests {
 
     #[test]
     fn execute_allowlist_allows_silently() {
-        let git_status = serde_json::json!({"command": "git status"});
+        let status_args = serde_json::json!({"command": "git status"});
         assert_eq!(
-            PermissionManager::execute_decision("bash", &git_status),
+            PermissionManager::execute_decision("bash", &status_args),
             ExecuteDecision::AllowSilent
         );
 

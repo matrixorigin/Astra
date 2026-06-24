@@ -108,7 +108,7 @@ pub const BASELINE_PREVIEW_TEMPLATES: &[(&str, u32, &str)] = &[
     ("pg_schema_structurize", 1200, "sql_v1"),
     ("slow_query_analyzer", 1200, "sql_v1"),
     ("curl", 1000, "text_v1"),
-    ("git_log", 1200, "diff_v1"),
+    ("git", 1200, "diff_v1"),
     ("docker_logs", 1200, "text_v1"),
     ("kubectl", 1200, "text_v1"),
     ("python_stdout", 1200, "text_v1"),

@@ -1347,7 +1347,7 @@ mod tests {
         let mut q = ApprovalQueue::new();
         let (tx, _rx) = oneshot::channel();
         q.push_with_metadata(
-            "git_show".into(),
+            "git".into(),
             "Git show HEAD".into(),
             None,
             "This command needs your approval before it runs.".into(),

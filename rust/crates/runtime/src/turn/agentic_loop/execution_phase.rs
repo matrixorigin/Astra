@@ -2367,7 +2367,7 @@ pub(crate) fn is_exploration_family_lockout(m: &serde_json::Value) -> bool {
 
 fn restricted_tools_for_exploration_family(family: &str) -> &'static [&'static str] {
     match family {
-        "diff" => &["git_diff"],
+        "diff" => &["git"],
         "search" => &["glob", "grep", "rg"],
         "read" => &["read_file", "view"],
         _ => &[],
@@ -5193,7 +5193,7 @@ mod tests {
         let mut state = make_state();
         state.message = "review local changes".into();
         for _ in 0..CACHE_WASTE_MIDLOOP_THRESHOLD {
-            state.turn_guard.record_cache_hit("git_diff");
+            state.turn_guard.record_cache_hit("git");
         }
         assert!(should_inject_cache_waste_corrective(
             &state,
@@ -5206,7 +5206,7 @@ mod tests {
         let mut state = make_state();
         state.message = "review local changes".into();
         for _ in 0..(CACHE_WASTE_MIDLOOP_THRESHOLD - 1) {
-            state.turn_guard.record_cache_hit("git_diff");
+            state.turn_guard.record_cache_hit("git");
         }
         assert!(!should_inject_cache_waste_corrective(
             &state,
@@ -5219,14 +5219,14 @@ mod tests {
         let mut state = make_state();
         state.message = "review local changes".into();
         for _ in 0..(CACHE_WASTE_MIDLOOP_THRESHOLD + 2) {
-            state.turn_guard.record_cache_hit("git_diff");
+            state.turn_guard.record_cache_hit("git");
         }
         assert!(should_inject_cache_waste_corrective(
             &state,
             CACHE_WASTE_MIDLOOP_THRESHOLD
         ));
         state.stall.forced_cache_waste_corrective = true;
-        state.turn_guard.record_cache_hit("git_diff");
+        state.turn_guard.record_cache_hit("git");
         assert!(!should_inject_cache_waste_corrective(
             &state,
             CACHE_WASTE_MIDLOOP_THRESHOLD
@@ -5237,7 +5237,7 @@ mod tests {
     fn cache_waste_corrective_marker_recognized() {
         let msg = serde_json::json!({
             "role": "user",
-            "content": cache_waste_corrective_message(&[("git_diff", 3)], "review local changes"),
+            "content": cache_waste_corrective_message(&[("git", 3)], "review local changes"),
         });
         assert!(is_cache_waste_corrective(&msg));
         let unrelated = serde_json::json!({"role": "user", "content": "hello"});
@@ -5305,10 +5305,12 @@ mod tests {
     fn push_diff_round(state: &mut AgenticLoopState, round: u32) {
         for idx in 0..2 {
             state.stall.tool_call_records.push(ToolCallRecord {
-                name: "git_diff".into(),
+                name: "git".into(),
                 ok: true,
                 round: Some(round),
-                args_full: Some(format!(r#"{{"path":"src/file_{round}_{idx}.rs"}}"#)),
+                args_full: Some(format!(
+                    r#"{{"action":"diff","path":"src/file_{round}_{idx}.rs"}}"#
+                )),
                 ..Default::default()
             });
         }
@@ -5368,8 +5370,8 @@ mod tests {
         );
 
         let restricted = apply_exploration_family_restrictions(&mut state, &family);
-        assert_eq!(restricted, vec!["git_diff".to_string()]);
-        assert!(state.restricted_tools.contains("git_diff"));
+        assert_eq!(restricted, vec!["git".to_string()]);
+        assert!(state.restricted_tools.contains("git"));
         assert!(
             !state.restricted_tools.contains("bash"),
             "exploration-family corrective must not globally block bash"
@@ -5426,7 +5428,7 @@ mod tests {
             "content": exploration_family_corrective_message(
                 "diff",
                 3,
-                &["git_diff".to_string()],
+                &["git".to_string()],
                 "review local changes",
             ),
         });
@@ -5442,12 +5444,12 @@ mod tests {
         state.message = "review local changes".into();
         state.stall.forced_exploration_family_corrective = true;
         state.stall.exploration_family_corrective_family = Some("diff".into());
-        push_blocked_restricted_round(&mut state, "git_diff", 7);
+        push_blocked_restricted_round(&mut state, "git", 7);
 
         let candidate = exploration_family_lockout_candidate(&state);
         assert_eq!(
             candidate,
-            Some(("diff".to_string(), vec!["git_diff".to_string()])),
+            Some(("diff".to_string(), vec!["git".to_string()])),
         );
     }
 
@@ -5457,7 +5459,7 @@ mod tests {
         state.message = "review local changes".into();
         state.stall.forced_exploration_family_corrective = true;
         state.stall.exploration_family_corrective_family = Some("diff".into());
-        push_blocked_restricted_round(&mut state, "git_diff", 7);
+        push_blocked_restricted_round(&mut state, "git", 7);
         state.stall.tool_call_records.push(ToolCallRecord {
             name: "bash".into(),
             ok: true,
@@ -5475,7 +5477,7 @@ mod tests {
         state.message = "review local changes".into();
         state.stall.forced_exploration_family_corrective = true;
         state.stall.exploration_family_corrective_family = Some("diff".into());
-        push_blocked_restricted_round(&mut state, "git_diff", 7);
+        push_blocked_restricted_round(&mut state, "git", 7);
 
         assert!(exploration_family_lockout_candidate(&state).is_some());
         state.stall.forced_exploration_family_lockout = true;
@@ -5488,7 +5490,7 @@ mod tests {
             "role": "user",
             "content": exploration_family_lockout_message(
                 "diff",
-                &["git_diff".to_string()],
+                &["git".to_string()],
                 "review local changes",
             ),
         });

@@ -99,12 +99,12 @@ impl ToolExecutor {
         })
     }
 
-    pub(crate) async fn github_list_prs(&self, args: &Value) -> String {
+    pub(crate) async fn list_prs(&self, args: &Value) -> String {
         let repo = match args.get("repo").and_then(Value::as_str) {
             Some(r) => r.to_string(),
             None => {
                 return github_error_response(
-                    "github_list_prs",
+                    "list_prs",
                     "pull_requests",
                     Some(GithubDetail::Brief),
                     None,
@@ -117,7 +117,7 @@ impl ToolExecutor {
             Ok(detail) => detail,
             Err(error) => {
                 return github_error_response(
-                    "github_list_prs",
+                    "list_prs",
                     "pull_requests",
                     Some(GithubDetail::Brief),
                     Some(&repo),
@@ -133,7 +133,7 @@ impl ToolExecutor {
             Ok(resolution) => resolution,
             Err(error) => {
                 return github_error_response(
-                    "github_list_prs",
+                    "list_prs",
                     "pull_requests",
                     Some(detail),
                     Some(&repo),
@@ -157,7 +157,7 @@ impl ToolExecutor {
             Ok(response) => response,
             Err(error) => {
                 return github_error_response(
-                    "github_list_prs",
+                    "list_prs",
                     "pull_requests",
                     Some(detail),
                     Some(&repo),
@@ -169,7 +169,7 @@ impl ToolExecutor {
 
         let Some(prs) = response.as_array() else {
             return github_error_response(
-                "github_list_prs",
+                "list_prs",
                 "pull_requests",
                 Some(detail),
                 Some(&repo),
@@ -185,7 +185,8 @@ impl ToolExecutor {
 
         github_response_string(json!({
             "ok": true,
-            "tool": "github_list_prs",
+            "tool": "github",
+            "action": "list_prs",
             "detail": detail.as_str(),
             "requested_repo": repo,
             "resolved_repo": resolution_output_repo(&resolution),
@@ -197,12 +198,12 @@ impl ToolExecutor {
         }))
     }
 
-    pub(crate) async fn github_get_pr(&self, args: &Value) -> String {
+    pub(crate) async fn get_pr(&self, args: &Value) -> String {
         let repo = match args.get("repo").and_then(Value::as_str) {
             Some(r) => r.to_string(),
             None => {
                 return github_error_response(
-                    "github_get_pr",
+                    "get_pr",
                     "pull_request",
                     Some(GithubDetail::Brief),
                     None,
@@ -215,7 +216,7 @@ impl ToolExecutor {
             Some(n) => n,
             None => {
                 return github_error_response(
-                    "github_get_pr",
+                    "get_pr",
                     "pull_request",
                     Some(GithubDetail::Brief),
                     Some(&repo),
@@ -228,7 +229,7 @@ impl ToolExecutor {
             Ok(detail) => detail,
             Err(error) => {
                 return github_error_response(
-                    "github_get_pr",
+                    "get_pr",
                     "pull_request",
                     Some(GithubDetail::Brief),
                     Some(&repo),
@@ -242,7 +243,7 @@ impl ToolExecutor {
             Ok(resolution) => resolution,
             Err(error) => {
                 return github_error_response(
-                    "github_get_pr",
+                    "get_pr",
                     "pull_request",
                     Some(detail),
                     Some(&repo),
@@ -266,7 +267,7 @@ impl ToolExecutor {
             Ok(response) => response,
             Err(error) => {
                 return github_error_response(
-                    "github_get_pr",
+                    "get_pr",
                     "pull_request",
                     Some(detail),
                     Some(&repo),
@@ -278,7 +279,7 @@ impl ToolExecutor {
 
         if !response.is_object() {
             return github_error_response(
-                "github_get_pr",
+                "get_pr",
                 "pull_request",
                 Some(detail),
                 Some(&repo),
@@ -296,7 +297,7 @@ impl ToolExecutor {
                     Ok(conclusion) => conclusion,
                     Err(error) => {
                         return github_error_response(
-                            "github_get_pr",
+                            "get_pr",
                             "pull_request",
                             Some(detail),
                             Some(&repo),
@@ -316,7 +317,7 @@ impl ToolExecutor {
                 Ok(files) => files,
                 Err(error) => {
                     return github_error_response(
-                        "github_get_pr",
+                        "get_pr",
                         "pull_request",
                         Some(detail),
                         Some(&repo),
@@ -337,7 +338,7 @@ impl ToolExecutor {
                 Ok(comments) => comments,
                 Err(error) => {
                     return github_error_response(
-                        "github_get_pr",
+                        "get_pr",
                         "pull_request",
                         Some(detail),
                         Some(&repo),
@@ -394,7 +395,8 @@ impl ToolExecutor {
 
         github_response_string(json!({
             "ok": true,
-            "tool": "github_get_pr",
+            "tool": "github",
+            "action": "get_pr",
             "detail": detail.as_str(),
             "requested_repo": repo,
             "resolved_repo": resolution_output_repo(&resolution),
@@ -405,12 +407,12 @@ impl ToolExecutor {
         }))
     }
 
-    pub(crate) async fn github_ci_status(&self, args: &Value) -> String {
+    pub(crate) async fn ci_status(&self, args: &Value) -> String {
         let repo = match args.get("repo").and_then(Value::as_str) {
             Some(r) => r.to_string(),
             None => {
                 return github_error_response(
-                    "github_ci_status",
+                    "ci_status",
                     "workflow_runs",
                     Some(GithubDetail::Brief),
                     None,
@@ -423,7 +425,7 @@ impl ToolExecutor {
             Ok(detail) => detail,
             Err(error) => {
                 return github_error_response(
-                    "github_ci_status",
+                    "ci_status",
                     "workflow_runs",
                     Some(GithubDetail::Brief),
                     Some(&repo),
@@ -438,7 +440,7 @@ impl ToolExecutor {
             Ok(resolution) => resolution,
             Err(error) => {
                 return github_error_response(
-                    "github_ci_status",
+                    "ci_status",
                     "workflow_runs",
                     Some(detail),
                     Some(&repo),
@@ -462,7 +464,7 @@ impl ToolExecutor {
             Ok(response) => response,
             Err(error) => {
                 return github_error_response(
-                    "github_ci_status",
+                    "ci_status",
                     "workflow_runs",
                     Some(detail),
                     Some(&repo),
@@ -474,7 +476,7 @@ impl ToolExecutor {
 
         let Some(runs) = response.get("workflow_runs").and_then(Value::as_array) else {
             return github_error_response(
-                "github_ci_status",
+                "ci_status",
                 "workflow_runs",
                 Some(detail),
                 Some(&repo),
@@ -495,7 +497,7 @@ impl ToolExecutor {
                         Ok(job_details) => job_details,
                         Err(error) => {
                             return github_error_response(
-                                "github_ci_status",
+                                "ci_status",
                                 "workflow_runs",
                                 Some(detail),
                                 Some(&repo),
@@ -555,7 +557,8 @@ impl ToolExecutor {
 
         github_response_string(json!({
             "ok": true,
-            "tool": "github_ci_status",
+            "tool": "github",
+            "action": "ci_status",
             "detail": detail.as_str(),
             "requested_repo": repo,
             "resolved_repo": resolution_output_repo(&resolution),
@@ -566,12 +569,12 @@ impl ToolExecutor {
         }))
     }
 
-    pub(crate) async fn github_list_issues(&self, args: &Value) -> String {
+    pub(crate) async fn list_issues(&self, args: &Value) -> String {
         let repo = match args.get("repo").and_then(Value::as_str) {
             Some(r) => r.to_string(),
             None => {
                 return github_error_response(
-                    "github_list_issues",
+                    "list_issues",
                     "issues",
                     Some(GithubDetail::Brief),
                     None,
@@ -584,7 +587,7 @@ impl ToolExecutor {
             Ok(detail) => detail,
             Err(error) => {
                 return github_error_response(
-                    "github_list_issues",
+                    "list_issues",
                     "issues",
                     Some(GithubDetail::Brief),
                     Some(&repo),
@@ -601,7 +604,7 @@ impl ToolExecutor {
             Ok(resolution) => resolution,
             Err(error) => {
                 return github_error_response(
-                    "github_list_issues",
+                    "list_issues",
                     "issues",
                     Some(detail),
                     Some(&repo),
@@ -630,7 +633,7 @@ impl ToolExecutor {
             Ok(response) => response,
             Err(error) => {
                 return github_error_response(
-                    "github_list_issues",
+                    "list_issues",
                     "issues",
                     Some(detail),
                     Some(&repo),
@@ -642,7 +645,7 @@ impl ToolExecutor {
 
         let Some(issues) = response.as_array() else {
             return github_error_response(
-                "github_list_issues",
+                "list_issues",
                 "issues",
                 Some(detail),
                 Some(&repo),
@@ -659,7 +662,8 @@ impl ToolExecutor {
 
         github_response_string(json!({
             "ok": true,
-            "tool": "github_list_issues",
+            "tool": "github",
+            "action": "list_issues",
             "detail": detail.as_str(),
             "requested_repo": repo,
             "resolved_repo": resolution_output_repo(&resolution),
@@ -672,12 +676,12 @@ impl ToolExecutor {
         }))
     }
 
-    pub(crate) async fn github_get_issue(&self, args: &Value) -> String {
+    pub(crate) async fn get_issue(&self, args: &Value) -> String {
         let repo = match args.get("repo").and_then(Value::as_str) {
             Some(r) => r.to_string(),
             None => {
                 return github_error_response(
-                    "github_get_issue",
+                    "get_issue",
                     "issue",
                     Some(GithubDetail::Brief),
                     None,
@@ -690,7 +694,7 @@ impl ToolExecutor {
             Some(n) => n,
             None => {
                 return github_error_response(
-                    "github_get_issue",
+                    "get_issue",
                     "issue",
                     Some(GithubDetail::Brief),
                     Some(&repo),
@@ -703,7 +707,7 @@ impl ToolExecutor {
             Ok(detail) => detail,
             Err(error) => {
                 return github_error_response(
-                    "github_get_issue",
+                    "get_issue",
                     "issue",
                     Some(GithubDetail::Brief),
                     Some(&repo),
@@ -717,7 +721,7 @@ impl ToolExecutor {
             Ok(resolution) => resolution,
             Err(error) => {
                 return github_error_response(
-                    "github_get_issue",
+                    "get_issue",
                     "issue",
                     Some(detail),
                     Some(&repo),
@@ -741,7 +745,7 @@ impl ToolExecutor {
             Ok(response) => response,
             Err(error) => {
                 return github_error_response(
-                    "github_get_issue",
+                    "get_issue",
                     "issue",
                     Some(detail),
                     Some(&repo),
@@ -753,7 +757,7 @@ impl ToolExecutor {
 
         if !response.is_object() {
             return github_error_response(
-                "github_get_issue",
+                "get_issue",
                 "issue",
                 Some(detail),
                 Some(&repo),
@@ -764,7 +768,7 @@ impl ToolExecutor {
 
         if response.get("pull_request").is_some() {
             return github_error_response(
-                "github_get_issue",
+                "get_issue",
                 "issue",
                 Some(detail),
                 Some(&repo),
@@ -781,7 +785,7 @@ impl ToolExecutor {
                 Ok(comments) => comments,
                 Err(error) => {
                     return github_error_response(
-                        "github_get_issue",
+                        "get_issue",
                         "issue",
                         Some(detail),
                         Some(&repo),
@@ -815,7 +819,8 @@ impl ToolExecutor {
 
         github_response_string(json!({
             "ok": true,
-            "tool": "github_get_issue",
+            "tool": "github",
+            "action": "get_issue",
             "detail": detail.as_str(),
             "requested_repo": repo,
             "resolved_repo": resolution_output_repo(&resolution),
@@ -826,12 +831,12 @@ impl ToolExecutor {
         }))
     }
 
-    pub(crate) async fn github_repo_stats(&self, args: &Value) -> String {
+    pub(crate) async fn repo_stats(&self, args: &Value) -> String {
         let repo = match args.get("repo").and_then(Value::as_str) {
             Some(r) => r.to_string(),
             None => {
                 return github_error_response(
-                    "github_repo_stats",
+                    "repo_stats",
                     "repository",
                     Some(GithubDetail::Brief),
                     None,
@@ -844,7 +849,7 @@ impl ToolExecutor {
             Ok(detail) => detail,
             Err(error) => {
                 return github_error_response(
-                    "github_repo_stats",
+                    "repo_stats",
                     "repository",
                     Some(GithubDetail::Brief),
                     Some(&repo),
@@ -858,7 +863,7 @@ impl ToolExecutor {
             Ok(resolution) => resolution,
             Err(error) => {
                 return github_error_response(
-                    "github_repo_stats",
+                    "repo_stats",
                     "repository",
                     Some(detail),
                     Some(&repo),
@@ -879,7 +884,7 @@ impl ToolExecutor {
             Ok(response) => response,
             Err(error) => {
                 return github_error_response(
-                    "github_repo_stats",
+                    "repo_stats",
                     "repository",
                     Some(detail),
                     Some(&repo),
@@ -891,7 +896,7 @@ impl ToolExecutor {
 
         if !response.is_object() {
             return github_error_response(
-                "github_repo_stats",
+                "repo_stats",
                 "repository",
                 Some(detail),
                 Some(&repo),
@@ -939,7 +944,8 @@ impl ToolExecutor {
 
         github_response_string(json!({
             "ok": true,
-            "tool": "github_repo_stats",
+            "tool": "github",
+            "action": "repo_stats",
             "detail": detail.as_str(),
             "requested_repo": repo,
             "resolved_repo": resolution_output_repo(&resolution),
@@ -1452,7 +1458,7 @@ fn resolution_output_repo(resolution: &GithubRepoResolution) -> Option<String> {
 }
 
 fn github_error_response(
-    tool: &str,
+    action: &str,
     payload_key: &str,
     detail: Option<GithubDetail>,
     requested_repo: Option<&str>,
@@ -1461,7 +1467,8 @@ fn github_error_response(
 ) -> String {
     let mut response = json!({
         "ok": false,
-        "tool": tool,
+        "tool": "github",
+        "action": action,
         "detail": detail.map(GithubDetail::as_str),
         "requested_repo": requested_repo,
         "resolved_repo": resolution.and_then(resolution_output_repo),
@@ -1906,7 +1913,7 @@ mod tests {
     #[test]
     pub(crate) fn github_missing_repo_error_guides_recovery() {
         let response = github_error_response(
-            "github_ci_status",
+            "ci_status",
             "workflow_runs",
             Some(GithubDetail::Brief),
             None,
@@ -2086,7 +2093,7 @@ mod tests {
     #[test]
     fn github_error_response_structure() {
         let response = github_error_response(
-            "github_list_prs",
+            "list_prs",
             "pull_requests",
             Some(GithubDetail::Brief),
             Some("matrixorigin/memoria"),
@@ -2095,7 +2102,8 @@ mod tests {
         );
         let parsed: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed["ok"], json!(false));
-        assert_eq!(parsed["tool"], "github_list_prs");
+        assert_eq!(parsed["tool"], "github");
+        assert_eq!(parsed["action"], "list_prs");
         assert_eq!(parsed["error"], "some error message");
         assert_eq!(parsed["count"], 0);
         assert!(
@@ -2111,7 +2119,7 @@ mod tests {
             resolved_by_search: true,
         };
         let response = github_error_response(
-            "github_ci_status",
+            "ci_status",
             "workflow_runs",
             Some(GithubDetail::Normal),
             Some("memoria"),
@@ -2119,6 +2127,8 @@ mod tests {
             "API failure",
         );
         let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["tool"], "github");
+        assert_eq!(parsed["action"], "ci_status");
         assert_eq!(parsed["resolved_repo"], "MatrixOrigin/Memoria");
         assert_eq!(parsed["resolved_by_search"], true);
     }

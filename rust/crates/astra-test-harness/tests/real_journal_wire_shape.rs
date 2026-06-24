@@ -49,7 +49,7 @@ fn outcome_placeholder() -> RunOutcome {
 //   turn, turn_evaluation, session_end; 4 llm_round events.
 //
 //   tool_calls (nested in 3 of the 4 llm_round events, first-seen
-//   order, de-duplicated):  git_diff, git_log
+//   order, de-duplicated):  git
 //
 // The 4th llm_round has NO tool_calls (the "final synthesis" round),
 // which is normal in real sessions and exercises the shape-1 loop's
@@ -96,8 +96,8 @@ fn legacy_fixture_tools_invoked_walks_nested_tool_calls() {
     // This is R4's Blocker regression: `tools_invoked()` must walk
     // `llm_round.tool_calls[]` for the legacy layout, not just the
     // non-existent top-level `tool_invocation` events. Ground truth
-    // from the fixture: git_diff appears twice in sequential rounds,
-    // then git_log once. De-duped first-seen order: [git_diff, git_log].
+    // from the fixture: git appears in three sequential rounds.
+    // De-duped first-seen order: [git].
     let cap = load_session_from_path(
         "fixture-sess-legacy",
         &fixture_path("fixture_realistic_legacy.jsonl"),
@@ -106,14 +106,14 @@ fn legacy_fixture_tools_invoked_walks_nested_tool_calls() {
     let tools = cap.tools_invoked();
     assert_eq!(
         tools,
-        vec!["git_diff".to_string(), "git_log".to_string()],
-        "tools_invoked must walk llm_round.tool_calls[] and return [git_diff, git_log] in first-seen order; got {tools:?}"
+        vec!["git".to_string()],
+        "tools_invoked must walk llm_round.tool_calls[] and return [git] in first-seen order; got {tools:?}"
     );
 }
 
 #[test]
 fn legacy_fixture_journal_tool_called_criterion_matches() {
-    // End-to-end contract: a case using `journal_tool_called { name: "git_diff" }`
+    // End-to-end contract: a case using `journal_tool_called { name: "git" }`
     // must PASS against a real-shape fixture. Before the R4 fix this
     // criterion returned the `no-session` FAIL path on EVERY real
     // session because tools_invoked() never saw the nested shape.
@@ -124,7 +124,7 @@ fn legacy_fixture_journal_tool_called_criterion_matches() {
     .expect("fixture should load");
     let outcome = outcome_placeholder();
 
-    for name in ["git_diff", "git_log"] {
+    for name in ["git"] {
         let r: Vec<CriterionResult> = evaluate_deterministic_with_session(
             &[Criterion::JournalToolCalled {
                 name: name.into(),
@@ -379,7 +379,7 @@ fn merged_session_exposes_union_of_tool_names() {
     // #[non_exhaustive] we can't literal-construct from outside. Reuse
     // `merged` as-is; it's still valid.
     let tools = merged.tools_invoked();
-    for expected in ["git_diff", "git_log", "list_dir"] {
+    for expected in ["git", "list_dir"] {
         assert!(
             tools.contains(&expected.to_string()),
             "merged layout must expose {expected:?}; got {tools:?}"

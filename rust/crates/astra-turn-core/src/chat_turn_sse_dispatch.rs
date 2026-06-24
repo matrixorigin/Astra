@@ -1628,7 +1628,7 @@ mod tests {
         dispatch_chat_turn_sse_event_block(
             &sse(
                 "tool_call_start",
-                ",\"call_id\":\"tc-1\",\"tool\":\"git_log\",\"arguments\":\"{\\\"n\"",
+                ",\"call_id\":\"tc-1\",\"tool\":\"git\",\"arguments\":\"{\\\"action\\\":\\\"log\\\",\\\"n\"",
             ),
             &mut a,
             &mut p,
@@ -1639,7 +1639,7 @@ mod tests {
         dispatch_chat_turn_sse_event_block(
             &sse(
                 "tool_call",
-                ",\"id\":\"tc-1\",\"name\":\"git_log\",\"arguments\":{\"n\":5}",
+                ",\"id\":\"tc-1\",\"name\":\"git\",\"arguments\":{\"action\":\"log\",\"n\":5}",
             ),
             &mut a,
             &mut p,

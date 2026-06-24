@@ -230,9 +230,9 @@ mod tests {
     fn quality_feedback_messages() {
         let cases: &[(&str, ResultQuality, Option<&str>)] = &[
             ("bash", ResultQuality::Success, None),
-            ("github_list_prs", ResultQuality::Error, Some("error")),
+            ("github", ResultQuality::Error, Some("error")),
             ("grep", ResultQuality::Empty, Some("Do NOT retry")),
-            ("git_log", ResultQuality::Truncated, Some("truncated")),
+            ("git", ResultQuality::Truncated, Some("truncated")),
         ];
         for (tool_name, quality, expected_substr) in cases {
             let msg = quality_feedback(tool_name, *quality);

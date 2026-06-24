@@ -6035,7 +6035,7 @@ esac
     // ── Git operations ─────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn git_status_in_non_git_dir_returns_error() {
+    async fn git_action_status_in_non_git_dir_returns_error() {
         let (exec, _dir) = test_executor();
         let result = exec.execute("git", &json!({"action": "status"})).await;
         assert!(result.contains("Error:") || result.contains("fatal"));
@@ -6067,7 +6067,7 @@ esac
     }
 
     #[tokio::test]
-    async fn git_log_caps_at_100() {
+    async fn git_action_log_caps_at_100() {
         let (exec, dir) = test_executor();
         // Initialize a git repo
         std::process::Command::new("git")
@@ -6104,19 +6104,20 @@ esac
     }
 
     #[tokio::test]
-    async fn git_helper_aliases_are_not_executable_on_server_executor() {
+    async fn git_helper_style_names_are_not_executable_on_server_executor() {
         let (exec, _dir) = test_executor();
-        for name in [
-            "git_status",
-            "git_diff",
-            "git_log",
-            "git_show",
-            "git_blame",
-            "git_file_history",
-            "git_log_search",
-            "git_contributors",
-        ] {
-            let result = exec.execute_with_metadata(name, &json!({})).await;
+        let actions = [
+            "status",
+            "diff",
+            "log",
+            "show",
+            "blame",
+            "file_history",
+            "log_search",
+            "contributors",
+        ];
+        for name in actions.into_iter().map(|action| format!("git_{action}")) {
+            let result = exec.execute_with_metadata(&name, &json!({})).await;
             assert!(result.is_error, "{name}: {result:?}");
             let metadata = result.metadata.as_ref().expect("metadata should exist");
             assert_eq!(
@@ -6295,17 +6296,18 @@ esac
     }
 
     #[tokio::test]
-    async fn github_helper_aliases_are_not_executable_on_server_executor() {
+    async fn github_helper_style_names_are_not_executable_on_server_executor() {
         let (exec, _dir) = test_executor();
-        for name in [
-            "github_list_prs",
-            "github_get_pr",
-            "github_ci_status",
-            "github_list_issues",
-            "github_get_issue",
-            "github_repo_stats",
-        ] {
-            let result = exec.execute_with_metadata(name, &json!({})).await;
+        let actions = [
+            "list_prs",
+            "get_pr",
+            "ci_status",
+            "list_issues",
+            "get_issue",
+            "repo_stats",
+        ];
+        for name in actions.into_iter().map(|action| format!("github_{action}")) {
+            let result = exec.execute_with_metadata(&name, &json!({})).await;
             assert!(result.is_error, "{name}: {result:?}");
             let metadata = result.metadata.as_ref().expect("metadata should exist");
             assert_eq!(

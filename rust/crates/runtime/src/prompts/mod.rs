@@ -102,8 +102,8 @@ mod tests {
     fn no_github_tools_omits_github_rules() {
         let p = build_main_system_prompt(&["bash", "memory"], "", None);
         assert!(
-            !p.contains("github_list_prs"),
-            "should NOT mention github_list_prs when no GitHub tools selected"
+            !p.contains("github(action="),
+            "should NOT mention the github tool when no GitHub tools selected"
         );
     }
 
@@ -129,11 +129,8 @@ mod tests {
     /// Compressed prompt is shorter than the old version.
     #[test]
     fn compressed_prompt_under_token_budget() {
-        let p = build_main_system_prompt(
-            &["read_file", "bash", "memory", "github_list_prs", "git_diff"],
-            "",
-            None,
-        );
+        let p =
+            build_main_system_prompt(&["read_file", "bash", "memory", "github", "git"], "", None);
         assert!(
             p.len() < 13000,
             "compressed prompt should be under 13000 chars, got {}",
@@ -278,7 +275,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_code_review_strategy_when_task_type_set() {
-        let p = build_main_system_prompt(&["bash", "git_diff"], "", Some("code_review"));
+        let p = build_main_system_prompt(&["bash", "git"], "", Some("code_review"));
         assert!(
             p.contains("Code Review Strategy"),
             "code_review task_type should inject review strategy"

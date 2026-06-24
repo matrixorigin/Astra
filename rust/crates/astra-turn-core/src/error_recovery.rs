@@ -612,7 +612,7 @@ mod tests {
 
     #[test]
     fn suggestions_data_driven() {
-        // consolidated action tools do not suggest retired helper names
+        // consolidated action tools do not suggest helper-style names
         assert!(suggest_alternatives("git", &[]).is_empty());
         assert!(suggest_alternatives("github", &[]).is_empty());
 

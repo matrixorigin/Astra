@@ -655,7 +655,7 @@ mod tests {
         let mut schemas = vec![sample_schema("bash"), sample_schema("read_file")];
         // Ensure a always_load + non-always_load mix so construction keeps the deferred
         // schema lookupable while the conversational path returns no tools.
-        schemas.push(sample_schema("github_list_prs"));
+        schemas.push(sample_schema("github"));
         let registry = ToolRegistry::new(schemas);
         // "hello" is the conversational short-circuit case.
         let (out_schemas, report) =

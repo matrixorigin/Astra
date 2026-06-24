@@ -42,32 +42,44 @@ async fn execute_unknown_tool_returns_error() {
 }
 
 #[tokio::test]
-async fn retired_git_github_helper_aliases_are_unknown_on_cli_edge_executor() {
+async fn git_github_helper_style_names_are_unknown_on_cli_edge_executor() {
     let executor = test_executor();
 
-    for name in [
-        "git_status",
-        "git_diff",
-        "git_log",
-        "git_show",
-        "git_blame",
-        "git_file_history",
-        "git_log_search",
-        "git_contributors",
-        "git_commit",
-        "git_revert_commit",
-        "git_stash",
-        "git_checkout_file",
-        "git_worktree",
-        "github_list_prs",
-        "github_get_pr",
-        "github_ci_status",
-        "github_list_issues",
-        "github_get_issue",
-        "github_repo_stats",
-        "github_create_issue",
-    ] {
-        let result = executor.execute(name, &json!({})).await;
+    let git_actions = [
+        "status",
+        "diff",
+        "log",
+        "show",
+        "blame",
+        "file_history",
+        "log_search",
+        "contributors",
+        "commit",
+        "revert_commit",
+        "stash",
+        "checkout_file",
+        "worktree",
+    ];
+    let github_actions = [
+        "list_prs",
+        "get_pr",
+        "ci_status",
+        "list_issues",
+        "get_issue",
+        "repo_stats",
+        "create_issue",
+    ];
+
+    for name in git_actions
+        .into_iter()
+        .map(|action| format!("git_{action}"))
+        .chain(
+            github_actions
+                .into_iter()
+                .map(|action| format!("github_{action}")),
+        )
+    {
+        let result = executor.execute(&name, &json!({})).await;
         assert!(result.starts_with("Error:"), "{name}: {result}");
         assert!(result.contains("not available"), "{name}: {result}");
     }
@@ -102,7 +114,7 @@ async fn retired_session_state_actions_are_rejected_on_cli_edge_executor() {
 }
 
 #[tokio::test]
-async fn consolidated_github_create_issue_error_does_not_leak_retired_alias() {
+async fn consolidated_github_create_issue_error_does_not_leak_helper_style_name() {
     let executor = test_executor();
 
     let result = executor
@@ -116,7 +128,7 @@ async fn consolidated_github_create_issue_error_does_not_leak_retired_alias() {
         )
         .await;
 
-    assert!(!result.contains("github_create_issue"), "{result}");
+    assert!(!result.contains("github_"), "{result}");
     let parsed: serde_json::Value = serde_json::from_str(&result).expect("github error json");
     assert_eq!(parsed["ok"], false);
     assert_eq!(parsed["tool"], "github");

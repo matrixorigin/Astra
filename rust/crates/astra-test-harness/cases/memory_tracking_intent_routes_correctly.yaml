@@ -7,7 +7,7 @@ description: |
   "我关注matrixorigin" caused the LLM to explore the codebase instead of storing the interest.
   **Why**: Chinese-language tracking expressions ("关注", "追踪") are semantically memory-store operations,
   not code search operations. The tool surface must expose memory tools, not exploration tools.
-  After removing "关注" from github_list_prs triggers and deleting detect_store_signal, the system prompt
+  After removing "关注" from github(action=list_prs) triggers and deleting detect_store_signal, the system prompt
   memory rules must carry the full burden of routing these intents correctly.
   **Pass means**: The agent calls memory to persist the tracking interest, and does NOT waste turns
   exploring the filesystem for "oceanbase" (which is just the name of what the user wants to track).

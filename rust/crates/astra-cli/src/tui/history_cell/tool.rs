@@ -342,7 +342,7 @@ impl ToolCell {
     ///   arrived) — a Braille spinner + `"streaming · N lines · K KB"`
     ///   counter. Honest, monotonic, no fake percentages.
     /// - **Indeterminate mode** (no progress signal ever arrived —
-    ///   non-streaming tools like `read_file`, `git_log`, skill
+    ///   non-streaming tools like `read_file`, `git(action=log)`, skill
     ///   dispatch) — a breathing bar with a small block sliding back
     ///   and forth. Purely time-based; makes "still working" visible
     ///   without pretending to track progress.

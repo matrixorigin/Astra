@@ -1537,7 +1537,6 @@ mod tests {
         assert_eq!(classify_tool("grep"), ToolSafetyClass::PureRead);
         assert_eq!(classify_tool("glob"), ToolSafetyClass::PureRead);
         assert_eq!(classify_tool("list_dir"), ToolSafetyClass::PureRead);
-        assert_eq!(classify_tool("git_log"), ToolSafetyClass::PureRead);
         assert_eq!(classify_tool("find_definition"), ToolSafetyClass::PureRead);
     }
 

@@ -18,8 +18,7 @@
 //!
 //! Only covers the **active** tool set shipped today (the names
 //! advertised in `astra-tools::schemas`). Retired separate names
-//! (`task_create`, `git_show`, `memory_retrieve`, `hover_info`, …)
-//! have been retired — the model now issues unified action-param
+//! have been removed — the model now issues unified action-param
 //! calls (`task(action="create")`, `git(action="show")`,
 //! `memory(action="retrieve")`, `lsp(operation="hover")`) and we
 //! don't maintain preview code for dead paths.
@@ -984,7 +983,7 @@ mod tests {
     }
 
     #[test]
-    fn github_get_pr() {
+    fn github_action_get_pr() {
         assert_eq!(
             p(
                 "github",
@@ -1240,7 +1239,7 @@ mod tests {
     // ─── Schema-canonical field names ──────────────────────────────────
 
     #[test]
-    fn git_show_uses_canonical_revision_field() {
+    fn git_action_show_uses_canonical_revision_field() {
         assert_eq!(
             p("git", json!({"action": "show", "revision": "abc123"})),
             "Git show abc123"
@@ -1248,7 +1247,7 @@ mod tests {
     }
 
     #[test]
-    fn git_show_defaults_to_head_when_omitted() {
+    fn git_action_show_defaults_to_head_when_omitted() {
         assert_eq!(p("git", json!({"action": "show"})), "Git show HEAD");
     }
 
@@ -1280,7 +1279,7 @@ mod tests {
     }
 
     #[test]
-    fn git_checkout_file_with_ref() {
+    fn git_action_checkout_file_with_ref() {
         assert_eq!(
             p(
                 "git",
@@ -1291,7 +1290,7 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_add() {
+    fn git_action_worktree_add() {
         assert_eq!(
             p(
                 "git",
@@ -1302,7 +1301,7 @@ mod tests {
     }
 
     #[test]
-    fn github_get_pr_uses_canonical_pr_number_field() {
+    fn github_action_get_pr_uses_canonical_pr_number_field() {
         assert_eq!(
             p(
                 "github",
@@ -1313,7 +1312,7 @@ mod tests {
     }
 
     #[test]
-    fn github_get_issue_uses_canonical_issue_number_field() {
+    fn github_action_get_issue_uses_canonical_issue_number_field() {
         assert_eq!(
             p(
                 "github",

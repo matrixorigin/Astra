@@ -1033,7 +1033,6 @@ mod tests {
             "delete_file",
             "multi_edit",
             "git",
-            "git_checkout_file",
             "github",
             "mo_query",
             "memory", // action-aware; conservatively classified as Mutating
@@ -1294,14 +1293,14 @@ mod tests {
             "id": "call_abc",
             "type": "function",
             "function": {
-                "name": "git_log",
-                "arguments": "{\"n\":5}"
+                "name": "git",
+                "arguments": "{\"action\":\"log\",\"n\":5}"
             }
         });
         let (id, name, args) = parse_flat_tool_call_event(&tc);
         assert_eq!(id, "call_abc");
-        assert_eq!(name, "git_log");
-        assert_eq!(args, json!({"n": 5}));
+        assert_eq!(name, "git");
+        assert_eq!(args, json!({"action": "log", "n": 5}));
     }
 
     /// OpenAI format with empty function.name should still return empty
@@ -1328,16 +1327,16 @@ mod tests {
             "id": "call_1",
             "type": "function",
             "function": {
-                "name": "git_show",
-                "arguments": "{\"commit\":\"abc\"}"
+                "name": "git",
+                "arguments": "{\"action\":\"show\",\"revision\":\"abc\"}"
             }
         })];
         let slot =
             resolve_headless_tool_slot(HeadlessRoundToolIdx::ServerToolCall(0), &server, |_| {
                 panic!("edge lookup not used")
             });
-        assert_eq!(slot.name, "git_show");
-        assert_eq!(slot.args, json!({"commit": "abc"}));
+        assert_eq!(slot.name, "git");
+        assert_eq!(slot.args, json!({"action": "show", "revision": "abc"}));
     }
 
     /// Regression: openai_tool_call_entries_from_server must handle OpenAI-format
@@ -1373,15 +1372,16 @@ mod tests {
     #[test]
     fn openai_assistant_message_mixed_format_tool_calls() {
         let server = vec![
-            json!({"id": "c1", "name": "git_status", "arguments": {}}),
-            json!({"id": "c2", "type": "function", "function": {"name": "git_diff", "arguments": "{\"ref\":\"HEAD\"}"}}),
+            json!({"id": "c1", "name": "git", "arguments": {"action": "status"}}),
+            json!({"id": "c2", "type": "function", "function": {"name": "git", "arguments": "{\"action\":\"diff\",\"ref\":\"HEAD\"}"}}),
         ];
         let msg = openai_assistant_with_tool_calls_message(&server, &[] as &[Row], "");
         let tc = msg["tool_calls"].as_array().unwrap();
-        assert_eq!(tc[0]["function"]["name"], "git_status");
-        assert_eq!(tc[1]["function"]["name"], "git_diff");
+        assert_eq!(tc[0]["function"]["name"], "git");
+        assert_eq!(tc[1]["function"]["name"], "git");
         let args: Value =
             serde_json::from_str(tc[1]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["action"], "diff");
         assert_eq!(args["ref"], "HEAD");
     }
 

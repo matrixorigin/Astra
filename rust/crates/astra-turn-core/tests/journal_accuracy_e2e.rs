@@ -51,25 +51,6 @@ fn surgical_removal(original_name: &str) -> ToolCallRecord {
     }
 }
 
-fn sentinel_surgical_removal() -> ToolCallRecord {
-    // Sentinel-name records are audit-only placeholders even when the explicit
-    // flag is absent; current analytics must filter both representations.
-    ToolCallRecord {
-        name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
-        ok: true,
-        ms: 0,
-        error: None,
-        input_bytes: None,
-        output_bytes: Some(0),
-        args_preview: None,
-        result_preview: Some("(removed from context — skill covered this work)".into()),
-        file_path: None,
-        surgically_removed: None,
-        original_tool_name: None,
-        ..Default::default()
-    }
-}
-
 fn skipped_tool(name: &str) -> ToolCallRecord {
     ToolCallRecord {
         name: name.to_string(),
@@ -150,7 +131,7 @@ fn e2e_skill_interception_produces_accurate_journal_and_evaluation() {
         surgical_removal("read_file"),
         surgical_removal("glob"),
         surgical_removal("grep"),
-        surgical_removal("git_show"),
+        surgical_removal("git"),
         // Real calls that ran alongside the skill
         real_tool("write_file", true, 45),
         real_tool("bash", true, 120),
@@ -329,21 +310,23 @@ fn e2e_multi_turn_session_turn_numbering_consistent() {
     }
 }
 
-// ─── Unhappy path: mixed synthetic placeholder records ──────────────────────
+// ─── Unhappy path: current synthetic records are filtered ────────────────────
 
 #[test]
-fn e2e_mixed_synthetic_placeholder_records_are_filtered() {
+fn e2e_current_synthetic_records_are_filtered() {
     let tmp = tempfile::tempdir().unwrap();
     let _guard = JournalDirGuard::new(tmp.path());
-    let session_id = "e2e-mixed-synthetic-placeholders";
+    let session_id = "e2e-current-synthetic";
 
+    // Synthetic records must carry current explicit markers. A sentinel name
+    // alone is not part of the supported contract.
     let records = vec![
         real_tool("read_file", true, 30),
-        sentinel_surgical_removal(), // sentinel name only
-        surgical_removal("glob"),    // explicit flag + original_tool_name
+        surgical_removal("glob"),
+        surgical_removal("read_file"),
         real_tool("bash", true, 100),
-        skipped_tool("grep"),      // skill-routed skip
-        deferred_tool("git_show"), // skill-routed defer
+        skipped_tool("grep"),
+        deferred_tool("git"),
         real_tool("write_file", true, 50),
     ];
 
@@ -395,7 +378,7 @@ fn e2e_mixed_synthetic_placeholder_records_are_filtered() {
     assert_eq!(
         synthetic.len(),
         4,
-        "4 synthetic: sentinel surgical, flagged surgical, skipped, deferred"
+        "4 synthetic: surgical, skipped, deferred"
     );
 
     // tool_call_count in evaluation should match real count
@@ -416,7 +399,7 @@ fn e2e_all_surgical_removals_zero_real_tool_count() {
         surgical_removal("read_file"),
         surgical_removal("glob"),
         surgical_removal("grep"),
-        surgical_removal("git_show"),
+        surgical_removal("git"),
     ];
 
     let writer = JournalWriter::new(session_id).unwrap();
@@ -533,8 +516,8 @@ fn e2e_session_3f4389fe_scenario_turn1_surgical_removal_accuracy() {
         "read_file",
         "glob",
         "grep",
-        "git_show",
-        "git_show",
+        "git",
+        "git",
         "bash",
         "write_file",
         "write_file",
@@ -551,8 +534,8 @@ fn e2e_session_3f4389fe_scenario_turn1_surgical_removal_accuracy() {
         "glob",
         "grep",
         "grep",
-        "git_show",
-        "git_show",
+        "git",
+        "git",
     ] {
         records.push(surgical_removal(tool));
     }
@@ -582,7 +565,7 @@ fn e2e_session_3f4389fe_scenario_turn1_surgical_removal_accuracy() {
             "read_file".into(),
             "glob".into(),
             "grep".into(),
-            "git_show".into(),
+            "git".into(),
             "bash".into(),
             "write_file".into(),
         ],
@@ -624,7 +607,7 @@ fn e2e_session_3f4389fe_scenario_turn1_surgical_removal_accuracy() {
     assert!(original_names.contains(&"read_file"));
     assert!(original_names.contains(&"glob"));
     assert!(original_names.contains(&"grep"));
-    assert!(original_names.contains(&"git_show"));
+    assert!(original_names.contains(&"git"));
 }
 
 // ─── Unhappy path: all tool calls fail (worst case turn) ────────────────────

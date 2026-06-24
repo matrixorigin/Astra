@@ -957,9 +957,6 @@ impl ToolCallRecord {
         if self.surgically_removed == Some(true) {
             return true;
         }
-        if self.name == SURGICAL_REMOVAL_TOOL_NAME {
-            return true;
-        }
 
         let Some(result_preview) = self.result_preview.as_deref() else {
             return false;
@@ -4805,7 +4802,7 @@ mod tests {
             .collect();
         assert_eq!(
             repeat_tools,
-            std::collections::BTreeSet::from(["git_show", "read_file"])
+            std::collections::BTreeSet::from(["git", "read_file"])
         );
     }
 
@@ -5333,9 +5330,9 @@ mod tests {
             1234,
         )
         .with_tool_surface(
-            vec!["bash".into(), "github_list_prs".into(), "read_file".into()],
+            vec!["bash".into(), "github".into(), "read_file".into()],
             vec!["tune-performance".into()],
-            vec!["github_list_prs".into()],
+            vec!["github".into()],
             45,
         )
         .with_budget_pressure(0.6);
@@ -5346,7 +5343,7 @@ mod tests {
             parsed.selected_skills.as_ref().unwrap(),
             &["tune-performance"]
         );
-        assert_eq!(parsed.tools_used.as_ref().unwrap(), &["github_list_prs"]);
+        assert_eq!(parsed.tools_used.as_ref().unwrap(), &["github"]);
         assert_eq!(parsed.budget_used, Some(45));
         assert_eq!(parsed.budget_pressure, Some(0.6));
     }
@@ -5401,9 +5398,9 @@ mod tests {
                     500,
                 )
                 .with_tool_surface(
-                    vec!["bash".into(), "github_list_prs".into()],
+                    vec!["bash".into(), "github".into()],
                     vec![],
-                    vec!["github_list_prs".into()],
+                    vec!["github".into()],
                     35,
                 )
                 .with_budget_pressure(0.3),
@@ -5425,7 +5422,7 @@ mod tests {
         assert_eq!(turn.event_type, JournalEventType::Turn);
         assert_eq!(turn.visible_tools.as_ref().unwrap().len(), 2);
         assert!(turn.selected_skills.is_none());
-        assert_eq!(turn.tools_used.as_ref().unwrap(), &["github_list_prs"]);
+        assert_eq!(turn.tools_used.as_ref().unwrap(), &["github"]);
         assert_eq!(turn.budget_used, Some(35));
         assert_eq!(turn.budget_pressure, Some(0.3));
     }
@@ -5453,14 +5450,9 @@ mod tests {
             150,
             800,
         )
-        .with_tool_surface(
-            vec!["github_list_prs".into()],
-            vec![],
-            vec!["github_list_prs".into()],
-            20,
-        )
+        .with_tool_surface(vec!["github".into()], vec![], vec!["github".into()], 20)
         .with_tool_calls(vec![ToolCallRecord {
-            name: "github_list_prs".into(),
+            name: "github".into(),
             ok: true,
             ms: 761,
             error: None,
@@ -5477,7 +5469,7 @@ mod tests {
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
         let calls = parsed.tool_calls.unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "github_list_prs");
+        assert_eq!(calls[0].name, "github");
         assert!(calls[0].ok);
         assert_eq!(calls[0].ms, 761);
     }
@@ -6777,7 +6769,7 @@ mod tests {
         // ── basic serialization round-trip ──
         {
             let record = ToolCallRecord {
-                name: "github_list_prs".into(),
+                name: "github".into(),
                 ok: true,
                 ms: 761,
                 error: None,
@@ -6794,7 +6786,7 @@ mod tests {
             assert!(json.contains("\"ok\":true"));
             assert!(!json.contains("\"error\""), "None error should be omitted");
             let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
-            assert_eq!(parsed.name, "github_list_prs");
+            assert_eq!(parsed.name, "github");
             assert!(parsed.ok);
             assert_eq!(parsed.ms, 761);
             assert!(parsed.error.is_none());
@@ -6803,7 +6795,7 @@ mod tests {
         // ── with error field ──
         {
             let record = ToolCallRecord {
-                name: "github_ci_status".into(),
+                name: "github".into(),
                 ok: false,
                 ms: 587,
                 error: Some("missing repo parameter".into()),
@@ -6856,7 +6848,7 @@ mod tests {
         // ── unicode error message ──
         {
             let record = ToolCallRecord {
-                name: "github_list_prs".into(),
+                name: "github".into(),
                 ok: false,
                 ms: 500,
                 error: Some("连接超时: タイムアウト 🚫".into()),
@@ -7029,14 +7021,14 @@ mod tests {
 
         // ── is_synthetic_placeholder ── all patterns
         {
-            let rec = base_tool_record(
+            let unflagged_sentinel = base_tool_record(
                 SURGICAL_REMOVAL_TOOL_NAME,
                 true,
-                Some("(removed from context — skill covered this work)"),
+                Some("(removed from context - skill covered this work)"),
             );
             assert!(
-                rec.is_synthetic_placeholder(),
-                "surgically_removed records must be synthetic"
+                !unflagged_sentinel.is_synthetic_placeholder(),
+                "sentinel name alone must not be treated as a supported synthetic marker"
             );
             assert!(
                 base_tool_record("read_file", false, Some("Skipped: skill routed"))
@@ -7054,7 +7046,7 @@ mod tests {
                 )
                 .is_synthetic_placeholder()
             );
-            assert!(!base_tool_record("git_show", true, Some("diff")).is_synthetic_placeholder());
+            assert!(!base_tool_record("git", true, Some("diff")).is_synthetic_placeholder());
             assert!(
                 !base_tool_record("grep", false, Some("error: bad regex"))
                     .is_synthetic_placeholder()
@@ -7471,16 +7463,16 @@ mod turn_event_buffer_tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             tool_calls_returned: 1,
-            tool_call_names: vec!["git_diff".into()],
+            tool_call_names: vec!["git".into()],
             finish_reason: Some("tool_calls".into()),
             agentic_step: Some(1),
             source: Some("agentic_loop".into()),
             run_id: Some("run-embed".into()),
             tool_calls: Some(vec![ToolCallRecord {
-                name: "git_diff".into(),
+                name: "git".into(),
                 ok: true,
                 ms: 50,
-                args_full: Some("{\"stat_only\":true}".into()),
+                args_full: Some("{\"action\":\"diff\",\"stat_only\":true}".into()),
                 result_preview: Some("diff --git ...".into()),
                 round: Some(0),
                 ..Default::default()
@@ -7491,10 +7483,10 @@ mod turn_event_buffer_tests {
         let ev = &events[0];
         let tool_calls = ev.tool_calls.as_ref().expect("embedded tool calls");
         assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].name, "git_diff");
+        assert_eq!(tool_calls[0].name, "git");
         assert_eq!(
             tool_calls[0].args_full.as_deref(),
-            Some("{\"stat_only\":true}")
+            Some("{\"action\":\"diff\",\"stat_only\":true}")
         );
     }
 

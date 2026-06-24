@@ -157,12 +157,12 @@ fn git_worktree_error_paths() {
     let exe = ToolExecutor::new(dir.path());
 
     // enter without branch
-    let result = exe.git_worktree(&json!({"action": "enter"}));
+    let result = exe.worktree(&json!({"action": "enter"}));
     assert!(result.contains("Error"));
     assert!(result.contains("branch"));
 
     // exit when not in session
-    let result = exe.git_worktree(&json!({"action": "exit"}));
+    let result = exe.worktree(&json!({"action": "exit"}));
     assert!(result.contains("Error"));
     assert!(result.contains("Not in a worktree session"));
 }
@@ -174,7 +174,7 @@ async fn git_worktree_enter_records_rollback_handle() {
     exe.journal_turn_index
         .store(7, std::sync::atomic::Ordering::Relaxed);
 
-    let outcome = exe.git_worktree_with_metadata(&json!({
+    let outcome = exe.worktree_with_metadata(&json!({
         "action": "enter",
         "branch": "session-demo",
     }));
@@ -191,7 +191,7 @@ async fn git_worktree_enter_records_rollback_handle() {
     let listed_json: serde_json::Value = serde_json::from_str(&listed).unwrap();
     assert_eq!(listed_json["total_git_worktree_entries"].as_u64(), Some(1));
 
-    let cleanup = exe.git_worktree(&json!({
+    let cleanup = exe.worktree(&json!({
         "action": "exit",
         "exit_action": "remove",
         "discard_changes": true,

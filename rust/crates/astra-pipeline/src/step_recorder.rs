@@ -1577,7 +1577,7 @@ mod tests {
     fn recorder_plan_phase_transition() {
         let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
         rec.begin_turn(0);
-        rec.record_plan(&["github_list_prs".into(), "grep".into()], 0.3, 4000);
+        rec.record_plan(&["github".into(), "grep".into()], 0.3, 4000);
 
         let step = rec.current_step().unwrap();
         assert_eq!(step.execution.cursor.phase, StepAction::Plan);

@@ -378,13 +378,13 @@ mod tests {
     }
 
     #[test]
-    fn registry_select_git_status() {
+    fn registry_select_git_for_status_query() {
         let registry = ToolRegistry::new(mock_schemas());
         let selected = registry.build_initial_surface("git status 看看改了什么", 1);
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             names.contains(&"git".to_string()),
-            "git status query should include git_status, got: {:?}",
+            "git status query should include git, got: {:?}",
             names
         );
     }

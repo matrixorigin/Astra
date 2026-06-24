@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use super::ToolExecutor;
 
-/// State for an active worktree session created by `git_worktree enter`.
+/// State for an active worktree session created by `git(action=worktree)`.
 /// Tracks the worktree path, branch, and original directory for restoration.
 #[derive(Debug, Clone)]
 pub struct WorktreeSession {
@@ -561,7 +561,10 @@ impl ToolExecutor {
     pub fn enter_worktree(&self, branch: &str) -> Result<WorktreeSession, String> {
         // Check if already in a worktree session
         if self.in_worktree_session() {
-            return Err("Already in a worktree session. Use git_worktree exit first.".to_string());
+            return Err(
+                "Already in a worktree session. Use git action=worktree sub_action=exit first."
+                    .to_string(),
+            );
         }
 
         // Validate branch name
@@ -718,7 +721,7 @@ impl ToolExecutor {
         }
     }
 
-    pub(crate) fn git_worktree_with_metadata(&self, args: &Value) -> super::ToolExecutionOutcome {
+    pub(crate) fn worktree_with_metadata(&self, args: &Value) -> super::ToolExecutionOutcome {
         let action = match args.get("action").and_then(Value::as_str) {
             Some(a) => a,
             None => {
@@ -768,7 +771,7 @@ impl ToolExecutor {
                         }
                         super::ToolExecutionOutcome {
                             output: format!(
-                                "✓ Entered worktree\n  Branch: {}\n  Path: {}\n  Session is now working in the worktree. Use `git_worktree exit` to leave.",
+                                "✓ Entered worktree\n  Branch: {}\n  Path: {}\n  Session is now working in the worktree. Use `git` action=`worktree`, sub_action=`exit` to leave.",
                                 session.branch_name,
                                 session.worktree_path.display()
                             ),
@@ -868,8 +871,8 @@ impl ToolExecutor {
         }
     }
 
-    /// Execute git_worktree tool with enter/exit session management.
-    pub(super) fn git_worktree(&self, args: &Value) -> String {
-        self.git_worktree_with_metadata(args).output
+    /// Execute git(action=worktree) with enter/exit session management.
+    pub(super) fn worktree(&self, args: &Value) -> String {
+        self.worktree_with_metadata(args).output
     }
 }

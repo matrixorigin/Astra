@@ -498,9 +498,9 @@ fn build_review_prompt(arg: &str) -> String {
         "Review target: {target_line}\n\
 \n\
 Step 1: Fetch the diff.\n\
-- HEAD → `git_show HEAD` (or parallel: `git_show HEAD` + `git_show HEAD~1` for last 2 commits)\n\
-- WORKING_TREE → `git_diff()`\n\
-- Range/rev → `git_show <rev>` or `git_diff(ref: ...)`\n\
+- HEAD → `git(action=\"show\", revision=\"HEAD\")` (or parallel with `revision=\"HEAD~1\"` for last 2 commits)\n\
+- WORKING_TREE → `git(action=\"diff\")`\n\
+- Range/rev → `git(action=\"show\", revision=\"<rev>\")` or `git(action=\"diff\", ref=\"...\")`\n\
 \n\
 Step 2: Review the diff. Write findings. Stop.\n\
 \n\
@@ -2537,7 +2537,7 @@ mod tests {
     fn build_review_prompt_defaults_to_head() {
         let prompt = build_review_prompt("");
         assert!(prompt.contains("Review target: HEAD"));
-        assert!(prompt.contains("git_show"));
+        assert!(prompt.contains("git(action=\"show\""));
         assert!(prompt.contains("Do NOT call `read_file`"));
     }
 
@@ -2545,7 +2545,7 @@ mod tests {
     fn build_review_prompt_supports_working_tree() {
         let prompt = build_review_prompt("working");
         assert!(prompt.contains("Review target: WORKING_TREE"));
-        assert!(prompt.contains("git_diff"));
+        assert!(prompt.contains("git(action=\"diff\")"));
         assert!(prompt.contains("Do NOT call `read_file`"));
     }
 

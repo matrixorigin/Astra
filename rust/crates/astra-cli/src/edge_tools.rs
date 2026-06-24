@@ -328,7 +328,7 @@ mod tool_search;
 
 /// Git porcelain status codes for git status --porcelain output parsing.
 /// Format: XY PATH or XY ORIG_PATH -> PATH where X and Y are status codes.
-mod git_status {
+mod porcelain_status {
     /// Modified in index (staged)
     pub const MODIFIED: char = 'M';
     /// Added to index (staged)
@@ -4284,26 +4284,26 @@ impl ToolExecutor {
                 .unwrap_or("status");
             match action {
                 "commit" => {
-                    let mut outcome = self.git_commit_with_metadata(args);
+                    let mut outcome = self.commit_with_metadata(args);
                     outcome.output = self.finalize_tool_output(outcome.output, name);
                     self.record_output_size(outcome.output.len());
                     return outcome;
                 }
                 "revert_commit" => {
-                    let mut outcome = self.git_revert_commit_with_metadata(args);
+                    let mut outcome = self.revert_commit_with_metadata(args);
                     outcome.output = self.finalize_tool_output(outcome.output, name);
                     self.record_output_size(outcome.output.len());
                     return outcome;
                 }
                 "stash" => {
                     let stash_args = git_stash_action_args(args);
-                    let mut outcome = self.git_stash_with_metadata(&stash_args);
+                    let mut outcome = self.stash_with_metadata(&stash_args);
                     outcome.output = self.finalize_tool_output(outcome.output, name);
                     self.record_output_size(outcome.output.len());
                     return outcome;
                 }
                 "worktree" => {
-                    let mut outcome = self.git_worktree_with_metadata(args);
+                    let mut outcome = self.worktree_with_metadata(args);
                     outcome.output = self.finalize_tool_output(outcome.output, name);
                     self.record_output_size(outcome.output.len());
                     return outcome;
@@ -4398,35 +4398,35 @@ impl ToolExecutor {
                         .and_then(Value::as_str)
                         .unwrap_or("status");
                     match action {
-                        "status" => git_gix::git_status(&self.project_root, args),
-                        "diff" => git_gix::git_diff(
+                        "status" => git_gix::status(&self.project_root, args),
+                        "diff" => git_gix::diff(
                             &self.project_root,
                             args,
                             self.get_budget_pressure(),
                             self.aggregate_output_bytes
                                 .load(std::sync::atomic::Ordering::Relaxed),
                         ),
-                        "log" => git_gix::git_log(&self.project_root, args),
-                        "show" => git_gix::git_show(
+                        "log" => git_gix::log(&self.project_root, args),
+                        "show" => git_gix::show(
                             &self.project_root,
                             args,
                             self.get_budget_pressure(),
                             self.aggregate_output_bytes
                                 .load(std::sync::atomic::Ordering::Relaxed),
                         ),
-                        "blame" => git_gix::git_blame(&self.project_root, args),
-                        "file_history" => git_gix::git_file_history(&self.project_root, args),
-                        "log_search" => git_gix::git_log_search(&self.project_root, args),
-                        "contributors" => git_gix::git_contributors(&self.project_root, args),
-                        "commit" => self.git_commit(args),
-                        "revert_commit" => self.git_revert_commit(args),
+                        "blame" => git_gix::blame(&self.project_root, args),
+                        "file_history" => git_gix::file_history(&self.project_root, args),
+                        "log_search" => git_gix::log_search(&self.project_root, args),
+                        "contributors" => git_gix::contributors(&self.project_root, args),
+                        "commit" => self.commit(args),
+                        "revert_commit" => self.revert_commit(args),
                         "stash" => {
                             let stash_args = git_stash_action_args(args);
-                            self.git_stash(&stash_args)
+                            self.stash(&stash_args)
                         }
-                        "checkout_file" => self.git_checkout_file(args),
-                        "worktree" => self.git_worktree(args),
-                        "push" => git_gix::git_push(&self.project_root, args),
+                        "checkout_file" => self.checkout_file(args),
+                        "worktree" => self.worktree(args),
+                        "push" => git_gix::push(&self.project_root, args),
                         _ => format!(
                             "Error: unknown git action '{action}'. Use one of: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash, checkout_file, worktree, push"
                         ),
@@ -4447,12 +4447,12 @@ impl ToolExecutor {
                 "github" => {
                     let action = args.get("action").and_then(Value::as_str).unwrap_or("");
                     match action {
-                        "list_prs" => self.github_list_prs(args).await,
-                        "get_pr" => self.github_get_pr(args).await,
-                        "ci_status" => self.github_ci_status(args).await,
-                        "list_issues" => self.github_list_issues(args).await,
-                        "get_issue" => self.github_get_issue(args).await,
-                        "repo_stats" => self.github_repo_stats(args).await,
+                        "list_prs" => self.list_prs(args).await,
+                        "get_pr" => self.get_pr(args).await,
+                        "ci_status" => self.ci_status(args).await,
+                        "list_issues" => self.list_issues(args).await,
+                        "get_issue" => self.get_issue(args).await,
+                        "repo_stats" => self.repo_stats(args).await,
                         "create_issue" => self.github_create_issue(args).await,
                         "" => "Error: missing required parameter 'action'. Use one of: list_prs, get_pr, ci_status, list_issues, get_issue, repo_stats, create_issue".to_string(),
                         other => format!(

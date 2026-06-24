@@ -54,7 +54,7 @@ pub enum Scope {
 /// Static metadata for a tool — used for catalog diagnostics and discovery, never sent to LLM.
 #[derive(Debug, Clone)]
 pub struct ToolMeta {
-    /// Tool function name (e.g. "bash", "github_list_prs")
+    /// Tool function name (e.g. "bash", "github")
     pub name: &'static str,
     /// Short description for deferred discovery metadata.
     pub description: &'static str,
