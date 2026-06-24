@@ -153,13 +153,6 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
         return result.to_string();
     }
 
-    if has_query_prefix(query, "detail:") {
-        return tool_search_error(
-            "'detail:' mode has been removed; use 'select:NAME' to activate the tool schema",
-        )
-        .to_string();
-    }
-
     // Keyword search mode — delegates scoring to shared utility.
     let adapters: Vec<ToolSchemaAdapter> = valid_schemas
         .iter()
@@ -547,10 +540,6 @@ mod tests {
             parsed["matches"][0].get("score").is_none(),
             "select mode must return schema entries, not keyword scores: {parsed}"
         );
-        assert!(
-            parsed["matches"][0].get("detail_query").is_none(),
-            "detail mode has been removed; select results must not suggest it: {parsed}"
-        );
     }
 
     #[test]
@@ -829,16 +818,6 @@ mod tests {
             "select result should keep callable shape but strip nested prose: {parsed}"
         );
 
-        let result = tool_search(&schemas, &json!({"query": "detail:read_file"}));
-        let parsed: Value = serde_json::from_str(&result).expect("valid json");
-        assert_eq!(parsed["mode"].as_str(), Some("error"));
-        assert_eq!(parsed["status"].as_str(), Some("failed"));
-        assert_eq!(
-            parsed["error"].as_str(),
-            Some("'detail:' mode has been removed; use 'select:NAME' to activate the tool schema"),
-            "detail mode must be retired instead of duplicating select semantics: {parsed}"
-        );
-
         let result = tool_search(&schemas, &json!({"query": "file"}));
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert!(parsed["matches"][0].get("parameters").is_none());
@@ -896,16 +875,6 @@ mod tests {
             parsed["matches"][0]["description_truncated"].as_bool(),
             Some(true)
         );
-        assert!(
-            parsed["matches"][0].get("detail_query").is_none(),
-            "select result must not carry retired detail guidance: {parsed}"
-        );
-
-        let result = tool_search(&schemas, &json!({"query": "detail:big"}));
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["mode"].as_str(), Some("error"));
-        assert_eq!(parsed["status"].as_str(), Some("failed"));
-
         let result = tool_search(&schemas, &json!({"query": "big"}));
         let parsed: Value = serde_json::from_str(&result).unwrap();
         let desc = parsed["matches"][0]["description"].as_str().unwrap();
