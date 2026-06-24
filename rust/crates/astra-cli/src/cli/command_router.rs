@@ -79,6 +79,17 @@ async fn start_http_server(host: &str, port: u16) -> Result<(), String> {
         .map_err(|e| format!("API server failed to start: {e}"))
 }
 
+async fn fresh_access_token_or_error(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+) -> Result<String, String> {
+    session_runtime::fresh_access_token(api, profile)
+        .await
+        .ok_or_else(|| {
+            "Unable to obtain a valid access token; run `astra login` and retry.".to_string()
+        })
+}
+
 impl From<ExitCode> for i32 {
     fn from(code: ExitCode) -> i32 {
         code as i32
@@ -457,10 +468,8 @@ async fn execute_headless_task_body(
         session_routing,
     } = input;
     use astra_services::TaskStatus;
-    let (_creds, profile_name, _, token) = get_profile_and_token(profile)?;
-    let token = session_runtime::fresh_access_token(api, profile)
-        .await
-        .unwrap_or(token);
+    let (_creds, profile_name, _, _token) = get_profile_and_token(profile)?;
+    let token = fresh_access_token_or_error(api, profile).await?;
     let session_id = session_routing.server_session_id.clone();
     let effective_model = resolve_one_shot_model(
         api,
@@ -1097,6 +1106,23 @@ mod permission_mode_display_tests {
     }
 }
 
+#[cfg(test)]
+mod token_refresh_error_tests {
+    #[test]
+    fn command_router_does_not_fall_back_to_stale_token_after_refresh_failure() {
+        let source = include_str!("command_router.rs");
+        let stale_fallback_pattern = [".unwrap_or(", "token)"].concat();
+        assert!(
+            source.contains("fresh_access_token_or_error"),
+            "one-shot command paths must use the shared fail-fast token refresh helper"
+        );
+        assert!(
+            !source.contains(&stale_fallback_pattern),
+            "fresh_access_token failures must not silently reuse stale credentials"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_cli_command(
     command: Option<Command>,
@@ -1180,10 +1206,8 @@ async fn execute_cli_command_impl(
         Some(Command::Message(words)) => {
             let raw_message = words.join(" ");
             let message = apply_system_prompt(&raw_message, system_prompt.as_deref());
-            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let token = session_runtime::fresh_access_token(api, profile.as_deref())
-                .await
-                .unwrap_or(token);
+            let (_, _, _, _token) = get_profile_and_token(profile.as_deref())?;
+            let token = fresh_access_token_or_error(api, profile.as_deref()).await?;
             let session_routing = resolve_one_shot_session_routing(
                 api,
                 profile.as_deref(),
@@ -1672,10 +1696,8 @@ async fn execute_cli_command_impl(
                 return Ok(ExitCode::Success);
             };
 
-            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let token = session_runtime::fresh_access_token(api, profile.as_deref())
-                .await
-                .unwrap_or(token);
+            let (_, _, _, _token) = get_profile_and_token(profile.as_deref())?;
+            let token = fresh_access_token_or_error(api, profile.as_deref()).await?;
             let explicit_session_id = args.session_id.clone();
             let session_routing = resolve_one_shot_session_routing(
                 api,
@@ -2467,10 +2489,8 @@ pub(crate) async fn run_print_mode(
     };
     let message = apply_system_prompt(&raw_message, system_prompt);
 
-    let (_, _, _, token) = get_profile_and_token(profile)?;
-    let token = session_runtime::fresh_access_token(api, profile)
-        .await
-        .unwrap_or(token);
+    let (_, _, _, _token) = get_profile_and_token(profile)?;
+    let token = fresh_access_token_or_error(api, profile).await?;
     let session_routing =
         resolve_one_shot_session_routing(api, profile, cli_context.session_id.clone(), true)
             .await?;

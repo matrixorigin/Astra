@@ -612,6 +612,7 @@ fn build_server_skill_executor(
     request_constraints: RequestConstraints,
     inherited_permissions: InheritedPermissions,
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
+    user_id: &str,
     session_id: &str,
     edge_connection_pool: Option<&astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
@@ -626,6 +627,7 @@ fn build_server_skill_executor(
     let mut subrun_executor = ServerSkillSubRunExecutor::new(
         matrixone.clone(),
         Arc::clone(encryptor),
+        user_id.to_string(),
         session_id.to_string(),
     )
     .with_pool(shared_pool.cloned())
@@ -3276,6 +3278,7 @@ impl AgenticRunLifecycleService {
             request_constraints.clone(),
             root_permissions.clone(),
             skill_resolver.clone(),
+            user_id,
             session_id,
             self.edge_connection_pool.as_ref(),
             cancel_token,
@@ -3323,7 +3326,7 @@ impl AgenticRunLifecycleService {
             restricted_tools,
             boosted_tools: std::collections::HashSet::new(),
             widen_selection_pending: false,
-            step_recorder: StepRecorder::new(session_id, run_id),
+            step_recorder: StepRecorder::new(user_id, session_id, run_id),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
             call_counts: HashMap::new(),
@@ -7214,7 +7217,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             restricted_tools,
             boosted_tools: std::collections::HashSet::new(),
             widen_selection_pending: false,
-            step_recorder: StepRecorder::new(&config.session_id, &config.run_id),
+            step_recorder: StepRecorder::new(&config.user_id, &config.session_id, &config.run_id),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
             call_counts: HashMap::new(),

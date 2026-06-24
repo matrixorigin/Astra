@@ -30,7 +30,7 @@ mod tests {
 
     #[test]
     fn record_plan_with_report() {
-        let mut rec = StepRecorder::new("sid", "tid");
+        let mut rec = StepRecorder::new("test-user", "sid", "tid");
         let rep = SelectionReport {
             tools_selected: vec!["bash".into()],
             dynamic_tools_selected: Vec::new(),

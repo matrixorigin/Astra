@@ -605,7 +605,7 @@ mod tests {
                 deferred_tool_names: HashSet::new(),
                 restricted_tools: HashSet::new(),
                 turn_guard: TurnGuard::new(),
-                step_recorder: StepRecorder::new("test-session", "test-task"),
+                step_recorder: StepRecorder::new("test-user", "test-session", "test-task"),
                 idempotency_cache: InMemoryIdempotencyCache::new(),
                 semantic_dedup: SemanticDedup::new(0.95),
                 call_counts: HashMap::new(),

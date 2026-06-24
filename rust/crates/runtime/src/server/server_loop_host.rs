@@ -7538,7 +7538,7 @@ mod tests {
             restricted_tools: HashSet::new(),
             boosted_tools: HashSet::new(),
             widen_selection_pending: false,
-            step_recorder: StepRecorder::new("test-session", "test-task"),
+            step_recorder: StepRecorder::new("test-user", "test-session", "test-task"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
             call_counts: HashMap::new(),

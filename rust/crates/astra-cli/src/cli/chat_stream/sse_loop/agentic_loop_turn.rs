@@ -2004,7 +2004,7 @@ mod tests {
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
-        let mut step_recorder = StepRecorder::new("session-1", "task-1");
+        let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -2184,7 +2184,7 @@ mod tests {
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
-        let mut step_recorder = StepRecorder::new("session-1", "task-1");
+        let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -2305,7 +2305,8 @@ mod tests {
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
-        let mut step_recorder = StepRecorder::new("session-empty-selector", "task-empty-selector");
+        let mut step_recorder =
+            StepRecorder::new("test-user", "session-empty-selector", "task-empty-selector");
         let turn_guard = TurnGuard::default();
         let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -2420,8 +2421,11 @@ mod tests {
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
-        let mut step_recorder =
-            StepRecorder::new("session-pending-activation", "task-pending-activation");
+        let mut step_recorder = StepRecorder::new(
+            "test-user",
+            "session-pending-activation",
+            "task-pending-activation",
+        );
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
         let mut first_selection_report = None;
@@ -2524,7 +2528,7 @@ mod tests {
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
-        let mut step_recorder = StepRecorder::new("session-empty", "task-empty");
+        let mut step_recorder = StepRecorder::new("test-user", "session-empty", "task-empty");
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
         let mut first_selection_report = None;
@@ -2636,7 +2640,7 @@ mod tests {
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
-        let mut step_recorder = StepRecorder::new("session-1", "task-1");
+        let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -2748,7 +2752,7 @@ mod tests {
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
-        let mut step_recorder = StepRecorder::new("session-1", "task-1");
+        let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -2877,7 +2881,7 @@ mod tests {
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
-        let mut step_recorder = StepRecorder::new("session-1", "task-1");
+        let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -3003,7 +3007,7 @@ mod tests {
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
-        let mut step_recorder = StepRecorder::new("session-1", "task-1");
+        let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -3115,7 +3119,7 @@ mod tests {
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
-        let mut step_recorder = StepRecorder::new("session-1", "task-1");
+        let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -3220,7 +3224,7 @@ mod tests {
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
-        let mut step_recorder = StepRecorder::new("session-1", "task-1");
+        let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -3333,7 +3337,7 @@ mod tests {
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
-        let mut step_recorder = StepRecorder::new("session-1", "task-1");
+        let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let skill_search = astra_core::SkillSearchSettings::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -3450,7 +3454,7 @@ mod tests {
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = true;
-        let mut step_recorder = StepRecorder::new("session-1", "task-1");
+        let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let mut turn_guard = TurnGuard::default();
         turn_guard.health.record_failure("write_file");
         turn_guard.health.record_failure("write_file");

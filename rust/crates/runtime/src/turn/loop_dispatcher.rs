@@ -297,7 +297,7 @@ mod tests {
             restricted_tools: HashSet::new(),
             boosted_tools: HashSet::new(),
             widen_selection_pending: false,
-            step_recorder: StepRecorder::new("test", "run"),
+            step_recorder: StepRecorder::new("test-user", "test", "run"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
             call_counts: HashMap::new(),

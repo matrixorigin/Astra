@@ -71,6 +71,9 @@ pub struct ServerSkillSubRunExecutor {
     request_constraints: RequestConstraints,
     /// Session ID for the parent run.
     session_id: String,
+    /// Owner ID for the parent run. Skill sub-runs inherit this owner for
+    /// step artifacts instead of deriving identity from generated subrun IDs.
+    user_id: String,
     /// Edge connection pool for routing tool calls to connected edges.
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     /// Shared tool_call dedup state from the parent host. When set, the sub-run
@@ -96,6 +99,7 @@ impl ServerSkillSubRunExecutor {
     pub fn new(
         matrixone: MatrixOneSettings,
         encryptor: Arc<FernetTokenEncryptor>,
+        user_id: String,
         session_id: String,
     ) -> Self {
         Self {
@@ -112,6 +116,7 @@ impl ServerSkillSubRunExecutor {
             forward_headers: HashMap::new(),
             request_constraints: Default::default(),
             session_id,
+            user_id,
             edge_connection_pool: None,
             #[cfg(feature = "bridge-e2e-hooks")]
             dedup_state: None,
@@ -379,7 +384,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
             .unwrap_or_default();
 
-        let step_recorder = StepRecorder::new(&subrun_session_id, &subrun_session_id);
+        let step_recorder =
+            StepRecorder::new(&self.user_id, &subrun_session_id, &subrun_session_id);
 
         let mut state = AgenticLoopState {
             messages,
@@ -621,8 +627,10 @@ mod tests {
         let executor = ServerSkillSubRunExecutor::new(
             mock_matrixone(),
             mock_encryptor(),
+            "test-user".to_string(),
             "test-session".to_string(),
         );
+        assert_eq!(executor.user_id, "test-user");
         assert!(executor.cancel_token.is_none());
         assert!(executor.skill_resolver.is_none());
         assert!(executor.llm_token_service.is_none());
@@ -637,6 +645,7 @@ mod tests {
         let executor = ServerSkillSubRunExecutor::new(
             mock_matrixone(),
             mock_encryptor(),
+            "test-user".to_string(),
             "test-session".to_string(),
         )
         .with_default_model(Some("claude-sonnet-4-20250514".to_string()))
@@ -663,6 +672,7 @@ mod tests {
         let executor = ServerSkillSubRunExecutor::new(
             mock_matrixone(),
             mock_encryptor(),
+            "test-user".to_string(),
             "test-session".to_string(),
         )
         .with_inherited_permissions(inherited_permissions);
@@ -679,6 +689,7 @@ mod tests {
         let executor = ServerSkillSubRunExecutor::new(
             mock_matrixone(),
             mock_encryptor(),
+            "test-user".to_string(),
             "test-session".to_string(),
         )
         .with_execution_binding_snapshot(snapshot.clone());
@@ -701,6 +712,7 @@ mod tests {
         let executor = ServerSkillSubRunExecutor::new(
             mock_matrixone(),
             mock_encryptor(),
+            "test-user".to_string(),
             "test-session".to_string(),
         );
         // NOTE: empty `allowed_tools` here is intentional and SAFE because

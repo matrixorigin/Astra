@@ -187,7 +187,7 @@ mod tests {
             restricted_tools: HashSet::new(),
             boosted_tools: HashSet::new(),
             widen_selection_pending: false,
-            step_recorder: StepRecorder::new("test-session", "test-task"),
+            step_recorder: StepRecorder::new("test-user", "test-session", "test-task"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.95),
             call_counts: HashMap::new(),
@@ -659,7 +659,7 @@ mod tests {
         let valid_tool_names = HashSet::from(["bash".to_string()]);
         let mut restricted_tools = HashSet::new();
         let mut turn_guard = TurnGuard::new();
-        let mut step_recorder = StepRecorder::new("test-session", "perm-headless");
+        let mut step_recorder = StepRecorder::new("test-user", "test-session", "perm-headless");
         let mut idempotency_cache = InMemoryIdempotencyCache::new();
         let mut semantic_dedup = SemanticDedup::new(0.95);
         let mut tool_call_records = Vec::new();
@@ -738,7 +738,7 @@ mod tests {
         let valid_tool_names = HashSet::from(["write_file".to_string()]);
         let mut restricted_tools = HashSet::new();
         let mut turn_guard = TurnGuard::new();
-        let mut step_recorder = StepRecorder::new("test-session", "plan-mode-write");
+        let mut step_recorder = StepRecorder::new("test-user", "test-session", "plan-mode-write");
         let mut idempotency_cache = InMemoryIdempotencyCache::new();
         let mut semantic_dedup = SemanticDedup::new(0.95);
         let mut tool_call_records = Vec::new();
@@ -831,7 +831,7 @@ mod tests {
         let valid_tool_names = HashSet::from(["bash".to_string()]);
         let mut restricted_tools = HashSet::new();
         let mut turn_guard = TurnGuard::new();
-        let mut step_recorder = StepRecorder::new("test-session", "empty-id");
+        let mut step_recorder = StepRecorder::new("test-user", "test-session", "empty-id");
         let mut idempotency_cache = InMemoryIdempotencyCache::new();
         let mut semantic_dedup = SemanticDedup::new(0.95);
         let mut tool_call_records = Vec::new();
@@ -932,7 +932,7 @@ mod tests {
         let valid_tool_names = HashSet::from(["bash".to_string(), "skill".to_string()]);
         let mut restricted_tools = HashSet::new();
         let mut turn_guard = TurnGuard::new();
-        let mut step_recorder = StepRecorder::new("test-session", "pre-resolved");
+        let mut step_recorder = StepRecorder::new("test-user", "test-session", "pre-resolved");
         let mut idempotency_cache = InMemoryIdempotencyCache::new();
         let mut semantic_dedup = SemanticDedup::new(0.95);
         let mut tool_call_records = Vec::new();
@@ -1059,7 +1059,7 @@ mod tests {
         ]);
         let mut restricted_tools = HashSet::new();
         let mut turn_guard = TurnGuard::new();
-        let mut step_recorder = StepRecorder::new("test-session", "all-pre-resolved");
+        let mut step_recorder = StepRecorder::new("test-user", "test-session", "all-pre-resolved");
         let mut idempotency_cache = InMemoryIdempotencyCache::new();
         let mut semantic_dedup = SemanticDedup::new(0.95);
         let mut tool_call_records = Vec::new();
@@ -1178,7 +1178,7 @@ mod tests {
         let valid_tool_names = HashSet::from(["skill".to_string(), "grep".to_string()]);
         let mut restricted_tools = HashSet::new();
         let mut turn_guard = TurnGuard::new();
-        let mut step_recorder = StepRecorder::new("test-session", "mixed-edge");
+        let mut step_recorder = StepRecorder::new("test-user", "test-session", "mixed-edge");
         let mut idempotency_cache = InMemoryIdempotencyCache::new();
         let mut semantic_dedup = SemanticDedup::new(0.95);
         let mut tool_call_records = Vec::new();
@@ -1283,7 +1283,7 @@ mod tests {
         let valid_tool_names = HashSet::from(["bash".to_string()]);
         let mut restricted_tools = HashSet::new();
         let mut turn_guard = TurnGuard::new();
-        let mut step_recorder = StepRecorder::new("test-session", "empty-name-burst");
+        let mut step_recorder = StepRecorder::new("test-user", "test-session", "empty-name-burst");
         let mut idempotency_cache = InMemoryIdempotencyCache::new();
         let mut semantic_dedup = SemanticDedup::new(0.95);
         let mut tool_call_records = Vec::new();
@@ -1410,7 +1410,7 @@ mod tests {
         let valid_tool_names = HashSet::from(["bash".to_string()]);
         let mut restricted_tools = HashSet::new();
         let mut turn_guard = TurnGuard::new();
-        let mut step_recorder = StepRecorder::new("test-session", "perm-request");
+        let mut step_recorder = StepRecorder::new("test-user", "test-session", "perm-request");
         let mut idempotency_cache = InMemoryIdempotencyCache::new();
         let mut semantic_dedup = SemanticDedup::new(0.95);
         let mut tool_call_records = Vec::new();
@@ -1543,7 +1543,7 @@ mod tests {
         let valid_tool_names = HashSet::from(["bash".to_string()]);
         let mut restricted_tools = HashSet::new();
         let mut turn_guard = TurnGuard::new();
-        let mut step_recorder = StepRecorder::new("test-session", "perm-denied");
+        let mut step_recorder = StepRecorder::new("test-user", "test-session", "perm-denied");
         let mut idempotency_cache = InMemoryIdempotencyCache::new();
         let mut semantic_dedup = SemanticDedup::new(0.95);
         let mut tool_call_records = Vec::new();
@@ -1633,7 +1633,7 @@ mod tests {
         let valid_tool_names = HashSet::from(["bash".to_string()]);
         let mut restricted_tools = HashSet::new();
         let mut turn_guard = TurnGuard::new();
-        let mut step_recorder = StepRecorder::new("test-session", "empty-name");
+        let mut step_recorder = StepRecorder::new("test-user", "test-session", "empty-name");
         let mut idempotency_cache = InMemoryIdempotencyCache::new();
         let mut semantic_dedup = SemanticDedup::new(0.95);
         let mut tool_call_records = Vec::new();

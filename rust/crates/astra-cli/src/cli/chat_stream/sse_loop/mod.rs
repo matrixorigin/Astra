@@ -567,6 +567,7 @@ pub(crate) async fn stream_chat_sse(
         )
     } else {
         StepRecorder::new(
+            &current_user_id,
             "ephemeral",
             step_recorder_chat_ephemeral_run_id(start.elapsed().as_millis()).as_str(),
         )

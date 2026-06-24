@@ -1,10 +1,10 @@
 //! Step checkpoint persistence — write/read StepCheckpoint JSON to local filesystem.
 //!
 //! Stores checkpoints at:
-//! `~/.astra/sessions/v1/users/sha256-<user_id>/sessions/<session_id>/step_checkpoints/<number>-<tier>.json`
+//! `~/.astra/sessions/v1/users/b64-<url-safe-user-id>/sessions/<session_id>/step_checkpoints/<number>-<tier>.json`
 //!
 //! Also provides a file-backed StepEventStore that writes events as JSONL:
-//! `~/.astra/sessions/v1/users/sha256-<user_id>/sessions/<session_id>/step_events.jsonl`
+//! `~/.astra/sessions/v1/users/b64-<url-safe-user-id>/sessions/<session_id>/step_events.jsonl`
 //!
 //! Light checkpoints (~1KB) written after each tool completion.
 //! Heavy checkpoints (~10-100KB) written after each turn's verdict.
@@ -13,8 +13,8 @@
 use std::path::{Path, PathBuf};
 
 use astra_services::SessionArtifactStore;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sha2::{Digest, Sha256};
 
 use crate::step_protocol::{
     CheckpointTier, HeavyCheckpoint, LightCheckpoint, StepCheckpoint, StepEvent, StepEventStore,
@@ -153,13 +153,10 @@ fn owner_key(user_id: &str) -> std::io::Result<String> {
             "user_id must not be empty for owner-bound step artifacts",
         ));
     }
-    let digest = Sha256::digest(user_id.as_bytes());
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut hex, "{byte:02x}");
-    }
-    Ok(format!("sha256-{hex}"))
+    Ok(format!(
+        "b64-{}",
+        URL_SAFE_NO_PAD.encode(user_id.as_bytes())
+    ))
 }
 
 pub fn owner_session_dir_for(user_id: &str, session_id: &str) -> std::io::Result<PathBuf> {
@@ -1004,6 +1001,29 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn owner_directory_key_is_versioned_url_safe_base64() {
+        let user_id = "owner+matrixone@example.com";
+        let session_id = "owner-layout";
+
+        let owner_key = owner_key(user_id).unwrap();
+        assert_eq!(owner_key, "b64-b3duZXIrbWF0cml4b25lQGV4YW1wbGUuY29t");
+        assert!(!owner_key.starts_with("sha256-"));
+        assert!(!owner_key.contains('/'));
+        assert!(!owner_key.contains('='));
+
+        let decoded = URL_SAFE_NO_PAD
+            .decode(owner_key.strip_prefix("b64-").unwrap())
+            .unwrap();
+        assert_eq!(decoded, user_id.as_bytes());
+
+        let path = owner_session_dir_for(user_id, session_id).unwrap();
+        let rendered = path.to_string_lossy();
+        assert!(rendered.contains(&format!(
+            "/{STEP_LOCAL_LAYOUT_VERSION}/users/b64-b3duZXIrbWF0cml4b25lQGV4YW1wbGUuY29t/sessions/owner-layout"
+        )));
     }
 
     #[test]
