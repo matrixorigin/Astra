@@ -463,25 +463,52 @@ fn string_array_field(value: &Value, field: &str) -> Vec<String> {
 
 fn compact_select_parameters(params: &Value) -> Value {
     let mut compact = params.clone();
-    strip_nested_descriptions(&mut compact);
+    strip_schema_descriptions(&mut compact);
     compact
 }
 
-fn strip_nested_descriptions(value: &mut Value) {
+fn strip_schema_descriptions(value: &mut Value) {
     match value {
         Value::Object(map) => {
             map.remove("description");
-            for child in map.values_mut() {
-                strip_nested_descriptions(child);
+            for (key, child) in map {
+                if is_schema_map_key(key) {
+                    strip_schema_map_descriptions(child);
+                } else {
+                    strip_schema_descriptions(child);
+                }
             }
         }
         Value::Array(values) => {
             for child in values {
-                strip_nested_descriptions(child);
+                strip_schema_descriptions(child);
             }
         }
         _ => {}
     }
+}
+
+fn strip_schema_map_descriptions(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for child in map.values_mut() {
+                strip_schema_descriptions(child);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                strip_schema_descriptions(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_schema_map_key(key: &str) -> bool {
+    matches!(
+        key,
+        "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas"
+    )
 }
 
 #[cfg(test)]
@@ -895,6 +922,36 @@ mod tests {
         let result = tool_search(&schemas, &json!({"query": "file"}));
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert!(parsed["matches"][0].get("parameters").is_none());
+    }
+
+    #[test]
+    fn select_compaction_preserves_property_named_description() {
+        let schemas = crate::schemas::all_tool_schemas();
+
+        let result = tool_search(&schemas, &json!({"query": "select:agent_fanout"}));
+        let parsed: Value = serde_json::from_str(&result).expect("valid json");
+        let fanout = &parsed["matches"][0];
+        let slot_schema = &fanout["parameters"]["properties"]["slots"]["items"];
+        let slot_required = slot_schema["required"]
+            .as_array()
+            .unwrap_or_else(|| panic!("slot schema must declare required fields: {parsed}"));
+        assert!(
+            slot_required
+                .iter()
+                .any(|value| value.as_str() == Some("description")),
+            "slot description must remain required: {parsed}"
+        );
+        let slot_props = slot_schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("slot schema must declare properties: {parsed}"));
+        let description_param = slot_props.get("description").unwrap_or_else(|| {
+            panic!("select compaction must preserve parameter named description: {parsed}")
+        });
+        assert_eq!(description_param["type"].as_str(), Some("string"));
+        assert!(
+            description_param.get("description").is_none(),
+            "select compaction should strip prose from the description parameter schema without deleting the parameter: {parsed}"
+        );
     }
 
     #[test]

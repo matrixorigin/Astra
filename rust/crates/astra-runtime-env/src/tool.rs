@@ -254,9 +254,10 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         control_plane("exit_plan_mode", ToolLoadPolicy::Deferred),
         control_plane("get_agent_info", ToolLoadPolicy::Deferred),
         control_plane("introspect", ToolLoadPolicy::Deferred),
-        // notify is also control-plane, but it is non-blocking/proactive
-        // communication, so it does not earn default tools[] space.
-        control_plane("notify", ToolLoadPolicy::Deferred),
+        // Non-blocking status updates are still part of the user communication
+        // path, so keep notify available with ask_user instead of requiring a
+        // discovery round-trip.
+        control_plane("notify", ToolLoadPolicy::AlwaysLoad),
         control_plane("compress_context", ToolLoadPolicy::Deferred),
         control_plane("rollback_session_state", ToolLoadPolicy::Deferred),
         control_plane("session", ToolLoadPolicy::Deferred),
@@ -945,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_load_policy_separates_blocking_prompt_from_notification() {
+    fn control_plane_user_communication_tools_are_always_load() {
         let registry = registry();
         let ask_user = registry.get("ask_user").expect("ask_user registered");
         let notify = registry.get("notify").expect("notify registered");
@@ -953,7 +954,7 @@ mod tests {
         assert_eq!(ask_user.required.executor, RequiredExecutor::ControlPlane);
         assert_eq!(notify.required.executor, RequiredExecutor::ControlPlane);
         assert_eq!(ask_user.load_policy, ToolLoadPolicy::AlwaysLoad);
-        assert_eq!(notify.load_policy, ToolLoadPolicy::Deferred);
+        assert_eq!(notify.load_policy, ToolLoadPolicy::AlwaysLoad);
     }
 
     #[test]

@@ -103,7 +103,7 @@ fn internal_runtime_tool_specs_do_not_have_public_schemas() {
     }
 }
 
-/// The default always_load set is the 13-member core.
+/// The default always_load set is the 14-member core.
 /// See `astra_runtime_env::ToolSpec::load_policy` for the per-tool classification.
 #[test]
 fn always_load_default_members_are_the_core_set() {
@@ -122,6 +122,7 @@ fn always_load_default_members_are_the_core_set() {
         "glob",
         "list_dir",
         "memory", // intrinsic per ToolSpec load policy
+        "notify", // non-blocking user communication; pairs with ask_user
         "tool_search",
         "skill",
         "task", // session_todos surface — TUI dashboard depends on it
@@ -145,10 +146,6 @@ fn always_load_default_members_are_the_core_set() {
     assert!(
         !always_load_names.iter().any(|n| n == "introspect"),
         "introspect is diagnostic-only and must remain deferred by default"
-    );
-    assert!(
-        !always_load_names.iter().any(|n| n == "notify"),
-        "notify is non-blocking/proactive communication; ask_user remains the always-load blocking clarification tool"
     );
 }
 
