@@ -61,7 +61,7 @@ pub const HEALTH_AVOIDANCE_TOOL_FACTOR: f64 = 0.3;
 pub struct HealthRankingInputs<'a> {
     /// Per-tool failure rate in `[0.0, 1.0]`.
     pub tool_failure_rates: &'a std::collections::HashMap<String, f64>,
-    /// Tools explicitly health_avoidance by health feedback.
+    /// Tools with active health-avoidance advice.
     pub health_avoidance_tools: &'a HashSet<String>,
     /// Optional skill-level quality tracker. If `None`, all skills start
     /// from boost `1.0` and are penalized only by tool health.
@@ -147,10 +147,10 @@ mod tests {
     #[test]
     fn healthy_tool_gives_unchanged_quality_boost() {
         let r = rates(&[("read_file", 0.0)]);
-        let dep = HashSet::new();
+        let avoidance = HashSet::new();
         let inputs = HealthRankingInputs {
             tool_failure_rates: &r,
-            health_avoidance_tools: &dep,
+            health_avoidance_tools: &avoidance,
             skill_quality: None,
         };
         let m = rank_multiplier("explore", &["read_file"], &inputs);
@@ -160,10 +160,10 @@ mod tests {
     #[test]
     fn failing_tool_penalizes_multiplier() {
         let r = rates(&[("flaky", 0.8)]);
-        let dep = HashSet::new();
+        let avoidance = HashSet::new();
         let inputs = HealthRankingInputs {
             tool_failure_rates: &r,
-            health_avoidance_tools: &dep,
+            health_avoidance_tools: &avoidance,
             skill_quality: None,
         };
         let m = rank_multiplier("risky_skill", &["flaky"], &inputs);
@@ -174,11 +174,11 @@ mod tests {
     #[test]
     fn health_avoidance_tool_pins_factor_regardless_of_rate() {
         let r = rates(&[("bash", 0.0)]); // looks healthy by rate
-        let mut dep = HashSet::new();
-        dep.insert("bash".to_string());
+        let mut avoidance = HashSet::new();
+        avoidance.insert("bash".to_string());
         let inputs = HealthRankingInputs {
             tool_failure_rates: &r,
-            health_avoidance_tools: &dep,
+            health_avoidance_tools: &avoidance,
             skill_quality: None,
         };
         let m = rank_multiplier("shell_skill", &["bash"], &inputs);
@@ -188,11 +188,11 @@ mod tests {
     #[test]
     fn no_tools_means_quality_only() {
         let r = rates(&[]);
-        let dep = HashSet::new();
+        let avoidance = HashSet::new();
         let q = SkillQualityTracker::new();
         let inputs = HealthRankingInputs {
             tool_failure_rates: &r,
-            health_avoidance_tools: &dep,
+            health_avoidance_tools: &avoidance,
             skill_quality: Some(&q),
         };
         let m = rank_multiplier("abstract_skill", &[], &inputs);
@@ -202,10 +202,10 @@ mod tests {
     #[test]
     fn multiple_tools_compound_penalties() {
         let r = rates(&[("a", 0.5), ("b", 0.4)]);
-        let dep = HashSet::new();
+        let avoidance = HashSet::new();
         let inputs = HealthRankingInputs {
             tool_failure_rates: &r,
-            health_avoidance_tools: &dep,
+            health_avoidance_tools: &avoidance,
             skill_quality: None,
         };
         let m = rank_multiplier("chain_skill", &["a", "b"], &inputs);
@@ -216,10 +216,10 @@ mod tests {
     #[test]
     fn score_clamped_above_min() {
         let r = rates(&[("x", 1.0), ("y", 1.0), ("z", 1.0)]);
-        let dep = HashSet::new();
+        let avoidance = HashSet::new();
         let inputs = HealthRankingInputs {
             tool_failure_rates: &r,
-            health_avoidance_tools: &dep,
+            health_avoidance_tools: &avoidance,
             skill_quality: None,
         };
         let m = rank_multiplier("tripled_broken", &["x", "y", "z"], &inputs);
@@ -234,10 +234,10 @@ mod tests {
             ("third".into(), vec!["read_file".into()]),
         ];
         let r = rates(&[("read_file", 0.0)]);
-        let dep = HashSet::new();
+        let avoidance = HashSet::new();
         let inputs = HealthRankingInputs {
             tool_failure_rates: &r,
-            health_avoidance_tools: &dep,
+            health_avoidance_tools: &avoidance,
             skill_quality: None,
         };
         let scores = sort_by_health_rank(&mut skills, &inputs);
@@ -256,10 +256,10 @@ mod tests {
             ("healthy".into(), vec!["read_file".into()]),
         ];
         let r = rates(&[("bash", 0.9), ("read_file", 0.0)]);
-        let dep = HashSet::new();
+        let avoidance = HashSet::new();
         let inputs = HealthRankingInputs {
             tool_failure_rates: &r,
-            health_avoidance_tools: &dep,
+            health_avoidance_tools: &avoidance,
             skill_quality: None,
         };
         sort_by_health_rank(&mut skills, &inputs);

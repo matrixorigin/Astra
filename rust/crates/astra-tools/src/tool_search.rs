@@ -570,27 +570,30 @@ mod tests {
             "tool_search must return data, not prompt instructions: {parsed}"
         );
 
-        let result = tool_search(&schemas, &json!({"query": "select:spawn_agent"}));
+        let result = tool_search(&schemas, &json!({"query": "select:missing_tool"}));
         let parsed = parse_result(&result);
         assert_eq!(match_names(&parsed), Vec::<String>::new());
-        assert_eq!(field_strings(&parsed, "missing"), strings(&["spawn_agent"]));
+        assert_eq!(
+            field_strings(&parsed, "missing"),
+            strings(&["missing_tool"])
+        );
     }
 
     #[test]
-    fn select_mode_does_not_resolve_legacy_aliases() {
+    fn select_mode_does_not_guess_unknown_tool_names() {
         let schemas = vec![json!({
             "type": "function",
             "function": {"name": "agent", "description": "spawn/list agents", "parameters": {"type":"object"}}
         })];
-        let result = tool_search(&schemas, &json!({"query": "select:spawn_agent"}));
+        let result = tool_search(&schemas, &json!({"query": "select:agent_spawn"}));
         let parsed = parse_result(&result);
 
         assert_eq!(match_names(&parsed), Vec::<String>::new());
         assert_eq!(
             field_strings(&parsed, "requested"),
-            strings(&["spawn_agent"])
+            strings(&["agent_spawn"])
         );
-        assert_eq!(field_strings(&parsed, "missing"), strings(&["spawn_agent"]));
+        assert_eq!(field_strings(&parsed, "missing"), strings(&["agent_spawn"]));
     }
 
     #[test]
