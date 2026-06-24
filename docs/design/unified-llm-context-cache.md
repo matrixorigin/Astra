@@ -153,7 +153,7 @@ The CLI path contributes these context sources:
 | Active skills detected from user message | Merged into `edge_profile.active_skills` | `TurnState.active_skills` or stable skill source metadata |
 | Skill listing prefix | Routed through `edge_profile` instead of leading system message | Stable `Session` section when listing is session-stable |
 | Memory boost | Top-k memory search, semantic query normalization, digest rendering | `ExternalSources.memory_entries` plus optional volatile recall digest |
-| Tool schemas | Registry selection by semantic query, budget, recent tools | `ToolSurfacePlan.selected_schemas` |
+| Tool schemas | Declarative always-load core plus compact deferred catalog; explicit `tool_search` activation materializes additional full schemas | `ToolSurfacePlan.selected_schemas` |
 | Invoked tool retention | Re-add schemas for tools used in tool loop | `ToolSurfacePlan.retained_invoked_schemas` |
 | Skill allowed tools | Force-inject schemas declared by active skill | `ToolSurfacePlan.required_schemas` |
 | Deferred tool catalog | Edge profile deferred block | `SessionContext.deferred_tools_block` |

@@ -2,7 +2,7 @@
 
 9 scrubbed `llm_capture_*.json` files from live session
 `986a553e-b0e5-4570-bcd2-a47a11c41a15` (2026-05-08). This session was
-captured AFTER the d0640d3d rolling-breakpoint + pinned-tool fixes
+captured AFTER the d0640d3d rolling-breakpoint + deferred-tool surface fixes
 landed and exposed a **new** class of regression: `MiniMax-M2.7`
 (provider=openai) shows `cache_read` collapsing from 7680 tokens at
 `t4 r0` to **zero** for six consecutive tool-loop rounds (`t4 r1..r6`).

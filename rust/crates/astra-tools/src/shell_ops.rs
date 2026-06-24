@@ -18,7 +18,9 @@ use uuid::Uuid;
 use astra_sandbox::{CommandRisk, analyze_command_risks};
 
 use crate::detach::DetachShellHandle;
-use crate::exit_semantics::{ExitSemantics, classify_command_result, classify_exit};
+use crate::exit_semantics::{
+    CommandResultClass, ExitSemantics, classify_command_result, classify_exit,
+};
 use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
 const GREP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -1299,28 +1301,38 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     };
 
     if exit_code == 1 && stdout.trim().is_empty() {
-        return if stderr.trim().is_empty() {
-            ToolResult::text("No matches found".into())
+        let output = if stderr.trim().is_empty() {
+            "No matches found".into()
         } else {
-            ToolResult::text(format!("No matches found (warnings: {})", stderr.trim()))
+            format!("No matches found (warnings: {})", stderr.trim())
         };
+        return grep_process_result(output, exit_code, timed_out, cancelled);
     }
 
     if stdout.trim().is_empty() && exit_code != 0 {
         if cancelled {
-            return ToolResult::error("Error: grep was cancelled before returning results.".into());
+            return grep_process_result(
+                "Error: grep was cancelled before returning results.".into(),
+                exit_code,
+                timed_out,
+                cancelled,
+            );
         }
         if timed_out {
-            return ToolResult::error(
+            return grep_process_result(
                 "Error: grep timed out after 20s with no results. Narrow the search with 'path', 'include'/'glob', 'type', or a more specific pattern.".into(),
+                exit_code,
+                timed_out,
+                cancelled,
             );
         }
 
-        return if stderr.trim().is_empty() {
-            ToolResult::error("Error: grep failed".into())
+        let output = if stderr.trim().is_empty() {
+            "Error: grep failed".into()
         } else {
-            ToolResult::error(format!("Error: {}", stderr.trim()))
+            format!("Error: {}", stderr.trim())
         };
+        return grep_process_result(output, exit_code, timed_out, cancelled);
     }
 
     let filtered = if output_mode == SearchOutputMode::Count {
@@ -1355,24 +1367,34 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         &gitignored_paths,
     );
     if lines.is_empty() {
-        return ToolResult::text(no_visible_results_message(
-            "matches",
-            timed_out,
-            cancelled,
-            stdout_capped,
-            stderr.trim(),
-        ));
-    }
-    let paged_lines = if offset > 0 {
-        if offset >= lines.len() {
-            return ToolResult::text(no_more_results_message(
-                offset,
-                lines.len(),
-                "lines",
+        return grep_process_result(
+            no_visible_results_message(
+                "matches",
                 timed_out,
                 cancelled,
                 stdout_capped,
-            ));
+                stderr.trim(),
+            ),
+            exit_code,
+            timed_out,
+            cancelled,
+        );
+    }
+    let paged_lines = if offset > 0 {
+        if offset >= lines.len() {
+            return grep_process_result(
+                no_more_results_message(
+                    offset,
+                    lines.len(),
+                    "lines",
+                    timed_out,
+                    cancelled,
+                    stdout_capped,
+                ),
+                exit_code,
+                timed_out,
+                cancelled,
+            );
         }
         &lines[offset..]
     } else {
@@ -1442,7 +1464,53 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         result_text = annotate_grep_with_scope(&result_text, workspace_root);
     }
 
-    ToolResult::text(result_text)
+    grep_process_result(result_text, exit_code, timed_out, cancelled)
+}
+
+fn grep_process_result(
+    output: String,
+    exit_code: i32,
+    timed_out: bool,
+    cancelled: bool,
+) -> ToolResult {
+    let exit_semantics = grep_exit_semantics(exit_code, timed_out, cancelled);
+    let result_class = grep_result_class(exit_semantics);
+    let result = if exit_semantics.is_tool_error() {
+        ToolResult::error(output)
+    } else {
+        ToolResult::text(output)
+    };
+    result
+        .with_exit_semantics(exit_semantics)
+        .with_result_class(result_class)
+        .with_exit_code(exit_code)
+}
+
+fn grep_exit_semantics(exit_code: i32, timed_out: bool, cancelled: bool) -> ExitSemantics {
+    if cancelled {
+        return ExitSemantics::Cancelled;
+    }
+    if timed_out {
+        return ExitSemantics::TimedOut;
+    }
+    match exit_code {
+        0 => ExitSemantics::Success,
+        1 => ExitSemantics::EmptyResult,
+        128..=255 => ExitSemantics::Signaled,
+        _ => ExitSemantics::ExecutionError,
+    }
+}
+
+fn grep_result_class(exit_semantics: ExitSemantics) -> CommandResultClass {
+    match exit_semantics {
+        ExitSemantics::Success | ExitSemantics::PipelineTruncated => CommandResultClass::Success,
+        ExitSemantics::EmptyResult => CommandResultClass::EmptyResult,
+        ExitSemantics::DomainNegative => CommandResultClass::DomainNegative,
+        ExitSemantics::TimedOut
+        | ExitSemantics::Cancelled
+        | ExitSemantics::Signaled
+        | ExitSemantics::ExecutionError => CommandResultClass::ExecutionError,
+    }
 }
 
 /// Find files matching a glob pattern without blocking the async executor.
@@ -3844,6 +3912,45 @@ mod tests {
 
         assert!(!result.is_error, "grep should succeed: {}", result.output);
         assert_eq!(result.output, "No matches found");
+        let metadata = result
+            .metadata
+            .as_ref()
+            .expect("grep no-match must carry structured exit metadata");
+        assert_eq!(metadata.get("exit_code").and_then(Value::as_i64), Some(1));
+        assert_eq!(
+            metadata.get("exit_semantics").and_then(Value::as_str),
+            Some("empty_result")
+        );
+        assert_eq!(
+            metadata.get("result_class").and_then(Value::as_str),
+            Some("empty_result")
+        );
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::EmptyResult));
+    }
+
+    #[test]
+    fn grep_backend_error_result_is_structured_execution_error() {
+        let result = grep_process_result("Error: grep failed".to_string(), 2, false, false);
+
+        assert!(
+            result.is_error,
+            "backend exit 2 must fail: {}",
+            result.output
+        );
+        let metadata = result
+            .metadata
+            .as_ref()
+            .expect("grep failure must carry structured exit metadata");
+        assert_eq!(metadata.get("exit_code").and_then(Value::as_i64), Some(2));
+        assert_eq!(
+            metadata.get("exit_semantics").and_then(Value::as_str),
+            Some("execution_error")
+        );
+        assert_eq!(
+            metadata.get("result_class").and_then(Value::as_str),
+            Some("execution_error")
+        );
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::ExecutionError));
     }
 
     #[tokio::test]

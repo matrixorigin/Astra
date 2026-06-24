@@ -199,7 +199,7 @@ def route(state: TurnState) -> None:
             state.max_rounds = classification.max_rounds
 ```
 
-**Intent classification** — same keyword + embedding hybrid as before, but simpler because it only needs to answer one question: "should I restrict the tool set?"
+**Intent classification** — deterministic policy gating over the current request and runtime surface. It answers one question: "should I restrict the tool set?"
 
 | Intent | Restriction | Max Rounds |
 |--------|------------|------------|

@@ -1,7 +1,7 @@
 //! Regression fixture for **session 986a553e**
 //! (`986a553e-b0e5-4570-bcd2-a47a11c41a15`, 2026-05-08).
 //!
-//! Captured AFTER the d0640d3d rolling-breakpoint + pinned-tool fixes
+//! Captured AFTER the d0640d3d rolling-breakpoint + deferred-tool surface fixes
 //! landed. Exposes the *next* cache regression: MiniMax's OpenAI-
 //! compatible prompt cache is strict-history (any mid-history byte
 //! change invalidates), and astra was injecting volatile content

@@ -399,7 +399,7 @@ Peak tokens_in: {peak} tokens ({peak/effective * 100}% utilization)
 
 | Issue                         | Fix                                                                                                                                                    | Savings             |
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------- |
-| Low surface utilization (<50%) | Reduce pinned tools, move rarely used tools behind deferred activation, or tighten `tool_search` activation prompts | 2-5K tokens         |
+| Low surface utilization (<50%) | Reduce always-load schemas, move rarely used tools behind deferred activation, or tighten `tool_search` activation prompts | 2-5K tokens         |
 | >25 visible tools              | Move non-core schemas to deferred activation and verify only activated tools materialize next turn | 2-4K tokens         |
 | Large individual schemas      | Trim verbose parameter descriptions                                                                                                                    | 100-500 tokens/tool |
 

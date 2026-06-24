@@ -360,19 +360,19 @@ Edge tools and cloud skills are two separate worlds:
 │         │                  │                │               │
 │         └──────────────────┼────────────────┘               │
 │                            ▼                                │
-│              ToolRegistry.get_tools_schema()                │
-│              (semantic retrieve from ALL tools,              │
-│               budget-controlled, unified audit)              │
+│              Tool surface assembly                          │
+│              (ToolSpec.load_policy + compact deferred        │
+│               catalog + explicit tool_search activation)     │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 Key changes:
-1. Edge tools are **registered into ToolRegistry** on first turn (not passed through)
-2. ToolRegistry does semantic retrieval across **all** tools (edge + cloud + MCP)
-3. Budget control applies to the **merged** set
-4. Audit trail covers **all** tool selections, not just cloud skills
+1. Builtin tools declare `ToolSpec.load_policy` once; always-load vs deferred is not inferred by ranking.
+2. Runtime plugin schemas, including MCP tools, enter the deferred catalog unless the current surface assembly explicitly promotes them.
+3. `tool_search(select:NAME)` is the activation primitive for deferred full schemas.
+4. Audit trail covers the assembled surface and activation decisions, not just cloud skills.
 
-This means: when the user asks "fix the bug in auth.go", the registry can consider `read_file` (edge), `knowledge_search` (cloud), and `db_query` (MCP) from the same catalog surface, with skill instructions exposed through the session-scoped `<available_skills>` listing.
+This means: when the user asks "fix the bug in auth.go", the runtime exposes the small core tool surface, advertises eligible non-core tools compactly, and requires explicit activation before deferred full schemas reach `tools[]`. Skill instructions remain exposed through the session-scoped `<available_skills>` listing.
 
 ### Edge Tool Metadata Enrichment
 

@@ -122,8 +122,8 @@ fan-out + 并发 10），共 200 次独立 HTTP fetch。每个 URL 对应 1
 200 字符 JSON 序列化 `{url, http_status:200, title:"<90 char>",
 first_paragraph:"<80 char>", keywords:[...], relevance_score:0.82,
 content_type:"arxiv_abstract"}`。批量 insert 拆 10 批 × 20 行避免
-N+1。relevance_score 由一个 cheap ranker（TF-IDF + 关键词匹配）
-在 executor 侧就地计算，**不**经 LLM。
+N+1。relevance_score 由确定性的词法、域名、文档类型信号在 executor
+侧就地计算，**不**经 LLM。
 
 **manifest zone**：本轮 agent 只需 ACK 200 个 fetch 完成，不对任
 何单 URL 做 reasoning。`tool_previews` 320（1 条聚合 preview：
