@@ -106,6 +106,8 @@ impl CapabilityProvider for ControllableProvider {
             ToolResult::Error {
                 message: "hung".into(),
                 retryable: true,
+                exit_code: None,
+                metadata: None,
             }
         } else if self.exec_delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(self.exec_delay_ms)).await;
@@ -114,6 +116,7 @@ impl CapabilityProvider for ControllableProvider {
                 stdout: String::new(),
                 stderr: String::new(),
                 exit_code: 0,
+                metadata: None,
             }
         } else {
             ToolResult::Success {
@@ -121,6 +124,7 @@ impl CapabilityProvider for ControllableProvider {
                 stdout: String::new(),
                 stderr: String::new(),
                 exit_code: 0,
+                metadata: None,
             }
         }
     }

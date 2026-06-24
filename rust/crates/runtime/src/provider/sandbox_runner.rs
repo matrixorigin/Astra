@@ -137,6 +137,8 @@ impl CapabilityProvider for SandboxRuntimeProvider {
                         request.tool_name
                     ),
                     retryable: false,
+                    exit_code: None,
+                    metadata: None,
                 };
             }
         }
@@ -156,6 +158,8 @@ impl CapabilityProvider for SandboxRuntimeProvider {
                           Wire a SandboxRuntimeService via with_sandbox_service()."
                     .into(),
                 retryable: false,
+                exit_code: None,
+                metadata: None,
             },
         }
     }
@@ -204,6 +208,7 @@ mod tests {
                 stdout: format!("sandboxed {}\n", tool_name),
                 stderr: String::new(),
                 exit_code: 0,
+                metadata: None,
             }
         }
     }

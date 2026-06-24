@@ -482,6 +482,7 @@ mod tests {
                 stdout: String::new(),
                 stderr: String::new(),
                 exit_code: 0,
+                metadata: None,
             }
         }
 

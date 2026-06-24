@@ -26,6 +26,8 @@ impl ServerToolRuntime for DummyRuntime {
         ToolResult::Error {
             message: "dummy runtime".into(),
             retryable: false,
+            exit_code: None,
+            metadata: None,
         }
     }
 }
@@ -91,6 +93,8 @@ impl CapabilityProvider for StaticProvider {
         ToolResult::Error {
             message: "static provider".into(),
             retryable: false,
+            exit_code: None,
+            metadata: None,
         }
     }
 
@@ -766,6 +770,8 @@ impl CapabilityProvider for UnhealthyProvider {
         ToolResult::Error {
             message: "unhealthy".into(),
             retryable: true,
+            exit_code: None,
+            metadata: None,
         }
     }
     async fn health_check(&self) -> Result<(), ProviderError> {

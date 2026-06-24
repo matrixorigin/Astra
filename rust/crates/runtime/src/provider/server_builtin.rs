@@ -188,6 +188,7 @@ mod tests {
                 stdout: format!("executed {}\n", name),
                 stderr: String::new(),
                 exit_code: 0,
+                metadata: None,
             }
         }
     }

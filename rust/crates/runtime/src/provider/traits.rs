@@ -59,6 +59,8 @@ pub enum ToolResult {
         stderr: String,
         /// Exit code (0 = success).
         exit_code: i32,
+        /// Structured tool metadata propagated from the execution backend.
+        metadata: Option<serde_json::Map<String, serde_json::Value>>,
     },
     /// Execution failed.
     Error {
@@ -66,6 +68,10 @@ pub enum ToolResult {
         message: String,
         /// Whether the caller may retry with the same parameters.
         retryable: bool,
+        /// Process exit code when the backend exposed one.
+        exit_code: Option<i32>,
+        /// Structured tool metadata propagated from the execution backend.
+        metadata: Option<serde_json::Map<String, serde_json::Value>>,
     },
 }
 

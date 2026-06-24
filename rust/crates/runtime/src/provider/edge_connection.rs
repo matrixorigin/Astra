@@ -196,17 +196,26 @@ impl CapabilityProvider for EdgeConnectionProvider {
 
 /// Convert an `astra_tools::ToolResult` into the provider's `ToolResult` enum.
 fn convert_tool_result(result: astra_tools::ToolResult) -> ToolResult {
+    let exit_code = result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("exit_code"))
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|code| i32::try_from(code).ok());
     if result.is_error {
         ToolResult::Error {
             message: result.output,
             retryable: true,
+            exit_code,
+            metadata: result.metadata,
         }
     } else {
         ToolResult::Success {
             data: serde_json::Value::Null,
             stdout: result.output,
             stderr: String::new(),
-            exit_code: 0,
+            exit_code: exit_code.unwrap_or(0),
+            metadata: result.metadata,
         }
     }
 }
@@ -231,6 +240,52 @@ mod tests {
         let caps = provider.capabilities().await;
         assert!(!caps.is_empty());
         assert!(caps.len() >= 3);
+    }
+
+    #[test]
+    fn conversion_preserves_error_exit_code_and_metadata() {
+        let result = astra_tools::ToolResult::error("failed".to_string())
+            .with_exit_code(42)
+            .with_result_class(astra_tools::exit_semantics::CommandResultClass::ExecutionError);
+
+        match convert_tool_result(result) {
+            ToolResult::Error {
+                message,
+                exit_code,
+                metadata,
+                ..
+            } => {
+                assert_eq!(message, "failed");
+                assert_eq!(exit_code, Some(42));
+                let metadata = metadata.expect("provider metadata");
+                assert_eq!(metadata["exit_code"], 42);
+                assert_eq!(metadata["result_class"], "execution_error");
+            }
+            other => panic!("expected provider error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conversion_preserves_non_error_nonzero_exit_code() {
+        let result = astra_tools::ToolResult::text("no match".to_string())
+            .with_exit_code(1)
+            .with_exit_semantics(astra_tools::exit_semantics::ExitSemantics::DomainNegative);
+
+        match convert_tool_result(result) {
+            ToolResult::Success {
+                stdout,
+                exit_code,
+                metadata,
+                ..
+            } => {
+                assert_eq!(stdout, "no match");
+                assert_eq!(exit_code, 1);
+                let metadata = metadata.expect("provider metadata");
+                assert_eq!(metadata["exit_code"], 1);
+                assert_eq!(metadata["exit_semantics"], "domain_negative");
+            }
+            other => panic!("expected provider success, got {other:?}"),
+        }
     }
 
     #[tokio::test]
