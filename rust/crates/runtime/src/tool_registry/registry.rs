@@ -575,7 +575,7 @@ mod tests {
                 names.sort();
                 names
             },
-            "cross-crate always_load metadata must be stable and reflect runtime additions"
+            "resolved always_load names must be stable and reflect runtime additions"
         );
     }
 

@@ -60,8 +60,6 @@ pub struct ToolMeta {
     pub description: &'static str,
     /// Trigger phrases — search hints for `tool_search`.
     pub triggers: &'static [&'static str],
-    /// Whether this tool is part of the default always_load surface.
-    pub always_load: bool,
     /// Intent classification tags
     pub intents: &'static [IntentType],
     /// Data source scope
@@ -104,9 +102,6 @@ impl RuntimeBindingValidation {
 pub static TOOL_CATALOG: &[ToolMeta] = &[
     // ── Built-in tools ──────────────────────────────────────────────
     //
-    // `always_load` must match the runtime default surface for catalog-backed tools.
-    // Non-core tools stay deferred by default and enter `tools[]` only through
-    // explicit activation or user always-load config.
     ToolMeta {
         name: "bash",
         description: "Execute shell commands for builds, tests, installs, git, CLI tasks",
@@ -114,7 +109,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "run", "execute", "build", "test", "install", "command", "shell", "script", "compile",
             "运行", "执行", "编译", "测试", "安装", "命令", "脚本",
         ],
-        always_load: true,
         intents: &[IntentType::CodeEdit, IntentType::CodeRead, IntentType::Git],
         scope: Scope::Local,
         requires: &[],
@@ -133,7 +127,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "下载文件",
             "预览文件",
         ],
-        always_load: false,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -163,7 +156,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "文件内容",
             "查看文件",
         ],
-        always_load: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -195,8 +187,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "输出到文件",
             "导出文件",
         ],
-        // Always-load: paired with str_replace/read_file as the basic edit triad.
-        always_load: true,
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[],
@@ -228,7 +218,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "更改",
             // Note: 重命名 is intentionally not here — LSP rename is preferred for semantic renames
         ],
-        always_load: true,
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[],
@@ -260,7 +249,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "文件结构",
             "目录结构",
         ],
-        always_load: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -280,9 +268,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "代码搜索",
             "全文搜索",
         ],
-        // Always-load: near-universal for code navigation — including in the static
-        // tool prefix keeps prompt cache stable across turns.
-        always_load: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -312,8 +297,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "文件模式",
             "扩展名",
         ],
-        // Always-load: partner to grep for locating files before reading them.
-        always_load: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -334,7 +317,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "状态",
             "健康度",
         ],
-        always_load: false,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -353,9 +335,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "搜工具",
             "查工具",
         ],
-        // Always-load: activation primitive for the deferred tool layer. Must always
-        // be in tools[] so the model can reach any deferred tool.
-        always_load: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -410,7 +389,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "文档链接",
             "联动编辑",
         ],
-        always_load: false,
         intents: &[IntentType::CodeRead, IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[Capability::LSPServer],
@@ -439,7 +417,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "分支",
             "历史",
         ],
-        always_load: true,
         intents: &[IntentType::Git],
         scope: Scope::LocalGit,
         requires: &[],
@@ -459,7 +436,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "merge",
             "review",
         ],
-        always_load: false,
         intents: &[IntentType::GitHub],
         scope: Scope::External,
         requires: &[Capability::GitHubAuth],
@@ -491,16 +467,16 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "获取页面",
             "打开网址",
         ],
-        always_load: false,
         intents: &[IntentType::CodeRead],
         scope: Scope::External,
         requires: &[],
         binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 25,
     },
-    // memory is always_load — intrinsic memory capability. The model must always be
-    // able to store and retrieve memories regardless of query content. Without
-    // this, implicit preferences and background extraction have no stable path.
+    // ToolSpec marks memory as always-load: intrinsic memory capability. The
+    // model must always be able to store and retrieve memories regardless of
+    // query content. Without this, implicit preferences and background
+    // extraction have no stable path.
     ToolMeta {
         name: "memory",
         description: "Memory operations: store, retrieve, purge, correct, profile, search, feedback. Pass action parameter.",
@@ -508,7 +484,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "memory", "remember", "recall", "forget", "store", "retrieve", "记忆", "记住", "回忆",
             "存储",
         ],
-        always_load: true,
         intents: &[IntentType::Memory],
         scope: Scope::CrossSession,
         requires: &[Capability::MemoryService],
@@ -528,7 +503,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "配置",
             "历史",
         ],
-        always_load: false,
         intents: &[IntentType::Introspect],
         scope: Scope::Local,
         requires: &[],
@@ -546,7 +520,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "压缩上下文",
             "压缩历史",
         ],
-        always_load: false,
         intents: &[IntentType::Introspect],
         scope: Scope::Local,
         requires: &[],
@@ -564,7 +537,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "回滚会话",
             "恢复会话状态",
         ],
-        always_load: false,
         intents: &[IntentType::Introspect],
         scope: Scope::Local,
         requires: &[],
@@ -582,7 +554,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "数据库查询",
             "执行 SQL",
         ],
-        always_load: false,
         intents: &[IntentType::Database],
         scope: Scope::External,
         requires: &[Capability::Database],
@@ -600,7 +571,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "数据库回滚",
             "恢复数据库快照",
         ],
-        always_load: false,
         intents: &[IntentType::Database],
         scope: Scope::External,
         requires: &[Capability::Database],
@@ -611,7 +581,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         name: "agent",
         description: "Multi-agent operations: spawn one sub-agent, collect one background result, send messages, or execute a tool chain.",
         triggers: &["agent", "spawn", "chain", "orchestrate", "代理"],
-        always_load: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::External,
         requires: &[Capability::AgentSpawner],
@@ -639,7 +608,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "多视角审查",
             "同时审查",
         ],
-        always_load: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::External,
         requires: &[Capability::AgentSpawner],
@@ -655,7 +623,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "shell output",
             "bg output",
         ],
-        always_load: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[Capability::LocalBackgroundTasks],
@@ -671,7 +638,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "kill background",
             "cancel background",
         ],
-        always_load: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[Capability::LocalBackgroundTasks],
@@ -687,7 +653,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "list background",
             "bg tasks",
         ],
-        always_load: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[Capability::LocalBackgroundTasks],
@@ -707,7 +672,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "函数列表",
             "类列表",
         ],
-        always_load: false,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -718,7 +682,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         name: "powershell",
         description: "Execute PowerShell commands for Windows shell tasks and cross-platform automation",
         triggers: &["powershell", "pwsh", "ps1", "windows", "PowerShell"],
-        always_load: false,
         intents: &[IntentType::CodeEdit, IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -729,7 +692,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         name: "run_script",
         description: "Execute a structured script via sandbox RPC transport (Unix-only)",
         triggers: &["run_script", "script", "sandbox", "rpc"],
-        always_load: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[],
@@ -740,7 +702,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         name: "skill",
         description: "Execute a discovered skill by name. Skills wrap reusable workflows.",
         triggers: &["skill", "workflow", "技能"],
-        always_load: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[Capability::SkillsCatalog],
@@ -751,7 +712,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         name: "enter_plan_mode",
         description: "Switch the runtime into plan-authoring mode. Server-owned state machine.",
         triggers: &["plan", "enter plan mode"],
-        always_load: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::External,
         requires: &[Capability::PlanLifecycle],
@@ -762,7 +722,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         name: "exit_plan_mode",
         description: "Submit the authored plan for user review and exit plan-authoring mode.",
         triggers: &["exit plan", "submit plan"],
-        always_load: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::External,
         requires: &[Capability::PlanLifecycle],
@@ -770,13 +729,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         schema_tokens: 20,
     },
 ];
-
-/// Returns `true` when `name` matches a always_load tool in [`TOOL_CATALOG`].
-/// Always-load tools are essential to agent operation and must never be blocked
-/// by cross-session learning or pattern-library heuristics.
-pub fn is_always_load_tool(name: &str) -> bool {
-    TOOL_CATALOG.iter().any(|t| t.always_load && t.name == name)
-}
 
 /// Look up the static [`ToolMeta`] for a tool by name.
 ///
@@ -907,20 +859,6 @@ mod tests {
     }
 
     #[test]
-    fn catalog_always_load_tools_include_bash_and_read_file() {
-        let always_load: Vec<&str> = TOOL_CATALOG
-            .iter()
-            .filter(|t| t.always_load)
-            .map(|t| t.name)
-            .collect();
-        assert!(always_load.contains(&"bash"), "bash should be always_load");
-        assert!(
-            always_load.contains(&"read_file"),
-            "read_file should be always_load"
-        );
-    }
-
-    #[test]
     fn catalog_schema_tokens_positive_for_all() {
         for tool in TOOL_CATALOG {
             assert!(
@@ -957,18 +895,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn catalog_consolidated_memory_is_always_load() {
-        let tool = TOOL_CATALOG
-            .iter()
-            .find(|t| t.name == "memory")
-            .expect("consolidated `memory` tool must exist in catalog");
-        assert!(
-            tool.always_load,
-            "memory must be always_load — intrinsic store/retrieve capability"
-        );
     }
 
     #[test]
@@ -1053,16 +979,5 @@ mod tests {
                 tool.description
             );
         }
-    }
-
-    #[test]
-    fn is_always_load_tool_matches_catalog() {
-        assert!(is_always_load_tool("bash"));
-        assert!(is_always_load_tool("read_file"));
-        assert!(is_always_load_tool("str_replace"));
-        assert!(is_always_load_tool("memory"));
-        assert!(!is_always_load_tool("session"));
-        assert!(!is_always_load_tool("web_fetch"));
-        assert!(!is_always_load_tool("nonexistent_tool"));
     }
 }

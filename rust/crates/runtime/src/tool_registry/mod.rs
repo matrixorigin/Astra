@@ -74,31 +74,10 @@ mod tests {
     }
 
     #[test]
-    fn catalog_always_load_metadata_matches_default_always_load_catalog_subset() {
-        let catalog_names: std::collections::HashSet<&str> =
-            TOOL_CATALOG.iter().map(|tool| tool.name).collect();
-        let expected: std::collections::HashSet<&str> = surface::default_always_load_names()
+    fn always_load_tools_are_core_set() {
+        let always_load: std::collections::HashSet<&str> = surface::default_always_load_names()
             .iter()
             .map(String::as_str)
-            .filter(|name| catalog_names.contains(name))
-            .collect();
-        let actual: std::collections::HashSet<&str> = TOOL_CATALOG
-            .iter()
-            .filter(|tool| tool.always_load)
-            .map(|tool| tool.name)
-            .collect();
-        assert_eq!(
-            actual, expected,
-            "catalog always_load metadata is only a catalog subset mirror; the runtime ToolSurface remains the source of truth"
-        );
-    }
-
-    #[test]
-    fn always_load_tools_are_core_set() {
-        let always_load: Vec<&str> = TOOL_CATALOG
-            .iter()
-            .filter(|t| t.always_load)
-            .map(|t| t.name)
             .collect();
         // Runtime default catalog core — file, edit, search, git, memory, and activation.
         assert!(always_load.contains(&"bash"));
@@ -202,9 +181,10 @@ mod tests {
     fn always_load_memory_always_available_for_recall() {
         // memory is always_load so memory lifecycle cases always have it available
         // without an activation round trip.
-        let tool = TOOL_CATALOG.iter().find(|t| t.name == "memory").unwrap();
         assert!(
-            tool.always_load,
+            surface::default_always_load_names()
+                .iter()
+                .any(|name| name == "memory"),
             "memory must be always_load for reliable memory lifecycle"
         );
     }

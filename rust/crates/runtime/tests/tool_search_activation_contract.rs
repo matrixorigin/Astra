@@ -19,7 +19,7 @@
 //! separate capability, dispatched by the edge-tool executor.
 
 use astra_tools::schemas::all_tool_schemas;
-use astra_turn_core::tool_registry_meta::{TOOL_CATALOG, is_always_load_tool};
+use astra_turn_core::tool_registry_meta::TOOL_CATALOG;
 use serde_json::Value;
 
 fn schema_names(schemas: &[Value]) -> Vec<String> {
@@ -52,7 +52,9 @@ fn tool_search_is_in_catalog_and_always_load() {
         "tool_search must be present in TOOL_CATALOG"
     );
     assert!(
-        is_always_load_tool("tool_search"),
+        astra_runtime::tool_registry::surface::default_always_load_names()
+            .iter()
+            .any(|name| name == "tool_search"),
         "tool_search must be always_load — it's the activation primitive for deferred tools"
     );
 }
@@ -98,8 +100,11 @@ fn introspect_is_available_but_deferred_by_default() {
         .iter()
         .find(|t| t.name == "introspect")
         .expect("introspect must remain in TOOL_CATALOG");
+    assert_eq!(introspect.name, "introspect");
     assert!(
-        !introspect.always_load,
+        !astra_runtime::tool_registry::surface::default_always_load_names()
+            .iter()
+            .any(|name| name == "introspect"),
         "introspect is diagnostic-only and should not be in every turn's always_load tool prefix"
     );
     let names = schema_names(&all_tool_schemas());

@@ -4,8 +4,7 @@
 //! `plans/tool-surface-deferred-simplification-2026-06-23.md`.
 //!
 //! Contracts under test:
-//!   1. Default T1 (always_load) members are a configurable set — not the
-//!      whole TOOL_CATALOG.
+//!   1. Default T1 (always_load) members come from `ToolSpec.load_policy`.
 //!   2. User config can add extra tools to the default always_load set.
 //!   3. Every non-T1 tool appears in the deferred list as `name + short_desc`
 //!      (no schema, no parameters).
@@ -20,7 +19,6 @@
 use crate::tool_registry::surface::{DeferredEntry, ToolSurface, default_always_load_names};
 use astra_config::ToolSurfaceConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
-use astra_turn_core::tool_registry_meta::TOOL_CATALOG;
 use serde_json::{Value, json};
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
@@ -74,29 +72,6 @@ fn every_default_always_load_has_a_schema_in_the_canonical_pool() {
 }
 
 #[test]
-fn catalog_always_load_metadata_matches_runtime_default_surface_for_catalog_tools() {
-    let default_always_load: std::collections::HashSet<&str> = default_always_load_names()
-        .iter()
-        .map(String::as_str)
-        .collect();
-    let catalog_default_always_load: std::collections::BTreeSet<&str> = TOOL_CATALOG
-        .iter()
-        .filter(|tool| default_always_load.contains(tool.name))
-        .map(|tool| tool.name)
-        .collect();
-    let catalog_metadata_always_load: std::collections::BTreeSet<&str> = TOOL_CATALOG
-        .iter()
-        .filter(|tool| tool.always_load)
-        .map(|tool| tool.name)
-        .collect();
-
-    assert_eq!(
-        catalog_metadata_always_load, catalog_default_always_load,
-        "catalog always_load metadata must not drift from runtime default always_load declarations for catalog-backed tools"
-    );
-}
-
-#[test]
 fn public_schema_names_have_public_runtime_tool_specs() {
     let registry = astra_runtime_env::ToolRegistry::builtins();
 
@@ -146,7 +121,7 @@ fn always_load_default_members_are_the_core_set() {
         "grep",
         "glob",
         "list_dir",
-        "memory", // intrinsic per TOOL_CATALOG comment
+        "memory", // intrinsic per ToolSpec load policy
         "tool_search",
         "skill",
         "task", // session_todos surface — TUI dashboard depends on it

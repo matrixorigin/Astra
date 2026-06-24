@@ -68,7 +68,7 @@ pub enum ToolFilter {
     Wide,
     /// Domain-focused → filter to specific tool categories.
     Domain(Vec<String>),
-    /// Conversational → minimal tools (only pinned).
+    /// Conversational → minimal or no tool surface.
     Minimal,
 }
 
