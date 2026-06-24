@@ -457,9 +457,8 @@ impl ServerToolExecutor {
         };
     }
 
-    /// Install plugin-registered schemas (MCP, etc.) so
+    /// Install plugin-registered non-MCP schemas so
     /// `tool_search(select:NAME)` can resolve them for deferred activation.
-    /// Called by the server loop host after MCP manager refresh.
     ///
     /// Poison handling: plugin schemas are a rebuildable cache. Reset cached
     /// state on poison instead of reusing possibly half-written inner data.
@@ -693,7 +692,7 @@ impl ServerToolExecutor {
         self.tool_has_runtime_binding(name)
     }
 
-    pub(crate) fn plugin_schemas_snapshot(&self, label: &str) -> Vec<Value> {
+    pub(crate) fn external_schemas_snapshot(&self, label: &str) -> Vec<Value> {
         let mut schemas = rwlock_read_clone_or_default(&self.plugin_schemas, label);
         let mcp_runtime =
             rwlock_read_clone_or_default(&self.mcp_runtime, "mcp_runtime_schema_snapshot");
@@ -772,7 +771,7 @@ impl ServerToolExecutor {
     }
 
     fn plugin_schema_has_name(&self, name: &str) -> bool {
-        self.plugin_schemas_snapshot("plugin_schemas_runtime_binding")
+        self.external_schemas_snapshot("external_schemas_runtime_binding")
             .iter()
             .any(|schema| tool_schema_name(schema).is_some_and(|schema_name| schema_name == name))
     }

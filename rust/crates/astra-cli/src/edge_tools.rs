@@ -1030,10 +1030,8 @@ pub struct ToolExecutor {
     self_mod_mutation_counter: std::sync::Mutex<(u32, u32)>,
     /// Shared tool executor for delegating unknown tools to astra-tools.
     default_executor: astra_tools::executor::DefaultToolExecutor,
-    /// Plugin-registered tool schemas (e.g. MCP servers). Joined with the
-    /// static catalog when `tool_search(select:X)` runs, so deferred
-    /// activation can reach plugin tools. Populated by the TUI after
-    /// `PluginRegistry::register` loads the user's skill manifests.
+    /// Plugin-registered non-MCP tool schemas. MCP schemas live in
+    /// `mcp_runtime` so routing ownership and discovery data stay atomic.
     plugin_schemas: std::sync::RwLock<Vec<Value>>,
     /// Atomic snapshot of the current visible/deferred execution surface.
     ///
@@ -1325,9 +1323,8 @@ impl ToolExecutor {
         self
     }
 
-    /// Install plugin-registered schemas so `tool_search(select:NAME)`
-    /// can resolve MCP / skill-backed tools. Called once at TUI start
-    /// after `PluginRegistry::register` loads manifests.
+    /// Install plugin-registered non-MCP schemas so `tool_search(select:NAME)`
+    /// can resolve skill-backed tools. Called after plugin manifests load.
     ///
     /// Poison handling: plugin schemas are a rebuildable cache. Reset cached
     /// state on poison instead of reusing possibly half-written inner data.
@@ -1466,7 +1463,7 @@ impl ToolExecutor {
     }
 
     fn plugin_schema_has_name(&self, name: &str) -> bool {
-        self.plugin_schemas_snapshot("plugin_schemas_runtime_binding")
+        self.external_schemas_snapshot("external_schemas_runtime_binding")
             .iter()
             .any(|schema| {
                 astra_turn_core::tool::schema::tool_schema_name(schema)
@@ -1648,22 +1645,22 @@ impl ToolExecutor {
         }
     }
 
-    pub(crate) fn runtime_bound_plugin_schemas_excluding(
+    pub(crate) fn runtime_bound_external_schemas_excluding(
         &self,
         restricted_tools: &HashSet<String>,
     ) -> Vec<Value> {
-        let plugin_schemas: Vec<Value> = self
-            .plugin_schemas_snapshot("plugin_schemas_deferred_manifest")
+        let external_schemas: Vec<Value> = self
+            .external_schemas_snapshot("external_schemas_deferred_manifest")
             .into_iter()
             .filter(|schema| {
                 astra_turn_core::tool::schema::tool_schema_name(schema)
                     .is_none_or(|name| !restricted_tools.contains(name))
             })
             .collect();
-        self.runtime_bound_tool_schemas(plugin_schemas)
+        self.runtime_bound_tool_schemas(external_schemas)
     }
 
-    pub(super) fn plugin_schemas_snapshot(&self, label: &str) -> Vec<Value> {
+    pub(super) fn external_schemas_snapshot(&self, label: &str) -> Vec<Value> {
         let mut schemas = rwlock_read_clone_or_default(&self.plugin_schemas, label);
         schemas.extend(
             self.mcp_runtime_snapshot("mcp_runtime_schema_snapshot")
@@ -5158,7 +5155,7 @@ impl ToolExecutor {
         }
 
         let mut pool = full_tool_schemas();
-        pool.extend(self.plugin_schemas_snapshot("plugin_schemas_capability_view"));
+        pool.extend(self.external_schemas_snapshot("external_schemas_capability_view"));
 
         let outcome = astra_turn_core::tool_surface::resolve_with_diagnostics(
             astra_turn_core::tool_surface::Surface::CliLocal,
@@ -6664,7 +6661,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_bound_plugin_schemas_excluding_filters_restricted_plugins() {
+    fn runtime_bound_external_schemas_excluding_filters_restricted_plugins() {
         let executor = test_executor();
         executor.set_plugin_schemas(vec![serde_json::json!({
             "type": "function",
@@ -6679,14 +6676,15 @@ mod tests {
             }
         })]);
 
-        let unrestricted = executor.runtime_bound_plugin_schemas_excluding(&HashSet::new());
+        let unrestricted = executor.runtime_bound_external_schemas_excluding(&HashSet::new());
         assert_eq!(
             astra_turn_core::tool::schema::tool_names_from_schemas(&unrestricted),
             HashSet::from(["custom_weather".to_string()])
         );
 
-        let restricted = executor
-            .runtime_bound_plugin_schemas_excluding(&HashSet::from(["custom_weather".to_string()]));
+        let restricted = executor.runtime_bound_external_schemas_excluding(&HashSet::from([
+            "custom_weather".to_string(),
+        ]));
         assert!(
             restricted.is_empty(),
             "restricted dynamic plugin schemas must not be advertised as deferred"

@@ -148,7 +148,7 @@ impl ToolHandler<ServerToolExecutor> for ToolSearchToolHandler {
         _cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
         let mut pool = context.capability_filtered_server_tool_schemas();
-        pool.extend(context.plugin_schemas_snapshot("plugin_schemas_tool_search"));
+        pool.extend(context.external_schemas_snapshot("external_schemas_tool_search"));
         let Some(searchable_names) = context.current_searchable_tool_names() else {
             return tool_result_from_output(astra_tools::tool_search::tool_search(&[], args));
         };

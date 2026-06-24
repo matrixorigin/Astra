@@ -852,11 +852,12 @@ fn attach_subrun_tool_surface(
         .cloned()
         .collect();
     let eligible_surface_schemas = executor.runtime_bound_tool_schemas(eligible_surface_schemas);
-    let eligible_plugin_schemas = executor.runtime_bound_plugin_schemas_excluding(restricted_tools);
+    let eligible_external_schemas =
+        executor.runtime_bound_external_schemas_excluding(restricted_tools);
     let tool_surface = astra_runtime::tool_registry::surface::ToolSurface::build_excluding_visible(
         eligible_surface_schemas,
         &astra_config::runtime_config::RuntimeConfig::cached().tool_surface,
-        &eligible_plugin_schemas,
+        &eligible_external_schemas,
         &final_visible_tool_names,
     );
     let mut activatable_tool_names = HashSet::new();
