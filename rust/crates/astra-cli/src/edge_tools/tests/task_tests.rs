@@ -26,16 +26,24 @@ fn setup() -> (tempfile::TempDir, ToolExecutor) {
 // ── Task tool tests ─────────────────────────────────────────��────────────
 
 #[tokio::test]
-async fn legacy_task_tool_names_are_not_executable() {
+async fn retired_public_tool_names_are_not_executable() {
     let (_dir, exe) = setup();
 
-    let legacy = exe
-        .execute("task_create", &json!({"title": "old surface"}))
-        .await;
-    assert!(
-        legacy.starts_with("Error:") || legacy.contains("Unknown"),
-        "legacy task_create must not remain an executable task surface: {legacy}"
-    );
+    for &retired in astra_core::tool_names::RETIRED_TOOL_NAMES {
+        let legacy = exe
+            .execute_with_metadata(retired, &json!({"title": "old surface"}))
+            .await;
+        assert!(legacy.is_error, "{retired}: {legacy:?}");
+        assert_eq!(
+            legacy
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("error_kind"))
+                .and_then(serde_json::Value::as_str),
+            Some(astra_core::ErrorKind::ToolBinding.as_str()),
+            "{retired}: {legacy:?}"
+        );
+    }
 
     let unified = exe
         .execute("task", &json!({"action": "create", "title": "new surface"}))

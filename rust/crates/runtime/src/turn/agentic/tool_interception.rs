@@ -819,7 +819,7 @@ fn build_skill_extra(state: &AgenticLoopState) -> HashMap<String, String> {
     );
     let depri = state.turn_guard.health.deprioritized_tools();
     if !depri.is_empty() {
-        extra.insert("deprioritized_tools".into(), depri.join(", "));
+        extra.insert("health_deprioritized_tools".into(), depri.join(", "));
     }
     if !state.stall.events.is_empty() {
         let stalls: Vec<String> = state

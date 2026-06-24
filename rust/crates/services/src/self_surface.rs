@@ -97,7 +97,7 @@ pub struct EnvironmentSurface {
     pub resolved_sources: Vec<&'static str>,
     pub available_tools: usize,
     pub tool_names: Vec<String>,
-    pub deprioritized_tools: Vec<String>,
+    pub health_deprioritized_tools: Vec<String>,
     pub discovered_skills: Vec<String>,
     pub active_experiment_id: Option<String>,
     pub active_variant: Option<String>,
@@ -204,7 +204,7 @@ pub struct ProfileSurface {
 pub struct CapabilitySurface {
     pub total_tools: usize,
     pub tool_names: Vec<String>,
-    pub deprioritized_tools: Vec<String>,
+    pub health_deprioritized_tools: Vec<String>,
     pub skills: Vec<String>,
     pub tool_health: Vec<ToolHealthView>,
 }
@@ -298,7 +298,7 @@ pub struct HealthSurface {
     pub phase: String,
     pub risk_flags: Vec<String>,
     pub pending_blockers: Vec<String>,
-    pub blocked_tools: Vec<String>,
+    pub health_deprioritized_tools: Vec<String>,
     pub tool_hotspots: Vec<ToolHealthView>,
     pub recent_failures: Vec<ToolFailureView>,
     pub acceptance_ok: bool,
@@ -660,7 +660,7 @@ fn build_environment_surface(
         resolved_sources: resolved_sources(artifacts),
         available_tools: tool_names.len(),
         tool_names,
-        deprioritized_tools: merged_deprioritized_tools(artifacts),
+        health_deprioritized_tools: merged_health_deprioritized_tools(artifacts),
         discovered_skills: merged_skills(workspace),
         active_experiment_id: workspace.and_then(|ws| ws.active_experiment_id.clone()),
         active_variant: workspace.and_then(|ws| ws.active_variant.clone()),
@@ -828,7 +828,7 @@ fn build_profile_surface(
         capabilities: CapabilitySurface {
             total_tools: snapshot.environment.available_tools,
             tool_names: snapshot.environment.tool_names.clone(),
-            deprioritized_tools: snapshot.environment.deprioritized_tools.clone(),
+            health_deprioritized_tools: snapshot.environment.health_deprioritized_tools.clone(),
             skills: snapshot.environment.discovered_skills.clone(),
             tool_health: health.tool_health.into_iter().take(8).collect(),
         },
@@ -927,7 +927,7 @@ fn build_health_surface(
         phase: snapshot.run.phase.clone(),
         risk_flags: snapshot.run.risk_flags.clone(),
         pending_blockers: snapshot.run.pending_blockers.clone(),
-        blocked_tools: health.blocked_tools,
+        health_deprioritized_tools: health.health_deprioritized_tools,
         tool_hotspots: health.tool_health.into_iter().take(10).collect(),
         recent_failures: health.recent_failures,
         acceptance_ok: snapshot.acceptance.ok,
@@ -1201,13 +1201,13 @@ struct ToolHealthAccumulator {
 }
 
 struct HealthData {
-    blocked_tools: Vec<String>,
+    health_deprioritized_tools: Vec<String>,
     tool_health: Vec<ToolHealthView>,
     recent_failures: Vec<ToolFailureView>,
 }
 
 fn build_health_data(artifacts: &SessionArtifacts) -> HealthData {
-    let blocked_tools = merged_deprioritized_tools(artifacts);
+    let health_deprioritized_tools = merged_health_deprioritized_tools(artifacts);
     let mut by_tool: BTreeMap<String, ToolHealthAccumulator> = BTreeMap::new();
 
     for event in &artifacts.journal_events {
@@ -1229,7 +1229,7 @@ fn build_health_data(artifacts: &SessionArtifacts) -> HealthData {
         }
     }
 
-    for tool in &blocked_tools {
+    for tool in &health_deprioritized_tools {
         by_tool.entry(tool.clone()).or_default().deprioritized = true;
     }
 
@@ -1256,7 +1256,7 @@ fn build_health_data(artifacts: &SessionArtifacts) -> HealthData {
     });
 
     HealthData {
-        blocked_tools,
+        health_deprioritized_tools,
         tool_health,
         recent_failures: recent_tool_failures(&artifacts.journal_events, 12),
     }
@@ -1592,8 +1592,8 @@ fn build_risk_flags(
     if !health.recent_failures.is_empty() {
         flags.push("recent_tool_failures".to_string());
     }
-    if !health.blocked_tools.is_empty() {
-        flags.push("deprioritized_tools".to_string());
+    if !health.health_deprioritized_tools.is_empty() {
+        flags.push("health_deprioritized_tools".to_string());
     }
     if evolution
         .records
@@ -1679,15 +1679,24 @@ fn persistence_pending_blockers(persistence_error: Option<&str>) -> Vec<String> 
         .unwrap_or_default()
 }
 
-fn merged_deprioritized_tools(artifacts: &SessionArtifacts) -> Vec<String> {
-    let mut blocked_tools = artifacts
-        .restored
-        .as_ref()
-        .map(|restored| restored.blocked_tools.clone())
-        .unwrap_or_default();
-    blocked_tools.sort();
-    blocked_tools.dedup();
-    blocked_tools
+fn merged_health_deprioritized_tools(artifacts: &SessionArtifacts) -> Vec<String> {
+    let mut health_deprioritized_tools = BTreeSet::new();
+    for event in &artifacts.journal_events {
+        let Some(names) = event
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("deprioritized_tool_names"))
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for name in names {
+            if let Some(name) = name.as_str().filter(|name| !name.is_empty()) {
+                health_deprioritized_tools.insert(name.to_string());
+            }
+        }
+    }
+    health_deprioritized_tools.into_iter().collect()
 }
 
 fn merged_skills(workspace: Option<&WorkspaceMetadata>) -> Vec<String> {
@@ -2100,6 +2109,21 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct StubArtifactLoader {
+        artifacts: LoadedSelfSurfaceArtifacts,
+    }
+
+    #[async_trait]
+    impl SelfSurfaceArtifactLoader for StubArtifactLoader {
+        async fn load_artifacts(
+            &self,
+            _session_id: &str,
+        ) -> Result<LoadedSelfSurfaceArtifacts, String> {
+            Ok(self.artifacts.clone())
+        }
+    }
+
     fn append_turn_event(session_id: &str, turn: u32) {
         JournalWriter::new(session_id)
             .unwrap()
@@ -2297,6 +2321,78 @@ mod tests {
         assert_eq!(snapshot.recent_steps.len(), 2);
         assert_eq!(snapshot.recent_decisions.len(), 1);
         assert!(snapshot.acceptance.ok);
+    }
+
+    #[tokio::test]
+    async fn self_surface_serializes_health_deprioritized_tools_without_legacy_keys() {
+        let session_id = "svc-self-health-surface";
+        let artifacts = LoadedSelfSurfaceArtifacts {
+            session_id: session_id.to_string(),
+            workspace: None,
+            restored: Some(RestoredSession {
+                session_id: session_id.to_string(),
+                blocked_tools: vec!["hard_restricted_tool".to_string()],
+                ..Default::default()
+            }),
+            journal_events: vec![JournalEvent::turn_guard_verdict(
+                Some(session_id),
+                3,
+                "warning",
+                &[],
+                &["flaky_http".to_string()],
+                &["flaky_http".to_string()],
+                false,
+                0,
+                3,
+                1,
+                0,
+                &[],
+                0,
+                0,
+            )],
+            latest_full_context_trace: None,
+        };
+        let service = LocalSelfSurfaceService::new()
+            .with_runtime_support(Arc::new(StubRuntimeSupport))
+            .with_artifact_loader(Arc::new(StubArtifactLoader { artifacts }));
+
+        let snapshot = service.snapshot(session_id, 10).await.unwrap();
+        assert_eq!(
+            snapshot.environment.health_deprioritized_tools,
+            vec!["flaky_http".to_string()]
+        );
+        assert!(
+            !snapshot
+                .environment
+                .health_deprioritized_tools
+                .contains(&"hard_restricted_tool".to_string()),
+            "checkpoint hard restrictions must not be reported as health-deprioritized tools"
+        );
+        assert!(
+            snapshot
+                .run
+                .risk_flags
+                .contains(&"health_deprioritized_tools".to_string())
+        );
+
+        let environment_json = serde_json::to_value(&snapshot.environment).unwrap();
+        assert_eq!(
+            environment_json["health_deprioritized_tools"],
+            serde_json::json!(["flaky_http"])
+        );
+        assert!(environment_json.get("deprioritized_tools").is_none());
+
+        let health = service
+            .surface(session_id, SelfSurfaceDimension::Health, 10)
+            .await
+            .unwrap();
+        let health_json = serde_json::to_value(&health).unwrap();
+        assert_eq!(
+            health_json["body"]["health_deprioritized_tools"],
+            serde_json::json!(["flaky_http"])
+        );
+        assert!(health_json["body"].get("blocked_tools").is_none());
+        assert!(health_json["body"].get("deprioritized_tools").is_none());
     }
 
     #[tokio::test]

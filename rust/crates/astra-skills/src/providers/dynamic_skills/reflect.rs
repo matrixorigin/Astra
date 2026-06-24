@@ -36,7 +36,7 @@ Pause and critically examine your own behavior using both your conversation hist
 | Tool calls (total) | ${{CTX_TOTAL_TOOL_CALLS}} |
 | Stall nudges sent | ${{CTX_NUDGE_COUNT}} |
 | Errors | ${{CTX_ERROR_COUNT}} |
-| Deprioritized tools | ${{CTX_DEPRIORITIZED_TOOLS}} |
+| Health-deprioritized tools | ${{CTX_HEALTH_DEPRIORITIZED_TOOLS}} |
 | Stall events | ${{CTX_STALL_EVENTS}} |
 | Correction follow rate | ${{CTX_CORRECTION_FOLLOW_RATE}} |
 
@@ -47,7 +47,7 @@ Use these numbers — don't guess. A blank value means zero/none.
 Read the snapshot above and answer:
 
 - **Token burn rate**: Is `prompt_tokens` growing faster than expected? Over 50k in <5 turns suggests context bloat (large tool results, repeated file reads, or compaction not triggering).
-- **Tool failure rate**: `errors / tool_calls` — above 20% means something systemic is wrong. Check which tools are deprioritized.
+- **Tool failure rate**: `errors / tool_calls` — above 20% means something systemic is wrong. Check which tools are health-deprioritized.
 - **Stall signals**: Any `nudge_count > 0` or `stall_events` means the system already detected you're stuck. What pattern triggered it? Are you still doing the same thing?
 - **Correction compliance**: If `correction_follow_rate` is below 80%, you're ignoring the system's guidance. Why?
 

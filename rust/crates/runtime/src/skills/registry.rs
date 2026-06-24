@@ -51,8 +51,8 @@ fn default_metadata_budget() -> u32 {
 pub struct SkillHealthInputs {
     /// Per-tool recent failure rate in `[0.0, 1.0]`.
     pub tool_failure_rates: HashMap<String, f64>,
-    /// Tools flagged as low-confidence by the observability hub.
-    pub deprioritized_tools: HashSet<String>,
+    /// Tools explicitly deprioritized by health feedback.
+    pub health_deprioritized_tools: HashSet<String>,
     /// Optional per-skill quality tracker used as the base multiplier.
     pub skill_quality: Option<Arc<SkillQualityTracker>>,
 }
@@ -168,7 +168,7 @@ impl UnifiedSkillRegistry {
             let q_ref = h.skill_quality.as_deref();
             let inputs = HealthRankingInputs {
                 tool_failure_rates: &h.tool_failure_rates,
-                deprioritized_tools: &h.deprioritized_tools,
+                health_deprioritized_tools: &h.health_deprioritized_tools,
                 skill_quality: q_ref,
             };
             let ranks: HashMap<String, f64> = all_manifests
@@ -1582,7 +1582,7 @@ Shared MCP.
         rates.insert("stable".to_string(), 0.0);
         registry.update_health_inputs(SkillHealthInputs {
             tool_failure_rates: rates,
-            deprioritized_tools: HashSet::new(),
+            health_deprioritized_tools: HashSet::new(),
             skill_quality: None,
         });
 
@@ -1610,7 +1610,7 @@ Shared MCP.
         dep.insert("bash".to_string());
         registry.update_health_inputs(SkillHealthInputs {
             tool_failure_rates: HashMap::new(), // bash "looks healthy" by rate
-            deprioritized_tools: dep,
+            health_deprioritized_tools: dep,
             skill_quality: None,
         });
 
@@ -1643,7 +1643,7 @@ Shared MCP.
         rates.insert("stable".to_string(), 0.0);
         registry.update_health_inputs(SkillHealthInputs {
             tool_failure_rates: rates,
-            deprioritized_tools: HashSet::new(),
+            health_deprioritized_tools: HashSet::new(),
             skill_quality: None,
         });
         let registered = registry.discover_all().await.unwrap();
@@ -1675,7 +1675,7 @@ Shared MCP.
         rates.insert("flaky".to_string(), 0.9);
         registry.update_health_inputs(SkillHealthInputs {
             tool_failure_rates: rates,
-            deprioritized_tools: HashSet::new(),
+            health_deprioritized_tools: HashSet::new(),
             skill_quality: None,
         });
         let registered = registry.discover_all().await.unwrap();
@@ -1707,7 +1707,7 @@ Shared MCP.
         rates.insert("flaky".to_string(), 0.9);
         registry.update_health_inputs(SkillHealthInputs {
             tool_failure_rates: rates,
-            deprioritized_tools: HashSet::new(),
+            health_deprioritized_tools: HashSet::new(),
             skill_quality: None,
         });
         let with_health = registry.discover_all().await.unwrap();

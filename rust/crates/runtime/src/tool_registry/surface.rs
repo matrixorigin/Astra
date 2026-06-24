@@ -102,11 +102,11 @@ impl ToolSurface {
             .chain(plugin_schemas.iter().cloned())
         {
             if let Some(name) = tool_schema_name(&schema) {
-                if builtin_tool_is_internal(name) {
+                if tool_name_is_forbidden_model_surface(name) {
                     tracing::warn!(
                         target: "astra.tool_surface",
                         name,
-                        "tool surface: internal builtin schema '{name}' ignored"
+                        "tool surface: forbidden schema name '{name}' ignored"
                     );
                     continue;
                 }
@@ -290,6 +290,10 @@ fn builtin_tool_is_internal(name: &str) -> bool {
     REGISTRY
         .get(name)
         .is_some_and(|spec| !spec.load_policy.is_public_schema_policy())
+}
+
+fn tool_name_is_forbidden_model_surface(name: &str) -> bool {
+    astra_core::tool_names::is_retired_tool_name(name) || builtin_tool_is_internal(name)
 }
 
 /// Truncate the schema description to a compact UTF-8 char-boundary summary.

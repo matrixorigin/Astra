@@ -569,21 +569,16 @@ fn normalized_skill_text(text: &str) -> String {
 }
 
 fn contains_token_subsequence(haystack: &str, needle: &str) -> bool {
-    let haystack_tokens: Vec<&str> = haystack.split_whitespace().collect();
     let needle_tokens: Vec<&str> = needle.split_whitespace().collect();
     if needle_tokens.is_empty() {
         return false;
     }
 
-    let mut start = 0usize;
+    let mut haystack_tokens = haystack.split_whitespace();
     for token in needle_tokens {
-        let Some(found) = haystack_tokens[start..]
-            .iter()
-            .position(|candidate| *candidate == token)
-        else {
+        if !haystack_tokens.any(|candidate| candidate == token) {
             return false;
-        };
-        start += found + 1;
+        }
     }
     true
 }
@@ -609,6 +604,9 @@ pub fn select_auto_routed_skill_with_config(
     }
 
     let query_lower = normalized_skill_text(query);
+    // Skill catalogs are unbounded user/plugin content, so relevance scoring
+    // is local retrieval over a catalog. Tool visibility stays declarative
+    // (`always_load` + deferred activation) and does not use this selector.
     let adapters: Vec<SkillScoreAdapter> = catalog.iter().map(SkillScoreAdapter).collect();
     let ranked = astra_tools::relevance_score::rank_by_relevance(&adapters, &query_lower, 2);
     let (top_idx, top_score) = ranked.first().copied()?;
@@ -635,8 +633,9 @@ pub fn select_auto_routed_skill_with_config(
 }
 
 /// Run discovery; returns assistant-facing text and canonical names to merge into session state.
-/// Scores candidates by query relevance. Empty queries list the first page; non-empty queries
-/// only return relevant matches.
+/// Scores skill-catalog candidates by query relevance. Empty queries list the first page;
+/// non-empty queries only return relevant matches. This retrieval path is intentionally
+/// separate from declarative tool surfacing.
 pub fn execute_discover_skills(
     query: &str,
     catalog: &[SkillToolInfo],

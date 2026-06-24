@@ -185,8 +185,8 @@ pub struct CapabilityView {
     pub tool_names: Vec<String>,
     /// Tools with health issues (name → health summary).
     pub tool_health: Vec<ToolHealthSummary>,
-    /// Currently deprioritized tools.
-    pub deprioritized_tools: Vec<String>,
+    /// Tools currently deprioritized by health feedback.
+    pub health_deprioritized_tools: Vec<String>,
     /// Discovered skills.
     pub skills: Vec<String>,
     /// Tools currently boosted by the last auto-reflection strategy delta.
@@ -369,7 +369,7 @@ impl SelfModel {
     ) -> Self {
         // ── Capabilities ──
         let mut tool_health_summaries = Vec::new();
-        let mut deprioritized = Vec::new();
+        let mut health_deprioritized = Vec::new();
         let mut outcome_memory = Vec::new();
 
         if let Some(health) = tool_health {
@@ -387,7 +387,7 @@ impl SelfModel {
                 if h.deprioritized
                     && !astra_turn_core::tool::categories::registry().is_never_restrict(name)
                 {
-                    deprioritized.push(name.clone());
+                    health_deprioritized.push(name.clone());
                 }
             }
             // Sort by name for stability
@@ -414,7 +414,7 @@ impl SelfModel {
                 .collect();
         }
 
-        deprioritized.sort();
+        health_deprioritized.sort();
 
         let (boosted_tools, widen_surface_pending) = match last_strategy {
             Some(app) => {
@@ -435,7 +435,7 @@ impl SelfModel {
             total_tools: tool_names.len(),
             tool_names: tool_names.iter().map(|s| s.to_string()).collect(),
             tool_health: tool_health_summaries,
-            deprioritized_tools: deprioritized,
+            health_deprioritized_tools: health_deprioritized,
             skills: skills.to_vec(),
             boosted_tools,
             widen_surface_pending,
@@ -659,11 +659,11 @@ impl SelfModel {
         }
 
         // ── Tool health ──
-        if !self.capabilities.deprioritized_tools.is_empty() {
+        if !self.capabilities.health_deprioritized_tools.is_empty() {
             let _ = writeln!(
                 s,
-                "Deprioritized tools: {} (repeated failures — try alternatives)",
-                self.capabilities.deprioritized_tools.join(", ")
+                "Health-deprioritized tools: {} (repeated failures — try alternatives)",
+                self.capabilities.health_deprioritized_tools.join(", ")
             );
         }
         if !self.capabilities.outcome_memory.is_empty() {
@@ -1055,7 +1055,7 @@ impl SelfModel {
             return true;
         }
         if !self.capabilities.outcome_memory.is_empty()
-            || !self.capabilities.deprioritized_tools.is_empty()
+            || !self.capabilities.health_deprioritized_tools.is_empty()
             || !self.capabilities.boosted_tools.is_empty()
             || self.capabilities.widen_surface_pending
         {
@@ -1185,11 +1185,11 @@ impl SelfModel {
         // ── Capabilities ──
         s.push_str("\n## Capabilities\n");
         let _ = writeln!(s, "- Total tools: {}", self.capabilities.total_tools);
-        if !self.capabilities.deprioritized_tools.is_empty() {
+        if !self.capabilities.health_deprioritized_tools.is_empty() {
             let _ = writeln!(
                 s,
-                "- Deprioritized tools: {}",
-                self.capabilities.deprioritized_tools.join(", ")
+                "- Health-deprioritized tools: {}",
+                self.capabilities.health_deprioritized_tools.join(", ")
             );
         }
         if !self.capabilities.skills.is_empty() {
@@ -1394,7 +1394,10 @@ mod tests {
             &[],
             &config,
         );
-        assert_eq!(model.capabilities.deprioritized_tools, vec!["write_file"]);
+        assert_eq!(
+            model.capabilities.health_deprioritized_tools,
+            vec!["write_file"]
+        );
         assert_eq!(model.capabilities.tool_health.len(), 2);
     }
 
@@ -1423,7 +1426,7 @@ mod tests {
             &config,
         );
 
-        assert_eq!(model.capabilities.deprioritized_tools, vec!["bash"]);
+        assert_eq!(model.capabilities.health_deprioritized_tools, vec!["bash"]);
         assert!(
             model
                 .capabilities
@@ -2309,9 +2312,12 @@ mod tests {
     }
 
     #[test]
-    fn meaningful_when_deprioritized_tools_present() {
+    fn meaningful_when_health_deprioritized_tools_present() {
         let mut model = minimal_model();
-        model.capabilities.deprioritized_tools.push("grep".into());
+        model
+            .capabilities
+            .health_deprioritized_tools
+            .push("grep".into());
         assert!(model.has_meaningful_self_awareness());
     }
 }

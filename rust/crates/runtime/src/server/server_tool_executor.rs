@@ -760,6 +760,9 @@ impl ServerToolExecutor {
     }
 
     fn tool_has_runtime_binding(&self, name: &str) -> bool {
+        if astra_core::tool_names::is_retired_tool_name(name) {
+            return false;
+        }
         if name.starts_with("mcp__") {
             return self.mcp_tool_has_runtime_binding(name);
         }
@@ -2506,16 +2509,28 @@ esac
     }
 
     #[tokio::test]
-    async fn retired_task_tool_names_are_not_executable_on_server_executor() {
+    async fn retired_public_tool_names_are_unknown_on_server_executor() {
         let (exec, _dir) = test_executor();
 
-        let retired = exec
-            .execute("task_create", &json!({"title": "old surface"}))
-            .await;
-        assert!(
-            retired.contains("not available") || retired.contains("Unknown tool"),
-            "retired task_create must not remain an executable task surface: {retired}"
-        );
+        for &retired in astra_core::tool_names::RETIRED_TOOL_NAMES {
+            let result = exec
+                .execute_with_metadata(retired, &json!({"title": "old surface"}))
+                .await;
+            assert!(result.is_error, "{retired}: {result:?}");
+            let metadata = result.metadata.as_ref().expect("metadata should exist");
+            assert_eq!(
+                metadata.get("capability_denial").and_then(Value::as_str),
+                Some("UnknownTool"),
+                "{retired}: {result:?}"
+            );
+            assert!(
+                metadata
+                    .get("execution_started")
+                    .and_then(Value::as_bool)
+                    .is_some_and(|started| !started),
+                "{retired}: {result:?}"
+            );
+        }
 
         let unified = exec
             .execute("task", &json!({"action": "create", "title": "new surface"}))
@@ -4356,6 +4371,44 @@ esac
         );
     }
 
+    #[tokio::test]
+    async fn server_retired_plugin_schema_cannot_become_activatable() {
+        let (exec, _dir) = test_executor();
+        exec.set_current_visible_tool_schemas(&[
+            json!({"type": "function", "function": {"name": "bash"}}),
+            json!({"type": "function", "function": {"name": "tool_search"}}),
+        ]);
+        exec.set_plugin_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "task_create",
+                "description": "Retired task creation surface.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })]);
+        exec.set_current_activatable_tool_names(HashSet::from(["task_create".to_string()]));
+
+        assert!(
+            exec.current_activatable_tool_names_snapshot().is_empty(),
+            "retired plugin schemas must not be treated as runtime-bound activatable tools"
+        );
+
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:task_create"}))
+            .await;
+        let parsed = parse_tool_search_output(&result.output);
+        assert_eq!(tool_search_match_names(&parsed), Vec::<String>::new());
+        assert_eq!(
+            tool_search_string_array(&parsed, "missing"),
+            vec!["task_create".to_string()]
+        );
+        assert_eq!(
+            exec.activated_deferred_tool_names(),
+            Vec::<String>::new(),
+            "retired plugin schemas must not record deferred activation"
+        );
+    }
+
     #[test]
     fn server_search_pool_names_are_visible_union_activatable() {
         let (exec, _dir) = test_executor();
@@ -6069,29 +6122,6 @@ esac
                 "{name}: {result:?}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn standalone_delegate_is_not_executable_on_server_executor() {
-        let (exec, _dir) = test_executor();
-        let result = exec
-            .execute_with_metadata("delegate", &json!({"task": "review this"}))
-            .await;
-
-        assert!(result.is_error, "{result:?}");
-        let metadata = result.metadata.as_ref().expect("metadata should exist");
-        assert_eq!(
-            metadata.get("capability_denial").and_then(Value::as_str),
-            Some("UnknownTool"),
-            "{result:?}"
-        );
-        assert!(
-            metadata
-                .get("execution_started")
-                .and_then(Value::as_bool)
-                .is_some_and(|started| !started),
-            "{result:?}"
-        );
     }
 
     #[tokio::test]

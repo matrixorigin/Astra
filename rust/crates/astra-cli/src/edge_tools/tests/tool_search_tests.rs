@@ -357,3 +357,35 @@ async fn mcp_plugin_schema_requires_runtime_binding_to_resolve() {
     );
     assert_eq!(activatable["total_tools"].as_u64(), Some(2));
 }
+
+#[tokio::test]
+async fn retired_plugin_schema_cannot_become_activatable() {
+    let executor = executor();
+    set_visible(&executor, &["bash", "tool_search"]);
+    let retired = "task_create";
+    executor.set_plugin_schemas(vec![json!({
+        "type": "function",
+        "function": {
+            "name": retired,
+            "description": "Retired task creation surface.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    })]);
+    executor.set_current_activatable_tool_names(HashSet::from([retired.to_string()]));
+
+    assert!(
+        executor
+            .current_activatable_tool_names_snapshot()
+            .is_empty(),
+        "retired plugin schemas must not be treated as runtime-bound activatable tools"
+    );
+
+    let parsed = run_search(&executor, json!({"query": "select:task_create"})).await;
+    assert!(match_names(&parsed).is_empty(), "{parsed}");
+    assert_eq!(field_strings(&parsed, "missing"), strings(&["task_create"]));
+    assert_eq!(
+        executor.activated_deferred_tool_names(),
+        Vec::<String>::new(),
+        "retired plugin schemas must not record deferred activation"
+    );
+}

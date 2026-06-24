@@ -1438,6 +1438,9 @@ impl ToolExecutor {
     }
 
     fn tool_has_runtime_binding(&self, name: &str) -> bool {
+        if astra_core::tool_names::is_retired_tool_name(name) {
+            return false;
+        }
         if name.starts_with("mcp__") {
             return self.mcp_tool_has_runtime_binding(name);
         }
@@ -5103,7 +5106,7 @@ impl ToolExecutor {
                 "tools_dropped_by_surface": caps.dropped_by_surface,
                 "tools_pass_through_mcp": caps.mcp_pass_through,
                 "tool_count": model.capabilities.total_tools,
-                "deprioritized_tools": model.capabilities.deprioritized_tools,
+                "health_deprioritized_tools": model.capabilities.health_deprioritized_tools,
                 "skills": model.capabilities.skills,
                 "tool_health": model.capabilities.tool_health.iter().map(|t| {
                     json!({

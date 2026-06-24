@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serde_json::Value;
 
 use astra_config::ToolSurfaceConfig;
@@ -36,7 +38,7 @@ pub struct ToolRegistry {
     /// Pre-sorted always_load schemas for `always_load_only()` — shared via Arc
     /// to avoid ~5-8KB clone per conversational turn. Atomically replaced when
     /// runtime-injected schemas change.
-    always_load_sorted: std::sync::Arc<Vec<Value>>,
+    always_load_sorted: Arc<Vec<Value>>,
     /// Cached set of always_load tool names, rebuilt alongside `always_load_sorted`.
     /// Avoids reconstructing a `HashSet<String>` (cloning ~14 names) on every
     /// selection path — 2-3 calls per turn previously.
@@ -84,7 +86,7 @@ impl ToolRegistry {
             measured_costs,
             schema_index,
             always_load_schemas,
-            always_load_sorted: std::sync::Arc::new(always_load_sorted),
+            always_load_sorted: Arc::new(always_load_sorted),
             always_load_name_cache,
         }
     }
@@ -242,16 +244,16 @@ impl ToolRegistry {
         }
 
         let schemas = self.always_load_only();
-        let names = Self::visible_names(&schemas);
+        let names = Self::visible_names(schemas.as_ref());
 
         let report = ToolSurfaceReport {
-            visible_count: schemas.len() as u32,
+            visible_count: schemas.as_ref().len() as u32,
             visible_tools: names,
             schema_budget_used: 0,
             schema_budget_total: schema_budget,
         };
 
-        (schemas, report)
+        (schemas.as_ref().clone(), report)
     }
 
     /// Pipeline-integrated tool surface using a pre-computed RoutingDecision.
@@ -261,9 +263,9 @@ impl ToolRegistry {
     /// tools stay deferred until explicitly activated via `tool_search`.
     pub fn build_routed_surface(&self, schema_budget: u32) -> (Vec<Value>, ToolSurfaceReport) {
         let schemas = self.always_load_only();
-        let names = Self::visible_names(&schemas);
+        let names = Self::visible_names(schemas.as_ref());
         (
-            schemas,
+            schemas.as_ref().clone(),
             ToolSurfaceReport {
                 visible_count: names.len() as u32,
                 visible_tools: names,
@@ -274,8 +276,8 @@ impl ToolRegistry {
     }
 
     /// Return only always_load tools.
-    pub fn always_load_only(&self) -> Vec<Value> {
-        self.always_load_sorted.as_ref().clone()
+    pub fn always_load_only(&self) -> Arc<Vec<Value>> {
+        Arc::clone(&self.always_load_sorted)
     }
 
     fn rebuild_always_load_sorted(&mut self) {
@@ -285,7 +287,7 @@ impl ToolRegistry {
             .map(|(_, s)| s.clone())
             .collect();
         sort_schemas_by_name(&mut sorted);
-        self.always_load_sorted = std::sync::Arc::new(sorted);
+        self.always_load_sorted = Arc::new(sorted);
         self.always_load_name_cache = self
             .always_load_schemas
             .iter()
@@ -354,7 +356,7 @@ impl ToolRegistry {
         self.schema_index = Self::build_schema_index(&self.all_schemas);
     }
 
-    /// Inject a single tool schema dynamically (e.g. the `skill` or `delegate` tool).
+    /// Inject a single tool schema dynamically (e.g. a session-local plugin tool).
     ///
     /// When `always_load` is true the tool is budget-exempt (always included like
     /// core tools such as `bash` and `read_file`). When false it is lookupable

@@ -58,14 +58,13 @@
 //! so dynamic content **must** be moved to the second message to avoid per-turn cache
 //! invalidation.
 //!
-//! ## Tool Schema Pinning
+//! ## Always-Load Tool Schema Caching
 //!
 //! For Anthropic, tool schemas in the request body also participate in caching.
-//! [`annotate_tool_schemas_for_caching_with_always_load`] pins a predefined set of
-//! high-frequency tools (read, write, edit, search, shell, task management) at the start
-//! of the tool list with `cache_control` markers. Lower-frequency tools follow without
-//! markers — when the tool list changes, only the tail is invalidated while the always_load
-//! prefix remains cached.
+//! [`annotate_tool_schemas_for_caching_with_always_load`] marks the last schema in the
+//! declarative `always_load` prefix with `cache_control`. Lower-frequency tools follow
+//! without markers, so schema churn invalidates only the tail while the always-load
+//! prefix remains cacheable.
 //!
 //! ## Cache Key Design
 //!
@@ -106,7 +105,7 @@
 //!   provider policy selection, and edge cases (empty tools, disabled cache, override
 //!   files).
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::prompts;
 use astra_config::ToolSurfaceConfig;
@@ -244,6 +243,29 @@ pub(crate) fn provider_cache_policy_for(
     } else {
         ProviderCachePolicy::openai_compatible()
     }
+}
+
+fn compact_cache_control_marker(cache_control: &Value) -> Value {
+    let Some(object) = cache_control.as_object() else {
+        return cache_control.clone();
+    };
+    let Some(kind) = object.get("type").and_then(Value::as_str) else {
+        return cache_control.clone();
+    };
+
+    let mut marker = Map::with_capacity(object.len());
+    marker.insert("type".to_string(), Value::String(kind.to_string()));
+    if let Some(ttl) = object.get("ttl") {
+        let Some(ttl) = ttl.as_str() else {
+            return cache_control.clone();
+        };
+        marker.insert("ttl".to_string(), Value::String(ttl.to_string()));
+    }
+    if object.keys().any(|key| key != "type" && key != "ttl") {
+        return cache_control.clone();
+    }
+
+    Value::Object(marker)
 }
 
 /// Assemble a system message via the context pipeline directly, without
@@ -422,7 +444,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
             prompts::PromptTokenBucket::Environment,
         ));
     }
-    let all_sections_for_trace = {
+    let trace_extra_sections = {
         let mut v = stable.clone();
         if let Some(section) = system_override_trace_section {
             v.push(section);
@@ -544,7 +566,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     // in their original form — trace_signals intact. Downstream
     // `build_system_prompt_trace` aggregates context_signals across every
     // section, so this preserves the bridge's telemetry contract.
-    sections.extend(all_sections_for_trace.iter().cloned());
+    sections.extend(trace_extra_sections);
 
     let tier = output.plan.compact_tier;
     let pruned_tool_schemas = output.optimized.tool_schemas.clone();
@@ -577,7 +599,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
             } else {
                 let mut b = json!({"type": "text", "text": block.text});
                 if should_annotate_cache_controls && let Some(ref cc) = block.cache_control {
-                    b["cache_control"] = cc.clone();
+                    b["cache_control"] = compact_cache_control_marker(cc);
                 }
                 stable_blocks.push(b);
             }
@@ -677,28 +699,59 @@ pub(crate) fn annotate_tool_schemas_for_caching_with_always_load(
     cache_cfg: &PromptCacheConfig,
     always_load_names: &std::collections::HashSet<String>,
 ) {
+    clear_tool_cache_controls(tools);
     if !cache_cfg.should_annotate() || tools.is_empty() {
         return;
     }
-    if !always_load_names.is_empty()
-        && !tools.iter().any(|t| {
-            t.get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)
-                .is_some_and(|n| always_load_names.contains(n))
-        })
-    {
-        // Fallback path: no always_load tool present in this tool list. Legit
-        // for delegated sub-runs that pass a fully custom toolset, but a
-        // cache-hit regression triage needs to see it — otherwise "why
-        // does this sub-run cache worse than its parent?" is opaque.
-        tracing::debug!(
-            tool_count = tools.len(),
-            "cache marker fallback: no always_load tools present; placing on last tool. \
-             Static-prefix caching unavailable for this request."
-        );
+    let marker_idx = match always_load_prefix_marker_index(tools, always_load_names) {
+        Some(idx) => idx,
+        None => {
+            // Fallback path: no always_load prefix is present in this tool
+            // list. Legit for delegated sub-runs that pass a fully custom
+            // toolset, but a cache-hit regression triage needs to see it.
+            tracing::debug!(
+                tool_count = tools.len(),
+                "cache marker fallback: no always_load prefix present; placing on last tool. \
+                 Static-prefix caching unavailable for this request."
+            );
+            tools.len() - 1
+        }
+    };
+    tools[marker_idx]["cache_control"] =
+        astra_turn_core::context_serializer::anthropic_ephemeral_cache_control();
+}
+
+fn clear_tool_cache_controls(tools: &mut [Value]) {
+    for tool in tools {
+        if let Some(object) = tool.as_object_mut() {
+            object.remove("cache_control");
+        }
     }
-    astra_turn_core::context_serializer::annotate_always_load_tool_schema(tools, always_load_names);
+}
+
+fn always_load_prefix_marker_index(
+    tools: &[Value],
+    always_load_names: &std::collections::HashSet<String>,
+) -> Option<usize> {
+    if always_load_names.is_empty() {
+        return None;
+    }
+
+    let mut last_prefix_idx = None;
+    for (idx, tool) in tools.iter().enumerate() {
+        let Some(name) = tool
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+        else {
+            break;
+        };
+        if !always_load_names.contains(name) {
+            break;
+        }
+        last_prefix_idx = Some(idx);
+    }
+    last_prefix_idx
 }
 
 /// Runtime-configured always_load tool names for fallback paths that do not receive
@@ -946,15 +999,16 @@ mod tests {
     /// the cached prefix every turn.
 
     /// When dynamic tools are interleaved (shouldn't happen in production but
-    /// could via custom pipelines), the marker goes on the LAST always_load tool —
-    /// guaranteeing the always_load prefix is fully cached.
+    /// could via custom pipelines), the static prefix ends at the first
+    /// non-always_load tool. Later always_load-named tools must not pull the
+    /// marker past dynamic content.
     #[test]
-    fn annotate_tool_schemas_handles_interleaved_tools() {
+    fn annotate_tool_schemas_does_not_cross_interleaved_dynamic_tools() {
         let mut tools = vec![
             json!({"type": "function", "function": {"name": "bash"}}), // always_load
             json!({"type": "function", "function": {"name": "lsp"}}),  // dynamic
             json!({"type": "function", "function": {"name": "memory"}}), // always_load
-            json!({"type": "function", "function": {"name": "git"}}),  // dynamic
+            json!({"type": "function", "function": {"name": "git"}}), // always_load name in dynamic tail
         ];
         annotate_test_tool_schemas_for_caching(
             &mut tools,
@@ -963,8 +1017,51 @@ mod tests {
                 is_anthropic: true,
             },
         );
-        assert!(tools[2].get("cache_control").is_some());
+        assert!(tools[0].get("cache_control").is_some());
+        assert!(tools[2].get("cache_control").is_none());
         assert!(tools[3].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn annotate_tool_schemas_ignores_always_load_name_in_dynamic_tail() {
+        let mut tools = vec![
+            json!({"type": "function", "function": {"name": "bash"}}),
+            json!({"type": "function", "function": {"name": "read_file"}}),
+            json!({"type": "function", "function": {"name": "skill"}}),
+        ];
+        let prefix_len = tools.len();
+        tools.push(json!({"type": "function", "function": {"name": "web_fetch"}}));
+        tools.push(json!({"type": "function", "function": {"name": "git"}}));
+
+        let always_load = default_test_always_load_tool_names();
+        assert!(always_load.contains("bash"));
+        assert!(always_load.contains("read_file"));
+        assert!(always_load.contains("skill"));
+        assert_eq!(
+            always_load_prefix_marker_index(&tools, &always_load),
+            Some(prefix_len - 1)
+        );
+
+        annotate_test_tool_schemas_for_caching(
+            &mut tools,
+            &PromptCacheConfig {
+                cache_enabled: true,
+                is_anthropic: true,
+            },
+        );
+
+        assert!(
+            tools[prefix_len - 1].get("cache_control").is_some(),
+            "{tools:#?}"
+        );
+        assert!(
+            tools[prefix_len].get("cache_control").is_none(),
+            "{tools:#?}"
+        );
+        assert!(
+            tools[prefix_len + 1].get("cache_control").is_none(),
+            "{tools:#?}"
+        );
     }
 
     #[test]
@@ -2155,7 +2252,7 @@ mod cache_stability_regression {
     }
 
     /// Bedrock path: tools get translated to `toolSpec` blocks + a trailing
-    /// `cachePoint`. The cachePoint must sit AT THE END OF THE PINNED PREFIX,
+    /// `cachePoint`. The cachePoint must sit AT THE END OF THE ALWAYS-LOAD PREFIX,
     /// not at the end of the full tool list.
 
     /// Direct Anthropic path: tools are rewritten to `{name, input_schema}`
@@ -2172,7 +2269,7 @@ mod cache_stability_regression {
             let mut tools = always_load_prefix_fixture();
             // Deliberately DIFFERENT dynamic tools each call — the test
             // asserts the always_load portion is unaffected.
-            tools.extend([schema("git"), schema("mo_query")]);
+            tools.extend([schema("mo_query"), schema("github")]);
             annotate_test_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
             build_provider_request_body(
                 &[json!({"role": "user", "content": "hi"})],
@@ -2242,7 +2339,7 @@ mod cache_stability_regression {
                 &ThinkingConfig::Off,
             )
         };
-        let a = build(vec![schema("git"), schema("mo_query")]);
+        let a = build(vec![schema("mo_query"), schema("github")]);
         let b = build(vec![schema("web_fetch")]);
 
         let a_tools = a["tools"].as_array().unwrap();
@@ -2271,11 +2368,11 @@ mod cache_stability_regression {
     #[test]
     fn runtime_dynamic_addition_does_not_touch_always_load_cache() {
         let mut without = always_load_prefix_fixture();
-        without.push(schema("git"));
+        without.push(schema("web_fetch"));
         annotate_test_tool_schemas_for_caching(&mut without, &cfg_anthropic());
 
         let mut with_new_mcp = always_load_prefix_fixture();
-        with_new_mcp.push(schema("git"));
+        with_new_mcp.push(schema("web_fetch"));
         with_new_mcp.push(schema("mcp_new_runtime_tool")); // discovered mid-session
         annotate_test_tool_schemas_for_caching(&mut with_new_mcp, &cfg_anthropic());
 
@@ -2337,7 +2434,7 @@ mod cache_stability_regression {
             )
         };
 
-        let a = build(vec![schema("git"), schema("mo_query")]);
+        let a = build(vec![schema("mo_query"), schema("github")]);
         let b = build(vec![schema("web_fetch")]);
         (a, b, always_load_prefix_fixture().len())
     }
@@ -2390,7 +2487,7 @@ mod cache_stability_regression {
                 &astra_turn_core::thinking_config::ThinkingConfig::Off,
             )
         };
-        let a = build(vec![schema("git"), schema("mo_query")]);
+        let a = build(vec![schema("mo_query"), schema("github")]);
         let b = build(vec![schema("web_fetch")]);
 
         // Static system + user message identical
@@ -2433,7 +2530,7 @@ mod cache_stability_regression {
                 &astra_turn_core::thinking_config::ThinkingConfig::Off,
             )
         };
-        let a = build(vec![schema("git"), schema("mo_query")]);
+        let a = build(vec![schema("mo_query"), schema("github")]);
         let b = build(vec![schema("web_fetch")]);
 
         assert_eq!(a["messages"], b["messages"]);

@@ -24,8 +24,8 @@ pub fn anthropic_ephemeral_cache_control() -> Value {
     json!({ "type": "ephemeral" })
 }
 
-/// Place a single `cache_control` marker on the last always-load tool schema in
-/// `tool_schemas`, ending the static-lib prefix. Later dynamic tools still
+/// Place a single `cache_control` marker on the last schema in the contiguous
+/// always-load prefix, ending the static-lib prefix. Later dynamic tools still
 /// appear in the array but do not invalidate the cached prefix.
 ///
 /// `always_load_names` is the set of tool names guaranteed present every turn
@@ -35,8 +35,8 @@ pub fn anthropic_ephemeral_cache_control() -> Value {
 /// win, and the caller is expected to log a warning at the call-site.
 ///
 /// No-op when `tool_schemas` is empty.
-/// Annotates tool schemas with `cache_control` on the last always-load tool. See
-/// module-level docs for cache-key rationale.
+/// Annotates tool schemas with `cache_control` on the last tool in the
+/// contiguous always-load prefix. See module-level docs for cache-key rationale.
 ///
 /// Fallback: if no always-load tools are present in the input slice, falls back to
 /// marking the final tool to preserve cache-boundary behavior and emits a
@@ -48,7 +48,7 @@ pub fn annotate_always_load_tool_schema(
     if tool_schemas.is_empty() {
         return;
     }
-    let marker_idx = match last_always_load_tool_index(tool_schemas, always_load_names) {
+    let marker_idx = match always_load_prefix_marker_index(tool_schemas, always_load_names) {
         Some(idx) => idx,
         None => {
             // Degraded path: no always-load tools present. Fall back to the last
@@ -67,24 +67,28 @@ pub fn annotate_always_load_tool_schema(
     tool_schemas[marker_idx]["cache_control"] = anthropic_ephemeral_cache_control();
 }
 
-fn last_always_load_tool_index(
+fn always_load_prefix_marker_index(
     tools: &[Value],
     always_load_names: &std::collections::HashSet<String>,
 ) -> Option<usize> {
     if always_load_names.is_empty() {
         return None;
     }
-    tools.iter().enumerate().rev().find_map(|(idx, t)| {
-        let name = t
+    let mut last_prefix_idx = None;
+    for (idx, tool) in tools.iter().enumerate() {
+        let Some(name) = tool
             .get("function")
             .and_then(|f| f.get("name"))
-            .and_then(Value::as_str)?;
-        if always_load_names.contains(name) {
-            Some(idx)
-        } else {
-            None
+            .and_then(Value::as_str)
+        else {
+            break;
+        };
+        if !always_load_names.contains(name) {
+            break;
         }
-    })
+        last_prefix_idx = Some(idx);
+    }
+    last_prefix_idx
 }
 
 /// Place exactly one `cache_control` marker on the last non-system message.
@@ -329,6 +333,25 @@ mod tests {
         // Marker goes on last always-load (read_file, idx 1), NOT the last
         // overall tool — dynamic churn after this marker is expected
         // and cache-safe.
+        assert!(tools[0]["cache_control"].is_null());
+        assert_eq!(tools[1]["cache_control"], json!({"type": "ephemeral"}));
+        assert!(tools[2]["cache_control"].is_null());
+        assert!(tools[3]["cache_control"].is_null());
+    }
+
+    #[test]
+    fn annotate_always_load_tool_schema_ignores_same_name_after_prefix() {
+        let mut tools = vec![
+            tool_schema("bash"),
+            tool_schema("read_file"),
+            tool_schema("dynamic_tool"),
+            tool_schema("bash"),
+        ];
+        let always_load: std::collections::HashSet<String> =
+            ["bash".into(), "read_file".into()].into_iter().collect();
+
+        annotate_always_load_tool_schema(&mut tools, &always_load);
+
         assert!(tools[0]["cache_control"].is_null());
         assert_eq!(tools[1]["cache_control"], json!({"type": "ephemeral"}));
         assert!(tools[2]["cache_control"].is_null());
