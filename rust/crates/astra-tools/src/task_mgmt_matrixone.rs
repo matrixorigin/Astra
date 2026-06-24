@@ -212,22 +212,7 @@ async fn ensure_counter_owner_available(
         ));
     }
 
-    let existing: Option<(String,)> =
-        sqlx::query_as("SELECT user_id FROM session_todo_counters WHERE session_id = ? FOR UPDATE")
-            .bind(session_id)
-            .fetch_optional(&mut *executor)
-            .await
-            .map_err(|e| e.to_string())?;
-    match existing {
-        Some((existing_user_id,)) if existing_user_id != user_id => {
-            Err(counter_owner_mismatch_error(
-                session_id,
-                user_id,
-                &format!("counter row belongs to {existing_user_id}"),
-            ))
-        }
-        _ => Ok(()),
-    }
+    Ok(())
 }
 
 fn peek_task_id_from_counter(row: Option<i64>, session_id: &str) -> Result<u32, String> {
@@ -787,10 +772,12 @@ impl TaskStore for MatrixOneTaskStore {
             return Err(e);
         }
 
-        let existing: Option<(String, i64)> = match sqlx::query_as(
-            "SELECT user_id, next_id FROM session_todo_counters WHERE session_id = ? FOR UPDATE",
+        let existing: Option<(i64,)> = match sqlx::query_as(
+            "SELECT next_id FROM session_todo_counters \
+             WHERE session_id = ? AND user_id = ? FOR UPDATE",
         )
         .bind(session_id)
+        .bind(&self.user_id)
         .fetch_optional(&mut *tx)
         .await
         {
@@ -823,7 +810,7 @@ impl TaskStore for MatrixOneTaskStore {
                 }
                 1
             }
-            Some((existing_user_id, raw)) if existing_user_id == self.user_id => {
+            Some((raw,)) => {
                 let (current, next_stored) = match locked_counter_advance(raw, session_id) {
                     Ok(v) => v,
                     Err(e) => {
@@ -852,17 +839,6 @@ impl TaskStore for MatrixOneTaskStore {
                     return Err(e);
                 }
                 current
-            }
-            Some(_) => {
-                let err = counter_owner_mismatch_error(
-                    session_id,
-                    &self.user_id,
-                    "counter row belongs to another user",
-                );
-                if let Err(rollback_err) = tx.rollback().await {
-                    return Err(format!("{err}; rollback failed: {rollback_err}"));
-                }
-                return Err(err);
             }
         };
         tx.commit().await.map_err(|e| e.to_string())?;
@@ -995,45 +971,33 @@ impl TaskStore for MatrixOneTaskStore {
         // 0/negative, fail loudly so try_snapshot_state falls back to
         // max(existing task id) + 1 instead of capturing a corrupt
         // counter and later restoring it.
-        let row: Option<(String, i64)> = sqlx::query_as(
-            "SELECT user_id, next_id FROM session_todo_counters WHERE session_id = ?",
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT next_id FROM session_todo_counters WHERE session_id = ? AND user_id = ?",
         )
         .bind(session_id)
+        .bind(&self.user_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
         match row {
-            Some((existing_user_id, next_id)) if existing_user_id == self.user_id => {
-                peek_task_id_from_counter(Some(next_id), session_id)
-            }
-            Some((existing_user_id, _)) => Err(counter_owner_mismatch_error(
-                session_id,
-                &self.user_id,
-                &format!("counter row belongs to {existing_user_id}"),
-            )),
+            Some((next_id,)) => peek_task_id_from_counter(Some(next_id), session_id),
             None => peek_task_id_from_counter(None, session_id),
         }
     }
 
     async fn get_session_version(&self, session_id: &str) -> Result<u64, String> {
-        let row: Option<(String, i64)> = sqlx::query_as(
-            "SELECT user_id, version FROM session_todo_counters WHERE session_id = ?",
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT version FROM session_todo_counters WHERE session_id = ? AND user_id = ?",
         )
         .bind(session_id)
+        .bind(&self.user_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
         match row {
-            Some((existing_user_id, _)) if existing_user_id != self.user_id => {
-                Err(counter_owner_mismatch_error(
-                    session_id,
-                    &self.user_id,
-                    &format!("counter row belongs to {existing_user_id}"),
-                ))
-            }
-            Some((_, version)) if version >= 0 => u64::try_from(version)
+            Some((version,)) if version >= 0 => u64::try_from(version)
                 .map_err(|_| format!("session_todo_counters.version overflow for {session_id}")),
-            Some((_, version)) => Err(format!(
+            Some((version,)) => Err(format!(
                 "session_todo_counters.version out of range for {session_id}: {version}"
             )),
             None => Ok(0),

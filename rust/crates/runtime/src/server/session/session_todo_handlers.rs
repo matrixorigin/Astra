@@ -418,24 +418,7 @@ async fn ensure_session_todo_counter_owner_available(
     session_id: &str,
     user_id: &str,
 ) -> Result<(), String> {
-    ensure_session_todo_session_owner(executor, session_id, user_id).await?;
-
-    let existing: Option<(String,)> =
-        sqlx::query_as("SELECT user_id FROM session_todo_counters WHERE session_id = ? FOR UPDATE")
-            .bind(session_id)
-            .fetch_optional(&mut *executor)
-            .await
-            .map_err(|e| e.to_string())?;
-    match existing {
-        Some((existing_user_id,)) if existing_user_id != user_id => {
-            Err(session_todo_owner_mismatch_error(
-                session_id,
-                user_id,
-                &format!("counter row belongs to {existing_user_id}"),
-            ))
-        }
-        _ => Ok(()),
-    }
+    ensure_session_todo_session_owner(executor, session_id, user_id).await
 }
 
 async fn adopt_task_into_session_atomic(

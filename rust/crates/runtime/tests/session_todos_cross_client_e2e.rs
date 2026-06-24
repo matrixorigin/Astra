@@ -101,12 +101,14 @@ async fn edge_created_task_visible_on_cloud() {
         list.contains("shared task"),
         "cloud TaskManager did not see edge-created task: {list}"
     );
-    let counter_owner: String =
-        sqlx::query_scalar("SELECT user_id FROM session_todo_counters WHERE session_id = ?")
-            .bind(&session_id)
-            .fetch_one(&pool)
-            .await
-            .expect("load counter owner");
+    let counter_owner: String = sqlx::query_scalar(
+        "SELECT user_id FROM session_todo_counters WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load counter owner");
     assert_eq!(
         counter_owner, user_id,
         "task id counter must carry the same owner as session_todos"
@@ -117,9 +119,9 @@ async fn edge_created_task_visible_on_cloud() {
 
 #[tokio::test]
 #[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
-async fn matrixone_task_store_refuses_mixed_owner_counter_without_overwrite() {
+async fn matrixone_task_store_uses_owner_bound_counter_without_touching_foreign_rows() {
     let pool = bootstrap_pool().await;
-    let session_id = format!("s-mixed-counter-store-{}", uuid::Uuid::new_v4());
+    let session_id = format!("s-owner-bound-counter-store-{}", uuid::Uuid::new_v4());
     let owner_user_id = format!("u-owner-{}", uuid::Uuid::new_v4());
     let other_user_id = format!("u-other-{}", uuid::Uuid::new_v4());
     prepare_session(&pool, &session_id, &owner_user_id).await;
@@ -135,46 +137,42 @@ async fn matrixone_task_store_refuses_mixed_owner_counter_without_overwrite() {
     .expect("insert other-owner counter");
 
     let store = MatrixOneTaskStore::new_for_user(pool.clone(), owner_user_id.clone()).unwrap();
-    let set_err = store
+    store
         .set_next_task_id(&session_id, 99)
         .await
-        .expect_err("set_next_task_id must reject a counter owned by another user");
-    assert!(
-        set_err.contains("session_todo_counters owner mismatch"),
-        "unexpected set_next_task_id error: {set_err}"
-    );
+        .expect("set_next_task_id must update only the owner counter");
 
-    let restore_err = store
-        .restore_snapshot_state(&session_id, Vec::new(), 99, 0)
+    store
+        .restore_snapshot_state(&session_id, Vec::new(), 101, 1)
         .await
-        .expect_err("restore_snapshot_state must reject a counter owned by another user");
-    assert!(
-        restore_err.contains("session_todo_counters owner mismatch"),
-        "unexpected restore_snapshot_state error: {restore_err}"
-    );
+        .expect("restore_snapshot_state must update only the owner counter");
 
     let manager = TaskManager::new(
         session_id.clone(),
         Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), owner_user_id.clone()).unwrap()),
     );
-    let create = manager
-        .create(&json!({"title": "must not overwrite"}))
-        .await;
+    let create = manager.create(&json!({"title": "owner task"})).await;
     assert!(
-        create.starts_with("Error:") && create.contains("session_todo_counters owner mismatch"),
-        "create must fail closed on mixed-owner counter: {create}"
+        create.contains("\"success\":true") && create.contains("task-101"),
+        "create must allocate from the owner counter, not the foreign counter: {create}"
     );
 
-    let (actual_owner, next_id, version): (String, i64, i64) = sqlx::query_as(
-        "SELECT user_id, next_id, version FROM session_todo_counters WHERE session_id = ?",
+    let counter_rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT user_id, next_id, version FROM session_todo_counters \
+         WHERE session_id = ? ORDER BY user_id",
     )
     .bind(&session_id)
-    .fetch_one(&pool)
+    .fetch_all(&pool)
     .await
-    .expect("load counter after rejected writes");
-    assert_eq!(actual_owner, other_user_id);
-    assert_eq!(next_id, 7);
-    assert_eq!(version, 3);
+    .expect("load counters after owner writes");
+    assert_eq!(
+        counter_rows,
+        vec![
+            (other_user_id.clone(), 7, 3),
+            (owner_user_id.clone(), 102, 4),
+        ],
+        "owner writes must not overwrite the foreign counter row"
+    );
 
     let owner_rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM session_todos WHERE session_id = ? AND user_id = ?",
@@ -184,7 +182,7 @@ async fn matrixone_task_store_refuses_mixed_owner_counter_without_overwrite() {
     .fetch_one(&pool)
     .await
     .expect("count owner todos");
-    assert_eq!(owner_rows, 0, "failed create must not insert task rows");
+    assert_eq!(owner_rows, 1, "owner create must insert an owner task row");
 
     cleanup(&pool, &session_id).await;
 }

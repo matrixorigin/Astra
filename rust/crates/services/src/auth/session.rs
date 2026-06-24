@@ -8,7 +8,6 @@ use sqlx::{MySql, QueryBuilder, Row, query};
 use uuid::Uuid;
 
 const MAX_SESSION_ACTIVITY_ROWS: u32 = 200;
-const SESSION_DELETE_OWNER_MISMATCH_PREFIX: &str = "session_delete_owner_mismatch:";
 
 #[async_trait]
 pub trait SessionService: Send + Sync {
@@ -382,7 +381,7 @@ impl SessionService for DatabaseSessionService {
         let mut tx = pool.begin().await.map_err(internal_error)?;
         hard_delete_session_rows(&mut tx, &session_id, &user_id)
             .await
-            .map_err(map_hard_delete_session_error)?;
+            .map_err(internal_error)?;
         tx.commit().await.map_err(internal_error)?;
 
         let details = serde_json::json!({ "title": existing.title });
@@ -489,188 +488,12 @@ async fn delete_session_rows_session_user_twice(
         .map_err(|source| format!("delete_session.{label}: {source}"))
 }
 
-async fn ensure_session_delete_owner_consistency(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    session_id: &str,
-    user_id: &str,
-) -> Result<(), String> {
-    for (label, statement) in [
-        (
-            "agent_events",
-            "SELECT COUNT(*) AS c FROM agent_events WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "agent_runs",
-            "SELECT COUNT(*) AS c FROM agent_runs WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "agent_run_events",
-            "SELECT COUNT(*) AS c FROM agent_run_events WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "run_checkpoints",
-            "SELECT COUNT(*) AS c FROM run_checkpoints WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "run_display_projections",
-            "SELECT COUNT(*) AS c FROM run_display_projections WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "session_tool_output_batches",
-            "SELECT COUNT(*) AS c FROM session_tool_output_batches WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "session_tool_outputs",
-            "SELECT COUNT(*) AS c FROM session_tool_outputs WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "session_device_lease_events",
-            "SELECT COUNT(*) AS c FROM session_device_lease_events WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "session_device_leases",
-            "SELECT COUNT(*) AS c FROM session_device_leases WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "session_transcript_items",
-            "SELECT COUNT(*) AS c FROM session_transcript_items WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "transcript_pages",
-            "SELECT COUNT(*) AS c FROM transcript_pages WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "conversation_log",
-            "SELECT COUNT(*) AS c FROM conversation_log WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "ctx_snapshots",
-            "SELECT COUNT(*) AS c FROM ctx_snapshots WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "ctx_decision_audits",
-            "SELECT COUNT(*) AS c FROM ctx_decision_audits WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "prompt_request_records",
-            "SELECT COUNT(*) AS c FROM prompt_request_records WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "session_state_revisions",
-            "SELECT COUNT(*) AS c FROM session_state_revisions WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "context_manifests",
-            "SELECT COUNT(*) AS c FROM context_manifests WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "session_artifacts_grants",
-            "SELECT COUNT(*) AS c FROM session_artifacts_grants WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "session_artifacts",
-            "SELECT COUNT(*) AS c FROM session_artifacts WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "session_state_item_events",
-            "SELECT COUNT(*) AS c FROM session_state_item_events WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "session_state_items",
-            "SELECT COUNT(*) AS c FROM session_state_items WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "session_delegations",
-            "SELECT COUNT(*) AS c FROM session_delegations WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "session_plan_todos",
-            "SELECT COUNT(*) AS c FROM session_plan_todos WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "session_history_chunks",
-            "SELECT COUNT(*) AS c FROM session_history_chunks WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "harness_snapshots",
-            "SELECT COUNT(*) AS c FROM harness_snapshots WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "skill_selection_events",
-            "SELECT COUNT(*) AS c FROM skill_selection_events WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "session_sync_log",
-            "SELECT COUNT(*) AS c FROM session_sync_log WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "agent_tasks",
-            "SELECT COUNT(*) AS c FROM agent_tasks WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "plans",
-            "SELECT COUNT(*) AS c FROM plans WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "session_checkpoints",
-            "SELECT COUNT(*) AS c FROM session_checkpoints WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "session_todos",
-            "SELECT COUNT(*) AS c FROM session_todos WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "session_todo_counters",
-            "SELECT COUNT(*) AS c FROM session_todo_counters WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "task_contracts",
-            "SELECT COUNT(*) AS c FROM task_contracts WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "skill_installations",
-            "SELECT COUNT(*) AS c FROM skill_installations WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "wf_triggers",
-            "SELECT COUNT(*) AS c FROM wf_triggers WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "eval_user_feedback",
-            "SELECT COUNT(*) AS c FROM eval_user_feedback WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "team_snapshots",
-            "SELECT COUNT(*) AS c FROM team_snapshots WHERE session_id = ? AND user_id <> ?",
-        ),
-        (
-            "tool_exactly_once_results",
-            "SELECT COUNT(*) AS c FROM tool_exactly_once_results WHERE session_id = ? AND user_id <> ?",
-        ),
-    ] {
-        let row = query(statement)
-            .bind(session_id)
-            .bind(user_id)
-            .fetch_one(&mut **tx)
-            .await
-            .map_err(|source| format!("delete_session.{label}.owner_check: {source}"))?;
-        let mismatches = row.try_get::<i64, _>("c").unwrap_or(0);
-        if mismatches > 0 {
-            return Err(format!(
-                "{SESSION_DELETE_OWNER_MISMATCH_PREFIX}{label}:{mismatches}"
-            ));
-        }
-    }
-    Ok(())
-}
-
 async fn hard_delete_session_rows(
     tx: &mut sqlx::Transaction<'_, MySql>,
     session_id: &str,
     user_id: &str,
 ) -> Result<u64, String> {
     let mut deleted = 0_u64;
-    ensure_session_delete_owner_consistency(tx, session_id, user_id).await?;
 
     for (label, statement) in [(
         "user_skill_evaluations",
@@ -923,16 +746,6 @@ async fn hard_delete_session_rows(
     }
 
     Ok(deleted)
-}
-
-fn map_hard_delete_session_error(error: String) -> (StatusCode, Json<ErrorResponse>) {
-    if error.starts_with(SESSION_DELETE_OWNER_MISMATCH_PREFIX) {
-        return error_response(
-            StatusCode::CONFLICT,
-            "Session ownership is inconsistent; deletion blocked",
-        );
-    }
-    internal_error(error)
 }
 
 #[derive(Clone, Debug)]

@@ -811,15 +811,20 @@ async fn phase4_state_projection_schema_contract() {
         "session_todo_counters.user_id must not use an empty-string owner sentinel"
     );
     assert_eq!(
+        primary_key_columns(&pool, &schema, "session_todo_counters").await,
+        ["user_id", "session_id"],
+        "session todo counters must be owner-bound at the uniqueness boundary"
+    );
+    assert!(
         index_columns(
             &pool,
             &schema,
             "session_todo_counters",
             "idx_session_todo_counters_owner_session"
         )
-        .await,
-        ["user_id", "session_id"],
-        "session todo counter lookups must use owner/session index"
+        .await
+        .is_empty(),
+        "session_todo_counters must not keep a redundant owner/session secondary index"
     );
     assert_eq!(
         primary_key_columns(&pool, &schema, "session_todo_idempotency").await,

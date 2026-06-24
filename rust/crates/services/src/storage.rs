@@ -2015,17 +2015,16 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
-    // Per-session monotonic counter used to mint `task-<n>` ids. Kept in a
-    // separate table (not on `session_todos`) because a todo can be deleted
-    // but its id must never be reused for the session.
+    // Per owner/session monotonic counter used to mint `task-<n>` ids. Kept in
+    // a separate table (not on `session_todos`) because a todo can be deleted
+    // but its id must never be reused for that owner/session board.
     query(
         "CREATE TABLE IF NOT EXISTS session_todo_counters (
             user_id VARCHAR(64) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
             next_id BIGINT NOT NULL,
             version BIGINT NOT NULL DEFAULT 0,
-            PRIMARY KEY (session_id),
-            INDEX idx_session_todo_counters_owner_session (user_id, session_id)
+            PRIMARY KEY (user_id, session_id)
         )",
     )
     .execute(&pool)

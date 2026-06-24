@@ -4140,7 +4140,7 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn session_delete_blocks_mixed_owner_core_rows_on_live_matrixone() {
+async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matrixone() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
 
@@ -4148,13 +4148,30 @@ async fn session_delete_blocks_mixed_owner_core_rows_on_live_matrixone() {
     let other_user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
     let owner_event_id = Uuid::new_v4().to_string();
-    let stray_event_id = Uuid::new_v4().to_string();
+    let foreign_event_id = Uuid::new_v4().to_string();
+    let owner_context_capture_id = Uuid::new_v4().to_string();
+    let foreign_context_capture_id = Uuid::new_v4().to_string();
+    let owner_decision_id = Uuid::new_v4().to_string();
+    let foreign_decision_id = Uuid::new_v4().to_string();
+
+    for table in [
+        "ctx_decision_audits",
+        "ctx_snapshots",
+        "transcript_pages",
+        "session_todo_counters",
+        "conversation_log",
+    ] {
+        let _ = sqlx::query(&format!("DELETE FROM {table} WHERE session_id = ?"))
+            .bind(&session_id)
+            .execute(&pool)
+            .await;
+    }
 
     cleanup_agent_sessions_and_events(
         &pool,
         std::slice::from_ref(&session_id),
-        &[owner_event_id.clone(), stray_event_id.clone()],
-        &[],
+        &[owner_event_id.clone(), foreign_event_id.clone()],
+        &[owner_decision_id.clone(), foreign_decision_id.clone()],
     )
     .await;
 
@@ -4170,7 +4187,7 @@ async fn session_delete_blocks_mixed_owner_core_rows_on_live_matrixone() {
 
     for (event_id, user_id, event_type) in [
         (&owner_event_id, &owner_user_id, "owner_evt"),
-        (&stray_event_id, &other_user_id, "stray_evt"),
+        (&foreign_event_id, &other_user_id, "foreign_evt"),
     ] {
         sqlx::query(
             "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, causal_chain_id) \
@@ -4185,44 +4202,167 @@ async fn session_delete_blocks_mixed_owner_core_rows_on_live_matrixone() {
         .expect("insert event");
     }
 
+    for (user_id, seq, content) in [
+        (&owner_user_id, 1_i64, "owner"),
+        (&other_user_id, 2_i64, "foreign"),
+    ] {
+        let payload = format!(
+            "{{\"type\":\"snapshot\",\"seq\":{seq},\"turn\":1,\"messages\":[{{\"role\":\"user\",\"content\":\"{content}\"}}],\"session_state\":{{}}}}"
+        );
+        sqlx::query(
+            "INSERT INTO conversation_log \
+             (user_id, session_id, seq, turn, entry_type, payload) \
+             VALUES (?, ?, ?, 1, 0, ?)",
+        )
+        .bind(user_id)
+        .bind(&session_id)
+        .bind(seq)
+        .bind(payload)
+        .execute(&pool)
+        .await
+        .expect("insert conversation log");
+    }
+
+    for (user_id, page_seq, page_hash) in [
+        (&owner_user_id, 1_i64, "page-owner"),
+        (&other_user_id, 7_i64, "page-foreign"),
+    ] {
+        sqlx::query(
+            "INSERT INTO transcript_pages \
+             (user_id, session_id, page_seq, start_item_seq, end_item_seq, item_count, page_hash) \
+             VALUES (?, ?, ?, 1, 2, 2, ?)",
+        )
+        .bind(user_id)
+        .bind(&session_id)
+        .bind(page_seq)
+        .bind(page_hash)
+        .execute(&pool)
+        .await
+        .expect("insert transcript page");
+    }
+
+    for (user_id, next_id, version) in [
+        (&owner_user_id, 42_i64, 1_i64),
+        (&other_user_id, 7_i64, 3_i64),
+    ] {
+        sqlx::query(
+            "INSERT INTO session_todo_counters (session_id, user_id, next_id, version) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(&session_id)
+        .bind(user_id)
+        .bind(next_id)
+        .bind(version)
+        .execute(&pool)
+        .await
+        .expect("insert todo counter");
+    }
+
+    for (user_id, event_id, context_capture_id, decision_id, marker) in [
+        (
+            &owner_user_id,
+            &owner_event_id,
+            &owner_context_capture_id,
+            &owner_decision_id,
+            "owner",
+        ),
+        (
+            &other_user_id,
+            &foreign_event_id,
+            &foreign_context_capture_id,
+            &foreign_decision_id,
+            "foreign",
+        ),
+    ] {
+        let context_data = format!("{{\"marker\":\"{marker}\"}}");
+        sqlx::query(
+            "INSERT INTO ctx_snapshots \
+             (context_capture_id, user_id, session_id, event_id, context_data) \
+             VALUES (?, ?, ?, ?, CAST(? AS JSON))",
+        )
+        .bind(context_capture_id)
+        .bind(user_id)
+        .bind(&session_id)
+        .bind(event_id)
+        .bind(&context_data)
+        .execute(&pool)
+        .await
+        .expect("insert context snapshot");
+
+        let decision_output = format!("{{\"marker\":\"{marker}\"}}");
+        sqlx::query(
+            "INSERT INTO ctx_decision_audits \
+             (decision_id, user_id, session_id, event_id, context_capture_id, decision_type, decision_output) \
+             VALUES (?, ?, ?, ?, ?, 'owner_scoped_delete_it', CAST(? AS JSON))",
+        )
+        .bind(decision_id)
+        .bind(user_id)
+        .bind(&session_id)
+        .bind(event_id)
+        .bind(context_capture_id)
+        .bind(&decision_output)
+        .execute(&pool)
+        .await
+        .expect("insert decision audit");
+    }
+
     let session_service = DatabaseSessionService::new(settings).with_pool(shared);
-    let delete_result = session_service
+    session_service
         .delete_session(session_id.clone(), owner_user_id.clone())
-        .await;
-    assert_eq!(
-        delete_result
-            .expect_err("mixed-owner session delete must fail closed")
-            .0,
-        axum::http::StatusCode::CONFLICT
-    );
+        .await
+        .expect("owner-scoped delete must ignore unrelated foreign rows");
 
-    let remaining_session = sqlx::query(
-        "SELECT COUNT(*) AS c FROM agent_sessions WHERE session_id = ? AND user_id = ?",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count remaining session")
-    .try_get::<i64, _>("c")
-    .expect("decode remaining session count");
-    assert_eq!(remaining_session, 1, "blocked delete must keep session");
+    for (label, table) in [
+        ("agent_sessions", "agent_sessions"),
+        ("agent_events", "agent_events"),
+        ("conversation_log", "conversation_log"),
+        ("transcript_pages", "transcript_pages"),
+        ("session_todo_counters", "session_todo_counters"),
+        ("ctx_snapshots", "ctx_snapshots"),
+        ("ctx_decision_audits", "ctx_decision_audits"),
+    ] {
+        let owner_remaining = sqlx::query(&format!(
+            "SELECT COUNT(*) AS c FROM {table} WHERE session_id = ? AND user_id = ?"
+        ))
+        .bind(&session_id)
+        .bind(&owner_user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("count owner {label}: {error}"))
+        .try_get::<i64, _>("c")
+        .expect("decode owner row count");
+        assert_eq!(owner_remaining, 0, "{label} owner rows must be deleted");
 
-    let remaining_events =
-        sqlx::query("SELECT COUNT(*) AS c FROM agent_events WHERE session_id = ?")
+        let foreign_remaining = sqlx::query(&format!(
+            "SELECT COUNT(*) AS c FROM {table} WHERE session_id = ? AND user_id = ?"
+        ))
+        .bind(&session_id)
+        .bind(&other_user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("count foreign {label}: {error}"))
+        .try_get::<i64, _>("c")
+        .expect("decode foreign row count");
+        let expected_foreign = if table == "agent_sessions" { 0 } else { 1 };
+        assert_eq!(
+            foreign_remaining, expected_foreign,
+            "{label} foreign rows must not be touched by owner delete"
+        );
+    }
+
+    for table in [
+        "ctx_decision_audits",
+        "ctx_snapshots",
+        "transcript_pages",
+        "session_todo_counters",
+        "conversation_log",
+    ] {
+        let _ = sqlx::query(&format!("DELETE FROM {table} WHERE session_id = ?"))
             .bind(&session_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count remaining events")
-            .try_get::<i64, _>("c")
-            .expect("decode remaining event count");
-    assert_eq!(
-        remaining_events, 2,
-        "blocked delete must not partially remove owner or non-owner events"
-    );
-
-    cleanup_agent_sessions_and_events(&pool, &[session_id], &[owner_event_id, stray_event_id], &[])
-        .await;
+            .execute(&pool)
+            .await;
+    }
+    cleanup_agent_sessions_and_events(&pool, &[session_id], &[foreign_event_id], &[]).await;
 }
 
 #[tokio::test]
@@ -4363,379 +4503,6 @@ async fn session_delete_removes_owner_scoped_transcript_pages_and_todo_counter_o
             .expect("decode remaining count");
         assert_eq!(remaining, 0, "{label} must be removed by hard delete");
     }
-}
-
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn session_delete_blocks_mixed_owner_conversation_log_on_live_matrixone() {
-    let (shared, settings) = setup_pool_and_settings().await;
-    let pool = shared.get().clone();
-
-    let owner_user_id = Uuid::new_v4().to_string();
-    let other_user_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
-
-    let _ = sqlx::query("DELETE FROM conversation_log WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(&pool)
-        .await;
-    cleanup_agent_sessions_and_events(&pool, std::slice::from_ref(&session_id), &[], &[]).await;
-
-    sqlx::query(
-        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'mixed-csl-delete-it', 'active', 0)",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .execute(&pool)
-    .await
-    .expect("insert owner session");
-    sqlx::query(
-        "INSERT INTO conversation_log \
-         (user_id, session_id, seq, turn, entry_type, payload) \
-         VALUES (?, ?, 1, 1, 0, '{\"type\":\"snapshot\",\"seq\":1,\"turn\":1,\"messages\":[{\"role\":\"user\",\"content\":\"other\"}],\"session_state\":{}}')",
-    )
-    .bind(&other_user_id)
-    .bind(&session_id)
-    .execute(&pool)
-    .await
-    .expect("insert stray conversation log");
-
-    let visible_mismatch = sqlx::query(
-        "SELECT COUNT(*) AS c FROM conversation_log WHERE session_id = ? AND user_id <> ?",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count preflight-visible conversation log")
-    .try_get::<i64, _>("c")
-    .expect("decode preflight-visible conversation log count");
-    assert_eq!(
-        visible_mismatch, 1,
-        "test fixture must be visible to delete_session owner preflight"
-    );
-
-    let session_service = DatabaseSessionService::new(settings).with_pool(shared);
-    let delete_result = session_service
-        .delete_session(session_id.clone(), owner_user_id.clone())
-        .await;
-    assert_eq!(
-        delete_result
-            .expect_err("mixed-owner conversation log delete must fail closed")
-            .0,
-        axum::http::StatusCode::CONFLICT
-    );
-
-    let remaining_session = sqlx::query(
-        "SELECT COUNT(*) AS c FROM agent_sessions WHERE session_id = ? AND user_id = ?",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count owner session")
-    .try_get::<i64, _>("c")
-    .expect("decode owner session count");
-    assert_eq!(remaining_session, 1, "blocked delete must keep session");
-
-    let remaining_csl_rows: Vec<(String, i64, i64)> =
-        sqlx::query_as("SELECT user_id, seq, turn FROM conversation_log WHERE session_id = ?")
-            .bind(&session_id)
-            .fetch_all(&pool)
-            .await
-            .expect("load remaining conversation log rows");
-    assert_eq!(
-        remaining_csl_rows,
-        vec![(other_user_id.clone(), 1, 1)],
-        "blocked delete must not remove or rewrite stray conversation log"
-    );
-
-    let _ = sqlx::query("DELETE FROM conversation_log WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(&pool)
-        .await;
-    cleanup_agent_sessions_and_events(&pool, &[session_id], &[], &[]).await;
-}
-
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn session_delete_blocks_mixed_owner_transcript_pages_on_live_matrixone() {
-    let (shared, settings) = setup_pool_and_settings().await;
-    let pool = shared.get().clone();
-
-    let owner_user_id = Uuid::new_v4().to_string();
-    let other_user_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
-
-    let _ = sqlx::query("DELETE FROM transcript_pages WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(&pool)
-        .await;
-    cleanup_agent_sessions_and_events(&pool, std::slice::from_ref(&session_id), &[], &[]).await;
-
-    sqlx::query(
-        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'mixed-page-delete-it', 'active', 0)",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .execute(&pool)
-    .await
-    .expect("insert owner session");
-    sqlx::query(
-        "INSERT INTO transcript_pages \
-         (user_id, session_id, page_seq, start_item_seq, end_item_seq, item_count, page_hash) \
-         VALUES (?, ?, 7, 301, 350, 50, 'page-stray')",
-    )
-    .bind(&other_user_id)
-    .bind(&session_id)
-    .execute(&pool)
-    .await
-    .expect("insert stray transcript page");
-
-    let session_service = DatabaseSessionService::new(settings).with_pool(shared);
-    let delete_result = session_service
-        .delete_session(session_id.clone(), owner_user_id.clone())
-        .await;
-    assert_eq!(
-        delete_result
-            .expect_err("mixed-owner transcript page delete must fail closed")
-            .0,
-        axum::http::StatusCode::CONFLICT
-    );
-
-    let remaining_session = sqlx::query(
-        "SELECT COUNT(*) AS c FROM agent_sessions WHERE session_id = ? AND user_id = ?",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count remaining session")
-    .try_get::<i64, _>("c")
-    .expect("decode remaining session count");
-    assert_eq!(remaining_session, 1, "blocked delete must keep session");
-    let remaining_pages = sqlx::query(
-        "SELECT COUNT(*) AS c FROM transcript_pages WHERE session_id = ? AND user_id = ?",
-    )
-    .bind(&session_id)
-    .bind(&other_user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count remaining stray page")
-    .try_get::<i64, _>("c")
-    .expect("decode remaining page count");
-    assert_eq!(
-        remaining_pages, 1,
-        "blocked delete must not partially remove stray page"
-    );
-
-    let _ = sqlx::query("DELETE FROM transcript_pages WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(&pool)
-        .await;
-    cleanup_agent_sessions_and_events(&pool, &[session_id], &[], &[]).await;
-}
-
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn session_delete_blocks_mixed_owner_context_decision_rows_on_live_matrixone() {
-    let (shared, settings) = setup_pool_and_settings().await;
-    let pool = shared.get().clone();
-
-    let owner_user_id = Uuid::new_v4().to_string();
-    let other_user_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
-    let context_capture_id = Uuid::new_v4().to_string();
-    let decision_id = Uuid::new_v4().to_string();
-    let event_id = Uuid::new_v4().to_string();
-
-    let _ = sqlx::query("DELETE FROM ctx_decision_audits WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(&pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM ctx_snapshots WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(&pool)
-        .await;
-    cleanup_agent_sessions_and_events(&pool, std::slice::from_ref(&session_id), &[], &[]).await;
-
-    sqlx::query(
-        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'mixed-ctx-delete-it', 'active', 0)",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .execute(&pool)
-    .await
-    .expect("insert owner session");
-    sqlx::query(
-        "INSERT INTO ctx_snapshots \
-         (context_capture_id, user_id, session_id, event_id, context_data) \
-         VALUES (?, ?, ?, ?, CAST('{\"secret\":\"other\"}' AS JSON))",
-    )
-    .bind(&context_capture_id)
-    .bind(&other_user_id)
-    .bind(&session_id)
-    .bind(&event_id)
-    .execute(&pool)
-    .await
-    .expect("insert stray context snapshot");
-    sqlx::query(
-        "INSERT INTO ctx_decision_audits \
-         (decision_id, user_id, session_id, event_id, context_capture_id, decision_type, decision_output) \
-         VALUES (?, ?, ?, ?, ?, 'stray_decision', CAST('{\"secret\":\"other\"}' AS JSON))",
-    )
-    .bind(&decision_id)
-    .bind(&other_user_id)
-    .bind(&session_id)
-    .bind(&event_id)
-    .bind(&context_capture_id)
-    .execute(&pool)
-    .await
-    .expect("insert stray decision audit");
-
-    let session_service = DatabaseSessionService::new(settings).with_pool(shared);
-    let delete_result = session_service
-        .delete_session(session_id.clone(), owner_user_id.clone())
-        .await;
-    assert_eq!(
-        delete_result
-            .expect_err("mixed-owner context/decision delete must fail closed")
-            .0,
-        axum::http::StatusCode::CONFLICT
-    );
-
-    for (label, sql, expected_user_id) in [
-        (
-            "ctx_snapshots",
-            "SELECT COUNT(*) AS c FROM ctx_snapshots WHERE session_id = ? AND user_id = ?",
-            &other_user_id,
-        ),
-        (
-            "ctx_decision_audits",
-            "SELECT COUNT(*) AS c FROM ctx_decision_audits WHERE session_id = ? AND user_id = ?",
-            &other_user_id,
-        ),
-        (
-            "agent_sessions",
-            "SELECT COUNT(*) AS c FROM agent_sessions WHERE session_id = ? AND user_id = ?",
-            &owner_user_id,
-        ),
-    ] {
-        let remaining = sqlx::query(sql)
-            .bind(&session_id)
-            .bind(expected_user_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap_or_else(|error| panic!("count remaining {label}: {error}"))
-            .try_get::<i64, _>("c")
-            .expect("decode remaining count");
-        assert_eq!(remaining, 1, "blocked delete must keep {label}");
-    }
-
-    let _ = sqlx::query("DELETE FROM ctx_decision_audits WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(&pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM ctx_snapshots WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(&pool)
-        .await;
-    cleanup_agent_sessions_and_events(&pool, &[session_id], &[], &[]).await;
-}
-
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn session_delete_blocks_mixed_owner_todo_counter_on_live_matrixone() {
-    let (shared, settings) = setup_pool_and_settings().await;
-    let pool = shared.get().clone();
-
-    let owner_user_id = Uuid::new_v4().to_string();
-    let other_user_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
-
-    let _ = sqlx::query("DELETE FROM session_todo_counters WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(&pool)
-        .await;
-    cleanup_agent_sessions_and_events(&pool, std::slice::from_ref(&session_id), &[], &[]).await;
-
-    sqlx::query(
-        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'mixed-counter-delete-it', 'active', 0)",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .execute(&pool)
-    .await
-    .expect("insert owner session");
-    sqlx::query(
-        "INSERT INTO session_todo_counters (session_id, user_id, next_id, version) \
-         VALUES (?, ?, 7, 3)",
-    )
-    .bind(&session_id)
-    .bind(&other_user_id)
-    .execute(&pool)
-    .await
-    .expect("insert stray todo counter");
-
-    let visible_mismatch = sqlx::query(
-        "SELECT COUNT(*) AS c FROM session_todo_counters WHERE session_id = ? AND user_id <> ?",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count preflight-visible todo counter")
-    .try_get::<i64, _>("c")
-    .expect("decode preflight-visible todo counter count");
-    assert_eq!(
-        visible_mismatch, 1,
-        "test fixture must be visible to delete_session owner preflight"
-    );
-
-    let session_service = DatabaseSessionService::new(settings).with_pool(shared);
-    let delete_result = session_service
-        .delete_session(session_id.clone(), owner_user_id.clone())
-        .await;
-    assert_eq!(
-        delete_result
-            .expect_err("mixed-owner todo counter delete must fail closed")
-            .0,
-        axum::http::StatusCode::CONFLICT
-    );
-
-    let remaining_session = sqlx::query(
-        "SELECT COUNT(*) AS c FROM agent_sessions WHERE session_id = ? AND user_id = ?",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count owner session")
-    .try_get::<i64, _>("c")
-    .expect("decode owner session count");
-    assert_eq!(remaining_session, 1, "blocked delete must keep session");
-    let remaining_counter_rows: Vec<(String, i64, i64)> = sqlx::query_as(
-        "SELECT user_id, next_id, version FROM session_todo_counters WHERE session_id = ?",
-    )
-    .bind(&session_id)
-    .fetch_all(&pool)
-    .await
-    .expect("load remaining todo counter rows");
-    assert_eq!(
-        remaining_counter_rows,
-        vec![(other_user_id.clone(), 7, 3)],
-        "blocked delete must not remove or rewrite stray counter"
-    );
-
-    let _ = sqlx::query("DELETE FROM session_todo_counters WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(&pool)
-        .await;
-    cleanup_agent_sessions_and_events(&pool, &[session_id], &[], &[]).await;
 }
 
 #[tokio::test]
