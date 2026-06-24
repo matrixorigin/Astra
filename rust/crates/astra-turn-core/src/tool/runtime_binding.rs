@@ -1,5 +1,23 @@
 use crate::capability::Capability;
 
+/// Whether a tool name is known to require a live runtime binding before it can
+/// execute.
+///
+/// This is about the tool's declared shape, not the current runtime state. It
+/// lets dispatch paths classify stale direct calls from resumed sessions as a
+/// missing binding instead of as a generic unknown/deferred-tool mistake.
+pub fn tool_name_requires_runtime_binding(name: &str) -> bool {
+    if name.starts_with("mcp__") {
+        return true;
+    }
+
+    crate::tool::registry::meta::tool_meta(name).is_some_and(|meta| {
+        meta.requires
+            .iter()
+            .any(|capability| capability.is_executor_gated())
+    })
+}
+
 /// User-facing explanation for a tool call whose backing runtime is absent.
 ///
 /// This intentionally names the real recovery path. `tool_search` can only
@@ -55,6 +73,15 @@ mod tests {
             message.contains("connect or enable the MCP server"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn runtime_binding_requirement_is_declared_by_tool_shape() {
+        assert!(tool_name_requires_runtime_binding("agent_fanout"));
+        assert!(tool_name_requires_runtime_binding("agent"));
+        assert!(tool_name_requires_runtime_binding("mcp__weather"));
+        assert!(!tool_name_requires_runtime_binding("github"));
+        assert!(!tool_name_requires_runtime_binding("definitely_unknown"));
     }
 
     #[test]

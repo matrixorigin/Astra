@@ -2281,6 +2281,17 @@ impl ServerAgenticLoopHost {
                     .as_ref()
                     .is_some_and(|executor| executor.has_runtime_binding(name))
             };
+            let action = args.get("action").and_then(Value::as_str);
+            let missing_runtime_binding =
+                !has_runtime_binding(&tool_name)
+                    && astra_turn_core::tool::runtime_binding::tool_name_requires_runtime_binding(
+                        &tool_name,
+                    )
+                    && !astra_turn_core::tool::registry::meta::tool_allows_validation_without_runtime_binding(
+                        &tool_name,
+                        action,
+                    );
+            let mut error_kind = None;
             let output = match astra_turn_core::tool::deferred_activation::classify_direct_deferred_call(
                 &tool_name,
                 is_activatable_deferred,
@@ -2297,9 +2308,10 @@ impl ServerAgenticLoopHost {
                     )
                 }
                 astra_turn_core::tool::deferred_activation::DirectDeferredCallAdmission::NotAdmitted => {
+                    error_kind = Some(astra_core::ErrorKind::ToolBinding);
                     astra_turn_core::tool::runtime_binding::runtime_binding_denial_message(
                         &tool_name,
-                        args.get("action").and_then(Value::as_str),
+                        action,
                     )
                 }
                 astra_turn_core::tool::deferred_activation::DirectDeferredCallAdmission::Unknown => {
@@ -2309,11 +2321,18 @@ impl ServerAgenticLoopHost {
                                 &tool_name,
                             )
                         } else {
+                            error_kind = Some(astra_core::ErrorKind::ToolBinding);
                             astra_turn_core::tool::runtime_binding::runtime_binding_denial_message(
                                 &tool_name,
-                                args.get("action").and_then(Value::as_str),
+                                action,
                             )
                         }
+                    } else if missing_runtime_binding {
+                        error_kind = Some(astra_core::ErrorKind::ToolBinding);
+                        astra_turn_core::tool::runtime_binding::runtime_binding_denial_message(
+                            &tool_name,
+                            action,
+                        )
                     } else {
                         astra_turn_core::tool::deferred_activation::tool_not_admitted_message(
                             &tool_name, false,
@@ -2339,7 +2358,11 @@ impl ServerAgenticLoopHost {
                         &request_id,
                         &tool_name,
                         &args,
-                        None,
+                        error_kind.map(|kind| {
+                            let mut fields = Map::new();
+                            fields.insert("error_kind".to_string(), json!(kind.as_str()));
+                            fields
+                        }),
                     )),
                     status: "failed".to_string(),
                     duration_ms: 0,
@@ -5876,13 +5899,23 @@ mod tests {
         assert!(
             direct_results[0]
                 .output
-                .contains("not available in this turn"),
-            "direct call to an unadvertised unavailable tool must fail closed: {:?}",
+                .contains("multi-agent runtime is not connected"),
+            "direct call to an unadvertised unavailable runtime tool must name the missing binding: {:?}",
             direct_results[0]
         );
         assert!(
             !direct_results[0].output.contains("select:agent_fanout"),
             "denial must not claim select can attach the runtime: {:?}",
+            direct_results[0]
+        );
+        assert_eq!(
+            direct_results[0]
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("error_kind"))
+                .and_then(Value::as_str),
+            Some(astra_core::ErrorKind::ToolBinding.as_str()),
+            "ledger direct-call denial must be structured as a runtime binding failure: {:?}",
             direct_results[0]
         );
     }
