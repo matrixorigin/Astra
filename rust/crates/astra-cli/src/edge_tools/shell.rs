@@ -11,6 +11,7 @@ use astra_tools::detach::{
     AdoptionAckOutcome, await_adoption_ack, detach_signal_observed, render_bash_detached_marker,
     restore_detach_signal_receiver, sigkill_process_group, terminate_detached_payload,
 };
+use astra_tools::exit_semantics::{self, ExitSemantics};
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command as TokioCommand;
@@ -19,51 +20,27 @@ pub(crate) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-// ---------------------------------------------------------------------------
-// Command semantics — interpret exit codes per-command (inspired by Claude
-// Code's commandSemantics.ts). Many commands use non-zero exit codes to convey
-// information, not errors. Without this, the model treats grep exit 1 as a
-// failure and wastes turns retrying.
-// ---------------------------------------------------------------------------
-
-/// Semantic interpretation of a command's exit code.
-struct CommandResult {
-    is_error: bool,
-    /// Optional human-readable note (e.g. "No matches found").
-    note: Option<&'static str>,
-}
-
-/// Interpret exit code based on the command that produced it.
-/// Extracts the *last* command in a pipeline (that's what determines the exit code).
-fn interpret_exit_code(command: &str, code: i32) -> CommandResult {
-    match astra_tools::exit_semantics::classify_exit(command, code) {
-        astra_tools::exit_semantics::ExitSemantics::Success
-        | astra_tools::exit_semantics::ExitSemantics::DomainNegative
-        | astra_tools::exit_semantics::ExitSemantics::PipelineTruncated => CommandResult {
-            is_error: false,
-            note: None,
-        },
-        astra_tools::exit_semantics::ExitSemantics::EmptyResult => CommandResult {
-            is_error: false,
-            note: Some(empty_result_note(command)),
-        },
-        astra_tools::exit_semantics::ExitSemantics::TimedOut
-        | astra_tools::exit_semantics::ExitSemantics::Cancelled
-        | astra_tools::exit_semantics::ExitSemantics::Signaled
-        | astra_tools::exit_semantics::ExitSemantics::ExecutionError => CommandResult {
-            is_error: true,
-            note: None,
-        },
-    }
-}
-
 fn empty_result_note(command: &str) -> &'static str {
-    let family = astra_tools::exit_semantics::command_family(command);
+    let family = exit_semantics::command_family(command);
     if matches!(family.as_deref(), Some("pgrep" | "pkill" | "killall")) {
         "No processes matched"
     } else {
         "No matches found"
     }
+}
+
+fn empty_nonzero_exit_output(command: &str, exit_code: i32) -> String {
+    match exit_semantics::classify_exit(command, exit_code) {
+        ExitSemantics::EmptyResult => empty_result_note(command).to_string(),
+        semantics if semantics.is_tool_error() => {
+            format!("Error: command failed (exit code {exit_code})")
+        }
+        _ => format!("(exit code {exit_code})"),
+    }
+}
+
+fn should_append_exit_code(command: &str, exit_code: i32) -> bool {
+    exit_semantics::classify_exit(command, exit_code).is_tool_error()
 }
 
 // ---------------------------------------------------------------------------
@@ -4249,15 +4226,7 @@ impl ToolExecutor {
             return if out.status.success() {
                 "(no output)".to_string()
             } else {
-                // Use command semantics to interpret exit code
-                let sem = interpret_exit_code(command, exit_code);
-                if let Some(note) = sem.note {
-                    note.to_string()
-                } else if sem.is_error {
-                    format!("Error: command failed (exit code {exit_code})")
-                } else {
-                    format!("(exit code {exit_code})")
-                }
+                empty_nonzero_exit_output(command, exit_code)
             };
         }
 
@@ -4315,8 +4284,7 @@ impl ToolExecutor {
 
         // Append exit code context for non-zero, non-build commands
         if !out.status.success() {
-            let sem = interpret_exit_code(command, exit_code);
-            if sem.is_error {
+            if should_append_exit_code(command, exit_code) {
                 result.push_str(&format!("\n(exit code {exit_code})"));
             }
         }
@@ -4561,15 +4529,7 @@ impl ToolExecutor {
                     return if out.status.success() {
                         "(no output)".to_string()
                     } else {
-                        // Use command semantics to interpret exit code
-                        let sem = interpret_exit_code(command, exit_code);
-                        if let Some(note) = sem.note {
-                            note.to_string()
-                        } else if sem.is_error {
-                            format!("Error: command failed (exit code {exit_code})")
-                        } else {
-                            format!("(exit code {exit_code})")
-                        }
+                        empty_nonzero_exit_output(command, exit_code)
                     };
                 }
 
@@ -4586,8 +4546,7 @@ impl ToolExecutor {
                 }
 
                 if !out.status.success() {
-                    let sem = interpret_exit_code(command, exit_code);
-                    if sem.is_error {
+                    if should_append_exit_code(command, exit_code) {
                         result.push_str(&format!("\n(exit code {exit_code})"));
                     }
                 }
@@ -5114,8 +5073,7 @@ mod tests {
         check_bash_path_boundary_with_oldpwd, check_dangerous_command,
         check_powershell_path_boundary, default_bash_timeout_secs, destructive_command_warning,
         destructive_powershell_warning, find_powershell_program, forbidden_name_based_process_kill,
-        html_to_text, interpret_exit_code, is_ssrf_target, looks_like_html,
-        run_command_with_cleanup,
+        html_to_text, is_ssrf_target, looks_like_html, run_command_with_cleanup,
     };
     use std::process::Command;
     use std::time::Duration;
@@ -8196,56 +8154,6 @@ mod tests {
             "output should be capped near MAX_OUTPUT_CHARS, got {} bytes",
             output.len()
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // Command semantics tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn interpret_exit_code_rules() {
-        let cases: &[(&str, i32, bool, Option<&str>)] = &[
-            ("grep -r foo .", 1, false, Some("No matches found")),
-            ("rg foo .", 1, false, Some("No matches found")),
-            ("git grep foo -- src", 1, false, Some("No matches found")),
-            ("grep -r foo .", 2, true, None),
-            ("diff a b", 1, false, None),
-            ("cmp a b", 1, false, None),
-            ("test -f /tmp/x", 1, false, None),
-            (
-                "cat file | grep pattern",
-                1,
-                false,
-                Some("No matches found"),
-            ),
-            (
-                "cd /work/repo && grep -n missing src/main.rs",
-                1,
-                false,
-                Some("No matches found"),
-            ),
-            (
-                "pgrep missing-process-name",
-                1,
-                false,
-                Some("No processes matched"),
-            ),
-            (
-                "cd /work/repo && pgrep missing-process-name",
-                1,
-                false,
-                Some("No processes matched"),
-            ),
-            ("rg TODO src | head -20", 141, false, None),
-            ("cargo build", 1, false, None),
-            ("cargo test --lib", 101, false, None),
-            ("timeout 1 sleep 5", 124, true, None),
-        ];
-        for (cmdline, code, is_error, note) in cases {
-            let r = interpret_exit_code(cmdline, *code);
-            assert_eq!(r.is_error, *is_error, "cmd={cmdline} code={code}");
-            assert_eq!(r.note, *note, "cmd={cmdline} code={code}");
-        }
     }
 
     // -----------------------------------------------------------------------
