@@ -78,6 +78,21 @@ describe("requireKnownBackendModelName", () => {
     ).rejects.toThrow('Unknown model "model-row-1"');
   });
 
+  it("accepts model_id only when the runtime model has no name", async () => {
+    const { client, mockListModels } = makeRuntime();
+    mockListModels.mockResolvedValue([
+      { model_id: "model-row-1", name: null },
+      { model_id: "model-row-2" },
+    ]);
+
+    await expect(
+      requireKnownBackendModelName(client, "model-row-1"),
+    ).resolves.toBe("model-row-1");
+    await expect(
+      requireKnownBackendModelName(client, "model-row-2"),
+    ).resolves.toBe("model-row-2");
+  });
+
   it("caches listModels for repeated exact canonical names", async () => {
     const { client, mockListModels } = makeRuntime();
     mockListModels.mockResolvedValue([

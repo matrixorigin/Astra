@@ -414,6 +414,8 @@ fn model_list_entry_name(entry: &serde_json::Value) -> Option<&str> {
     entry
         .get("name")
         .or_else(|| entry.get("model_name"))
+        .or_else(|| entry.get("model_id"))
+        .or_else(|| entry.get("id"))
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|name| !name.is_empty())
@@ -1438,12 +1440,12 @@ mod tests {
 
         assert_eq!(
             default_model_from_models_response(&body).as_deref(),
-            Some("items-active-model")
+            Some("row-without-name")
         );
     }
 
     #[test]
-    fn default_model_from_models_response_returns_none_without_active_names() {
+    fn default_model_from_models_response_uses_model_id_when_name_is_missing() {
         let body = serde_json::json!({
             "models": [
                 {"name": "inactive", "is_active": false},
@@ -1451,7 +1453,10 @@ mod tests {
             ]
         });
 
-        assert_eq!(default_model_from_models_response(&body), None);
+        assert_eq!(
+            default_model_from_models_response(&body).as_deref(),
+            Some("row-without-name")
+        );
     }
 
     #[test]

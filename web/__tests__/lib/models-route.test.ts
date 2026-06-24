@@ -20,7 +20,7 @@ describe("/api/models", () => {
     vi.clearAllMocks();
   });
 
-  it("exposes only active canonical runtime model names", async () => {
+  it("exposes active runtime models using name first and model_id when name is missing", async () => {
     const listModels = vi.fn().mockResolvedValue([
       {
         model_id: "row-flash",
@@ -50,7 +50,7 @@ describe("/api/models", () => {
     const payload = await response.json();
 
     expect(payload.source).toBe("astra");
-    expect(payload.items).toHaveLength(1);
+    expect(payload.items).toHaveLength(2);
     expect(payload.items[0]).toMatchObject({
       id: "deepseek-v4-flash-anthropic",
       name: "deepseek-v4-flash-anthropic",
@@ -58,6 +58,12 @@ describe("/api/models", () => {
     });
     expect(payload.items[0].subtitle).toContain("anthropic");
     expect(payload.items[0].subtitle).toContain("128k context");
+    expect(payload.items[1]).toMatchObject({
+      id: "row-only",
+      name: "row-only",
+      tier: "included",
+    });
+    expect(payload.items[1].subtitle).toContain("openai");
   });
 
   it("uses static fallback models only when runtime listing is unavailable", async () => {

@@ -2574,7 +2574,7 @@ export async function requireKnownBackendModelName(
   }
 
   const cached = modelCache.get(accessToken);
-  let modelsPromise: Promise<Array<{ name?: string | null }>>;
+  let modelsPromise: Promise<Array<{ model_id?: string | null; name?: string | null }>>;
   if (cached) {
     modelsPromise = cached;
   } else {
@@ -2582,7 +2582,7 @@ export async function requireKnownBackendModelName(
     modelCache.set(accessToken, modelsPromise);
   }
 
-  let models: Array<{ name?: string | null }>;
+  let models: Array<{ model_id?: string | null; name?: string | null }>;
   try {
     models = await modelsPromise;
   } catch (error) {
@@ -2592,7 +2592,7 @@ export async function requireKnownBackendModelName(
 
   const knownNames = new Set(
     models
-      .map((item) => item.name?.trim())
+      .map((item) => item.name?.trim() || item.model_id?.trim())
       .filter((name): name is string => Boolean(name)),
   );
   if (!knownNames.has(requestedModel)) {
