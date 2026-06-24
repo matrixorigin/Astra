@@ -317,7 +317,7 @@ RECORD: Store the learning signal for future pattern matching
 
 ### Already Implemented
 
-- **Deterministic Tool Surface**: ToolRegistry provides a pinned/deferred surface with explicit deferred activation.
+- **Deterministic Tool Surface**: ToolRegistry provides an always-load/deferred surface with explicit deferred activation.
 - **RegressionGate (ChangeType.TOOL_SURFACE)**: Validates tool surface changes before deployment via unified gate
 - **InputFaceLearner**: ✅ Unified meta-learning loop for prompt, context budget, and knowledge input faces (`core/learning/input_face_learner.py`)
 

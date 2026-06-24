@@ -414,33 +414,33 @@ pub struct ToolRegistry {
 
 ### 5.4 Skill Tool Integration
 
-The `skill` tool is injected into the ToolRegistry as an always-load schema:
+The `skill` tool is injected into the ToolRegistry as an always-load, cache-stable schema:
 
 ```rust
 // rust/crates/runtime/src/turn/skill_tool.rs
-pub fn skill_tool_schema(skills: &[SkillToolInfo]) -> Value {
-    // Generates JSON schema with skill names as enum
-    // Budget-aware: format_skills_within_budget() trims descriptions
-}
+pub fn skill_tool_schema_v2() -> Value; // open-string `skill_name`, no catalog enum
 
 // Injected via:
 registry.inject_schema("skill", schema);
 ```
 
-### 5.5 Token Budget for Skill Listing
+The available catalog is rendered separately as a session-scoped prompt section:
 
 ```rust
-const DEFAULT_SKILL_LISTING_BUDGET: usize = 8_000;  // ~1% of 200K context
-const MAX_LISTING_DESC_CHARS: usize = 250;           // Per-skill cap
-
-fn format_skills_within_budget(skills: &[SkillToolInfo], budget: usize)
-    -> (Vec<String>, Vec<String>)
-{
-    // Tier 1: Bundled skills — always full description
-    // Tier 2: Other sources — proportionally truncated
-    // Tier 3: Names-only when under extreme budget pressure
-}
+// rust/crates/runtime/src/prompts/system.rs
+pub fn build_skill_listing_section_for_model(
+    skills: &[SkillToolInfo],
+    model: Option<&str>,
+) -> Option<PromptSection>;
 ```
+
+### 5.5 Token Budget for Skill Listing
+
+`build_skill_listing_section_for_model` sizes the `<available_skills>` block
+from the model context window, sorts entries for byte stability, truncates
+oversized descriptions, and drops entries that do not fit. Dropped skills remain
+available through `discover_skills`; the schema itself never changes with the
+catalog.
 
 ---
 

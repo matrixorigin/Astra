@@ -70,7 +70,7 @@ prompt 之外的那部分）。
 
 **state 变化**：新增 `anchor`（目标：MySQL→MatrixOne 迁前审计）；
 `workspace_state` 固定在 cloud（DB 生产库凭据只在 cloud workspace
-可用，edge 工具被 skill selector 过滤掉）；`plan_state` version=0；
+可用，edge 工具被请求级 runtime capability 约束排除）；`plan_state` version=0；
 `session_tool_outputs` / `session_artifacts` 均为空。
 
 **manifest zone**：`system_static` 1200 / `tool_schemas` 1800（保留

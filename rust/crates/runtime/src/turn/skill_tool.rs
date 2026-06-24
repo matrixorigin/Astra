@@ -177,6 +177,7 @@ pub const DISCOVER_SKILLS_TOOL_NAME: &str = "discover_skills";
 
 /// Max skills returned from a single `discover_skills` call.
 const DISCOVER_SKILLS_MAX_RESULTS: usize = 8;
+const DISCOVER_SKILLS_NO_MATCH_MESSAGE: &str = "No additional skills matched that query. Try different keywords, or proceed with general tools.";
 const LARGE_SKILL_CATALOG_WARNING_THRESHOLD: usize = 50;
 static LARGE_SKILL_CATALOG_WARNING_EMITTED: OnceLock<()> = OnceLock::new();
 pub const DEFAULT_AUTO_ROUTE_MIN_SCORE: usize = 20;
@@ -389,11 +390,6 @@ pub fn apply_skill_surfacing_policy(
     )?)))
 }
 
-// `DEFAULT_SKILL_LISTING_BUDGET` was removed — its only consumer,
-// `format_skills_within_budget`, is now test-only scaffolding that no
-// longer relies on a shared budget constant. Current production uses
-// `build_skill_listing_section` which doesn't truncate.
-
 /// Per-entry description cap. Listing is for discovery only — the full content
 /// is loaded when a skill is actually invoked. Trimmed from 250 to 120:
 /// the first meaningful sentence is enough for the LLM to decide relevance.
@@ -425,93 +421,6 @@ fn format_skill_description(s: &SkillToolInfo) -> String {
     } else {
         desc
     }
-}
-
-// Production no longer calls `format_skills_within_budget` — it was the
-// budget-aware formatter for `skill_listing_system_message`, both gone.
-// Retained under `#[cfg(test)]` because a body of tests exercises its
-// budget-pressure edge cases (truncation thresholds and bundled priority).
-// Those tests guard logic invariants that might be resurrected if a future
-// iteration needs budget-shaped listings; the
-// current `build_skill_listing_section` renderer trusts upstream callers
-// to keep the list bounded and doesn't truncate in-renderer.
-#[cfg(test)]
-fn format_skills_within_budget(
-    skills: &[SkillToolInfo],
-    budget: usize,
-    quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
-) -> (Vec<String>, Vec<String>) {
-    if skills.is_empty() {
-        return (Vec::new(), Vec::new());
-    }
-
-    let mut seen: std::collections::HashSet<&str> =
-        skills.iter().map(|s| s.name.as_str()).collect();
-    let mut all_names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
-    for s in skills {
-        for alias in &s.aliases {
-            if seen.insert(alias.as_str()) {
-                all_names.push(alias.clone());
-            }
-        }
-    }
-
-    let full_entries: Vec<String> = skills
-        .iter()
-        .map(|s| format!("- **{}**: {}", s.name, format_skill_description(s)))
-        .collect();
-    let total: usize = full_entries.iter().map(|e| e.len() + 1).sum();
-    if total <= budget {
-        return (full_entries, all_names);
-    }
-
-    let mut bundled_entries = Vec::new();
-    let mut rest_skills: Vec<&SkillToolInfo> = Vec::new();
-    for (i, s) in skills.iter().enumerate() {
-        if s.source == SkillSourceKind::Bundled {
-            bundled_entries.push(full_entries[i].clone());
-        } else {
-            rest_skills.push(s);
-        }
-    }
-
-    if let Some(tracker) = quality_tracker {
-        rest_skills.sort_by(|a, b| {
-            tracker
-                .selection_boost(&b.name)
-                .partial_cmp(&tracker.selection_boost(&a.name))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-    }
-
-    let bundled_chars: usize = bundled_entries.iter().map(|e| e.len() + 1).sum();
-    let remaining_budget = budget.saturating_sub(bundled_chars);
-    if rest_skills.is_empty() {
-        return (bundled_entries, all_names);
-    }
-
-    let name_overhead: usize = rest_skills.iter().map(|s| s.name.len() + 6).sum();
-    let avail = remaining_budget.saturating_sub(name_overhead);
-    let max_desc = avail / rest_skills.len();
-
-    let mut entries = bundled_entries;
-    if max_desc < 20 {
-        for s in &rest_skills {
-            entries.push(format!("- {}", s.name));
-        }
-    } else {
-        for s in &rest_skills {
-            let desc = format_skill_description(s);
-            let truncated = if desc.len() > max_desc {
-                truncate_desc(&desc, max_desc)
-            } else {
-                desc
-            };
-            entries.push(format!("- **{}**: {}", s.name, truncated));
-        }
-    }
-
-    (entries, all_names)
 }
 
 pub fn warn_if_full_skill_catalog_surface_is_large(skill_count: usize) {
@@ -726,7 +635,8 @@ pub fn select_auto_routed_skill_with_config(
 }
 
 /// Run discovery; returns assistant-facing text and canonical names to merge into session state.
-/// Scores candidates by query relevance. Falls back to first N when query is empty or no matches.
+/// Scores candidates by query relevance. Empty queries list the first page; non-empty queries
+/// only return relevant matches.
 pub fn execute_discover_skills(
     query: &str,
     catalog: &[SkillToolInfo],
@@ -746,10 +656,7 @@ pub fn execute_discover_skills(
         .collect();
 
     if candidates.is_empty() {
-        return (
-            "No additional skills matched that query. Try different keywords, or proceed with general tools.".to_string(),
-            Vec::new(),
-        );
+        return (DISCOVER_SKILLS_NO_MATCH_MESSAGE.to_string(), Vec::new());
     }
 
     // Score candidates by query relevance, fall back to insertion order.
@@ -770,12 +677,7 @@ pub fn execute_discover_skills(
             DISCOVER_SKILLS_MAX_RESULTS,
         );
         if ranked.is_empty() {
-            // No matches — fallback to first N (backward compat).
-            candidates
-                .iter()
-                .take(DISCOVER_SKILLS_MAX_RESULTS)
-                .map(|(idx, _)| *idx)
-                .collect()
+            return (DISCOVER_SKILLS_NO_MATCH_MESSAGE.to_string(), Vec::new());
         } else {
             // Map adapter indices back to catalog indices.
             ranked
@@ -805,24 +707,6 @@ pub fn execute_discover_skills(
         ),
         new_names,
     )
-}
-
-#[cfg(test)]
-fn skill_enum_names(skills: &[SkillToolInfo]) -> Vec<String> {
-    // Sort for deterministic ordering — the skill cache is a HashMap, so the
-    // incoming `skills` slice has non-deterministic iteration order. Any byte
-    // drift in the JSON schema breaks Bedrock/Anthropic prompt cache hits.
-    let mut seen: HashSet<&str> = skills.iter().map(|s| s.name.as_str()).collect();
-    let mut names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
-    for skill in skills {
-        for alias in &skill.aliases {
-            if seen.insert(alias.as_str()) {
-                names.push(alias.clone());
-            }
-        }
-    }
-    names.sort();
-    names
 }
 
 /// Generate the `skill` tool schema — cache-stable, list-free.
@@ -866,10 +750,9 @@ pub fn skill_tool_schema_v2() -> Value {
     })
 }
 
-// Legacy `skill_tool_schema(skills, open_skill_name)` and
-// `skill_listing_system_message(...)` were deleted in the P2 cleanup.
-// Production uses `skill_tool_schema_v2` (byte-stable, no enum) and
-// `build_skill_listing_section` (CacheScope::Session) in prompts/system.rs.
+// Production uses an open-string schema and keeps the available skill catalog
+// in the session-scoped prompt listing, so schema bytes do not depend on the
+// current catalog contents.
 
 /// Check if a tool call is a skill invocation.
 ///
@@ -1015,8 +898,8 @@ pub struct InterceptedToolResult {
 
 /// Handle `discover_skills` then `skill` tool calls in one batch (discover runs first).
 ///
-/// When dynamic surfacing is off, callers typically see no `discover_skills` calls; this still
-/// splits `skill` vs other tools and runs discovery first when present.
+/// This keeps discovery deterministic when a model invokes `discover_skills` and `skill`
+/// in the same tool round: discovery results are merged before skill activation runs.
 pub async fn partition_discover_and_execute_skills(
     tool_calls: &[Value],
     resolver: &dyn SkillResolver,
@@ -2614,65 +2497,6 @@ mod tests {
         assert_eq!(selected.as_deref(), Some("review-changes"));
     }
 
-    // Legacy `schema_has_correct_structure` tested `skill_tool_schema`'s
-    // enum — deleted along with that function. `skill_tool_schema_v2`
-    // coverage lives in skill_surfacing_contract integration tests.
-
-    #[test]
-    fn skill_enum_names_include_unique_aliases() {
-        let skills = vec![
-            SkillToolInfo {
-                name: "review".into(),
-                aliases: vec!["inspect".into(), "audit".into()],
-                ..Default::default()
-            },
-            SkillToolInfo {
-                name: "audit".into(),
-                aliases: vec!["inspect".into(), "check".into()],
-                ..Default::default()
-            },
-        ];
-
-        // Sorted alphabetically for byte-stable tool schema across turns —
-        // prompt cache hits require deterministic ordering.
-        assert_eq!(
-            skill_enum_names(&skills),
-            vec!["audit", "check", "inspect", "review"]
-        );
-    }
-
-    /// Regression test: `skill_enum_names` output must be identical across
-    /// calls even when the input slice order changes (upstream cache is a
-    /// HashMap). A drifting enum breaks Bedrock/Anthropic prompt cache hits.
-    #[test]
-    fn skill_enum_names_are_stable_under_input_reorder() {
-        let a = SkillToolInfo {
-            name: "alpha".into(),
-            aliases: vec!["a1".into()],
-            ..Default::default()
-        };
-        let b = SkillToolInfo {
-            name: "beta".into(),
-            aliases: vec!["b1".into()],
-            ..Default::default()
-        };
-        let c = SkillToolInfo {
-            name: "charlie".into(),
-            ..Default::default()
-        };
-
-        let order1 = skill_enum_names(&[a.clone(), b.clone(), c.clone()]);
-        let order2 = skill_enum_names(&[c.clone(), a.clone(), b.clone()]);
-        let order3 = skill_enum_names(&[b.clone(), c.clone(), a.clone()]);
-        assert_eq!(order1, order2);
-        assert_eq!(order1, order3);
-    }
-
-    // Removed tests exercised the legacy `skill_tool_schema` +
-    // `skill_listing_system_message` pair. Replaced by
-    // `skill_surfacing_contract.rs` (no-enum invariant) and
-    // `skill_listing_session_scope_e2e.rs` (byte-stability).
-
     #[test]
     fn visible_skills_omit_already_invoked_entries() {
         let skills = vec![
@@ -2808,13 +2632,12 @@ mod tests {
         }
 
         let excluded = HashSet::from(["already-visible".to_string(), "alias-blocked".to_string()]);
-        let (text, names) = execute_discover_skills("anything", &catalog, excluded);
+        let (text, names) = execute_discover_skills("candidate", &catalog, excluded);
 
         assert_eq!(names.len(), DISCOVER_SKILLS_MAX_RESULTS);
         assert!(!names.iter().any(|name| name == "already-visible"));
         assert!(!names.iter().any(|name| name == "blocked-by-alias"));
         assert!(names.iter().all(|name| name.starts_with("candidate-")));
-        // "anything" doesn't match any name/desc → fallback to first N.
         assert!(text.contains("candidate-0"), "{text}");
     }
 
@@ -2856,7 +2679,7 @@ mod tests {
     }
 
     #[test]
-    fn discover_skills_no_match_falls_back_to_first_n() {
+    fn discover_skills_no_match_returns_empty() {
         let catalog: Vec<SkillToolInfo> = (0..3)
             .map(|i| SkillToolInfo {
                 name: format!("alpha-{i}"),
@@ -2864,8 +2687,13 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let (_, names) = execute_discover_skills("zzz_nonexistent_xyz", &catalog, HashSet::new());
-        assert_eq!(names.len(), 3, "fallback should return all available");
+        let (text, names) =
+            execute_discover_skills("zzz_nonexistent_xyz", &catalog, HashSet::new());
+        assert!(
+            names.is_empty(),
+            "unmatched queries must not surface arbitrary skills"
+        );
+        assert!(text.contains("No additional skills matched"), "{text}");
     }
 
     #[test]
@@ -4169,229 +3997,6 @@ mod tests {
         assert_eq!(remaining.len(), 0);
     }
 
-    // `system_listing_includes_when_to_use` removed.
-    // `build_skill_listing_section` currently renders name + description only;
-    // `when_to_use` folding into the block is a future enhancement tracked in
-    // P2 follow-up.
-
-    #[test]
-    fn budget_full_descriptions_fit() {
-        let skills: Vec<SkillToolInfo> = (0..5)
-            .map(|i| SkillToolInfo {
-                name: format!("skill-{i}"),
-                description: format!("Does thing {i}"),
-                when_to_use: None,
-                source: SkillSourceKind::Local,
-                aliases: Vec::new(),
-                category: None,
-                tags: Vec::new(),
-            })
-            .collect();
-        let (entries, names) = format_skills_within_budget(&skills, 10_000, None);
-        assert_eq!(entries.len(), 5);
-        assert_eq!(names.len(), 5);
-        // All entries have full descriptions
-        assert!(entries[0].contains("Does thing 0"));
-    }
-
-    #[test]
-    fn budget_truncates_under_pressure() {
-        // Create skills that exceed a tiny budget
-        let skills: Vec<SkillToolInfo> = (0..20)
-            .map(|i| SkillToolInfo {
-                name: format!("skill-{i}"),
-                description: format!(
-                    "This is a very long description for skill number {i} that goes on and on"
-                ),
-                when_to_use: Some(format!(
-                    "when the user needs to do something very specific related to task {i}"
-                )),
-                source: SkillSourceKind::Local,
-                aliases: Vec::new(),
-                category: None,
-                tags: Vec::new(),
-            })
-            .collect();
-        let (entries, names) = format_skills_within_budget(&skills, 500, None);
-        assert_eq!(names.len(), 20); // All names still present in enum
-        assert_eq!(entries.len(), 20); // All entries present
-        // Entries should be shorter than full descriptions
-        let total: usize = entries.iter().map(|e| e.len() + 1).sum();
-        assert!(total <= 500 + 50, "total {total} should be near budget 500");
-    }
-
-    #[test]
-    fn budget_bundled_preserved_others_truncated() {
-        let mut skills: Vec<SkillToolInfo> = (0..3)
-            .map(|i| SkillToolInfo {
-                name: format!("bundled-{i}"),
-                description: format!("Important bundled skill {i}"),
-                when_to_use: None,
-                source: SkillSourceKind::Bundled,
-                aliases: Vec::new(),
-                category: None,
-                tags: Vec::new(),
-            })
-            .collect();
-        // Add many local skills
-        for i in 0..20 {
-            skills.push(SkillToolInfo {
-                name: format!("local-{i}"),
-                description: format!("Local skill with a fairly long description for number {i}"),
-                when_to_use: None,
-                source: SkillSourceKind::Local,
-                aliases: Vec::new(),
-                category: None,
-                tags: Vec::new(),
-            });
-        }
-        let (entries, names) = format_skills_within_budget(&skills, 800, None);
-        assert_eq!(names.len(), 23);
-        // Bundled entries should have full descriptions
-        assert!(entries[0].contains("Important bundled skill 0"));
-        assert!(entries[1].contains("Important bundled skill 1"));
-        assert!(entries[2].contains("Important bundled skill 2"));
-    }
-
-    #[test]
-    fn budget_names_only_under_extreme_pressure() {
-        let skills: Vec<SkillToolInfo> = (0..100)
-            .map(|i| SkillToolInfo {
-                name: format!("s{i}"),
-                description: format!("Description {i}"),
-                when_to_use: None,
-                source: SkillSourceKind::Local,
-                aliases: Vec::new(),
-                category: None,
-                tags: Vec::new(),
-            })
-            .collect();
-        // With 100 skills and 200 byte budget, names-only
-        let (entries, names) = format_skills_within_budget(&skills, 200, None);
-        assert_eq!(names.len(), 100);
-        // At least some entries should be names-only (no ":")
-        let names_only_count = entries.iter().filter(|e| !e.contains(": ")).count();
-        assert!(
-            names_only_count > 0,
-            "should have names-only entries under extreme pressure"
-        );
-    }
-
-    #[test]
-    fn per_entry_description_capped() {
-        let long_desc = "x".repeat(500);
-        let skills = vec![SkillToolInfo {
-            name: "long".into(),
-            description: long_desc.clone(),
-            when_to_use: None,
-            source: SkillSourceKind::Local,
-            aliases: Vec::new(),
-            category: None,
-            tags: Vec::new(),
-        }];
-        let (entries, _) = format_skills_within_budget(&skills, 10_000, None);
-        // Description should be capped at MAX_LISTING_DESC_CHARS
-        assert!(
-            entries[0].len() < long_desc.len(),
-            "entry should be shorter than raw description"
-        );
-        assert!(entries[0].contains('…'), "should have truncation marker");
-    }
-
-    #[test]
-    fn per_entry_description_cap_stays_tight() {
-        // Pin the per-entry cap at ≤150 chars so skill listings remain
-        // compact in the volatile `<system-reminder>`. Pre-tightening the
-        // cap was 250, contributing ~2.3K chars of skill descriptions
-        // every turn (observed in session 2f4706d1). If this test needs
-        // to grow, check whether the volatile block is still growing in
-        // proportion — a 250-char cap on 7 skills burns ~210 tok/turn.
-        let long_desc = "Sentence one. ".repeat(40); // ~560 chars
-        let skills = vec![SkillToolInfo {
-            name: "long".into(),
-            description: long_desc,
-            when_to_use: None,
-            source: SkillSourceKind::Local,
-            aliases: Vec::new(),
-            category: None,
-            tags: Vec::new(),
-        }];
-        let (entries, _) = format_skills_within_budget(&skills, 10_000, None);
-        // Entry = "- **name**: <desc>" — strip the prefix to measure desc only.
-        let desc_only = entries[0]
-            .strip_prefix("- **long**: ")
-            .expect("entry format");
-        assert!(
-            desc_only.chars().count() <= 150,
-            "description cap must stay ≤150 chars, got {} chars: {desc_only:?}",
-            desc_only.chars().count()
-        );
-    }
-
-    #[test]
-    fn quality_boost_sorts_skills_under_budget_pressure() {
-        use crate::skills::quality::{SkillOutcome, SkillQualityTracker};
-
-        let skills = vec![
-            SkillToolInfo {
-                name: "low-quality".into(),
-                description: "A skill that fails often".into(),
-                when_to_use: None,
-                source: SkillSourceKind::Local,
-                aliases: Vec::new(),
-                category: None,
-                tags: Vec::new(),
-            },
-            SkillToolInfo {
-                name: "high-quality".into(),
-                description: "A skill that succeeds often".into(),
-                when_to_use: None,
-                source: SkillSourceKind::Local,
-                aliases: Vec::new(),
-                category: None,
-                tags: Vec::new(),
-            },
-        ];
-
-        let mut tracker = SkillQualityTracker::new();
-        // Record 5 successes for high-quality
-        for _ in 0..5 {
-            tracker.record_outcome(&SkillOutcome {
-                skill_name: "high-quality".into(),
-                tokens_used: 100,
-                duration_ms: 50,
-                all_required_passed: true,
-                partial: false,
-            });
-        }
-        // Record 5 failures for low-quality
-        for _ in 0..5 {
-            tracker.record_outcome(&SkillOutcome {
-                skill_name: "low-quality".into(),
-                tokens_used: 100,
-                duration_ms: 50,
-                all_required_passed: false,
-                partial: false,
-            });
-        }
-
-        // Under budget pressure, high-quality should come first
-        let (entries, _) = format_skills_within_budget(&skills, 80, Some(&tracker));
-        // With quality sorting, high-quality should appear before low-quality
-        let high_pos = entries
-            .iter()
-            .position(|e| e.contains("high-quality"))
-            .unwrap();
-        let low_pos = entries
-            .iter()
-            .position(|e| e.contains("low-quality"))
-            .unwrap();
-        assert!(
-            high_pos < low_pos,
-            "high-quality skill should be listed first"
-        );
-    }
-
     #[test]
     fn truncate_desc_handles_cjk_without_panic() {
         // 3 bytes per CJK char — slicing at byte 5 would split a char
@@ -4422,10 +4027,6 @@ mod tests {
         let desc = format_skill_description(&skill);
         assert!(desc.ends_with('…'));
     }
-
-    // `skill_listing_includes_category_in_xml` removed; category rendering
-    // is a legacy skill_listing_system_message feature not yet migrated to
-    // `build_skill_listing_section`. Tracked as P2 follow-up.
 
     #[tokio::test]
     async fn execute_skill_returns_activation_with_allowed_tools() {
