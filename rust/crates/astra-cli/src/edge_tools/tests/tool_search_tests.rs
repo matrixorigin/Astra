@@ -61,12 +61,20 @@ async fn tool_search_missing_or_blank_query_returns_exact_error() {
     set_visible(&executor, &["tool_search"]);
 
     let missing = executor.execute("tool_search", &json!({})).await;
-    assert_eq!(missing, "Error: 'query' is required");
+    let missing: Value = serde_json::from_str(&missing)
+        .unwrap_or_else(|error| panic!("tool_search error must be JSON, got {error}: {missing}"));
+    assert_eq!(missing["mode"].as_str(), Some("error"));
+    assert_eq!(missing["status"].as_str(), Some("failed"));
+    assert_eq!(missing["error"].as_str(), Some("'query' is required"));
 
     let blank = executor
         .execute("tool_search", &json!({"query": "   "}))
         .await;
-    assert_eq!(blank, "Error: 'query' is required");
+    let blank: Value = serde_json::from_str(&blank)
+        .unwrap_or_else(|error| panic!("tool_search error must be JSON, got {error}: {blank}"));
+    assert_eq!(blank["mode"].as_str(), Some("error"));
+    assert_eq!(blank["status"].as_str(), Some("failed"));
+    assert_eq!(blank["error"].as_str(), Some("'query' is required"));
 }
 
 #[tokio::test]

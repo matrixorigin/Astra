@@ -1635,6 +1635,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_tool_search_missing_query_returns_structured_error() {
+        let (_tmp, exec) = test_executor();
+        let result = exec.execute("tool_search", &serde_json::json!({})).await;
+
+        assert!(
+            result.is_error,
+            "structured tool_search failure must be marked as a tool error"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&result.output)
+            .unwrap_or_else(|error| panic!("tool_search error must stay JSON: {error}"));
+        assert_eq!(parsed["mode"].as_str(), Some("error"));
+        assert_eq!(parsed["status"].as_str(), Some("failed"));
+        assert_eq!(parsed["error"].as_str(), Some("'query' is required"));
+    }
+
+    #[tokio::test]
     async fn dispatch_github_without_client_gives_actionable_guidance() {
         let (_tmp, exec) = test_executor();
         let result = exec

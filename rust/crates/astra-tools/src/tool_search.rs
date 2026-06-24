@@ -674,19 +674,19 @@ mod tests {
     #[test]
     fn select_mode_unique_prefix_resolves_canonical_tool_name() {
         let schemas = sample_schemas();
-        let result = tool_search(&schemas, &json!({"query": "select:gitHub"}));
+        let result = tool_search(&schemas, &json!({"query": "select:gitH"}));
         let parsed = parse_result(&result);
 
         assert_eq!(parsed["status"].as_str(), Some("completed"));
         assert_eq!(parsed["selection_status"].as_str(), Some("ok"));
-        assert_eq!(field_strings(&parsed, "requested"), strings(&["gitHub"]));
+        assert_eq!(field_strings(&parsed, "requested"), strings(&["gitH"]));
         assert_eq!(field_strings(&parsed, "resolved"), strings(&["github"]));
         assert_eq!(match_names(&parsed), strings(&["github"]));
         assert_eq!(
             parsed["matches"][0]["matched_by"].as_str(),
             Some("unique_prefix")
         );
-        assert_eq!(parsed["matches"][0]["requested"].as_str(), Some("gitHub"));
+        assert_eq!(parsed["matches"][0]["requested"].as_str(), Some("gitH"));
         assert!(field_strings(&parsed, "missing").is_empty());
     }
 
