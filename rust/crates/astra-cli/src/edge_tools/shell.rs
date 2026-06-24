@@ -43,9 +43,9 @@ fn interpret_exit_code(command: &str, code: i32) -> CommandResult {
             is_error: false,
             note: None,
         },
-        astra_tools::exit_semantics::ExitSemantics::InformationalFailure => CommandResult {
+        astra_tools::exit_semantics::ExitSemantics::EmptyResult => CommandResult {
             is_error: false,
-            note: Some(informational_failure_note(command)),
+            note: Some(empty_result_note(command)),
         },
         astra_tools::exit_semantics::ExitSemantics::TimedOut
         | astra_tools::exit_semantics::ExitSemantics::Cancelled
@@ -57,7 +57,7 @@ fn interpret_exit_code(command: &str, code: i32) -> CommandResult {
     }
 }
 
-fn informational_failure_note(command: &str) -> &'static str {
+fn empty_result_note(command: &str) -> &'static str {
     let family = astra_tools::exit_semantics::command_family(command);
     if matches!(family.as_deref(), Some("pgrep" | "pkill" | "killall")) {
         "No processes matched"

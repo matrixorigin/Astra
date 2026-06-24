@@ -243,7 +243,7 @@ async fn execute_with_metadata_bash_non_zero_exit_preserves_structured_failure()
 }
 
 #[tokio::test]
-async fn execute_with_metadata_bash_domain_negative_is_structured_non_error() {
+async fn execute_with_metadata_bash_empty_result_is_structured_non_error() {
     let executor = test_executor();
     let outcome = executor
         .execute_with_metadata_cancelable(
@@ -263,13 +263,13 @@ async fn execute_with_metadata_bash_domain_negative_is_structured_non_error() {
         fields
             .get("exit_semantics")
             .and_then(serde_json::Value::as_str),
-        Some("informational_failure")
+        Some("empty_result")
     );
     assert_eq!(
         fields
             .get("result_class")
             .and_then(serde_json::Value::as_str),
-        Some("domain_negative")
+        Some("empty_result")
     );
 }
 

@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum ExitSemantics {
     Success,
-    /// Command completed normally but did not find a requested informational
-    /// target (e.g. `grep`/`rg` no matches, `pgrep` no processes).
-    InformationalFailure,
+    /// Command completed normally but produced an empty/absent result
+    /// (e.g. `grep`/`rg` no matches, `pgrep` no processes).
+    EmptyResult,
     /// Command completed normally and found a negative/different domain state
     /// (e.g. `diff`/`cmp` found differences, `test` false).
     DomainNegative,
@@ -47,6 +47,7 @@ impl ExitSemantics {
 #[serde(rename_all = "snake_case")]
 pub enum CommandResultClass {
     Success,
+    EmptyResult,
     DomainNegative,
     TestFailure,
     EnvFailure,
@@ -59,6 +60,7 @@ impl CommandResultClass {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Success => "success",
+            Self::EmptyResult => "empty_result",
             Self::DomainNegative => "domain_negative",
             Self::TestFailure => "test_failure",
             Self::EnvFailure => "env_failure",
@@ -99,22 +101,18 @@ pub fn classify_exit(command: &str, exit_code: i32) -> ExitSemantics {
         return ExitSemantics::ExecutionError;
     }
     if exit_code == 1
-        && let Some(semantics) = pipeline_domain_negative_semantics(command)
+        && let Some(semantics) = pipeline_non_error_semantics(command)
     {
         return semantics;
     }
 
     let family = command_family(command);
     match (family.as_deref(), exit_code) {
-        (Some("grep" | "rg" | "ripgrep" | "ag"), 1) => ExitSemantics::InformationalFailure,
-        (Some("git"), 1) if command_contains_word(command, "grep") => {
-            ExitSemantics::InformationalFailure
-        }
-        (Some("pgrep" | "pkill" | "killall"), 1) => ExitSemantics::InformationalFailure,
-        (Some("which" | "type" | "hash"), 1) => ExitSemantics::InformationalFailure,
-        (Some("command"), 1) if command_contains_token(command, "-v") => {
-            ExitSemantics::InformationalFailure
-        }
+        (Some("grep" | "rg" | "ripgrep" | "ag"), 1) => ExitSemantics::EmptyResult,
+        (Some("git"), 1) if command_contains_word(command, "grep") => ExitSemantics::EmptyResult,
+        (Some("pgrep" | "pkill" | "killall"), 1) => ExitSemantics::EmptyResult,
+        (Some("which" | "type" | "hash"), 1) => ExitSemantics::EmptyResult,
+        (Some("command"), 1) if command_contains_token(command, "-v") => ExitSemantics::EmptyResult,
         (Some("diff" | "cmp"), 1) => ExitSemantics::DomainNegative,
         (Some("false"), 1) => ExitSemantics::DomainNegative,
         (Some("test" | "["), 1) => ExitSemantics::DomainNegative,
@@ -164,7 +162,8 @@ pub fn classify_command_result(
             ExitSemantics::Success | ExitSemantics::PipelineTruncated => {
                 CommandResultClass::Success
             }
-            ExitSemantics::InformationalFailure | ExitSemantics::DomainNegative => {
+            ExitSemantics::EmptyResult => CommandResultClass::EmptyResult,
+            ExitSemantics::DomainNegative => {
                 if is_build_test_or_lint_command(command) {
                     CommandResultClass::TestFailure
                 } else {
@@ -271,7 +270,7 @@ fn segment_family(segment: &str) -> Option<String> {
     Some(family)
 }
 
-fn pipeline_domain_negative_semantics(command: &str) -> Option<ExitSemantics> {
+fn pipeline_non_error_semantics(command: &str) -> Option<ExitSemantics> {
     let segments = split_pipeline_segments(command);
     if segments.len() < 2 {
         return None;
@@ -284,10 +283,10 @@ fn pipeline_domain_negative_semantics(command: &str) -> Option<ExitSemantics> {
     let last = segments.last().unwrap();
     match segment_family(last).as_deref() {
         Some("grep" | "rg" | "ripgrep" | "ag") => {
-            return Some(ExitSemantics::InformationalFailure);
+            return Some(ExitSemantics::EmptyResult);
         }
         Some("git") if command_contains_word(last, "grep") => {
-            return Some(ExitSemantics::InformationalFailure);
+            return Some(ExitSemantics::EmptyResult);
         }
         Some("diff" | "cmp" | "false" | "test" | "[") => {
             return Some(ExitSemantics::DomainNegative);
@@ -301,17 +300,17 @@ fn pipeline_domain_negative_semantics(command: &str) -> Option<ExitSemantics> {
         _ => {}
     }
 
-    // Last segment is not a known domain-negative tool. With pipefail, exit 1
-    // could come from an earlier search/test segment IF the last segment is a
-    // passive data sink that doesn't independently fail with exit 1.
+    // Last segment is not a known non-error producer. With pipefail, exit 1
+    // could come from an earlier search/test segment if the last segment is a
+    // passive data sink that does not independently fail with exit 1.
     if is_passive_pipe_sink(last) {
         for segment in &segments[..segments.len() - 1] {
             match segment_family(segment).as_deref() {
                 Some("grep" | "rg" | "ripgrep" | "ag") => {
-                    return Some(ExitSemantics::InformationalFailure);
+                    return Some(ExitSemantics::EmptyResult);
                 }
                 Some("git") if command_contains_word(segment, "grep") => {
-                    return Some(ExitSemantics::InformationalFailure);
+                    return Some(ExitSemantics::EmptyResult);
                 }
                 Some("diff" | "cmp" | "false" | "test" | "[") => {
                     return Some(ExitSemantics::DomainNegative);
@@ -507,7 +506,7 @@ mod tests {
     use super::{CommandResultClass, ExitSemantics, classify_command_result, classify_exit};
 
     #[test]
-    fn grep_no_match_is_informational_failure() {
+    fn grep_no_match_is_empty_result() {
         for cmd in &[
             "grep needle missing",
             "grep missing src/main.rs",
@@ -516,22 +515,22 @@ mod tests {
             "ag needle src",
         ] {
             let sem = classify_exit(cmd, 1);
-            assert_eq!(sem, ExitSemantics::InformationalFailure, "cmd={cmd}");
+            assert_eq!(sem, ExitSemantics::EmptyResult, "cmd={cmd}");
             assert!(!sem.is_tool_error(), "cmd={cmd}");
         }
     }
 
     #[test]
-    fn cd_wrapped_grep_no_match_is_informational() {
+    fn cd_wrapped_grep_no_match_is_empty_result() {
         let semantics = classify_exit("cd /work/repo && grep -n missing src/main.rs", 1);
-        assert_eq!(semantics, ExitSemantics::InformationalFailure);
+        assert_eq!(semantics, ExitSemantics::EmptyResult);
         assert!(!semantics.is_tool_error());
     }
 
     #[test]
-    fn grep_pipeline_no_match_remains_informational_under_pipefail() {
+    fn grep_pipeline_no_match_remains_empty_result_under_pipefail() {
         let semantics = classify_exit("grep needle haystack.txt | head -20", 1);
-        assert_eq!(semantics, ExitSemantics::InformationalFailure);
+        assert_eq!(semantics, ExitSemantics::EmptyResult);
         assert!(!semantics.is_tool_error());
     }
 
@@ -543,14 +542,14 @@ mod tests {
     }
 
     #[test]
-    fn git_grep_no_match_is_informational() {
+    fn git_grep_no_match_is_empty_result() {
         let semantics = classify_exit("git grep missing -- src", 1);
-        assert_eq!(semantics, ExitSemantics::InformationalFailure);
+        assert_eq!(semantics, ExitSemantics::EmptyResult);
         assert!(!semantics.is_tool_error());
     }
 
     #[test]
-    fn process_match_commands_no_match_are_informational() {
+    fn process_match_commands_no_match_are_empty_result() {
         for command in [
             "pgrep missing-process-name",
             "cd /work/repo && pgrep missing-process-name",
@@ -558,28 +557,28 @@ mod tests {
             "killall -0 missing-process-name",
         ] {
             let semantics = classify_exit(command, 1);
-            assert_eq!(semantics, ExitSemantics::InformationalFailure, "{command}");
+            assert_eq!(semantics, ExitSemantics::EmptyResult, "{command}");
             assert!(!semantics.is_tool_error(), "{command}");
         }
     }
 
     #[test]
-    fn grep_escaped_pipe_no_match_is_informational() {
+    fn grep_escaped_pipe_no_match_is_empty_result() {
         // Regression: `grep 'version\|Version' file` has an escaped `|` in the
         // regex, not a pipeline separator. It must still be classified as grep.
         let semantics = classify_exit("grep -n 'version\\|Version' crates/foo/src/file.rs", 1);
-        assert_eq!(semantics, ExitSemantics::InformationalFailure);
+        assert_eq!(semantics, ExitSemantics::EmptyResult);
         assert!(!semantics.is_tool_error());
     }
 
     #[test]
-    fn grep_quoted_regex_pipe_no_match_is_informational() {
+    fn grep_quoted_regex_pipe_no_match_is_empty_result() {
         for command in [
             "grep -E 'foo|bar' crates/foo/src/file.rs",
             "grep -E \"foo|bar\" crates/foo/src/file.rs",
         ] {
             let semantics = classify_exit(command, 1);
-            assert_eq!(semantics, ExitSemantics::InformationalFailure, "{command}");
+            assert_eq!(semantics, ExitSemantics::EmptyResult, "{command}");
             assert!(!semantics.is_tool_error(), "{command}");
         }
     }
@@ -588,7 +587,7 @@ mod tests {
     fn pipeline_last_command_determines_exit_semantics() {
         // `ls | grep foo`: exit code comes from grep, not ls.
         let semantics = classify_exit("ls -la | grep missing", 1);
-        assert_eq!(semantics, ExitSemantics::InformationalFailure);
+        assert_eq!(semantics, ExitSemantics::EmptyResult);
         assert!(!semantics.is_tool_error());
     }
 
@@ -654,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn command_presence_checks_missing_are_informational() {
+    fn command_presence_checks_missing_are_empty_result() {
         for command in [
             "which definitely_missing_tool",
             "command -v definitely_missing_tool",
@@ -662,7 +661,7 @@ mod tests {
             "hash definitely_missing_tool",
         ] {
             let semantics = classify_exit(command, 1);
-            assert_eq!(semantics, ExitSemantics::InformationalFailure, "{command}");
+            assert_eq!(semantics, ExitSemantics::EmptyResult, "{command}");
             assert!(!semantics.is_tool_error(), "{command}");
         }
     }
@@ -703,7 +702,7 @@ mod tests {
     fn leading_env_assignment_does_not_hide_command_family() {
         assert_eq!(
             classify_exit("LC_ALL=C grep needle file", 1),
-            ExitSemantics::InformationalFailure
+            ExitSemantics::EmptyResult
         );
     }
 
@@ -729,11 +728,10 @@ mod tests {
         assert_eq!(class, CommandResultClass::TestFailure);
         assert!(!class.is_tool_error());
 
-        // grep no-match is a semantic non-error outcome. The coarse result
-        // class stays domain_negative; exit_semantics keeps the finer
-        // informational_failure distinction.
+        // grep no-match is a semantic non-error outcome, distinct from
+        // domain-negative answers like `diff` differences or `test` false.
         let class = classify_command_result("grep needle missing", "", "", Some(1));
-        assert_eq!(class, CommandResultClass::DomainNegative);
+        assert_eq!(class, CommandResultClass::EmptyResult);
         assert!(!class.is_tool_error());
 
         let class = classify_command_result(
@@ -761,7 +759,7 @@ mod tests {
     #[test]
     fn command_result_keeps_grep_no_match_non_error() {
         let class = classify_command_result("grep needle missing", "", "", Some(1));
-        assert_eq!(class, CommandResultClass::DomainNegative);
+        assert_eq!(class, CommandResultClass::EmptyResult);
         assert!(!class.is_tool_error());
     }
 }

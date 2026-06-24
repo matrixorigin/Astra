@@ -5005,12 +5005,12 @@ printf 'probe.txt:1:needle\n'
 
         assert!(
             !result.is_error,
-            "grep no-match is informational, not a tool error: {}",
+            "grep no-match is an empty result, not a tool error: {}",
             result.output
         );
         assert_eq!(
             result.exit_semantics,
-            Some(crate::exit_semantics::ExitSemantics::InformationalFailure)
+            Some(crate::exit_semantics::ExitSemantics::EmptyResult)
         );
     }
 
@@ -5030,12 +5030,12 @@ printf 'probe.txt:1:needle\n'
 
         assert!(
             !result.is_error,
-            "grep no-match pipeline is informational, not a tool error: {}",
+            "grep no-match pipeline is an empty result, not a tool error: {}",
             result.output
         );
         assert_eq!(
             result.exit_semantics,
-            Some(crate::exit_semantics::ExitSemantics::InformationalFailure)
+            Some(crate::exit_semantics::ExitSemantics::EmptyResult)
         );
     }
 

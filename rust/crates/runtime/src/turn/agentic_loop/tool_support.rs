@@ -166,8 +166,8 @@ mod tests {
             args: json!({"command": "grep needle haystack.txt"}),
             output: "No matches found".into(),
             tool_result_fields: Some(serde_json::Map::from_iter([
-                ("exit_semantics".to_string(), json!("informational_failure")),
-                ("result_class".to_string(), json!("domain_negative")),
+                ("exit_semantics".to_string(), json!("empty_result")),
+                ("result_class".to_string(), json!("empty_result")),
             ])),
             status: "failed".into(),
             duration_ms: 10,

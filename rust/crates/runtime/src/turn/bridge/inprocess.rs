@@ -629,6 +629,10 @@ mod exit_semantics_tests {
             Some("execution_error".to_string())
         );
         assert_eq!(
+            normalize_exit_semantics_tag("empty_result"),
+            Some("empty_result".to_string())
+        );
+        assert_eq!(
             normalize_exit_semantics_tag("domain_negative"),
             Some("domain_negative".to_string())
         );
@@ -8078,7 +8082,7 @@ mod tests {
     }
 
     #[test]
-    fn build_bridge_records_structured_informational_exit_as_ok() {
+    fn build_bridge_records_structured_empty_result_exit_as_ok() {
         let tool_calls = vec![json!({
             "id": "call-1",
             "function": {"name": "bash", "arguments": "{\"command\":\"grep needle haystack.txt\"}"}
@@ -8089,8 +8093,8 @@ mod tests {
             "status": "failed",
             "output": "No matches found",
             "duration_ms": 50,
-            "exit_semantics": "informational_failure",
-            "result_class": "domain_negative"
+            "exit_semantics": "empty_result",
+            "result_class": "empty_result"
         })];
         let records = build_bridge_tool_call_records(
             &tool_calls,
@@ -8100,11 +8104,8 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(records[0].ok, "{records:?}");
         assert!(records[0].error.is_none(), "{records:?}");
-        assert_eq!(
-            records[0].exit_semantics.as_deref(),
-            Some("informational_failure")
-        );
-        assert_eq!(records[0].result_class.as_deref(), Some("domain_negative"));
+        assert_eq!(records[0].exit_semantics.as_deref(), Some("empty_result"));
+        assert_eq!(records[0].result_class.as_deref(), Some("empty_result"));
     }
 
     #[test]

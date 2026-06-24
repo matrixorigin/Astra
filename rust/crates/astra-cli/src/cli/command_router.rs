@@ -3045,13 +3045,13 @@ mod exit_code_tests {
     }
 
     #[test]
-    fn exit_code_success_on_informational_failure_semantics() {
+    fn exit_code_success_on_empty_result_semantics() {
         let mut sr = empty_stream_result();
         sr.tool_call_records.push(tool_call_record(
             "Bash",
             false,
             Some("grep returned 1"),
-            Some("informational_failure"),
+            Some("empty_result"),
         ));
         assert_eq!(compute_exit_code(&sr), ExitCode::Success);
     }

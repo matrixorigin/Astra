@@ -273,7 +273,7 @@ impl ToolCell {
             return None;
         }
         match classify_exit(bash_command_from_description(&self.description), exit_code) {
-            ExitSemantics::InformationalFailure => Some("no matches".to_string()),
+            ExitSemantics::EmptyResult => Some("no matches".to_string()),
             _ => Some(format!("exit {exit_code} · no output")),
         }
     }

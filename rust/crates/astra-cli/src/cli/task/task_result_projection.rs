@@ -93,7 +93,7 @@ pub(crate) fn stream_result_exit_code(sr: &StreamResult) -> crate::cli::exit_cod
         {
             Some(
                 astra_tools::exit_semantics::ExitSemantics::Success
-                | astra_tools::exit_semantics::ExitSemantics::InformationalFailure
+                | astra_tools::exit_semantics::ExitSemantics::EmptyResult
                 | astra_tools::exit_semantics::ExitSemantics::DomainNegative
                 | astra_tools::exit_semantics::ExitSemantics::PipelineTruncated,
             ) => false,
@@ -247,10 +247,10 @@ mod tests {
     }
 
     #[test]
-    fn stream_result_exit_code_treats_domain_negative_exit_semantics_as_success() {
+    fn stream_result_exit_code_treats_non_error_exit_semantics_as_success() {
         for semantics in [
             "success",
-            "informational_failure",
+            "empty_result",
             "domain_negative",
             "pipeline_truncated",
         ] {
