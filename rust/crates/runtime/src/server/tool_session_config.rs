@@ -118,23 +118,6 @@ pub(crate) fn apply_runtime_config_update(
                 drift,
             })
         }
-        "tool_policy.max_tools" => {
-            let Some(new) = parse_u32(value) else {
-                return Err(json!({"error": "value must be an integer"}));
-            };
-            if !(5..=80).contains(&new) {
-                return Err(json!({"error": "tool_policy.max_tools must be within [5, 80]"}));
-            }
-            let old = config.tool_policy.max_tools;
-            let drift = normalized_drift(old as f64, new as f64);
-            check_drift(path, old, new, drift, force, ceiling)?;
-            config.tool_policy.max_tools = new;
-            Ok(RuntimeConfigUpdate {
-                old_value: json!(old),
-                new_value: json!(new),
-                drift,
-            })
-        }
         "token_budget.max_turn_input_tokens" => {
             let Some(new) = parse_u32(value) else {
                 return Err(json!({"error": "value must be an integer"}));
@@ -196,7 +179,6 @@ pub(crate) fn apply_runtime_config_update(
             "supported_paths": [
                 "compression.compression_threshold",
                 "memory.retrieval_top_k",
-                "tool_policy.max_tools",
                 "token_budget.max_turn_input_tokens",
                 "token_budget.tools_reserve",
                 "verification.strictness",

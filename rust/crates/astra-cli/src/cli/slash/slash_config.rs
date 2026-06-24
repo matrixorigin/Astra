@@ -142,17 +142,6 @@ fn show_config() {
         format!("{:.2}", config.memory.long_term_weight).yellow()
     );
 
-    // tool surface settings
-    println!("\n{}", "🔧 tool surface".bold());
-    println!(
-        "  max_tools: {}",
-        config.tool_policy.max_tools.to_string().yellow()
-    );
-    println!(
-        "  prefer_recent_tools: {}",
-        config.tool_policy.prefer_recent_tools.to_string().yellow()
-    );
-
     // Token budget settings
     println!("\n{}", "🎯 Token Budget".bold());
     println!(

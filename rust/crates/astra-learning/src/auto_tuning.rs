@@ -1183,7 +1183,6 @@ impl AutoTuningEngine {
 
 fn get_config_value(config: &RuntimeConfig, path: &str) -> Option<serde_json::Value> {
     match path {
-        "tool_policy.max_tools" => Some(serde_json::json!(config.tool_policy.max_tools)),
         "token_budget.max_prompt_tokens" => {
             Some(serde_json::json!(config.token_budget.max_prompt_tokens))
         }
@@ -1214,11 +1213,6 @@ fn get_config_value(config: &RuntimeConfig, path: &str) -> Option<serde_json::Va
 
 fn apply_config_value(config: &mut RuntimeConfig, path: &str, value: &serde_json::Value) {
     match path {
-        "tool_policy.max_tools" => {
-            if let Some(v) = value.as_u64() {
-                config.tool_policy.max_tools = (v as u32).clamp(1, 256);
-            }
-        }
         "token_budget.max_prompt_tokens" => {
             if let Some(v) = value.as_u64() {
                 config.token_budget.max_prompt_tokens = (v as u32).clamp(1000, 500_000);
@@ -1315,22 +1309,6 @@ pub fn load_feedback(profile: &str, engine: &AutoTuningEngine) -> Result<bool, S
 /// Create default evolution rules.
 pub fn default_rules() -> Vec<EvolutionRule> {
     vec![
-        // High retry rate → reduce max tools
-        EvolutionRule::new(
-            "high-retry-reduce-tools",
-            EvolutionTrigger::HighRetryRate {
-                threshold: 0.3,
-                window_secs: 3600,
-                min_samples: 10,
-            },
-            EvolutionAction::AdjustConfig {
-                path: "tool_policy.max_tools".to_string(),
-                delta: -2.0,
-                min: Some(3.0),
-                max: Some(15.0),
-            },
-        )
-        .with_name("Reduce tools on high retry rate"),
         // Negative feedback streak → alert
         EvolutionRule::new(
             "negative-streak-alert",
@@ -1873,8 +1851,8 @@ mod tests {
     #[test]
     fn test_default_rules() {
         let rules = default_rules();
-        assert_eq!(rules.len(), 9);
-        assert!(rules.iter().any(|r| r.id == "low-success-boost-confidence"));
+        assert_eq!(rules.len(), 7);
+        assert!(rules.iter().any(|r| r.id == "negative-streak-alert"));
         assert!(rules.iter().any(|r| r.id == "correction-raise-strictness"));
         assert!(rules.iter().any(|r| r.id == "churn-expand-memory"));
         assert!(rules.iter().any(|r| r.id == "drift-trim-history"));

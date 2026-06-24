@@ -3533,10 +3533,6 @@ fn handle_session_adaptive(_arg: &str, state: &SessionState) {
                 "      compression.compression_threshold   = {:.3}",
                 guard.config.compression.compression_threshold
             );
-            eprintln!(
-                "      tool_policy.max_tools            = {}",
-                guard.config.tool_policy.max_tools
-            );
         }
     } else {
         eprintln!("  {}", "No active observability session.".dim());

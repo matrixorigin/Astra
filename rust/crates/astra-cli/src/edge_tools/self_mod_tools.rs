@@ -108,33 +108,6 @@ impl ToolExecutor {
                 old_value = Some(json!(old));
                 new_value = Some(json!(new));
             }
-            "tool_policy.max_tools" => {
-                let Some(new) = parse_u32(value) else {
-                    return json!({"error": "value must be an integer"}).to_string();
-                };
-                if !(5..=80).contains(&new) {
-                    return json!({"error": "tool_policy.max_tools must be within [5, 80]"})
-                        .to_string();
-                }
-                let old = session.config.tool_policy.max_tools;
-                if let Some(d) = bounded_drift(old as f64, new as f64, 5.0, 80.0) {
-                    if !force && d > ceiling {
-                        return json!({
-                            "error": "config_drift_ceiling_exceeded",
-                            "path": path,
-                            "old": old,
-                            "new": new,
-                            "drift": d,
-                            "ceiling": ceiling
-                        })
-                        .to_string();
-                    }
-                    drift = Some(d);
-                }
-                session.config.tool_policy.max_tools = new;
-                old_value = Some(json!(old));
-                new_value = Some(json!(new));
-            }
             "token_budget.max_turn_input_tokens" => {
                 let Some(new) = parse_u32(value) else {
                     return json!({"error": "value must be an integer"}).to_string();
@@ -221,7 +194,6 @@ impl ToolExecutor {
                     "supported_paths": [
                         "compression.compression_threshold",
                         "memory.retrieval_top_k",
-                        "tool_policy.max_tools",
                         "token_budget.max_turn_input_tokens",
                         "token_budget.tools_reserve",
                         "verification.strictness"

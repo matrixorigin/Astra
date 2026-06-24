@@ -115,8 +115,8 @@ fn apply_scenario_to_config(
     let strategy = scenario.strategy_hints();
 
     // `max_tools_per_turn` is the execution limit per headless round.
-    // Scenario routing must not change `max_tools`, which is only the
-    // visible-schema selection count.
+    // Schema visibility is owned by `tool_surface`, not adaptive scenario
+    // routing.
     config.tool_policy.max_tools_per_turn = strategy.max_tools_per_turn as u32;
 
     match strategy.detail_level {
@@ -1106,13 +1106,11 @@ mod tests {
     use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
 
     #[test]
-    fn scenario_config_code_review_updates_execution_limits_not_surface_size() {
+    fn scenario_config_code_review_updates_execution_limits() {
         let mut config = astra_config::runtime_config::RuntimeConfig::default();
-        let original_max_tools = config.tool_policy.max_tools;
 
         apply_scenario_to_config(&mut config, Scenario::CodeReview);
 
-        assert_eq!(config.tool_policy.max_tools, original_max_tools);
         assert_eq!(config.tool_policy.effective_max_tools_per_turn(), 10);
         assert!((config.verification.strictness - 0.7).abs() < 0.01);
     }

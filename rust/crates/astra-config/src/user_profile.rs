@@ -146,11 +146,6 @@ impl UserPreferences {
 /// Apply a single config override based on key path.
 fn apply_preference_override(config: &mut RuntimeConfig, key: &str, value: &serde_json::Value) {
     match key {
-        "tool_policy.max_tools" => {
-            if let Some(v) = value.as_u64() {
-                config.tool_policy.max_tools = v as u32;
-            }
-        }
         "token_budget.max_prompt_tokens" => {
             if let Some(v) = value.as_u64() {
                 config.token_budget.max_prompt_tokens = v as u32;

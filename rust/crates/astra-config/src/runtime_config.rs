@@ -549,27 +549,11 @@ pub enum MemoryStrategy {
     Custom,
 }
 
-// ─── tool surface Configuration ────────────────────────────────────────────
+// ─── Tool Execution Policy Configuration ───────────────────────────────────
 
-/// Configuration for tool surface.
+/// Configuration for per-turn tool execution guards.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolPolicyConfig {
-    /// Maximum number of tools to include in the prompt.
-    #[serde(default = "default_max_tools")]
-    pub max_tools: u32,
-
-    /// Whether to prefer tools used recently in the conversation.
-    #[serde(default = "default_true")]
-    pub prefer_recent_tools: bool,
-
-    /// Boost factor for recently used tools.
-    #[serde(default = "default_recent_tool_boost")]
-    pub recent_tool_boost: f64,
-
-    /// Maximum tokens for tool schemas.
-    #[serde(default = "default_max_tool_schema_tokens")]
-    pub max_tool_schema_tokens: u32,
-
     /// Max times the same (tool, args) can execute across a session.
     /// 0 = use default (2). Prevents infinite loops from ignored dedup hints.
     #[serde(default)]
@@ -1096,23 +1080,9 @@ fn apply_profile(base: EffectiveToolPolicy, profile: &ModelPolicyProfile) -> Eff
     }
 }
 
-fn default_max_tools() -> u32 {
-    30
-}
-fn default_recent_tool_boost() -> f64 {
-    0.15
-}
-fn default_max_tool_schema_tokens() -> u32 {
-    15000
-}
-
 impl Default for ToolPolicyConfig {
     fn default() -> Self {
         Self {
-            max_tools: default_max_tools(),
-            prefer_recent_tools: default_true(),
-            recent_tool_boost: default_recent_tool_boost(),
-            max_tool_schema_tokens: default_max_tool_schema_tokens(),
             max_identical_tool_calls: 0,
             max_tools_per_turn: 0,
             circuit_breaker_stall_threshold: 0,
@@ -1870,10 +1840,6 @@ impl RuntimeConfig {
         );
 
         let ToolPolicyConfig {
-            max_tools,
-            prefer_recent_tools,
-            recent_tool_boost,
-            max_tool_schema_tokens,
             max_identical_tool_calls,
             max_tools_per_turn,
             circuit_breaker_stall_threshold,
@@ -1892,26 +1858,6 @@ impl RuntimeConfig {
             exploration_family_churn_midloop_threshold,
             model_profiles,
         } = tool_policy;
-        merge_if_non_default(
-            &mut self.tool_policy.max_tools,
-            max_tools,
-            default_max_tools(),
-        );
-        merge_if_non_default(
-            &mut self.tool_policy.prefer_recent_tools,
-            prefer_recent_tools,
-            default_true(),
-        );
-        merge_if_non_default(
-            &mut self.tool_policy.recent_tool_boost,
-            recent_tool_boost,
-            default_recent_tool_boost(),
-        );
-        merge_if_non_default(
-            &mut self.tool_policy.max_tool_schema_tokens,
-            max_tool_schema_tokens,
-            default_max_tool_schema_tokens(),
-        );
         merge_if_non_default(
             &mut self.tool_policy.max_identical_tool_calls,
             max_identical_tool_calls,
@@ -2455,10 +2401,6 @@ mod tests {
                 strategy: MemoryStrategy::Comprehensive,
             },
             tool_policy: ToolPolicyConfig {
-                max_tools: 12,
-                prefer_recent_tools: false,
-                recent_tool_boost: 0.4,
-                max_tool_schema_tokens: 22000,
                 max_identical_tool_calls: 0,
                 max_tools_per_turn: 0,
                 circuit_breaker_stall_threshold: 0,
@@ -2551,11 +2493,6 @@ mod tests {
         assert_eq!(merged.memory.max_memory_tokens, 8192);
         assert!(!merged.memory.include_repository_memories);
         assert_eq!(merged.memory.strategy, MemoryStrategy::Comprehensive);
-
-        assert_eq!(merged.tool_policy.max_tools, 12);
-        assert!(!merged.tool_policy.prefer_recent_tools);
-        assert!((merged.tool_policy.recent_tool_boost - 0.4).abs() < 0.001);
-        assert_eq!(merged.tool_policy.max_tool_schema_tokens, 22000);
 
         assert_eq!(merged.trace.profile, TraceProfile::Custom);
         assert_eq!(merged.trace.min_level, TraceLevel::Debug);
