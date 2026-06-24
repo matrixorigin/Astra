@@ -2345,7 +2345,6 @@ impl InProcessChatTurnBridge {
                                         edge_profile
                                             .get("system_prompt_override")
                                             .and_then(Value::as_str),
-                                        task_type,
                                     ),
                     session: crate::turn::llm::context::BridgeSessionContextInput::new(
                         &cache_cfg,
@@ -2486,7 +2485,6 @@ impl InProcessChatTurnBridge {
                                             edge_profile
                                                 .get("system_prompt_override")
                                                 .and_then(Value::as_str),
-                                            task_type,
                                         ),
                                     session:
                                         crate::turn::llm::context::BridgeSessionContextInput::new(
@@ -5445,7 +5443,6 @@ mod tests {
             crate::turn::prompt_cache::assemble_system_message_via_pipeline(
                 &["bash", "read_file"],
                 &dynamic_sections,
-                Some("implementation"),
                 &PromptCacheConfig::latch("openai", "gpt-4"),
                 "test-session",
                 "gpt-4",

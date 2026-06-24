@@ -339,8 +339,8 @@ impl Default for RuntimeConfig {
 /// apply additively to the built-in [`default always-load`](runtime crate) set:
 /// - A plain name (e.g. `"github"`) *adds* that tool to the always-load set.
 /// - Surrounding whitespace is trimmed before matching.
-/// - Unknown names, whitespace-only values, and non-canonical entries such as
-///   `"-grep"` are ignored (see `ToolSurface::build`).
+/// - Unknown names and whitespace-only values are ignored (see
+///   `ToolSurface::build`).
 ///
 /// **Across config layers** (user `~/.astra/config/runtime.toml` vs.
 /// project `.astra/config/runtime.toml`), the merge is **atomic, not

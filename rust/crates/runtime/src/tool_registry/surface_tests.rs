@@ -287,16 +287,16 @@ fn config_always_load_tools_additive_appends_to_defaults() {
 }
 
 #[test]
-fn config_always_load_tools_prefix_dash_is_ignored() {
+fn config_always_load_tools_unknown_name_does_not_remove_defaults() {
     let cfg = ToolSurfaceConfig {
-        always_load_tools: vec!["-grep".into()],
+        always_load_tools: vec!["not_a_real_tool".into()],
     };
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
 
     let always_load = names(&surface.always_load_schemas());
     assert!(
         always_load.iter().any(|n| n == "grep"),
-        "-grep is not a supported removal syntax; grep must remain default always_load: {always_load:?}"
+        "unknown always_load_tools entries must not remove default always_load tools: {always_load:?}"
     );
     assert!(
         !surface.deferred().iter().any(|e| e.name == "grep"),
@@ -306,8 +306,9 @@ fn config_always_load_tools_prefix_dash_is_ignored() {
 
 #[test]
 fn empty_and_malformed_config_entries_are_ignored_not_panic() {
-    // Footguns the user might type by accident: empty string, dash-prefixed
-    // names, surrounding whitespace. They must not panic or change defaults.
+    // Footguns the user might type by accident: empty strings, malformed
+    // unknown names, and surrounding whitespace. They must not panic or change
+    // defaults.
     let cfg = ToolSurfaceConfig {
         always_load_tools: vec![
             "".into(),

@@ -569,13 +569,13 @@ fn normalized_skill_text(text: &str) -> String {
 }
 
 fn contains_token_subsequence(haystack: &str, needle: &str) -> bool {
-    let needle_tokens: Vec<&str> = needle.split_whitespace().collect();
-    if needle_tokens.is_empty() {
+    let mut needle_tokens = needle.split_whitespace();
+    let Some(first) = needle_tokens.next() else {
         return false;
-    }
+    };
 
     let mut haystack_tokens = haystack.split_whitespace();
-    for token in needle_tokens {
+    for token in std::iter::once(first).chain(needle_tokens) {
         if !haystack_tokens.any(|candidate| candidate == token) {
             return false;
         }

@@ -291,7 +291,6 @@ fn compact_cache_control_marker(cache_control: &Value) -> Value {
 pub(crate) fn assemble_system_message_via_pipeline(
     tool_names: &[&str],
     extra_dynamic_sections: &[prompts::PromptSection],
-    task_type: Option<&str>,
     cache_cfg: &PromptCacheConfig,
     session_id: &str,
     model_id: &str,
@@ -307,7 +306,6 @@ pub(crate) fn assemble_system_message_via_pipeline(
         &[],
         None,
         None,
-        task_type,
         cache_cfg,
         None,
         session_id,
@@ -361,7 +359,6 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     memory_entries: &[astra_turn_core::context_sources::MemoryEntry],
     session_memory_entry: Option<&astra_turn_core::context_sources::MemoryEntry>,
     system_override: Option<&str>,
-    task_type: Option<&str>,
     cache_cfg: &PromptCacheConfig,
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     session_id: &str,
@@ -516,8 +513,6 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         last_user_message: String::new(),
     };
     let statics = prompts::build_pipeline_static_sections();
-
-    let _ = task_type; // Reserved for future planner input; unused today.
 
     // Ephemeral per-request session. Bridge doesn't persist a session across
     // turns — its compaction lives elsewhere — so a fresh session per call
@@ -946,7 +941,7 @@ mod tests {
     #[test]
     fn cache_static_prefix_tool_names_follow_toml_surface_additions() {
         let cfg = ToolSurfaceConfig {
-            always_load_tools: vec!["github".into(), "-grep".into()],
+            always_load_tools: vec!["github".into(), "not_a_real_tool".into()],
         };
         let always_load = resolve_always_load_tool_names_for_config(&cfg);
 
@@ -956,7 +951,7 @@ mod tests {
         );
         assert!(
             always_load.contains("grep"),
-            "dash-prefixed entries are ignored for default always_load tools"
+            "unknown entries must not remove default always_load tools"
         );
         assert!(
             always_load.contains("bash"),
@@ -964,7 +959,7 @@ mod tests {
         );
         assert!(
             !always_load.contains("web_search"),
-            "deferred web_search must not become cache always_load without an explicit TOML pin"
+            "deferred web_search must not become cache always_load without an explicit TOML always_load entry"
         );
     }
 
@@ -1107,7 +1102,6 @@ mod tests {
             &[],
             None,
             None,
-            None,
             &cache_cfg,
             None,
             "sid-bridge",
@@ -1164,7 +1158,6 @@ mod tests {
             &memory_entries,
             None,
             None,
-            None,
             &cache_cfg,
             None,
             "sid-memory",
@@ -1213,7 +1206,6 @@ mod tests {
             &[],
             &[],
             Some(&session_memory),
-            None,
             None,
             &cache_cfg,
             None,
@@ -1271,7 +1263,6 @@ mod tests {
             &[],
             None,
             Some("You must answer using the MOI agent contract."),
-            None,
             &cache_cfg,
             None,
             "sid-system-override",
@@ -1330,7 +1321,6 @@ mod tests {
             &[],
             Some(&session_memory),
             None,
-            None,
             &cache_cfg,
             None,
             "sid-session-memory-anthropic",
@@ -1386,7 +1376,6 @@ mod tests {
             &[],
             None,
             None,
-            None,
             &cache_cfg,
             None,
             "sid-deferred-tools",
@@ -1440,7 +1429,6 @@ mod tests {
                 prompts::PromptTokenBucket::Environment,
             )],
             &[],
-            None,
             None,
             None,
             &cache_cfg,
@@ -1499,7 +1487,6 @@ mod tests {
         let (primary, dynamic, sections) = assemble_system_message_via_pipeline(
             &["bash", "read_file"],
             &[],
-            None,
             &cache_cfg,
             "test-session",
             "claude-sonnet-4-6",
@@ -1551,7 +1538,6 @@ mod tests {
         let (primary, dynamic, _sections) = assemble_system_message_via_pipeline(
             &["bash", "read_file"],
             &[],
-            None,
             &cache_cfg,
             "sid",
             "gpt-4o",
@@ -1607,7 +1593,6 @@ mod tests {
         let (primary, dynamic, _) = assemble_system_message_via_pipeline(
             &["bash"],
             &extra,
-            None,
             &cache_cfg,
             "sid",
             "claude-sonnet-4-6",
@@ -1668,7 +1653,6 @@ mod tests {
                     "extra content".to_string(),
                     prompts::PromptTokenBucket::Environment,
                 )],
-                None,
                 &cache_cfg,
                 "sid",
                 "claude-sonnet-4-6",
@@ -1699,7 +1683,6 @@ mod tests {
         let (primary, _, _) = assemble_system_message_via_pipeline(
             &["bash", "read_file"],
             &[],
-            None,
             &cache_cfg,
             "sid",
             "claude-sonnet-4-6",
@@ -1752,7 +1735,6 @@ mod tests {
         let (primary, _, _) = assemble_system_message_via_pipeline(
             &["bash"],
             &[],
-            None,
             &PromptCacheConfig {
                 cache_enabled: true,
                 is_anthropic: true,
@@ -1800,7 +1782,6 @@ mod tests {
         let (primary1, _, _) = assemble_system_message_via_pipeline(
             &["bash"],
             &[],
-            None,
             &PromptCacheConfig::default(),
             "sid",
             "gpt-4",
@@ -1815,7 +1796,6 @@ mod tests {
         let (primary2, _, _) = assemble_system_message_via_pipeline(
             &["bash"],
             &[],
-            None,
             &PromptCacheConfig::default(),
             "sid",
             "gpt-4",
@@ -1845,7 +1825,6 @@ mod tests {
         let (primary1, _, _) = assemble_system_message_via_pipeline(
             &["bash"],
             &[],
-            None,
             &PromptCacheConfig::default(),
             "sid",
             "gpt-4",
@@ -1865,7 +1844,6 @@ mod tests {
         let (primary2, _, _) = assemble_system_message_via_pipeline(
             &["bash"],
             &[],
-            None,
             &PromptCacheConfig::default(),
             "sid",
             "gpt-4",
@@ -1992,7 +1970,6 @@ mod tests {
             &[],
             &[],
             &[],
-            None,
             None,
             None,
             &cache_cfg,

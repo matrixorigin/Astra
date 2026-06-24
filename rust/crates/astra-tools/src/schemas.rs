@@ -20,7 +20,30 @@ pub const SERVER_RUN_SCRIPT_RPC_TOOL_NAMES: &[&str] = &[
 ];
 
 pub fn all_tool_schemas() -> Vec<Value> {
-    all_tool_schemas_with_env(|k| std::env::var(k).ok())
+    let mut schemas = all_tool_schemas_core();
+    enforce_task_schema_unknown_field_contract(&mut schemas);
+    // run_script is Unix-only (UDS RPC transport). Always exposed on Unix;
+    // there is no environment gate for production tools.
+    #[cfg(unix)]
+    {
+        schemas.push(run_script_schema_default());
+    }
+    schemas.push(json!({
+        "type": "function",
+        "function": {
+            "name": "powershell",
+            "description": "Execute a PowerShell command. Use for Windows shell tasks, pwsh scripts, and cross-platform automation when PowerShell syntax is preferred over bash. PREFER dedicated tools (git, glob, grep, read_file, write_file, str_replace) over shell commands when they cover the operation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "PowerShell command to run"},
+                    "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Pass a larger value for long-running builds/tests (e.g. 300 for cargo build, 600 for full test suites)."}
+                },
+                "required": ["command"]
+            }
+        }
+    }));
+    schemas
 }
 
 /// Check whether a tool name has a corresponding schema in the built-in
@@ -49,38 +72,6 @@ pub fn narrow_run_script_for_server(schemas: &mut [Value]) {
     }) {
         *slot = run_script_schema_for(SERVER_RUN_SCRIPT_RPC_TOOL_NAMES);
     }
-}
-
-/// Like `all_tool_schemas()` but reads env via a caller-supplied closure.
-/// The `env` parameter is currently unused (all gated tools have been
-/// removed) but kept for forward compatibility with future per-env
-/// opt-in surfaces.
-pub fn all_tool_schemas_with_env<F: Fn(&str) -> Option<String>>(env: F) -> Vec<Value> {
-    let _ = env; // reserved for future env-gated tools
-    let mut schemas = all_tool_schemas_core();
-    enforce_task_schema_unknown_field_contract(&mut schemas);
-    // run_script is Unix-only (UDS RPC transport). Always exposed on Unix —
-    // no env gate, this is the production tool.
-    #[cfg(unix)]
-    {
-        schemas.push(run_script_schema_default());
-    }
-    schemas.push(json!({
-        "type": "function",
-        "function": {
-            "name": "powershell",
-            "description": "Execute a PowerShell command. Use for Windows shell tasks, pwsh scripts, and cross-platform automation when PowerShell syntax is preferred over bash. PREFER dedicated tools (git, glob, grep, read_file, write_file, str_replace) over shell commands when they cover the operation.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "PowerShell command to run"},
-                    "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Pass a larger value for long-running builds/tests (e.g. 300 for cargo build, 600 for full test suites)."}
-                },
-                "required": ["command"]
-            }
-        }
-    }));
-    schemas
 }
 
 fn enforce_task_schema_unknown_field_contract(schemas: &mut [Value]) {
@@ -1227,7 +1218,7 @@ mod tests {
 
     #[test]
     fn agent_schema_does_not_expose_model_background_parameter() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
         let props = agent
             .get("function")
@@ -1248,7 +1239,7 @@ mod tests {
         // queue. If a future refactor collapses the description
         // without the sync/async paragraph, the cache-safe short
         // description would lose the load-bearing semantics.
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
         let desc = agent
             .get("function")
@@ -1267,7 +1258,7 @@ mod tests {
 
     #[test]
     fn agent_schema_parallel_fanout_warns_against_agents_payloads() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
         let desc = agent
             .get("function")
@@ -1298,7 +1289,7 @@ mod tests {
 
     #[test]
     fn agent_fanout_schema_exposes_atomic_group_contract() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let fanout = find_schema(&schemas, "agent_fanout").expect("agent_fanout schema must exist");
         let desc = fanout
             .get("function")
@@ -1345,7 +1336,7 @@ mod tests {
 
     #[test]
     fn agent_schema_pins_exact_runtime_agent_id_contract() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
         let desc = agent
             .get("function")
@@ -1381,7 +1372,7 @@ mod tests {
 
     #[test]
     fn typed_background_task_schemas_replace_job_public_contract() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         assert!(
             find_schema(&schemas, "job").is_none()
                 && find_schema(&schemas, "task_output").is_some()
@@ -1429,7 +1420,7 @@ mod tests {
 
     #[test]
     fn task_schema_keeps_compact_multi_step_contract() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let task = find_schema(&schemas, "task").expect("task schema must exist");
         let desc = task
             .get("function")
@@ -1449,7 +1440,7 @@ mod tests {
 
     #[test]
     fn memory_and_task_schemas_stay_compact() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let memory = find_schema(&schemas, "memory").expect("memory schema must exist");
         let task = find_schema(&schemas, "task").expect("task schema must exist");
         let memory_tokens = schema_token_cost(memory);
@@ -1467,7 +1458,7 @@ mod tests {
 
     #[test]
     fn always_load_high_frequency_descriptions_stay_compact() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         for (name, max_len) in [
             ("bash", 180usize),
             ("str_replace", 180),
@@ -1490,7 +1481,7 @@ mod tests {
 
     #[test]
     fn notify_always_load_incremental_schema_cost_is_quantified() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let notify = find_schema(&schemas, "notify").expect("notify schema must exist");
         let notify_tokens = schema_token_cost(notify);
         const EXPECTED_NOTIFY_TOKENS: usize = 126;
@@ -1507,7 +1498,7 @@ mod tests {
 
     #[test]
     fn task_schema_discourages_single_umbrella_task() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let task = find_schema(&schemas, "task").expect("task schema must exist");
         let desc = task["function"]["description"].as_str().unwrap();
 
@@ -1517,7 +1508,7 @@ mod tests {
 
     #[test]
     fn task_schema_exposes_lifecycle_progress_and_dependencies() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let task = find_schema(&schemas, "task").expect("task schema must exist");
         let properties = &task["function"]["parameters"]["properties"];
         assert_eq!(
@@ -1737,7 +1728,7 @@ mod tests {
 
     #[test]
     fn plan_schema_uses_semantic_guidance_not_lexical_triggers() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let enter =
             find_schema(&schemas, "enter_plan_mode").expect("enter_plan_mode schema must exist");
         let plan_desc = enter["function"]["description"].as_str().unwrap();
@@ -1763,7 +1754,7 @@ mod tests {
 
     #[test]
     fn exit_plan_mode_schema_points_to_task_board_not_legacy_plan_todos() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let exit =
             find_schema(&schemas, "exit_plan_mode").expect("exit_plan_mode schema must exist");
         let desc = exit["function"]["description"].as_str().unwrap();
@@ -1791,7 +1782,7 @@ mod tests {
 
     #[test]
     fn introspect_schema_mentions_lifecycle_and_resume_state() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let introspect = find_schema(&schemas, "introspect").expect("introspect schema must exist");
         let desc = introspect["function"]["description"]
             .as_str()
@@ -1812,7 +1803,7 @@ mod tests {
 
     #[test]
     fn self_mod_session_state_top_level_schemas_exist() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         for name in ["compress_context", "rollback_session_state"] {
             find_schema(&schemas, name)
                 .expect("top-level schema must exist for ToolEngine routing");
@@ -1828,7 +1819,7 @@ mod tests {
 
     #[test]
     fn matrixone_top_level_schemas_exist() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         assert!(
             find_schema(&schemas, "mo").is_none(),
             "MatrixOne must expose one public query shape; do not keep the old aggregate mo schema"
@@ -1860,7 +1851,7 @@ mod tests {
 
     #[test]
     fn session_schema_excludes_retired_session_state_actions() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let session = find_schema(&schemas, "session").expect("session schema");
         let actions = session["function"]["parameters"]["properties"]["action"]["enum"]
             .as_array()
@@ -1903,7 +1894,7 @@ mod tests {
 
     #[test]
     fn get_agent_info_schema_exposes_capability_dimension() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let get_agent_info =
             find_schema(&schemas, "get_agent_info").expect("get_agent_info schema must exist");
         let properties = get_agent_info["function"]["parameters"]["properties"]
@@ -1926,7 +1917,7 @@ mod tests {
 
     #[test]
     fn execute_code_no_longer_present_in_schemas() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let names = schema_names(&schemas);
         assert!(
             !names.contains(&"execute_code"),
@@ -1941,7 +1932,7 @@ mod tests {
     fn run_script_visible_by_default_on_unix() {
         // run_script is the production successor to execute_code and must
         // be discoverable without any opt-in env var.
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let names = schema_names(&schemas);
         assert!(
             names.contains(&"run_script"),
@@ -1952,7 +1943,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_script_default_schema_lists_all_sandbox_tools() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let rs = schemas
             .iter()
             .find(|s| {
@@ -2005,7 +1996,7 @@ mod tests {
     #[cfg(not(unix))]
     #[test]
     fn run_script_hidden_on_non_unix() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let names = schema_names(&schemas);
         assert!(
             !names.contains(&"run_script"),
@@ -2015,7 +2006,7 @@ mod tests {
 
     #[test]
     fn read_file_schema_exposes_only_line_range_contract() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let read_file = find_schema(&schemas, "read_file").expect("read_file schema must exist");
         let func = read_file
             .get("function")
@@ -2060,7 +2051,7 @@ mod tests {
 
     #[test]
     fn write_file_schema_requires_content_or_delete_contract() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let write_file = find_schema(&schemas, "write_file").expect("write_file schema must exist");
         let func = write_file
             .get("function")
@@ -2137,7 +2128,7 @@ mod tests {
 
     #[test]
     fn str_replace_schema_uses_provider_compatible_edit_mode_contract() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let str_replace =
             find_schema(&schemas, "str_replace").expect("str_replace schema must exist");
         let desc = str_replace
@@ -2254,7 +2245,7 @@ mod tests {
 
     #[test]
     fn bash_schema_timeout_default_matches_code_default() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let bash = find_schema(&schemas, "bash").expect("bash schema must exist");
         let desc = timeout_description(bash);
         assert!(
@@ -2271,7 +2262,7 @@ mod tests {
 
     #[test]
     fn bash_schema_hints_to_extend_timeout_for_long_commands() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let bash = find_schema(&schemas, "bash").expect("bash schema must exist");
         let desc = timeout_description(bash);
         // Presence of at least ONE of these signal tokens tells the
@@ -2289,7 +2280,7 @@ mod tests {
 
     #[test]
     fn powershell_schema_timeout_default_matches_code_default() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let ps = find_schema(&schemas, "powershell").expect("powershell schema must exist");
         let desc = timeout_description(ps);
         assert!(

@@ -604,14 +604,14 @@ mod tests {
     }
 
     #[test]
-    fn dash_prefixed_always_load_config_is_ignored_for_default_tool() {
+    fn unknown_always_load_config_does_not_remove_default_tool() {
         let schemas = vec![
             sample_schema("bash"),
             sample_schema("grep"),
             sample_schema("tool_search"),
         ];
         let cfg = ToolSurfaceConfig {
-            always_load_tools: vec!["-grep".into()],
+            always_load_tools: vec!["not_a_real_tool".into()],
         };
         let reg = ToolRegistry::new_with_tool_surface(schemas, &cfg);
 
@@ -623,7 +623,7 @@ mod tests {
             reg.always_load_schemas
                 .iter()
                 .any(|(name, _)| name == "grep"),
-            "-grep is not a supported removal syntax; grep remains default always_load"
+            "unknown always_load_tools entries must not remove default always_load tools"
         );
         assert!(
             names.contains(&"grep".to_string()),

@@ -82,8 +82,8 @@ impl ToolSurface {
     ///
     /// Algorithm:
     /// 1. Start from names classified as `ToolLoadPolicy::AlwaysLoad`.
-    /// 2. Apply `cfg.always_load_tools`: a canonical tool name adds that tool
-    ///    to always_load. Unknown or non-canonical entries are ignored.
+    /// 2. Apply `cfg.always_load_tools`: a known tool name adds that tool to
+    ///    always_load. Unknown or malformed entries are ignored.
     /// 3. Partition the union of catalog + plugins: names in the resolved
     ///    always_load set → `always_load_schemas`; everything else → `deferred`.
     /// 4. Sort both alphabetically for byte-stability.
@@ -122,8 +122,8 @@ impl ToolSurface {
         }
 
         // Resolve the always_load name set: defaults plus additive overrides.
-        // Unknown or non-canonical names emit a warning — they are likely typos
-        // or stale entries after a tool was renamed.
+        // Unknown names emit a warning — they are likely typos or stale
+        // entries after a tool was renamed.
         let mut always_load_names: std::collections::BTreeSet<String> = default_always_load_names()
             .iter()
             .map(|s| s.to_string())
@@ -131,14 +131,6 @@ impl ToolSurface {
         for entry in &cfg.always_load_tools {
             let trimmed = entry.trim();
             if trimmed.is_empty() {
-                continue;
-            }
-            if trimmed.starts_with('-') {
-                tracing::warn!(
-                    target: "astra.tool_surface",
-                    entry = trimmed,
-                    "tool_surface.always_load_tools: non-canonical tool name '{trimmed}' ignored: always_load_tools only adds tools"
-                );
                 continue;
             }
             if by_name.contains_key(trimmed) {

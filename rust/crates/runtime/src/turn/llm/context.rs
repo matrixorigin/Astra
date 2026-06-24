@@ -384,7 +384,6 @@ pub(crate) struct BridgeRuntimeSignals<'a> {
     pub memory_entries: &'a [astra_turn_core::context_sources::MemoryEntry],
     pub session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
     pub system_override: Option<&'a str>,
-    pub task_type: Option<&'a str>,
 }
 
 impl<'a> BridgeRuntimeSignals<'a> {
@@ -394,7 +393,6 @@ impl<'a> BridgeRuntimeSignals<'a> {
         memory_entries: &'a [astra_turn_core::context_sources::MemoryEntry],
         session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
         system_override: Option<&'a str>,
-        task_type: Option<&'a str>,
     ) -> Self {
         Self {
             extra_stable_sections,
@@ -402,7 +400,6 @@ impl<'a> BridgeRuntimeSignals<'a> {
             memory_entries,
             session_memory_entry,
             system_override,
-            task_type,
         }
     }
 }
@@ -681,7 +678,6 @@ pub(crate) fn assemble_bridge_context(
         input.runtime_signals.memory_entries,
         input.runtime_signals.session_memory_entry.as_ref(),
         input.runtime_signals.system_override,
-        input.runtime_signals.task_type,
         input.session.cache_cfg,
         input.session.cache_capability,
         input.session.session_id,
