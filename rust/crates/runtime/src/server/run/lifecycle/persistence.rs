@@ -1882,6 +1882,7 @@ mod tests {
             json!({"role": "system", "content": "[Context compacted: older messages were removed to reduce token pressure. The conversation continues below.]"}),
             json!({"role": "user", "content": "不要review啊！"}),
             json!({"role": "assistant", "reasoning_content": "trace"}),
+            json!({"role": "system", "content": "[Session runtime recap]\nRecent tools: stale"}),
             json!({"role": "tool", "tool_call_id": "c1", "content": "tool output"}),
         ];
         state.final_text = "ok".to_string();
@@ -1902,6 +1903,12 @@ mod tests {
                 .iter()
                 .all(|msg| !msg["content"].as_str().unwrap_or("").contains("old review"))
         );
+        assert!(messages.iter().all(|msg| {
+            !msg["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("runtime recap")
+        }));
     }
 
     #[tokio::test]

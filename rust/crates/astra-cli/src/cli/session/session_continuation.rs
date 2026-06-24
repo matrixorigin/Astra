@@ -15,7 +15,13 @@ pub(crate) fn load_session_messages_for_continuation(
     let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
     match astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(&user_id, session_id) {
         Ok(Some(cp)) if !cp.messages.is_empty() => {
-            Some(sanitize_continuation_messages(cp.messages))
+            let prompt_state = heavy_checkpoint_prompt_state(&cp);
+            Some(
+                astra_turn_core::prompt_facing::sanitize_prompt_facing_messages_with_state(
+                    cp.messages,
+                    &prompt_state,
+                ),
+            )
         }
         Err(error) => {
             tracing::warn!(
@@ -27,6 +33,25 @@ pub(crate) fn load_session_messages_for_continuation(
             None
         }
         _ => None,
+    }
+}
+
+fn heavy_checkpoint_prompt_state(
+    cp: &astra_pipeline::step_protocol::HeavyCheckpoint,
+) -> astra_turn_core::conversation_log::SessionStateCompact {
+    astra_turn_core::conversation_log::SessionStateCompact {
+        recent_tools: cp.recent_tools.clone(),
+        budget_remaining_tokens: cp.budget_remaining_tokens,
+        budget_remaining_rounds: cp.budget_remaining_rounds,
+        consecutive_ctx_errors: cp.consecutive_context_window_errors,
+        delegation: cp.delegation_id.as_ref().map(|id| {
+            astra_turn_core::conversation_log::DelegationCompact {
+                id: id.clone(),
+                pattern: cp.delegation_pattern.clone().unwrap_or_default(),
+                completed_sub_runs: cp.delegation_sub_run_summaries.clone(),
+            }
+        }),
+        ..Default::default()
     }
 }
 
@@ -142,11 +167,18 @@ mod tests {
         );
 
         let messages = messages.expect("should load messages from checkpoint");
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 3);
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[0]["content"], "Remember: code is ZEBRA-99");
         assert_eq!(messages[1]["role"], "assistant");
         assert_eq!(messages[1]["content"], "OK, noted.");
+        assert_eq!(messages[2]["role"], "system");
+        assert!(
+            messages[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Last checkpoint budget: tokens=100000, rounds=50")
+        );
     }
 
     #[test]
@@ -236,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_trims_trailing_tool_round() {
+    fn sanitize_compacts_trailing_completed_tool_round() {
         let msgs = vec![
             json!({"role": "user", "content": "check status"}),
             json!({"role": "assistant", "content": "Here is the status."}),
@@ -247,8 +279,20 @@ mod tests {
             json!({"role": "tool", "content": "+line", "tool_call_id": "2"}),
         ];
         let result = super::sanitize_continuation_messages(msgs);
-        assert_eq!(result.len(), 3);
+        assert_eq!(result.len(), 5);
         assert_eq!(result[2]["content"], "hi");
+        assert!(
+            result[3]["content"]
+                .as_str()
+                .unwrap()
+                .contains("[Runtime tool result]\ngit: M file.rs")
+        );
+        assert!(
+            result[4]["content"]
+                .as_str()
+                .unwrap()
+                .contains("[Runtime tool result]\ngit: +line")
+        );
     }
 
     #[test]
