@@ -231,8 +231,6 @@ impl ToolRegistry {
             control_plane("get_agent_info"),
             control_plane("introspect"),
             control_plane("notify"),
-            control_plane("prioritize_tool"),
-            control_plane("deprioritize_tool"),
             control_plane("compress_context"),
             control_plane("rollback_session_state"),
             control_plane("session"),
@@ -898,6 +896,26 @@ mod tests {
                 ),
                 Err(ToolUnavailableReason::UnknownTool),
                 "{tool} must not resolve through static or dynamic registry entries"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_control_plane_tool_names_are_unknown_tools() {
+        let registry = registry();
+        let binding = RunBinding::cloud_control_plane(&registry);
+
+        for tool in ["prioritize_tool", "deprioritize_tool"] {
+            assert!(!binding.tool_surface.contains(tool));
+            assert_eq!(
+                CapabilityResolver.check_tool_call(
+                    &registry,
+                    tool,
+                    &serde_json::json!({}),
+                    &binding.capabilities,
+                ),
+                Err(ToolUnavailableReason::UnknownTool),
+                "{tool} must not remain registered in the runtime capability surface"
             );
         }
     }

@@ -109,7 +109,6 @@ static TOOL_DECLARATIONS: &[ToolDeclaration] = &[
     internal("hover_info", "code-intel operation behind lsp"),
     internal("multi_edit", "batch-edit operation behind str_replace"),
     internal("notebook_edit", "notebook mutation helper"),
-    internal("prioritize_tool", "tool-health control-plane helper"),
     internal("query_context", "context exchange helper"),
     internal("reflect", "local reflection helper"),
     internal("rename_symbol", "code-intel write operation behind lsp"),
@@ -118,7 +117,6 @@ static TOOL_DECLARATIONS: &[ToolDeclaration] = &[
     internal("symbol_search", "code-intel operation behind symbols"),
     internal("type_hierarchy", "code-intel operation behind lsp"),
     internal("background_shell", "user-controlled background shell task"),
-    internal("deprioritize_tool", "tool-health control-plane helper"),
     internal("git_clone", "deployment/runtime clone helper"),
 ];
 
