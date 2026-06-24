@@ -492,7 +492,7 @@ impl DriftDetector {
             severity += 0.4;
         }
 
-        // Check for topic divergence (TF-IDF cosine similarity)
+        // Check for topic divergence with token-frequency cosine similarity.
         let original_keywords = extract_keywords(original_query);
         for (i, query) in recent_queries.iter().enumerate() {
             let sim = query_similarity(original_query, query);

@@ -3,9 +3,9 @@
 //! Three tiers of dedup:
 //! - Tier 1 (exact): handled externally by `normalize_call_sig()` in chat_stream
 //! - Tier 2 (parameter-aware): same tool, semantically equivalent args (case, trailing slash)
-//! - Tier 3 (output similarity): TF-IDF cosine similarity on tool outputs
+//! - Tier 3 (output similarity hint): token cosine similarity on tool outputs
 //!
-//! No embeddings — pure string processing. <0.5ms per check.
+//! No embeddings, no corpus IDF, and no model calls — pure string processing.
 
 use crate::text_tokenize::{build_tf, tokenize};
 use serde::{Deserialize, Serialize};
@@ -319,9 +319,9 @@ fn semantic_bash_git_key(args: &Value) -> Option<String> {
     }
 }
 
-// ─── Tier 3: Output Similarity ───────────────────────────────────────────────
+// ─── Tier 3: Output Similarity Hint ──────────────────────────────────────────
 
-/// TF-IDF cosine similarity between two tool outputs.
+/// Token-frequency cosine similarity between two tool outputs.
 /// Returns 0.0-1.0. Outputs shorter than MIN_OUTPUT_LEN are not compared.
 const MIN_OUTPUT_LEN: usize = 30;
 
@@ -362,7 +362,7 @@ fn is_read_only_tool(tool_name: &str) -> bool {
     )
 }
 
-pub fn output_similarity(output1: &str, output2: &str) -> f64 {
+pub fn token_cosine_similarity(output1: &str, output2: &str) -> f64 {
     // Too-short outputs aren't meaningful for similarity comparison
     if output1.len() < MIN_OUTPUT_LEN || output2.len() < MIN_OUTPUT_LEN {
         return 0.0;
@@ -505,9 +505,9 @@ impl SemanticDedup {
         if result.is_none() && output.len() >= MIN_OUTPUT_LEN {
             for (prev_tool, prev_turn, prev_output) in self.output_log.iter().rev() {
                 if prev_tool == tool_name && current_turn > *prev_turn {
-                    let sim = output_similarity(output, prev_output);
+                    let sim = token_cosine_similarity(output, prev_output);
                     if sim >= self.threshold {
-                        result = Some((*prev_turn, format!("output_sim={:.2}", sim)));
+                        result = Some((*prev_turn, format!("token_cosine={:.2}", sim)));
                         break;
                     }
                 }
@@ -1046,19 +1046,19 @@ mod tests {
         assert_ne!(k1, k2, "different paths must differ for list_dir");
     }
 
-    // ── Tier 3: output_similarity ──
+    // ── Tier 3: token_cosine_similarity ──
 
     #[test]
     fn identical_outputs() {
         let out = "PR #123: fix bug in parser\nPR #124: add tests";
-        assert!((output_similarity(out, out) - 1.0).abs() < f64::EPSILON);
+        assert!((token_cosine_similarity(out, out) - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn high_overlap_outputs() {
         let out1 = "PR #1: fix authentication bug\nPR #2: add new feature\nPR #3: docs update";
         let out2 = "PR #1: fix authentication bug\nPR #2: add new feature\nPR #4: test coverage";
-        let sim = output_similarity(out1, out2);
+        let sim = token_cosine_similarity(out1, out2);
         assert!(sim >= 0.5, "2/3 overlap should be high: {sim}");
     }
 
@@ -1067,14 +1067,14 @@ mod tests {
         let out1 = "src/main.rs: fn main() { println!(\"hello world\"); }";
         let out2 =
             "CREATE TABLE users (id INT, name VARCHAR(255), email VARCHAR(255) PRIMARY KEY);";
-        let sim = output_similarity(out1, out2);
+        let sim = token_cosine_similarity(out1, out2);
         assert!(sim < 0.3, "different domains should be low: {sim}");
     }
 
     #[test]
     fn short_outputs_return_zero() {
-        assert_eq!(output_similarity("ok", "ok"), 0.0);
-        assert_eq!(output_similarity("", "something"), 0.0);
+        assert_eq!(token_cosine_similarity("ok", "ok"), 0.0);
+        assert_eq!(token_cosine_similarity("", "something"), 0.0);
     }
 
     // ── SemanticDedup tracker ──
@@ -1120,7 +1120,7 @@ mod tests {
     }
 
     #[test]
-    fn tracker_detects_output_similarity() {
+    fn tracker_detects_token_cosine_similarity() {
         let mut tracker = SemanticDedup::new(0.7);
         let output1 = "PR #1: fix\nPR #2: feature\nPR #3: docs\nPR #4: perf improvement";
         tracker.check_and_record("github_list_prs", &json!({"repo": "a/b"}), output1, 1);
@@ -1129,10 +1129,10 @@ mod tests {
         let output2 = "PR #1: fix\nPR #2: feature\nPR #3: docs\nPR #5: refactor code";
         let result =
             tracker.check_and_record("github_list_prs", &json!({"repo": "a/c"}), output2, 2);
-        // Should detect via output similarity (different repo → no param match)
+        // Should detect via token cosine similarity (different repo → no param match)
         // Note: may or may not trigger depending on exact cosine score
         if let Some((_, reason)) = &result {
-            assert!(reason.starts_with("output_sim"));
+            assert!(reason.starts_with("token_cosine"));
         }
     }
 
@@ -1352,7 +1352,7 @@ mod tests {
         assert!(names.contains(&"glob"));
     }
 
-    // ── output_similarity (already covered above by Tier 3 tests at ~L1049) ─
+    // ── token_cosine_similarity (already covered above by Tier 3 tests) ─
 
     #[test]
     fn git_diff_key_includes_base_ref() {
@@ -1534,10 +1534,10 @@ mod tests {
         assert!(block.is_some(), "identical grep must be deduplicated");
     }
 
-    /// Scenario: Tier 3 output similarity — two different tool calls that
+    /// Scenario: Tier 3 token cosine similarity — two different tool calls that
     /// produce nearly identical output should be flagged.
     #[test]
-    fn output_similarity_detects_near_duplicate() {
+    fn token_cosine_similarity_detects_near_duplicate() {
         let mut dedup = SemanticDedup::new(0.75);
         let output = "error: cannot find module `auth`\n  --> src/main.rs:5:1\n  |\n5 | mod auth;\n  | ^^^^^^^^^ file not found";
 
