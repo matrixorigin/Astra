@@ -627,7 +627,6 @@ Follow these steps:
                     }
                 };
                 let skill_md = skill_dir.join("SKILL.md");
-                let test_file = skill_dir.join("test_skill.py");
 
                 if skill_md.exists() {
                     eprintln!(
@@ -692,48 +691,10 @@ Follow these steps:
                     if ok {
                         eprintln!("  {}", "\u{2713} SKILL.md validation passed".green());
                     }
-                } else if test_file.exists() {
-                    eprintln!("  Running legacy Python tests...");
-                    let out = std::process::Command::new("python3")
-                        .args([
-                            "-m",
-                            "unittest",
-                            "discover",
-                            "-s",
-                            ".",
-                            "-p",
-                            "test_*.py",
-                            "-q",
-                        ])
-                        .current_dir(&skill_dir)
-                        .output();
-                    match out {
-                        Ok(o) => {
-                            let stdout = String::from_utf8_lossy(&o.stdout);
-                            let stderr = String::from_utf8_lossy(&o.stderr);
-                            if o.status.success() {
-                                eprintln!("  {}", "\u{2713} Local skill tests passed".green());
-                            } else {
-                                eprintln!("  {}", "\u{2717} Local skill tests failed".red());
-                            }
-                            if !stdout.is_empty() {
-                                eprintln!("{stdout}");
-                            }
-                            if !stderr.is_empty() {
-                                eprintln!("{stderr}");
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "{}",
-                                format!("  \u{2717} Failed to run local tests: {e}").red()
-                            );
-                        }
-                    }
                 } else {
                     eprintln!(
                         "  {}",
-                        "No SKILL.md or test_skill.py found. Use /skill new to scaffold.".yellow()
+                        "No SKILL.md found. Use /skill new to scaffold.".yellow()
                     );
                 }
             }
@@ -768,8 +729,6 @@ Follow these steps:
                 let dir = base.join(name);
                 if dir.join("SKILL.md").exists() {
                     Some((dir, "SKILL.md"))
-                } else if dir.join("skill.py").exists() {
-                    Some((dir, "skill.py (legacy)"))
                 } else {
                     None
                 }
@@ -923,8 +882,6 @@ Follow these steps:
                                         }
                                         Err(e) => format!("read err: {e}").red().to_string(),
                                     }
-                                } else if d.join("skill.py").exists() {
-                                    "legacy skill.py".dim().to_string()
                                 } else {
                                     "no SKILL.md".yellow().to_string()
                                 }
@@ -1364,7 +1321,7 @@ fn resolve_skill_dir_on_disk(name: &str) -> Option<std::path::PathBuf> {
         .into_iter()
         .find_map(|base| {
             let dir = base.join(name);
-            if dir.join("SKILL.md").exists() || dir.join("skill.py").exists() {
+            if dir.join("SKILL.md").exists() {
                 Some(dir)
             } else {
                 None
@@ -1405,7 +1362,6 @@ fn collect_skill_md_issues(_skill_name: &str, src: &str) -> Vec<String> {
 
 fn print_skill_directory_raw(name: &str, skill_dir: &std::path::Path) -> Result<(), String> {
     let skill_md_path = skill_dir.join("SKILL.md");
-    let json_path = skill_dir.join("skill.json");
     if skill_md_path.exists() {
         let raw = std::fs::read_to_string(&skill_md_path).map_err(|e| e.to_string())?;
         if raw.starts_with("---") {
@@ -1428,26 +1384,8 @@ fn print_skill_directory_raw(name: &str, skill_dir: &std::path::Path) -> Result<
             eprintln!("  {}", "SKILL.md has no frontmatter".yellow());
         }
         Ok(())
-    } else if json_path.exists() {
-        let raw = std::fs::read_to_string(&json_path).map_err(|e| e.to_string())?;
-        let value: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
-        let pretty = serde_json::to_string_pretty(&value).unwrap_or(raw);
-        eprintln!(
-            "\n{}",
-            format!("─── {name}/skill.json (legacy) ─────────────────────────────")
-                .bold()
-                .magenta()
-        );
-        for line in pretty.lines() {
-            eprintln!("  {line}");
-        }
-        eprintln!();
-        Ok(())
     } else {
-        Err(format!(
-            "\u{2717} No SKILL.md or skill.json in {}",
-            skill_dir.display()
-        ))
+        Err(format!("\u{2717} No SKILL.md in {}", skill_dir.display()))
     }
 }
 
@@ -2050,7 +1988,7 @@ mod tests {
     mod marketplace_tests {
         use super::super::{
             browse_marketplace, default_skill_category, fetch_marketplace_version,
-            install_single_skill_legacy, list_installed_marketplace, trending_marketplace,
+            list_installed_marketplace, trending_marketplace,
         };
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2232,98 +2170,6 @@ mod tests {
 
             let client = make_client(&srv.uri());
             list_installed_marketplace(&client, Some("tok")).await;
-        }
-
-        #[tokio::test]
-        async fn install_legacy_writes_skill_md() {
-            let srv = MockServer::start().await;
-            let record = serde_json::json!({
-                "skill_id": "sk-001",
-                "skill_name": "test-install-skill",
-                "version": "1.0.0",
-                "description": "A test skill",
-                "metadata": {
-                    "manifest": "---\nname: test-install-skill\nversion: 1.0.0\n---",
-                    "instructions": "Do the thing."
-                },
-                "created_at": "2025-01-01T00:00:00Z",
-            });
-
-            Mock::given(method("GET"))
-                .and(path("/skills/test-install-skill"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(&record))
-                .expect(1)
-                .mount(&srv)
-                .await;
-
-            let client = make_client(&srv.uri());
-            let ok = install_single_skill_legacy("test-install-skill", None, &client, "tok").await;
-
-            assert!(ok, "install should succeed");
-
-            // install_single_skill_legacy writes to cwd/.astra/skills/<name>
-            let skill_dir = std::env::current_dir()
-                .unwrap()
-                .join(".astra/skills/test-install-skill");
-            let skill_md = skill_dir.join("SKILL.md");
-            assert!(skill_md.exists(), "SKILL.md should be written");
-            let content = std::fs::read_to_string(&skill_md).unwrap();
-            assert!(content.contains("test-install-skill"));
-            assert!(content.contains("Do the thing."));
-
-            // Clean up
-            let _ = std::fs::remove_dir_all(&skill_dir);
-        }
-
-        #[tokio::test]
-        async fn install_legacy_with_version_query() {
-            let srv = MockServer::start().await;
-            let record = serde_json::json!({
-                "skill_id": "sk-002",
-                "skill_name": "versioned-skill",
-                "version": "2.0.0",
-                "description": null,
-                "metadata": {
-                    "instructions": "Version 2 instructions."
-                },
-                "created_at": null,
-            });
-
-            Mock::given(method("GET"))
-                .and(path("/skills/versioned-skill"))
-                .and(query_param("version", "2.0.0"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(&record))
-                .expect(1)
-                .mount(&srv)
-                .await;
-
-            let client = make_client(&srv.uri());
-            let ok =
-                install_single_skill_legacy("versioned-skill", Some("2.0.0"), &client, "tok").await;
-
-            assert!(ok);
-
-            // Clean up
-            let skill_dir = std::env::current_dir()
-                .unwrap()
-                .join(".astra/skills/versioned-skill");
-            let _ = std::fs::remove_dir_all(&skill_dir);
-        }
-
-        #[tokio::test]
-        async fn install_legacy_returns_false_on_404() {
-            let srv = MockServer::start().await;
-
-            Mock::given(method("GET"))
-                .and(path("/skills/missing-skill"))
-                .respond_with(ResponseTemplate::new(404))
-                .mount(&srv)
-                .await;
-
-            let client = make_client(&srv.uri());
-            let ok = install_single_skill_legacy("missing-skill", None, &client, "tok").await;
-
-            assert!(!ok, "install should fail on 404");
         }
 
         #[tokio::test]
@@ -2743,130 +2589,53 @@ async fn install_single_skill(
         vec![]
     };
 
-    // Attempt bundle download (binary, base64-encoded)
     match api
         .get_bearer_path_query_text(tok, &bundle_path, &query_pairs)
         .await
     {
         Ok(text) => {
-            if let Ok(bytes) =
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text.trim())
-            {
-                let install_dir = std::env::current_dir()
-                    .unwrap_or_default()
-                    .join(".astra")
-                    .join("skills");
+            match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text.trim()) {
+                Ok(bytes) => {
+                    let install_dir = std::env::current_dir()
+                        .unwrap_or_default()
+                        .join(".astra")
+                        .join("skills");
 
-                match astra_skills::pack::unpack_skill_from_bytes(&bytes, &install_dir) {
-                    Ok((installed, manifest)) => {
-                        eprintln!(
-                            "  {} Installed {} v{} to {}",
-                            theme::icon_ok(),
-                            manifest.name.magenta(),
-                            manifest.version.dim(),
-                            installed.display().to_string().dim()
-                        );
-                        return true;
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "  {} {}",
-                            "Bundle unpack failed, trying legacy format...".yellow(),
-                            format!("{e}").dim()
-                        );
+                    match astra_skills::pack::unpack_skill_from_bytes(&bytes, &install_dir) {
+                        Ok((installed, manifest)) => {
+                            eprintln!(
+                                "  {} Installed {} v{} to {}",
+                                theme::icon_ok(),
+                                manifest.name.magenta(),
+                                manifest.version.dim(),
+                                installed.display().to_string().dim()
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "  {} {}",
+                                "Bundle unpack failed:".red(),
+                                format!("{e}").dim()
+                            );
+                            false
+                        }
                     }
                 }
-            }
-            // Fall through to legacy install
-            install_single_skill_legacy(skill_name, version, api, tok).await
-        }
-        Err(_) => {
-            // Bundle endpoint not available, use legacy
-            install_single_skill_legacy(skill_name, version, api, tok).await
-        }
-    }
-}
-
-/// Legacy install: fetches SkillRecord JSON and writes SKILL.md directly. Returns true on success.
-async fn install_single_skill_legacy(
-    skill_name: &str,
-    version: Option<&str>,
-    api: &astra_thin_client::ThinClient,
-    tok: &str,
-) -> bool {
-    let path = format!("/skills/{}", skill_name);
-    let query_pairs: Vec<(&str, String)> = if let Some(v) = version {
-        vec![("version", v.to_string())]
-    } else {
-        vec![]
-    };
-
-    match api
-        .get_bearer_path_query_text(tok, &path, &query_pairs)
-        .await
-    {
-        Ok(text) => match serde_json::from_str::<astra_services::skills::SkillRecord>(&text) {
-            Ok(record) => {
-                let instructions = record
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.get("instructions"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-
-                let manifest_str = record
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.get("manifest"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-
-                let install_dir = std::env::current_dir()
-                    .unwrap_or_default()
-                    .join(".astra")
-                    .join("skills")
-                    .join(skill_name);
-
-                if let Err(e) = std::fs::create_dir_all(&install_dir) {
-                    eprintln!("  {} {}", "✗ Failed to create directory:".red(), e);
-                    return false;
-                }
-
-                let skill_md = if !manifest_str.is_empty() {
-                    format!("{manifest_str}\n\n{instructions}")
-                } else {
-                    let header = format!(
-                        "---\nname: {}\nversion: {}\ndescription: {}\n---\n\n",
-                        record.skill_name,
-                        record.version,
-                        record.description.as_deref().unwrap_or(""),
+                Err(e) => {
+                    eprintln!(
+                        "  {} {}",
+                        "Bundle response was not valid base64:".red(),
+                        format!("{e}").dim()
                     );
-                    format!("{header}{instructions}")
-                };
-
-                if let Err(e) = std::fs::write(install_dir.join("SKILL.md"), &skill_md) {
-                    eprintln!("  {} {}", "✗ Failed to write SKILL.md:".red(), e);
-                    return false;
+                    false
                 }
-
-                eprintln!(
-                    "  {} Installed {} v{} to {}",
-                    theme::icon_ok(),
-                    record.skill_name.magenta(),
-                    record.version.dim(),
-                    install_dir.display().to_string().dim()
-                );
-                true
             }
-            Err(e) => {
-                eprintln!("  {} {}", "✗ Parse error:".yellow(), format!("{e}").dim());
-                false
-            }
-        },
+        }
         Err(e) => {
             eprintln!(
                 "  {} {}",
-                "✗ Failed to fetch skill:".yellow(),
+                "Bundle download failed:".red(),
                 format!("{e}").dim()
             );
             false

@@ -1511,7 +1511,7 @@ mod tests {
     #[test]
     fn intent_drift_correction_includes_user_query() {
         let turns = make_intent_turns(&[
-            (&["write_file"], "skill.py"),
+            (&["write_file"], "SKILL.md"),
             (&["write_file"], "test.py"),
             (&["list_dir"], "skills/"),
         ]);

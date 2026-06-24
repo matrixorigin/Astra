@@ -68,7 +68,7 @@ fn every_default_always_load_has_a_schema_in_the_canonical_pool() {
     for always_load in default_always_load_names() {
         assert!(
             schema_names.contains(always_load),
-            "default always_load declaration contains {always_load}, but the canonical schema pool has no schema for it"
+            "default always_load ToolSpec contains {always_load}, but the canonical schema pool has no schema for it"
         );
     }
 }

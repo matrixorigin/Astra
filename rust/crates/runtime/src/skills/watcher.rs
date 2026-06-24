@@ -213,7 +213,6 @@ fn is_skill_relevant_event(event: &notify::Event) -> bool {
         name == "SKILL.md"
             || name == "manifest.yaml"
             || name == "manifest.yml"
-            || name == "skill.json"
             // Directory-level changes (new skill dirs, renames)
             || matches!(event.kind, EventKind::Create(notify::event::CreateKind::Folder)
                 | EventKind::Remove(notify::event::RemoveKind::Folder))

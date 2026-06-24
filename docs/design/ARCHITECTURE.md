@@ -103,7 +103,6 @@ This is the index. Each document is the **single source of truth** for its domai
 | [Data Versioning](data-versioning.md) | Git for Data: time travel, sandbox, branching, cost-aware branching, training data pipeline |
 | [Evaluation and Evolution](evaluation-and-evolution.md) | Quality scoring, replay gating, prompt auto-evolution, implicit feedback mining, self-improving agents, meta-learning closed loop |
 | [Write Path Optimization](write-path-optimization-v1-python.md) | Async event pipeline: fire-and-forget emit, background batch flush, embedding fully decoupled into `event_embeddings`, event tiering — 60x hot-path latency reduction |
-| [Feedback Classification Model](feedback-classification-model.md) | Native feedback classifier: data pipeline, model training, deployment as platform skill, continuous learning |
 | [Deployment Architecture](deployment-architecture.md) | Deployment topologies (single machine → K8s), edge-cloud split execution, `/chat/turn` protocol, execution backend abstraction, GPU scheduling, Ray integration |
 | [Implementation Plan](implementation-plan-v1-python.md) | Unified execution plan: write path optimization (A1-A5) + CLI edge-cloud architecture (B1-B5), acceptance criteria, risk register |
 
@@ -127,7 +126,6 @@ This is the index. Each document is the **single source of truth** for its domai
 | [LLM Integration](../implementation/llm-integration.md) | Provider abstraction, auto-detection from DB tokens, routing, cost tracking |
 | [GitHub Integration](../implementation/github-integration.md) | Repo operations, token management |
 | [Deployment](../implementation/deployment.md) | Project structure, Docker, configuration |
-| [Feedback Classifier Deployment](../implementation/feedback-classifier-deployment.md) | Training/inference skill isolation, ONNX export, batch processing, model artifacts |
 | [Scope Configuration](../implementation/scope-configuration.md) | Scope-based config resolution |
 | [CI](../implementation/ci.md) | GitHub Actions workflows |
 

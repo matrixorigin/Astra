@@ -402,6 +402,11 @@ pub struct ToolRegistry {
 2. **Deferred Tools** — Advertised compactly and activated explicitly with `tool_search(select:NAME)`
 3. **Injected Tools** — Runtime-injected schemas, including MCP/plugin tools, are deferred by default unless the current surface assembly or additive user config explicitly promotes a known schema into always-load
 
+Always-load is not synonymous with "control-plane." `ask_user` is always-load
+because it is the blocking clarification primitive for a safe turn. `notify`
+is also control-plane, but it is non-blocking/proactive communication, so it
+stays deferred unless explicitly promoted.
+
 MCP tools are dynamic runtime discoveries, not compile-time builtin declarations.
 They therefore cannot opt into default AlwaysLoad in code via
 `ToolSpec::load_policy`; keeping them deferred preserves prompt-cache stability

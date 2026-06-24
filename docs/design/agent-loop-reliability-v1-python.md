@@ -209,7 +209,7 @@ def route(state: TurnState) -> None:
 
 Only two categories that restrict. Everything else passes through unchanged. This is deliberately minimal — the self-improving selector can learn more categories over time.
 
-**Relationship to ToolRegistry**: The router operates on the tool schema list *after* ToolRegistry has already selected candidates. It's a post-filter, not a replacement. ToolRegistry does semantic retrieval; the router does intent-based scoping.
+**Relationship to ToolRegistry**: The router operates on the tool schema list *after* ToolRegistry has resolved the deterministic always-load/deferred surface. It's a post-filter, not a replacement. Tool discovery happens through `tool_search`; the router does intent-based scoping.
 
 ---
 

@@ -338,7 +338,7 @@ This enables the **ContextBudgetTuner** (already designed) to make data-driven d
 
 Edge tools and cloud skills are two separate worlds:
 - Edge sends `edge_tools` (OpenAI schemas) → cloud passes them through to LLM unchanged
-- Cloud has `ToolRegistry` (semantic retrieval, budget control) → only for cloud skills
+- Cloud has `ToolRegistry` (always-load/deferred partition + `tool_search` activation) → only for cloud skills
 - The LLM sees both, but the platform doesn't know the relationship
 
 ### Design: Unified Tool Catalog with Edge/Cloud Annotations

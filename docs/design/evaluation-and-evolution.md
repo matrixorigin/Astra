@@ -252,9 +252,11 @@ ON DUPLICATE KEY UPDATE version=VALUES(version), content=VALUES(content),
 
 The implicit feedback detection currently uses regex heuristics + optional LLM classification. As the platform accumulates labeled conversation data (both from heuristic detection and explicit `/rate` feedback), we can train a small specialized model for feedback classification — see §4.1 below.
 
-### 4.1 Feedback Classification Model (Design)
+### 4.1 Feedback Classification Model (Future)
 
-> Full design: [Feedback Classification Model](feedback-classification-model.md) — data pipeline, model architecture, training, deployment, continuous learning.
+No standalone implementation spec is maintained for this future model. Any
+future implementation must use the current background-job and `SKILL.md` package
+contracts, not the retired Python skill-runtime shape.
 
 **Motivation**: Regex heuristics catch obvious signals but miss nuanced dissatisfaction. LLM classification is accurate but expensive. A small fine-tuned model (e.g., distilled from labeled conversation pairs) can achieve high accuracy at near-zero marginal cost.
 

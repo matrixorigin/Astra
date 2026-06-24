@@ -245,6 +245,8 @@ impl ToolRegistry {
 
 fn builtin_tool_specs() -> Vec<ToolSpec> {
     vec![
+        // Blocking clarification is part of the default safety loop: when the
+        // model needs a user decision, ask_user must already be callable.
         control_plane("ask_user", ToolLoadPolicy::AlwaysLoad),
         control_plane("agent", ToolLoadPolicy::Deferred),
         control_plane("agent_fanout", ToolLoadPolicy::Deferred),
@@ -252,6 +254,8 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         control_plane("exit_plan_mode", ToolLoadPolicy::Deferred),
         control_plane("get_agent_info", ToolLoadPolicy::Deferred),
         control_plane("introspect", ToolLoadPolicy::Deferred),
+        // notify is also control-plane, but it is non-blocking/proactive
+        // communication, so it does not earn default tools[] space.
         control_plane("notify", ToolLoadPolicy::Deferred),
         control_plane("compress_context", ToolLoadPolicy::Deferred),
         control_plane("rollback_session_state", ToolLoadPolicy::Deferred),
@@ -938,6 +942,42 @@ mod tests {
                 "{tool} must not remain registered in the runtime capability surface"
             );
         }
+    }
+
+    #[test]
+    fn control_plane_load_policy_separates_blocking_prompt_from_notification() {
+        let registry = registry();
+        let ask_user = registry.get("ask_user").expect("ask_user registered");
+        let notify = registry.get("notify").expect("notify registered");
+
+        assert_eq!(ask_user.required.executor, RequiredExecutor::ControlPlane);
+        assert_eq!(notify.required.executor, RequiredExecutor::ControlPlane);
+        assert_eq!(ask_user.load_policy, ToolLoadPolicy::AlwaysLoad);
+        assert_eq!(notify.load_policy, ToolLoadPolicy::Deferred);
+    }
+
+    #[test]
+    fn dynamic_mcp_tools_are_request_scoped_deferred_not_builtin_always_load() {
+        let registry = registry();
+        let name = "mcp__filesystem__read_file";
+
+        assert!(
+            registry.get(name).is_none(),
+            "MCP tools are dynamic request schemas, not builtin ToolSpecs"
+        );
+
+        let spec = dynamic_tool_spec(name).expect("mcp-prefixed names resolve dynamically");
+        assert_eq!(spec.load_policy, ToolLoadPolicy::Deferred);
+        assert_eq!(spec.required.executor, RequiredExecutor::McpExecutor);
+
+        let binding = RunBinding::cloud_control_plane(&registry);
+        assert!(!binding.tool_surface.contains(name));
+        assert_eq!(
+            CapabilityResolver.check_tool(&registry, name, &binding.capabilities),
+            Err(ToolUnavailableReason::ExecutorUnavailable(
+                "mcp_executor_required".to_string()
+            ))
+        );
     }
 
     #[test]

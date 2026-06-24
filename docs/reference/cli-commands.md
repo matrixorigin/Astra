@@ -73,8 +73,6 @@ astra model show <model_name>
 astra skill list [--limit 50] [--offset 0]
 astra skill show <skill_id> [--version 1.0.0]
 astra skill status [--per-group 50]
-astra skill register --name my-skill --version 1.0.0 --code-file ./skill.json
-astra skill register --name my-skill --version 1.0.0 --code '{"entry":"run"}' --metadata-json '{"owner":"team-a"}'
 ```
 
 ## astra-admin

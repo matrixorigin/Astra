@@ -12,7 +12,8 @@
 //!   schema visible in upcoming `tools[]` payloads until the model actually
 //!   calls that tool once.
 //!
-//! The default T1 set is the coding core, derived from the tool declaration table.
+//! The default T1 set is the coding core, derived from
+//! `astra_runtime_env::ToolSpec::load_policy`.
 //! Users can add extra T1 tools via `runtime.tool_surface.always_load_tools` in TOML.
 //!
 //! Implementation is complete and wired into production.
