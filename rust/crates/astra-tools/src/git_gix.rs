@@ -1317,7 +1317,9 @@ pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
     } else {
         vec!["diff", "HEAD", "--no-ext-diff", "--no-color"]
     };
-    match diff_via_git_cli_result(project_root, &cli_args, limit).output_or_else(|| diff_worktree(&repo, limit)) {
+    match diff_via_git_cli_result(project_root, &cli_args, limit)
+        .output_or_else(|| diff_worktree(&repo, limit))
+    {
         Ok(result) => result,
         Err(error) => error,
     }

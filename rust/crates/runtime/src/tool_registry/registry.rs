@@ -24,6 +24,7 @@ fn split_ascii_words(text: &str) -> Vec<&str> {
 }
 
 fn is_pure_conversational_query(query: &str) -> bool {
+    const CONVERSATIONAL_THRESHOLD_CHARS: usize = 20;
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return true;
@@ -36,7 +37,7 @@ fn is_pure_conversational_query(query: &str) -> bool {
     if !has_content {
         return true;
     }
-    if lower.chars().count() > 20 {
+    if lower.chars().count() > CONVERSATIONAL_THRESHOLD_CHARS {
         return false;
     }
 
