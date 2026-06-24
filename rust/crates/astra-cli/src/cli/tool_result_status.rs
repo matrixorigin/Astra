@@ -18,6 +18,10 @@ pub(crate) fn tool_result_status_is_success(status: &str) -> bool {
     kind.is_success()
 }
 
+pub(crate) fn tool_result_status_is_canonical_success(status: &str) -> bool {
+    status.trim().eq_ignore_ascii_case("completed")
+}
+
 pub(crate) fn tool_result_status_icon(status: &str) -> String {
     if tool_result_status_is_failure(status) {
         theme::icon_err()
@@ -33,7 +37,7 @@ pub(crate) fn tool_result_status_icon(status: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::tool_result_status_icon;
+    use super::{tool_result_status_icon, tool_result_status_is_canonical_success};
     use crate::cli::theme;
 
     #[test]
@@ -44,5 +48,17 @@ mod tests {
         assert_eq!(tool_result_status_icon("done"), theme::icon_ok());
         assert_eq!(tool_result_status_icon("skipped"), theme::icon_warn());
         assert_eq!(tool_result_status_icon("failed"), theme::icon_err());
+    }
+
+    #[test]
+    fn canonical_success_is_strict_for_control_flow() {
+        assert!(tool_result_status_is_canonical_success("completed"));
+        assert!(tool_result_status_is_canonical_success("  COMPLETED  "));
+        for alias in ["ok", "success", "done", "complete", "passed"] {
+            assert!(
+                !tool_result_status_is_canonical_success(alias),
+                "non-canonical alias '{alias}' must not advance control-flow state"
+            );
+        }
     }
 }

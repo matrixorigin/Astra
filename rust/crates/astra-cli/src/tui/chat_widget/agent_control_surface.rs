@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::cli::tool_result_status::tool_result_status_is_success;
+use crate::cli::tool_result_status::tool_result_status_is_canonical_success;
 use crate::tui::agent_control_status::{
     AgentControlWireOutcomeKind, agent_control_interrupted_message, agent_control_running_preview,
     project_agent_control_wire,
@@ -43,7 +43,7 @@ pub(crate) struct AgentControlSurface<'a> {
 impl<'a> AgentControlSurface<'a> {
     pub(crate) fn from_wire(action: &str, outer_status: &str, parsed: Option<&'a Value>) -> Self {
         let is_result_wait = action == "get_result";
-        let outer_success = tool_result_status_is_success(outer_status);
+        let outer_success = tool_result_status_is_canonical_success(outer_status);
         let projection = project_agent_control_wire(action, outer_success, parsed);
 
         let outcome = match projection.outcome {
