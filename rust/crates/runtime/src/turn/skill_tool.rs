@@ -522,20 +522,10 @@ pub fn warn_if_full_skill_catalog_surface_is_large(skill_count: usize) {
             tracing::warn!(
                 skill_count,
                 threshold = LARGE_SKILL_CATALOG_WARNING_THRESHOLD,
-                "skill selector removed; full skill catalog is surfaced"
+                "large skill catalog surfaced; discover_skills remains available for targeted search"
             );
         });
     }
-}
-
-/// Selector removed: always returns the full catalog.
-pub fn select_skills_for_turn(
-    all_skills: &[SkillToolInfo],
-    _user_message: &str,
-    _quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
-    _pinned_skills: Option<&HashSet<String>>,
-) -> Vec<SkillToolInfo> {
-    all_skills.to_vec()
 }
 
 /// Skills visible this session after merging previously discovered entries.
@@ -575,13 +565,9 @@ fn filter_already_invoked_skills(
         .collect()
 }
 
-/// Selector removed: always returns the full catalog with invoked-skill filtering.
+/// Return the full catalog with invoked-skill filtering.
 pub fn visible_skills_for_host_turn(
     full: &[SkillToolInfo],
-    _user_message: &str,
-    _quality_tracker: &crate::skills::quality::SkillQualityTracker,
-    _pinned: &HashSet<String>,
-    _discovered: &HashSet<String>,
     invoked: &HashMap<String, InvokedSkill>,
 ) -> Vec<SkillToolInfo> {
     filter_already_invoked_skills(full.to_vec(), invoked)
@@ -623,8 +609,7 @@ pub fn discover_skills_tool_schema() -> Value {
     })
 }
 
-/// True if this tool call targets the public `discover_skills` tool or the
-/// consolidated `skill {action: "discover"}` form.
+/// True if this tool call targets the public `discover_skills` tool.
 ///
 /// Tool name comparison is case-insensitive to stay aligned with
 /// `astra_turn_core::tool_allowlist::normalize_tool_name`, which the runtime
@@ -642,14 +627,6 @@ pub fn is_discover_skills_call(tool_call: &Value) -> bool {
     };
     if name == DISCOVER_SKILLS_TOOL_NAME {
         return true;
-    }
-    // Consolidated form: skill {action: "discover", query: "..."}
-    if name == SKILL_TOOL_NAME {
-        if let Some(args) = extract_tool_args(tool_call) {
-            if args.get("action").and_then(Value::as_str) == Some("discover") {
-                return true;
-            }
-        }
     }
     false
 }
@@ -756,7 +733,6 @@ pub fn execute_discover_skills(
     query: &str,
     catalog: &[SkillToolInfo],
     mut excluded_lowercase: HashSet<String>,
-    _quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
 ) -> (String, Vec<String>) {
     // Filter excluded skills first.
     let candidates: Vec<(usize, &SkillToolInfo)> = catalog
@@ -1091,12 +1067,7 @@ pub async fn partition_discover_and_execute_skills(
         let result = match args {
             Some(args) => {
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-                let (text, discovered) = execute_discover_skills(
-                    query,
-                    catalog,
-                    excluded.clone(),
-                    quality_tracker.as_deref(),
-                );
+                let (text, discovered) = execute_discover_skills(query, catalog, excluded.clone());
                 for n in &discovered {
                     discovered_skills.insert(n.clone());
                 }
@@ -2737,14 +2708,7 @@ mod tests {
             },
         )]);
 
-        let visible = visible_skills_for_host_turn(
-            &skills,
-            "review local changes",
-            &crate::skills::quality::SkillQualityTracker::default(),
-            &HashSet::new(),
-            &HashSet::new(),
-            &invoked,
-        );
+        let visible = visible_skills_for_host_turn(&skills, &invoked);
 
         assert!(
             !visible.iter().any(|skill| skill.name == "review-changes"),
@@ -2754,39 +2718,6 @@ mod tests {
             visible.iter().any(|skill| skill.name == "analyze-session")
                 || visible.iter().any(|skill| skill.name == "test-writer"),
             "catalog should keep alternate skills visible after omission"
-        );
-    }
-
-    #[test]
-    fn select_skills_for_turn_returns_full_catalog_despite_selector_settings() {
-        let skills = vec![
-            SkillToolInfo {
-                name: "alpha".into(),
-                description: "First skill".into(),
-                ..Default::default()
-            },
-            SkillToolInfo {
-                name: "beta".into(),
-                description: "Second skill".into(),
-                ..Default::default()
-            },
-            SkillToolInfo {
-                name: "gamma".into(),
-                description: "Third skill".into(),
-                ..Default::default()
-            },
-        ];
-        let selected = select_skills_for_turn(
-            &skills,
-            "only beta seems relevant",
-            None,
-            Some(&HashSet::from(["beta".to_string()])),
-        );
-
-        assert_eq!(
-            selected.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            vec!["alpha", "beta", "gamma"],
-            "selector removal must preserve the full catalog in source order"
         );
     }
 
@@ -2827,14 +2758,7 @@ mod tests {
             ),
         ]);
 
-        let visible = visible_skills_for_host_turn(
-            &skills,
-            "review local changes",
-            &crate::skills::quality::SkillQualityTracker::default(),
-            &HashSet::new(),
-            &HashSet::new(),
-            &invoked,
-        );
+        let visible = visible_skills_for_host_turn(&skills, &invoked);
 
         assert!(visible.is_empty(), "all invoked skills should stay hidden");
     }
@@ -2855,7 +2779,7 @@ mod tests {
         ];
         let mut ex = HashSet::new();
         ex.insert("surfaced".into());
-        let (text, names) = execute_discover_skills("kubernetes deploy", &catalog, ex, None);
+        let (text, names) = execute_discover_skills("kubernetes deploy", &catalog, ex);
         assert!(text.contains("hidden-deploy"), "{text}");
         assert_eq!(names, vec!["hidden-deploy".to_string()]);
     }
@@ -2886,7 +2810,7 @@ mod tests {
         }
 
         let excluded = HashSet::from(["already-visible".to_string(), "alias-blocked".to_string()]);
-        let (text, names) = execute_discover_skills("anything", &catalog, excluded, None);
+        let (text, names) = execute_discover_skills("anything", &catalog, excluded);
 
         assert_eq!(names.len(), DISCOVER_SKILLS_MAX_RESULTS);
         assert!(!names.iter().any(|name| name == "already-visible"));
@@ -2915,8 +2839,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let (_, names) =
-            execute_discover_skills("deploy kubernetes", &catalog, HashSet::new(), None);
+        let (_, names) = execute_discover_skills("deploy kubernetes", &catalog, HashSet::new());
         assert_eq!(names[0], "deploy-k8s", "best match should be first");
     }
 
@@ -2929,7 +2852,7 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let (_, names) = execute_discover_skills("", &catalog, HashSet::new(), None);
+        let (_, names) = execute_discover_skills("", &catalog, HashSet::new());
         assert_eq!(names.len(), 5);
         assert_eq!(names[0], "skill-0");
     }
@@ -2943,8 +2866,7 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let (_, names) =
-            execute_discover_skills("zzz_nonexistent_xyz", &catalog, HashSet::new(), None);
+        let (_, names) = execute_discover_skills("zzz_nonexistent_xyz", &catalog, HashSet::new());
         assert_eq!(names.len(), 3, "fallback should return all available");
     }
 
@@ -2964,7 +2886,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let (_, names) = execute_discover_skills("validate", &catalog, HashSet::new(), None);
+        let (_, names) = execute_discover_skills("validate", &catalog, HashSet::new());
         assert_eq!(
             names[0], "also-generic",
             "when_to_use containing query term should boost ranking"
@@ -2986,7 +2908,7 @@ mod tests {
             },
         ];
         let excluded = HashSet::from(["deploy".to_string()]);
-        let (_, names) = execute_discover_skills("deploy", &catalog, excluded, None);
+        let (_, names) = execute_discover_skills("deploy", &catalog, excluded);
         assert!(
             !names.contains(&"deploy".to_string()),
             "excluded must not appear"
@@ -3091,11 +3013,6 @@ mod tests {
             "function": {"name": "DISCOVER_SKILLS", "arguments": "{}"}
         });
         assert!(is_discover_skills_call(&mixed));
-        let consolidated = serde_json::json!({
-            "id": "x",
-            "function": {"name": " Skill ", "arguments": "{\"action\":\"discover\"}"}
-        });
-        assert!(is_discover_skills_call(&consolidated));
     }
 
     #[test]

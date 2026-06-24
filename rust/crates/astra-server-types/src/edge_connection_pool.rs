@@ -72,6 +72,7 @@ pub struct EdgeToolResult {
     pub output: String,
     pub is_error: bool,
     pub duration_ms: Option<u64>,
+    pub tool_result_fields: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Pool key: `{user_id}:{edge_agent_id}`.
@@ -713,6 +714,10 @@ mod tests {
                 output: "file1.txt\nfile2.txt".into(),
                 is_error: false,
                 duration_ms: Some(10),
+                tool_result_fields: Some(serde_json::Map::from_iter([(
+                    "exit_code".to_string(),
+                    serde_json::json!(0),
+                )])),
             },
         );
         assert!(delivered);
@@ -723,6 +728,14 @@ mod tests {
         let result = result.unwrap();
         assert_eq!(result.output, "file1.txt\nfile2.txt");
         assert!(!result.is_error);
+        assert_eq!(
+            result
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("exit_code"))
+                .and_then(serde_json::Value::as_i64),
+            Some(0)
+        );
     }
 
     #[tokio::test]

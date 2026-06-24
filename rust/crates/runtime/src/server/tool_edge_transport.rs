@@ -131,10 +131,11 @@ async fn try_edge_websocket(
     let Some(edge_result) = edge_result else {
         return EdgeTransportAttempt::TransportDisconnected;
     };
-    EdgeTransportAttempt::Delivered(plan.delivered_result(
+    EdgeTransportAttempt::Delivered(plan.delivered_result_with_fields(
         edge_result.output,
         edge_result.is_error,
         ToolTransportKind::EdgeWs,
+        edge_result.tool_result_fields,
     ))
 }
 

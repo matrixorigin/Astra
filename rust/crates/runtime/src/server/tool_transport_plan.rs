@@ -97,15 +97,6 @@ impl EdgeBoundExecutionPlan {
         serde_json::to_string(&self.dispatch_message())
     }
 
-    pub(crate) fn delivered_result(
-        &self,
-        output: String,
-        is_error: bool,
-        transport: ToolTransportKind,
-    ) -> astra_tools::ToolResult {
-        self.delivered_result_with_fields(output, is_error, transport, None)
-    }
-
     pub(crate) fn delivered_result_with_fields(
         &self,
         output: String,

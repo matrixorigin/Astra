@@ -3366,7 +3366,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         query,
                         &catalog,
                         std::collections::HashSet::new(),
-                        None,
                     );
                     text
                 } else {

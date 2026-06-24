@@ -1019,7 +1019,12 @@ fn edge_bound_execution_plan_builds_dispatch_payload_and_delivery_metadata() {
     assert_eq!(payload["timeout_secs"], 300);
     assert_eq!(payload["args"]["command"], "pwd");
 
-    let result = plan.delivered_result("ok".to_string(), false, ToolTransportKind::EdgeLedger);
+    let result = plan.delivered_result_with_fields(
+        "ok".to_string(),
+        false,
+        ToolTransportKind::EdgeLedger,
+        None,
+    );
     assert!(!result.is_error);
     assert_eq!(result.output, "ok");
     let metadata = result.metadata.expect("delivery metadata");
@@ -2123,6 +2128,72 @@ async fn edge_bound_selected_executor_does_not_route_to_other_connected_edge() {
         rx.try_recv().is_err(),
         "selected edge binding must not dispatch to a different connected edge"
     );
+}
+
+#[tokio::test]
+async fn edge_ws_result_preserves_tool_result_fields() {
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    pool.register_with_capabilities(
+        "user-1",
+        "edge-selected",
+        Some("MacBook Pro".to_string()),
+        Some("/Users/test/project".to_string()),
+        Some(edge_runtime_environment_advertisement("edge-selected")),
+        tx,
+    );
+    let service = ToolExecutionService::builder()
+        .edge_connection_pool(pool.clone())
+        .build();
+    let request = request(
+        "bash",
+        WorkspaceBinding::edge_workspace(
+            "MacBook Pro",
+            "/Users/test/project",
+            WorkspaceAuthority::ReadWrite,
+        ),
+        ExecutorBinding::edge_agent(
+            "edge-selected",
+            "MacBook Pro",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        ),
+    );
+    let handle = tokio::spawn(async move {
+        let local = CountingLocalTransport::new();
+        service.execute(request, &local).await
+    });
+
+    let message = rx.recv().await.expect("edge tool request");
+    let request_id = match message {
+        astra_server_types::EdgeServerMessage::ToolRequest { request_id, .. } => request_id,
+        other => panic!("expected tool request, got {other:?}"),
+    };
+    let mut fields = serde_json::Map::new();
+    fields.insert("exit_code".to_string(), serde_json::json!(7));
+    fields.insert(
+        "result_class".to_string(),
+        serde_json::json!("execution_error"),
+    );
+    assert!(pool.deliver_tool_result(
+        "user-1",
+        "edge-selected",
+        &request_id,
+        astra_server_types::edge_connection_pool::EdgeToolResult {
+            output: "failed".to_string(),
+            is_error: true,
+            duration_ms: Some(5),
+            tool_result_fields: Some(fields),
+        },
+    ));
+
+    let result = handle.await.expect("edge execution join");
+    assert!(result.is_error, "{result:?}");
+    assert_eq!(result.output, "failed");
+    let metadata = result.metadata.expect("edge ws metadata");
+    assert_eq!(metadata["transport"], "edge_ws");
+    assert_eq!(metadata["exit_code"], 7);
+    assert_eq!(metadata["result_class"], "execution_error");
 }
 
 #[tokio::test]

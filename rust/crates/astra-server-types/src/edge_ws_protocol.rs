@@ -9,7 +9,7 @@
 //! **Edge → Server** (JSON text frames):
 //! ```text
 //! {"type": "edge_auth", "token": "Bearer ...", "edge_agent_id": "...", "hostname": "...", "workspace_dir": "..."}
-//! {"type": "edge_tool_result", "request_id": "...", "output": "...", "is_error": false}
+//! {"type": "edge_tool_result", "request_id": "...", "output": "...", "is_error": false, "tool_result_fields": {"exit_code": 0}}
 //! {"type": "edge_ping"}
 //! ```
 //!
@@ -23,7 +23,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Timeout for tool execution on the edge agent.
 pub const EDGE_TOOL_TIMEOUT_SECS: u64 = 300; // 5 minutes
@@ -60,6 +60,8 @@ pub enum EdgeClientMessage {
         is_error: bool,
         #[serde(default)]
         duration_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_result_fields: Option<Map<String, Value>>,
     },
 
     /// Edge heartbeat.
@@ -158,11 +160,13 @@ mod tests {
                 output,
                 is_error,
                 duration_ms,
+                tool_result_fields,
             } => {
                 assert_eq!(request_id, "req-123");
                 assert_eq!(output, "file contents here");
                 assert!(!is_error);
                 assert_eq!(duration_ms, Some(42));
+                assert!(tool_result_fields.is_none());
             }
             _ => panic!("expected ToolResult"),
         }
@@ -233,10 +237,12 @@ mod tests {
             output: "ok".into(),
             is_error: false,
             duration_ms: Some(42),
+            tool_result_fields: Some(Map::from_iter([("exit_code".into(), json!(0))])),
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "edge_tool_result");
         assert_eq!(v["duration_ms"], 42);
+        assert_eq!(v["tool_result_fields"]["exit_code"], 0);
     }
 
     #[test]
@@ -246,6 +252,7 @@ mod tests {
             output: "ok".into(),
             is_error: false,
             duration_ms: None,
+            tool_result_fields: None,
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert!(v["duration_ms"].is_null());

@@ -550,14 +550,8 @@ async fn intercept_skill_calls(
     let skill_ctx = build_skill_context(state);
     let composition_ctx = crate::skills::composition::CompositionContext::root();
     let full_catalog = resolver.available_skills();
-    let visible_for_mask = crate::turn::skill_tool::visible_skills_for_host_turn(
-        &full_catalog,
-        state.message.as_str(),
-        &state.skills.quality_tracker,
-        &state.skills.pinned,
-        &state.skills.discovered,
-        &state.skills.invoked,
-    );
+    let visible_for_mask =
+        crate::turn::skill_tool::visible_skills_for_host_turn(&full_catalog, &state.skills.invoked);
     let discover_exclude = crate::turn::skill_tool::skill_mask_names_lowercase(&visible_for_mask);
 
     let (dedup_pairs, fresh_tool_calls) = dedup_skill_calls(state, tool_calls);

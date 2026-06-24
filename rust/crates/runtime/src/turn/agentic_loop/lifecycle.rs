@@ -134,14 +134,8 @@ async fn maybe_pre_route_skill(state: &mut AgenticLoopState) {
         return;
     }
 
-    let visible = crate::turn::skill_tool::visible_skills_for_host_turn(
-        &full,
-        &query,
-        &state.skills.quality_tracker,
-        &state.skills.pinned,
-        &state.skills.discovered,
-        &state.skills.invoked,
-    );
+    let visible =
+        crate::turn::skill_tool::visible_skills_for_host_turn(&full, &state.skills.invoked);
     let Some(skill_name) = crate::turn::skill_tool::select_auto_routed_skill_with_config(
         &query,
         &visible,

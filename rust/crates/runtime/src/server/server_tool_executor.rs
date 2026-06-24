@@ -5537,6 +5537,14 @@ esac
             .await;
         assert!(result.is_error, "got: {}", result.output);
         assert!(result.output.contains("exit code: 42"));
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("exit_code"))
+                .and_then(Value::as_i64),
+            Some(42)
+        );
     }
 
     #[tokio::test]

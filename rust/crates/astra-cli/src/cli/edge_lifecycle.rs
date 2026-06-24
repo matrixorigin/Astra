@@ -475,6 +475,7 @@ async fn reexecute_pending_requests(
             }
         };
 
+        let tool_result_fields = outcome.tool_result_fields;
         let output = outcome.output;
         let status = if outcome.is_error {
             "error"
@@ -482,12 +483,13 @@ async fn reexecute_pending_requests(
             "completed"
         };
 
-        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+        let body = astra_thin_client::ToolResultRequest::new_with_hash_and_fields(
             request_id.clone(),
             Some(executor_id.to_string()),
             status.to_string(),
             output,
             0, // reconnection re-execution doesn't track timing
+            tool_result_fields,
         );
 
         match post_replayed_tool_result(api, profile, &mut replay_token, executor_id, &body).await {

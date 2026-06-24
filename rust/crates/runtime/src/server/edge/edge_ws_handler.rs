@@ -254,6 +254,7 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
                                     output,
                                     is_error,
                                     duration_ms,
+                                    tool_result_fields,
                                 }) => {
                                     state.edge_connection_pool.deliver_tool_result(
                                         &user_id,
@@ -263,6 +264,7 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
                                             output: output.clone(),
                                             is_error,
                                             duration_ms,
+                                            tool_result_fields: tool_result_fields.clone(),
                                         },
                                     );
 
@@ -275,12 +277,13 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
                                         "completed".to_string()
                                     };
                                     let duration = duration_ms.unwrap_or(0);
-                                    let tool_result = astra_thin_client::ToolResultRequest::new_with_hash(
+                                    let tool_result = astra_thin_client::ToolResultRequest::new_with_hash_and_fields(
                                         request_id.clone(),
                                         Some(edge_agent_id.clone()),
                                         status,
                                         output,
                                         duration,
+                                        tool_result_fields,
                                     );
                                     let result_json = match serde_json::to_string(&tool_result) {
                                         Ok(json) => json,

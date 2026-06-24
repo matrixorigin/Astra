@@ -491,6 +491,7 @@ async fn edge_deliver_result_for_unknown_request_returns_false() {
             output: "orphaned".into(),
             is_error: false,
             duration_ms: None,
+            tool_result_fields: None,
         },
     );
     assert!(!delivered);

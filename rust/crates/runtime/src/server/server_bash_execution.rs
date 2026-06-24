@@ -125,6 +125,9 @@ pub(crate) fn tool_result_from_server_bash_output(
         result = result.with_exit_semantics(semantics);
     }
     result = result.with_result_class(result_class);
+    if let Some(exit_code) = output.exit_code {
+        result = result.with_exit_code(exit_code);
+    }
     result
 }
 
@@ -283,6 +286,14 @@ mod tests {
         assert_eq!(
             result.exit_semantics,
             Some(astra_tools::exit_semantics::ExitSemantics::DomainNegative)
+        );
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("exit_code"))
+                .and_then(serde_json::Value::as_i64),
+            Some(1)
         );
         assert!(result.output.contains("(exit code: 1)"), "{result:?}");
     }
