@@ -3,7 +3,6 @@
 //! Core types for routing analysis:
 //! - `TaskType` — 8 task classifications
 //! - `DomainHint` — 7 domain categories
-//! - `ToolFilter` — tool surface strategy
 
 use serde::{Deserialize, Serialize};
 
@@ -57,19 +56,6 @@ pub fn domain_hint_to_label(d: DomainHint) -> &'static str {
         DomainHint::System => "system",
         DomainHint::Database => "database",
     }
-}
-
-// ─── Tool Filter ─────────────────────────────────────────────────────────────
-
-/// Recommended tool surface strategy based on routing analysis.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ToolFilter {
-    /// Low confidence → include all tools, let LLM decide.
-    Wide,
-    /// Domain-focused → filter to specific tool categories.
-    Domain(Vec<String>),
-    /// Conversational → minimal or no tool surface.
-    Minimal,
 }
 
 // ─── Calibration Axis ────────────────────────────────────────────────────────
