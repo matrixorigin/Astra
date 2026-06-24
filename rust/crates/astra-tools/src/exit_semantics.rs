@@ -17,6 +17,10 @@ pub enum ExitSemantics {
     /// Command completed normally and found a negative/different domain state
     /// (e.g. `diff`/`cmp` found differences, `test` false).
     DomainNegative,
+    /// A pipeline produced useful output, but a downstream bounded consumer
+    /// closed the pipe early (e.g. `... | head -20`) and `pipefail` surfaced
+    /// the upstream writer's SIGPIPE as exit 141.
+    PipelineTruncated,
     /// Command was terminated because the tool timeout elapsed.
     TimedOut,
     /// Command was terminated because the user/run cancellation token fired.
@@ -74,6 +78,20 @@ pub fn classify_exit(command: &str, exit_code: i32) -> ExitSemantics {
     if exit_code == 0 {
         return ExitSemantics::Success;
     }
+    if exit_code == 124
+        && matches!(
+            command_family(command).as_deref(),
+            Some("timeout" | "gtimeout")
+        )
+    {
+        return ExitSemantics::TimedOut;
+    }
+    if exit_code == 141 && pipeline_sigpipe_is_benign(command) {
+        return ExitSemantics::PipelineTruncated;
+    }
+    if exit_code == 128 && matches!(command_family(command).as_deref(), Some("git")) {
+        return ExitSemantics::ExecutionError;
+    }
     if (128..256).contains(&exit_code) {
         return ExitSemantics::Signaled;
     }
@@ -93,14 +111,26 @@ pub fn classify_exit(command: &str, exit_code: i32) -> ExitSemantics {
             ExitSemantics::InformationalFailure
         }
         (Some("pgrep" | "pkill" | "killall"), 1) => ExitSemantics::InformationalFailure,
+        (Some("which" | "type" | "hash"), 1) => ExitSemantics::InformationalFailure,
+        (Some("command"), 1) if command_contains_token(command, "-v") => {
+            ExitSemantics::InformationalFailure
+        }
         (Some("diff" | "cmp"), 1) => ExitSemantics::DomainNegative,
         (Some("false"), 1) => ExitSemantics::DomainNegative,
         (Some("test" | "["), 1) => ExitSemantics::DomainNegative,
+        (Some("sort"), 1) if sort_check_command(command) => ExitSemantics::DomainNegative,
         (Some("pytest" | "nose2" | "tox" | "unittest" | "jest" | "vitest" | "mocha"), 1) => {
             ExitSemantics::DomainNegative
         }
         // `git diff --quiet` intentionally returns 1 when changes exist.
         (Some("git"), 1) if command_contains_word(command, "diff") => ExitSemantics::DomainNegative,
+        (Some("git"), 1)
+            if command_contains_word(command, "merge-base")
+                && command_contains_token(command, "--is-ancestor") =>
+        {
+            ExitSemantics::DomainNegative
+        }
+        _ if is_build_test_or_lint_command(command) => ExitSemantics::DomainNegative,
         _ => ExitSemantics::ExecutionError,
     }
 }
@@ -131,7 +161,9 @@ pub fn classify_command_result(
 
     match exit_code {
         Some(code) => match classify_exit(command, code) {
-            ExitSemantics::Success => CommandResultClass::Success,
+            ExitSemantics::Success | ExitSemantics::PipelineTruncated => {
+                CommandResultClass::Success
+            }
             ExitSemantics::InformationalFailure | ExitSemantics::DomainNegative => {
                 if is_build_test_or_lint_command(command) {
                     CommandResultClass::TestFailure
@@ -323,6 +355,14 @@ fn is_passive_pipe_sink(segment: &str) -> bool {
     )
 }
 
+fn pipeline_sigpipe_is_benign(command: &str) -> bool {
+    let segments = split_pipeline_segments(command);
+    segments.len() >= 2
+        && segments
+            .last()
+            .is_some_and(|last| is_passive_pipe_sink(last))
+}
+
 fn last_shell_list_segment(command: &str) -> &str {
     let bytes = command.as_bytes();
     let mut last_start = 0;
@@ -372,6 +412,20 @@ fn command_contains_word(command: &str, needle: &str) -> bool {
         .any(|word| word == needle)
 }
 
+fn command_contains_token(command: &str, needle: &str) -> bool {
+    command
+        .split_whitespace()
+        .map(|token| token.trim_matches('"').trim_matches('\''))
+        .any(|token| token == needle)
+}
+
+fn sort_check_command(command: &str) -> bool {
+    command_contains_token(command, "-c")
+        || command_contains_token(command, "--check")
+        || command_contains_token(command, "--check=diagnose-first")
+        || command_contains_token(command, "--check=quiet")
+}
+
 fn is_test_runner_family(family: &str) -> bool {
     matches!(
         family,
@@ -401,6 +455,8 @@ fn is_build_test_or_lint_command(command: &str) -> bool {
         "go build",
         "make test",
         "make check",
+        "bun test",
+        "cargo nextest",
         "mypy",
         "pyright",
         "eslint",
@@ -537,19 +593,43 @@ mod tests {
     }
 
     #[test]
+    fn pipefail_sigpipe_to_bounded_sink_is_not_tool_error() {
+        for command in [
+            "rg TODO src | head -20",
+            "yes | head -1",
+            "grep -r TODO . | head -20",
+        ] {
+            let semantics = classify_exit(command, 141);
+            assert_eq!(semantics, ExitSemantics::PipelineTruncated, "{command}");
+            assert!(!semantics.is_tool_error(), "{command}");
+            assert_eq!(
+                classify_command_result(command, "one useful line\n", "", Some(141)),
+                CommandResultClass::Success,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
     fn diff_test_false_and_false_are_domain_negative() {
         for command in [
             "diff a b",
             "cmp a b",
             "git diff --quiet",
             "git diff --exit-code",
+            "git merge-base --is-ancestor HEAD origin/main",
             "test -f missing",
             "[ -f missing ]",
             "false",
+            "sort -c unsorted.txt",
             "cargo test",
+            "cargo check",
+            "cargo clippy",
             "go test ./...",
+            "go build ./...",
             "npm test",
             "pnpm test",
+            "bun test",
             "pytest tests/",
             "python -m pytest tests/",
         ] {
@@ -557,6 +637,48 @@ mod tests {
             assert_eq!(semantics, ExitSemantics::DomainNegative, "{command}");
             assert!(!semantics.is_tool_error(), "{command}");
         }
+    }
+
+    #[test]
+    fn build_test_nonstandard_failure_codes_are_domain_negative() {
+        for (command, code) in [
+            ("cargo test --lib", 101),
+            ("cargo check", 101),
+            ("cargo clippy --all-targets", 101),
+            ("python -m pytest tests/", 5),
+        ] {
+            let semantics = classify_exit(command, code);
+            assert_eq!(semantics, ExitSemantics::DomainNegative, "{command}");
+            assert!(!semantics.is_tool_error(), "{command}");
+        }
+    }
+
+    #[test]
+    fn command_presence_checks_missing_are_informational() {
+        for command in [
+            "which definitely_missing_tool",
+            "command -v definitely_missing_tool",
+            "type definitely_missing_tool",
+            "hash definitely_missing_tool",
+        ] {
+            let semantics = classify_exit(command, 1);
+            assert_eq!(semantics, ExitSemantics::InformationalFailure, "{command}");
+            assert!(!semantics.is_tool_error(), "{command}");
+        }
+    }
+
+    #[test]
+    fn timeout_command_timeout_is_timed_out() {
+        let semantics = classify_exit("timeout 1 sleep 5", 124);
+        assert_eq!(semantics, ExitSemantics::TimedOut);
+        assert!(semantics.is_tool_error());
+    }
+
+    #[test]
+    fn git_fatal_128_is_execution_error_not_signal() {
+        let semantics = classify_exit("git rev-parse --verify missing", 128);
+        assert_eq!(semantics, ExitSemantics::ExecutionError);
+        assert!(semantics.is_tool_error());
     }
 
     #[test]
@@ -612,6 +734,15 @@ mod tests {
         // informational_failure distinction.
         let class = classify_command_result("grep needle missing", "", "", Some(1));
         assert_eq!(class, CommandResultClass::DomainNegative);
+        assert!(!class.is_tool_error());
+
+        let class = classify_command_result(
+            "cargo test --lib",
+            "test result: FAILED. 0 passed; 1 failed",
+            "",
+            Some(101),
+        );
+        assert_eq!(class, CommandResultClass::TestFailure);
         assert!(!class.is_tool_error());
     }
 

@@ -5040,6 +5040,36 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
+    async fn bash_pipeline_sigpipe_to_head_is_not_tool_error_with_pipefail() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({
+                "command": "yes match | head -1"
+            }),
+        )
+        .await;
+
+        assert!(
+            !result.is_error,
+            "bounded pipeline SIGPIPE is a normal truncation outcome, not a tool error: {}",
+            result.output
+        );
+        assert_eq!(
+            result.exit_semantics,
+            Some(crate::exit_semantics::ExitSemantics::PipelineTruncated)
+        );
+        let metadata = result.metadata.as_ref().expect("structured metadata");
+        assert_eq!(
+            metadata.get("result_class").and_then(Value::as_str),
+            Some("success")
+        );
+        assert_eq!(metadata.get("exit_code").and_then(Value::as_i64), Some(141));
+    }
+
+    #[tokio::test]
     async fn bash_pipeline_preserves_upstream_execution_failure() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());

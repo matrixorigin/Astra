@@ -94,7 +94,8 @@ pub(crate) fn stream_result_exit_code(sr: &StreamResult) -> crate::cli::exit_cod
             Some(
                 astra_tools::exit_semantics::ExitSemantics::Success
                 | astra_tools::exit_semantics::ExitSemantics::InformationalFailure
-                | astra_tools::exit_semantics::ExitSemantics::DomainNegative,
+                | astra_tools::exit_semantics::ExitSemantics::DomainNegative
+                | astra_tools::exit_semantics::ExitSemantics::PipelineTruncated,
             ) => false,
             None => !r.ok,
             Some(
@@ -247,7 +248,12 @@ mod tests {
 
     #[test]
     fn stream_result_exit_code_treats_domain_negative_exit_semantics_as_success() {
-        for semantics in ["success", "informational_failure", "domain_negative"] {
+        for semantics in [
+            "success",
+            "informational_failure",
+            "domain_negative",
+            "pipeline_truncated",
+        ] {
             let result = StreamResult {
                 tool_call_records: vec![astra_services::session_journal::ToolCallRecord {
                     name: "bash".into(),

@@ -38,7 +38,8 @@ struct CommandResult {
 fn interpret_exit_code(command: &str, code: i32) -> CommandResult {
     match astra_tools::exit_semantics::classify_exit(command, code) {
         astra_tools::exit_semantics::ExitSemantics::Success
-        | astra_tools::exit_semantics::ExitSemantics::DomainNegative => CommandResult {
+        | astra_tools::exit_semantics::ExitSemantics::DomainNegative
+        | astra_tools::exit_semantics::ExitSemantics::PipelineTruncated => CommandResult {
             is_error: false,
             note: None,
         },
@@ -8235,7 +8236,10 @@ mod tests {
                 false,
                 Some("No processes matched"),
             ),
-            ("cargo build", 1, true, None),
+            ("rg TODO src | head -20", 141, false, None),
+            ("cargo build", 1, false, None),
+            ("cargo test --lib", 101, false, None),
+            ("timeout 1 sleep 5", 124, true, None),
         ];
         for (cmdline, code, is_error, note) in cases {
             let r = interpret_exit_code(cmdline, *code);
@@ -8327,12 +8331,16 @@ mod tests {
     }
 
     #[test]
-    fn bash_false_command_is_error() {
+    fn bash_false_command_is_domain_negative_not_error() {
         let executor = test_executor();
         let result = executor.bash(&serde_json::json!({"command": "false"}));
         assert!(
-            result.contains("exit code") || result.to_lowercase().contains("error"),
-            "false should indicate failure: {result}"
+            !result.to_lowercase().starts_with("error"),
+            "false is a predicate result, not a tool execution error: {result}"
+        );
+        assert!(
+            result.contains("exit code"),
+            "false still reports status: {result}"
         );
     }
 
