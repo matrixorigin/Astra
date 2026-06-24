@@ -61,9 +61,9 @@ pub(crate) fn should_bootstrap_lessons(state: &SessionState) -> bool {
 
 async fn filter_lessons_by_relevance(
     user_message: &str,
-    lessons: Vec<astra_runtime::self_model::LessonHint>,
+    lessons: Vec<astra_services::LessonHint>,
     params: Option<&astra_runtime::memory_hooks::relevance::LlmConnParams>,
-) -> Vec<astra_runtime::self_model::LessonHint> {
+) -> Vec<astra_services::LessonHint> {
     let texts: Vec<String> = lessons.iter().map(|lesson| lesson.action.clone()).collect();
     let filtered = if let Some(params) = params {
         astra_runtime::memory_hooks::relevance::filter_memories(params, user_message, &texts).await
@@ -191,8 +191,8 @@ mod tests {
     use super::{filter_lessons_by_relevance, should_bootstrap_lessons};
     use crate::cli::session::session_state::SessionState;
 
-    fn lesson(action: &str) -> astra_runtime::self_model::LessonHint {
-        astra_runtime::self_model::LessonHint {
+    fn lesson(action: &str) -> astra_services::LessonHint {
+        astra_services::LessonHint {
             kind: astra_services::LessonKind::PromptShape,
             trigger_signal: "memoria".into(),
             action: action.into(),

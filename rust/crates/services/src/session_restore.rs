@@ -768,7 +768,7 @@ impl HybridRestoreService {
         }
     }
 
-    /// Restore recent tools from recent cloud checkpoints, with a legacy turn-complete fallback.
+    /// Restore recent tools from recent cloud checkpoints.
     async fn restore_recent_tools(
         &self,
         user_id: &str,
@@ -801,29 +801,6 @@ impl HybridRestoreService {
             }
         }
 
-        if !tools.is_empty() {
-            return Ok(tools);
-        }
-
-        let legacy_rows = sqlx::query(
-            "SELECT CAST(metadata AS CHAR) AS metadata_json FROM agent_events \
-             WHERE session_id = ? AND user_id = ? AND event_type = 'turn_complete' \
-             ORDER BY created_at DESC LIMIT 5",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| format!("restore_recent_tools: {e}"))?;
-
-        for row in &legacy_rows {
-            if let Ok(Some(meta_str)) = row.try_get::<Option<String>, _>("metadata_json")
-                && let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str)
-                && let Some(used) = meta.get("tools_used").and_then(|v| v.as_array())
-            {
-                append_unique_tools(&mut tools, used.iter().filter_map(|tool| tool.as_str()));
-            }
-        }
         Ok(tools)
     }
 

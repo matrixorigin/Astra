@@ -2543,7 +2543,7 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn restore_recent_tools_falls_back_to_legacy_turn_complete_metadata_on_live_matrixone() {
+async fn restore_recent_tools_ignores_agent_events_turn_complete_metadata_on_live_matrixone() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
     let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
@@ -2561,7 +2561,7 @@ async fn restore_recent_tools_falls_back_to_legacy_turn_complete_metadata_on_liv
         None,
         None,
         0,
-        Some("feature/legacy-tools"),
+        Some("feature/checkpoint-tools"),
         Some("gpt-5.4"),
     )
     .await
@@ -2570,7 +2570,7 @@ async fn restore_recent_tools_falls_back_to_legacy_turn_complete_metadata_on_liv
     sqlx::query(
         "INSERT INTO agent_events \
          (event_id, session_id, user_id, event_type, content, token_usage, token_input, token_output, token_total, created_at) \
-         VALUES (?, ?, ?, 'user_query', 'legacy recent tools turn', CAST(? AS JSON), 20, 10, 30, '2026-09-05 08:00:00.000000')",
+         VALUES (?, ?, ?, 'user_query', 'agent events only recent tools turn', CAST(? AS JSON), 20, 10, 30, '2026-09-05 08:00:00.000000')",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(&session_id)
@@ -2596,7 +2596,7 @@ async fn restore_recent_tools_falls_back_to_legacy_turn_complete_metadata_on_liv
         sqlx::query(
             "INSERT INTO agent_events \
              (event_id, session_id, user_id, event_type, content, metadata, created_at) \
-             VALUES (?, ?, ?, 'turn_complete', 'legacy tool summary', CAST(? AS JSON), ?)",
+             VALUES (?, ?, ?, 'turn_complete', 'non-authoritative tool summary', CAST(? AS JSON), ?)",
         )
         .bind(event_id)
         .bind(&session_id)
@@ -2605,7 +2605,7 @@ async fn restore_recent_tools_falls_back_to_legacy_turn_complete_metadata_on_liv
         .bind(created_at)
         .execute(&pool)
         .await
-        .expect("insert legacy turn_complete");
+        .expect("insert non-authoritative turn_complete");
     }
 
     let restore = HybridRestoreService::new(pool.clone());
@@ -2617,10 +2617,10 @@ async fn restore_recent_tools_falls_back_to_legacy_turn_complete_metadata_on_liv
 
     assert_eq!(restored.turn_count, 1);
     assert_eq!(restored.checkpoint_count, 0);
-    assert_eq!(
-        restored.recent_tools,
-        vec!["view".to_string(), "rg".to_string(), "bash".to_string()],
-        "cloud restore should still recover recent tools from legacy turn_complete metadata"
+    assert!(
+        restored.recent_tools.is_empty(),
+        "agent_events turn_complete metadata is not authoritative recent-tool state; \
+         session_checkpoints must be the single restore source"
     );
     assert!(restored.last_context_trace.is_none());
 

@@ -84,9 +84,7 @@ pub struct Lesson {
 /// the LLM should read the *advice*, not the metadata. Callers that need
 /// to track adoption (for `record_hit`) keep the `id` out-of-band.
 ///
-/// Canonical home: this crate (next to [`Lesson`]). Runtime re-exports it
-/// for backwards-compat so existing code that imports from `self_model`
-/// continues to compile.
+/// Canonical home: this crate (next to [`Lesson`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LessonHint {
     pub kind: LessonKind,

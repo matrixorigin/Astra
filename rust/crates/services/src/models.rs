@@ -2948,8 +2948,7 @@ mod tests {
 
     #[test]
     fn quirks_wire_model_name_omitted_when_none() {
-        // `skip_serializing_if = "Option::is_none"` keeps legacy rows that
-        // never carry a wire name from bloating their quirks_json payload.
+        // Unset optional transport aliases should not bloat quirks_json.
         let q = QuirksData::default();
         let json = serde_json::to_string(&q).unwrap();
         assert!(

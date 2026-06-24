@@ -588,12 +588,12 @@ mod build_direct_request_tests {
 /// Retrieve procedural/semantic lessons from Memoria for session bootstrap.
 /// `context_query` should be derived from the user's first message — this
 /// produces much better semantic retrieval than keyword stuffing.
-/// Returns LessonHint-compatible structs. Best-effort: returns empty vec
+/// Returns canonical lesson hints. Best-effort: returns empty vec
 /// on any error (circuit breaker, timeout, parse failure).
 pub async fn memoria_retrieve_lessons(
     top_k: u64,
     context_query: Option<&str>,
-) -> Vec<astra_runtime::self_model::LessonHint> {
+) -> Vec<astra_services::LessonHint> {
     let query = context_query.unwrap_or("reusable lessons and corrections from prior sessions");
     let payload = json!({
         "query": query,

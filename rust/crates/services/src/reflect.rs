@@ -116,7 +116,6 @@ pub struct EvidenceGraph {
 #[derive(Debug, Clone)]
 pub struct RawError {
     skill_name: String,
-    #[allow(dead_code)]
     event_type: String,
     content: String,
 }

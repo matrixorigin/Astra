@@ -337,7 +337,7 @@ pub(crate) struct ChatTurnParams<'a> {
     /// P6 seam: cross-session lessons loaded once at session bootstrap.
     /// Passed through to the ToolExecutor via `set_session_lessons` so
     /// every SelfModel snapshot surfaces prior-session advice.
-    pub(crate) session_lessons: &'a [astra_runtime::self_model::LessonHint],
+    pub(crate) session_lessons: &'a [astra_services::LessonHint],
     /// P8 seam: most recent auto-invoke diagnosis from the previous turn.
     /// Injected into this turn's ToolExecutor via
     /// `set_latest_skill_diagnosis` so the LLM sees "the system already

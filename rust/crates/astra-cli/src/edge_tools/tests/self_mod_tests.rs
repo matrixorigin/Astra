@@ -261,7 +261,7 @@ async fn switching_sessions_clears_session_scoped_self_model_context() {
         .with_active_session_id("context-source-session")
         .with_observability_session(session);
 
-    let lessons = vec![astra_runtime::self_model::LessonHint {
+    let lessons = vec![astra_services::LessonHint {
         kind: astra_services::LessonKind::PromptShape,
         trigger_signal: "stale review context".into(),
         action: "reload branch-specific context first".into(),
@@ -459,14 +459,14 @@ async fn set_session_lessons_feeds_build_self_model_snapshot() {
     // LLM sees prior-session advice on turn 1.
     let (exe, _session) = executor_with_session();
     let lessons = vec![
-        astra_runtime::self_model::LessonHint {
+        astra_services::LessonHint {
             kind: astra_services::LessonKind::ToolDeprioritize,
             trigger_signal: "3 stalls on grep".into(),
             action: "switch to rg".into(),
             workload_tag: None,
             compact: None,
         },
-        astra_runtime::self_model::LessonHint {
+        astra_services::LessonHint {
             kind: astra_services::LessonKind::PromptShape,
             trigger_signal: "repeated scope drift".into(),
             action: "restate scope before tool call".into(),

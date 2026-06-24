@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use astra_config::runtime_config::RuntimeConfig;
 use astra_config::user_profile::Scenario;
 use astra_learning::auto_tuning::{FeedbackSignal, SignalType};
+use astra_services::LessonHint;
 use astra_text_utils::str_preview::truncate_str;
 use astra_turn_core::context_assembly_trace::TokenBudgetTrace;
 use astra_turn_core::tool_health::ToolHealthTracker;
@@ -113,10 +114,6 @@ pub struct SelfModel {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lessons: Vec<LessonHint>,
 }
-
-// Re-export from canonical location (services::agent_lessons) so existing
-// `use astra_runtime::self_model::LessonHint` imports continue to compile.
-pub use astra_services::LessonHint;
 
 /// Actionable feedback derived from the previous turn's passive evaluator.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

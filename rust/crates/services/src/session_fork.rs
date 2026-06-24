@@ -46,7 +46,6 @@ pub struct ForkSessionOptions {
     pub data_branch: Option<DataBranchOptions>,
     /// When set, a `CompositeSnapshot` is built at the fork point.
     /// Each filled field produces a `SnapshotRef` in the snapshot.
-    #[allow(dead_code)]
     pub snapshot_spec: Option<SnapshotSpec>,
 }
 

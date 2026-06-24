@@ -1017,7 +1017,7 @@ pub struct ToolExecutor {
     /// P3.1 seam: cross-session lessons loaded at session bootstrap.
     /// Populated once via `set_session_lessons`, then passed through on
     /// every `build_self_model_snapshot` for the session's lifetime.
-    session_lessons: std::sync::Mutex<Vec<astra_runtime::self_model::LessonHint>>,
+    session_lessons: std::sync::Mutex<Vec<astra_services::LessonHint>>,
     /// P3.3 seam: latest auto-invoked diagnostic skill output.
     /// `AutoInvokeHandler::maybe_fire` writes each successful parse here;
     /// the next `build_self_model_snapshot` injects it into the prompt and
@@ -1870,7 +1870,7 @@ impl ToolExecutor {
     /// P3.1 seam: stash cross-session lessons loaded at session bootstrap.
     /// Every subsequent `build_self_model_snapshot` will project them via
     /// [`astra_runtime::self_model::SelfModel::with_lessons`].
-    pub fn set_session_lessons(&self, lessons: Vec<astra_runtime::self_model::LessonHint>) {
+    pub fn set_session_lessons(&self, lessons: Vec<astra_services::LessonHint>) {
         if let Ok(mut g) = self.session_lessons.lock() {
             *g = lessons;
         }
@@ -1880,7 +1880,7 @@ impl ToolExecutor {
     /// injection-freshness observer (`observe_bridge_injections`) so it can
     /// fingerprint the same slice the next SelfModel snapshot will
     /// project into the system prompt.
-    pub fn session_lessons_snapshot(&self) -> Vec<astra_runtime::self_model::LessonHint> {
+    pub fn session_lessons_snapshot(&self) -> Vec<astra_services::LessonHint> {
         self.session_lessons
             .lock()
             .map(|g| g.clone())

@@ -260,11 +260,7 @@ fn journal_needs_session_start_impl(path: &Path, skip_cache: bool) -> std::io::R
 struct LastEventScan {
     event_type: Option<JournalEventType>,
     /// Bytes actually read from the file.  Always ≤ `RECOVERY_TAIL_MAX_BYTES`.
-    /// Independent of file size by construction.  Currently only consumed
-    /// by complexity-assertion tests, but exposed unconditionally so the
-    /// observability story is the same in production: any future on-call
-    /// histogram can pick this up without changing the surface.
-    #[allow(dead_code)]
+    /// Independent of file size by construction.
     bytes_read: u64,
 }
 
@@ -276,7 +272,9 @@ struct LastEventScan {
 /// Returns `None` if the file is empty or no line in the tail window is a
 /// parseable JournalEvent.
 fn read_last_event_type(path: &Path) -> std::io::Result<Option<JournalEventType>> {
-    Ok(read_last_event_type_with_bytes(path)?.event_type)
+    let scan = read_last_event_type_with_bytes(path)?;
+    debug_assert!(scan.bytes_read <= RECOVERY_TAIL_MAX_BYTES as u64);
+    Ok(scan.event_type)
 }
 
 fn read_last_event_type_with_bytes(path: &Path) -> std::io::Result<LastEventScan> {

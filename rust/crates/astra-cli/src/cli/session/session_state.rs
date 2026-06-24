@@ -431,7 +431,7 @@ pub(crate) struct SessionState {
     /// until a turn loads lessons for the current session.
     /// Passed through to every turn's ToolExecutor so the LLM sees prior
     /// session's advice on every SelfModel snapshot.
-    pub session_lessons: Vec<astra_runtime::self_model::LessonHint>,
+    pub session_lessons: Vec<astra_services::LessonHint>,
     /// Set after the first bootstrap attempt regardless of result count.
     /// Prevents per-turn DB calls for new users with zero lessons.
     pub session_lessons_loaded: bool,

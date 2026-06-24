@@ -110,7 +110,7 @@ fn merged_metadata_from_journal_event(
         match m {
             serde_json::Value::Object(map) => obj.extend(map.clone()),
             other => {
-                obj.insert("legacy_metadata".to_string(), other.clone());
+                obj.insert("event_metadata".to_string(), other.clone());
             }
         }
     }
@@ -1135,6 +1135,23 @@ mod tests {
         let merged = super::merged_metadata_from_journal_event(&journal);
         let obj = merged.expect("expected metadata");
         assert!(obj.get("cloud_pull").is_some());
+    }
+
+    #[test]
+    fn merged_metadata_wraps_non_object_metadata_under_canonical_key() {
+        let mut journal = make_turn_event();
+        journal.metadata = Some(serde_json::json!("raw scalar metadata"));
+
+        let merged = super::merged_metadata_from_journal_event(&journal).expect("metadata");
+
+        assert_eq!(
+            merged.get("event_metadata"),
+            Some(&serde_json::json!("raw scalar metadata"))
+        );
+        assert!(
+            merged.get("legacy_metadata").is_none(),
+            "new journal metadata must not emit compatibility-only keys"
+        );
     }
 
     #[test]
