@@ -63,6 +63,18 @@ pub(crate) async fn apply_turn_success_async(
     }
 }
 
+fn recent_tools_after_successful_turn(previous: &[String], result: &StreamResult) -> Vec<String> {
+    if !result.tools_used.is_empty() {
+        return result.tools_used.clone();
+    }
+
+    if result.tool_calls_count == 0 && result.tool_call_records.is_empty() {
+        return previous.to_vec();
+    }
+
+    Vec::new()
+}
+
 struct TurnSuccessLiveSnapshot {
     session_id: Option<String>,
     run_id: Option<String>,
@@ -255,7 +267,7 @@ fn apply_turn_success_sync(
         line.to_string(),
         build_history_text(&result.full_text, &result.tool_call_records),
     ));
-    state.recent_tools = result.tools_used.clone();
+    state.recent_tools = recent_tools_after_successful_turn(&state.recent_tools, &result);
     state.resume_restricted_tools = result
         .interruption
         .as_ref()
@@ -337,6 +349,7 @@ mod tests {
     use crate::cli::session::session_state::PersistedAdaptiveState;
     use crate::cli::session::session_state::SessionState;
     use crate::tests::heavy_checkpoint_with_runtime_state;
+    use astra_runtime::tool_registry::ToolRegistry;
     use astra_services::session_journal;
     use std::time::Instant;
 
@@ -357,6 +370,75 @@ mod tests {
                 .as_ref()
                 .map(|suggestion| suggestion.text.as_str()),
             Some("run the tests")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_turn_success_preserves_recent_tools_after_toolless_turn() {
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let mut state = SessionState {
+            recent_tools: vec!["git".into(), "bash".into()],
+            ..Default::default()
+        };
+        let mut result = crate::tests::stub_stream_result(
+            "我将逐个修复所有发现的问题。先确认每个文件的当前状态，再依次修复。",
+        );
+        result.visible_tools = vec![
+            "bash".into(),
+            "git".into(),
+            "read_file".into(),
+            "tool_search".into(),
+        ];
+
+        apply_turn_success(&mut state, None, "修复这些问题", result, Instant::now());
+
+        assert_eq!(
+            state.recent_tools,
+            vec!["git".to_string(), "bash".to_string()],
+            "a text-only turn must not erase the previous tool context"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_turn_success_replaces_recent_tools_when_tools_run() {
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let mut state = SessionState {
+            recent_tools: vec!["git".into(), "bash".into()],
+            ..Default::default()
+        };
+        let mut result = crate::tests::stub_stream_result("Updated one file.");
+        result.tools_used = vec!["str_replace".into()];
+        result.tool_calls_count = 1;
+
+        apply_turn_success(&mut state, None, "apply the fix", result, Instant::now());
+
+        assert_eq!(state.recent_tools, vec!["str_replace".to_string()]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn preserved_recent_tools_keep_ack_followup_tool_bearing() {
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let mut state = SessionState {
+            recent_tools: vec!["git".into(), "bash".into()],
+            ..Default::default()
+        };
+        let result = crate::tests::stub_stream_result("我将逐个修复所有发现的问题。");
+
+        apply_turn_success(&mut state, None, "修复这些问题", result, Instant::now());
+
+        let registry = ToolRegistry::new(astra_tools::schemas::all_tool_schemas());
+        let (schemas, report) =
+            registry.build_initial_surface_with_report_ctx("？", 800, &state.recent_tools);
+        assert!(
+            !schemas.is_empty(),
+            "a short follow-up after a toolful context must not get an empty tool surface"
+        );
+        assert!(
+            report.visible_count > 0,
+            "tool surface report must match the non-empty schema surface"
         );
     }
 

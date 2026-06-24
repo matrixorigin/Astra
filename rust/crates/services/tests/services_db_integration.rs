@@ -2444,13 +2444,10 @@ async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matr
     newer_workspace.last_context_trace = Some(ContextTraceSignal {
         turn_id: "turn-remote-workspace-new".into(),
         captured_at: Some("2026-09-07T10:00:00Z".into()),
-        tool_selection: Some(ContextTraceToolSelection {
+        tool_surface: Some(ContextTraceToolSurface {
             tools_available: 12,
-            selected_tools: vec!["git".into(), "rg".into()],
-            selection_scope: "latest_round".into(),
-            rejected_tools: 0,
-            strategy: "artifact-restore-newest".into(),
-            confidence: 0.99,
+            visible_tools: vec!["git".into(), "rg".into()],
+            surface_scope: "latest_round".into(),
             latency_ms: 3,
         }),
         memory: None,
@@ -2516,8 +2513,8 @@ async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matr
     let expected_tools = expected_workspace
         .last_context_trace
         .as_ref()
-        .and_then(|trace| trace.tool_selection.as_ref())
-        .map(|selection| selection.selected_tools.clone())
+        .and_then(|trace| trace.tool_surface.as_ref())
+        .map(|surface| surface.visible_tools.clone())
         .unwrap_or_default();
     assert_eq!(restored.recent_tools, expected_tools);
     assert_eq!(

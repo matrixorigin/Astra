@@ -37,12 +37,12 @@ Show available commands and usage hints.
 
 Open the model picker, inspect the current model, or switch directly.
 
-| Subcommand           | Description                 |
-| -------------------- | --------------------------- |
-| (none) or `list`     | Open the model picker       |
-| `info`               | Show current model details  |
-| `clear`              | Reset to the API default    |
-| `<name>`             | Switch directly to a model  |
+| Subcommand       | Description                |
+| ---------------- | -------------------------- |
+| (none) or `list` | Open the model picker      |
+| `info`           | Show current model details |
+| `clear`          | Reset to the API default   |
+| `<name>`         | Switch directly to a model |
 
 ```
 /model                      # Open picker
@@ -198,18 +198,18 @@ Show the last delivery report from plan execution.
 
 Memoria memory operations. In the TUI, `list`, `search`, and `stats` open panels; `health` opens a read-only info pane; richer subcommands stay text-first.
 
-| Subcommand     | Description                          |
-| -------------- | ------------------------------------ |
-| `list` / `ls`  | List memories                        |
-| `search <q>`   | Search memories by content           |
-| `show <id>`    | Inspect specific memory              |
-| `inspect <id>` | Alias for `show <id>`                |
-| `stats`        | Count memories by type               |
-| `dismiss <q>`  | Lower retrieval score for matches    |
-| `forget <id> --reason <text>` | Permanently delete a memory |
-| `session`      | Show current session memory          |
-| `health`       | Show memory hygiene status           |
-| `help`         | Show the full `/memory` help surface |
+| Subcommand                    | Description                          |
+| ----------------------------- | ------------------------------------ |
+| `list` / `ls`                 | List memories                        |
+| `search <q>`                  | Search memories by content           |
+| `show <id>`                   | Inspect specific memory              |
+| `inspect <id>`                | Alias for `show <id>`                |
+| `stats`                       | Count memories by type               |
+| `dismiss <q>`                 | Lower retrieval score for matches    |
+| `forget <id> --reason <text>` | Permanently delete a memory          |
+| `session`                     | Show current session memory          |
+| `health`                      | Show memory hygiene status           |
+| `help`                        | Show the full `/memory` help surface |
 
 ```
 /memory list                     # List all
@@ -253,7 +253,7 @@ Use these as:
 
 Cycle through explanation modes: off → on (API) → verbose (+stderr).
 
-### `/verbose` *(removed)*
+### `/verbose` _(removed)_
 
 Migration: use `/stats` for metrics and `/timeline` for turn traces.
 
@@ -272,7 +272,7 @@ Summarize and trim conversation history.
 
 Reflect on session (skill_failure, performance, etc.).
 
-### `/turn` *(removed)*
+### `/turn` _(removed)_
 
 Migration: use `/timeline` and press Enter to drill into a turn.
 
@@ -284,18 +284,18 @@ Developer-oriented low-level inspection for messages, tools, and context injecti
 
 Harness inspection utilities. Today these open the text fallback view directly.
 
-| Subcommand   | Description                      |
-| ------------ | -------------------------------- |
-| (none)       | Show inspect help / overview     |
-| `budget`     | Token budget breakdown           |
-| `tools`      | Tool dashboard                   |
-| `context`    | Context snapshot                 |
-| `json`       | Raw snapshot JSON                |
-| `diff`       | Session state diff               |
-| `history`    | Recent turn history              |
-| `trace`      | Permission trace                 |
-| `forensics`  | Forensics dump                   |
-| `export`     | Export inspect output            |
+| Subcommand  | Description                  |
+| ----------- | ---------------------------- |
+| (none)      | Show inspect help / overview |
+| `budget`    | Token budget breakdown       |
+| `tools`     | Tool dashboard               |
+| `context`   | Context snapshot             |
+| `json`      | Raw snapshot JSON            |
+| `diff`      | Session state diff           |
+| `history`   | Recent turn history          |
+| `trace`     | Permission trace             |
+| `forensics` | Forensics dump               |
+| `export`    | Export inspect output        |
 
 ### `/stats [subcommand]`
 
@@ -318,15 +318,15 @@ Alias for `/stats health`. Use `detail` for the per-tool breakdown.
 
 Runtime configuration inspection and editing.
 
-| Subcommand | Description                                  |
-| ---------- | -------------------------------------------- |
-| (none)     | Open the interactive config editor panel     |
-| `edit`     | Explicit alias for opening the editor panel  |
-| `show`     | Print the current config                     |
-| `paths`    | Show config file locations                   |
-| `sources`  | Show where each value came from              |
-| `diff`     | Show differences from defaults               |
-| `export`   | Export config to a file or stdout            |
+| Subcommand | Description                                 |
+| ---------- | ------------------------------------------- |
+| (none)     | Open the interactive config editor panel    |
+| `edit`     | Explicit alias for opening the editor panel |
+| `show`     | Print the current config                    |
+| `paths`    | Show config file locations                  |
+| `sources`  | Show where each value came from             |
+| `diff`     | Show differences from defaults              |
+| `export`   | Export config to a file or stdout           |
 
 ### `/lsp [status]`
 
@@ -336,7 +336,7 @@ LSP (Language Server Protocol) backend status.
 
 Deep observability traces: turns, drift, decisions, profile, and context.
 
-### `/tuning` *(removed)*
+### `/tuning` _(removed)_
 
 Migration: evolution/tuning commands were deleted; use `/stats`, `/inspect`, and `/profile experiments` instead.
 
@@ -494,16 +494,16 @@ Logout from the API.
 
 Manage user profile preferences.
 
-| Subcommand      | Description                    |
-| --------------- | ------------------------------ |
-| `show`          | Show current profile           |
-| `edit <k> <v>`  | Edit a preference              |
-| `scenario`      | Show detected work scenario    |
-| `stats`         | Show profile usage stats       |
-| `tools`         | Show tool preferences          |
-| `experiments`   | Show enrolled experiments      |
-| `reset`         | Reset preferences              |
-| `help`          | Show profile help              |
+| Subcommand     | Description                 |
+| -------------- | --------------------------- |
+| `show`         | Show current profile        |
+| `edit <k> <v>` | Edit a preference           |
+| `scenario`     | Show detected work scenario |
+| `stats`        | Show profile usage stats    |
+| `tools`        | Show blocked tool policy    |
+| `experiments`  | Show enrolled experiments   |
+| `reset`        | Reset preferences           |
+| `help`         | Show profile help           |
 
 ### `/memory-setup`
 
@@ -517,15 +517,15 @@ Guided Memoria configuration wizard.
 
 Set permission mode for tool execution.
 
-| Mode     | Description                   |
-| -------- | ----------------------------- |
-| `auto`   | Auto-approve all tool use     |
-| `all`    | Alias for auto                |
-| `plan`   | Read-only investigation mode  |
+| Mode                                     | Description                   |
+| ---------------------------------------- | ----------------------------- |
+| `auto`                                   | Auto-approve all tool use     |
+| `all`                                    | Alias for auto                |
+| `plan`                                   | Read-only investigation mode  |
 | `accept_edits` / `accept-edits` / `edit` | Auto-approve local file edits |
-| `prompt` | Prompt before each tool       |
-| `deny`   | Deny all tool use             |
-| `rules`  | Show current permission rules |
+| `prompt`                                 | Prompt before each tool       |
+| `deny`                                   | Deny all tool use             |
+| `rules`                                  | Show current permission rules |
 
 ```
 /allow auto      # Trust all tools

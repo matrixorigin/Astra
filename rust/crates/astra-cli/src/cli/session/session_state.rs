@@ -278,7 +278,8 @@ pub(crate) struct SessionState {
     pub config_version_id: Option<String>,
     pub context_budget: prompts::ContextBudget,
     pub journal: Option<session_journal::JournalWriter>,
-    /// Tools used in the last turn — fed into selection for recency boost.
+    /// Most recent non-empty tool usage context — fed into tool-surface
+    /// continuity for short follow-up turns.
     pub recent_tools: Vec<String>,
     /// Session-persistent permission manager — "always"/"skip" survives across turns.
     pub perm_manager: PermissionManager,

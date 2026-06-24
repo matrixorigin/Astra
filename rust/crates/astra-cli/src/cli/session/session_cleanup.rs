@@ -314,21 +314,30 @@ fn shutdown_session_facts(state: &SessionState) -> astra_runtime::SessionFacts {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    // recent_tools is per-turn (reassigned from result.tools_used each turn),
-    // so `turn: state.turn` and `ok: true` are accurate: every entry is a tool
-    // that was invoked during the current turn.
     let recent_tool_calls = state
-        .recent_tools
-        .iter()
-        .rev()
-        .take(10)
-        .cloned()
-        .map(|name| astra_runtime::ToolFact {
-            name,
-            ok: true,
-            turn: state.turn,
+        .last_turn_event
+        .as_ref()
+        .and_then(|event| {
+            event
+                .tools_used
+                .as_ref()
+                .filter(|tools| !tools.is_empty())
+                .map(|tools| (tools, event.turn.unwrap_or(state.turn)))
         })
-        .collect();
+        .map(|(tools, turn)| {
+            tools
+                .iter()
+                .rev()
+                .take(10)
+                .cloned()
+                .map(|name| astra_runtime::ToolFact {
+                    name,
+                    ok: true,
+                    turn,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let accumulated_tool_errors: u32 = state
         .tool_health_entries
         .iter()
@@ -352,13 +361,14 @@ fn shutdown_session_facts(state: &SessionState) -> astra_runtime::SessionFacts {
 mod tests {
     use super::{
         SessionExit, finalize_session_exit, resume_hint_lines, should_clear_last_session_id,
-        should_show_resume_hint,
+        should_show_resume_hint, shutdown_session_facts,
     };
     use crate::cli::cli_config::cli_utils::{
         CredentialsFile, Profile, load_credentials, save_credentials,
     };
     use crate::cli::session::session_guard::ShutdownSignal;
     use crate::cli::session::session_state::SessionState;
+    use astra_services::session_journal::JournalEvent;
 
     #[test]
     fn resume_hint_is_shown_for_graceful_exit_paths() {
@@ -395,6 +405,70 @@ mod tests {
         let (label, command) = resume_hint_lines("1234-5678");
         assert_eq!(label, "Resume this session with:");
         assert_eq!(command, "/resume 1234-5678");
+    }
+
+    #[test]
+    fn shutdown_session_facts_do_not_treat_preserved_recent_tools_as_current_turn_calls() {
+        let state = SessionState {
+            turn: 3,
+            recent_tools: vec!["git".into(), "bash".into()],
+            last_turn_event: Some(
+                JournalEvent::turn(
+                    Some("session-1"),
+                    3,
+                    Some("gpt-5"),
+                    "？",
+                    "现在开始逐个修复。",
+                    0,
+                    100,
+                    20,
+                    1000,
+                )
+                .with_tool_surface(vec![], vec![], vec![], 0),
+            ),
+            ..Default::default()
+        };
+
+        let facts = shutdown_session_facts(&state);
+
+        assert!(
+            facts.recent_tool_calls.is_empty(),
+            "preserved recent_tools are continuity context, not current-turn tool facts"
+        );
+    }
+
+    #[test]
+    fn shutdown_session_facts_report_last_turn_event_tools() {
+        let state = SessionState {
+            turn: 4,
+            recent_tools: vec!["read_file".into()],
+            last_turn_event: Some(
+                JournalEvent::turn(
+                    Some("session-1"),
+                    4,
+                    Some("gpt-5"),
+                    "read the file",
+                    "done",
+                    1,
+                    100,
+                    20,
+                    1000,
+                )
+                .with_tool_surface(
+                    vec!["read_file".into()],
+                    vec![],
+                    vec!["read_file".into()],
+                    0,
+                ),
+            ),
+            ..Default::default()
+        };
+
+        let facts = shutdown_session_facts(&state);
+
+        assert_eq!(facts.recent_tool_calls.len(), 1);
+        assert_eq!(facts.recent_tool_calls[0].name, "read_file");
+        assert_eq!(facts.recent_tool_calls[0].turn, 4);
     }
 
     #[serial_test::serial]

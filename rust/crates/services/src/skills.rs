@@ -330,7 +330,7 @@ impl SkillService for DatabaseSkillService {
             .fetch_one(&pool)
             .await
             .map_err(internal_error)?;
-        let total: i64 = count_row.try_get("cnt").unwrap_or(0);
+        let total: i64 = count_row.try_get("cnt").map_err(internal_error)?;
 
         let list_sql = format!(
             "SELECT {SKILL_REGISTRY_LIST_SELECT} FROM skills_registry WHERE {VISIBLE_SKILL_PREDICATE} \
@@ -346,17 +346,25 @@ impl SkillService for DatabaseSkillService {
 
         let skills: Vec<SkillListItem> = rows
             .iter()
-            .map(|row| SkillListItem {
-                skill_id: row.try_get::<String, _>("skill_id").unwrap_or_default(),
-                skill_name: row.try_get::<String, _>("skill_name").unwrap_or_default(),
-                version: row.try_get::<String, _>("version").unwrap_or_default(),
-                description: row.try_get::<String, _>("description").ok(),
-                status: row.try_get::<String, _>("status").ok(),
-                source: row.try_get::<String, _>("source").ok(),
-                category: row.try_get::<String, _>("category").ok(),
-                created_at: row.try_get::<String, _>("created_at").ok(),
+            .map(|row| -> Result<SkillListItem, _> {
+                Ok(SkillListItem {
+                    skill_id: row
+                        .try_get::<String, _>("skill_id")
+                        .map_err(internal_error)?,
+                    skill_name: row
+                        .try_get::<String, _>("skill_name")
+                        .map_err(internal_error)?,
+                    version: row
+                        .try_get::<String, _>("version")
+                        .map_err(internal_error)?,
+                    description: row.try_get::<String, _>("description").ok(),
+                    status: row.try_get::<String, _>("status").ok(),
+                    source: row.try_get::<String, _>("source").ok(),
+                    category: row.try_get::<String, _>("category").ok(),
+                    created_at: row.try_get::<String, _>("created_at").ok(),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(SkillListRecord {
             skills,
@@ -431,9 +439,7 @@ impl SkillService for DatabaseSkillService {
                 format!("Skill '{}' not found", skill_id),
             )
         })?;
-        let def_json: String = row
-            .try_get("definition_json")
-            .unwrap_or_else(|_| "null".into());
+        let def_json: String = row.try_get("definition_json").map_err(internal_error)?;
 
         Ok(SkillRecord {
             skill_id: row.try_get("skill_id").map_err(internal_error)?,
@@ -686,9 +692,9 @@ impl SkillService for DatabaseSkillService {
         }
         let skill_definition_json =
             serde_json::to_string(&serde_json::Value::Object(manifest_map.clone()))
-                .unwrap_or_else(|_| "{}".into());
+                .expect("serde_json Value::Object serialization is infallible");
         let manifest_json = serde_json::to_string(&serde_json::Value::Object(manifest_map))
-            .unwrap_or_else(|_| "{}".into());
+            .expect("serde_json Value::Object serialization is infallible");
 
         let insert_result = query(
             "INSERT INTO skills_registry \
