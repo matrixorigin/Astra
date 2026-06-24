@@ -51,8 +51,9 @@ fn surgical_removal(original_name: &str) -> ToolCallRecord {
     }
 }
 
-fn legacy_surgical_removal() -> ToolCallRecord {
-    // Old-format record: no surgically_removed flag, just the sentinel name
+fn sentinel_surgical_removal() -> ToolCallRecord {
+    // Sentinel-name records are audit-only placeholders even when the explicit
+    // flag is absent; current analytics must filter both representations.
     ToolCallRecord {
         name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
         ok: true,
@@ -328,20 +329,18 @@ fn e2e_multi_turn_session_turn_numbering_consistent() {
     }
 }
 
-// ─── Unhappy path: mixed legacy + new surgical removal records ──────────────
+// ─── Unhappy path: mixed synthetic placeholder records ──────────────────────
 
 #[test]
-fn e2e_mixed_legacy_and_new_surgical_records_both_filtered() {
+fn e2e_mixed_synthetic_placeholder_records_are_filtered() {
     let tmp = tempfile::tempdir().unwrap();
     let _guard = JournalDirGuard::new(tmp.path());
-    let session_id = "e2e-mixed-legacy";
+    let session_id = "e2e-mixed-synthetic-placeholders";
 
-    // Simulate a scenario where journal has been migrated mid-session:
-    // some records use old sentinel-name-only, others use new flag.
     let records = vec![
         real_tool("read_file", true, 30),
-        legacy_surgical_removal(), // old format: no flag, just name
-        surgical_removal("glob"),  // new format: flag + original_tool_name
+        sentinel_surgical_removal(), // sentinel name only
+        surgical_removal("glob"),    // explicit flag + original_tool_name
         real_tool("bash", true, 100),
         skipped_tool("grep"),      // skill-routed skip
         deferred_tool("git_show"), // skill-routed defer
@@ -396,7 +395,7 @@ fn e2e_mixed_legacy_and_new_surgical_records_both_filtered() {
     assert_eq!(
         synthetic.len(),
         4,
-        "4 synthetic: legacy surgical, new surgical, skipped, deferred"
+        "4 synthetic: sentinel surgical, flagged surgical, skipped, deferred"
     );
 
     // tool_call_count in evaluation should match real count
@@ -508,90 +507,6 @@ fn e2e_zero_tool_calls_conversational() {
     assert_eq!(
         extract_tool_call_count(find_event(&events, JournalEventType::TurnEvaluation)),
         0
-    );
-}
-
-// ─── Unhappy path: backward compat — deserialize legacy JSONL without new fields
-
-#[test]
-fn e2e_legacy_journal_without_surgical_fields_deserializes() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _guard = JournalDirGuard::new(tmp.path());
-    let session_id = "e2e-legacy-compat";
-
-    // Write raw JSONL as it would appear from an old version (no surgical fields)
-    let legacy_turn = serde_json::json!({
-        "type": "turn",
-        "ts": "2026-04-17T07:20:00Z",
-        "session_id": session_id,
-        "turn": 1,
-        "model": "MiniMax-M2.7",
-        "user_input": "Check the files",
-        "assistant_output": "Found issues.",
-        "tool_count": 3,
-        "tokens_in": 70000,
-        "tokens_out": 7700,
-        "duration_ms": 8000,
-        "tool_calls": [
-            {
-                "name": "read_file",
-                "ok": true,
-                "ms": 30,
-                "output_bytes": 500
-            },
-            {
-                "name": "(surgically_removed)",
-                "ok": true,
-                "ms": 0,
-                "output_bytes": 0,
-                "result_preview": "(removed from context — skill covered this work)"
-            },
-            {
-                "name": "bash",
-                "ok": false,
-                "ms": 100,
-                "error": "command not found"
-            }
-        ]
-    });
-
-    let path = tmp.path().join(format!("{session_id}.jsonl"));
-    std::fs::write(&path, format!("{}\n", legacy_turn)).unwrap();
-
-    let events = session_journal::read_journal(session_id).unwrap();
-    assert_eq!(events.len(), 1);
-
-    let tool_calls = events[0].tool_calls.as_ref().unwrap();
-    assert_eq!(tool_calls.len(), 3);
-
-    // Legacy surgical removal should still be detected as synthetic
-    assert!(tool_calls[1].is_synthetic_placeholder());
-    // surgically_removed field should be None (not in legacy JSON)
-    assert_eq!(tool_calls[1].surgically_removed, None);
-    assert_eq!(tool_calls[1].original_tool_name, None);
-
-    // Real calls should not be synthetic
-    assert!(!tool_calls[0].is_synthetic_placeholder());
-    assert!(!tool_calls[2].is_synthetic_placeholder());
-
-    // Build evaluation using the deserialized records — should count correctly
-    let eval_event = build_turn_evaluation_journal_event(
-        Some(session_id),
-        Some(1),
-        "MiniMax-M2.7",
-        "Check the files",
-        &[],
-        tool_calls,
-        0,
-        false,
-        0.3,
-        &make_eval(false, 0.4),
-    );
-    // Only 2 real calls (read_file OK + bash FAIL), not 3
-    assert_eq!(
-        extract_tool_call_count(&eval_event),
-        2,
-        "legacy surgical removal must still be excluded from tool_call_count"
     );
 }
 

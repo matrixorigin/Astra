@@ -5686,7 +5686,7 @@ mod tests {
             .await;
         assert_eq!(chain.len(), 2);
 
-        let journal_path = sessions_dir.join("sess-journal-retry.jsonl");
+        let journal_path = astra_services::session_journal::journal_file_path("sess-journal-retry");
         let content = std::fs::read_to_string(&journal_path).unwrap();
         let retry_events: Vec<astra_services::session_journal::JournalEvent> = content
             .lines()
@@ -5738,7 +5738,7 @@ mod tests {
             .await
             .unwrap();
 
-        let journal_path = sessions_dir.join("sess-subrun-start.jsonl");
+        let journal_path = astra_services::session_journal::journal_file_path("sess-subrun-start");
         let content = std::fs::read_to_string(&journal_path).unwrap();
         let started_events: Vec<astra_services::session_journal::JournalEvent> = content
             .lines()
@@ -5795,7 +5795,8 @@ mod tests {
             )
             .await;
 
-        let journal_path = sessions_dir.join("sess-subrun-complete.jsonl");
+        let journal_path =
+            astra_services::session_journal::journal_file_path("sess-subrun-complete");
         let content = std::fs::read_to_string(&journal_path).unwrap();
         let completed_events: Vec<astra_services::session_journal::JournalEvent> = content
             .lines()

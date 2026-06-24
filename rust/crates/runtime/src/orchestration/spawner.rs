@@ -1628,13 +1628,8 @@ impl DynamicAgentSpawner {
             });
         }
         let Some(executor) = self.executor.as_ref().cloned() else {
-            self.record_fanout_spawn_rejected_for_input(
-                fanout_slot.as_ref(),
-                &input,
-                context,
-                "agent executor unavailable",
-            )
-            .await;
+            // Executor absence is a host capability failure: no child reached the
+            // spawn boundary, so do not materialize a fanout slot that never ran.
             return Err(SpawnError::ExecutorUnavailable);
         };
 
@@ -3907,7 +3902,7 @@ mod tests {
             .expect("background agent should complete");
         assert!(matches!(status, AgentStatus::Completed { .. }));
 
-        let journal_path = tmp.path().join("sess-123.jsonl");
+        let journal_path = astra_services::session_journal::journal_file_path("sess-123");
         let journal = std::fs::read_to_string(journal_path).unwrap();
         assert!(journal.contains("\"type\":\"agent_spawned\""), "{journal}");
         assert!(

@@ -78,9 +78,10 @@ mod tests {
     #[serial_test::serial]
     fn list_recent_session_ids_for_stats_surfaces_scan_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let broken_root = tmp.path().join("broken-sessions-root");
-        std::fs::write(&broken_root, "not-a-directory").unwrap();
-        let _guard = JournalDirGuard::new(&broken_root);
+        let _guard = JournalDirGuard::new(tmp.path());
+        let owner_sessions_root = session_journal::local_owner_sessions_dir();
+        std::fs::create_dir_all(owner_sessions_root.parent().unwrap()).unwrap();
+        std::fs::write(&owner_sessions_root, "not-a-directory").unwrap();
 
         let error =
             list_recent_session_ids_for_stats(10).expect_err("session scan failure should surface");

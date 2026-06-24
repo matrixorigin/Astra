@@ -25,7 +25,7 @@ use astra_turn_core::orchestration_fanout_group::{
 
 use super::{
     DynamicAgentSpawner, InheritedPermissions, SpawnAgentInput, SpawnAgentOutput, SpawnContext,
-    WaitForAgentOutcome,
+    SpawnError, WaitForAgentOutcome,
 };
 use astra_turn_core::trace_event::TraceContext;
 
@@ -715,6 +715,9 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
             return render_agent_runtime_binding_error("agent_fanout", "start");
         }
     };
+    if !ctx.spawner.has_executor() {
+        return render_agent_runtime_binding_error("agent_fanout", "start");
+    }
     let mut input: AgentFanoutStartInput = match serde_json::from_value(args.clone()) {
         Ok(input) => input,
         Err(e) => {
@@ -1596,6 +1599,9 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
 
     match ctx.spawner.spawn(input, &spawn_ctx).await {
         Ok(output) => render_spawn_agent_output(output),
+        Err(SpawnError::ExecutorUnavailable) => {
+            render_agent_runtime_binding_error("agent", "spawn")
+        }
         Err(e) => render_agent_tool_error(None, &e.to_string()),
     }
 }
@@ -2429,7 +2435,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fanout_executor_unavailable_records_rejected_slot_and_blocks_direct_replacement() {
+    async fn fanout_executor_unavailable_fails_before_declaring_group_or_blocking_spawn() {
         let spawner = test_spawner_without_executor();
         let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
 
@@ -2446,27 +2452,26 @@ mod tests {
         )
         .await;
         let value: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(value["status"], "failed_to_start");
-        assert_eq!(value["spawn_rejected"], 1);
+        assert_eq!(value["status"], "failed");
+        assert_eq!(
+            value["error_kind"].as_str(),
+            Some(astra_core::ErrorKind::ToolBinding.as_str())
+        );
         assert!(
-            value["instruction"]
+            value["error"]
                 .as_str()
-                .is_some_and(|text| text.contains("Do not retry")),
+                .is_some_and(|text| text.contains("multi-agent runtime is not connected")
+                    && text.contains("tool_search")),
             "{value}"
         );
 
         let groups = spawner.list_fanout_groups().await;
-        assert_eq!(groups.len(), 1);
-        let summary = groups[0].summary();
-        assert_eq!(summary.spawn_rejected, 1);
-        assert_eq!(summary.terminal, 1);
-        assert_eq!(summary.active, 0);
-        assert_eq!(
-            groups[0].slots[0].terminal_reason.as_deref(),
-            Some("agent executor unavailable")
+        assert!(
+            groups.is_empty(),
+            "host capability failures must not leave empty fanout groups: {groups:?}"
         );
 
-        let blocked = handle_agent_spawn_action(
+        let direct = handle_agent_spawn_action(
             &json!({
                 "description": "Replacement",
                 "prompt": "Try to replace the failed slot.",
@@ -2475,13 +2480,17 @@ mod tests {
             Some(&ctx),
         )
         .await;
-        let blocked_value: Value = serde_json::from_str(&blocked).unwrap();
-        assert_eq!(blocked_value["status"], "failed");
+        let direct_value: Value = serde_json::from_str(&direct).unwrap();
+        assert_eq!(direct_value["status"], "failed");
+        assert_eq!(
+            direct_value["error_kind"].as_str(),
+            Some(astra_core::ErrorKind::ToolBinding.as_str())
+        );
         assert!(
-            blocked_value["error"]
+            !direct_value["error"]
                 .as_str()
                 .is_some_and(|text| text.contains("already used agent_fanout")),
-            "{blocked_value}"
+            "direct spawn should fail because the executor is unavailable, not because a ghost fanout group was registered: {direct_value}"
         );
     }
 

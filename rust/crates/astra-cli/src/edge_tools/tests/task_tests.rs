@@ -1,5 +1,5 @@
 use crate::edge_tools::ToolExecutor;
-use astra_services::session_journal::{JournalDirGuard, JournalEvent, JournalEventType};
+use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalEventType};
 use astra_tools::task_mgmt::{SessionTask, TaskManager, TaskMutation, TaskStore};
 use async_trait::async_trait;
 use serde_json::json;
@@ -587,8 +587,10 @@ async fn session_summary_surfaces_task_board_load_failure() {
 
     let dir = tempfile::tempdir().unwrap();
     let _guard = JournalDirGuard::new(dir.path());
+    let journal_path = session_journal::journal_file_path("summary-task-load-fail");
+    std::fs::create_dir_all(journal_path.parent().unwrap()).unwrap();
     std::fs::write(
-        dir.path().join("summary-task-load-fail.jsonl"),
+        &journal_path,
         r#"{"type":"turn","turn":1,"tokens_in":1,"tokens_out":2}"#,
     )
     .unwrap();
@@ -727,7 +729,8 @@ async fn task_mutations_append_lifecycle_events_to_session_journal() {
         .await;
     exe.task_archive(&json!({"task_id": "task-1"})).await;
 
-    let raw = std::fs::read_to_string(dir.path().join("task-journal-session.jsonl")).unwrap();
+    let raw = std::fs::read_to_string(session_journal::journal_file_path("task-journal-session"))
+        .unwrap();
     let events: Vec<JournalEvent> = raw
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())

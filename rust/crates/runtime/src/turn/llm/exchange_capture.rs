@@ -833,6 +833,8 @@ mod tests {
         let session_dir = astra_services::local_session_artifact_store()
             .session_dir(session_id)
             .expect("session dir");
+        std::fs::create_dir_all(session_dir.parent().expect("session dir parent"))
+            .expect("create owner sessions root");
         std::fs::write(&session_dir, "block dir creation").expect("block session dir");
 
         let error = persist_configured_capture(

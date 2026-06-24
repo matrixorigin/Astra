@@ -673,7 +673,15 @@ test-ignored-integration:
 			-p astra-runtime -p astra-services -p astra-plan \
 			--features astra-runtime/bridge-e2e-hooks \
 			--tests --run-ignored only \
-			$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG; \
+			$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
+			-E 'not test(/perf_benchmark_/)'; \
+		echo "Running online performance benchmarks in an isolated serial lane..."; \
+		CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
+			-p astra-runtime \
+			--features astra-runtime/bridge-e2e-hooks \
+			--tests --run-ignored only \
+			$(NEXTEST_ONLINE_FLAGS) -j 1 \
+			-E 'test(/perf_benchmark_/)'; \
 	fi
 
 # Online (MatrixOne): opt-in #[ignore] integration binaries (see test-ignored-integration).

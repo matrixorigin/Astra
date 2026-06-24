@@ -763,7 +763,9 @@ mod tests {
     fn commit_turn_records_bridge_pipeline_build_error_without_rolling_back_turn() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-turn-commit-bridge-fail-{}", uuid::Uuid::new_v4());
-        std::fs::write(session_journal::journal_file_path(&sid), [0xff]).unwrap();
+        let journal_path = session_journal::journal_file_path(&sid);
+        std::fs::create_dir_all(journal_path.parent().unwrap()).unwrap();
+        std::fs::write(&journal_path, [0xff]).unwrap();
         let mut state = SessionState {
             journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
             session_id: Some(sid.clone()),

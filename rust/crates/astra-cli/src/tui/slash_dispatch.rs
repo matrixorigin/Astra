@@ -4180,9 +4180,12 @@ mod stats_view_tests {
     #[serial_test::serial(stats_view)]
     fn build_recent_session_history_lines_surfaces_scan_error() {
         let tmp = crate::tests::test_temp_dir();
-        let broken_root = tmp.path().join("broken-sessions-root");
-        std::fs::write(&broken_root, "not-a-directory").expect("write broken root file");
-        let _guard = JournalDirGuard::new(&broken_root);
+        let _guard = JournalDirGuard::new(tmp.path());
+        let owner_sessions_root = session_journal::local_owner_sessions_dir();
+        std::fs::create_dir_all(owner_sessions_root.parent().unwrap())
+            .expect("create owner layout parent");
+        std::fs::write(&owner_sessions_root, "not-a-directory")
+            .expect("write broken owner sessions root");
 
         let error = build_recent_session_history_lines(10)
             .expect_err("session scan failure should surface");

@@ -15,7 +15,7 @@ use std::io::Write;
 
 use astra_services::session_journal::{
     JournalDirGuard, JournalEvent, JournalEventType, JournalWriter, LlmRoundRecord,
-    TurnEventBuffer, read_journal,
+    TurnEventBuffer, journal_file_path, read_journal,
 };
 use tempfile::tempdir;
 
@@ -63,7 +63,8 @@ fn read_journal_recovers_valid_events_after_torn_last_line() {
 fn read_journal_handles_empty_file() {
     let tmp = tempdir().unwrap();
     let _guard = JournalDirGuard::new(tmp.path());
-    let path = tmp.path().join("sess-empty.jsonl");
+    let path = journal_file_path("sess-empty");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::File::create(&path).unwrap();
     assert_eq!(fs::metadata(&path).unwrap().len(), 0);
 
@@ -78,7 +79,8 @@ fn read_journal_handles_empty_file() {
 fn read_journal_skips_malformed_lines_between_valid_ones() {
     let tmp = tempdir().unwrap();
     let _guard = JournalDirGuard::new(tmp.path());
-    let path = tmp.path().join("sess-garbage.jsonl");
+    let path = journal_file_path("sess-garbage");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
 
     let good = serde_json::to_string(&JournalEvent::session_start(
         Some("sess-garbage"),
@@ -251,7 +253,8 @@ fn read_journal_missing_file_returns_empty() {
 fn read_journal_recovers_when_torn_line_sits_in_middle() {
     let tmp = tempdir().unwrap();
     let _guard = JournalDirGuard::new(tmp.path());
-    let path = tmp.path().join("sess-mid.jsonl");
+    let path = journal_file_path("sess-mid");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
 
     let a = serde_json::to_string(&JournalEvent::session_start(
         Some("sess-mid"),

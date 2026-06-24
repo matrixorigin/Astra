@@ -206,9 +206,9 @@ mod tests {
             Some(1024),
         );
         let path = dump.write_local().expect("dump path");
-        assert!(
-            path.starts_with(&*temp.path().join("sess-1").to_string_lossy()),
-            "{path}"
-        );
+        let session_dir = astra_services::local_session_artifact_store()
+            .session_dir("sess-1")
+            .expect("session dir");
+        assert!(path.starts_with(&*session_dir.to_string_lossy()), "{path}");
     }
 }

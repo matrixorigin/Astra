@@ -194,7 +194,7 @@ mod tests {
         assert!(first, "first call should succeed");
         assert!(!second, "second call should be suppressed");
 
-        let content = std::fs::read_to_string(temp.path().join("idem-test.jsonl")).unwrap();
+        let content = std::fs::read_to_string(writer.path()).unwrap();
         let events: Vec<serde_json::Value> = content
             .lines()
             .filter_map(|l| serde_json::from_str(l).ok())

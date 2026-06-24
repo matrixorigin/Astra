@@ -1330,6 +1330,7 @@ mod tests {
             .parent()
             .unwrap()
             .to_path_buf();
+        std::fs::create_dir_all(&sessions_root).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
