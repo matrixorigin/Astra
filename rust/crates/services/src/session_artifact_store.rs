@@ -65,18 +65,12 @@ pub const LOCAL_SESSION_JOURNAL_FILE_SUFFIX: &str = "jsonl";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnerScopeKind {
     User,
-    Team,
-    Org,
-    ServiceAccount,
 }
 
 impl OwnerScopeKind {
     fn directory_segment(self) -> &'static str {
         match self {
             OwnerScopeKind::User => "users",
-            OwnerScopeKind::Team => "teams",
-            OwnerScopeKind::Org => "orgs",
-            OwnerScopeKind::ServiceAccount => "service_accounts",
         }
     }
 }
@@ -633,6 +627,14 @@ mod tests {
         let owner_sessions_root = store
             .owner_sessions_root(&OwnerScope::local_user())
             .expect("owner sessions root");
+        assert!(
+            owner_sessions_root
+                .strip_prefix(temp.path())
+                .unwrap()
+                .starts_with(Path::new(LOCAL_SESSION_LAYOUT_VERSION).join("users")),
+            "local session artifacts support user-owned layout only: {}",
+            owner_sessions_root.display()
+        );
         let session_dir = store.session_dir("sess-123").unwrap();
         assert_eq!(session_dir, owner_sessions_root.join("sess-123"));
         let artifact_path = store

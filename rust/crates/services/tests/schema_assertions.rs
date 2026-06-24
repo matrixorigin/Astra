@@ -264,6 +264,17 @@ async fn phase1_run_durability_schema_contract() {
             &pool,
             &schema,
             "agent_events",
+            "idx_agent_events_owner_session_created"
+        )
+        .await,
+        ["user_id", "session_id", "created_at"],
+        "agent_events owner-bound session scans must not post-filter by user_id"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "agent_events",
             "idx_agent_events_parent_run"
         )
         .await,
