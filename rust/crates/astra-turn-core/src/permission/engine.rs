@@ -1736,7 +1736,7 @@ mod tests {
         let ctx = crate::permission::types::PermissionSyncContext::new(
             crate::permission::types::InheritedPermissions {
                 mode: crate::permission::types::PermissionMode::Auto,
-                allowed_tools: Some(std::collections::HashSet::from(["view".to_string()])),
+                allowed_tools: Some(std::collections::HashSet::from(["read_file".to_string()])),
                 ..Default::default()
             },
         );
@@ -1791,7 +1791,7 @@ mod tests {
         let ctx = crate::permission::types::PermissionSyncContext::new(
             crate::permission::types::InheritedPermissions {
                 mode: crate::permission::types::PermissionMode::Prompt,
-                allowed_tools: Some(std::collections::HashSet::from(["view".to_string()])),
+                allowed_tools: Some(std::collections::HashSet::from(["read_file".to_string()])),
                 ..Default::default()
             },
         );

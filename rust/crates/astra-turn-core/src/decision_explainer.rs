@@ -839,10 +839,10 @@ mod tests {
     fn test_decision_explanation_builder() {
         let exp = DecisionExplanation::new(
             DecisionType::ToolSurface {
-                visible_tools: vec!["grep".to_string(), "view".to_string()],
+                visible_tools: vec!["grep".to_string(), "read_file".to_string()],
                 total_available: 50,
             },
-            "Surfaced grep and view based on query pattern matching code search.",
+            "Surfaced grep and read_file based on query pattern matching code search.",
         )
         .with_input("query", "find the auth module", 0.8)
         .with_input_explained("file_type", "*.rs", 0.3, "Rust files targeted")

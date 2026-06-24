@@ -217,8 +217,8 @@ async fn e2e_callback_controls_permission() {
     let parent_ctx = PermissionSyncContext::root(PermissionMode::Prompt);
     let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(parent_ctx))).with_callback(
         Box::new(|req, _ctx| {
-            // Only allow view and grep, deny everything else
-            if req.tool_name == "view" || req.tool_name == "grep" {
+            // Only allow read_file and grep, deny everything else
+            if req.tool_name == "read_file" || req.tool_name == "grep" {
                 PermissionDecision::approve()
             } else {
                 PermissionDecision::deny(format!("tool {} not allowed by policy", req.tool_name))
@@ -226,7 +226,7 @@ async fn e2e_callback_controls_permission() {
         }),
     );
 
-    // Test: allowed tool (view)
+    // Test: allowed tool (read_file)
     let child_router = router.clone();
     let child_handle = tokio::spawn(async move {
         let mut child_mailbox = child_router
@@ -234,7 +234,8 @@ async fn e2e_callback_controls_permission() {
             .await
             .unwrap();
 
-        let request = PermissionRequest::new("view", serde_json::json!({"path": "/etc/passwd"}));
+        let request =
+            PermissionRequest::new("read_file", serde_json::json!({"path": "/etc/passwd"}));
 
         child_mailbox
             .request_permission(request, REQUEST_TIMEOUT)
@@ -312,8 +313,8 @@ async fn e2e_deny_mode_rejects_all() {
 
     let requests = vec![
         PermissionRequest::new("bash", serde_json::json!({"command": "ls"})),
-        PermissionRequest::new("edit", serde_json::json!({"path": "/tmp/file"})),
-        PermissionRequest::new("view", serde_json::json!({"path": "/etc/passwd"})),
+        PermissionRequest::new("str_replace", serde_json::json!({"path": "/tmp/file"})),
+        PermissionRequest::new("read_file", serde_json::json!({"path": "/etc/passwd"})),
     ];
 
     for req in requests {
@@ -329,7 +330,7 @@ async fn e2e_tool_allowlist() {
     let inherited = InheritedPermissions {
         mode: PermissionMode::Prompt,
         allowed_tools: Some(
-            ["view", "grep", "glob"]
+            ["read_file", "grep", "glob"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
@@ -337,10 +338,10 @@ async fn e2e_tool_allowlist() {
         ..Default::default()
     };
 
-    assert!(inherited.is_tool_allowed_by_allowlist("view"));
+    assert!(inherited.is_tool_allowed_by_allowlist("read_file"));
     assert!(inherited.is_tool_allowed_by_allowlist("grep"));
     assert!(!inherited.is_tool_allowed_by_allowlist("bash"));
-    assert!(!inherited.is_tool_allowed_by_allowlist("edit"));
+    assert!(!inherited.is_tool_allowed_by_allowlist("str_replace"));
 }
 
 /// Test: multi-level delegation (grandchild)

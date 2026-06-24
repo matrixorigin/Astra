@@ -442,17 +442,17 @@ impl Scenario {
     /// Get suggested tool labels for this scenario.
     pub fn suggested_tools(&self) -> Vec<&'static str> {
         match self {
-            Scenario::CodeReview => vec!["view", "grep", "github-mcp-server-pull_request_read"],
-            Scenario::Debugging => vec!["bash", "view", "grep", "glob"],
-            Scenario::Exploration => vec!["glob", "grep", "view", "github-mcp-server-search_code"],
-            Scenario::Planning => vec!["view", "create", "sql"],
-            Scenario::Implementation => vec!["edit", "create", "bash", "view"],
-            Scenario::Refactoring => vec!["edit", "view", "grep", "bash"],
-            Scenario::Testing => vec!["bash", "view", "edit", "create"],
-            Scenario::Documentation => vec!["view", "edit", "create"],
-            Scenario::DevOps => vec!["bash", "view", "edit", "create"],
-            Scenario::Learning => vec!["view", "grep", "web_search"],
-            Scenario::QuickAnswer => vec!["view", "grep"],
+            Scenario::CodeReview => vec!["read_file", "grep", "github"],
+            Scenario::Debugging => vec!["bash", "read_file", "grep", "glob"],
+            Scenario::Exploration => vec!["glob", "grep", "read_file", "tool_search"],
+            Scenario::Planning => vec!["read_file", "write_file", "mo_query"],
+            Scenario::Implementation => vec!["str_replace", "write_file", "bash", "read_file"],
+            Scenario::Refactoring => vec!["str_replace", "read_file", "grep", "bash"],
+            Scenario::Testing => vec!["bash", "read_file", "str_replace", "write_file"],
+            Scenario::Documentation => vec!["read_file", "str_replace", "write_file"],
+            Scenario::DevOps => vec!["bash", "read_file", "str_replace", "write_file"],
+            Scenario::Learning => vec!["read_file", "grep", "web_search"],
+            Scenario::QuickAnswer => vec!["read_file", "grep"],
         }
     }
 
@@ -1083,7 +1083,7 @@ mod tests {
         };
 
         assert!(prefs.is_blocked_tool("bash"));
-        assert!(!prefs.is_blocked_tool("view"));
+        assert!(!prefs.is_blocked_tool("read_file"));
     }
 
     #[test]
@@ -1094,7 +1094,7 @@ mod tests {
         detector.observe_query("there's a bug in the auth module");
         detector.observe_query("why is this test failing");
         detector.observe_tool("bash");
-        detector.observe_tool("view");
+        detector.observe_tool("read_file");
 
         let result = detector.detect();
         assert!(result.is_some());
@@ -1152,15 +1152,15 @@ mod tests {
     #[test]
     fn test_user_stats() {
         let mut stats = UserStats::default();
-        stats.record_tool_use("view");
-        stats.record_tool_use("view");
+        stats.record_tool_use("read_file");
+        stats.record_tool_use("read_file");
         stats.record_tool_use("grep");
 
         assert_eq!(stats.total_tool_calls, 3);
-        assert_eq!(stats.tool_usage.get("view"), Some(&2));
+        assert_eq!(stats.tool_usage.get("read_file"), Some(&2));
 
         let top = stats.top_tools(2);
-        assert_eq!(top[0], ("view", 2));
+        assert_eq!(top[0], ("read_file", 2));
     }
 
     #[test]

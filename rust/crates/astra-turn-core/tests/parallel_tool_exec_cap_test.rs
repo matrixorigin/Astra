@@ -372,7 +372,7 @@ fn tool_arg_parser_handles_nested_quotes_unicode_and_malformed_fail_closed() {
 // ── Sibling-abort coverage for non-bash mutating tools ──
 //
 // Previously, the sibling-abort guard only fired when the failing tool was
-// in `["bash", "BashTool", "shell", "execute_command"]`. A failing
+// in `["bash", "shell", "execute_command"]`. A failing
 // `write_file`, `git_commit`, `str_replace`, etc. did **not** abort queued
 // mutating siblings — even though mutations are typically part of a
 // coherent sequence (write → commit → push; the next step is meaningless

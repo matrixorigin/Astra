@@ -110,7 +110,7 @@ mod tests {
         assert!(rule.matches("Bash", Some("git commit --amend")));
         assert!(!rule.matches("bash", Some("git commitizen")));
         assert!(!rule.matches("bash", Some("git push")));
-        assert!(!rule.matches("edit", Some("git commit")));
+        assert!(!rule.matches("str_replace", Some("git commit")));
     }
 
     #[test]
@@ -165,7 +165,7 @@ mod tests {
     fn test_tool_allowlist() {
         let inherited = InheritedPermissions {
             allowed_tools: Some(
-                ["view", "grep", "glob"]
+                ["read_file", "grep", "glob"]
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
@@ -173,10 +173,10 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(inherited.is_tool_allowed_by_allowlist("view"));
+        assert!(inherited.is_tool_allowed_by_allowlist("read_file"));
         assert!(inherited.is_tool_allowed_by_allowlist("grep"));
         assert!(!inherited.is_tool_allowed_by_allowlist("bash"));
-        assert!(!inherited.is_tool_allowed_by_allowlist("edit"));
+        assert!(!inherited.is_tool_allowed_by_allowlist("str_replace"));
     }
 
     #[test]

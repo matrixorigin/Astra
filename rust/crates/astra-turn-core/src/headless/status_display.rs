@@ -81,7 +81,7 @@ fn fmt_github_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
 
 fn fmt_file_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
     match name {
-        "read_file" | "view_file" => {
+        "read_file" => {
             let path = obj.get("path").and_then(|v| v.as_str())?;
             let start = obj.get("start_line").and_then(|v| v.as_u64());
             let end = obj.get("end_line").and_then(|v| v.as_u64());
@@ -916,7 +916,7 @@ pub fn tool_result_summary(name: &str, result: &str) -> Option<String> {
     let result = astra_core::error_kind::strip_tool_binding_sentinel(result);
     let result = result.as_ref();
     match name {
-        "read_file" | "view_file" => {
+        "read_file" => {
             let lines = result.lines().count();
             let truncated = result.contains("[truncated");
             if truncated {

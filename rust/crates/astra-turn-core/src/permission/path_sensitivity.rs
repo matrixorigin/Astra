@@ -367,7 +367,7 @@ pub fn sensitive_path_match_for_shell_command(command: &str) -> Option<Sensitive
 
 fn direct_read_access(tool_name: &str) -> PathAccess {
     match tool_name {
-        "list_dir" | "glob" | "Glob" | "GlobTool" => PathAccess::List,
+        "list_dir" | "glob" => PathAccess::List,
         _ => PathAccess::Read,
     }
 }

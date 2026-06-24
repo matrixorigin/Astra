@@ -80,7 +80,7 @@ pub fn parse_tool_args(tc: &Value) -> Option<Value> {
 
 /// Classify a tool call as parallelizable using args-aware classification.
 ///
-/// For shell tools (bash, BashTool), inspects the `command` argument to
+/// For shell tools, inspects the `command` argument to
 /// determine if the command is read-only (e.g. `git status`, `ls`).
 /// Falls back to the process-wide [`crate::concurrency_safety`] registry
 /// for MCP / dynamic tools not in the static table.

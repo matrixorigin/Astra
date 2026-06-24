@@ -3,7 +3,7 @@
 /// Human-friendly display name for a tool (matches the SSE stream rendering).
 fn friendly_tool_name(tool_name: &str) -> &str {
     match tool_name {
-        "read_file" | "view_file" => "Reading",
+        "read_file" => "Reading",
         "run_build_test" => "Running build/test",
         "powershell" => "PowerShell",
         "rollback_database_snapshots" | "rollback_file_edits" => "Reverting",

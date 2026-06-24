@@ -327,7 +327,7 @@ mod tests {
         // Action 2.
         adapter.advance_step();
         let a2 = adapter.evaluate(&[AdaptationTrigger::ToolStall {
-            tool_name: "view".into(),
+            tool_name: "read_file".into(),
             calls: 4,
         }]);
         assert_eq!(a2.len(), 1);
@@ -361,7 +361,7 @@ mod tests {
         adapter.advance_step();
         let a2 = adapter.evaluate(&[AdaptationTrigger::ErrorStreak {
             count: 3,
-            last_tool: "view".into(),
+            last_tool: "read_file".into(),
         }]);
         assert!(a2.is_empty(), "should be frozen due to drift");
     }

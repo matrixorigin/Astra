@@ -211,7 +211,7 @@ mod tests {
             !t1.iter()
                 .any(|t| matches!(t, AdaptationTrigger::ErrorStreak { .. }))
         );
-        let t2 = c.record(fail_outcome("view", 500, 100));
+        let t2 = c.record(fail_outcome("read_file", 500, 100));
         assert!(
             !t2.iter()
                 .any(|t| matches!(t, AdaptationTrigger::ErrorStreak { .. }))

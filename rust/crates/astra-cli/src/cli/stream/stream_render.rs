@@ -4743,7 +4743,7 @@ fn tool_output_has_platform_warning_banner(output: &str) -> bool {
 
 /// Tool completion icon: optional empty→warn (see below), platform banners, slow runs; else ok.
 ///
-/// **Empty stdout:** warn only for `read_file` / `view_file` / `bash` / `shell` — those should
+/// **Empty stdout:** warn only for `read_file` / `bash` / `shell` — those should
 /// normally return bytes. `grep` / `glob` often mean “nothing matched” or an edge empty payload
 /// while `status == ok`; that is **not** a warning.
 ///
@@ -4765,10 +4765,7 @@ fn tool_completion_icon(
 
     let trimmed = output.trim();
 
-    let warn_if_empty_ok_status = matches!(
-        tool,
-        "read_file" | "view_file" | "bash" | "shell" | "shell_exec"
-    );
+    let warn_if_empty_ok_status = matches!(tool, "read_file" | "bash" | "shell" | "shell_exec");
     if warn_if_empty_ok_status && trimmed.is_empty() {
         return (theme::icon_warn(), true);
     }
@@ -5274,7 +5271,7 @@ impl StreamRenderState {
                     pluralize_with_count(meaningful_count, "line", "lines")
                 )))
             }
-            "read_file" | "view_file" => {
+            "read_file" => {
                 // Only skip our metadata lines, not code that happens to start with '['
                 let is_metadata = |l: &&str| {
                     str_starts_with_any_prefix(l, READ_FILE_METADATA_PREFIXES)
@@ -5762,7 +5759,7 @@ pub(crate) fn style_tool_description(tool: &str, description: &str) -> String {
     }
 
     match tool {
-        "read_file" | "view_file" => {
+        "read_file" => {
             if let Some(s) = style_first_matching_prefix(description, &["Reading: "]) {
                 return s;
             }
@@ -6125,7 +6122,7 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
     match name {
         "bash" | "shell_exec" | "run_build_test" => format!("$ {preview}"),
         "powershell" => format!("PS> {preview}"),
-        "read_file" | "view_file" => format!("Reading: {preview}"),
+        "read_file" => format!("Reading: {preview}"),
         "write_file" => format!("Writing: {preview}"),
         "str_replace" | "multi_edit" => format!("Editing: {preview}"),
         "delete_file" => format!("Deleting: {preview}"),

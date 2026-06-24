@@ -69,10 +69,7 @@ fn normalize_read_path(p: &str) -> String {
 }
 
 fn is_read_like_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "read_file" | "file_read" | "view_file" | "open_file" | "cat"
-    ) || name.to_lowercase().ends_with("/read_file")
+    name == "read_file" || name.to_lowercase().ends_with("/read_file")
 }
 
 /// Per-tool truncation scale (percent of tier `trunc_limit`). Lower = more aggressive.
@@ -89,12 +86,7 @@ fn tool_trunc_numerator(tool_name: Option<&str>) -> usize {
     {
         return 35;
     }
-    if n.contains("grep")
-        || n.contains("glob")
-        || n.contains("list_dir")
-        || n.contains("find_file")
-        || n.contains("codebase_search")
-    {
+    if n.contains("grep") || n.contains("glob") || n.contains("list_dir") {
         return 55;
     }
     100

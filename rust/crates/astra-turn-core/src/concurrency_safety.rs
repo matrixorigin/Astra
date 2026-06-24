@@ -49,7 +49,7 @@ impl ConcurrencySafety {
 ///
 /// Typically a constant method on a tool struct:
 /// ```ignore
-/// impl ConcurrencySafetyDeclaration for ReadFileTool {
+/// impl ConcurrencySafetyDeclaration for ReadFile {
 ///     fn concurrency_safety() -> ConcurrencySafety {
 ///         ConcurrencySafety::ReadOnly
 ///     }

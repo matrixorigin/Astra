@@ -166,10 +166,6 @@ pub const MICRO_COMPACT_STUB: &str = "[tool result cleared \u{2014} re-run if ne
 fn is_clearable_tool(name: &str) -> bool {
     let n = name.to_lowercase();
     n.contains("read_file")
-        || n.contains("file_read")
-        || n.contains("view_file")
-        || n.contains("open_file")
-        || n == "cat"
         || n.contains("bash")
         || n.contains("shell")
         || n.contains("terminal")
@@ -178,8 +174,6 @@ fn is_clearable_tool(name: &str) -> bool {
         || n.contains("grep")
         || n.contains("glob")
         || n.contains("list_dir")
-        || n.contains("find_file")
-        || n.contains("codebase_search")
         || n.contains("web_search")
         || n.contains("web_fetch")
         || n.contains("file_edit")
@@ -811,7 +805,6 @@ mod tests {
     fn collect_tool_results_includes_all_clearable_tool_types() {
         let clearable_names = [
             "read_file",
-            "file_read",
             "bash",
             "shell",
             "terminal",

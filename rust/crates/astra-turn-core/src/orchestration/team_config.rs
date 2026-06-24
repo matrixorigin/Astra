@@ -226,7 +226,7 @@ mod tests {
             system_prompt: "You are a security expert.".to_string(),
             model: Some("claude-sonnet".to_string()),
             max_turns: Some(10),
-            allowed_tools: Some(vec!["grep".to_string(), "view".to_string()]),
+            allowed_tools: Some(vec!["grep".to_string(), "read_file".to_string()]),
             read_only: Some(true),
         };
         let def = reg.resolve_config(config).unwrap();

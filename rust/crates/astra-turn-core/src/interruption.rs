@@ -963,7 +963,7 @@ mod tests {
         let json = serde_json::json!({
             "kind": "empty_completion",
             "stall_signal": "redundant_reads=22",
-            "resume_restricted_tools": ["read_file", "view", "bash"]
+            "resume_restricted_tools": ["read_file", "grep", "bash"]
         });
 
         assert!(

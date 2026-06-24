@@ -879,11 +879,11 @@ async fn persist_tool_events_for_tool_calls() {
     let payload = json!({
         "agent_id": "tool-persist-agent",
         "messages": [{ "role": "user", "content": "read the README" }],
-        "edge_tools": [tool_schema("read_file"), tool_schema("list_files")],
+        "edge_tools": [tool_schema("read_file"), tool_schema("list_dir")],
         "test_llm_rounds": [{
             "tool_calls": [
                 tool_call("tc-p1", "read_file", json!({"path": "README.md"})),
-                tool_call("tc-p2", "list_files", json!({"path": "/src"})),
+                tool_call("tc-p2", "list_dir", json!({"path": "/src"})),
             ]
         }]
     });
@@ -9555,11 +9555,11 @@ async fn c1_trace_tool_events_have_required_fields() {
         "session_id": "c1-tool-trace-sess",
         "agent_id": "c1-tool-agent",
         "messages": [{"role": "user", "content": "list files"}],
-        "edge_tools": [tool_schema("read_file"), tool_schema("list_files")],
+        "edge_tools": [tool_schema("read_file"), tool_schema("list_dir")],
         "test_llm_rounds": [{
             "tool_calls": [
                 tool_call("tc-c1a", "read_file", json!({"path": "main.rs"})),
-                tool_call("tc-c1b", "list_files", json!({"path": "/src"}))
+                tool_call("tc-c1b", "list_dir", json!({"path": "/src"}))
             ]
         }]
     });

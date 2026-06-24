@@ -77,11 +77,10 @@ impl ToolFlags {
     pub const WEB: Self = Self(1 << 6);
     pub const MEMORY: Self = Self(1 << 7);
     pub const EXPLORATION: Self = Self(1 << 8);
-    pub const ALIAS: Self = Self(1 << 9);
-    pub const MATRIXONE: Self = Self(1 << 10);
-    pub const ORCHESTRATION: Self = Self(1 << 11);
-    pub const FILE_OP: Self = Self(1 << 12);
-    pub const TASK_MGMT: Self = Self(1 << 13);
+    pub const MATRIXONE: Self = Self(1 << 9);
+    pub const ORCHESTRATION: Self = Self(1 << 10);
+    pub const FILE_OP: Self = Self(1 << 11);
+    pub const TASK_MGMT: Self = Self(1 << 12);
 
     pub const fn empty() -> Self {
         Self(0)
@@ -148,7 +147,6 @@ const GH: ToolFlags = ToolFlags::GITHUB_READ.union(ToolFlags::COMPACTABLE);
 const WB: ToolFlags = ToolFlags::WEB.union(ToolFlags::COMPACTABLE);
 const ME: ToolFlags = ToolFlags::MEMORY;
 const EX: ToolFlags = ToolFlags::EXPLORATION;
-const AL: ToolFlags = ToolFlags::ALIAS;
 const MO: ToolFlags = ToolFlags::MATRIXONE;
 const OR: ToolFlags = ToolFlags::ORCHESTRATION;
 const FI: ToolFlags = ToolFlags::FILE_OP;
@@ -161,24 +159,9 @@ const NONE: ToolFlags = ToolFlags::empty();
 static TOOL_TABLE: &[ToolMeta] = &[
     // ── Core filesystem read-only ────────────────────────────────────
     tool("read_file", RO, C.union(EX).union(FI)),
-    tool("file_read", RO, C.union(AL).union(FI)),
-    tool("ReadFileTool", RO, C.union(AL).union(FI)),
-    tool("Read", RO, C.union(AL).union(FI)),
-    tool("View", RO, C.union(AL).union(FI)),
-    tool("view", RO, C.union(AL).union(FI)),
     tool("list_dir", RO, C.union(EX)),
-    tool("ListDirTool", RO, C.union(AL)),
     tool("grep", RO, C.union(EX)),
-    tool("GrepTool", RO, C.union(AL)),
-    tool("Grep", RO, C.union(AL)),
     tool("glob", RO, C.union(EX)),
-    tool("GlobTool", RO, C.union(AL)),
-    tool("Glob", RO, C.union(AL)),
-    tool("get_file_contents", RO, C.union(AL).union(FI)),
-    tool("search_code", RO, C.union(AL)),
-    tool("list_files", RO, C.union(AL)),
-    tool("find_files", RO, C.union(AL)),
-    tool("view_file", RO, C.union(AL).union(FI)),
     tool("search", RO, C.union(EX)),
     tool("find", RO, C.union(EX)),
     tool("tool_search", RO, C),
@@ -201,9 +184,7 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("github", MU, A),
     // ── Web (read-only, compactable) ─────────────────────────────────
     tool("web_fetch", RO, WB),
-    tool("WebFetchTool", RO, WB.union(AL)),
     tool("web_search", RO, WB),
-    tool("WebSearchTool", RO, WB.union(AL)),
     // ── Memory / retrieval (read-only but not compactable) ───────────
     tool("memory_search", RO, ME),
     tool("memory_retrieve", RO, ME),
@@ -242,25 +223,10 @@ static TOOL_TABLE: &[ToolMeta] = &[
         A.union(FI),
         ToolIdempotency::IdempotentWrite,
     ),
-    tool_idem(
-        "WriteFileTool",
-        MU,
-        A.union(AL).union(FI),
-        ToolIdempotency::IdempotentWrite,
-    ),
-    tool_idem(
-        "Write",
-        MU,
-        A.union(AL).union(FI),
-        ToolIdempotency::IdempotentWrite,
-    ),
     tool("str_replace", MU, A.union(FI)),
     tool("multi_edit", MU, A.union(FI)),
     tool("edit_file", MU, A.union(FI)),
-    tool("EditFileTool", MU, A.union(AL).union(FI)),
-    tool("Edit", MU, A.union(AL).union(FI)),
     tool("apply_patch", MU, A.union(FI)),
-    tool("ApplyPatchTool", MU, A.union(AL).union(FI)),
     tool("create_file", MU, A.union(FI)),
     tool("delete_file", MU, A.union(FI)),
     tool("notebook_edit", MU, OR),
@@ -288,13 +254,10 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("task_stop", MU, OR.union(ToolFlags::TASK_MGMT)),
     // ── Shell execution (highest risk) ───────────────────────────────
     tool("bash", SH, AE.union(EX)),
-    tool("BashTool", SH, AE.union(AL)),
-    tool("Bash", SH, AE.union(AL)),
     tool("exec", SH, AE.union(EX)),
     tool("run_command", SH, AE.union(EX)),
     tool("shell", SH, AE.union(EX)),
     tool("powershell", SH, AE.union(EX)),
-    tool("PowerShellTool", SH, AE.union(AL).union(EX)),
 ];
 
 /// Runtime-queryable registry backed by the static table.
@@ -411,10 +374,6 @@ impl ToolRegistry {
         self.flags(name).contains(ToolFlags::CODE_INTEL)
     }
 
-    pub fn is_alias(&self, name: &str) -> bool {
-        self.flags(name).contains(ToolFlags::ALIAS)
-    }
-
     pub fn is_matrixone(&self, name: &str) -> bool {
         self.flags(name).contains(ToolFlags::MATRIXONE)
     }
@@ -456,20 +415,7 @@ impl ToolRegistry {
         } else if flags.contains(ToolFlags::WEB)
             || matches!(
                 name,
-                "search"
-                    | "grep"
-                    | "GrepTool"
-                    | "Grep"
-                    | "find"
-                    | "glob"
-                    | "GlobTool"
-                    | "Glob"
-                    | "list_dir"
-                    | "ListDirTool"
-                    | "tool_search"
-                    | "search_code"
-                    | "list_files"
-                    | "find_files"
+                "search" | "grep" | "find" | "glob" | "list_dir" | "tool_search"
             )
         {
             ToolDisplayCategory::Search
@@ -506,10 +452,7 @@ impl ToolRegistry {
     pub fn approval_required_names(&self) -> Vec<&'static str> {
         TOOL_TABLE
             .iter()
-            .filter(|m| {
-                m.flags.contains(ToolFlags::APPROVAL_REQUIRED)
-                    && !m.flags.contains(ToolFlags::ALIAS)
-            })
+            .filter(|m| m.flags.contains(ToolFlags::APPROVAL_REQUIRED))
             .map(|m| m.name)
             .collect()
     }
@@ -517,9 +460,7 @@ impl ToolRegistry {
     pub fn execute_command_names(&self) -> Vec<&'static str> {
         TOOL_TABLE
             .iter()
-            .filter(|m| {
-                m.flags.contains(ToolFlags::EXECUTE_COMMAND) && !m.flags.contains(ToolFlags::ALIAS)
-            })
+            .filter(|m| m.flags.contains(ToolFlags::EXECUTE_COMMAND))
             .map(|m| m.name)
             .collect()
     }
@@ -527,7 +468,7 @@ impl ToolRegistry {
     pub fn shell_names(&self) -> Vec<&'static str> {
         TOOL_TABLE
             .iter()
-            .filter(|m| m.category.is_shell() && !m.flags.contains(ToolFlags::ALIAS))
+            .filter(|m| m.category.is_shell())
             .map(|m| m.name)
             .collect()
     }
@@ -541,11 +482,7 @@ impl ToolRegistry {
     }
 
     pub fn canonical_names(&self) -> Vec<&'static str> {
-        TOOL_TABLE
-            .iter()
-            .filter(|m| !m.flags.contains(ToolFlags::ALIAS))
-            .map(|m| m.name)
-            .collect()
+        TOOL_TABLE.iter().map(|m| m.name).collect()
     }
 
     pub fn headless_read_only_names(&self) -> Vec<&'static str> {
@@ -555,7 +492,6 @@ impl ToolRegistry {
                 m.category.is_read_only()
                     && !m.flags.contains(ToolFlags::WEB)
                     && !m.flags.contains(ToolFlags::MEMORY)
-                    && !m.flags.contains(ToolFlags::ALIAS)
                     && !m.flags.contains(ToolFlags::MATRIXONE)
                     && !m.flags.contains(ToolFlags::ORCHESTRATION)
             })
@@ -583,8 +519,8 @@ pub fn registry() -> &'static ToolRegistry {
 /// (bash/heredoc/python redirection) — those bypass file-edit guards.
 ///
 /// Deriving from the registry (rather than a parallel hardcoded list) means
-/// new file-mutation tools and their aliases are covered automatically with
-/// no second list to keep in sync.
+/// new file-mutation tools are covered automatically with no second list to
+/// keep in sync.
 #[must_use]
 pub fn is_file_mutation_tool(name: &str) -> bool {
     let r = registry();
@@ -791,6 +727,36 @@ pub fn classify_name(name: &str) -> ToolClassification {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const REMOVED_TOOL_NAMES: &[&str] = &[
+        "file_read",
+        "ReadFileTool",
+        "Read",
+        "View",
+        "view",
+        "ListDirTool",
+        "GrepTool",
+        "Grep",
+        "GlobTool",
+        "Glob",
+        "get_file_contents",
+        "search_code",
+        "list_files",
+        "find_files",
+        "view_file",
+        "open_file",
+        "cat",
+        "WebFetchTool",
+        "WebSearchTool",
+        "WriteFileTool",
+        "Write",
+        "EditFileTool",
+        "Edit",
+        "ApplyPatchTool",
+        "BashTool",
+        "Bash",
+        "PowerShellTool",
+    ];
 
     #[test]
     fn read_file_is_read_only_never_restrict_compactable_parallelizable() {
@@ -1039,16 +1005,40 @@ mod tests {
     }
 
     #[test]
-    fn aliases_share_category_with_canonical() {
+    fn removed_tool_names_are_not_registered_and_fail_closed() {
         let r = registry();
-        assert_eq!(r.category("read_file"), r.category("file_read"));
-        assert_eq!(r.category("read_file"), r.category("ReadFileTool"));
-        assert_eq!(r.category("bash"), r.category("BashTool"));
-        assert_eq!(r.category("write_file"), r.category("WriteFileTool"));
-        assert!(r.is_alias("file_read"));
-        assert!(r.is_alias("ReadFileTool"));
-        assert!(!r.is_alias("read_file"));
-        assert!(!r.is_alias("bash"));
+        for name in REMOVED_TOOL_NAMES {
+            assert!(r.get(name).is_none(), "{name} must not remain registered");
+
+            let classification = classify_name(name);
+            assert_eq!(
+                classification.category,
+                ToolCategory::Mutating,
+                "{name} should use the unknown-tool category"
+            );
+            assert!(
+                !classification.parallelizable,
+                "{name} must not inherit read-only parallelism"
+            );
+            assert!(
+                !classification.compactable,
+                "{name} must not inherit compactability"
+            );
+            assert!(
+                !classification.never_restrict,
+                "{name} must not inherit never-restrict"
+            );
+            assert_eq!(
+                classification.idempotency,
+                ToolIdempotency::NonIdempotent,
+                "{name} should use conservative retry semantics"
+            );
+            assert_eq!(
+                r.display_category(name),
+                ToolDisplayCategory::Other,
+                "{name} should display as unknown/other"
+            );
+        }
     }
 
     #[test]
@@ -1104,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn headless_read_only_excludes_aliases_web_memory() {
+    fn headless_read_only_excludes_web_memory_and_dynamic_services() {
         let r = registry();
         let headless = r.headless_read_only_names();
         assert!(headless.contains(&"read_file"));
@@ -1112,11 +1102,15 @@ mod tests {
         assert!(headless.contains(&"get_agent_info"));
         assert!(!headless.contains(&"git"));
         assert!(!headless.contains(&"github"));
-        assert!(!headless.contains(&"file_read"));
-        assert!(!headless.contains(&"ReadFileTool"));
         assert!(!headless.contains(&"web_fetch"));
         assert!(!headless.contains(&"web_search"));
         assert!(!headless.contains(&"memory"));
+        for name in REMOVED_TOOL_NAMES {
+            assert!(
+                !headless.contains(name),
+                "{name} must not be present in the headless read-only set"
+            );
+        }
     }
 
     #[test]
@@ -1173,7 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn exploration_names_match_old_exploration_tools() {
+    fn exploration_names_match_current_exploration_tools() {
         let r = registry();
         let expl = r.exploration_names();
         for name in [
@@ -1241,7 +1235,7 @@ mod tests {
     }
 
     #[test]
-    fn old_shell_execution_tools_all_flagged() {
+    fn shell_execution_tools_all_flagged() {
         let r = registry();
         for name in ["bash", "exec", "run_command", "shell"] {
             assert!(r.is_shell(name), "{name} should be shell");
@@ -1257,23 +1251,11 @@ mod tests {
         let r = registry();
         for name in [
             "read_file",
-            "file_read",
-            "ReadFileTool",
             "grep",
-            "GrepTool",
             "glob",
-            "GlobTool",
             "list_dir",
-            "ListDirTool",
             "web_fetch",
-            "WebFetchTool",
             "web_search",
-            "WebSearchTool",
-            "get_file_contents",
-            "search_code",
-            "list_files",
-            "find_files",
-            "view_file",
             "find_definition",
             "find_references",
         ] {
@@ -1438,7 +1420,7 @@ mod tests {
     }
 
     /// Cloud deployment scenario: headless mode gets a restricted tool set
-    /// (no web, no memory, no aliases), while cloud approval gates all
+    /// (no web, no memory), while cloud approval gates all
     /// mutating + shell tools. MCP tools (prefix mcp_) are unknown to the
     /// registry and get fail-closed defaults.
     #[test]
@@ -1454,13 +1436,11 @@ mod tests {
         assert!(!headless.contains(&"github"));
 
         // Headless set excludes web (needs network), memory (needs server),
-        // MatrixOne (needs DB), orchestration (agent-internal), aliases
+        // MatrixOne (needs DB), orchestration (agent-internal)
         assert!(!headless.contains(&"web_fetch"));
         assert!(!headless.contains(&"memory"));
         assert!(!headless.contains(&"mo_query"));
         assert!(!headless.contains(&"context_analysis"));
-        assert!(!headless.contains(&"ReadFileTool"));
-        assert!(!headless.contains(&"GrepTool"));
 
         // Every tool in headless set is read-only and compactable
         for name in &headless {
@@ -1546,54 +1526,34 @@ mod tests {
         );
     }
 
-    /// Alias consistency: every alias must have identical classification
-    /// to its canonical tool across ALL dimensions.
     #[test]
-    fn scenario_alias_full_consistency() {
+    fn scenario_removed_names_do_not_receive_canonical_privileges() {
         let r = registry();
-        let alias_pairs = [
-            ("read_file", "file_read"),
-            ("read_file", "ReadFileTool"),
-            ("read_file", "Read"),
-            ("read_file", "View"),
-            ("read_file", "view"),
-            ("grep", "GrepTool"),
-            ("grep", "Grep"),
-            ("glob", "GlobTool"),
-            ("glob", "Glob"),
-            ("list_dir", "ListDirTool"),
-            ("write_file", "WriteFileTool"),
-            ("write_file", "Write"),
-            ("edit_file", "EditFileTool"),
-            ("edit_file", "Edit"),
-            ("bash", "BashTool"),
-            ("bash", "Bash"),
-            ("web_fetch", "WebFetchTool"),
-            ("web_search", "WebSearchTool"),
-            ("apply_patch", "ApplyPatchTool"),
-            ("powershell", "PowerShellTool"),
-        ];
-        for (canonical, alias) in alias_pairs {
+        for name in REMOVED_TOOL_NAMES {
+            assert!(r.get(name).is_none(), "{name} should be removed");
             assert_eq!(
-                r.category(canonical),
-                r.category(alias),
-                "category mismatch: {canonical} vs {alias}"
+                r.category(name),
+                ToolCategory::Mutating,
+                "{name} should not inherit its former canonical category"
             );
-            assert!(r.is_alias(alias), "{alias} should be flagged as alias");
-            assert!(!r.is_alias(canonical), "{canonical} should NOT be an alias");
-
-            // Approval-required must match (modulo ALIAS flag filtering in lists)
-            assert_eq!(
-                r.is_approval_required(canonical),
-                r.is_approval_required(alias),
-                "approval mismatch: {canonical} vs {alias}"
+            assert!(
+                !r.is_parallelizable(name),
+                "{name} should not inherit read-only parallelism"
             );
-            assert_eq!(
-                r.is_parallelizable(canonical),
-                r.is_parallelizable(alias),
-                "parallelizable mismatch: {canonical} vs {alias}"
+            assert!(
+                !r.is_compactable(name),
+                "{name} should not inherit compaction privileges"
             );
         }
+
+        let c = classify(
+            "BashTool",
+            Some(&serde_json::json!({"command": "git status"})),
+        );
+        assert_eq!(c.category, ToolCategory::Mutating);
+        assert!(!c.parallelizable);
+        assert!(!c.compactable);
+        assert_eq!(c.idempotency, ToolIdempotency::NonIdempotent);
     }
 
     /// Invariant: every tool in the table with APPROVAL_REQUIRED must be
@@ -1626,25 +1586,21 @@ mod tests {
         }
     }
 
-    /// Invariant: ALIAS tools must not appear in approval_required_names
-    /// or execute_command_names (avoid double-counting in cloud gating).
     #[test]
-    fn invariant_aliases_excluded_from_approval_lists() {
+    fn invariant_derived_name_lists_contain_only_registered_tools() {
         let r = registry();
-        for name in r.approval_required_names() {
-            assert!(
-                !r.is_alias(name),
-                "{name} is an alias in approval_required_names"
-            );
-        }
-        for name in r.execute_command_names() {
-            assert!(
-                !r.is_alias(name),
-                "{name} is an alias in execute_command_names"
-            );
-        }
-        for name in r.shell_names() {
-            assert!(!r.is_alias(name), "{name} is an alias in shell_names");
+        for (label, names) in [
+            ("approval_required", r.approval_required_names()),
+            ("execute_command", r.execute_command_names()),
+            ("shell", r.shell_names()),
+            ("canonical", r.canonical_names()),
+        ] {
+            for name in names {
+                assert!(
+                    r.get(name).is_some(),
+                    "{label} list contains unregistered tool {name}"
+                );
+            }
         }
     }
 
@@ -1837,15 +1793,17 @@ mod tests {
         assert!(c.approval_required);
     }
 
-    // ── BashTool alias should also get args-aware classification ─────
+    // ── Removed shell names do not get args-aware classification ─────
 
     #[test]
-    fn classify_bashtool_alias_git_status() {
+    fn classify_removed_bashtool_name_git_status_is_unknown_mutating() {
         let args = json!({"command": "git status"});
         let c = classify("BashTool", Some(&args));
-        assert_eq!(c.category, ToolCategory::ReadOnly);
-        assert!(c.parallelizable);
+        assert_eq!(c.category, ToolCategory::Mutating);
+        assert!(!c.parallelizable);
         assert!(!c.approval_required);
+        assert!(!c.compactable);
+        assert_eq!(c.idempotency, ToolIdempotency::NonIdempotent);
     }
 
     // ── Non-shell tools ignore args ─────────────────────────────────
@@ -2064,7 +2022,7 @@ mod tests {
         );
         assert_eq!(
             r.idempotency("WriteFileTool"),
-            ToolIdempotency::IdempotentWrite
+            ToolIdempotency::NonIdempotent
         );
     }
 
@@ -2321,7 +2279,6 @@ mod tests {
             "create_file",
             "delete_file",
             "apply_patch",
-            "view_file",
         ] {
             assert_eq!(
                 r.display_category(name),
@@ -2464,9 +2421,6 @@ mod tests {
     fn invariant_all_registered_tools_have_known_display_category() {
         let r = registry();
         for meta in TOOL_TABLE {
-            if meta.flags.contains(ToolFlags::ALIAS) {
-                continue;
-            }
             assert_ne!(
                 r.display_category(meta.name),
                 ToolDisplayCategory::Other,
@@ -2485,10 +2439,6 @@ mod tests {
         assert!(
             r.is_approval_required("apply_patch"),
             "apply_patch should require approval like other mutating file ops"
-        );
-        assert!(
-            r.is_approval_required("ApplyPatchTool"),
-            "ApplyPatchTool alias should also require approval"
         );
     }
 
@@ -2558,37 +2508,14 @@ mod tests {
         }
     }
 
-    /// Display category invariant also holds for alias tools.
     #[test]
-    fn display_category_aliases_resolve_same_as_canonical() {
+    fn removed_tool_names_display_as_other() {
         let r = registry();
-        let alias_pairs = [
-            ("read_file", "file_read"),
-            ("read_file", "ReadFileTool"),
-            ("read_file", "Read"),
-            ("read_file", "View"),
-            ("read_file", "view"),
-            ("grep", "GrepTool"),
-            ("grep", "Grep"),
-            ("glob", "GlobTool"),
-            ("glob", "Glob"),
-            ("list_dir", "ListDirTool"),
-            ("write_file", "WriteFileTool"),
-            ("write_file", "Write"),
-            ("edit_file", "EditFileTool"),
-            ("edit_file", "Edit"),
-            ("apply_patch", "ApplyPatchTool"),
-            ("web_fetch", "WebFetchTool"),
-            ("web_search", "WebSearchTool"),
-            ("bash", "BashTool"),
-            ("bash", "Bash"),
-            ("powershell", "PowerShellTool"),
-        ];
-        for (canonical, alias) in alias_pairs {
+        for name in REMOVED_TOOL_NAMES {
             assert_eq!(
-                r.display_category(canonical),
-                r.display_category(alias),
-                "{canonical} and {alias} should have the same display category"
+                r.display_category(name),
+                ToolDisplayCategory::Other,
+                "{name} should not inherit a display category"
             );
         }
     }
@@ -2600,9 +2527,6 @@ mod tests {
         let r = registry();
         let mut seen = std::collections::HashMap::<ToolDisplayCategory, Vec<&str>>::new();
         for meta in TOOL_TABLE {
-            if meta.flags.contains(ToolFlags::ALIAS) {
-                continue;
-            }
             let cat = r.display_category(meta.name);
             seen.entry(cat).or_default().push(meta.name);
         }

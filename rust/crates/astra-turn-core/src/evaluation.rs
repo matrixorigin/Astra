@@ -755,7 +755,7 @@ fn classify_exploration_family(record: &ToolCallRecord) -> Option<ExplorationFam
     let args = record.args_full.as_deref().unwrap_or("");
     match record.name.as_str() {
         "git" if tool_action_is(args, "diff") => Some(ExplorationFamily::Diff),
-        "read_file" | "view" => Some(ExplorationFamily::Read),
+        "read_file" => Some(ExplorationFamily::Read),
         "grep" | "rg" | "glob" => Some(ExplorationFamily::Search),
         "bash" if is_search_like_tool_call(&record.name, args) => Some(ExplorationFamily::Search),
         "bash" if extract_read_target(&record.name, args).is_some() => {
@@ -990,34 +990,23 @@ fn ranges_overlap(a: &ReadRange, b: &ReadRange) -> bool {
 /// for ambiguous bash commands, and for parse failures. Recognized:
 ///   - `bash` with `sed -n '<a>,<b>p' <file>`
 ///   - `bash` with bare `cat <file>` (no shell redirection / pipe input)
-///   - `view` tool with JSON args like `{"path":"<f>","view_range":[a,b]}`
+///   - `read_file` tool with JSON args like `{"path":"<f>","start_line":a,"end_line":b}`
 fn extract_read_target(name: &str, args: &str) -> Option<ReadRange> {
     use regex::Regex;
     use std::sync::OnceLock;
     static SED_RANGE: OnceLock<Regex> = OnceLock::new();
     static CAT_FILE: OnceLock<Regex> = OnceLock::new();
 
-    if name == "view" || name == "read_file" {
-        // Prefer JSON parsing — `view`/`read_file` args_full is always JSON.
+    if name == "read_file" {
+        // Prefer JSON parsing — `read_file` args_full is always JSON.
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(args.trim()) {
             let path = v.get("path").and_then(|p| p.as_str())?.to_string();
-            let range = if name == "view" {
-                v.get("view_range")
-                    .and_then(|r| r.as_array())
-                    .and_then(|arr| {
-                        let s = arr.first()?.as_u64()? as u32;
-                        let e = arr.get(1)?.as_u64()? as u32;
-                        Some((s, e))
-                    })
-            } else {
-                // read_file uses start_line / end_line
-                let s = v
-                    .get("start_line")
-                    .and_then(|n| n.as_u64())
-                    .map(|n| n as u32);
-                let e = v.get("end_line").and_then(|n| n.as_u64()).map(|n| n as u32);
-                s.zip(e)
-            };
+            let s = v
+                .get("start_line")
+                .and_then(|n| n.as_u64())
+                .map(|n| n as u32);
+            let e = v.get("end_line").and_then(|n| n.as_u64()).map(|n| n as u32);
+            let range = s.zip(e);
             return Some(ReadRange { file: path, range });
         }
         return None;
@@ -1070,7 +1059,10 @@ fn extract_read_target(name: &str, args: &str) -> Option<ReadRange> {
 /// clears the per-file read history so we don't over-flag legitimate
 /// "edit then verify" patterns.
 fn is_mutation_for_redundant_read(name: &str, args: &str) -> bool {
-    matches!(name, "edit" | "create" | "write") || (name == "bash" && bash_args_look_mutating(args))
+    matches!(
+        name,
+        "str_replace" | "multi_edit" | "write_file" | "create_file" | "delete_file" | "apply_patch"
+    ) || (name == "bash" && bash_args_look_mutating(args))
 }
 
 fn bash_args_look_mutating(args: &str) -> bool {
@@ -1118,8 +1110,11 @@ fn bash_args_look_mutating(args: &str) -> bool {
 /// per-file history clears. Returns `None` if the target file is unclear,
 /// in which case the caller clears ALL per-file histories (conservative).
 fn mutation_target_file(name: &str, args: &str) -> Option<String> {
-    if matches!(name, "edit" | "create" | "write") {
-        // Astra's edit/create tools take JSON args with a `path` field.
+    if matches!(
+        name,
+        "str_replace" | "multi_edit" | "write_file" | "create_file" | "delete_file" | "apply_patch"
+    ) {
+        // Astra's file mutation tools take JSON args with a `path` field.
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(args.trim()) {
             return v.get("path").and_then(|p| p.as_str()).map(String::from);
         }
@@ -2660,7 +2655,11 @@ mod tests {
         let records = vec![
             record_with_args("bash", 0, r#"{"command":"cat src/a.rs"}"#),
             record_with_args("bash", 1, r#"{"command":"sed -n '1,20p' src/b.rs"}"#),
-            record_with_args("view", 2, r#"{"path":"src/c.rs","view_range":[1,20]}"#),
+            record_with_args(
+                "read_file",
+                2,
+                r#"{"path":"src/c.rs","start_line":1,"end_line":20}"#,
+            ),
             record_with_args("read_file", 3, r#"{"path":"src/d.rs"}"#),
             record_with_args("git", 4, r#"{"action":"show","revision":"HEAD"}"#),
         ];
@@ -2744,7 +2743,7 @@ mod tests {
                 r#"{"command":"cd tmp && cargo check 2>&1 | head -30"}"#,
             ),
             record_with_args(
-                "edit",
+                "str_replace",
                 2,
                 r#"{"path":"tmp/src/main.rs","old_str":"a","new_str":"b"}"#,
             ),
@@ -2883,7 +2882,7 @@ mod tests {
             record_with_args("bash", 1, "sed -n '10,50p' src/foo.rs"),
             // Edit invalidates per-file history.
             record_with_args(
-                "edit",
+                "str_replace",
                 2,
                 r#"{"path":"src/foo.rs","old_str":"x","new_str":"y"}"#,
             ),
@@ -2924,14 +2923,30 @@ mod tests {
     }
 
     #[test]
-    fn redundant_reads_recognizes_view_tool_with_overlapping_ranges() {
-        // The native `view` tool with overlapping `view_range` should also
-        // count — the failure mode is identical regardless of bash vs view.
+    fn redundant_reads_signal_recognizes_read_file_with_overlapping_ranges() {
+        // The native `read_file` tool with overlapping ranges should also
+        // count — the failure mode is identical regardless of bash vs read_file.
         let records = vec![
-            record_with_args("view", 0, r#"{"path":"src/foo.rs","view_range":[10,50]}"#),
-            record_with_args("view", 1, r#"{"path":"src/foo.rs","view_range":[20,60]}"#),
-            record_with_args("view", 2, r#"{"path":"src/foo.rs","view_range":[30,70]}"#),
-            record_with_args("view", 3, r#"{"path":"src/foo.rs","view_range":[40,80]}"#),
+            record_with_args(
+                "read_file",
+                0,
+                r#"{"path":"src/foo.rs","start_line":10,"end_line":50}"#,
+            ),
+            record_with_args(
+                "read_file",
+                1,
+                r#"{"path":"src/foo.rs","start_line":20,"end_line":60}"#,
+            ),
+            record_with_args(
+                "read_file",
+                2,
+                r#"{"path":"src/foo.rs","start_line":30,"end_line":70}"#,
+            ),
+            record_with_args(
+                "read_file",
+                3,
+                r#"{"path":"src/foo.rs","start_line":40,"end_line":80}"#,
+            ),
         ];
         let eval = evaluate_tool_call_records("q", &[], &records, 0, false, 0.3);
         let count = eval.signals.iter().find_map(|s| match s {

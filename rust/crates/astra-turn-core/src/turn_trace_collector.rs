@@ -339,8 +339,8 @@ mod tests {
 
         // Record some data
         collector.record_tool_surface(
-            &["view".to_string(), "edit".to_string()],
-            &[("view".into(), 500), ("edit".into(), 500)],
+            &["read_file".to_string(), "str_replace".to_string()],
+            &[("read_file".into(), 500), ("str_replace".into(), 500)],
             50,
             15,
         );
@@ -366,7 +366,12 @@ mod tests {
         let collector1 = TurnTraceCollector::new("turn-1", "session-abc");
         let collector2 = collector1.clone_arc();
 
-        collector1.record_tool_surface(&["view".to_string()], &[("view".into(), 100)], 10, 5);
+        collector1.record_tool_surface(
+            &["read_file".to_string()],
+            &[("read_file".into(), 100)],
+            10,
+            5,
+        );
 
         // Both should see the same data
         assert!(collector2.has_data());

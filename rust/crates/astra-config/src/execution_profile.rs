@@ -182,8 +182,8 @@ mod tests {
     #[test]
     fn merge_boosts_stores_terms() {
         let mut profile = ExecutionProfile::from_base(RuntimeConfig::default());
-        profile.merge_boosts(vec!["grep".into(), "view".into()]);
-        assert_eq!(profile.boost_terms, vec!["grep", "view"]);
+        profile.merge_boosts(vec!["grep".into(), "read_file".into()]);
+        assert_eq!(profile.boost_terms, vec!["grep", "read_file"]);
     }
 
     #[test]

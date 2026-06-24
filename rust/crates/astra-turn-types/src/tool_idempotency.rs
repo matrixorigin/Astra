@@ -77,24 +77,9 @@ pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolI
 
         // Pure read tools — safe to re-execute
         "read_file"
-        | "file_read"
-        | "ReadFileTool"
-        | "Read"
-        | "get_file_contents"
-        | "view_file"
-        | "View"
-        | "view"
         | "grep"
-        | "GrepTool"
-        | "Grep"
         | "glob"
-        | "GlobTool"
-        | "Glob"
         | "list_dir"
-        | "ListDirTool"
-        | "list_files"
-        | "find_files"
-        | "search_code"
         | "task_output"
         | "task_list"
         | "symbols"
@@ -107,9 +92,7 @@ pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolI
         | "dead_code"
         | "extract_members"
         | "web_fetch"
-        | "WebFetchTool"
         | "web_search"
-        | "WebSearchTool"
         | "memory_search"
         | "memory_retrieve"
         | "memory_profile"
@@ -135,7 +118,7 @@ pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolI
         "ask_user" | "sleep" => ToolIdempotency::NonIdempotent,
 
         // Idempotent writes — overwrite semantics
-        "write_file" | "WriteFileTool" | "Write" => ToolIdempotency::IdempotentWrite,
+        "write_file" => ToolIdempotency::IdempotentWrite,
 
         // Everything else: non-idempotent (safe default)
         _ => ToolIdempotency::NonIdempotent,
@@ -155,14 +138,9 @@ mod tests {
     fn pure_read_tools() {
         for name in [
             "read_file",
-            "Read",
             "grep",
-            "Grep",
             "glob",
-            "Glob",
             "list_dir",
-            "View",
-            "view",
             "mo_query",
             "task_output",
             "task_list",
@@ -266,7 +244,6 @@ mod tests {
     #[test]
     fn idempotent_write() {
         assert_eq!(classify("write_file"), ToolIdempotency::IdempotentWrite);
-        assert_eq!(classify("WriteFileTool"), ToolIdempotency::IdempotentWrite);
     }
 
     #[test]
@@ -332,27 +309,36 @@ mod tests {
     }
 
     #[test]
-    fn aliases_match_canonical() {
-        let pairs = [
-            ("read_file", "file_read"),
-            ("read_file", "ReadFileTool"),
-            ("read_file", "Read"),
-            ("view_file", "View"),
-            ("view_file", "view"),
-            ("grep", "GrepTool"),
-            ("grep", "Grep"),
-            ("glob", "GlobTool"),
-            ("glob", "Glob"),
-            ("list_dir", "ListDirTool"),
-            ("write_file", "WriteFileTool"),
-            ("write_file", "Write"),
-            ("web_fetch", "WebFetchTool"),
-        ];
-        for (canonical, alias) in pairs {
+    fn removed_tool_names_default_to_non_idempotent() {
+        for name in [
+            "file_read",
+            "ReadFileTool",
+            "Read",
+            "View",
+            "view",
+            "GrepTool",
+            "Grep",
+            "GlobTool",
+            "Glob",
+            "ListDirTool",
+            "get_file_contents",
+            "view_file",
+            "list_files",
+            "find_files",
+            "search_code",
+            "WriteFileTool",
+            "Write",
+            "ApplyPatchTool",
+            "BashTool",
+            "Bash",
+            "PowerShellTool",
+            "WebFetchTool",
+            "WebSearchTool",
+        ] {
             assert_eq!(
-                classify(canonical),
-                classify(alias),
-                "{canonical} and {alias} should have same idempotency"
+                classify(name),
+                ToolIdempotency::NonIdempotent,
+                "{name} should not inherit idempotent retry semantics"
             );
         }
     }

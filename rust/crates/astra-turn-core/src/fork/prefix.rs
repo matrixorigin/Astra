@@ -744,12 +744,12 @@ mod tests {
         let p = sample_prefix(|a| {
             a.tool_schemas = vec![
                 sample_tool("bash", "original"),
-                sample_tool("edit", "edit files"),
+                sample_tool("str_replace", "edit files"),
             ]
         });
         let bash_hash = p.tool_hash("bash").copied().unwrap();
-        let edit_hash = p.tool_hash("edit").copied().unwrap();
-        assert_ne!(bash_hash, edit_hash);
+        let str_replace_hash = p.tool_hash("str_replace").copied().unwrap();
+        assert_ne!(bash_hash, str_replace_hash);
         assert!(p.tool_hash("nonexistent").is_none());
     }
 
@@ -781,19 +781,19 @@ mod tests {
         let p1 = sample_prefix(|a| {
             a.tool_schemas = vec![
                 sample_tool("bash", "original description"),
-                sample_tool("edit", "edit files"),
+                sample_tool("str_replace", "edit files"),
             ]
         });
         let p2 = sample_prefix(|a| {
             a.tool_schemas = vec![
                 sample_tool("bash", "REWRITTEN description with dynamic list"),
-                sample_tool("edit", "edit files"),
+                sample_tool("str_replace", "edit files"),
             ]
         });
         // bash churned — its per-tool hash differs.
         assert_ne!(p1.tool_hash("bash"), p2.tool_hash("bash"));
-        // edit didn't change — its per-tool hash matches.
-        assert_eq!(p1.tool_hash("edit"), p2.tool_hash("edit"));
+        // str_replace didn't change — its per-tool hash matches.
+        assert_eq!(p1.tool_hash("str_replace"), p2.tool_hash("str_replace"));
     }
 
     #[test]

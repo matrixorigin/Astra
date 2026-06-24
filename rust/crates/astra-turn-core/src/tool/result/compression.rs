@@ -80,7 +80,7 @@ pub fn compress_with_default_budget(tool_name: &str, content: &str) -> String {
 }
 
 fn prefers_listing_compression(tool_name: &str) -> bool {
-    matches!(tool_name, "read_file" | "view")
+    tool_name == "read_file"
 }
 
 // ── JSON compression ──────────────────────────────────────────────────────
