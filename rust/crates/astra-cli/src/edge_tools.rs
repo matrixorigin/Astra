@@ -23,6 +23,12 @@ use astra_turn_core::tool::deferred_activation::ToolSurfaceNames;
 /// for authorization instead of letting the model silently fall back to bash.
 pub const SANDBOX_DENIED_PREFIX: &str = "SANDBOX_DENIED: ";
 
+#[derive(Clone, Default)]
+pub(super) struct EdgeMcpRuntimeSnapshot {
+    manager: Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
+    schemas: Vec<Value>,
+}
+
 /// Error returned by [`ToolExecutor::expand_sandbox_path`] when a path is
 /// rejected by the validation gate.
 ///
@@ -912,10 +918,10 @@ pub struct ToolExecutor {
     passive_tsc_pending: AtomicBool,
     /// Optional passive LSP sessions (rust-analyzer, typescript-language-server).
     passive_lsp: passive_lsp::PassiveLspManager,
-    /// MCP client manager for external tool servers.
-    /// When present, tool names starting with `mcp__` are routed to MCP servers.
-    pub mcp_manager:
-        Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
+    /// MCP routing snapshot. Manager and MCP schemas are installed together so
+    /// `tool_search(select:mcp__*)` sees the same discovery snapshot as
+    /// execution.
+    mcp_runtime: std::sync::RwLock<EdgeMcpRuntimeSnapshot>,
     /// File edit journal — records before-state of every file write for undo.
     /// Wrapped in Arc so the chat session can share the journal across turns.
     pub file_journal:
@@ -1111,7 +1117,7 @@ impl ToolExecutor {
             passive_cargo_pending: AtomicBool::new(false),
             passive_tsc_pending: AtomicBool::new(false),
             passive_lsp: passive_lsp::PassiveLspManager::new(),
-            mcp_manager: None,
+            mcp_runtime: std::sync::RwLock::new(EdgeMcpRuntimeSnapshot::default()),
             file_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 astra_turn_core::file_edit_journal::FileEditJournal::default(),
             )),
@@ -1336,8 +1342,11 @@ impl ToolExecutor {
         manager: std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>,
         schemas: Vec<Value>,
     ) {
-        self.mcp_manager = Some(manager);
-        self.set_plugin_schemas(schemas);
+        let mut guard = rwlock_write_reset_on_poison(&self.mcp_runtime, "mcp_runtime");
+        *guard = EdgeMcpRuntimeSnapshot {
+            manager: Some(manager),
+            schemas,
+        };
     }
 
     /// Install the visible `tools[]` names for the current LLM request.
@@ -1466,7 +1475,8 @@ impl ToolExecutor {
     }
 
     fn mcp_tool_has_runtime_binding(&self, name: &str) -> bool {
-        let Some(manager) = &self.mcp_manager else {
+        let runtime = self.mcp_runtime_snapshot("mcp_runtime_binding");
+        let Some(manager) = &runtime.manager else {
             return false;
         };
         manager
@@ -1654,7 +1664,16 @@ impl ToolExecutor {
     }
 
     pub(super) fn plugin_schemas_snapshot(&self, label: &str) -> Vec<Value> {
-        rwlock_read_clone_or_default(&self.plugin_schemas, label)
+        let mut schemas = rwlock_read_clone_or_default(&self.plugin_schemas, label);
+        schemas.extend(
+            self.mcp_runtime_snapshot("mcp_runtime_schema_snapshot")
+                .schemas,
+        );
+        schemas
+    }
+
+    pub(super) fn mcp_runtime_snapshot(&self, label: &str) -> EdgeMcpRuntimeSnapshot {
+        rwlock_read_clone_or_default(&self.mcp_runtime, label)
     }
 
     /// Set the shared context cache for cross-agent knowledge sharing.

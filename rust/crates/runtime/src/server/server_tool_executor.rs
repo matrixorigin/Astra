@@ -78,6 +78,13 @@ use astra_tools::plan_task_mirror;
 
 mod tool_handlers;
 
+#[derive(Clone, Default)]
+struct McpRuntimeSnapshot {
+    schemas: Vec<Value>,
+    manager: Option<Arc<tokio::sync::RwLock<astra_mcp::McpClientManager>>>,
+    agent_binding_mcp: Option<Arc<super::runtime_mcp::AgentBindingMcpRuntime>>,
+}
+
 fn resolved_server_tool_names(
     capabilities: &astra_turn_core::capability::CapabilitySet,
     workspace: &WorkspaceBinding,
@@ -207,17 +214,12 @@ pub struct ServerToolExecutor {
     plan_resume_hint_handle: Option<Arc<std::sync::RwLock<Option<String>>>>,
 
     // ── MCP and external tool integration ─────────────────────────────────────
-    /// MCP client manager for forwarding `mcp__*` tool calls to connected
-    /// MCP servers. Set by `stream_chat()` after MCP discovery.
-    mcp_manager: Option<Arc<tokio::sync::RwLock<astra_mcp::McpClientManager>>>,
-    /// Agent Binding MCP adapter for stateless per-call JSON-RPC over the
-    /// shared HTTP transport pool. Unlike `mcp_manager`, this never holds a
-    /// long-lived authorization-scoped MCP session.
-    agent_binding_mcp: Option<Arc<super::runtime_mcp::AgentBindingMcpRuntime>>,
-    /// Plugin-registered tool schemas (e.g. MCP servers). Joined with the
-    /// server-side allowlist when `tool_search(select:NAME)` runs so
-    /// deferred activation reaches plugin tools. Populated by the server
-    /// loop host once MCP servers have been refreshed.
+    /// MCP runtime snapshot installed from one discovery pass. Manager,
+    /// Agent Binding ownership, and MCP schemas move together so
+    /// `tool_search(select:mcp__*)` cannot observe a half-refresh state.
+    mcp_runtime: Arc<std::sync::RwLock<McpRuntimeSnapshot>>,
+    /// Plugin-registered non-MCP tool schemas. MCP schemas live in
+    /// `mcp_runtime` so routing ownership and discovery data stay atomic.
     plugin_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
     /// Deferred tool names whose full schema has been fetched via
     /// `tool_search(query="select:NAME")` or direct-call recovery. This is
@@ -310,11 +312,10 @@ impl ServerToolExecutor {
             plan_repo: None,
             plan_mode_cache: Arc::new(tokio::sync::RwLock::new(PlanModeSnapshot::default())),
             plan_resume_hint_handle: None,
+            mcp_runtime: Arc::new(std::sync::RwLock::new(McpRuntimeSnapshot::default())),
             plugin_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
             activated_deferred_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             current_tool_surface: Arc::new(std::sync::RwLock::new(ToolSurfaceNames::default())),
-            mcp_manager: None,
-            agent_binding_mcp: None,
             agent_tool_context: None,
             work_surface_events: WorkSurfaceEventEmitter::new(session_id.clone()),
             execution_binding: ExecutionBindingState::server_sandbox(&workspace_root),
@@ -448,9 +449,12 @@ impl ServerToolExecutor {
     /// Install the MCP execution bundle in one step so schemas and runtime
     /// ownership are derived from the same discovery snapshot.
     pub(crate) fn install_mcp_bundle(&mut self, bundle: &super::runtime_mcp::RuntimeMcpBundle) {
-        self.mcp_manager = bundle.manager.clone();
-        self.agent_binding_mcp = bundle.agent_binding_mcp.clone();
-        self.set_plugin_schemas(bundle.schemas.clone());
+        let mut guard = rwlock_write_reset_on_poison(&self.mcp_runtime, "mcp_runtime");
+        *guard = McpRuntimeSnapshot {
+            schemas: bundle.schemas.clone(),
+            manager: bundle.manager.clone(),
+            agent_binding_mcp: bundle.agent_binding_mcp.clone(),
+        };
     }
 
     /// Install plugin-registered schemas (MCP, etc.) so
@@ -690,11 +694,16 @@ impl ServerToolExecutor {
     }
 
     pub(crate) fn plugin_schemas_snapshot(&self, label: &str) -> Vec<Value> {
-        rwlock_read_clone_or_default(&self.plugin_schemas, label)
+        let mut schemas = rwlock_read_clone_or_default(&self.plugin_schemas, label);
+        let mcp_runtime =
+            rwlock_read_clone_or_default(&self.mcp_runtime, "mcp_runtime_schema_snapshot");
+        schemas.extend(mcp_runtime.schemas);
+        schemas
     }
 
     async fn execute_mcp_tool(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
-        if let Some(agent_binding_mcp) = &self.agent_binding_mcp {
+        let mcp_runtime = rwlock_read_clone_or_default(&self.mcp_runtime, "mcp_runtime_execute");
+        if let Some(agent_binding_mcp) = &mcp_runtime.agent_binding_mcp {
             return match agent_binding_mcp.call_tool_by_mcp_name(name, args).await {
                 Ok(content) => astra_tools::ToolResult::text(content),
                 Err(error) => astra_tools::ToolResult::error(
@@ -705,7 +714,7 @@ impl ServerToolExecutor {
                 ),
             };
         }
-        let Some(mgr) = &self.mcp_manager else {
+        let Some(mgr) = &mcp_runtime.manager else {
             return self.runtime_binding_error_result(name, args);
         };
         match mgr
@@ -769,14 +778,15 @@ impl ServerToolExecutor {
     }
 
     fn mcp_tool_has_runtime_binding(&self, name: &str) -> bool {
-        if self
+        let mcp_runtime = rwlock_read_clone_or_default(&self.mcp_runtime, "mcp_runtime_binding");
+        if mcp_runtime
             .agent_binding_mcp
             .as_ref()
             .is_some_and(|runtime| runtime.owns_public_tool_name(name))
         {
             return true;
         }
-        let Some(manager) = &self.mcp_manager else {
+        let Some(manager) = &mcp_runtime.manager else {
             return false;
         };
         manager

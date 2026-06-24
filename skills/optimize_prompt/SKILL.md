@@ -156,16 +156,16 @@ From journal/debug `visible_tools` per turn:
 |------|---------------|-------------------|--------------------|---------|
 ```
 
-### 3.2 Pinned vs Dynamic Schemas
+### 3.2 Always-Load vs Deferred Schemas
 
-- **Pinned schemas**: Always sent (core tools like bash, read_file, etc.)
+- **Always-load schemas**: Sent by default (core tools like bash, read_file, etc.)
   - Count: typically 5-10 tools
   - Cost: ~2-4K tokens (always paid)
 - **Deferred schemas**: Activated by `tool_search` and then visible in subsequent turns
   - Count: varies (5-25 tools)
   - Cost: ~2-10K tokens
 
-**Total schema cost per turn**: `pinned_tokens + dynamic_tokens`
+**Total schema cost per turn**: `always_load_tokens + deferred_tokens`
 
 Flag:
 

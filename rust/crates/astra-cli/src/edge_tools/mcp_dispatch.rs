@@ -9,7 +9,7 @@ use super::ToolExecutor;
 
 impl ToolExecutor {
     pub(super) async fn execute_mcp_tool(&self, mcp_name: &str, args: &Value) -> String {
-        let manager_arc = match &self.mcp_manager {
+        let manager_arc = match self.mcp_runtime_snapshot("mcp_runtime_dispatch").manager {
             Some(m) => m.clone(),
             None => {
                 return format!("Error: MCP not available. Tool '{mcp_name}' cannot be executed.");
@@ -99,7 +99,7 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
-    /// Create a bare ToolExecutor with mcp_manager = None.
+    /// Create a bare ToolExecutor without an MCP runtime snapshot.
     fn executor_no_mcp() -> ToolExecutor {
         ToolExecutor::new("/tmp")
     }
@@ -115,7 +115,7 @@ mod tests {
     // ── Error path: MCP not available ─────────────────────────────────────
 
     #[tokio::test]
-    async fn dispatch_no_mcp_manager() {
+    async fn dispatch_without_mcp_runtime() {
         let executor = executor_no_mcp();
         let result = executor
             .execute_mcp_tool("mcp_test_tool", &serde_json::Value::Null)

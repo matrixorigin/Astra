@@ -394,7 +394,7 @@ Keep the report compact and grounded in digest JSON.
 | Nudge ignored by LLM | Strengthen nudge language in `build_stall_reflection()` |
 | Tool deprioritized incorrectly | Adjust consecutive failure threshold in `tool_health.rs` |
 | Compaction too aggressive | Lower budget_pressure thresholds in compaction config |
-| Deferred activation misses needed tools | Tighten `tool_search` activation descriptions and default pinned surface |
+| Deferred activation misses needed tools | Tighten `tool_search` activation descriptions and the always-load surface |
 | Context window too small | Increase model context or reduce tool schema count |
 | Error recovery not escalating | Adjust thresholds in `error_recovery.rs` EscalationLevel |
 

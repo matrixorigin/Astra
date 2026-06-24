@@ -202,7 +202,11 @@ impl ToolExecutor {
             }
 
             // MCP tools
-            if self.mcp_manager.is_some() {
+            if self
+                .mcp_runtime_snapshot("mcp_runtime_diagnose")
+                .manager
+                .is_some()
+            {
                 tools_info.insert("mcp_enabled".to_string(), json!(true));
             }
 

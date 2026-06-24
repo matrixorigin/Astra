@@ -408,8 +408,8 @@ pub(crate) async fn stream_chat_sse(
     let messages = load_turn_messages(p.pre_loaded_messages.take(), p.history, p.message);
 
     // ─── Context pre-fetch (disabled) ─────────────────────────────────────
-    // Returns (all_schemas, mcp_plugin_schemas) so the edge executor can
-    // install MCP tools for `tool_search(select:)` resolution while the
+    // Returns (all_schemas, mcp_runtime_schemas) so the edge executor can
+    // install MCP routing and discovery data from the same snapshot while the
     // registry gets the capability-filtered list.
     // Refresh any MCP servers that received tool-list-changed notifications
     if let Some(ref mgr) = p.mcp_manager {
@@ -419,8 +419,8 @@ pub(crate) async fn stream_chat_sse(
         m.consume_resource_changes();
     }
     // Inject MCP tool schemas from connected servers.
-    // Tracked separately from the static catalog so the edge
-    // `ToolExecutor` can install them via `set_plugin_schemas` for
+    // Tracked separately from the static catalog so the edge `ToolExecutor`
+    // can install MCP routing and schemas atomically for
     // `tool_search(select:mcp__X)` resolution.
     let mcp_schemas = if let Some(ref mgr) = p.mcp_manager {
         let m = mgr.read().await;
@@ -440,14 +440,14 @@ pub(crate) async fn stream_chat_sse(
         ),
         mcp_schemas,
     );
-    let mcp_plugin_schemas = all_schemas.1.clone();
+    let mcp_runtime_schemas = all_schemas.1.clone();
     let all_schemas = all_schemas.0;
     // Install MCP schemas on the edge executor so `tool_search(select:NAME)`
-    // can resolve plugin tool schemas by name.
+    // can resolve MCP tool schemas by name.
     if let Some(ref mgr) = p.mcp_manager {
-        executor.install_mcp_bundle(mgr.clone(), mcp_plugin_schemas);
+        executor.install_mcp_bundle(mgr.clone(), mcp_runtime_schemas);
     } else {
-        executor.set_plugin_schemas(mcp_plugin_schemas);
+        executor.set_plugin_schemas(mcp_runtime_schemas);
     }
     let registry = ToolRegistry::new_runtime_surface(all_schemas.clone());
     let always_load_schema_tokens = registry.total_always_load_token_cost() as u64;
