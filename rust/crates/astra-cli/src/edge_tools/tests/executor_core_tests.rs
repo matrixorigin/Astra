@@ -74,6 +74,34 @@ async fn retired_git_github_helper_aliases_are_unknown_on_cli_edge_executor() {
 }
 
 #[tokio::test]
+async fn retired_session_state_actions_are_rejected_on_cli_edge_executor() {
+    let executor = test_executor();
+
+    for action in [
+        "prioritize",
+        "deprioritize",
+        "compact",
+        "set_goal",
+        "ask_user",
+        "rollback_edits",
+        "timeline",
+        "summary",
+        "history",
+    ] {
+        let result = executor
+            .execute("session", &json!({"action": action}))
+            .await;
+        assert!(result.starts_with("Error:"), "{action}: {result}");
+        assert!(
+            result.contains("unknown `session` action")
+                && result.contains("history_page")
+                && result.contains("rollback_session_state"),
+            "{action}: {result}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn consolidated_github_create_issue_error_does_not_leak_retired_alias() {
     let executor = test_executor();
 

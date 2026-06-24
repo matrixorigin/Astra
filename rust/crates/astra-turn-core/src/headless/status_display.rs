@@ -717,10 +717,6 @@ fn fmt_utility_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
             .get("tool")
             .and_then(|v| v.as_str())
             .map(|tool| truncate_str(tool, 30)),
-        "set_goal" => obj
-            .get("goal")
-            .and_then(|v| v.as_str())
-            .map(|goal| truncate_str(goal, 50)),
         "compress_context" => obj
             .get("reason")
             .and_then(|v| v.as_str())

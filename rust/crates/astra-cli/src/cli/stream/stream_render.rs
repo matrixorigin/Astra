@@ -6182,7 +6182,6 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "adjust_config" => format!("Adjust config: {preview}"),
         "prioritize_tool" => format!("Prioritize tool: {preview}"),
         "deprioritize_tool" => format!("Deprioritize tool: {preview}"),
-        "set_goal" => format!("Set goal: \"{preview}\""),
         "compress_context" => format!("Compress context: {preview}"),
         "rollback_session_state" => format!("Rollback session state: {preview}"),
         "ask_user" => format!("Asking user: \"{preview}\""),

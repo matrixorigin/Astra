@@ -30,8 +30,8 @@
 //!   active focus hints and applies a consistent top-k.
 //! - **topic focus** → [`MemoryOrchestrator::focus_on_topic`]
 //!   sets a session-scoped boost. Callers decide when to call this
-//!   (e.g. after `session(action=set_goal)` or when the routing
-//!   engine sees a persistent topic).
+//!   (e.g. after the goal manager changes the active objective or
+//!   when the routing engine sees a persistent topic).
 //! - **tool-result feedback** → [`MemoryOrchestrator::feedback`]
 //!   records useful/irrelevant/outdated/wrong on a specific
 //!   memory_id — callers thread the id through from a prior recall.

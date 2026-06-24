@@ -1328,10 +1328,6 @@ pub enum JournalEventType {
     PipelineAlert,
     /// Context pipeline compaction audit (what was dropped/cleared, why).
     PipelineCompactionAudit,
-    /// Agent suppressed a memory from injection for the rest of the session.
-    MemorySuppressed,
-    /// Agent released a tool result from context (early eviction).
-    ContextReleased,
     /// Startup bootstrap phases completed (per-phase timestamps in metadata).
     Bootstrap,
     /// Lightweight trace span for cross-boundary observability (edge ↔ cloud).
@@ -2301,8 +2297,6 @@ fn is_recovery_activity_event(event_type: &JournalEventType) -> bool {
             | JournalEventType::AdaptivePerTurnApplied
             | JournalEventType::AdaptiveTuningRuleTriggered
             | JournalEventType::CompactionRetry
-            | JournalEventType::MemorySuppressed
-            | JournalEventType::ContextReleased
     )
 }
 
@@ -4264,32 +4258,6 @@ impl JournalEvent {
         evt.metadata = Some(event_payload);
         evt
     }
-
-    /// Agent suppressed a memory from being injected for the session.
-    pub fn memory_suppressed(
-        session_id: Option<&str>,
-        turn: u32,
-        memory_id: &str,
-        reason: Option<&str>,
-    ) -> Self {
-        let mut evt = Self::base(JournalEventType::MemorySuppressed, session_id);
-        evt.turn = Some(turn);
-        evt.metadata = Some(serde_json::json!({
-            "memory_id": memory_id,
-            "reason": reason,
-        }));
-        evt
-    }
-
-    /// Agent released a tool result from context (early eviction).
-    pub fn context_released(session_id: Option<&str>, turn: u32, tool_call_ids: &[&str]) -> Self {
-        let mut evt = Self::base(JournalEventType::ContextReleased, session_id);
-        evt.turn = Some(turn);
-        evt.metadata = Some(serde_json::json!({
-            "tool_call_ids": tool_call_ids,
-        }));
-        evt
-    }
 }
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -4991,7 +4959,7 @@ mod tests {
         let evt = JournalEvent::goal_steered(
             Some("sid-goal"),
             4,
-            "edge_tool:set_goal",
+            "control_plane:goal",
             Some("old goal"),
             "new goal",
             Some(serde_json::json!({"mode": "manual"})),
@@ -5005,7 +4973,7 @@ mod tests {
         let metadata = parsed.metadata.expect("metadata");
         assert_eq!(
             metadata.get("source").and_then(|value| value.as_str()),
-            Some("edge_tool:set_goal")
+            Some("control_plane:goal")
         );
         assert_eq!(
             metadata
@@ -5017,86 +4985,6 @@ mod tests {
             metadata.get("new_goal").and_then(|value| value.as_str()),
             Some("new goal")
         );
-    }
-
-    #[test]
-    fn journal_event_memory_suppressed_serializes_and_round_trips() {
-        let evt = JournalEvent::memory_suppressed(
-            Some("sid-suppress"),
-            5,
-            "mem-abc123",
-            Some("stale, not relevant to current task"),
-        );
-        assert_eq!(evt.event_type, JournalEventType::MemorySuppressed);
-        assert_eq!(evt.turn, Some(5));
-        let json = serde_json::to_string(&evt).unwrap();
-        assert!(json.contains("\"type\":\"memory_suppressed\""));
-        assert!(json.contains("\"memory_id\":\"mem-abc123\""));
-        assert!(json.contains("stale, not relevant"));
-        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.event_type, JournalEventType::MemorySuppressed);
-        assert_eq!(parsed.turn, Some(5));
-        let metadata = parsed.metadata.expect("metadata");
-        assert_eq!(
-            metadata.get("memory_id").and_then(|v| v.as_str()),
-            Some("mem-abc123")
-        );
-        assert_eq!(
-            metadata.get("reason").and_then(|v| v.as_str()),
-            Some("stale, not relevant to current task")
-        );
-    }
-
-    #[test]
-    fn journal_event_memory_suppressed_with_null_reason() {
-        let evt = JournalEvent::memory_suppressed(Some("sid-s2"), 3, "mem-xyz", None);
-        let json = serde_json::to_string(&evt).unwrap();
-        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
-        let metadata = parsed.metadata.expect("metadata");
-        assert_eq!(
-            metadata.get("memory_id").and_then(|v| v.as_str()),
-            Some("mem-xyz")
-        );
-        assert!(metadata.get("reason").unwrap().is_null());
-    }
-
-    #[test]
-    fn journal_event_context_released_serializes_and_round_trips() {
-        let evt = JournalEvent::context_released(
-            Some("sid-release"),
-            7,
-            &["call_001", "call_002", "call_003"],
-        );
-        assert_eq!(evt.event_type, JournalEventType::ContextReleased);
-        assert_eq!(evt.turn, Some(7));
-        let json = serde_json::to_string(&evt).unwrap();
-        assert!(json.contains("\"type\":\"context_released\""));
-        assert!(json.contains("call_001"));
-        assert!(json.contains("call_002"));
-        assert!(json.contains("call_003"));
-        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.event_type, JournalEventType::ContextReleased);
-        assert_eq!(parsed.turn, Some(7));
-        let metadata = parsed.metadata.expect("metadata");
-        let ids = metadata
-            .get("tool_call_ids")
-            .and_then(|v| v.as_array())
-            .expect("tool_call_ids array");
-        assert_eq!(ids.len(), 3);
-        assert_eq!(ids[0].as_str(), Some("call_001"));
-    }
-
-    #[test]
-    fn journal_event_context_released_empty_ids() {
-        let evt = JournalEvent::context_released(Some("sid-r2"), 1, &[]);
-        let json = serde_json::to_string(&evt).unwrap();
-        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
-        let metadata = parsed.metadata.expect("metadata");
-        let ids = metadata
-            .get("tool_call_ids")
-            .and_then(|v| v.as_array())
-            .expect("tool_call_ids array");
-        assert!(ids.is_empty());
     }
 
     #[test]
@@ -7249,16 +7137,6 @@ mod tests {
                 !base_tool_record("read_file", true, Some("fn main() {}"))
                     .is_noop_or_cached_result()
             );
-        }
-
-        // ── is_recovery_activity_event ──
-        {
-            assert!(!is_recovery_activity_event(
-                &JournalEventType::MemorySuppressed
-            ));
-            assert!(!is_recovery_activity_event(
-                &JournalEventType::ContextReleased
-            ));
         }
 
         // ── classify_session_end_state: Completed ──

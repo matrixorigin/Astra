@@ -1781,10 +1781,8 @@ impl InProcessChatTurnBridge {
 
                 // Per-turn hybrid recall runs every turn; session-start
                 // (profile + episodes) only on turn 1.
-                let sid_for_suppress: Option<&str> =
-                    if session_id.is_empty() { None } else { Some(&session_id) };
                 let (per_turn, cached_session_start) = tokio::join!(
-                    prefetch_memories(mem_url, mem_key, user_msg, &user_id, top_k, sid_for_suppress),
+                    prefetch_memories(mem_url, mem_key, user_msg, &user_id, top_k),
                     async {
                         if is_first_turn {
                             cached_first_turn_session_start_memory(
@@ -2480,40 +2478,6 @@ impl InProcessChatTurnBridge {
             };
 
             llm_messages.extend(merged_messages);
-
-            // Apply context release: stub tool results the agent marked as
-            // no longer needed so they don't consume tokens. Idempotent: runs
-            // every turn, so emit the per-turn stub count for observability.
-            // We log to tracing AND to the session journal so prod runs (where
-            // debug tracing is off) still leave a durable audit trail.
-            let released_count = apply_session_context_release(&session_id, &mut llm_messages);
-            if released_count > 0 {
-                tracing::debug!(
-                    target: "astra::runtime::context_release",
-                    session_id = %session_id,
-                    stubbed = released_count,
-                    "context_release applied"
-                );
-                if let Ok(writer) =
-                    astra_services::session_journal::JournalWriter::new(&session_id)
-                {
-                    let mut evt = astra_services::session_journal::JournalEvent::base_public(
-                        astra_services::session_journal::JournalEventType::ContextReleased,
-                        Some(&session_id),
-                    );
-                    // The applied-phase event is emitted *before* the LLM
-                    // round counter (`cloud_loop_turns`) is incremented for
-                    // this turn, so we leave `turn` unset here. The companion
-                    // `JournalEvent::context_released` (intent, written when
-                    // the agent calls `session(release_context)`) carries the
-                    // turn at intent time. Distinguished by `phase`.
-                    evt.metadata = Some(serde_json::json!({
-                        "applied_count": released_count,
-                        "phase": "per_turn_apply",
-                    }));
-                    let _ = writer.append(&evt);
-                }
-            }
 
             let bridge_synthetic_tail_prefix_end =
                 crate::turn::llm::context::finalize_bridge_wire_messages(
@@ -4682,14 +4646,6 @@ pub use super::super::memory_prefetch::{
     prefetch_session_start_memories,
 };
 
-fn apply_session_context_release(session_id: &str, llm_messages: &mut [Value]) -> usize {
-    if session_id.is_empty() {
-        return 0;
-    }
-    let released = astra_tools::memoria::MemoriaClient::released_snapshot(session_id);
-    crate::turn::cloud::compaction::apply_context_release(llm_messages, &released)
-}
-
 /// Test-accessible wrapper around private schema pruning — used by integration
 /// tests that need to verify progressive schema detail levels.
 pub mod bridge_inprocess_test_helpers {
@@ -4945,34 +4901,6 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         read_journal_events(session_id)
-    }
-
-    #[test]
-    fn bridge_applies_session_context_release_before_llm_submission() {
-        let sid = "bridge-release-pipeline-test";
-        astra_tools::memoria::MemoriaClient::reset_released(sid);
-        astra_tools::memoria::MemoriaClient::release_context(sid, "call_001");
-        let mut messages = vec![
-            json!({"role": "assistant", "tool_calls": [{"id": "call_001", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]}),
-            json!({"role": "tool", "tool_call_id": "call_001", "content": "large output"}),
-            json!({"role": "tool", "tool_call_id": "call_002", "content": "keep me"}),
-        ];
-
-        let count = apply_session_context_release(sid, &mut messages);
-
-        astra_tools::memoria::MemoriaClient::reset_released(sid);
-        assert_eq!(count, 1);
-        assert!(
-            messages[1]
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap()
-                .contains("context released")
-        );
-        assert_eq!(
-            messages[2].get("content").and_then(Value::as_str),
-            Some("keep me")
-        );
     }
 
     #[cfg(feature = "bridge-e2e-hooks")]

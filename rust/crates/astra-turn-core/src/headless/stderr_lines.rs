@@ -50,7 +50,6 @@ fn friendly_tool_name(tool_name: &str) -> &str {
         "adjust_config" => "Adjusting config",
         "prioritize_tool" => "Prioritizing tool",
         "deprioritize_tool" => "Deprioritizing tool",
-        "set_goal" => "Setting goal",
         "compress_context" => "Compressing context",
         "mo_query" => "MatrixOne query",
         "memory" => "Memory",

@@ -417,26 +417,6 @@ fn session_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: 
             let path = args.get("path").and_then(Value::as_str).unwrap_or("");
             format!("Adjust config: {}", trunc(path, 15))
         }
-        "prioritize" => {
-            let tool = args.get("tool").and_then(Value::as_str).unwrap_or("");
-            format!("Prioritize: {}", trunc(tool, 12))
-        }
-        "deprioritize" => {
-            let tool = args.get("tool").and_then(Value::as_str).unwrap_or("");
-            format!("Deprioritize: {}", trunc(tool, 14))
-        }
-        "set_goal" => {
-            let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
-            format!("Set goal: \"{}\"", trunc(goal, 12))
-        }
-        "compact" => "Compress context".to_string(),
-        "timeline" => "Session timeline".to_string(),
-        "summary" => "Session summary".to_string(),
-        "history" => "Session history".to_string(),
-        "ask_user" => {
-            let q = args.get("question").and_then(Value::as_str).unwrap_or("");
-            format!("Asking user: \"{}\"", trunc(q, 15))
-        }
         "sleep" => {
             let duration_ms = args.get("duration_ms").and_then(Value::as_u64).unwrap_or(0);
             let reason = args.get("reason").and_then(Value::as_str);
@@ -445,9 +425,23 @@ fn session_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: 
                 _ => format!("Sleeping: {duration_ms}ms"),
             }
         }
-        "tool_search" => {
-            let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-            format!("Searching tools: \"{}\"", trunc(query, 18))
+        "history_page" => {
+            let cursor = args
+                .get("before_seq")
+                .or_else(|| args.get("after_seq"))
+                .and_then(Value::as_i64);
+            match cursor {
+                Some(seq) => format!("Session history page near item {seq}"),
+                None => "Session history page".to_string(),
+            }
+        }
+        "history_search" => {
+            let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
+            format!("Searching session history: \"{}\"", trunc(pattern, 18))
+        }
+        "history_around" => {
+            let item_seq = args.get("item_seq").and_then(Value::as_i64).unwrap_or(0);
+            format!("Session history around item {item_seq}")
         }
         _ => format!("Session: {action}"),
     }
@@ -1367,18 +1361,31 @@ mod tests {
     }
 
     #[test]
-    fn session_timeline_summary_history_render() {
+    fn session_history_actions_render() {
         assert_eq!(
-            p("session", json!({"action": "timeline"})),
-            "Session timeline"
+            p("session", json!({"action": "history_page"})),
+            "Session history page"
         );
         assert_eq!(
-            p("session", json!({"action": "summary"})),
-            "Session summary"
+            p(
+                "session",
+                json!({"action": "history_page", "before_seq": 42})
+            ),
+            "Session history page near item 42"
         );
         assert_eq!(
-            p("session", json!({"action": "history"})),
-            "Session history"
+            p(
+                "session",
+                json!({"action": "history_search", "pattern": "failed build"})
+            ),
+            r#"Searching session history: "failed build""#
+        );
+        assert_eq!(
+            p(
+                "session",
+                json!({"action": "history_around", "item_seq": 17})
+            ),
+            "Session history around item 17"
         );
     }
 

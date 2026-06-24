@@ -420,10 +420,6 @@ fn tool_priority_compensation_summary(tool: Option<&str>) -> String {
     )
 }
 
-fn set_goal_compensation_summary() -> &'static str {
-    "prefer `rollback_session_state` with scope=`current_turn` to restore the previous_goal and goal-tracking snapshot; rerun `set_goal` with the `previous_goal` from the tool result only as the manual fallback"
-}
-
 fn compress_context_compensation_summary() -> &'static str {
     "prefer `rollback_session_state` with scope=`current_turn` to restore session-local compression state; manual compression journal markers remain append-only if you inspect the persisted journal later"
 }
@@ -628,10 +624,6 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
         "prioritize_tool" | "deprioritize_tool" => session_state_action_profile(
             ActionCategory::Write,
             tool_priority_compensation_summary(string_arg(&normalized_args, "tool")),
-        ),
-        "set_goal" => session_state_action_profile(
-            ActionCategory::Destructive,
-            set_goal_compensation_summary(),
         ),
         "compress_context" => session_state_action_profile(
             ActionCategory::Write,
@@ -1047,22 +1039,6 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("prior preference state")
-        );
-
-        let set_goal = tool_action_profile("set_goal", &json!({"goal": "ship rollback shell"}));
-        assert!(set_goal.bounded);
-        assert_eq!(set_goal.category, ActionCategory::Destructive);
-        assert!(set_goal.reversible);
-        assert_eq!(
-            set_goal.compensation_kind,
-            Some(CompensationKind::RestoreSessionState)
-        );
-        assert!(
-            set_goal
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("previous_goal")
         );
 
         let compress = tool_action_profile("compress_context", &json!({"turns": 4}));
