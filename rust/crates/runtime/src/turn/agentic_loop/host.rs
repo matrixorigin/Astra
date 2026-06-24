@@ -133,6 +133,12 @@ pub struct HostTurnResult {
     pub error_kind: Option<astra_core::ErrorKind>,
 }
 
+pub enum ControlToolRecovery {
+    Unsupported,
+    Missing,
+    Recovered(EdgeToolExecResult),
+}
+
 pub use astra_turn_core::interaction_types::{
     ASK_USER_TOOL_NAME, TurnInteractionMode, TurnInteractionPolicy,
     interaction_scoped_tool_restrictions, tool_counts_as_factual_evidence,
@@ -300,31 +306,22 @@ pub trait AgenticLoopHost: Send {
         astra_turn_core::capability::CapabilitySet::all()
     }
 
-    /// Whether this host has an authoritative state source for recovering a
-    /// missing post-SSE edge row for `tool_name`.
-    ///
-    /// The loop asks this before calling
-    /// [`AgenticLoopHost::recover_missing_control_tool_result`] so the runtime
-    /// stays tool-agnostic and hosts own their concrete control capabilities.
-    fn can_recover_missing_control_tool_result(&self, _tool_name: &str) -> bool {
-        false
-    }
-
     /// Recover a host-owned control-tool result when the LLM emitted a tool
     /// call but the post-SSE edge result row is missing.
     ///
     /// This is intentionally host-scoped: replaying arbitrary missing tools
     /// would duplicate side effects. Implementations must recover only from
     /// an authoritative host state source, such as the multi-agent fanout
-    /// registry for `agent_fanout`.
+    /// registry for `agent_fanout`, and must return [`ControlToolRecovery::Unsupported`]
+    /// for tool names they do not own.
     async fn recover_missing_control_tool_result(
         &mut self,
         _parent_run_id: Option<&str>,
         _tool_call_id: &str,
         _tool_name: &str,
         _args: &Value,
-    ) -> Option<EdgeToolExecResult> {
-        None
+    ) -> ControlToolRecovery {
+        ControlToolRecovery::Unsupported
     }
 
     /// Inject an additional tool schema into the host's tool list.
@@ -2557,6 +2554,7 @@ pub(crate) mod tests {
         /// populated that field.
         pub(crate) turn_completed_run_ids: Vec<Option<String>>,
         pub(crate) cancelled_agent_ids: Vec<String>,
+        pub(crate) cancel_child_agents_delay: Option<std::time::Duration>,
     }
 
     impl MockHost {
@@ -2576,6 +2574,7 @@ pub(crate) mod tests {
                 recovered_control_requests: Vec::new(),
                 turn_completed_run_ids: Vec::new(),
                 cancelled_agent_ids: Vec::new(),
+                cancel_child_agents_delay: None,
             }
         }
 
@@ -2601,6 +2600,11 @@ pub(crate) mod tests {
         ) -> Self {
             self.recovered_control_results
                 .insert(tool_call_id.to_string(), result);
+            self
+        }
+
+        pub(crate) fn with_cancel_child_agents_delay(mut self, delay: std::time::Duration) -> Self {
+            self.cancel_child_agents_delay = Some(delay);
             self
         }
 
@@ -2631,26 +2635,36 @@ pub(crate) mod tests {
             self.turn_intent.clone()
         }
 
-        fn can_recover_missing_control_tool_result(&self, tool_name: &str) -> bool {
-            self.recovered_control_results
-                .values()
-                .any(|result| result.tool == tool_name)
-        }
-
         async fn recover_missing_control_tool_result(
             &mut self,
             parent_run_id: Option<&str>,
             tool_call_id: &str,
             tool_name: &str,
             args: &Value,
-        ) -> Option<EdgeToolExecResult> {
+        ) -> ControlToolRecovery {
+            let Some(result) = self.recovered_control_results.remove(tool_call_id) else {
+                return if self
+                    .recovered_control_results
+                    .values()
+                    .any(|result| result.tool == tool_name)
+                {
+                    ControlToolRecovery::Missing
+                } else {
+                    ControlToolRecovery::Unsupported
+                };
+            };
+            if result.tool != tool_name {
+                self.recovered_control_results
+                    .insert(tool_call_id.to_string(), result);
+                return ControlToolRecovery::Unsupported;
+            }
             self.recovered_control_requests.push((
                 parent_run_id.map(str::to_string),
                 tool_call_id.to_string(),
                 tool_name.to_string(),
                 args.clone(),
             ));
-            self.recovered_control_results.remove(tool_call_id)
+            ControlToolRecovery::Recovered(result)
         }
 
         fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
@@ -2689,6 +2703,9 @@ pub(crate) mod tests {
             agent_ids: &[String],
             _reason: &str,
         ) -> Vec<String> {
+            if let Some(delay) = self.cancel_child_agents_delay {
+                tokio::time::sleep(delay).await;
+            }
             self.cancelled_agent_ids.extend(agent_ids.iter().cloned());
             agent_ids.to_vec()
         }

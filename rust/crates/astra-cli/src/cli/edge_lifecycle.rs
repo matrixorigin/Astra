@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::cli::chat_stream::edge_executor_instance_id;
-use crate::cli::session::session_runtime::{attempt_token_refresh, current_access_token};
+use crate::cli::session::session_runtime::{
+    attempt_token_refresh, current_access_token, fresh_access_token,
+};
 use astra_thin_client::edge::edge_runtime_environment_capabilities;
 use astra_thin_client::{EdgeHeartbeatRequest, EdgeRegisterRequest, ThinClient, ThinClientError};
 use tokio_util::sync::CancellationToken;
@@ -403,7 +405,7 @@ pub fn spawn_edge_heartbeat(
 /// sandbox state, approval expansions, and cancellation token.
 async fn reexecute_pending_requests(
     api: &ThinClient,
-    token: &str,
+    _token: &str,
     profile: Option<&str>,
     executor_id: &str,
     pending: &[serde_json::Value],
@@ -418,7 +420,13 @@ async fn reexecute_pending_requests(
         std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(&project_root))
     };
     let cancel_token = edge_lifecycle().registered_replay_cancel_token();
-    let mut replay_token = current_access_token(profile).unwrap_or_else(|| token.to_string());
+    let Some(mut replay_token) = fresh_access_token(api, profile).await else {
+        tracing::warn!(
+            target: "astra.edge.reconnect",
+            "reconnection: skipped pending tool replay because no fresh access token is available"
+        );
+        return;
+    };
 
     for req in pending {
         let request_id = match req.get("request_id").and_then(|v| v.as_str()) {
@@ -509,19 +517,30 @@ async fn reexecute_pending_requests(
         executor_id: &str,
         body: &astra_thin_client::ToolResultRequest,
     ) -> Result<(), ThinClientError> {
-        if let Some(fresh) = current_access_token(profile) {
-            *replay_token = fresh;
-        }
+        let Some(fresh) = fresh_access_token(api, profile).await else {
+            return Err(ThinClientError::InvalidInput(format!(
+                "refusing to post replayed tool result '{}' without a fresh access token",
+                body.request_id
+            )));
+        };
+        *replay_token = fresh;
 
         match api
             .post_tool_result(Some(replay_token.as_str()), Some(executor_id), body)
             .await
         {
             Ok(_) => Ok(()),
-            Err(err) if is_unauthorized(&err) && attempt_token_refresh(api, profile).await => {
-                if let Some(fresh) = current_access_token(profile) {
-                    *replay_token = fresh;
+            Err(err) if is_unauthorized(&err) => {
+                if !attempt_token_refresh(api, profile).await {
+                    return Err(err);
                 }
+                let Some(fresh) = fresh_access_token(api, profile).await else {
+                    return Err(ThinClientError::InvalidInput(format!(
+                        "token refresh completed but no fresh access token is available for replayed tool result '{}'",
+                        body.request_id
+                    )));
+                };
+                *replay_token = fresh;
                 api.post_tool_result(Some(replay_token.as_str()), Some(executor_id), body)
                     .await
                     .map(|_| ())
@@ -597,7 +616,7 @@ mod tests {
         PendingToolRequestGuard, ReplayInFlightGuard, attach_runtime_environment_capabilities,
         backoff_delay, completed_request_ids_snapshot, edge_cloud_registry_enabled, edge_lifecycle,
         enrich_register_body, heartbeat_period, jitter, record_completed_request,
-        register_edge_once, send_heartbeat,
+        reexecute_pending_requests, register_edge_once, send_heartbeat,
     };
     use astra_thin_client::{ASTRA_EDGE_ID_HEADER, EdgeRegisterRequest, ThinClient};
     use serial_test::serial;
@@ -823,6 +842,40 @@ mod tests {
         );
 
         ctx.pending_tool_requests.store(0, Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn replay_skips_pending_tools_when_no_fresh_token_is_available() {
+        let prev_token = std::env::var("ASTRA_ACCESS_TOKEN").ok();
+        env_remove("ASTRA_ACCESS_TOKEN");
+
+        let server = MockServer::start().await;
+        let api = ThinClient::new(&server.uri(), None).expect("url");
+        let pending = vec![serde_json::json!({
+            "request_id": "req-stale-replay",
+            "tool_name": "bash",
+            "args": {"cmd": "echo should-not-run"}
+        })];
+
+        reexecute_pending_requests(
+            &api,
+            "stale-token-from-old-sse-loop",
+            Some("__missing_edge_replay_profile__"),
+            "edge-test",
+            &pending,
+        )
+        .await;
+
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "edge replay must not reuse the old SSE token argument as a posting credential"
+        );
+
+        match prev_token {
+            Some(value) => env_set("ASTRA_ACCESS_TOKEN", &value),
+            None => env_remove("ASTRA_ACCESS_TOKEN"),
+        }
     }
 
     #[test]

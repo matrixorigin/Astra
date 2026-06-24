@@ -30,8 +30,8 @@ use super::super::agentic::tool_interception::{PreparedToolRound, prepare_interc
 use super::execution_phase::{TurnExecutionPhase, observe_turn_end_without_tools};
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CONSECUTIVE_ERROR_BUDGET,
-    MAX_TRACKED_FILE_READS, extract_file_path_from_tool, finalize_and_render, finalize_turn_trace,
-    record_edge_tool_observability,
+    ControlToolRecovery, MAX_TRACKED_FILE_READS, extract_file_path_from_tool, finalize_and_render,
+    finalize_turn_trace, record_edge_tool_observability,
 };
 use super::lifecycle::{TurnIterationPrep, current_agentic_step, session_turn_number};
 use astra_turn_core::agentic_post_tool_policy::{
@@ -203,9 +203,6 @@ async fn recover_missing_control_tool_results<H: AgenticLoopHost>(
         let Some(tool_name) = tool_call_name(tool_call) else {
             continue;
         };
-        if !host.can_recover_missing_control_tool_result(tool_name) {
-            continue;
-        }
         let Some(tool_call_id) = tool_call.get("id").and_then(Value::as_str) else {
             tracing::warn!(
                 target: "astra_runtime::agentic_loop_tool_phase",
@@ -221,17 +218,21 @@ async fn recover_missing_control_tool_results<H: AgenticLoopHost>(
         {
             continue;
         }
-        let Some(recovered) = host
+        let recovered = match host
             .recover_missing_control_tool_result(parent_run_id, tool_call_id, tool_name, &args)
             .await
-        else {
-            tracing::warn!(
-                target: "astra_runtime::agentic_loop_tool_phase",
-                tool_name,
-                tool_call_id,
-                "control-tool edge row missing and host could not recover it"
-            );
-            continue;
+        {
+            ControlToolRecovery::Unsupported => continue,
+            ControlToolRecovery::Missing => {
+                tracing::warn!(
+                    target: "astra_runtime::agentic_loop_tool_phase",
+                    tool_name,
+                    tool_call_id,
+                    "control-tool edge row missing and host could not recover it"
+                );
+                continue;
+            }
+            ControlToolRecovery::Recovered(recovered) => recovered,
         };
         tracing::warn!(
             target: "astra_runtime::agentic_loop_tool_phase",
@@ -2265,6 +2266,44 @@ mod tests {
                 .map(|(_, tool_call_id, _, _)| tool_call_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["call-fanout-b"]
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_non_control_tool_row_is_not_recovered_by_host_state() {
+        let recovered = EdgeToolExecResult {
+            request_id: "call-fanout".to_string(),
+            tool: "agent_fanout".to_string(),
+            args: json!({"action": "get_results", "group_id": "review"}),
+            output: json!({"status": "completed", "group_id": "review"}).to_string(),
+            tool_result_fields: None,
+            status: "completed".to_string(),
+            duration_ms: 0,
+        };
+        let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(Vec::new())
+            .with_recovered_control_tool_result("call-fanout", recovered);
+        let tool_calls = vec![json!({
+            "id": "call-bash",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": serde_json::to_string(&json!({"cmd": "echo hi"})).unwrap(),
+            }
+        })];
+        let mut edge_tool_round = Vec::new();
+
+        recover_missing_control_tool_results(
+            &mut host,
+            Some("run-parent"),
+            &tool_calls,
+            &mut edge_tool_round,
+        )
+        .await;
+
+        assert!(edge_tool_round.is_empty());
+        assert!(
+            host.recovered_control_requests.is_empty(),
+            "ordinary missing tool rows must not consume host-owned control recovery state"
         );
     }
 

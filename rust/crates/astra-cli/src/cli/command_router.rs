@@ -90,6 +90,24 @@ async fn fresh_access_token_or_error(
         })
 }
 
+fn repl_bridge_command_requires_access_token(slash_cmd: &str) -> bool {
+    matches!(
+        slash_cmd,
+        "/team" | "/task" | "/memory" | "/plan" | "/review" | "/grep"
+    )
+}
+
+async fn repl_bridge_access_token(
+    slash_cmd: &str,
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+) -> Result<Option<String>, String> {
+    if repl_bridge_command_requires_access_token(slash_cmd) {
+        return fresh_access_token_or_error(api, profile).await.map(Some);
+    }
+    Ok(session_runtime::fresh_access_token(api, profile).await)
+}
+
 impl From<ExitCode> for i32 {
     fn from(code: ExitCode) -> i32 {
         code as i32
@@ -1019,7 +1037,7 @@ async fn execute_repl_bridge_command(
     state.unified_skill_registry = pipeline_modules.unified_skill_registry.clone();
     state.mcp_manager = pipeline_modules.mcp_manager.clone();
 
-    let token = session_runtime::fresh_access_token(api, profile).await;
+    let token = repl_bridge_access_token(slash_cmd, api, profile).await?;
     if let Some(ref tok) = token {
         maybe_wire_delegation_engine(&mut state, api, tok);
     }
@@ -1108,18 +1126,73 @@ mod permission_mode_display_tests {
 
 #[cfg(test)]
 mod token_refresh_error_tests {
+    use super::{repl_bridge_access_token, repl_bridge_command_requires_access_token};
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: callers use `#[serial]` to isolate process env mutation.
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => {
+                    // SAFETY: callers use `#[serial]` to isolate process env mutation.
+                    unsafe { std::env::set_var(self.key, value) };
+                }
+                None => {
+                    // SAFETY: callers use `#[serial]` to isolate process env mutation.
+                    unsafe { std::env::remove_var(self.key) };
+                }
+            }
+        }
+    }
+
     #[test]
-    fn command_router_does_not_fall_back_to_stale_token_after_refresh_failure() {
-        let source = include_str!("command_router.rs");
-        let stale_fallback_pattern = [".unwrap_or(", "token)"].concat();
+    fn repl_bridge_auth_policy_matches_command_capabilities() {
+        for command in ["/team", "/task", "/memory", "/plan", "/review", "/grep"] {
+            assert!(
+                repl_bridge_command_requires_access_token(command),
+                "{command} needs cloud auth or delegation wiring and must fail fast"
+            );
+        }
+        for command in ["/diff", "/allow", "/debug", "/bug", "/agent", "/telemetry"] {
+            assert!(
+                !repl_bridge_command_requires_access_token(command),
+                "{command} must remain available without cloud auth"
+            );
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn repl_bridge_auth_policy_fails_fast_only_for_cloud_commands() {
+        let _env = EnvVarGuard::remove("ASTRA_ACCESS_TOKEN");
+
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let missing_profile = Some("__missing_repl_bridge_auth_test_profile__");
+
+        let err = repl_bridge_access_token("/task", &api, missing_profile)
+            .await
+            .unwrap_err();
         assert!(
-            source.contains("fresh_access_token_or_error"),
-            "one-shot command paths must use the shared fail-fast token refresh helper"
+            err.contains("Unable to obtain a valid access token"),
+            "cloud-backed slash commands should fail before running half-wired: {err}"
         );
-        assert!(
-            !source.contains(&stale_fallback_pattern),
-            "fresh_access_token failures must not silently reuse stale credentials"
-        );
+
+        let local_token = repl_bridge_access_token("/diff", &api, missing_profile)
+            .await
+            .expect("local slash command auth lookup should be best-effort");
+        assert_eq!(local_token, None);
     }
 }
 

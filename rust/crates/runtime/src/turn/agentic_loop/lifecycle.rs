@@ -24,6 +24,8 @@ use astra_turn_core::interruption::{
 };
 use astra_turn_core::stall::CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG;
 
+const CHILD_AGENT_CANCEL_TIMEOUT: Duration = Duration::from_secs(3);
+
 #[derive(Clone, Copy)]
 pub(crate) struct TurnIterationPrep {
     pub(crate) quiet: bool,
@@ -419,6 +421,33 @@ fn budget_exhaustion_completion_text(
 ) -> String {
     parallel_agent_budget_exhaustion_summary(state, cancelled_agents)
         .unwrap_or_else(|| default_budget_exhaustion_completion_text(state))
+}
+
+async fn cancel_child_agents_with_timeout<H: AgenticLoopHost>(
+    host: &mut H,
+    agent_ids: Vec<String>,
+    reason: &str,
+) -> HashSet<String> {
+    if agent_ids.is_empty() {
+        return HashSet::new();
+    }
+    match tokio::time::timeout(
+        CHILD_AGENT_CANCEL_TIMEOUT,
+        host.cancel_child_agents(&agent_ids, reason),
+    )
+    .await
+    {
+        Ok(cancelled) => cancelled.into_iter().collect(),
+        Err(_) => {
+            tracing::warn!(
+                target: "astra_runtime::agentic_loop_lifecycle",
+                agent_count = agent_ids.len(),
+                timeout_ms = CHILD_AGENT_CANCEL_TIMEOUT.as_millis() as u64,
+                "timed out while cancelling unfinished child agents"
+            );
+            HashSet::new()
+        }
+    }
 }
 
 fn used_budget_extensions(state: &AgenticLoopState) -> u32 {
@@ -1339,14 +1368,12 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 ResumeAction::ContinueImmediately,
                 interruption_state_summary(state, None),
             ));
-            let cancelled_agents: HashSet<String> = host
-                .cancel_child_agents(
-                    &unfinished_parallel_agent_ids(state),
-                    "parent turn budget exhausted",
-                )
-                .await
-                .into_iter()
-                .collect();
+            let cancelled_agents = cancel_child_agents_with_timeout(
+                host,
+                unfinished_parallel_agent_ids(state),
+                "parent turn budget exhausted",
+            )
+            .await;
             state.final_text = budget_exhaustion_completion_text(state, &cancelled_agents);
             state.final_text_streamed = false;
             if !quiet {
@@ -2676,6 +2703,28 @@ mod tests {
             state.final_text.contains("parent cancelled this sub-agent"),
             "{}",
             state.final_text
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn child_agent_cancel_timeout_does_not_block_budget_wrapup() {
+        let mut host = MockHost::new(Vec::new())
+            .with_cancel_child_agents_delay(CHILD_AGENT_CANCEL_TIMEOUT + Duration::from_secs(30));
+
+        let cancelled = cancel_child_agents_with_timeout(
+            &mut host,
+            vec!["agent-c".to_string()],
+            "parent turn budget exhausted",
+        )
+        .await;
+
+        assert!(
+            cancelled.is_empty(),
+            "a hung child-agent cancel hook should not claim cancellation"
+        );
+        assert!(
+            host.cancelled_agent_ids.is_empty(),
+            "timeout must cancel the host future before it mutates cancellation state"
         );
     }
 
