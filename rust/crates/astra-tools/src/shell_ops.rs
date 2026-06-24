@@ -1345,6 +1345,14 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         stdout
     };
 
+    // Count mode with all-zero results should report as no matches (exit 1)
+    let effective_exit_code =
+        if output_mode == SearchOutputMode::Count && filtered.trim().is_empty() && exit_code == 0 {
+            1
+        } else {
+            exit_code
+        };
+
     let mut lines: Vec<String> = filtered
         .lines()
         .map(|line| compact_grep_output_line(&normalize_grep_output_line(line, output_mode)))
@@ -1375,7 +1383,7 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
                 stdout_capped,
                 stderr.trim(),
             ),
-            exit_code,
+            effective_exit_code,
             timed_out,
             cancelled,
         );

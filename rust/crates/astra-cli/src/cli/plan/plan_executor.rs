@@ -1547,6 +1547,7 @@ async fn plan_executor_task(
                     render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
                     cli_context: Some(&ctx.cli_context),
                     recent_tools: &ctx.recent_tools,
+                    activated_deferred_tool_names: None,
                     tool_health_entries: &ctx.tool_health_entries,
                     resume_restricted_tools: &[],
                     session_lessons: &[],

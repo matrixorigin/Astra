@@ -281,6 +281,9 @@ pub(crate) struct SessionState {
     /// Most recent non-empty tool usage context — fed into tool-surface
     /// continuity for short follow-up turns.
     pub recent_tools: Vec<String>,
+    /// Deferred tools selected with `tool_search(select:...)` but not yet
+    /// consumed by a visible tool call.
+    pub activated_deferred_tool_names: Vec<String>,
     /// Session-persistent permission manager — "always"/"skip" survives across turns.
     pub perm_manager: PermissionManager,
     /// User ID for event ingestion attribution.
@@ -622,6 +625,7 @@ impl Default for SessionState {
             context_budget: prompts::ContextBudget::default(),
             journal: None,
             recent_tools: Vec::new(),
+            activated_deferred_tool_names: Vec::new(),
             perm_manager: PermissionManager::with_workspace_trust(
                 default_auto_approve_from_env(),
                 &std::env::current_dir().unwrap_or_default(),
@@ -802,6 +806,7 @@ impl SessionState {
         self.total_session_cost = 0.0;
         self.journal = None;
         self.recent_tools.clear();
+        self.activated_deferred_tool_names.clear();
         self.executing_plan = None;
         self.plan_execution_config = None;
         self.executing_plan_goal = None;
@@ -928,6 +933,7 @@ mod default_tests {
             total_cache_creation_tokens: 44,
             total_session_cost: 1.25,
             recent_tools: vec!["bash".into()],
+            activated_deferred_tool_names: vec!["write_file".into()],
             redo_stack: vec![("u".into(), "a".into(), 1)],
             resume_guidance: Some("resume".into()),
             resume_restricted_tools: vec!["read_file".into()],
@@ -976,6 +982,7 @@ mod default_tests {
         assert_eq!(state.total_cache_creation_tokens, 0);
         assert_eq!(state.total_session_cost, 0.0);
         assert!(state.recent_tools.is_empty());
+        assert!(state.activated_deferred_tool_names.is_empty());
         assert!(state.redo_stack.is_empty());
         assert!(state.resume_guidance.is_none());
         assert!(state.resume_restricted_tools.is_empty());
@@ -1149,6 +1156,7 @@ mod default_tests {
             session_id: Some("sess-restore".into()),
             history: vec![("u".into(), "a".into())],
             recent_tools: vec!["bash".into()],
+            activated_deferred_tool_names: vec!["write_file".into()],
             discovered_skills: ["skill-b".to_string()].into_iter().collect(),
             executing_plan_id: Some("plan-1".into()),
             plan_execution_last_error: Some("stale".into()),
@@ -1165,6 +1173,7 @@ mod default_tests {
         assert!(state.session_id.is_none());
         assert!(state.history.is_empty());
         assert!(state.recent_tools.is_empty());
+        assert!(state.activated_deferred_tool_names.is_empty());
         assert!(state.discovered_skills.is_empty());
         assert!(state.executing_plan_id.is_none());
         assert!(state.plan_execution_last_error.is_none());

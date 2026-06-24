@@ -76,6 +76,8 @@ pub struct SessionStateCompact {
     pub blocked_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activated_deferred_tool_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_overrides: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,6 +117,8 @@ pub struct SessionStatePatch {
     pub blocked_tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent_tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activated_deferred_tool_names: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "nullable")]
     pub approval_overrides: Option<Option<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "nullable")]
@@ -178,6 +182,9 @@ impl SessionStateCompact {
         }
         if let Some(rt) = &patch.recent_tools {
             self.recent_tools = rt.clone();
+        }
+        if let Some(names) = &patch.activated_deferred_tool_names {
+            self.activated_deferred_tool_names = names.clone();
         }
         if let Some(ao) = &patch.approval_overrides {
             self.approval_overrides = ao.clone();
@@ -562,6 +569,7 @@ mod tests {
                 vec![user_msg("turn3")],
                 SessionStatePatch {
                     recent_tools: Some(vec!["read_file".into()]),
+                    activated_deferred_tool_names: Some(vec!["write_file".into()]),
                     ..Default::default()
                 },
             ),
@@ -572,6 +580,10 @@ mod tests {
             vec!["bash", "write_file"]
         );
         assert_eq!(state.session_state.recent_tools, vec!["read_file"]);
+        assert_eq!(
+            state.session_state.activated_deferred_tool_names,
+            vec!["write_file"]
+        );
         // budget_remaining_tokens unchanged from snapshot (no patch touched it)
         assert_eq!(state.session_state.budget_remaining_tokens, 100_000);
     }
@@ -626,6 +638,7 @@ mod tests {
         let json = serde_json::to_string(&entry).unwrap();
         // recent_tools, approval_overrides, interruption should be absent
         assert!(!json.contains("recent_tools"));
+        assert!(!json.contains("activated_deferred_tool_names"));
         assert!(!json.contains("approval_overrides"));
         assert!(!json.contains("interruption"));
         // blocked_tools should be present
@@ -717,6 +730,7 @@ mod tests {
         let mut state = SessionStateCompact {
             blocked_tools: vec!["old".into()],
             recent_tools: vec!["old_tool".into()],
+            activated_deferred_tool_names: vec!["old_deferred".into()],
             approval_overrides: Some(json!({"old": true})),
             interruption: Some(json!({"old": "reason"})),
             ..Default::default()
@@ -724,6 +738,7 @@ mod tests {
         let patch = SessionStatePatch {
             blocked_tools: Some(vec!["new".into()]),
             recent_tools: Some(vec!["new_tool".into()]),
+            activated_deferred_tool_names: Some(vec!["new_deferred".into()]),
             approval_overrides: Some(Some(json!({"new": true}))),
             interruption: Some(Some(json!({"new": "reason"}))),
             budget_remaining_tokens: Some(42_000),
@@ -734,6 +749,7 @@ mod tests {
         state.apply_patch(&patch);
         assert_eq!(state.blocked_tools, vec!["new"]);
         assert_eq!(state.recent_tools, vec!["new_tool"]);
+        assert_eq!(state.activated_deferred_tool_names, vec!["new_deferred"]);
         assert_eq!(state.approval_overrides, Some(json!({"new": true})));
         assert_eq!(state.interruption, Some(json!({"new": "reason"})));
         assert_eq!(state.budget_remaining_tokens, 42_000);
@@ -780,6 +796,7 @@ mod tests {
         let state = SessionStateCompact {
             blocked_tools: vec!["bash".into()],
             recent_tools: vec!["read_file".into()],
+            activated_deferred_tool_names: vec!["write_file".into()],
             approval_overrides: Some(json!({"tool": "bash"})),
             compaction_tracker: Some(json!({"version": 1})),
             budget_remaining_tokens: 50_000,

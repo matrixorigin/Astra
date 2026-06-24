@@ -30,6 +30,13 @@ pub const EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW: &str = "deferred_tools
 /// resolve deferred names without re-parsing the rendered XML.
 pub const EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES: &str = "deferred_tool_names";
 
+/// Protocol key carrying deferred tool names omitted from the rendered
+/// `<deferred_tools>` block because the session-stable manifest hit its model
+/// budget. This is observability metadata only: omitted names are not
+/// activatable through `tool_search(select:NAME)` until they are rendered in a
+/// later manifest or found by keyword search.
+pub const EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES: &str = "deferred_tool_omitted_names";
+
 /// Protocol key carrying the JSON array of always-load (T1) tool names from the
 /// CLI-side [`ToolSurface`]. The runtime uses this to place cache_control
 /// markers at the correct always-load/dynamic boundary so the Anthropic prompt

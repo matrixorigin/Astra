@@ -11,7 +11,7 @@ use crate::tool::schema::tool_schema_name;
 /// Build an index mapping tool name → first schema with that name.
 /// O(all_schemas.len()) construction, O(1) lookup. Multiple schemas
 /// for the same name keep only the first occurrence.
-fn index_schemas_by_name<'a>(all_schemas: &'a [Value]) -> HashMap<&'a str, &'a Value> {
+fn index_schemas_by_name(all_schemas: &[Value]) -> HashMap<&str, &Value> {
     let mut map = HashMap::with_capacity(all_schemas.len());
     for schema in all_schemas {
         if let Some(name) = tool_schema_name(schema) {

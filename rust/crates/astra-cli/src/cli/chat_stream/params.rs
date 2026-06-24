@@ -332,6 +332,7 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) cli_context: Option<&'a CliContext>,
 
     pub(crate) recent_tools: &'a [String],
+    pub(crate) activated_deferred_tool_names: Option<&'a mut Vec<String>>,
     pub(crate) tool_health_entries: &'a [ToolHealthEntry],
     pub(crate) resume_restricted_tools: &'a [String],
     /// P6 seam: cross-session lessons loaded once at session bootstrap.
@@ -576,6 +577,7 @@ impl<'a> ChatTurnParams<'a> {
             cli_context: ctx.cli_context,
 
             recent_tools: &[],
+            activated_deferred_tool_names: None,
             tool_health_entries: &[],
             resume_restricted_tools: &[],
             session_lessons: &[],

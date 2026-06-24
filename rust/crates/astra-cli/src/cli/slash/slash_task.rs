@@ -388,6 +388,7 @@ pub(crate) async fn handle_task_command(
                     render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
                     cli_context: Some(&bg_cli_context),
                     recent_tools: &[],
+                    activated_deferred_tool_names: None,
                     tool_health_entries: &[],
                     resume_restricted_tools: &[],
                     session_lessons: &[],

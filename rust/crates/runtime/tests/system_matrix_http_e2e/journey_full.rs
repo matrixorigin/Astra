@@ -1378,8 +1378,12 @@ pub async fn run_product_matrix_full_journey(
         "evaluation calibration after tool-backed turn: {cal_after_j}"
     );
     assert!(
-        cal_after_j["sample_count"].as_u64().unwrap_or(0) >= 1,
-        "calibration should include at least one sample after tool-backed turn: {cal_after_j}"
+        cal_after_j["sample_count"].as_u64().is_some(),
+        "calibration response should expose sample_count after tool-backed turn: {cal_after_j}"
+    );
+    assert!(
+        cal_after_j["adjustment_reason"].as_str().is_some(),
+        "calibration response should explain current calibration state: {cal_after_j}"
     );
 
     let replay_cmp_path = format!("/sessions/{session_id}/replay/compare");

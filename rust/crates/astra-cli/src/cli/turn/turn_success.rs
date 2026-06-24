@@ -91,6 +91,7 @@ struct TurnSuccessLiveSnapshot {
     redo_stack: Vec<(String, String, u32)>,
     history: Vec<(String, String)>,
     recent_tools: Vec<String>,
+    activated_deferred_tool_names: Vec<String>,
     resume_restricted_tools: Vec<String>,
     tool_health_entries: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
     latest_turn_quality_feedback: Option<astra_runtime::self_model::TurnQualityFeedback>,
@@ -127,6 +128,7 @@ impl TurnSuccessLiveSnapshot {
             redo_stack: state.redo_stack.clone(),
             history: state.history.clone(),
             recent_tools: state.recent_tools.clone(),
+            activated_deferred_tool_names: state.activated_deferred_tool_names.clone(),
             resume_restricted_tools: state.resume_restricted_tools.clone(),
             tool_health_entries: state.tool_health_entries.clone(),
             latest_turn_quality_feedback: state.latest_turn_quality_feedback.clone(),
@@ -168,6 +170,7 @@ impl TurnSuccessLiveSnapshot {
         state.redo_stack = self.redo_stack;
         state.history = self.history;
         state.recent_tools = self.recent_tools;
+        state.activated_deferred_tool_names = self.activated_deferred_tool_names;
         state.resume_restricted_tools = self.resume_restricted_tools;
         state.tool_health_entries = self.tool_health_entries;
         state.latest_turn_quality_feedback = self.latest_turn_quality_feedback;

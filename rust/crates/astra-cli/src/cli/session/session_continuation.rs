@@ -37,47 +37,25 @@ pub(crate) fn load_session_messages_for_continuation(
 pub(crate) fn sanitize_continuation_messages(
     mut msgs: Vec<serde_json::Value>,
 ) -> Vec<serde_json::Value> {
+    msgs = astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(msgs);
     msgs.retain(|m| {
         let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
         let content_text = extract_text_content(m);
         let content = content_text.as_deref().unwrap_or("");
         !astra_turn_core::runtime_scaffolding::is_continuation_scaffolding_for_role(role, content)
     });
-    trim_trailing_incomplete_tool_round(&mut msgs);
     msgs
 }
 
 /// Extract text content from a message regardless of format.
 /// Handles both string content and array-format content blocks.
 pub(crate) fn extract_text_content(msg: &serde_json::Value) -> Option<String> {
-    if let Some(s) = msg.get("content").and_then(|c| c.as_str()) {
-        return Some(s.to_string());
-    }
-    if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
-        let texts: Vec<&str> = arr
-            .iter()
-            .filter_map(|block| {
-                let kind = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                match kind {
-                    "text" | "output_text" => block
-                        .get("text")
-                        .or_else(|| block.get("content"))
-                        .and_then(|t| t.as_str()),
-                    _ => None,
-                }
-            })
-            .collect();
-        if !texts.is_empty() {
-            return Some(texts.join("\n"));
-        }
-    }
-    None
+    astra_turn_core::prompt_facing::extract_text_content(msg)
 }
 
 /// Reconstruct CLI `(user, assistant)` history pairs from OpenAI-style messages.
 ///
 /// Rules:
-/// - preserve assistant-only context entries such as manual compaction summaries,
 /// - ignore tool/system messages,
 /// - ignore assistant tool-call stubs that have no visible text,
 /// - concatenate multiple visible assistant chunks in the same turn.
@@ -105,6 +83,9 @@ pub(crate) fn history_pairs_from_messages(msgs: &[serde_json::Value]) -> Vec<(St
                 if text.trim().is_empty() {
                     continue;
                 }
+                if current_user.is_empty() {
+                    continue;
+                }
                 if current_assistant.is_empty() {
                     current_assistant = text;
                 } else {
@@ -122,48 +103,6 @@ pub(crate) fn history_pairs_from_messages(msgs: &[serde_json::Value]) -> Vec<(St
 
     pairs
 }
-
-/// If the conversation ends with an incomplete tool round (assistant tool_use
-/// → tool results, but no final assistant text), trim back to the last
-/// complete exchange. This prevents the model from continuing a stale tool
-/// loop from the previous turn.
-fn trim_trailing_incomplete_tool_round(msgs: &mut Vec<serde_json::Value>) {
-    let mut cut_at = None;
-    for i in (0..msgs.len()).rev() {
-        let role = msgs[i].get("role").and_then(|r| r.as_str()).unwrap_or("");
-        match role {
-            "tool" => continue,
-            "assistant" => {
-                if has_tool_use_content(&msgs[i]) {
-                    cut_at = Some(i);
-                    continue;
-                }
-                break;
-            }
-            _ => break,
-        }
-    }
-    if let Some(cut) = cut_at {
-        msgs.truncate(cut);
-    }
-}
-
-fn has_tool_use_content(msg: &serde_json::Value) -> bool {
-    if msg
-        .get("tool_calls")
-        .and_then(|v| v.as_array())
-        .is_some_and(|a| !a.is_empty())
-    {
-        return true;
-    }
-    if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
-        return content
-            .iter()
-            .any(|c| c.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use astra_pipeline::step_protocol::{ExecutionCursor, StepCheckpoint};
@@ -241,6 +180,31 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_compaction_boundary_drops_pre_boundary_stale_goal() {
+        let msgs = vec![
+            json!({"role": "user", "content": "3 agents 不同角度review这个分支的所有changes"}),
+            json!({"role": "assistant", "content": "review summary"}),
+            json!({"role": "system", "content": "[Context compacted: older messages were removed to reduce token pressure. The conversation continues below.]"}),
+            json!({"role": "user", "content": "不要review啊！"}),
+            json!({"role": "assistant", "reasoning_content": "Maybe continue the old review"}),
+            json!({"role": "tool", "content": "No matches found", "tool_call_id": "c1"}),
+            json!({"role": "assistant", "content": "明白，不做 review。"}),
+        ];
+
+        let result = super::sanitize_continuation_messages(msgs);
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0]["role"], "system");
+        assert_eq!(result[1]["content"], "不要review啊！");
+        assert_eq!(result[2]["content"], "明白，不做 review。");
+        assert!(
+            result
+                .iter()
+                .all(|msg| !msg["content"].as_str().unwrap_or("").contains("3 agents"))
+        );
+    }
+
+    #[test]
     fn sanitize_strips_obsolete_active_task_attachment_garbage() {
         let msgs = vec![
             json!({"role": "user", "content": "review code"}),
@@ -308,12 +272,12 @@ mod tests {
 
         let result = super::sanitize_continuation_messages(msgs);
 
-        assert_eq!(result.len(), 2);
+        assert_eq!(result.len(), 1);
         assert_eq!(result[0]["content"], "✓ Deployment finished successfully.");
     }
 
     #[test]
-    fn history_pairs_preserve_assistant_only_summary_and_structured_text() {
+    fn history_pairs_drop_assistant_only_trace_and_preserve_structured_text() {
         let msgs = vec![
             json!({"role": "assistant", "content": "Earlier context compacted."}),
             json!({"role": "user", "content": "continue"}),
@@ -325,12 +289,8 @@ mod tests {
 
         let pairs = super::history_pairs_from_messages(&msgs);
 
-        assert_eq!(pairs.len(), 2);
-        assert_eq!(
-            pairs[0],
-            ("".to_string(), "Earlier context compacted.".to_string())
-        );
-        assert_eq!(pairs[1].0, "continue");
-        assert_eq!(pairs[1].1, "Sure.\n\nDone.");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "continue");
+        assert_eq!(pairs[0].1, "Sure.\n\nDone.");
     }
 }

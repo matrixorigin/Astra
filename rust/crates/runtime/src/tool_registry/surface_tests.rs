@@ -425,6 +425,10 @@ fn deferred_manifest_is_atomic_text_budget_and_names() {
             .collect::<Vec<_>>(),
         "producer must expose the exact names rendered in the deferred prompt block"
     );
+    assert!(
+        manifest.omitted_names.is_empty(),
+        "full-budget manifest must not report omitted deferred tools"
+    );
 }
 
 #[test]
@@ -470,6 +474,15 @@ fn deferred_manifest_names_follow_rendered_budget_subset() {
         .iter()
         .find(|name| !manifest.names.contains(name))
         .expect("budgeted manifest should omit at least one name");
+    let expected_omitted: Vec<_> = all_deferred_names
+        .iter()
+        .filter(|name| !manifest.names.contains(name))
+        .cloned()
+        .collect();
+    assert_eq!(
+        manifest.omitted_names, expected_omitted,
+        "manifest must expose every deferred tool omitted by the rendered budget"
+    );
     assert!(
         !manifest.text.contains(&format!("<name>{omitted}</name>")),
         "test setup expected {omitted} to be omitted from rendered prompt"

@@ -27,7 +27,7 @@ use crate::context_assembly_trace::{
     CompressionMethod, ContextAssemblyTrace, ContextAssemblyTraceBuilder, DecisionExplanation,
     HistorySelectionTrace, MemoryRetrievalTrace, SystemPromptBreakdown, TokenBudgetTrace,
     ToolSurfaceTrace, build_history_trace_from_compression, build_memory_trace_from_retrieval,
-    build_tool_surface_trace,
+    build_tool_surface_trace, build_tool_surface_trace_with_deferred,
 };
 
 /// Thread-safe trace collector for a single turn.
@@ -111,6 +111,28 @@ impl TurnTraceCollector {
     ) {
         let trace =
             build_tool_surface_trace(tools_available, visible_tools, per_tool_costs, latency_ms);
+        let mut state = recover_rwlock_write(&self.inner);
+        state.tools = Some(trace);
+    }
+
+    /// Record the concrete tool surface plus deferred activation telemetry.
+    pub fn record_tool_surface_with_deferred(
+        &self,
+        visible_tools: &[String],
+        per_tool_costs: &[(String, u32)],
+        tools_available: u32,
+        latency_ms: u64,
+        deferred_active_tools: &[String],
+        deferred_available: u32,
+    ) {
+        let trace = build_tool_surface_trace_with_deferred(
+            tools_available,
+            visible_tools,
+            per_tool_costs,
+            latency_ms,
+            deferred_active_tools,
+            deferred_available,
+        );
         let mut state = recover_rwlock_write(&self.inner);
         state.tools = Some(trace);
     }
@@ -359,6 +381,28 @@ mod tests {
         assert_eq!(trace.session_id, "session-abc");
         assert_eq!(trace.tools.visible_tools.len(), 2);
         assert_eq!(trace.memory.memories_selected.len(), 1);
+    }
+
+    #[test]
+    fn collector_records_deferred_activation_tool_surface_telemetry() {
+        let collector = TurnTraceCollector::new("turn-1", "session-abc");
+
+        collector.record_tool_surface_with_deferred(
+            &["tool_search".to_string(), "web_fetch".to_string()],
+            &[("tool_search".into(), 90), ("web_fetch".into(), 220)],
+            2,
+            11,
+            &["web_fetch".to_string()],
+            5,
+        );
+
+        let trace = collector.finalize();
+        assert_eq!(
+            trace.tools.deferred_active_tools,
+            vec!["web_fetch".to_string()]
+        );
+        assert_eq!(trace.tools.deferred_available, 5);
+        assert_eq!(trace.tools.surface_latency_ms, 11);
     }
 
     #[test]

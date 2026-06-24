@@ -7,6 +7,7 @@
 mod agentic_loop_turn;
 mod agentic_sse_loop;
 mod cli_loop_host;
+mod deferred_activation_state;
 
 pub(crate) use agentic_loop_turn::turn_policy_from_payload_edge_tools;
 
@@ -449,6 +450,7 @@ pub(crate) async fn stream_chat_sse(
     } else {
         executor.set_plugin_schemas(mcp_runtime_schemas);
     }
+    deferred_activation_state::restore_into_executor(&p.activated_deferred_tool_names, &executor);
     let registry = ToolRegistry::new_runtime_surface(all_schemas.clone());
     let always_load_schema_tokens = registry.total_always_load_token_cost() as u64;
     // Full runtime inventory is used only for static allow/deny policy
@@ -946,6 +948,10 @@ pub(crate) async fn stream_chat_sse(
         s.stop_clear();
     }
     if let Err(e) = run_agentic_loop_with_host(&mut host, &mut state).await {
+        deferred_activation_state::snapshot_from_executor(
+            &mut p.activated_deferred_tool_names,
+            host.executor.as_ref(),
+        );
         finalize_root_mailbox(p.root_mailbox_slot, &mut state.messaging.mailbox).await;
         if let Some(shared) = p.discovered_skills {
             *shared = state.skills.discovered;
@@ -976,6 +982,10 @@ pub(crate) async fn stream_chat_sse(
     }
 
     // ─── Finalize ────────────────────────────────────────────────────────
+    deferred_activation_state::snapshot_from_executor(
+        &mut p.activated_deferred_tool_names,
+        host.executor.as_ref(),
+    );
     // Merge skill quality data back to session-scoped tracker
     *p.skill_quality_tracker = state.skills.quality_tracker.clone();
     if let Some(shared) = p.discovered_skills {
@@ -1195,6 +1205,7 @@ fn load_turn_messages(
     current_message: &str,
 ) -> Vec<serde_json::Value> {
     if let Some(mut msgs) = pre_loaded_messages {
+        msgs = astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(msgs);
         msgs.push(json!({"role": "user", "content": current_message}));
         return msgs;
     }
@@ -1204,7 +1215,7 @@ fn load_turn_messages(
 #[cfg(test)]
 mod tests {
     use super::{
-        circuit_breaker_config_from_tool_policy, detect_turn_hook_sets,
+        circuit_breaker_config_from_tool_policy, detect_turn_hook_sets, load_turn_messages,
         missing_model_selection_journal_event, missing_model_selection_turn_failure,
         normalize_turn_model, refresh_root_permission_context, require_selected_turn_model,
         restored_compaction_effectiveness, root_permission_context_handle,
@@ -1230,6 +1241,32 @@ mod tests {
         assert_eq!(cfg.max_introspect_emissions, 3);
         assert_eq!(cfg.half_open_patience, 2);
         assert_eq!(cfg.absolute_max_rounds, 200);
+    }
+
+    #[test]
+    fn preloaded_turn_messages_drop_stale_pre_compaction_goal_and_trace() {
+        let preloaded = vec![
+            json!({"role": "user", "content": "3 agents review everything"}),
+            json!({"role": "system", "content": "[Context compacted: older messages were removed to reduce token pressure. The conversation continues below.]"}),
+            json!({"role": "user", "content": "不要review啊！"}),
+            json!({"role": "assistant", "reasoning_content": "I may review anyway"}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "No matches"}),
+            json!({"role": "assistant", "content": "明白，不做 review。"}),
+        ];
+
+        let messages = load_turn_messages(Some(preloaded), &[], "修复刚才发现的问题");
+
+        assert_eq!(messages.last().unwrap()["content"], "修复刚才发现的问题");
+        assert!(
+            messages
+                .iter()
+                .all(|msg| msg["role"] != "tool" && msg.get("reasoning_content").is_none())
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|msg| !msg["content"].as_str().unwrap_or("").contains("3 agents"))
+        );
     }
 
     #[test]

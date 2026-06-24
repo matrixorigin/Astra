@@ -68,6 +68,8 @@ async fn persist_turn_csl_snapshot(
         .map(|manager| manager.last_session_state().clone())
         .unwrap_or_default();
     let session_state = build_full_session_state_compact(state, csl_checkpoint_fields, &prev_state);
+    let final_messages =
+        astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(final_messages);
     if let Some(manager) = state.csl_manager.as_mut()
         && let Err(error) = manager
             .persist_turn(turn, &final_messages, &session_state)
@@ -118,7 +120,7 @@ pub(crate) fn extract_csl_fields_from_result(_result: &StreamResult) -> CslCheck
 mod tests {
     use super::{
         build_full_session_state_compact, extract_csl_fields_from_result,
-        run_turn_post_commit_tasks,
+        persist_turn_csl_snapshot, run_turn_post_commit_tasks,
     };
     use crate::cli::session::session_projection::CslCheckpointFields;
     use crate::cli::session::session_state::SessionState;
@@ -167,6 +169,51 @@ mod tests {
         assert!(compact.approval_overrides.is_none());
         assert!(compact.interruption.is_none());
         assert!(compact.compaction_tracker.is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn csl_persist_writes_prompt_facing_messages_only() {
+        use astra_turn_core::conversation_log::{
+            CslStore, file_store::FileCslStore, manager::CslManager,
+        };
+
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("csl-prompt-facing-{}", uuid::Uuid::new_v4());
+        let store = std::sync::Arc::new(FileCslStore::new(
+            astra_services::session_journal::local_owner_sessions_dir(),
+        ));
+        let mgr = CslManager::new(store.clone(), session_id.clone(), Default::default()).unwrap();
+        let mut state = SessionState {
+            session_id: Some(session_id.clone()),
+            csl_manager: Some(mgr),
+            turn: 1,
+            ..Default::default()
+        };
+        let final_messages = vec![
+            serde_json::json!({"role": "user", "content": "old review"}),
+            serde_json::json!({"role": "system", "content": "[Context compacted: older messages were removed to reduce token pressure. The conversation continues below.]"}),
+            serde_json::json!({"role": "user", "content": "不要review啊！"}),
+            serde_json::json!({"role": "assistant", "reasoning_content": "trace"}),
+            serde_json::json!({"role": "tool", "tool_call_id": "c1", "content": "tool output"}),
+            serde_json::json!({"role": "assistant", "content": "ok"}),
+        ];
+
+        persist_turn_csl_snapshot(&mut state, final_messages, CslCheckpointFields).await;
+
+        let entries = store.load_from_latest_snapshot(&session_id).await.unwrap();
+        let mat = astra_turn_core::conversation_log::materialize(&entries).unwrap();
+        assert_eq!(mat.messages.len(), 3);
+        assert!(
+            mat.messages
+                .iter()
+                .all(|msg| msg["role"] != "tool" && msg.get("reasoning_content").is_none())
+        );
+        assert!(
+            mat.messages
+                .iter()
+                .all(|msg| !msg["content"].as_str().unwrap_or("").contains("old review"))
+        );
     }
 
     #[tokio::test]

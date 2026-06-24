@@ -2941,7 +2941,6 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
     let heavy_only_session = Uuid::new_v4().to_string();
-    let legacy_heavy_session = Uuid::new_v4().to_string();
 
     let heavy_state_json = |messages: serde_json::Value,
                             blocked_tools: serde_json::Value,
@@ -2962,33 +2961,8 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
         })
         .to_string()
     };
-    let legacy_heavy_state_json =
-        |messages: serde_json::Value,
-         blocked_tools: serde_json::Value,
-         recent_tools: serde_json::Value,
-         approval_overrides: serde_json::Value,
-         interruption: serde_json::Value,
-         compaction_state: serde_json::Value| {
-            serde_json::json!({
-                "messages": messages,
-                "blocked_tools": blocked_tools,
-                "recent_tools": recent_tools,
-                "approval_overrides": approval_overrides,
-                "interruption": interruption,
-                "compaction_state": compaction_state
-            })
-            .to_string()
-        };
 
-    cleanup_restore_fixture(
-        &pool,
-        &[
-            session_id.clone(),
-            heavy_only_session.clone(),
-            legacy_heavy_session.clone(),
-        ],
-    )
-    .await;
+    cleanup_restore_fixture(&pool, &[session_id.clone(), heavy_only_session.clone()]).await;
 
     sqlx::query(
         "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
@@ -3035,29 +3009,6 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
     .execute(&pool)
     .await
     .expect("insert heavy-only user_query");
-
-    sqlx::query(
-        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'checkpoint-legacy-heavy', 'active', 1)",
-    )
-    .bind(&legacy_heavy_session)
-    .bind(&user_id)
-    .execute(&pool)
-    .await
-    .expect("insert legacy-heavy session");
-
-    sqlx::query(
-        "INSERT INTO agent_events \
-         (event_id, session_id, user_id, event_type, content, token_usage, token_input, token_output, token_total, created_at) \
-         VALUES (?, ?, ?, 'user_query', 'legacy-heavy turn', CAST(? AS JSON), 9, 3, 12, '2026-09-04 09:20:00.000000')",
-    )
-    .bind(Uuid::new_v4().to_string())
-    .bind(&legacy_heavy_session)
-    .bind(&user_id)
-    .bind(serde_json::json!({"input": 9, "output": 3, "total": 12}).to_string())
-    .execute(&pool)
-    .await
-    .expect("insert legacy-heavy user_query");
 
     svc.push_checkpoint(
         &session_id,
@@ -3150,40 +3101,6 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
     )
     .await
     .expect("push heavy-only step checkpoint");
-
-    let legacy_approval_overrides = serde_json::json!({
-        "rules": [[
-            {
-                "tool_name": "bash",
-                "command_prefix": "git stash",
-                "side_effect": "execute",
-                "path_pattern": null
-            },
-            true
-        ]]
-    });
-    svc.push_step_checkpoint(
-        &legacy_heavy_session,
-        &user_id,
-        1,
-        1,
-        "heavy",
-        "legacy-heavy-v1",
-        &serde_json::json!(["legacy-heavy-tool"]).to_string(),
-        &legacy_heavy_state_json(
-            serde_json::json!([
-                {"role":"user","content":"legacy user"},
-                {"role":"assistant","content":"legacy answer"}
-            ]),
-            serde_json::json!(["git"]),
-            serde_json::json!(["legacy-heavy-tool"]),
-            legacy_approval_overrides.clone(),
-            serde_json::json!({"kind":"legacy_resume","resumable":true}),
-            serde_json::json!({"attempt_count":3,"cumulative_tokens_freed":64,"last_was_insufficient":false}),
-        ),
-    )
-    .await
-    .expect("push legacy heavy step checkpoint");
 
     let rows = sqlx::query(
         "SELECT number, title, summary, CAST(tools_json AS CHAR) AS tools_json, state_json \
@@ -3336,40 +3253,6 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
         Some("context_window")
     );
 
-    let restored_legacy_heavy = restore
-        .restore_session(&user_id, &legacy_heavy_session)
-        .await
-        .expect("restore legacy-heavy session")
-        .expect("legacy-heavy session restored");
-    assert_eq!(restored_legacy_heavy.checkpoint_count, 0);
-    assert_eq!(
-        restored_legacy_heavy.recent_tools,
-        vec!["legacy-heavy-tool".to_string()],
-        "cloud restore should accept legacy unwrapped heavy checkpoint JSON too"
-    );
-    assert_eq!(restored_legacy_heavy.blocked_tools, vec!["git".to_string()]);
-    assert_eq!(restored_legacy_heavy.conversation_messages.len(), 2);
-    assert_eq!(
-        restored_legacy_heavy.approval_overrides.as_ref(),
-        Some(&legacy_approval_overrides)
-    );
-    assert_eq!(
-        restored_legacy_heavy
-            .interruption
-            .as_ref()
-            .and_then(|json| json.get("kind"))
-            .and_then(serde_json::Value::as_str),
-        Some("legacy_resume")
-    );
-    assert_eq!(
-        restored_legacy_heavy
-            .compaction_state
-            .as_ref()
-            .and_then(|json| json.get("attempt_count"))
-            .and_then(serde_json::Value::as_u64),
-        Some(3)
-    );
-
     // Flush audit entries before checking sync_log counts.
     drop(audit);
     flusher.shutdown.cancel();
@@ -3398,11 +3281,7 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
     .expect("decode ordinary checkpoint sync log count");
     assert_eq!(checkpoint_sync_successes, 1);
 
-    cleanup_restore_fixture(
-        &pool,
-        &[session_id, heavy_only_session, legacy_heavy_session],
-    )
-    .await;
+    cleanup_restore_fixture(&pool, &[session_id, heavy_only_session]).await;
 }
 
 #[tokio::test]

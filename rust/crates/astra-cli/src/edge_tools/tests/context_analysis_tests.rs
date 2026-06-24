@@ -82,6 +82,7 @@ fn sample_trace(turn: &str, total_used: u32, history: u32, pressure: f64) -> Con
                 tokens: 100,
             }],
             surface_latency_ms: 5,
+            ..Default::default()
         },
         token_budget: TokenBudgetTrace {
             max_tokens: 128000,

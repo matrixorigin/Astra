@@ -27,6 +27,7 @@ use astra_runtime::{
     turn::chat_turn_budget_pressure::budget_pressure_for_chat_turn,
     turn::chat_turn_edge_profile::{
         EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES,
+        EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES,
         EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW, EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT,
         detect_active_system_skills_in_message, read_git_branch_abbrev,
     },
@@ -539,6 +540,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     // Force-inject any skill allowed_tools that the assembled surface missed.
     let mut turn_schemas = turn_schemas;
     let mut surface_report = surface_report;
+    let mut activated_deferred_tool_names = Vec::new();
     if let Some(ref allowed) = ctx.skill_allowed_tools {
         astra_turn_core::tool_schema_prune::inject_skill_allowed_tools(
             &mut turn_schemas,
@@ -571,6 +573,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                 &refs,
                 ctx.all_schemas,
             );
+            activated_deferred_tool_names = activated;
         }
         if surface_report
             .visible_tools
@@ -715,9 +718,11 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                 EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT: manifest.text,
                 EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW: manifest.context_window,
                 EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES: manifest.names,
+                EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES: manifest.omitted_names,
             }),
         );
     }
+    let deferred_available = activatable_tool_names.len().min(u32::MAX as usize) as u32;
     ctx.executor
         .set_current_tool_surface(&final_visible_schemas, activatable_tool_names);
     // Telemetry truth: recompute token cost from the actual final visible
@@ -737,14 +742,22 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         visible_tool_tokens_total,
         surface_report.schema_budget_total,
     );
+    let final_visible_tool_names_for_trace = final_visible_tool_names.clone();
     *ctx.valid_tool_names = final_visible_tool_names;
 
     if let Some(collector) = ctx.telem.trace_collector {
-        collector.record_tool_surface(
+        let mut deferred_active_tools: Vec<String> = activated_deferred_tool_names
+            .into_iter()
+            .filter(|name| final_visible_tool_names_for_trace.contains(name))
+            .collect();
+        deferred_active_tools.sort();
+        collector.record_tool_surface_with_deferred(
             &final_surface_report.visible_tools,
             &visible_tool_costs,
             final_visible_schemas.len() as u32,
             surface_latency_ms,
+            &deferred_active_tools,
+            deferred_available,
         );
     }
 

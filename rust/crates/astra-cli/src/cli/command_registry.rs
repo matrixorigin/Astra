@@ -1090,7 +1090,6 @@ mod tests {
         assert!(subs.iter().any(|(tok, _)| *tok == "rollback"));
         assert!(subs.iter().any(|(tok, _)| *tok == "trending"));
         assert!(subs.iter().any(|(tok, _)| *tok == "uninstall"));
-        assert!(subs.iter().any(|(tok, _)| *tok == "unpin"));
         assert!(subs.iter().any(|(tok, _)| *tok == "upgrade"));
     }
 

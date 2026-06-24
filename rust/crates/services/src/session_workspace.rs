@@ -127,15 +127,15 @@ impl ContextTraceSignal {
         if !self.turn_id.is_empty() {
             parts.push(self.turn_id.clone());
         }
-        if let Some(selection) = self.tool_surface.as_ref() {
-            if !selection.visible_tools.is_empty() {
-                let label = if selection.surface_scope.is_empty() {
-                    "tools".to_string()
-                } else {
-                    format!("tools[{}]", selection.surface_scope)
-                };
-                parts.push(format!("{label}: {}", selection.visible_tools.join(", ")));
-            }
+        if let Some(selection) = self.tool_surface.as_ref()
+            && !selection.visible_tools.is_empty()
+        {
+            let label = if selection.surface_scope.is_empty() {
+                "tools".to_string()
+            } else {
+                format!("tools[{}]", selection.surface_scope)
+            };
+            parts.push(format!("{label}: {}", selection.visible_tools.join(", ")));
         }
         if let Some(memory) = self.memory.as_ref()
             && !memory.selected_memory_ids.is_empty()

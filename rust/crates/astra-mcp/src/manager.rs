@@ -264,6 +264,10 @@ impl McpClientManager {
             }
         }
         if !refreshed.is_empty() {
+            // Execution/runtime-binding lookups use `find_tool_by_mcp_name`,
+            // not `all_tool_schemas()`. Any refreshed tool list must therefore
+            // rebuild the public-name route index atomically with the schema
+            // snapshot update.
             self.rebuild_tool_route_index();
             tracing::info!("Refreshed tool lists for: {}", refreshed.join(", "));
         }
@@ -451,7 +455,7 @@ mod tests {
 
     #[test]
     fn tool_route_index_maps_public_names_to_original_server_tools() {
-        let tools = vec![
+        let tools = [
             (
                 "mock-server",
                 Tool::new("echo message", "Echo", empty_schema()),
@@ -479,7 +483,7 @@ mod tests {
 
     #[test]
     fn tool_route_index_keeps_first_collision_winner() {
-        let tools = vec![
+        let tools = [
             ("api", Tool::new("query.sql", "Query", empty_schema())),
             ("api", Tool::new("query sql", "Query", empty_schema())),
         ];
@@ -491,6 +495,28 @@ mod tests {
             Some(&McpToolRoute {
                 server_name: "api".to_string(),
                 original_tool_name: "query.sql".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn tool_route_index_rebuild_drops_removed_tools_and_adds_new_tools() {
+        let first_tools = [("api", Tool::new("old.query", "Old", empty_schema()))];
+        let second_tools = [("api", Tool::new("new.query", "New", empty_schema()))];
+
+        let first =
+            build_tool_route_index(first_tools.iter().map(|(server, tool)| (*server, tool)));
+        assert!(first.contains_key("mcp__api__old_query"));
+        assert!(!first.contains_key("mcp__api__new_query"));
+
+        let rebuilt =
+            build_tool_route_index(second_tools.iter().map(|(server, tool)| (*server, tool)));
+        assert!(!rebuilt.contains_key("mcp__api__old_query"));
+        assert_eq!(
+            rebuilt.get("mcp__api__new_query"),
+            Some(&McpToolRoute {
+                server_name: "api".to_string(),
+                original_tool_name: "new.query".to_string(),
             })
         );
     }

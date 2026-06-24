@@ -353,6 +353,7 @@ pub fn build_deferred_tools_section(
 pub struct DeferredToolsPromptBlock {
     pub section: PromptSection,
     pub names: Vec<String>,
+    pub omitted_names: Vec<String>,
 }
 
 /// Build deferred tools listing with explicit budget from context window size.
@@ -391,14 +392,16 @@ pub fn build_deferred_tools_prompt_block_with_budget(
     let mut listing_chars = 0usize;
     let mut has_degraded = false;
     let mut rendered_names = Vec::new();
+    let mut omitted_names = Vec::new();
 
     // entries are already sorted alphabetically by ToolSurface::build()
-    for entry in entries {
+    for (idx, entry) in entries.iter().enumerate() {
         let escaped_name = xml_escape_text(&entry.name);
         let name_only_len = name_only_wrap + escaped_name.len();
 
         if listing_chars + name_only_len > char_budget {
             has_degraded = true;
+            omitted_names.extend(entries[idx..].iter().map(|entry| entry.name.clone()));
             break;
         }
 
@@ -449,6 +452,7 @@ pub fn build_deferred_tools_prompt_block_with_budget(
     Some(DeferredToolsPromptBlock {
         section: PromptSection::stable(body, CacheScope::Session),
         names: rendered_names,
+        omitted_names,
     })
 }
 
@@ -3428,6 +3432,7 @@ mod tests {
             block.names,
             vec!["tool_000".to_string(), "tool_001".to_string()]
         );
+        assert!(block.omitted_names.is_empty());
         assert!(block.section.text.contains("<deferred_tools>"));
         assert!(block.section.text.contains("<name>tool_000</name>"));
         assert!(block.section.text.contains("<name>tool_001</name>"));
@@ -3470,6 +3475,8 @@ mod tests {
             ]
         );
         assert_eq!(first.names, second.names);
+        assert_eq!(first.omitted_names, second.omitted_names);
+        assert!(first.omitted_names.is_empty());
         assert_eq!(first.section.text, second.section.text);
         let tool_000 = first
             .section
@@ -3514,6 +3521,15 @@ mod tests {
         for name in &block.names {
             assert!(block.section.text.contains(&format!("<name>{name}</name>")));
         }
+        let expected_omitted: Vec<_> = all_names
+            .iter()
+            .filter(|candidate| !block.names.iter().any(|rendered| rendered == *candidate))
+            .cloned()
+            .collect();
+        assert_eq!(
+            block.omitted_names, expected_omitted,
+            "omitted_names must expose exactly the deferred tools dropped by budget truncation"
+        );
         for name in all_names.iter().filter(|candidate| {
             !block
                 .names

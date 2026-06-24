@@ -464,6 +464,7 @@ pub(crate) fn extract_session_state_compact(
         // checkpoints/interruption contracts.
         blocked_tools: Vec::new(),
         recent_tools: state.recent_tools.clone(),
+        activated_deferred_tool_names: Vec::new(),
         approval_overrides: None,
         budget_remaining_tokens: 0,
         budget_remaining_rounds: 0,
@@ -550,25 +551,23 @@ pub(crate) fn format_task_board_resume_hint(tasks: &[SessionTask]) -> Option<Str
 fn messages_for_csl_persist(state: &AgenticLoopState) -> Vec<Value> {
     let mut messages = state.messages.clone();
     let final_text = state.final_text.trim();
-    if final_text.is_empty() {
-        return messages;
+    if !final_text.is_empty() {
+        let already_has_final = messages
+            .last()
+            .and_then(|message| {
+                let role = message.get("role")?.as_str()?;
+                let content = message.get("content")?.as_str()?;
+                Some(role == "assistant" && content.trim() == final_text)
+            })
+            .unwrap_or(false);
+        if !already_has_final {
+            messages.push(json!({
+                "role": "assistant",
+                "content": final_text,
+            }));
+        }
     }
-
-    let already_has_final = messages
-        .last()
-        .and_then(|message| {
-            let role = message.get("role")?.as_str()?;
-            let content = message.get("content")?.as_str()?;
-            Some(role == "assistant" && content.trim() == final_text)
-        })
-        .unwrap_or(false);
-    if !already_has_final {
-        messages.push(json!({
-            "role": "assistant",
-            "content": final_text,
-        }));
-    }
-    messages
+    astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(messages)
 }
 
 pub(crate) fn server_loop_causal_chain_id(kind: &str) -> String {
@@ -1873,6 +1872,36 @@ mod tests {
             })
             .await
             .clone()
+    }
+
+    #[test]
+    fn messages_for_csl_persist_keeps_only_prompt_facing_history() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.messages = vec![
+            json!({"role": "user", "content": "old review"}),
+            json!({"role": "system", "content": "[Context compacted: older messages were removed to reduce token pressure. The conversation continues below.]"}),
+            json!({"role": "user", "content": "不要review啊！"}),
+            json!({"role": "assistant", "reasoning_content": "trace"}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "tool output"}),
+        ];
+        state.final_text = "ok".to_string();
+
+        let messages = messages_for_csl_persist(&state);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["content"], "不要review啊！");
+        assert_eq!(messages[2]["content"], "ok");
+        assert!(
+            messages
+                .iter()
+                .all(|msg| msg["role"] != "tool" && msg.get("reasoning_content").is_none())
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|msg| !msg["content"].as_str().unwrap_or("").contains("old review"))
+        );
     }
 
     #[tokio::test]

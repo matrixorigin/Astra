@@ -311,6 +311,14 @@ pub struct ToolSurfaceTrace {
     pub tools_available: u32,
     /// Tools included in the LLM-visible surface.
     pub visible_tools: Vec<VisibleTool>,
+    /// Deferred tools promoted into this request's visible surface by a prior
+    /// activation. This is the raw signal needed for future T2->T1 policy
+    /// analysis; it is telemetry only and does not change tool selection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_active_tools: Vec<String>,
+    /// Count of runtime-activatable deferred tools advertised for this turn.
+    #[serde(default)]
+    pub deferred_available: u32,
     /// Tool surface assembly latency in milliseconds.
     pub surface_latency_ms: u64,
 }
@@ -577,6 +585,25 @@ pub fn build_tool_surface_trace(
     per_tool_costs: &[(String, u32)],
     surface_latency_ms: u64,
 ) -> ToolSurfaceTrace {
+    build_tool_surface_trace_with_deferred(
+        tools_available,
+        visible_tools,
+        per_tool_costs,
+        surface_latency_ms,
+        &[],
+        0,
+    )
+}
+
+/// Build [`ToolSurfaceTrace`] with deferred activation telemetry.
+pub fn build_tool_surface_trace_with_deferred(
+    tools_available: u32,
+    visible_tools: &[String],
+    per_tool_costs: &[(String, u32)],
+    surface_latency_ms: u64,
+    deferred_active_tools: &[String],
+    deferred_available: u32,
+) -> ToolSurfaceTrace {
     let visible_tools: Vec<VisibleTool> = visible_tools
         .iter()
         .map(|name| {
@@ -595,6 +622,8 @@ pub fn build_tool_surface_trace(
     ToolSurfaceTrace {
         tools_available,
         visible_tools,
+        deferred_active_tools: deferred_active_tools.to_vec(),
+        deferred_available,
         surface_latency_ms,
     }
 }
@@ -735,7 +764,27 @@ mod tests {
         let trace = build_tool_surface_trace(16, &visible_tools, &[], 5);
         assert_eq!(trace.visible_tools.len(), 16);
         assert_eq!(trace.visible_tools[0].tool_name, "tool-0");
+        assert!(trace.deferred_active_tools.is_empty());
+        assert_eq!(trace.deferred_available, 0);
         assert_eq!(trace.surface_latency_ms, 5);
+    }
+
+    #[test]
+    fn tool_surface_trace_records_deferred_activation_telemetry() {
+        let visible_tools = vec!["bash".to_string(), "web_fetch".to_string()];
+        let deferred_active_tools = vec!["web_fetch".to_string()];
+        let trace = build_tool_surface_trace_with_deferred(
+            2,
+            &visible_tools,
+            &[("bash".to_string(), 100), ("web_fetch".to_string(), 250)],
+            7,
+            &deferred_active_tools,
+            4,
+        );
+
+        assert_eq!(trace.deferred_active_tools, vec!["web_fetch".to_string()]);
+        assert_eq!(trace.deferred_available, 4);
+        assert_eq!(trace.visible_tools[1].tokens, 250);
     }
 
     #[test]

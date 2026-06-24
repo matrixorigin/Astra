@@ -34,7 +34,7 @@ fn bench_build_always_load_surface(c: &mut Criterion) {
 fn bench_default_always_load_names(c: &mut Criterion) {
     let mut group = c.benchmark_group("default_always_load_names");
     group.bench_function("cached_access", |b| {
-        b.iter(|| astra_runtime::tool_registry::surface::default_always_load_names())
+        b.iter(astra_runtime::tool_registry::surface::default_always_load_names)
     });
     group.finish();
 }

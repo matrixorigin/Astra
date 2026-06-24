@@ -1993,7 +1993,8 @@ impl AgenticRunLifecycleService {
 
         match mgr.load().await {
             Ok(Some(mat)) => {
-                restored_messages = mat.messages;
+                restored_messages =
+                    astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(mat.messages);
                 restore_session_state_compact(mat.session_state, loop_state);
             }
             Ok(None) => {

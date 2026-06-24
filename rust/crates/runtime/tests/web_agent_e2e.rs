@@ -515,15 +515,51 @@ fn normalize_chat_stream_payload(mut payload: Value) -> Value {
     let Some(object) = payload.as_object_mut() else {
         return payload;
     };
-    let legacy_model = object.remove("model");
-    if object.contains_key("selected_model") {
-        return payload;
+    if !object.contains_key("selected_model") {
+        let legacy_model = object.remove("model");
+        let model = legacy_model
+            .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            .unwrap_or_else(|| DEFAULT_SELECTED_MODEL.to_string());
+        object.insert("selected_model".to_string(), json!({ "model": model }));
     }
-    let model = legacy_model
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| DEFAULT_SELECTED_MODEL.to_string());
-    object.insert("selected_model".to_string(), json!({ "model": model }));
+    if context_declares_edge_tools(object) {
+        object
+            .entry("workspace_binding".to_string())
+            .or_insert_with(default_edge_workspace_binding);
+        object
+            .entry("executor_binding".to_string())
+            .or_insert_with(default_edge_executor_binding);
+    }
     payload
+}
+
+fn context_declares_edge_tools(object: &serde_json::Map<String, Value>) -> bool {
+    object
+        .get("context")
+        .and_then(Value::as_object)
+        .and_then(|context| context.get("edge_tools"))
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+}
+
+fn default_edge_workspace_binding() -> Value {
+    json!({
+        "kind": "edge_workspace",
+        "display_name": "Test edge workspace",
+        "root": "/workspace/astra",
+        "authority": "read_write",
+        "fallback_policy": "disabled"
+    })
+}
+
+fn default_edge_executor_binding() -> Value {
+    json!({
+        "kind": "edge_agent",
+        "executor_id": "test-edge-agent",
+        "display_name": "Test edge agent",
+        "transport": "edge_ledger",
+        "status": "online"
+    })
 }
 
 /// Send a POST /chat/stream request and collect all SSE events from the stream.
@@ -760,7 +796,7 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
             "workspace_binding": {
                 "kind": "edge_workspace",
                 "display_name": "MacBook Pro",
-                "cwd": "/Users/xupeng/github/astra",
+                "root": "/Users/xupeng/github/astra",
                 "authority": "read_write",
                 "fallback_policy": "disabled"
             },
@@ -1343,7 +1379,7 @@ async fn edge_executor_offline_blocks_run_before_next_llm_round() {
             "workspace_binding": {
                 "kind": "edge_workspace",
                 "display_name": "MacBook Pro",
-                "cwd": "/Users/xupeng/github/astra",
+                "root": "/Users/xupeng/github/astra",
                 "authority": "read_write",
                 "fallback_policy": "disabled"
             },
@@ -1409,7 +1445,7 @@ async fn edge_executor_offline_child_spawn_blocks_parent_before_next_llm_round()
             "workspace_binding": {
                 "kind": "edge_workspace",
                 "display_name": "MacBook Pro",
-                "cwd": "/Users/xupeng/github/astra",
+                "root": "/Users/xupeng/github/astra",
                 "authority": "read_write",
                 "fallback_policy": "disabled"
             },

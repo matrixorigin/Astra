@@ -1382,6 +1382,30 @@ impl ToolExecutor {
         *guard = ToolSurfaceNames::installed(visible, activatable);
     }
 
+    pub(crate) fn restore_activated_deferred_tool_names_for_session(&self, names: &[String]) {
+        let restored: HashSet<String> = names
+            .iter()
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect();
+
+        {
+            let mut surface = rwlock_write_reset_on_poison(
+                &self.current_tool_surface,
+                "current_tool_surface_restore_deferred_activation",
+            );
+            if !restored.is_empty() && matches!(*surface, ToolSurfaceNames::Uninstalled) {
+                *surface = ToolSurfaceNames::installed(HashSet::new(), HashSet::new());
+            }
+        }
+
+        *rwlock_write_reset_on_poison(
+            &self.activated_deferred_tools,
+            "activated_deferred_tools_restore",
+        ) = restored;
+    }
+
     #[cfg(test)]
     pub(crate) fn clear_current_tool_surface_for_tests(&self) {
         *rwlock_write_reset_on_poison(
@@ -6725,6 +6749,31 @@ mod tests {
                 .and_then(|fields| fields.get("error_kind"))
                 .and_then(serde_json::Value::as_str),
             Some(astra_core::ErrorKind::ToolBinding.as_str())
+        );
+    }
+
+    #[test]
+    fn restored_activated_deferred_tool_survives_first_schema_injection() {
+        let executor = test_executor();
+        executor.restore_activated_deferred_tool_names_for_session(&[
+            "memory".to_string(),
+            " ".to_string(),
+        ]);
+
+        assert_eq!(
+            executor.activated_deferred_tool_names(),
+            vec!["memory".to_string()],
+            "session restore should seed valid pending activation"
+        );
+        assert_eq!(
+            executor.activated_deferred_tool_names_for_schema_injection(),
+            vec!["memory".to_string()],
+            "restored activation must survive until the first schema-injection opportunity"
+        );
+        assert_eq!(
+            executor.activated_deferred_tool_names(),
+            vec!["memory".to_string()],
+            "schema injection does not consume deferred activation"
         );
     }
 

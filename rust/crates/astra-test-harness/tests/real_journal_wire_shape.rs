@@ -124,7 +124,8 @@ fn legacy_fixture_journal_tool_called_criterion_matches() {
     .expect("fixture should load");
     let outcome = outcome_placeholder();
 
-    for name in ["git"] {
+    {
+        let name = "git";
         let r: Vec<CriterionResult> = evaluate_deterministic_with_session(
             &[Criterion::JournalToolCalled {
                 name: name.into(),

@@ -1271,6 +1271,7 @@ pub(crate) async fn handle_info_command(
                 render_policy: crate::cli::stream::stream_render::RenderPolicy::Stream,
                 cli_context: Some(&state.cli_context),
                 recent_tools: &state.recent_tools,
+                activated_deferred_tool_names: None,
                 tool_health_entries: &state.tool_health_entries,
                 resume_restricted_tools: &state.resume_restricted_tools,
                 session_lessons: &state.session_lessons,

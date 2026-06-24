@@ -874,6 +874,8 @@ fn attach_subrun_tool_surface(
                     manifest.context_window,
                 astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES:
                     manifest.names,
+                astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES:
+                    manifest.omitted_names,
             }),
         );
     }

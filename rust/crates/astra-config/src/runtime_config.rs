@@ -552,7 +552,7 @@ pub enum MemoryStrategy {
 // ─── Tool Execution Policy Configuration ───────────────────────────────────
 
 /// Configuration for per-turn tool execution guards.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolPolicyConfig {
     /// Max times the same (tool, args) can execute across a session.
     /// 0 = use default (2). Prevents infinite loops from ignored dedup hints.
@@ -1077,30 +1077,6 @@ fn apply_profile(base: EffectiveToolPolicy, profile: &ModelPolicyProfile) -> Eff
         } else {
             base.parallel_batching_force_streak
         },
-    }
-}
-
-impl Default for ToolPolicyConfig {
-    fn default() -> Self {
-        Self {
-            max_identical_tool_calls: 0,
-            max_tools_per_turn: 0,
-            circuit_breaker_stall_threshold: 0,
-            circuit_breaker_repetition_threshold: 0,
-            circuit_breaker_half_open_patience: 0,
-            circuit_breaker_absolute_max_rounds: 0,
-            circuit_breaker_read_only_stall_threshold: 0,
-            circuit_breaker_max_introspect_emissions: 0,
-            parallel_batching_force_streak: 0,
-            redundant_reads_midloop_threshold: 0,
-            sequential_read_churn_eval_threshold: 0,
-            redundant_reads_eval_threshold: 0,
-            search_fanout_eval_threshold: 0,
-            redundant_validation_retries_eval_threshold: 0,
-            cache_waste_midloop_threshold: 0,
-            exploration_family_churn_midloop_threshold: 0,
-            model_profiles: Vec::new(),
-        }
     }
 }
 

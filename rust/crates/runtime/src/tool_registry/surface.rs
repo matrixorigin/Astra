@@ -90,6 +90,7 @@ pub struct DeferredManifest {
     pub text: String,
     pub context_window: usize,
     pub names: Vec<String>,
+    pub omitted_names: Vec<String>,
 }
 
 /// The resolved tool surface for a session.
@@ -302,6 +303,7 @@ impl ToolSurface {
             text,
             context_window,
             names: block.names,
+            omitted_names: block.omitted_names,
         })
     }
 }

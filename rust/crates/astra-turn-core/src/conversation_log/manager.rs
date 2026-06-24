@@ -241,6 +241,7 @@ impl SessionStatePatch {
         Self {
             blocked_tools: Some(state.blocked_tools.clone()),
             recent_tools: Some(state.recent_tools.clone()),
+            activated_deferred_tool_names: Some(state.activated_deferred_tool_names.clone()),
             approval_overrides: Some(state.approval_overrides.clone()),
             interruption: Some(state.interruption.clone()),
             budget_remaining_tokens: Some(state.budget_remaining_tokens),
@@ -567,6 +568,7 @@ mod tests {
         let state = SessionStateCompact {
             blocked_tools: vec!["bash".into()],
             recent_tools: vec!["read".into()],
+            activated_deferred_tool_names: vec!["write_file".into()],
             approval_overrides: Some(json!({"x": 1})),
             compaction_tracker: Some(json!({"v": 2})),
             budget_remaining_tokens: 42,
@@ -583,6 +585,10 @@ mod tests {
         let patch = SessionStatePatch::from_full(&state);
         assert_eq!(patch.blocked_tools, Some(vec!["bash".into()]));
         assert_eq!(patch.recent_tools, Some(vec!["read".into()]));
+        assert_eq!(
+            patch.activated_deferred_tool_names,
+            Some(vec!["write_file".into()])
+        );
         assert_eq!(patch.approval_overrides, Some(Some(json!({"x": 1}))));
         assert_eq!(patch.compaction_tracker, Some(Some(json!({"v": 2}))));
         assert_eq!(patch.budget_remaining_tokens, Some(42));

@@ -138,6 +138,7 @@ fn build_turn_stream_params<'a>(
             .unwrap_or(crate::cli::stream::stream_render::RenderPolicy::Stream),
         cli_context: Some(&state.cli_context),
         recent_tools: &state.recent_tools,
+        activated_deferred_tool_names: Some(&mut state.activated_deferred_tool_names),
         tool_health_entries: &state.tool_health_entries,
         resume_restricted_tools: &state.resume_restricted_tools,
         session_lessons: &state.session_lessons,

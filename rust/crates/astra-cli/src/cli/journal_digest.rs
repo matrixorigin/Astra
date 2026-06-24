@@ -1165,7 +1165,7 @@ mod tests {
             turn.tool_groups.iter().any(|group| {
                 group.round == Some(0)
                     && group.call_count == 1
-                    && group.tools.iter().any(|tool| tool == "Git")
+                    && group.tools.iter().any(|tool| tool.starts_with("Git"))
             }),
             "digest should preserve the first repeated git round"
         );

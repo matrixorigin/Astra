@@ -1795,36 +1795,34 @@ impl EvaluationService for DatabaseEvaluationService {
         let days = clamp_eval_days(request.days);
         let min_quality = request.min_quality.clamp(0.0, 1.0);
         let max_samples = clamp_extract_limit(request.max_samples);
-        let sql = format!(
-            "SELECT qa.target_id AS session_id, \
-                    MAX(CAST(qa.score AS DOUBLE)) AS quality_score, \
-                    MAX(COALESCE(qa.step_count, 0)) AS step_count, \
-                    CAST(NULL AS DOUBLE) AS avg_confidence, \
-                    COUNT(ev.event_id) AS trace_count, \
-                    DATE_FORMAT(MAX(qa.updated_at), '%Y-%m-%dT%H:%i:%s') AS quality_updated_at, \
-                    DATE_FORMAT(MAX(ev.created_at), '%Y-%m-%dT%H:%i:%s') AS latest_context_trace_at \
-             FROM eval_quality_assessments qa \
-             LEFT JOIN agent_events ev \
-               ON ev.session_id = qa.target_id \
-              AND ev.user_id = qa.user_id \
-              AND ev.event_type = 'context_trace_signal' \
-              AND ev.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
-             WHERE qa.user_id = ? \
-               AND qa.level = 'session' \
-               AND qa.updated_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
-               AND qa.score >= ? \
-               AND qa.updated_at = ( \
-                   SELECT MAX(q2.updated_at) \
-                   FROM eval_quality_assessments q2 \
-                   WHERE q2.user_id = qa.user_id \
-                     AND q2.level = 'session' \
-                     AND q2.target_id = qa.target_id \
-               ) \
-             GROUP BY qa.target_id \
-             ORDER BY quality_score DESC, MAX(qa.updated_at) DESC \
-             LIMIT ?"
-        );
-        let rows = query(&sql)
+        let sql = "SELECT qa.target_id AS session_id, \
+                   MAX(CAST(qa.score AS DOUBLE)) AS quality_score, \
+                   MAX(COALESCE(qa.step_count, 0)) AS step_count, \
+                   CAST(NULL AS DOUBLE) AS avg_confidence, \
+                   COUNT(ev.event_id) AS trace_count, \
+                   DATE_FORMAT(MAX(qa.updated_at), '%Y-%m-%dT%H:%i:%s') AS quality_updated_at, \
+                   DATE_FORMAT(MAX(ev.created_at), '%Y-%m-%dT%H:%i:%s') AS latest_context_trace_at \
+            FROM eval_quality_assessments qa \
+            LEFT JOIN agent_events ev \
+              ON ev.session_id = qa.target_id \
+             AND ev.user_id = qa.user_id \
+             AND ev.event_type = 'context_trace_signal' \
+             AND ev.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
+            WHERE qa.user_id = ? \
+              AND qa.level = 'session' \
+              AND qa.updated_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
+              AND qa.score >= ? \
+              AND qa.updated_at = ( \
+                  SELECT MAX(q2.updated_at) \
+                  FROM eval_quality_assessments q2 \
+                  WHERE q2.user_id = qa.user_id \
+                    AND q2.level = 'session' \
+                    AND q2.target_id = qa.target_id \
+              ) \
+            GROUP BY qa.target_id \
+            ORDER BY quality_score DESC, MAX(qa.updated_at) DESC \
+            LIMIT ?";
+        let rows = query(sql)
             .bind(days)
             .bind(user_id)
             .bind(days)

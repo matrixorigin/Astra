@@ -7,9 +7,9 @@ use crate::tool_registry::surface::DeferredManifest;
 
 const LOG_TARGET: &str = "astra.deferred_tools";
 
-fn names(edge_profile: &Map<String, Value>) -> HashSet<String> {
+fn names_from_key(edge_profile: &Map<String, Value>, key: &str) -> HashSet<String> {
     edge_profile
-        .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES)
+        .get(key)
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -18,6 +18,20 @@ fn names(edge_profile: &Map<String, Value>) -> HashSet<String> {
         .filter(|name| !name.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn names(edge_profile: &Map<String, Value>) -> HashSet<String> {
+    names_from_key(
+        edge_profile,
+        astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES,
+    )
+}
+
+fn omitted_names(edge_profile: &Map<String, Value>) -> HashSet<String> {
+    names_from_key(
+        edge_profile,
+        astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES,
+    )
 }
 
 pub(crate) fn block_for_model(
@@ -72,6 +86,7 @@ fn manifest_for_model(
     resolved_model_name: &str,
 ) -> Option<DeferredManifest> {
     let declared_names = names(edge_profile);
+    let omitted_names = omitted_names(edge_profile);
     if declared_names.is_empty() {
         if edge_profile.contains_key(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT,
@@ -166,10 +181,13 @@ fn manifest_for_model(
     }
     let mut names: Vec<String> = declared_names.into_iter().collect();
     names.sort();
+    let mut omitted_names: Vec<String> = omitted_names.into_iter().collect();
+    omitted_names.sort();
     Some(DeferredManifest {
         text: block,
         context_window: effective_budget,
         names,
+        omitted_names,
     })
 }
 
@@ -286,6 +304,23 @@ mod tests {
         let block = block_for_model(&edge_profile, "gpt-4o")
             .expect("consistent deferred manifest should render");
         assert!(block.contains("<name>agent_fanout</name>"));
+    }
+
+    #[test]
+    fn omitted_names_are_observable_but_not_activatable() {
+        let mut edge_profile = deferred_profile(&["agent_fanout"], &["agent_fanout"], "gpt-4o");
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES
+                .to_string(),
+            json!(["web_fetch"]),
+        );
+
+        let names = names_for_model(&edge_profile, Some("gpt-4o"));
+        assert_eq!(names, HashSet::from(["agent_fanout".to_string()]));
+
+        let manifest = manifest_for_model(&edge_profile, "gpt-4o")
+            .expect("consistent manifest should keep omitted metadata");
+        assert_eq!(manifest.omitted_names, vec!["web_fetch".to_string()]);
     }
 
     #[test]
