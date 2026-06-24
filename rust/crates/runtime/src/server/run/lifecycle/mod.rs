@@ -182,8 +182,7 @@ impl astra_tools::ToolApprovalGate for NonInteractiveApprovalGate {
 
 use crate::server::run::binding_resolution::{
     RunExecutionBindingSnapshot, agent_working_dir_for_bindings, binding_snapshot_events,
-    execution_bindings_from_edge_profile, execution_bindings_from_metadata,
-    executor_binding_from_request, request_uses_server_workspace,
+    execution_bindings_from_metadata, executor_binding_from_request, request_uses_server_workspace,
     resolve_request_execution_bindings,
     resolve_request_execution_bindings_without_server_workspace, run_start_context_from_request,
 };
@@ -4489,14 +4488,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 })
             })
             .or_else(|| {
-                resolve_request_execution_bindings_without_server_workspace(
-                    &request,
-                    &edge_profile,
-                    !edge_tools.is_empty(),
+                resolve_request_execution_bindings_without_server_workspace(&request).map(
+                    |(workspace, executor)| ExecutionBindingSnapshot::inferred(workspace, executor),
                 )
-                .map(|(workspace, executor)| {
-                    ExecutionBindingSnapshot::inferred(workspace, executor)
-                })
             });
         let tool_runtime_workspace = if let Some(workspace) = cloud_workspace.clone() {
             Some(workspace)
@@ -5216,14 +5210,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 })
             })
             .or_else(|| {
-                resolve_request_execution_bindings_without_server_workspace(
-                    &request,
-                    &edge_profile,
-                    !edge_tools.is_empty(),
+                resolve_request_execution_bindings_without_server_workspace(&request).map(
+                    |(workspace, executor)| ExecutionBindingSnapshot::inferred(workspace, executor),
                 )
-                .map(|(workspace, executor)| {
-                    ExecutionBindingSnapshot::inferred(workspace, executor)
-                })
             });
         let stream_agent_spawner = self
             .server_agent_spawner_for_session(&session_id)
@@ -10134,68 +10123,11 @@ mod tests {
     }
 
     #[test]
-    fn edge_profile_execution_bindings_make_legacy_edge_tools_explicit() {
-        let mut edge_profile = Map::new();
-        edge_profile.insert("cwd".to_string(), json!("/Users/xupeng/github/astra"));
-        edge_profile.insert("edge_agent_id".to_string(), json!("edge-macbook-1"));
-        edge_profile.insert("hostname".to_string(), json!("MacBook Pro"));
-
-        let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
-            &test_request("review this repo"),
-            &edge_profile,
-            true,
-        )
-        .expect("legacy edge profile should produce explicit bindings");
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
-        assert_eq!(workspace.display_name, "MacBook Pro");
-        assert_eq!(workspace.cwd.as_deref(), Some("/Users/xupeng/github/astra"));
-        assert_eq!(workspace.authority, WorkspaceAuthority::ReadWrite);
-        assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
-        assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
-        assert_eq!(executor.executor_id, "edge-macbook-1");
-        assert_eq!(executor.display_name, "MacBook Pro");
-        assert_eq!(executor.transport, ToolTransportKind::EdgeLedger);
-        assert_eq!(executor.status, ExecutorStatus::Online);
-    }
-
-    #[test]
-    fn missing_edge_profile_execution_bindings_emit_no_workspace() {
-        let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
-            &test_request("hello"),
-            &Map::new(),
-            false,
-        )
-        .expect("missing edge profile should still produce an explicit no-workspace binding");
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::None);
-        assert_eq!(workspace.display_name, "No workspace");
-        assert_eq!(workspace.authority, WorkspaceAuthority::None);
-        assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
-        assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
-        assert_eq!(executor.executor_id, "server-control-plane");
-        assert_eq!(executor.display_name, "Server control plane");
-        assert_eq!(executor.transport, ToolTransportKind::ServerLocal);
-        assert_eq!(executor.status, ExecutorStatus::Online);
-    }
-
-    #[test]
-    fn missing_edge_profile_with_edge_tools_uses_edge_ledger() {
-        let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
-            &test_request("run client tool"),
-            &Map::new(),
-            true,
-        )
-        .expect("edge tools should produce an explicit edge-ledger binding");
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
-        assert_eq!(workspace.display_name, "Edge workspace");
-        assert_eq!(workspace.cwd, None);
-        assert_eq!(workspace.authority, WorkspaceAuthority::ReadWrite);
-        assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
-        assert_eq!(executor.executor_id, "edge-ledger");
-        assert_eq!(executor.transport, ToolTransportKind::EdgeLedger);
-        assert_eq!(executor.status, ExecutorStatus::Online);
+    fn missing_explicit_binding_without_server_workspace_emits_no_snapshot() {
+        assert!(
+            resolve_request_execution_bindings_without_server_workspace(&test_request("hello"))
+                .is_none()
+        );
     }
 
     #[test]
