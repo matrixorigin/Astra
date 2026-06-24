@@ -130,19 +130,6 @@ pub fn is_read_only_never_restrict(tool: &str) -> bool {
     crate::tool::categories::registry().is_never_restrict(tool)
 }
 
-/// Legacy compatibility hook for callers that used to promote soft tool-health
-/// signals into hard schema restrictions.
-///
-/// Tool health is diagnostic and advisory: it can produce warnings, retry
-/// guidance, and `avoid_tools`, but it must not hide a tool from the model. A
-/// hidden schema is a hard contract change and belongs only to permission,
-/// interaction-mode, runtime allowlist, or resource-limit enforcement.
-pub fn merge_deprioritized_tools_into_restricted(
-    _turn_guard: &TurnGuard,
-    _restricted: &mut HashSet<String>,
-) {
-}
-
 fn insert_avoid_tool(avoid_tools: &mut HashSet<String>, tool: &str) {
     if !is_read_only_never_restrict(tool) {
         avoid_tools.insert(tool.to_string());
@@ -2171,14 +2158,14 @@ mod tests {
     // cascade hides `read_file` from the schema and the agent can no
     // longer observe file state. ─────────────────────────────────────────
 
-    fn deprioritize_tool(guard: &mut TurnGuard, name: &str, times: usize) {
+    fn record_tool_failures(guard: &mut TurnGuard, name: &str, times: usize) {
         for _ in 0..times {
             guard.health.record_failure(name);
         }
     }
 
     #[test]
-    fn merge_does_not_restrict_read_only_tools_even_after_many_failures() {
+    fn repeated_read_only_failures_stay_out_of_avoid_guidance() {
         let mut guard = TurnGuard::new();
         // Drive far past CONSECUTIVE_FAILURE_THRESHOLD for every read-only tool.
         // Use the live registry so any newly added never-restrict tools are
@@ -2190,49 +2177,45 @@ mod tests {
             .filter(|&n| reg.is_never_restrict(n))
             .collect();
         for tool in &never_restrict_tools {
-            deprioritize_tool(&mut guard, tool, 10);
+            record_tool_failures(&mut guard, tool, 10);
         }
 
-        let mut restricted: HashSet<String> = HashSet::new();
-        super::merge_deprioritized_tools_into_restricted(&guard, &mut restricted);
+        let verdict = guard.evaluate();
 
         for tool in &never_restrict_tools {
             assert!(
-                !restricted.contains(*tool),
-                "read-only tool `{tool}` must not be restricted after repeated failures"
+                !verdict.avoid_tools.contains(&tool.to_string()),
+                "read-only tool `{tool}` must not produce avoid guidance after repeated failures"
             );
         }
     }
 
     #[test]
-    fn merge_keeps_mutating_tool_health_advisory() {
-        // Soft health guidance must not hide mutating tools from the schema.
-        // Hard restrictions live in the permission/runtime/resource-limit
-        // layers, not in repeated-failure diagnostics.
+    fn mutating_tool_health_remains_advisory() {
+        // Soft health guidance may advise alternatives, but hard restrictions
+        // live in permission/runtime/resource-limit layers.
         let mut guard = TurnGuard::new();
-        deprioritize_tool(&mut guard, "bash", 5);
-        deprioritize_tool(&mut guard, "write_file", 5);
+        record_tool_failures(&mut guard, "bash", 5);
+        record_tool_failures(&mut guard, "write_file", 5);
 
-        let mut restricted: HashSet<String> = HashSet::new();
-        super::merge_deprioritized_tools_into_restricted(&guard, &mut restricted);
+        let verdict = guard.evaluate();
 
-        assert!(restricted.is_empty(), "soft health must not restrict tools");
+        assert!(verdict.avoid_tools.contains(&"bash".to_string()));
+        assert!(verdict.avoid_tools.contains(&"write_file".to_string()));
     }
 
     #[test]
-    fn merge_mixed_failures_remain_advisory() {
-        // Complex case: read-only and mutating tools fail repeatedly, but the
-        // old merge hook remains a no-op.
+    fn mixed_failures_keep_read_only_tools_out_of_avoid_guidance() {
         let mut guard = TurnGuard::new();
-        deprioritize_tool(&mut guard, "read_file", 8);
-        deprioritize_tool(&mut guard, "grep", 4);
-        deprioritize_tool(&mut guard, "bash", 4);
-        deprioritize_tool(&mut guard, "str_replace", 4);
+        record_tool_failures(&mut guard, "read_file", 8);
+        record_tool_failures(&mut guard, "grep", 4);
+        record_tool_failures(&mut guard, "bash", 4);
+        record_tool_failures(&mut guard, "str_replace", 4);
 
-        let mut restricted: HashSet<String> = HashSet::new();
-        super::merge_deprioritized_tools_into_restricted(&guard, &mut restricted);
+        let verdict = guard.evaluate();
 
-        assert!(restricted.is_empty(), "soft health must not restrict tools");
+        assert!(!verdict.avoid_tools.contains(&"read_file".to_string()));
+        assert!(!verdict.avoid_tools.contains(&"grep".to_string()));
     }
 
     // ── P0-B: Full stall recovery pipeline behavioral test ──────────
@@ -2485,7 +2468,7 @@ mod tests {
     // ─── Optimization: avoid_tools must respect READ_ONLY_NEVER_RESTRICT ─────
 
     #[test]
-    fn read_only_tools_never_in_avoid_tools_or_restricted() {
+    fn read_only_tools_never_enter_avoid_guidance() {
         let mut guard = TurnGuard::new();
         // Trigger stall on read_file (3 identical calls)
         let calls = [make_tool_call("read_file", r#"{"path":"a.rs"}"#)];
@@ -2505,37 +2488,23 @@ mod tests {
             verdict.avoid_tools
         );
 
-        // And not in restricted_tools either
-        let mut restricted = HashSet::new();
-        merge_deprioritized_tools_into_restricted(&guard, &mut restricted);
-        assert!(
-            !restricted.contains("read_file"),
-            "read_file must never be added to restricted_tools; got: {:?}",
-            restricted
-        );
+        // Tool-health pressure is advisory and never mutates schema visibility.
     }
 
     #[test]
     fn deprioritized_non_read_only_tools_remain_advisory() {
         let mut guard = TurnGuard::new();
         // Direct health failures still produce avoid guidance.
-        deprioritize_tool(&mut guard, "write_file", 3);
+        record_tool_failures(&mut guard, "write_file", 3);
 
         let verdict = guard.evaluate();
         assert!(verdict.avoid_tools.contains(&"write_file".to_string()));
-
-        let mut restricted = HashSet::new();
-        merge_deprioritized_tools_into_restricted(&guard, &mut restricted);
-        assert!(
-            !restricted.contains("write_file"),
-            "soft health guidance must not hide non-read-only tools"
-        );
     }
 
     #[test]
     fn never_restrict_deprioritized_tools_do_not_enter_verdict_avoid_tools() {
         let mut guard = TurnGuard::new();
-        deprioritize_tool(&mut guard, "read_file", 8);
+        record_tool_failures(&mut guard, "read_file", 8);
 
         let verdict = guard.evaluate();
 
@@ -2559,8 +2528,8 @@ mod tests {
     #[test]
     fn deprioritize_guidance_filters_never_restrict_tools_from_mixed_sets() {
         let mut guard = TurnGuard::new();
-        deprioritize_tool(&mut guard, "read_file", 8);
-        deprioritize_tool(&mut guard, "bash", 8);
+        record_tool_failures(&mut guard, "read_file", 8);
+        record_tool_failures(&mut guard, "bash", 8);
 
         let verdict = guard.evaluate();
 

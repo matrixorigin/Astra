@@ -2871,7 +2871,7 @@ impl ServerAgenticLoopHost {
             self.turn_interaction_mode(),
         ));
         // Boosted tools are never hidden, even if they landed in the restricted
-        // set earlier (e.g., via stall-based deprioritization).
+        // set earlier via a hard strategy/runtime restriction.
         for boosted in &state.boosted_tools {
             effective.remove(boosted);
         }

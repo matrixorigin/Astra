@@ -1413,9 +1413,10 @@ mod tests {
         });
         harness.edge_tool_round[0].tool = "str_replace".to_string();
         harness.edge_tool_round[0].args = args;
-        harness.edge_tool_round[0].output =
-            "Replaced successfully\n<<<ASTRA_UNIFIED_DIFF>>>\n-old\n+new\n<<<END_ASTRA_UNIFIED_DIFF>>>"
-                .to_string();
+        harness.edge_tool_round[0].output = format!(
+            "Replaced successfully\n<<<ASTRA_UNIFIED_DIFF>>>\n-old\n+new\n<<<END_ASTRA_UNIFIED_DIFF>>>\n{}",
+            astra_turn_core::tool_result_semantics::TOOL_SUCCESS_SENTINEL
+        );
         harness.edge_tool_round[0].status = "error".to_string();
         let mut fields = edge_runtime_environment_fields();
         fields.insert("status".to_string(), Value::String("failed".to_string()));
@@ -2228,36 +2229,6 @@ mod tests {
         assert!(
             pipeline.ctx.turn_guard.health.get("").is_none(),
             "empty-name catalog misses use the consecutive-name guard only"
-        );
-    }
-
-    #[tokio::test]
-    async fn unknown_tool_does_not_merge_into_restricted() {
-        let mut harness = PipelineHarness::new();
-        for i in 0..3 {
-            harness.tool_calls.push(json!({
-                "id": format!("call-outline-{i}"),
-                "function": {
-                    "name": "outline",
-                    "arguments": format!("{{\"path\": \"file{i}.rs\"}}")
-                }
-            }));
-        }
-        let mut pipeline = harness.pipeline();
-
-        for i in 0..3 {
-            pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(i));
-        }
-
-        // Simulate what the server loop does between turns.
-        assert!(!pipeline.ctx.restricted_tools.contains("outline"));
-        astra_turn_core::turn_guard::merge_deprioritized_tools_into_restricted(
-            pipeline.ctx.turn_guard,
-            pipeline.ctx.restricted_tools,
-        );
-        assert!(
-            !pipeline.ctx.restricted_tools.contains("outline"),
-            "unknown catalog tool should not be added to restricted_tools"
         );
     }
 

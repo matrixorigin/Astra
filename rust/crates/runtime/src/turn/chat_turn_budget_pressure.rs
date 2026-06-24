@@ -1,4 +1,4 @@
-//! Compaction-tier budget pressure for `/chat` payload assembly (selector + schemas).
+//! Compaction-tier budget pressure for `/chat` payload assembly (messages + schemas).
 
 use serde_json::Value;
 

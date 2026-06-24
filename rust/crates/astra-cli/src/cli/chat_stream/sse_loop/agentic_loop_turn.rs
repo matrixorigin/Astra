@@ -39,7 +39,7 @@ use astra_runtime::{
     turn::chat_turn_step_plan::record_agentic_step_plan_after_payload_prep,
     turn::prepare_turn_explain_text::restricted_tools_explain_text,
     turn::tool_schema_prune::retain_invoked_tool_schemas,
-    turn::turn_guard::{TurnGuard, merge_deprioritized_tools_into_restricted},
+    turn::turn_guard::TurnGuard,
 };
 use astra_turn_core::tool::schema::tool_schema_name;
 use crossterm::style::Stylize;
@@ -78,17 +78,6 @@ fn log_chat_turn_timing_phase(timing: bool, label: &str, mark: &mut Instant) {
     let ms = mark.elapsed().as_millis();
     eprintln!("{}", format!("  [chat-turn timing] {label}: {ms}ms").dim());
     *mark = Instant::now();
-}
-
-fn apply_cli_health_restrictions(
-    turn_guard: &TurnGuard,
-    restricted_tools: &mut HashSet<String>,
-    widen_surface_pending: &mut bool,
-) {
-    if std::mem::take(widen_surface_pending) {
-        return;
-    }
-    merge_deprioritized_tools_into_restricted(turn_guard, restricted_tools);
 }
 
 /// Updates the live stderr prep line (`Ns  Phase… ⠿`, braille animates at end) for normal chat.
@@ -509,11 +498,9 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     touch_prep_ui_phase(&ctx.prep_ui_phase, "Preparing tools…");
 
     let memory_domain_hints = domain_hints_from_boost_terms(&boost_terms);
-    apply_cli_health_restrictions(
-        ctx.turn_guard,
-        ctx.restricted_tools,
-        ctx.widen_surface_pending,
-    );
+    // Consume the one-shot strategy/correction reset marker. Tool health is
+    // advisory only and never mutates the hard schema restriction set.
+    let _ = std::mem::take(ctx.widen_surface_pending);
     ctx.step_recorder.record_perceive(
         semantic_query_str,
         &[],

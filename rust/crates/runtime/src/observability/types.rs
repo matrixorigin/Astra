@@ -130,7 +130,7 @@ pub struct ObservabilitySession {
     /// when the agent loops too often.
     pub stall_event_count: u32,
 
-    /// Gap 6: per-tool outcome bias currently applied by the selector
+    /// Gap 6: per-tool outcome bias currently applied as advisory health signal
     /// (`ToolHealthTracker::outcome_bias_by_tool`). Sorted by tool name.
     ///
     /// Values are `OutcomeBiasEntry { score, last_failure_tag }`. The tag

@@ -81,7 +81,7 @@ pub struct SelfModel {
     /// across turns instead of only seeing a raw correction count.
     #[serde(default)]
     pub recent_correction_excerpts: Vec<String>,
-    /// Gap 6: per-tool outcome bias currently affecting the selector
+    /// Gap 6: per-tool outcome bias currently surfaced as advisory health signal
     /// (`ToolHealthTracker::outcome_bias_by_tool`). Positive entries mildly
     /// boost the tool's score; negative entries penalize. Surfaced so the
     /// agent can audit why a tool is being preferred or avoided.
@@ -191,12 +191,12 @@ pub struct CapabilityView {
     pub skills: Vec<String>,
     /// Tools currently boosted by the last auto-reflection strategy delta.
     /// These are subtracted from any per-turn restricted set so the LLM sees
-    /// them even when general deprioritization would hide them.
+    /// them when a hard runtime restriction would otherwise hide them.
     #[serde(default)]
     pub boosted_tools: Vec<String>,
     /// Whether the next tool-visibility assembly will consume a one-shot
-    /// `widen_surface` request from the pipeline (skipping the
-    /// deprioritized→restricted merge).
+    /// `widen_surface` request from the pipeline (a one-shot hard restriction
+    /// reset after a correction or strategy signal).
     #[serde(default)]
     pub widen_surface_pending: bool,
     /// Compact recent signature-level execution memory surfaced back to the
@@ -715,7 +715,7 @@ impl SelfModel {
         }
         if self.capabilities.widen_surface_pending {
             s.push_str(
-                "Tool surface: widened for next turn (deprioritized set relaxed to recover from tool failures).\n",
+                "Tool surface: hard restrictions reset for next turn (one-shot recovery after correction/strategy signal).\n",
             );
         }
         // P3.1: surface the structured before/after diff of the most recent
@@ -823,9 +823,9 @@ impl SelfModel {
             );
         }
 
-        // ── Gap 6: per-tool outcome bias applied by the selector ──
-        // Explains which tools the selector is currently boosting /
-        // penalizing based on recent success / failure history.
+        // ── Gap 6: per-tool outcome bias surfaced as health advice ──
+        // Explains which tools currently have positive or negative outcome
+        // history without changing schema visibility.
         if !self.outcome_bias.is_empty() {
             let mut entries: Vec<(String, f64, Option<String>)> = self
                 .outcome_bias
@@ -856,7 +856,7 @@ impl SelfModel {
                     .collect();
                 let _ = writeln!(
                     s,
-                    "Tool outcome bias (selector-applied): {}",
+                    "Tool outcome bias (health-advisory): {}",
                     rendered.join(" · ")
                 );
             }
@@ -1674,7 +1674,7 @@ mod tests {
             "got: {rendered}"
         );
         assert!(
-            rendered.contains("widened for next turn"),
+            rendered.contains("hard restrictions reset for next turn"),
             "got: {rendered}"
         );
     }
@@ -1738,7 +1738,7 @@ mod tests {
         let rendered = model.to_system_prompt_section();
         assert!(!rendered.contains("Boosted tools"), "got: {rendered}");
         assert!(
-            !rendered.contains("widened for next turn"),
+            !rendered.contains("hard restrictions reset for next turn"),
             "got: {rendered}"
         );
     }
@@ -2078,7 +2078,7 @@ mod tests {
         let model = minimal_model().with_outcome_bias(bias);
         let rendered = model.to_system_prompt_section();
         assert!(
-            rendered.contains("Tool outcome bias (selector-applied)"),
+            rendered.contains("Tool outcome bias (health-advisory)"),
             "got: {rendered}"
         );
         let line = rendered
