@@ -386,6 +386,13 @@ impl CapabilityResolver {
                 if !seen.insert(tool_name.to_string()) {
                     return false;
                 }
+                let dynamic_spec = dynamic_tool_spec(tool_name);
+                let Some(spec) = registry.get(tool_name).or(dynamic_spec.as_ref()) else {
+                    return false;
+                };
+                if !spec.load_policy.is_public_schema_policy() {
+                    return false;
+                }
                 self.check_tool_call(registry, tool_name, &Value::Null, capabilities)
                     .is_ok()
             })
@@ -1344,6 +1351,27 @@ mod tests {
             );
         }
         assert!(!names.iter().any(|name| name == "not_registered"));
+    }
+
+    #[test]
+    fn schema_filter_hides_internal_runtime_tool_schemas_even_when_capable() {
+        let registry = registry();
+        let binding = RunBinding::local_developer("/repo", &registry);
+        let schemas = vec![
+            serde_json::json!({"type": "function", "function": {"name": "read_file"}}),
+            serde_json::json!({"type": "function", "function": {"name": "delete_file"}}),
+            serde_json::json!({"type": "function", "function": {"name": "multi_edit"}}),
+            serde_json::json!({"type": "function", "function": {"name": "git_clone"}}),
+            serde_json::json!({"type": "function", "function": {"name": "find_definition"}}),
+        ];
+
+        let names: Vec<String> = CapabilityResolver
+            .filter_tool_schemas(&registry, schemas, &binding.capabilities)
+            .into_iter()
+            .filter_map(|schema| tool_schema_name(&schema).map(str::to_string))
+            .collect();
+
+        assert_eq!(names, vec!["read_file".to_string()]);
     }
 
     #[test]

@@ -102,6 +102,14 @@ impl ToolSurface {
             .chain(plugin_schemas.iter().cloned())
         {
             if let Some(name) = tool_schema_name(&schema) {
+                if builtin_tool_is_internal(name) {
+                    tracing::warn!(
+                        target: "astra.tool_surface",
+                        name,
+                        "tool surface: internal builtin schema '{name}' ignored"
+                    );
+                    continue;
+                }
                 if by_name.contains_key(name) {
                     tracing::warn!(
                         target: "astra.tool_surface",
@@ -274,6 +282,14 @@ impl ToolSurface {
             names: block.names,
         })
     }
+}
+
+fn builtin_tool_is_internal(name: &str) -> bool {
+    static REGISTRY: LazyLock<astra_runtime_env::ToolRegistry> =
+        LazyLock::new(astra_runtime_env::ToolRegistry::builtins);
+    REGISTRY
+        .get(name)
+        .is_some_and(|spec| !spec.load_policy.is_public_schema_policy())
 }
 
 /// Truncate the schema description to a compact UTF-8 char-boundary summary.

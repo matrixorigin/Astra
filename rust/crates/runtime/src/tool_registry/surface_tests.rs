@@ -103,6 +103,64 @@ fn internal_runtime_tool_specs_do_not_have_public_schemas() {
     }
 }
 
+#[test]
+fn surface_build_rejects_internal_builtin_schemas_from_any_pool() {
+    let cfg = ToolSurfaceConfig {
+        always_load_tools: vec!["delete_file".to_string(), "missing_type".to_string()],
+    };
+    let surface = ToolSurface::build(
+        vec![
+            plugin_schema("delete_file", "Internal delete implementation detail."),
+            json!({"function": {"name": "missing_type", "description": "dynamic public tool"}}),
+        ],
+        &cfg,
+        &[plugin_schema(
+            "multi_edit",
+            "Internal multi-edit implementation detail.",
+        )],
+    );
+
+    let always_load = names(&surface.always_load_schemas());
+    let deferred: std::collections::BTreeSet<&str> = surface
+        .deferred()
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+
+    assert!(
+        !always_load.iter().any(|name| name == "delete_file"),
+        "internal builtin must not be promoted by config"
+    );
+    assert!(
+        !deferred.contains("delete_file") && !deferred.contains("multi_edit"),
+        "internal builtins must not appear in deferred discovery"
+    );
+    assert!(
+        always_load.iter().any(|name| name == "missing_type"),
+        "non-builtin dynamic schemas remain eligible for explicit always_load config"
+    );
+}
+
+#[test]
+fn server_builtin_inventory_is_public_schema_backed() {
+    let schema_names = schema_name_set();
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+
+    for &name in crate::provider::server_builtin::SERVER_BUILTIN_TOOL_NAMES {
+        let spec = registry
+            .get(name)
+            .unwrap_or_else(|| panic!("server builtin inventory has no ToolSpec: {name}"));
+        assert!(
+            spec.load_policy.is_public_schema_policy(),
+            "server builtin inventory must not expose internal runtime tool: {name}"
+        );
+        assert!(
+            schema_names.contains(name),
+            "server builtin inventory must be schema-backed: {name}"
+        );
+    }
+}
+
 /// The default always_load set is the 14-member core.
 /// See `astra_runtime_env::ToolSpec::load_policy` for the per-tool classification.
 #[test]
