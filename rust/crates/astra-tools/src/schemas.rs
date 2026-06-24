@@ -626,17 +626,16 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "session",
-                "description": "Session lifecycle and introspection. Actions grouped by category:\n  Config: `config`(set key=value), `prioritize`/`deprioritize`(tool priority).\n  Lifecycle: `set_goal`, `compact`(compress context), `rollback_edits`(revert file changes to previous turn), `sleep`(pause, max 300s).\n  History: `timeline`, `summary`, `history_page`, `history_search`, `history_around` — use when the user refers to older turns and visible context is insufficient.\nFor plan mode use the dedicated `enter_plan_mode`/`exit_plan_mode` tools — they are not session sub-actions. Use `ask_user` for user questions.",
+                "description": "Session lifecycle and history. Actions: config(path+value), rollback_edits, sleep, history_page, history_search, history_around. Use dedicated tools for tool preferences (`prioritize_tool`/`deprioritize_tool`), context compression (`compress_context`), plan mode (`enter_plan_mode`/`exit_plan_mode`), and user questions (`ask_user`).",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
-                        "action": {"type": "string", "enum": ["config","prioritize","deprioritize","set_goal","compact","rollback_edits","sleep","timeline","summary","history_page","history_search","history_around"]},
-                        "key": {"type": "string", "description": "Config key"},
+                        "action": {"type": "string", "enum": ["config","rollback_edits","sleep","history_page","history_search","history_around"]},
+                        "path": {"type": "string", "description": "Config path for action=config, or file path for rollback_edits scope=file."},
                         "value": {"type": "string", "description": "Config value"},
-                        "tool": {"type": "string", "description": "Tool name (prioritize/deprioritize)"},
-                        "goal": {"type": "string", "description": "Goal text"},
+                        "force": {"type": "boolean", "description": "Override config drift/mutation governor for action=config."},
                         "scope": {"type": "string", "enum": ["current_turn","turn","file","list"], "description": "Rollback scope"},
-                        "path": {"type": "string", "description": "File path (rollback scope=file)"},
                         "turn_index": {"type": "integer", "description": "Turn index (rollback scope=turn)"},
                         "duration_ms": {"type": "integer", "description": "Sleep ms, max 300000"},
                         "reason": {"type": "string", "description": "Reason (sleep)"},
@@ -653,9 +652,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "required": ["action"],
                     "x-astra-per-action-required": {
                         "config": ["path", "value"],
-                        "prioritize": ["tool"],
-                        "deprioritize": ["tool"],
-                        "history_search": ["pattern"]
+                        "history_search": ["pattern"],
+                        "history_around": ["item_seq"]
                     }
                 }
             }
@@ -717,27 +715,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "turn_index": {"type": "integer", "description": "Turn index when scope=turn."},
                         "session_state_after_sequence": {"type": "integer", "description": "Only restore entries recorded after this rollback-journal sequence."},
                         "after_sequence": {"type": "integer", "description": "Alias for session_state_after_sequence."}
-                    }
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "mo",
-                "description": "MatrixOne database operations. Actions: query (run SQL), snapshot (create named snapshot), branch (create named branch).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "action": {"type": "string", "enum": ["query","snapshot","branch"], "description": "MO operation"},
-                        "sql": {"type": "string", "description": "SQL to execute (for query)"},
-                        "name": {"type": "string", "description": "Snapshot/branch name"}
-                    },
-                    "required": ["action"],
-                    "x-astra-per-action-required": {
-                        "query": ["sql"],
-                        "snapshot": ["sub_action"],
-                        "branch": ["sub_action"]
                     }
                 }
             }
@@ -1860,7 +1837,11 @@ mod tests {
     #[test]
     fn matrixone_top_level_schemas_exist() {
         let schemas = all_tool_schemas_with_env(|_| None);
-        for name in ["mo", "mo_query", "rollback_database_snapshots"] {
+        assert!(
+            find_schema(&schemas, "mo").is_none(),
+            "MatrixOne must expose one public query shape; do not keep the old aggregate mo schema"
+        );
+        for name in ["mo_query", "rollback_database_snapshots"] {
             find_schema(&schemas, name)
                 .expect("top-level schema must exist for ToolEngine routing");
         }
@@ -1883,6 +1864,50 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
         assert!(scopes.contains("snapshot"));
         assert!(scopes.contains("list"));
+    }
+
+    #[test]
+    fn session_schema_excludes_retired_session_state_actions() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let session = find_schema(&schemas, "session").expect("session schema");
+        let actions = session["function"]["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("session action enum")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<std::collections::HashSet<_>>();
+
+        for retired in [
+            "prioritize",
+            "deprioritize",
+            "compact",
+            "set_goal",
+            "ask_user",
+        ] {
+            assert!(
+                !actions.contains(retired),
+                "session must not expose retired action {retired}; use the dedicated tool"
+            );
+        }
+        for current in [
+            "config",
+            "rollback_edits",
+            "sleep",
+            "history_page",
+            "history_search",
+            "history_around",
+        ] {
+            assert!(
+                actions.contains(current),
+                "session must expose current action {current}"
+            );
+        }
+        let props = session["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("session properties");
+        assert!(props.contains_key("path"));
+        assert!(!props.contains_key("key"));
+        assert!(!props.contains_key("tool"));
     }
 
     #[test]

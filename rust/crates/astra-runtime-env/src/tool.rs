@@ -242,7 +242,6 @@ impl ToolRegistry {
             control_plane("task_stop"),
             control_plane("task_list"),
             server_service("memory"),
-            server_service("mo"),
             server_service("mo_query"),
             server_service("rollback_database_snapshots"),
             server_service("tool_search"),

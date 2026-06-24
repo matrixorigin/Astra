@@ -46,7 +46,7 @@ fn tool_schemas_include_core_tools() {
                 .map(String::from)
         })
         .collect();
-    // Consolidated action tools: git, github, memory, session, mo, agent.
+    // Consolidated action tools: git, github, memory, session, agent.
     for expected in &[
         "bash",
         "read_file",
@@ -59,7 +59,7 @@ fn tool_schemas_include_core_tools() {
         "github",
         "memory",
         "session",
-        "mo",
+        "mo_query",
         "agent",
         "task_output",
         "task_stop",
@@ -221,6 +221,16 @@ fn conditional_required_for(schema: &serde_json::Value, target_action: &str) -> 
         .collect()
 }
 
+fn required_fields(schema: &serde_json::Value) -> Vec<String> {
+    schema["function"]["parameters"]["required"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect()
+}
+
 /// Anthropic/Bedrock Messages API rejects `tools[].input_schema`
 /// that contains `allOf`, `oneOf`, or `anyOf` at the top level
 /// (HTTP 400: "input_schema does not support oneOf, allOf, or anyOf
@@ -370,7 +380,7 @@ fn memory_schema_requires_content_query_new_content_signal() {
 }
 
 #[test]
-fn session_schema_requires_path_value_tool_query_and_not_ask_user() {
+fn session_schema_requires_current_action_fields_and_not_retired_actions() {
     let schemas = all_tool_schemas();
     let sess = tool_schema(&schemas, "session");
     assert_eq!(
@@ -378,24 +388,28 @@ fn session_schema_requires_path_value_tool_query_and_not_ask_user() {
         vec!["path".to_string(), "value".to_string()]
     );
     assert_eq!(
-        conditional_required_for(sess, "prioritize"),
-        vec!["tool".to_string()]
+        conditional_required_for(sess, "history_search"),
+        vec!["pattern".to_string()]
     );
     assert_eq!(
-        conditional_required_for(sess, "deprioritize"),
-        vec!["tool".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(sess, "ask_user"),
-        Vec::<String>::new()
+        conditional_required_for(sess, "history_around"),
+        vec!["item_seq".to_string()]
     );
     let actions = sess["function"]["parameters"]["properties"]["action"]["enum"]
         .as_array()
         .expect("session action enum");
-    assert!(
-        !actions.iter().any(|v| v.as_str() == Some("ask_user")),
-        "ask_user must be a first-class tool, not a stale session action"
-    );
+    for retired in [
+        "prioritize",
+        "deprioritize",
+        "compact",
+        "set_goal",
+        "ask_user",
+    ] {
+        assert!(
+            !actions.iter().any(|v| v.as_str() == Some(retired)),
+            "{retired} must be a dedicated tool or removed, not a stale session action"
+        );
+    }
 }
 
 #[test]
@@ -439,21 +453,16 @@ fn ask_user_schema_advertises_questionnaire_tabs_and_multi_select() {
 }
 
 #[test]
-fn mo_schema_requires_sql_and_sub_action() {
+fn mo_query_schema_requires_sql() {
     let schemas = all_tool_schemas();
-    let mo = tool_schema(&schemas, "mo");
-    assert_eq!(
-        conditional_required_for(mo, "query"),
-        vec!["sql".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(mo, "snapshot"),
-        vec!["sub_action".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(mo, "branch"),
-        vec!["sub_action".to_string()]
-    );
+    assert!(schemas.iter().all(|schema| {
+        schema
+            .pointer("/function/name")
+            .and_then(serde_json::Value::as_str)
+            != Some("mo")
+    }));
+    let mo_query = tool_schema(&schemas, "mo_query");
+    assert_eq!(required_fields(mo_query), vec!["sql".to_string()]);
 }
 
 #[test]

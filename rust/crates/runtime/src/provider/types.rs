@@ -91,7 +91,6 @@ impl ToolCategory {
             | "task_output"
             | "task_stop"
             | "task_list"
-            | "mo"
             | "mo_query"
             | "rollback_database_snapshots"
             | "rollback_session_state" => Some(Self::StateManagement),

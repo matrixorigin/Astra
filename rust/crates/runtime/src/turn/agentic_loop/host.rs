@@ -3217,7 +3217,7 @@ pub(crate) mod tests {
         let policy = TurnInteractionPolicy::from_visible_tool_names(
             TurnInteractionMode::Prompt,
             vec![
-                "mo".to_string(),
+                "mo_query".to_string(),
                 ASK_USER_TOOL_NAME.to_string(),
                 "read_file".to_string(),
             ],
@@ -3227,7 +3227,7 @@ pub(crate) mod tests {
         assert!(policy.can_pause_for_user);
         assert_eq!(
             policy.evidence_tool_names,
-            vec!["mo".to_string(), "read_file".to_string()]
+            vec!["mo_query".to_string(), "read_file".to_string()]
         );
     }
 

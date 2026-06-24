@@ -26,30 +26,14 @@ pub(crate) struct SessionToolRuntimeContext<'a> {
     pub(crate) file_journal: &'a Mutex<FileEditJournal>,
 }
 
-pub(crate) async fn execute_session_tool<
-    'a,
-    Config,
-    Prioritize,
-    Deprioritize,
-    Compact,
-    AskUser,
-    Sleep,
->(
+pub(crate) async fn execute_session_tool<'a, Config, Sleep>(
     context: SessionToolRuntimeContext<'a>,
     args: &'a Value,
     config: Config,
-    prioritize: Prioritize,
-    deprioritize: Deprioritize,
-    compact: Compact,
-    ask_user: AskUser,
     sleep: Sleep,
 ) -> astra_tools::ToolResult
 where
     Config: FnOnce(&Value) -> String,
-    Prioritize: FnOnce(&Value) -> String,
-    Deprioritize: FnOnce(&Value) -> String,
-    Compact: FnOnce(&Value) -> String,
-    AskUser: FnOnce(&'a Value) -> SessionToolFuture<'a>,
     Sleep: FnOnce(&'a Value) -> SessionToolFuture<'a>,
 {
     let action = match args.get("action") {
@@ -72,16 +56,12 @@ where
 
     match action {
         "config" => tool_result_from_output(config(args)),
-        "prioritize" => tool_result_from_output(prioritize(args)),
-        "deprioritize" => tool_result_from_output(deprioritize(args)),
-        "compact" => tool_result_from_output(compact(args)),
         "rollback_edits" => tool_result_from_output(execute_rollback_file_edits(
             context.workspace_root,
             args,
             context.turn_index,
             context.file_journal,
         )),
-        "ask_user" => ask_user(args).await,
         "sleep" => sleep(args).await,
         "history_page" => tool_session_history::history_page(session_history_context(), args).await,
         "history_search" => {
@@ -99,7 +79,7 @@ where
 
 fn missing_action_result() -> astra_tools::ToolResult {
     astra_tools::ToolResult::error(
-        "Error: missing required parameter `action` for `session`. Use: config, prioritize, deprioritize, compact, rollback_edits, ask_user, sleep, history_page, history_search, history_around. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools."
+        "Error: missing required parameter `action` for `session`. Use: config, rollback_edits, sleep, history_page, history_search, history_around. Use dedicated tools: prioritize_tool, deprioritize_tool, compress_context, ask_user, enter_plan_mode, exit_plan_mode."
             .to_string(),
     )
 }
@@ -121,10 +101,6 @@ pub(super) async fn execute_with_executor(
         },
         args,
         |args| executor.adjust_config(args),
-        |args| executor.prioritize_tool(args),
-        |args| executor.deprioritize_tool(args),
-        |args| executor.compress_context(args),
-        |args| Box::pin(executor.server_ask_user(args)),
         |args| Box::pin(executor.default_executor.execute("sleep", args)),
     )
     .await
@@ -165,17 +141,14 @@ mod tests {
             test_context(dir.path(), &journal),
             &json!({}),
             unreachable_text_action,
-            unreachable_text_action,
-            unreachable_text_action,
-            unreachable_text_action,
-            unreachable_async_action,
             unreachable_async_action,
         )
         .await;
 
         assert!(result.is_error, "{result:?}");
         assert!(result.output.contains("missing required parameter"));
-        assert!(result.output.contains("ask_user"));
+        assert!(!result.output.contains("prioritize"));
+        assert!(!result.output.contains("ask_user"));
     }
 
     #[tokio::test]
@@ -186,10 +159,6 @@ mod tests {
             test_context(dir.path(), &journal),
             &json!({"action": 7}),
             unreachable_text_action,
-            unreachable_text_action,
-            unreachable_text_action,
-            unreachable_text_action,
-            unreachable_async_action,
             unreachable_async_action,
         )
         .await;
@@ -206,10 +175,6 @@ mod tests {
             test_context(dir.path(), &journal),
             &json!({"action": "sleep", "seconds": 0}),
             unreachable_text_action,
-            unreachable_text_action,
-            unreachable_text_action,
-            unreachable_text_action,
-            unreachable_async_action,
             |args| {
                 assert_eq!(args.get("seconds").and_then(Value::as_i64), Some(0));
                 Box::pin(async { astra_tools::ToolResult::text("sleep ok".to_string()) })

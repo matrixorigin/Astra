@@ -517,26 +517,16 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
     },
     ToolMeta {
         name: "session",
-        description: "Session state and lifecycle operations: config, prioritize, deprioritize, compact, rollback_edits, ask_user, sleep, timeline, summary, history, suppress_memory(memory_id), unsuppress_memory(memory_id), list_suppressed, release_context(tool_call_id|string[]), list_released.",
+        description: "Session lifecycle and history operations: config, rollback_edits, sleep, history_page, history_search, history_around.",
         triggers: &[
             "config",
             "adjust",
-            "prioritize",
-            "deprioritize",
-            "goal",
-            "compact",
-            "plan",
             "rollback",
-            "ask",
             "sleep",
-            "search tools",
-            "suppress",
-            "unsuppress",
-            "release",
-            "压缩",
-            "目标",
+            "history",
+            "session history",
             "配置",
-            "计划",
+            "历史",
         ],
         always_load: false,
         intents: &[IntentType::Introspect],
@@ -616,26 +606,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         requires: &[],
         binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 35,
-    },
-    ToolMeta {
-        name: "mo",
-        description: "MatrixOne database operations: query, snapshot, branch. Execute SQL and manage DB state.",
-        triggers: &[
-            "sql",
-            "query",
-            "database",
-            "matrixone",
-            "snapshot",
-            "branch",
-            "数据库",
-            "查询",
-        ],
-        always_load: false,
-        intents: &[IntentType::CodeEdit],
-        scope: Scope::External,
-        requires: &[Capability::Database],
-        binding_validation: RuntimeBindingValidation::None,
-        schema_tokens: 40,
     },
     ToolMeta {
         name: "mo_query",
@@ -1005,7 +975,8 @@ mod tests {
     fn catalog_has_expected_count() {
         // Sanity check — if tools are added/removed, update this.
         // Post-consolidation: 8 git→1, 7 github→1, 5 memory→1, 5 session→1,
-        // 3 mo→1, 2 agent→1 — catalog now has ~17 entries.
+        // MatrixOne exposes the canonical query tool plus rollback support;
+        // agent fan-out is a dedicated tool.
         assert!(
             TOOL_CATALOG.len() >= 15,
             "expected at least 15 tools, got {}",
@@ -1065,7 +1036,6 @@ mod tests {
             ("agent", Capability::AgentSpawner),
             ("agent_fanout", Capability::AgentSpawner),
             ("memory", Capability::MemoryService),
-            ("mo", Capability::Database),
             ("mo_query", Capability::Database),
             ("rollback_database_snapshots", Capability::Database),
             ("github", Capability::GitHubAuth),

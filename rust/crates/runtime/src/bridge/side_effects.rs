@@ -754,7 +754,7 @@ mod inprocess_hook_contract_tests {
         let messages = vec![json!({"role": "user", "content": "update the database"})];
         let tool_results: Vec<Value> = vec![json!({
             "tool_call_id": "call-1",
-            "name": "mo",
+            "name": "mo_query",
             "result": "OK (no results)",
             "pre_state_snapshot_id": "moq_snap_123",
             "pre_state_snapshot_database": "analytics"
@@ -762,7 +762,7 @@ mod inprocess_hook_contract_tests {
         let tool_calls = vec![json!({
             "id": "call-1",
             "function": {
-                "name": "mo",
+                "name": "mo_query",
                 "arguments": "{\"sql\": \"UPDATE metrics SET value = 1\", \"database\": \"analytics\"}"
             }
         })];

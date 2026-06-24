@@ -167,7 +167,7 @@ pub fn render_preview(tool: &str, args: &Value, style: PreviewStyle, desc_budget
         "github" => github_preview(args, path_budget, verbose),
         "memory" => memory_preview(args, path_budget, verbose),
         "session" => session_preview(args, path_budget, verbose),
-        "mo" => mo_preview(args, path_budget, verbose),
+        "mo_query" => mo_query_preview(args, path_budget, verbose),
         "agent" => agent_preview(args, path_budget, verbose),
         "skill" => skill_preview(args, path_budget, verbose),
         "task" => task_preview(args, path_budget, verbose),
@@ -457,8 +457,7 @@ fn session_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: 
     }
 }
 
-fn mo_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bool) -> String {
-    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+fn mo_query_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bool) -> String {
     let trunc = |s: &str, b: usize| -> String {
         if verbose {
             s.to_string()
@@ -466,21 +465,8 @@ fn mo_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bool)
             truncate_line(s, path_budget(b))
         }
     };
-    match action {
-        "query" => {
-            let sql = args.get("sql").and_then(Value::as_str).unwrap_or("");
-            format!("MO query: \"{}\"", trunc(sql, 11))
-        }
-        "snapshot" => {
-            let name = args.get("name").and_then(Value::as_str).unwrap_or("");
-            format!("MO snapshot: {}", trunc(name, 13))
-        }
-        "branch" => {
-            let name = args.get("name").and_then(Value::as_str).unwrap_or("");
-            format!("MO branch: {}", trunc(name, 11))
-        }
-        _ => format!("MO: {action}"),
-    }
+    let sql = args.get("sql").and_then(Value::as_str).unwrap_or("");
+    format!("MO query: \"{}\"", trunc(sql, 11))
 }
 
 fn agent_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bool) -> String {
@@ -1073,7 +1059,7 @@ mod tests {
     #[test]
     fn mo_query() {
         assert_eq!(
-            p("mo", json!({"action": "query", "sql": "SELECT 1"})),
+            p("mo_query", json!({"sql": "SELECT 1"})),
             r#"MO query: "SELECT 1""#
         );
     }

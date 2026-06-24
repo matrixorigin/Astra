@@ -1851,28 +1851,16 @@ mod tests {
     #[tokio::test]
     async fn matrixone_tools_execute_from_tool_engine_registry() {
         let (exec, _dir) = test_executor();
-        for name in ["mo", "mo_query", "rollback_database_snapshots"] {
+        assert!(
+            !exec.tool_engine.contains("mo"),
+            "old aggregate mo tool must not remain registered"
+        );
+        for name in ["mo_query", "rollback_database_snapshots"] {
             assert!(
                 exec.tool_engine.contains(name),
                 "{name} should be registered in ToolEngine for server-local execution"
             );
         }
-
-        let mo_missing_sql = exec.execute_with_metadata("mo", &json!({})).await;
-        assert!(mo_missing_sql.is_error, "{mo_missing_sql:?}");
-        assert!(
-            mo_missing_sql.output.contains("Missing 'sql' parameter"),
-            "{mo_missing_sql:?}"
-        );
-
-        let mo_unknown_action = exec
-            .execute_with_metadata("mo", &json!({"action": "vacuum"}))
-            .await;
-        assert!(mo_unknown_action.is_error, "{mo_unknown_action:?}");
-        assert!(
-            mo_unknown_action.output.contains("Unknown mo action"),
-            "{mo_unknown_action:?}"
-        );
 
         let mo_query_missing_sql = exec.execute_with_metadata("mo_query", &json!({})).await;
         assert!(mo_query_missing_sql.is_error, "{mo_query_missing_sql:?}");
@@ -2250,6 +2238,12 @@ mod tests {
             assert!(
                 actions.iter().any(|value| value.as_str() == Some(action)),
                 "session action {action} must be advertised for web-agent history recall"
+            );
+        }
+        for action in ["prioritize", "deprioritize", "compact", "ask_user"] {
+            assert!(
+                !actions.iter().any(|value| value.as_str() == Some(action)),
+                "session action {action} must not remain as a public sub-action"
             );
         }
     }
@@ -6231,7 +6225,7 @@ esac
         exec.set_turn_index(11);
 
         let result = exec
-            .execute_with_metadata("mo", &json!({"sql": "UPDATE metrics SET value = 1"}))
+            .execute_with_metadata("mo_query", &json!({"sql": "UPDATE metrics SET value = 1"}))
             .await;
         assert!(!result.is_error, "got: {}", result.output);
         let fields = result.metadata.as_ref().expect("mo_query metadata");

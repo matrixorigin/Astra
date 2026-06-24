@@ -194,7 +194,7 @@
       {
         "function": {
           "_scrubbed_schema_digest": "<232903e941b7875a:398>",
-          "name": "mo"
+          "name": "mo_query"
         },
         "type": "function"
       },

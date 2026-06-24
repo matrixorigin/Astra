@@ -88,7 +88,6 @@ pub(super) fn server_tool_engine() -> ToolEngine<ServerToolExecutor> {
         "rollback_session_state",
         RollbackSessionStateToolHandler
     );
-    register_handler_or_log!(engine, "mo", MoToolHandler);
     register_handler_or_log!(engine, "mo_query", MoQueryToolHandler);
     register_handler_or_log!(
         engine,
@@ -594,46 +593,6 @@ impl ToolHandler<ServerToolExecutor> for RollbackSessionStateToolHandler {
             )
             .await,
         )
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct MoToolHandler;
-
-#[async_trait]
-impl ToolHandler<ServerToolExecutor> for MoToolHandler {
-    async fn execute(
-        &self,
-        context: &ServerToolExecutor,
-        args: &Value,
-        cancel_token: Option<&CancellationToken>,
-    ) -> astra_tools::ToolResult {
-        // P2-C: Cooperative cancellation check at heavy handler entry
-        if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::ToolResult::error(
-                "MatrixOne tool not executed: run was cancelled".to_string(),
-            );
-        }
-        let action = args
-            .get("action")
-            .and_then(|value| value.as_str())
-            .unwrap_or("query");
-        match action {
-            "query" => execute_mo_query(
-                context.database_snapshot_journal.as_ref(),
-                args,
-                context.journal_turn_index.load(Ordering::Relaxed),
-            ),
-            "snapshot" | "branch" => {
-                context
-                    .default_executor
-                    .execute(&format!("mo_{action}"), args)
-                    .await
-            }
-            other => tool_result_from_output(format!(
-                "Error: Unknown mo action: '{other}'. Use: query, snapshot, branch"
-            )),
-        }
     }
 }
 

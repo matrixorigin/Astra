@@ -88,7 +88,6 @@ static TOOL_DECLARATIONS: &[ToolDeclaration] = &[
     deferred("github", "credentialed GitHub access"),
     deferred("introspect", "self-inspection"),
     deferred("lsp", "language-server operations"),
-    deferred("mo", "MatrixOne operations"),
     deferred("mo_query", "MatrixOne query"),
     deferred("notify", "user notification"),
     deferred("powershell", "PowerShell shell"),

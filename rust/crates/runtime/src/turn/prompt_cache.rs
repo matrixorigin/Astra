@@ -876,7 +876,7 @@ mod tests {
             "web_fetch",
             "web_search",
             "session",
-            "mo",
+            "mo_query",
             "agent",
             "symbols",
             "powershell",
@@ -2172,7 +2172,7 @@ mod cache_stability_regression {
             let mut tools = always_load_prefix_fixture();
             // Deliberately DIFFERENT dynamic tools each call — the test
             // asserts the always_load portion is unaffected.
-            tools.extend([schema("git_log"), schema("mo")]);
+            tools.extend([schema("git_log"), schema("mo_query")]);
             annotate_test_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
             build_provider_request_body(
                 &[json!({"role": "user", "content": "hi"})],
@@ -2188,7 +2188,11 @@ mod cache_stability_regression {
         let a = build_once();
         let b_tools_churned = {
             let mut tools = always_load_prefix_fixture();
-            tools.extend([schema("web_fetch"), schema("github_list_prs"), schema("mo")]);
+            tools.extend([
+                schema("web_fetch"),
+                schema("github_list_prs"),
+                schema("mo_query"),
+            ]);
             annotate_test_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
             build_provider_request_body(
                 &[json!({"role": "user", "content": "hi"})],
@@ -2242,7 +2246,7 @@ mod cache_stability_regression {
                 &ThinkingConfig::Off,
             )
         };
-        let a = build(vec![schema("git_log"), schema("mo")]);
+        let a = build(vec![schema("git_log"), schema("mo_query")]);
         let b = build(vec![schema("web_fetch")]);
 
         let a_tools = a["tools"].as_array().unwrap();
@@ -2337,7 +2341,7 @@ mod cache_stability_regression {
             )
         };
 
-        let a = build(vec![schema("git_log"), schema("mo")]);
+        let a = build(vec![schema("git_log"), schema("mo_query")]);
         let b = build(vec![schema("web_fetch")]);
         (a, b, always_load_prefix_fixture().len())
     }
@@ -2390,7 +2394,7 @@ mod cache_stability_regression {
                 &astra_turn_core::thinking_config::ThinkingConfig::Off,
             )
         };
-        let a = build(vec![schema("git_log"), schema("mo")]);
+        let a = build(vec![schema("git_log"), schema("mo_query")]);
         let b = build(vec![schema("web_fetch")]);
 
         // Static system + user message identical
@@ -2433,7 +2437,7 @@ mod cache_stability_regression {
                 &astra_turn_core::thinking_config::ThinkingConfig::Off,
             )
         };
-        let a = build(vec![schema("git_log"), schema("mo")]);
+        let a = build(vec![schema("git_log"), schema("mo_query")]);
         let b = build(vec![schema("web_fetch")]);
 
         assert_eq!(a["messages"], b["messages"]);

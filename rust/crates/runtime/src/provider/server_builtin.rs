@@ -41,7 +41,6 @@ pub const SERVER_BUILTIN_TOOL_NAMES: &[&str] = &[
     "memory",
     "session",
     "task",
-    "mo",
     "mo_query",
     "rollback_database_snapshots",
     "rollback_session_state",

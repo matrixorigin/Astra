@@ -432,7 +432,7 @@
       {
         "function": {
           "_scrubbed_schema_digest": "<6f50aa59ce23b0f4:412>",
-          "name": "mo"
+          "name": "mo_query"
         },
         "type": "function"
       },

@@ -2456,7 +2456,6 @@ async fn server_runtime_tools_bypass_edge_transport() {
         "web_search",
         "web_fetch",
         "memory",
-        "mo",
         "mo_query",
         "rollback_database_snapshots",
         "github",

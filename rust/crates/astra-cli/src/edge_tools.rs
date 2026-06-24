@@ -224,7 +224,7 @@ pub(crate) fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
 
     matches!(
         tool,
-        "bash" | "write_file" | "str_replace" | "mo" | "rollback_database_snapshots"
+        "bash" | "write_file" | "str_replace" | "rollback_database_snapshots"
     )
 }
 
@@ -3335,150 +3335,6 @@ impl ToolExecutor {
         .to_string()
     }
 
-    // ── Timeline tool: unified multi-agent trace ───────────────────────────────
-
-    fn render_session_timeline(&self, args: &Value) -> String {
-        let session_id = match self.active_session_id() {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => return "Error: no active session. Timeline requires a session.".to_string(),
-        };
-        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
-        let agent_filter = args.get("agent_id").and_then(Value::as_str);
-
-        let journal_path = astra_services::session_journal::journal_file_path(&session_id);
-
-        if !journal_path.exists() {
-            return format!("Error: journal not found at {}", journal_path.display());
-        }
-
-        let events: Vec<serde_json::Value> = match std::fs::read_to_string(&journal_path) {
-            Ok(content) => content
-                .lines()
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect(),
-            Err(e) => return format!("Error reading journal: {e}"),
-        };
-
-        let mut timeline = astra_turn_core::unified_timeline::build_timeline(&events);
-
-        if let Some(filter) = agent_filter {
-            timeline.entries.retain(|e| {
-                e.agent_id.as_deref() == Some(filter)
-                    || matches!(&e.kind,
-                        astra_turn_core::unified_timeline::TimelineEntryKind::AgentSpawned { child_agent_id, .. }
-                        | astra_turn_core::unified_timeline::TimelineEntryKind::AgentCompleted { child_agent_id, .. }
-                        | astra_turn_core::unified_timeline::TimelineEntryKind::AgentFailed { child_agent_id, .. }
-                        if child_agent_id.contains(filter)
-                    )
-                    || e.agent_id.is_none() // always show parent rounds for context
-            });
-        }
-
-        astra_turn_core::unified_timeline::render_timeline(&timeline, limit)
-    }
-
-    // ── Session summary: structured overview of current session ────────────────
-
-    async fn render_session_summary(&self) -> String {
-        let session_id = match self.active_session_id() {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => return "Error: no active session.".to_string(),
-        };
-        let journal_path = astra_services::session_journal::journal_file_path(&session_id);
-
-        let events: Vec<serde_json::Value> = match std::fs::read_to_string(&journal_path) {
-            Ok(content) => content
-                .lines()
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect(),
-            Err(_) => return "Error: journal not found.".to_string(),
-        };
-
-        let mut turns = 0u32;
-        let mut total_tokens_in = 0u64;
-        let mut total_tokens_out = 0u64;
-        let mut total_rounds = 0u32;
-        let mut errors = 0u32;
-        let mut agents_spawned = 0u32;
-        let mut agents_completed = 0u32;
-
-        for evt in &events {
-            let etype = evt.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            match etype {
-                "turn" => {
-                    turns += 1;
-                    if let Some(tin) = evt.get("tokens_in").and_then(|v| v.as_u64()) {
-                        total_tokens_in += tin;
-                    }
-                    if let Some(tout) = evt.get("tokens_out").and_then(|v| v.as_u64()) {
-                        total_tokens_out += tout;
-                    }
-                }
-                "llm_round" => total_rounds += 1,
-                "turn_error" => errors += 1,
-                "agent_spawned" => agents_spawned += 1,
-                "AgentTerminated" => agents_completed += 1,
-                _ => {}
-            }
-        }
-
-        let mut out = String::from("## Session Summary\n");
-        out.push_str(&format!("Session: {session_id}\n"));
-        out.push_str(&format!(
-            "Turns: {turns} | LLM rounds: {total_rounds} | Errors: {errors}\n"
-        ));
-        out.push_str(&format!(
-            "Tokens: {} in + {} out = {} total\n",
-            total_tokens_in,
-            total_tokens_out,
-            total_tokens_in + total_tokens_out
-        ));
-        if agents_spawned > 0 {
-            out.push_str(&format!(
-                "Agents: {agents_spawned} spawned, {agents_completed} completed\n"
-            ));
-        }
-        // Task status nudge: if there is open work, remind the
-        // agent to update them (reference-agent parity: proactive nudge).
-        match self.task_manager.load_tasks().await {
-            Ok(tasks) => {
-                let open_tasks: Vec<_> = tasks.iter().filter(|t| t.status.is_open_work()).collect();
-                if !open_tasks.is_empty() {
-                    out.push_str(&format!("\nOpen tasks: {}\n", open_tasks.len()));
-                    for t in open_tasks.iter().take(5) {
-                        let status_icon = if t.status.is_in_progress() {
-                            "▶"
-                        } else if t.status == astra_tools::task_mgmt::SessionTaskStatusKind::Paused
-                        {
-                            "⏸"
-                        } else {
-                            "○"
-                        };
-                        let blocked = if !t.blocked_by.is_empty() {
-                            format!(" [blocked by: {}]", t.blocked_by.join(","))
-                        } else {
-                            String::new()
-                        };
-                        out.push_str(&format!(
-                            "  {status_icon} {} — {}{}\n",
-                            t.id, t.title, blocked
-                        ));
-                    }
-                    out.push_str(
-                        "Hint: update task status with `task(action=\"update\", task_id=\"...\", new_status=\"...\")` as you make progress.\n",
-                    );
-                }
-            }
-            Err(error) => {
-                out.push_str(&format!(
-                    "\nTask board unavailable: {error}\n\
-                     Do not assume there are no open tasks; retry `task(action=\"list\")` before creating duplicate work.\n"
-                ));
-            }
-        }
-        out
-    }
-
     // ── Session history: recall past conversation turns ──────────────────────
 
     fn render_session_history(&self, args: &Value) -> String {
@@ -3487,7 +3343,11 @@ impl ToolExecutor {
             _ => return "Error: no active session.".to_string(),
         };
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
-        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+        let query = args
+            .get("pattern")
+            .or_else(|| args.get("query"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
 
         let journal_path = astra_services::session_journal::journal_file_path(&session_id);
 
@@ -3569,144 +3429,11 @@ impl ToolExecutor {
         out
     }
 
-    // ── Memory suppress ────────────────────────────────────────────────────────
-
-    /// Suppress a Memoria `memory_id` for the active session.
-    ///
-    /// `memory_id` is the exact id shown by memory recall/search results.
-    /// The optional `reason` is written to the session journal. Suppression
-    /// only affects prompt injection for this session; it does not delete the
-    /// memory from Memoria.
-    fn suppress_memory(&self, args: &Value) -> String {
-        let memory_id = args.get("memory_id").and_then(Value::as_str).unwrap_or("");
-        if memory_id.is_empty() {
-            return "Error: missing required parameter `memory_id`.".to_string();
+    fn render_session_history_around(&self, args: &Value) -> String {
+        if args.get("item_seq").and_then(Value::as_u64).is_none() {
+            return "Error: history_around requires item_seq.".to_string();
         }
-        let session_id = match self.active_session_id() {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => return "Error: no active session.".to_string(),
-        };
-        let reason = args.get("reason").and_then(Value::as_str);
-        astra_tools::memoria::MemoriaClient::suppress_memory(&session_id, memory_id);
-        let turn = self
-            .journal_turn_index
-            .load(std::sync::atomic::Ordering::Relaxed);
-        crate::cli::cli_config::cli_utils::append_session_journal_event_or_warn(
-            &session_id,
-            &astra_services::session_journal::JournalEvent::memory_suppressed(
-                Some(&session_id),
-                turn,
-                memory_id,
-                reason,
-            ),
-            "edge_tools:suppress_memory",
-        );
-        format!(
-            "Memory `{mid}` suppressed for this session. It will not be injected in future turns.",
-            mid = memory_id
-        )
-    }
-
-    /// Remove a Memoria `memory_id` from the active session suppress list.
-    fn unsuppress_memory(&self, args: &Value) -> String {
-        let memory_id = args.get("memory_id").and_then(Value::as_str).unwrap_or("");
-        if memory_id.is_empty() {
-            return "Error: missing required parameter `memory_id`.".to_string();
-        }
-        let session_id = match self.active_session_id() {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => return "Error: no active session.".to_string(),
-        };
-        astra_tools::memoria::MemoriaClient::unsuppress_memory(&session_id, memory_id);
-        format!("Memory `{mid}` unsuppressed.", mid = memory_id)
-    }
-
-    /// List Memoria `memory_id` values suppressed in the active session.
-    fn list_suppressed_memories(&self) -> String {
-        let session_id = match self.active_session_id() {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => return "Error: no active session.".to_string(),
-        };
-        let suppressed = astra_tools::memoria::MemoriaClient::suppressed_snapshot(&session_id);
-        if suppressed.is_empty() {
-            return "No memories are suppressed in this session.".to_string();
-        }
-        let mut out = format!("## Suppressed memories ({} total)\n", suppressed.len());
-        for id in &suppressed {
-            out.push_str(&format!("- {id}\n"));
-        }
-        out
-    }
-
-    // ── Context release ──────────────────────────────────────────────────────────
-
-    /// Release one or more tool results from future LLM context.
-    ///
-    /// `tool_call_id` accepts a string or array of strings copied from tool
-    /// result metadata. Released results remain in the journal, but their
-    /// content is replaced with a short stub before the next LLM request.
-    fn release_context(&self, args: &Value) -> String {
-        let session_id = match self.active_session_id() {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => return "Error: no active session.".to_string(),
-        };
-        // Accept single ID or array of IDs. `tool_call_ids` (plural) is
-        // accepted as an alias so a typo in the agent prompt doesn't silently
-        // fall through to the missing-parameter error.
-        let raw = args
-            .get("tool_call_id")
-            .or_else(|| args.get("tool_call_ids"));
-        let ids: Vec<String> = if let Some(arr) = raw.and_then(Value::as_array) {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(String::from)
-                .collect()
-        } else if let Some(id) = raw.and_then(Value::as_str) {
-            vec![id.to_string()]
-        } else {
-            return "Error: missing required parameter `tool_call_id` (string or array)."
-                .to_string();
-        };
-        if ids.is_empty() {
-            return "Error: `tool_call_id` must not be empty.".to_string();
-        }
-        for id in &ids {
-            astra_tools::memoria::MemoriaClient::release_context(&session_id, id);
-        }
-        let turn = self
-            .journal_turn_index
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-        crate::cli::cli_config::cli_utils::append_session_journal_event_or_warn(
-            &session_id,
-            &astra_services::session_journal::JournalEvent::context_released(
-                Some(&session_id),
-                turn,
-                &id_refs,
-            ),
-            "edge_tools:release_context",
-        );
-        format!(
-            "Released {} tool result(s). They will be stubbed on the next LLM call.",
-            ids.len()
-        )
-    }
-
-    /// List tool_call_id values marked for context release in this session.
-    fn list_released_context(&self) -> String {
-        let session_id = match self.active_session_id() {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => return "Error: no active session.".to_string(),
-        };
-        let released = astra_tools::memoria::MemoriaClient::released_snapshot(&session_id);
-        if released.is_empty() {
-            return "No tool results are released in this session.".to_string();
-        }
-        let mut out = format!("## Released context ({} tool_call_ids)\n", released.len());
-        for id in &released {
-            out.push_str(&format!("- {id}\n"));
-        }
-        out
+        "Error: session history_around requires server-backed transcript item_seq support in this runtime. Use history_page or history_search in local CLI mode.".to_string()
     }
 
     // ── Env tool: environment variable management ─────────────────────────────
@@ -4535,7 +4262,7 @@ impl ToolExecutor {
 
     pub async fn execute_with_metadata(&self, name: &str, args: &Value) -> ToolExecutionOutcome {
         // Admission gate (fail-closed). This is a public entry point called
-        // directly by the server executor; without this gate, `mo_query`, `mo`,
+        // directly by the server executor; without this gate, `mo_query`
         // and `git` metadata-tagged paths would bypass `execute_run`'s gate.
         if let Some(denied) = self.tool_admission_denial(name, args) {
             return denied.into_outcome();
@@ -4548,16 +4275,6 @@ impl ToolExecutor {
             return outcome;
         }
         if name == "mo_query" {
-            let mut outcome = self.mo_query_with_metadata(args);
-            let output = self.finalize_tool_output(outcome.output, name);
-            self.record_output_size(output.len());
-            outcome.output = output;
-            return outcome;
-        }
-        // Consolidated `mo` tool (action=query|snapshot|branch).
-        // Only `query` has a metadata path — snapshot/branch fall
-        // through to `execute()` which dispatches without metadata.
-        if name == "mo" && args.get("action").and_then(Value::as_str) == Some("query") {
             let mut outcome = self.mo_query_with_metadata(args);
             let output = self.finalize_tool_output(outcome.output, name);
             self.record_output_size(output.len());
@@ -4733,26 +4450,6 @@ impl ToolExecutor {
                 "mo_query" => self.mo_query(args),
                 "mo_snapshot" => self.mo_snapshot(args),
                 "mo_branch" => self.mo_branch(args),
-                // Consolidated `mo` tool (matches the schema in
-                // astra-tools/schemas.rs). Routes by `action` to the
-                // existing legacy handlers. Without this arm, calls
-                // to `mo` fall to DefaultToolExecutor which doesn't
-                // know about it either — the tool was effectively
-                // dead-wired. Per-action required fields (sql for
-                // query, sub_action for snapshot/branch) are
-                // enforced by the schema's `allOf` block.
-                "mo" => {
-                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-                    match action {
-                        "query" => self.mo_query(args),
-                        "snapshot" => self.mo_snapshot(args),
-                        "branch" => self.mo_branch(args),
-                        "" => "Error: missing required parameter 'action'. Use one of: query, snapshot, branch".to_string(),
-                        other => format!(
-                            "Error: unknown mo action '{other}'. Use one of: query, snapshot, branch"
-                        ),
-                    }
-                }
                 "github" => {
                     let action = args.get("action").and_then(Value::as_str).unwrap_or("");
                     match action {
@@ -4935,21 +4632,12 @@ impl ToolExecutor {
                     let action = args.get("action").and_then(Value::as_str).unwrap_or("");
                     match action {
                         "config" => self.adjust_config(args),
-                        "prioritize" => self.prioritize_tool(args),
-                        "deprioritize" => self.deprioritize_tool(args),
-                        "compact" => self.compress_context(args),
                         "rollback_edits" => self.rollback_file_edits(args),
                         "sleep" => self.sleep_tool(args).await,
-                        "timeline" => self.render_session_timeline(args),
-                        "summary" => self.render_session_summary().await,
-                        "history" => self.render_session_history(args),
-                        "suppress_memory" => self.suppress_memory(args),
-                        "unsuppress_memory" => self.unsuppress_memory(args),
-                        "list_suppressed" => self.list_suppressed_memories(),
-                        "release_context" => self.release_context(args),
-                        "list_released" => self.list_released_context(),
-                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, compact, rollback_edits, sleep, timeline, summary, history, suppress_memory(memory_id, reason?), unsuppress_memory(memory_id), list_suppressed, release_context(tool_call_id|string[]), list_released. Use the first-class `ask_user` tool for user questions. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools.".to_string(),
-                        other => format!("Error: unknown `session` action '{other}'. Valid: config, prioritize, deprioritize, compact, rollback_edits, sleep, timeline, summary, history, suppress_memory, unsuppress_memory, list_suppressed, release_context, list_released. Use the first-class `ask_user` tool for user questions. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools."),
+                        "history_page" | "history_search" => self.render_session_history(args),
+                        "history_around" => self.render_session_history_around(args),
+                        "" => "Missing required parameter: action. Use: config, rollback_edits, sleep, history_page, history_search, history_around. Use dedicated tools: prioritize_tool, deprioritize_tool, compress_context, ask_user, enter_plan_mode, exit_plan_mode.".to_string(),
+                        other => format!("Error: unknown `session` action '{other}'. Valid: config, rollback_edits, sleep, history_page, history_search, history_around. Use dedicated tools: prioritize_tool, deprioritize_tool, compress_context, ask_user, enter_plan_mode, exit_plan_mode."),
                     }
                 }
                 // Task management (unified tool with action param)

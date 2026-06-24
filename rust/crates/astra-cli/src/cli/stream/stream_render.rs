@@ -6164,7 +6164,6 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "web_search" => format!("Searching web: \"{preview}\""),
         "github" => format!("GitHub: {preview}"),
         "session" => format!("Session: {preview}"),
-        "mo" => format!("MO: {preview}"),
         "agent" => {
             if is_agent_control_preview(preview) {
                 preview.to_string()
