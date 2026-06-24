@@ -293,19 +293,42 @@ pub async fn handle_agent_fanout_tool(args: &Value, ctx: Option<&AgentToolContex
 /// of replaying the start and duplicating child agents.
 pub async fn recover_agent_fanout_tool_result(
     args: &Value,
+    tool_call_id: Option<&str>,
     ctx: Option<&AgentToolContext>,
 ) -> String {
     let action = args.get("action").and_then(Value::as_str).unwrap_or("");
     let Some(ctx) = ctx else {
         return render_agent_runtime_binding_error("agent_fanout", action);
     };
+    if action == "get_results" {
+        let mut get_args = args.clone();
+        if let Some(tool_call_id) = tool_call_id
+            && let Some(object) = get_args.as_object_mut()
+        {
+            object.insert(
+                "_tool_call_id".to_string(),
+                Value::String(tool_call_id.to_string()),
+            );
+        }
+        return handle_agent_fanout_get_results_action(&get_args, Some(ctx)).await;
+    }
+    if action == "stop_slot" {
+        return render_agent_tool_error(
+            None,
+            "Cannot recover missing agent_fanout.stop_slot result because stop_slot has side effects. Recovery never replays control actions that can mutate child-agent state; call agent_fanout(action='get_results', group_id=...) to inspect the current group.",
+        );
+    }
     if action != "start" {
-        return handle_agent_fanout_tool(args, Some(ctx)).await;
+        return render_agent_tool_error(
+            None,
+            &format!(
+                "Cannot recover missing agent_fanout result for unknown action '{action}'. Use one of: start, get_results, stop_slot."
+            ),
+        );
     }
 
-    let tool_call_id = args
-        .get("_tool_call_id")
-        .and_then(Value::as_str)
+    let tool_call_id = tool_call_id
+        .or_else(|| args.get("_tool_call_id").and_then(Value::as_str))
         .map(str::trim)
         .filter(|id| !id.is_empty());
     let requested_group_id = args
@@ -328,7 +351,14 @@ pub async fn recover_agent_fanout_tool_result(
             .await;
     }
     if requested_group_id.is_some() {
-        return handle_agent_fanout_tool(args, Some(ctx)).await;
+        return render_agent_tool_error(
+            None,
+            &format!(
+                "Cannot recover missing agent_fanout.start result: requested group_id '{}' does not exist for parent run '{}'. Recovery is read-only and will not start replacement agents.",
+                requested_group_id.unwrap_or_default(),
+                ctx.run_id
+            ),
+        );
     }
     if let Some(tool_call_id) = tool_call_id
         && let Some(group) = parent_groups
@@ -358,7 +388,13 @@ pub async fn recover_agent_fanout_tool_result(
         );
     }
 
-    handle_agent_fanout_tool(args, Some(ctx)).await
+    render_agent_tool_error(
+        None,
+        &format!(
+            "Cannot recover missing agent_fanout.start result: parent run '{}' has no registered fanout group. Recovery is read-only and will not replay start or spawn replacement agents.",
+            ctx.run_id
+        ),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -2778,7 +2814,8 @@ mod tests {
         assert_eq!(start_value["status"], "completed");
         assert_eq!(executor.spawn_count(), 2);
 
-        let recovered = recover_agent_fanout_tool_result(&start_args, Some(&ctx)).await;
+        let recovered =
+            recover_agent_fanout_tool_result(&start_args, Some("call-start"), Some(&ctx)).await;
         let value: Value = serde_json::from_str(&recovered).unwrap();
 
         assert_eq!(value["status"], "completed");
@@ -2797,6 +2834,40 @@ mod tests {
             "recovering a missing edge row must not duplicate child agents"
         );
         assert_eq!(spawner.list_fanout_groups().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recover_agent_fanout_start_without_registered_group_fails_without_respawn() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        let recovered = recover_agent_fanout_tool_result(
+            &json!({
+                "action": "start",
+                "target_count": 1,
+                "slots": [
+                    {"description": "Review storage", "prompt": "Review changes"}
+                ]
+            }),
+            Some("call-missing-start"),
+            Some(&ctx),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&recovered).unwrap();
+
+        assert_eq!(value["status"], "failed");
+        assert!(
+            value["error"]
+                .as_str()
+                .is_some_and(|text| text.contains("no registered fanout group")),
+            "{recovered}"
+        );
+        assert_eq!(
+            executor.spawn_count(),
+            0,
+            "recovery must not replay agent_fanout.start when no registry state exists"
+        );
+        assert!(spawner.list_fanout_groups().await.is_empty());
     }
 
     #[tokio::test]
@@ -2830,6 +2901,7 @@ mod tests {
                     {"description": "Review unknown", "prompt": "Review changes"}
                 ]
             }),
+            None,
             Some(&ctx),
         )
         .await;
@@ -2850,7 +2922,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_agent_fanout_start_respects_explicit_group_id() {
+    async fn recover_agent_fanout_start_refuses_unknown_explicit_group_id() {
         let executor = Arc::new(CapturingModelExecutor::new());
         let spawner = test_spawner(executor.clone());
         let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
@@ -2879,17 +2951,65 @@ mod tests {
                     {"description": "Review new", "prompt": "Review new changes"}
                 ]
             }),
+            None,
             Some(&ctx),
         )
         .await;
         let value: Value = serde_json::from_str(&recovered).unwrap();
 
-        assert_eq!(value["status"], "completed");
-        assert_eq!(value["group_id"], "new-review");
+        assert_eq!(value["status"], "failed");
+        assert!(
+            value["error"]
+                .as_str()
+                .is_some_and(|text| text.contains("requested group_id 'new-review'")),
+            "{recovered}"
+        );
         assert_eq!(
             executor.spawn_count(),
-            2,
-            "explicit group_id must not recover a different parent group"
+            1,
+            "recovery must not start a new explicit group when no matching registry state exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_agent_fanout_stop_slot_refuses_side_effect_replay() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let start = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "review-stop-recovery",
+                "target_count": 1,
+                "slots": [
+                    {"description": "Review existing", "prompt": "Review existing changes"}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&start).unwrap();
+        assert_eq!(value["status"], "completed");
+        assert_eq!(executor.spawn_count(), 1);
+
+        let recovered = recover_agent_fanout_tool_result(
+            &json!({
+                "action": "stop_slot",
+                "group_id": "review-stop-recovery",
+                "slot_index": 0
+            }),
+            Some("call-stop-slot"),
+            Some(&ctx),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&recovered).unwrap();
+
+        assert_eq!(value["status"], "failed");
+        assert!(
+            value["error"]
+                .as_str()
+                .is_some_and(|text| text.contains("stop_slot has side effects")),
+            "{recovered}"
         );
     }
 

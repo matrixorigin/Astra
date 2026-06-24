@@ -9,7 +9,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use astra_runtime::{
     tool_registry::ToolRegistry,
@@ -20,8 +20,8 @@ use astra_runtime::{
     },
 };
 use astra_turn_core::{
-    compaction_types::CompactionEvent, sse_stream_host::EdgeToolExecResult,
-    tool_result_semantics::cloud_tool_result_status_label,
+    compaction_types::CompactionEvent, orchestration::agent_result_wire::render_agent_tool_error,
+    sse_stream_host::EdgeToolExecResult, tool_result_semantics::cloud_tool_result_status_label,
 };
 use async_trait::async_trait;
 use crossterm::style::Stylize;
@@ -40,6 +40,25 @@ use crate::cli::chat_stream::sse_loop::agentic_loop_turn::{
 use crate::cli::chat_stream::sse_loop::refresh_root_permission_context;
 
 use astra_runtime::tool_sandbox::SandboxPolicy;
+
+const AGENT_FANOUT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn failed_control_tool_recovery_result(
+    tool_call_id: &str,
+    tool_name: &str,
+    args: &Value,
+    message: &str,
+) -> EdgeToolExecResult {
+    EdgeToolExecResult {
+        request_id: tool_call_id.to_string(),
+        tool: tool_name.to_string(),
+        args: args.clone(),
+        output: render_agent_tool_error(None, message),
+        tool_result_fields: None,
+        status: "failed".to_string(),
+        duration_ms: 0,
+    }
+}
 
 /// RAII guard for the executor's sandbox policy slot.
 ///
@@ -913,32 +932,52 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             return None;
         }
         let spawn_context = self.executor.spawn_context.as_ref()?;
-        if let Some(parent_run_id) = parent_run_id
-            && parent_run_id != spawn_context.run_id
-        {
+        let Some(parent_run_id) = parent_run_id else {
+            tracing::warn!(
+                target: "astra_cli::agentic_loop_host",
+                spawn_context_run_id = %spawn_context.run_id,
+                tool_call_id,
+                "agent_fanout recovery failed: missing parent run id"
+            );
+            return Some(failed_control_tool_recovery_result(
+                tool_call_id,
+                tool_name,
+                args,
+                "Cannot recover missing agent_fanout edge result: parent_run_id is missing, so the host cannot prove which parent turn owns the fanout group.",
+            ));
+        };
+        if parent_run_id != spawn_context.run_id {
             tracing::warn!(
                 target: "astra_cli::agentic_loop_host",
                 parent_run_id,
                 spawn_context_run_id = %spawn_context.run_id,
                 tool_call_id,
-                "agent_fanout recovery skipped: parent run id does not match spawn context"
+                "agent_fanout recovery failed: parent run id does not match spawn context"
             );
-            return None;
+            return Some(failed_control_tool_recovery_result(
+                tool_call_id,
+                tool_name,
+                args,
+                "Cannot recover missing agent_fanout edge result: parent_run_id does not match the active spawn context.",
+            ));
         }
 
-        let started = Instant::now();
-        let mut exec_args = args.clone();
-        if let Some(object) = exec_args.as_object_mut() {
-            object.insert(
-                "_tool_call_id".to_string(),
-                Value::String(tool_call_id.to_string()),
-            );
-        }
-        let output = astra_runtime::orchestration::recover_agent_fanout_tool_result(
-            &exec_args,
-            Some(spawn_context),
+        let output = match tokio::time::timeout(
+            AGENT_FANOUT_RECOVERY_TIMEOUT,
+            astra_runtime::orchestration::recover_agent_fanout_tool_result(
+                args,
+                Some(tool_call_id),
+                Some(spawn_context),
+            ),
         )
-        .await;
+        .await
+        {
+            Ok(output) => output,
+            Err(_) => render_agent_tool_error(
+                None,
+                "Cannot recover missing agent_fanout edge result: recovery timed out before the host could render the registered fanout group.",
+            ),
+        };
         let status = cloud_tool_result_status_label(&output).to_string();
         Some(EdgeToolExecResult {
             request_id: tool_call_id.to_string(),
@@ -947,7 +986,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             output,
             tool_result_fields: None,
             status,
-            duration_ms: started.elapsed().as_millis() as u64,
+            duration_ms: 0,
         })
     }
 

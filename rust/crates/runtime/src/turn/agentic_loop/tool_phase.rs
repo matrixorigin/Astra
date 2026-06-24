@@ -215,10 +215,9 @@ async fn recover_missing_control_tool_results<H: AgenticLoopHost>(
             continue;
         };
         let args = tool_call_arguments_value(tool_call);
-        let signature = tool_dedup_signature(tool_name, &args);
         if edge_tool_round
             .iter()
-            .any(|edge| tool_dedup_signature(&edge.tool, &edge.args) == signature)
+            .any(|edge| edge.request_id == tool_call_id)
         {
             continue;
         }
@@ -2196,6 +2195,76 @@ mod tests {
         assert!(
             !matched.output.contains("Error: headless edge protocol"),
             "{matched:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_control_tool_recovery_is_keyed_by_tool_call_id_not_args_signature() {
+        let args = json!({
+            "action": "get_results",
+            "group_id": "run-parent-fanout-1"
+        });
+        let first_existing = EdgeToolExecResult {
+            request_id: "call-fanout-a".to_string(),
+            tool: "agent_fanout".to_string(),
+            args: args.clone(),
+            output: json!({
+                "status": "completed",
+                "group_id": "run-parent-fanout-1",
+                "marker": "a"
+            })
+            .to_string(),
+            tool_result_fields: None,
+            status: "completed".to_string(),
+            duration_ms: 7,
+        };
+        let recovered_second = EdgeToolExecResult {
+            request_id: "call-fanout-b".to_string(),
+            tool: "agent_fanout".to_string(),
+            args: args.clone(),
+            output: json!({
+                "status": "completed",
+                "group_id": "run-parent-fanout-1",
+                "marker": "b"
+            })
+            .to_string(),
+            tool_result_fields: None,
+            status: "completed".to_string(),
+            duration_ms: 0,
+        };
+        let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(Vec::new())
+            .with_recovered_control_tool_result("call-fanout-b", recovered_second);
+        let tool_calls = vec![json!({
+            "id": "call-fanout-b",
+            "type": "function",
+            "function": {
+                "name": "agent_fanout",
+                "arguments": serde_json::to_string(&args).unwrap(),
+            }
+        })];
+        let mut edge_tool_round = vec![first_existing];
+
+        recover_missing_control_tool_results(
+            &mut host,
+            Some("run-parent"),
+            &tool_calls,
+            &mut edge_tool_round,
+        )
+        .await;
+
+        assert_eq!(
+            edge_tool_round
+                .iter()
+                .map(|edge| edge.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call-fanout-a", "call-fanout-b"]
+        );
+        assert_eq!(
+            host.recovered_control_requests
+                .iter()
+                .map(|(_, tool_call_id, _, _)| tool_call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call-fanout-b"]
         );
     }
 
