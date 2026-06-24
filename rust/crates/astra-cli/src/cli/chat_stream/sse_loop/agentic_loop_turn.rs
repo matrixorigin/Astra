@@ -519,7 +519,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         let budget = ctx.registry.default_schema_budget();
         let (mut schemas, mut report) = ctx.registry.build_initial_surface_with_report_ctx(
             semantic_query_str,
-            ctx.history.len() as u32,
             budget,
             ctx.recent_tools,
         );
@@ -534,7 +533,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         let sel_latency_ms = sel_start.elapsed().as_millis() as u64;
         (schemas, report, sel_latency_ms)
     };
-    log_chat_turn_timing_phase(timing, "registry_select_schemas", &mut mark);
+    log_chat_turn_timing_phase(timing, "registry_load_schemas", &mut mark);
 
     // Force-inject any skill allowed_tools that the assembled surface missed.
     let mut turn_schemas = turn_schemas;

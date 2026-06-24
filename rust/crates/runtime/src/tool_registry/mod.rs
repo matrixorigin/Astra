@@ -192,8 +192,7 @@ mod tests {
     #[test]
     fn code_intel_query_leaves_lsp_deferred() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected =
-            registry.build_initial_surface("find references for this symbol with lsp", 1);
+        let selected = registry.build_initial_surface("find references for this symbol with lsp");
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             !names.contains(&"lsp".to_string()),
@@ -204,9 +203,9 @@ mod tests {
 
     /// Regression: recall queries should surface recall-oriented memory tools.
     #[test]
-    fn select_memory_query_has_memory() {
+    fn memory_is_visible_for_recall_queries() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("我有哪些记忆？", 1);
+        let selected = registry.build_initial_surface("我有哪些记忆？");
         let names = ToolRegistry::visible_names(&selected);
         assert!(names.contains(&"memory".to_string()));
     }
@@ -214,9 +213,9 @@ mod tests {
     /// Regression: implicit Chinese preferences still have memory available
     /// because memory is always_load.
     #[test]
-    fn select_preference_statement_has_memory() {
+    fn memory_is_visible_for_preference_statements() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("苹果比较好吃", 1);
+        let selected = registry.build_initial_surface("苹果比较好吃");
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             names.contains(&"memory".to_string()),
@@ -226,9 +225,9 @@ mod tests {
     }
 
     #[test]
-    fn select_tracking_intent_has_memory() {
+    fn memory_is_visible_for_tracking_statements() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("我关注 matrixorigin", 1);
+        let selected = registry.build_initial_surface("我关注 matrixorigin");
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             names.contains(&"memory".to_string()),
@@ -241,7 +240,7 @@ mod tests {
     fn non_conversational_zero_budget_includes_always_load() {
         let registry = ToolRegistry::new(mock_schemas());
         let (result, _report) =
-            registry.build_initial_surface_with_report("inspect the repository files", 1, 0);
+            registry.build_initial_surface_with_report("inspect the repository files", 0);
         let names = ToolRegistry::visible_names(&result);
         assert!(
             names.contains(&"bash".to_string()),
@@ -257,7 +256,7 @@ mod tests {
     #[test]
     fn budget_does_not_add_deferred_tools() {
         let registry = ToolRegistry::new(mock_schemas());
-        let (result, _report) = registry.build_initial_surface_with_report("最新的pr?", 1, 50);
+        let (result, _report) = registry.build_initial_surface_with_report("最新的pr?", 50);
         let names = ToolRegistry::visible_names(&result);
         assert_eq!(names, registry.always_load_tool_names_sorted());
     }
@@ -265,9 +264,9 @@ mod tests {
     // ── ToolRegistry integration ──
 
     #[test]
-    fn registry_select_pr_query_leaves_github_deferred() {
+    fn pr_query_leaves_github_deferred() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("matrixorigin memoria 最新的pr?", 1);
+        let selected = registry.build_initial_surface("matrixorigin memoria 最新的pr?");
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             !names.contains(&"github".to_string()),
@@ -287,7 +286,6 @@ mod tests {
         );
         let (selected, _report) = registry.build_initial_surface_with_report(
             "fetch the contents of https://example.com and summarize the web page",
-            1,
             800,
         );
         let names = ToolRegistry::visible_names(&selected);
@@ -306,9 +304,9 @@ mod tests {
     }
 
     #[test]
-    fn registry_select_conversational_uses_no_tools() {
+    fn conversational_query_uses_no_tools() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("你好", 1);
+        let selected = registry.build_initial_surface("你好");
         let names = ToolRegistry::visible_names(&selected);
         assert_eq!(
             names.len(),
@@ -319,19 +317,18 @@ mod tests {
     }
 
     #[test]
-    fn registry_select_complex_query() {
+    fn complex_query_uses_always_load_surface() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected =
-            registry.build_initial_surface("analyze why the CI failed on the latest PR", 1);
+        let selected = registry.build_initial_surface("analyze why the CI failed on the latest PR");
         let names = ToolRegistry::visible_names(&selected);
         assert!(names.contains(&"git".to_string()));
         assert!(!names.contains(&"github".to_string()));
     }
 
     #[test]
-    fn registry_select_repo_stats_query_leaves_github_deferred() {
+    fn repo_stats_query_leaves_github_deferred() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("matrixorigin memoria 多少star了？", 1);
+        let selected = registry.build_initial_surface("matrixorigin memoria 多少star了？");
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             !names.contains(&"github".to_string()),
@@ -341,9 +338,9 @@ mod tests {
     }
 
     #[test]
-    fn registry_select_memory_query() {
+    fn memory_query_uses_always_load_memory() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("我之前记住的偏好是什么?", 1);
+        let selected = registry.build_initial_surface("我之前记住的偏好是什么?");
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             names.contains(&"memory".to_string()),
@@ -353,9 +350,9 @@ mod tests {
     }
 
     #[test]
-    fn registry_select_create_issue_leaves_github_deferred() {
+    fn create_issue_query_leaves_github_deferred() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("create a new issue for this bug", 1);
+        let selected = registry.build_initial_surface("create a new issue for this bug");
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             !names.contains(&"github".to_string()),
@@ -365,9 +362,9 @@ mod tests {
     }
 
     #[test]
-    fn registry_select_git_for_status_query() {
+    fn git_status_query_uses_always_load_git() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("git status 看看改了什么", 1);
+        let selected = registry.build_initial_surface("git status 看看改了什么");
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             names.contains(&"git".to_string()),
@@ -377,9 +374,9 @@ mod tests {
     }
 
     #[test]
-    fn registry_select_reflect_query_leaves_introspect_deferred() {
+    fn reflect_query_leaves_introspect_deferred() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("为什么上次选错了工具?", 1);
+        let selected = registry.build_initial_surface("为什么上次选错了工具?");
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             !names.contains(&"introspect".to_string()),
@@ -395,9 +392,9 @@ mod tests {
         let schemas = mock_schemas();
         let registry = ToolRegistry::new(schemas);
         let (small, small_report) =
-            registry.build_initial_surface_with_report("matrixorigin memoria 最新的pr?", 1, 500);
+            registry.build_initial_surface_with_report("matrixorigin memoria 最新的pr?", 500);
         let (large, large_report) =
-            registry.build_initial_surface_with_report("matrixorigin memoria 最新的pr?", 1, 6000);
+            registry.build_initial_surface_with_report("matrixorigin memoria 最新的pr?", 6000);
         assert_eq!(
             ToolRegistry::visible_names(&large),
             ToolRegistry::visible_names(&small)
@@ -411,7 +408,7 @@ mod tests {
         let schemas = mock_schemas();
         let registry = ToolRegistry::new(schemas);
         let (selected, report) =
-            registry.build_initial_surface_with_report("matrixorigin memoria 最新的pr?", 1, 0);
+            registry.build_initial_surface_with_report("matrixorigin memoria 最新的pr?", 0);
         // AlwaysLoad tools are budget-exempt, always included
         assert_eq!(
             selected.len(),
@@ -482,7 +479,7 @@ mod tests {
     fn build_surface_with_report_returns_consistent_data() {
         let registry = ToolRegistry::new(mock_schemas());
         let (schemas, report) =
-            registry.build_initial_surface_with_report("matrixorigin 最新的pr?", 1, 3000);
+            registry.build_initial_surface_with_report("matrixorigin 最新的pr?", 3000);
         assert_eq!(schemas.len(), report.visible_count as usize);
         assert_eq!(ToolRegistry::visible_names(&schemas), report.visible_tools);
         assert_eq!(report.schema_budget_total, 3000);
@@ -491,7 +488,7 @@ mod tests {
     #[test]
     fn build_surface_with_report_conversational_zero_budget() {
         let registry = ToolRegistry::new(mock_schemas());
-        let (_schemas, report) = registry.build_initial_surface_with_report("你好", 1, 3000);
+        let (_schemas, report) = registry.build_initial_surface_with_report("你好", 3000);
         assert_eq!(
             report.schema_budget_used, 0,
             "conversational query should use 0 budget"
@@ -626,7 +623,7 @@ mod tests {
         // Phase 6.2: schema-budget exhaustion boundary
         let reg = ToolRegistry::new(mock_schemas());
         // Use a very small schema budget — always_load tools remain budget-exempt.
-        let (schemas, report) = reg.build_initial_surface_with_report("list PRs", 1, 1);
+        let (schemas, report) = reg.build_initial_surface_with_report("list PRs", 1);
         assert!(
             schemas.len() >= reg.always_load_tool_names_sorted().len(),
             "should always include always_load tools even with tiny budget"
@@ -637,7 +634,7 @@ mod tests {
     #[test]
     fn conversational_query_returns_no_tools() {
         let reg = ToolRegistry::new(mock_schemas());
-        let (schemas, _) = reg.build_initial_surface_with_report("hello there", 1, 2000);
+        let (schemas, _) = reg.build_initial_surface_with_report("hello there", 2000);
         assert!(
             schemas.is_empty(),
             "conversational turns should be tool-free"
@@ -672,11 +669,11 @@ mod tests {
     }
 
     #[test]
-    fn select_report_schemas_and_names_consistent() {
+    fn surface_report_schemas_and_names_consistent() {
         // Phase 6: Data consistency check
         let reg = ToolRegistry::new(mock_schemas());
         let (schemas, report) =
-            reg.build_initial_surface_with_report("show me open PRs in matrixone", 3, 800);
+            reg.build_initial_surface_with_report("show me open PRs in matrixone", 800);
         assert_eq!(
             schemas.len(),
             report.visible_count as usize,
@@ -693,7 +690,7 @@ mod tests {
     fn surface_report_schema_budget_used_excludes_deferred_discovery_entries() {
         let registry = ToolRegistry::new(mock_schemas());
         let (_schemas, report) =
-            registry.build_initial_surface_with_report("analyze everything", 1, 800);
+            registry.build_initial_surface_with_report("analyze everything", 800);
         assert_eq!(report.schema_budget_used, 0);
     }
 }

@@ -8,7 +8,6 @@ use super::DEFAULT_TOOL_SCHEMA_BUDGET_TOKENS;
 use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_registry_meta::{TOOL_CATALOG, ToolMeta};
 use astra_turn_core::tool_registry_report::ToolSurfaceReport;
-use astra_turn_core::tool_registry_state::ConversationState;
 
 fn sort_schemas_by_name(schemas: &mut [Value]) {
     schemas.sort_by(|a, b| {
@@ -18,11 +17,72 @@ fn sort_schemas_by_name(schemas: &mut [Value]) {
     });
 }
 
+fn split_ascii_words(text: &str) -> Vec<&str> {
+    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+fn is_pure_conversational_query(query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    let lower = trimmed.to_lowercase();
+    let has_content = lower
+        .chars()
+        .any(|c| c.is_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(&c));
+    if !has_content {
+        return true;
+    }
+    if lower.chars().count() > 20 {
+        return false;
+    }
+
+    const CONVERSATIONAL_CN: &[&str] = &["你好", "谢谢", "再见", "好的", "是的", "不是", "嗯"];
+    let compact_cjk: String = lower
+        .chars()
+        .filter(|c| c.is_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(c))
+        .collect();
+    if CONVERSATIONAL_CN
+        .iter()
+        .any(|phrase| compact_cjk == *phrase)
+    {
+        return true;
+    }
+
+    const CONVERSATIONAL_EN: &[&str] = &[
+        "hello",
+        "hi",
+        "hey",
+        "thanks",
+        "thank you",
+        "bye",
+        "goodbye",
+        "yes",
+        "no",
+        "ok",
+        "okay",
+        "sure",
+        "yep",
+        "nope",
+    ];
+    let words = split_ascii_words(&lower);
+    CONVERSATIONAL_EN.iter().any(|phrase| {
+        let phrase_words = split_ascii_words(phrase);
+        words == phrase_words
+            || (phrase_words.len() == 1
+                && matches!(phrase_words[0], "hello" | "hi" | "hey")
+                && words == [phrase_words[0], "there"])
+    })
+}
+
 /// The main tool surface interface.
 ///
 /// ```text
 /// let registry = ToolRegistry::new(all_tool_schemas());
-/// let surface = registry.build_initial_surface("matrixorigin memoria最新的pr?", 1);
+/// let surface = registry.build_initial_surface("matrixorigin memoria最新的pr?");
 /// // surface contains the stable always_load tools; deferred tools are activated explicitly
 /// ```
 pub struct ToolRegistry {
@@ -197,9 +257,9 @@ impl ToolRegistry {
     /// Returns tool schemas to include in the LLM request.
     /// AlwaysLoad tools are included deterministically. Non-always_load built-ins are
     /// deferred and must be activated explicitly through `tool_search`.
-    pub fn build_initial_surface(&self, query: &str, turn_count: u32) -> Vec<Value> {
+    pub fn build_initial_surface(&self, query: &str) -> Vec<Value> {
         let (schemas, _report) =
-            self.build_initial_surface_with_report(query, turn_count, self.schema_budget_tokens);
+            self.build_initial_surface_with_report(query, self.schema_budget_tokens);
         schemas
     }
 
@@ -207,33 +267,21 @@ impl ToolRegistry {
     pub fn build_initial_surface_with_report(
         &self,
         query: &str,
-        turn_count: u32,
         schema_budget: u32,
     ) -> (Vec<Value>, ToolSurfaceReport) {
-        self.build_initial_surface_with_report_ctx(query, turn_count, schema_budget, &[])
+        self.build_initial_surface_with_report_ctx(query, schema_budget, &[])
     }
 
     /// Build a tool surface with context from recent turns.
     pub fn build_initial_surface_with_report_ctx(
         &self,
         query: &str,
-        turn_count: u32,
         schema_budget: u32,
         recent_tools: &[String],
     ) -> (Vec<Value>, ToolSurfaceReport) {
-        let state = ConversationState::from_message_with_context(query, turn_count, recent_tools);
-
-        // Conversational short-circuit: pure greetings/acks need no tools.
-        // BUT: if recent_tools is non-empty, the session has active tool context
-        // and the next turn likely needs related tools (e.g., memory_retrieve
-        // after memory_store). Don't short-circuit in that case.
-        if state.is_conversational
-            && !state.is_fetch
-            && !state.is_mutate
-            && !state.is_analytical
-            && !state.references_history
-            && state.recent_tools.is_empty()
-        {
+        // Conversational short-circuit: pure greetings/acks need no tools. If
+        // recent tools exist, preserve tool continuity for follow-up turns.
+        if recent_tools.is_empty() && is_pure_conversational_query(query) {
             let report = ToolSurfaceReport {
                 visible_tools: Vec::new(),
                 visible_count: 0,
@@ -516,8 +564,7 @@ mod tests {
         assert!(reg.schema_by_name("skill").is_some());
         assert!(!reg.always_load_schemas.iter().any(|(n, _)| n == "skill"));
 
-        let (selected, report) =
-            reg.build_initial_surface_with_report("use the skill tool", 1, 800);
+        let (selected, report) = reg.build_initial_surface_with_report("use the skill tool", 800);
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             !names.contains(&"skill".to_string()),
@@ -593,7 +640,7 @@ mod tests {
         };
         let reg = ToolRegistry::new_with_tool_surface(schemas, &cfg);
 
-        let (selected, report) = reg.build_initial_surface_with_report("fetch this web page", 1, 0);
+        let (selected, report) = reg.build_initial_surface_with_report("fetch this web page", 0);
         let names = ToolRegistry::visible_names(&selected);
 
         assert!(names.contains(&"web_fetch".to_string()));
@@ -616,7 +663,7 @@ mod tests {
         let reg = ToolRegistry::new_with_tool_surface(schemas, &cfg);
 
         let (selected, report) =
-            reg.build_initial_surface_with_report("grep for UserSession in the code", 1, 0);
+            reg.build_initial_surface_with_report("grep for UserSession in the code", 0);
         let names = ToolRegistry::visible_names(&selected);
 
         assert!(
@@ -654,7 +701,7 @@ mod tests {
         let registry = ToolRegistry::new(schemas);
         // "hello" is the conversational short-circuit case.
         let (out_schemas, report) =
-            registry.build_initial_surface_with_report_ctx("hello", 0, 800, &[]);
+            registry.build_initial_surface_with_report_ctx("hello", 800, &[]);
         assert!(out_schemas.is_empty());
         assert_eq!(report.visible_count as usize, out_schemas.len());
     }
@@ -664,7 +711,7 @@ mod tests {
         let schemas: Vec<Value> = TOOL_CATALOG.iter().map(|t| sample_schema(t.name)).collect();
         let registry = ToolRegistry::new(schemas);
         // "谢谢" with no recent_tools → should short-circuit to no tools.
-        let (out, report) = registry.build_initial_surface_with_report_ctx("谢谢", 1, 800, &[]);
+        let (out, report) = registry.build_initial_surface_with_report_ctx("谢谢", 800, &[]);
         assert_eq!(
             report.visible_count, 0,
             "conversational + no recent_tools should return no tools"
@@ -673,6 +720,27 @@ mod tests {
             out.is_empty(),
             "pure conversational turns should be tool-free"
         );
+    }
+
+    #[test]
+    fn conversational_shortcut_requires_pure_ack_or_greeting() {
+        assert!(is_pure_conversational_query("hello there"));
+        assert!(is_pure_conversational_query("谢谢"));
+        assert!(!is_pure_conversational_query("hi fix the tests"));
+        assert!(!is_pure_conversational_query("你好请修复测试"));
+    }
+
+    #[test]
+    fn conversational_with_recent_tools_preserves_tool_surface() {
+        let schemas: Vec<Value> = TOOL_CATALOG.iter().map(|t| sample_schema(t.name)).collect();
+        let registry = ToolRegistry::new(schemas);
+        let recent_tools = vec!["read_file".to_string()];
+
+        let (out, report) =
+            registry.build_initial_surface_with_report_ctx("hello", 800, &recent_tools);
+
+        assert!(!out.is_empty());
+        assert_eq!(report.visible_count as usize, out.len());
     }
 
     #[test]
@@ -687,7 +755,6 @@ mod tests {
         // Analytical-ish query forces the non-conversational always_load-only path.
         let (out, report) = registry.build_initial_surface_with_report_ctx(
             "search for TODO in source files",
-            0,
             800,
             &[],
         );
