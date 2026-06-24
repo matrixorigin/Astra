@@ -8,18 +8,12 @@ pub struct ChatRouteResponse {
     confidence: f64,
     tier: u8,
     matched_by: String,
-    tool_filter: String,
-    /// Deprecated: the actual per-turn round limit is now governed by
-    /// `LoopCircuitBreaker::absolute_max_rounds`. This field is retained for
-    /// API backward compatibility and reflects a route-level hint only.
-    max_tool_rounds: u32,
     task_type: String,
 }
 
 pub fn classify_chat_route(query: String) -> ChatRouteResponse {
     let stripped = query.trim();
     let intent = classify_chat_route_intent(stripped, 0);
-    let (tool_filter, max_tool_rounds) = classify_chat_route_tool_filter(stripped);
     let task_type = classify_chat_route_task_type(stripped);
 
     ChatRouteResponse {
@@ -28,8 +22,6 @@ pub fn classify_chat_route(query: String) -> ChatRouteResponse {
         confidence: intent.confidence,
         tier: intent.tier,
         matched_by: intent.matched_by.to_string(),
-        tool_filter: tool_filter.to_string(),
-        max_tool_rounds,
         task_type: task_type.to_string(),
     }
 }
@@ -43,7 +35,6 @@ struct RouteIntentClassification {
 
 struct KeywordMatch {
     label: Option<&'static str>,
-    score: f64,
 }
 
 fn classify_chat_route_intent(query: &str, history_len: usize) -> RouteIntentClassification {
@@ -119,137 +110,6 @@ fn heuristic_classify_chat_route_intent(query: &str, history_len: usize) -> Opti
     None
 }
 
-fn classify_chat_route_tool_filter(query: &str) -> (&'static str, u32) {
-    let tool_filter = keyword_registry_match(
-        query,
-        &[
-            (
-                "CONVERSATIONAL",
-                &[
-                    "hello",
-                    "hi",
-                    "hey",
-                    "thanks",
-                    "thank you",
-                    "bye",
-                    "goodbye",
-                    "good morning",
-                    "good evening",
-                    "how are you",
-                    "what's up",
-                    "who are you",
-                    "what can you do",
-                    "help me",
-                    "yes",
-                    "no",
-                    "ok",
-                    "okay",
-                    "sure",
-                    "great",
-                    "nice",
-                    "please",
-                    "sorry",
-                    "excuse me",
-                    "你好",
-                    "您好",
-                    "谢谢",
-                    "感谢",
-                    "再见",
-                    "拜拜",
-                    "早上好",
-                    "晚上好",
-                    "你是谁",
-                    "你能做什么",
-                    "好的",
-                    "可以",
-                    "是的",
-                    "不是",
-                    "没问题",
-                    "请",
-                    "抱歉",
-                    "对不起",
-                ],
-            ),
-            (
-                "EXTERNAL_FETCH",
-                &[
-                    "search online",
-                    "look up",
-                    "find online",
-                    "web search",
-                    "what is the latest",
-                    "current price",
-                    "today's",
-                    "fetch from",
-                    "download",
-                    "api call",
-                    "http",
-                    "weather",
-                    "news",
-                    "stock price",
-                    "check the website",
-                    "browse",
-                    "搜索",
-                    "查找",
-                    "查一下",
-                    "网上找",
-                    "最新的",
-                    "当前价格",
-                    "今天的",
-                    "下载",
-                    "获取",
-                    "抓取",
-                    "天气",
-                    "新闻",
-                    "股价",
-                ],
-            ),
-        ],
-        &[(
-            "EXTERNAL_FETCH",
-            &[
-                "file",
-                "code",
-                "class",
-                "function",
-                "method",
-                "variable",
-                "refactor",
-                "implement",
-                "debug",
-                "fix",
-                "bug",
-                "test",
-                "import",
-                "module",
-                "package",
-                "repository",
-                "repo",
-                "algorithm",
-                "sort",
-                "tree",
-                "array",
-                "list",
-                "dict",
-            ],
-        )],
-    );
-
-    if tool_filter.label == Some("CONVERSATIONAL") {
-        let mut score = tool_filter.score;
-        if query.trim().chars().count() < 20 && score > 0.0 {
-            score = (score * 2.0).min(1.0);
-        }
-        if score >= 0.25 {
-            return ("all_blocked", 0);
-        }
-    } else if tool_filter.label == Some("EXTERNAL_FETCH") && tool_filter.score >= 0.25 {
-        return ("local_blocked", 3);
-    }
-
-    ("none", 10)
-}
-
 fn classify_chat_route_task_type(query: &str) -> &'static str {
     keyword_registry_match(
         query,
@@ -303,10 +163,7 @@ fn keyword_registry_match(
 ) -> KeywordMatch {
     let query = query.trim();
     if query.is_empty() {
-        return KeywordMatch {
-            label: None,
-            score: 0.0,
-        };
+        return KeywordMatch { label: None };
     }
 
     let mut best_label = None;
@@ -344,10 +201,7 @@ fn keyword_registry_match(
         }
     }
 
-    KeywordMatch {
-        label: best_label,
-        score: best_score,
-    }
+    KeywordMatch { label: best_label }
 }
 
 fn keyword_matches(query: &str, keyword: &str) -> bool {
@@ -432,14 +286,12 @@ mod tests {
     fn registry_match_empty_query() {
         let m = keyword_registry_match("", &[("test", &["hello"])], &[]);
         assert!(m.label.is_none());
-        assert_eq!(m.score, 0.0);
     }
 
     #[test]
     fn registry_match_single_hit() {
         let m = keyword_registry_match("hello world", &[("greet", &["hello"])], &[]);
         assert_eq!(m.label, Some("greet"));
-        assert!(m.score > 0.0);
     }
 
     #[test]
@@ -558,37 +410,6 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────
-    // classify_chat_route_tool_filter
-    // ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn tool_filter_conversational() {
-        let (filter, rounds) = classify_chat_route_tool_filter("hello");
-        assert_eq!(filter, "all_blocked");
-        assert_eq!(rounds, 0);
-    }
-
-    #[test]
-    fn tool_filter_external_fetch() {
-        let (filter, rounds) = classify_chat_route_tool_filter("search online for the latest news");
-        assert_eq!(filter, "local_blocked");
-        assert_eq!(rounds, 3);
-    }
-
-    #[test]
-    fn tool_filter_general() {
-        let (filter, rounds) = classify_chat_route_tool_filter("implement a new auth module");
-        assert_eq!(filter, "none");
-        assert_eq!(rounds, 10);
-    }
-
-    #[test]
-    fn tool_filter_chinese_conversational() {
-        let (filter, _) = classify_chat_route_tool_filter("你好");
-        assert_eq!(filter, "all_blocked");
-    }
-
-    // ──────────────────────────────────────────────────────────
     // classify_chat_route_task_type
     // ──────────────────────────────────────────────────────────
 
@@ -631,7 +452,8 @@ mod tests {
     #[test]
     fn full_route_conversational() {
         let r = classify_chat_route("hi".to_string());
-        assert_eq!(r.tool_filter, "all_blocked");
+        assert_eq!(r.query, "hi");
+        assert_eq!(r.task_type, "general");
     }
 
     #[test]

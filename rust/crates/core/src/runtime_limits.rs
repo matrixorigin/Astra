@@ -34,13 +34,6 @@ use std::sync::OnceLock;
 /// Global runtime limits, loaded once from env on first access.
 static LIMITS: OnceLock<RuntimeLimits> = OnceLock::new();
 
-/// Default value for max_tool_rounds — DEPRECATED.
-///
-/// The per-turn tool round limit is now handled by `LoopCircuitBreaker::absolute_max_rounds`
-/// (default 200). This constant is retained only for backward compatibility with
-/// code that references it during the transition period.
-pub const MAX_TOOL_ROUNDS_DEFAULT: i64 = 200;
-
 /// Centralized runtime limits.  Read from `MO_*` env vars with defaults.
 #[derive(Debug, Clone)]
 pub struct RuntimeLimits {
@@ -272,12 +265,6 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
 /// cannot link this hardcoded fallback.
 #[cfg(any(test, feature = "dev-defaults"))]
 pub const DEV_MATRIXONE_PASSWORD: &str = "111";
-
-/// Static assertion: ensure const default is updated if changed.
-const _: () = assert!(
-    MAX_TOOL_ROUNDS_DEFAULT == 200,
-    "MAX_TOOL_ROUNDS_DEFAULT should be 200 (update this assertion if intentionally changed)"
-);
 
 /// Emit a one-time warning if using the default MatrixOne password.
 #[cfg(any(test, feature = "dev-defaults"))]

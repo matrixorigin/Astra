@@ -1067,8 +1067,23 @@ pub async fn run_product_matrix_full_journey(
     )
     .await;
     assert_eq!(st_route, StatusCode::OK, "chat/route: {route_j}");
-    assert!(
-        route_j.get("tool_filter").is_some() && route_j.get("task_type").is_some(),
+    let mut route_keys = route_j
+        .as_object()
+        .expect("chat/route should return an object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    route_keys.sort_unstable();
+    assert_eq!(
+        route_keys,
+        [
+            "confidence",
+            "intent",
+            "matched_by",
+            "query",
+            "task_type",
+            "tier"
+        ],
         "chat/route shape: {route_j}"
     );
 

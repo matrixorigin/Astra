@@ -468,12 +468,15 @@ mod multi_file_edit_regression {
             ),
             tool_call_fn(
                 "grep",
-                r#"{"pattern":"MAX_TOOL_ROUNDS","path":"runtime/src"}"#,
+                r#"{"pattern":"absolute_max_rounds","path":"turn-core/src"}"#,
             ),
         ]);
         guard.record_tool_result("read_file", "fn extract_cjk_keywords...");
         guard.record_tool_result("read_file", "fn tool_done_inline...");
-        guard.record_tool_result("grep", "routing.rs:11: max_tool_rounds: u32");
+        guard.record_tool_result(
+            "grep",
+            "loop_circuit_breaker.rs:110: pub absolute_max_rounds: usize",
+        );
         let v2 = guard.evaluate();
         assert_eq!(v2.severity, VerdictSeverity::Healthy);
 

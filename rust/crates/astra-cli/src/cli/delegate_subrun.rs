@@ -1013,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_tool_and_skill_names_uses_tool_filter() {
+    fn mixed_tool_and_skill_names_uses_tool_allowlist() {
         // If at least one entry matches a tool, treat as tool allowlist
         let r = build_restricted_tools(
             &tools(&["bash", "review-changes"]),
