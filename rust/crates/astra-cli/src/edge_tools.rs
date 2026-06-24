@@ -1330,6 +1330,16 @@ impl ToolExecutor {
         *guard = schemas;
     }
 
+    /// Install MCP routing and schemas from one discovery snapshot.
+    pub fn install_mcp_bundle(
+        &mut self,
+        manager: std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>,
+        schemas: Vec<Value>,
+    ) {
+        self.mcp_manager = Some(manager);
+        self.set_plugin_schemas(schemas);
+    }
+
     /// Install the visible `tools[]` names for the current LLM request.
     pub fn set_current_visible_tool_schemas(&self, schemas: &[Value]) {
         let names = astra_turn_core::tool::schema::tool_names_from_schemas(schemas);
@@ -3999,15 +4009,6 @@ impl ToolExecutor {
         env_tools::is_sensitive_var(name)
     }
 
-    /// Set the MCP client manager for external tool routing.
-    pub fn with_mcp_manager(
-        mut self,
-        manager: std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>,
-    ) -> Self {
-        self.mcp_manager = Some(manager);
-        self
-    }
-
     /// Expand the sandbox boundary to include an additional directory.
     /// Called when the user approves access to a path outside the project.
     ///
@@ -6603,21 +6604,24 @@ mod tests {
 
     #[tokio::test]
     async fn tool_search_rejects_stale_mcp_plugin_schema_not_owned_by_manager() {
-        let executor = test_executor().with_mcp_manager(std::sync::Arc::new(
-            tokio::sync::RwLock::new(crate::mcp_client::McpClientManager::new()),
-        ));
-        executor.set_plugin_schemas(vec![serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "mcp__weather",
-                "description": "Get weather for a city.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"city": {"type": "string"}},
-                    "required": ["city"]
+        let mut executor = test_executor();
+        executor.install_mcp_bundle(
+            std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::mcp_client::McpClientManager::new(),
+            )),
+            vec![serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__weather",
+                    "description": "Get weather for a city.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"]
+                    }
                 }
-            }
-        })]);
+            })],
+        );
         executor.set_current_activatable_tool_names(HashSet::from(["mcp__weather".to_string()]));
 
         let out = executor

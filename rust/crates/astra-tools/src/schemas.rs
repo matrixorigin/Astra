@@ -1801,9 +1801,9 @@ mod tests {
                 .expect("top-level schema must exist for ToolEngine routing");
         }
 
-        for retired in ["prioritize", "deprioritize"].map(|prefix| format!("{prefix}_tool")) {
+        for &retired in astra_core::tool_names::RETIRED_TOOL_NAMES {
             assert!(
-                find_schema(&schemas, &retired).is_none(),
+                find_schema(&schemas, retired).is_none(),
                 "{retired} must not remain in the tool schema surface"
             );
         }

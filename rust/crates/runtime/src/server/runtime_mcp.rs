@@ -809,6 +809,10 @@ impl AgentBindingMcpRuntime {
     pub(crate) fn server_name(&self) -> &str {
         &self.server_name
     }
+
+    pub(crate) fn owns_public_tool_name(&self, public_name: &str) -> bool {
+        self.tool_names_by_public_name.contains_key(public_name)
+    }
 }
 
 pub(crate) async fn prepare_agent_binding_mcp_bundle(
@@ -1115,6 +1119,20 @@ mod tests {
         assert!(bundle.manager.is_none());
         assert!(bundle.agent_binding_mcp.is_some());
         assert_eq!(bundle.schemas[0]["function"]["name"], "mcp__tools__query");
+        assert!(
+            bundle
+                .agent_binding_mcp
+                .as_ref()
+                .unwrap()
+                .owns_public_tool_name("mcp__tools__query")
+        );
+        assert!(
+            !bundle
+                .agent_binding_mcp
+                .as_ref()
+                .unwrap()
+                .owns_public_tool_name("mcp__tools__missing")
+        );
 
         let output = bundle
             .agent_binding_mcp

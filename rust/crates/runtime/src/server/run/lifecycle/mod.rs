@@ -4688,13 +4688,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
 
             if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
-                if let Some(manager) = &bundle.manager {
-                    executor.set_mcp_manager(manager.clone());
-                }
-                if let Some(agent_binding_mcp) = &bundle.agent_binding_mcp {
-                    executor.set_agent_binding_mcp(agent_binding_mcp.clone());
-                }
-                executor.set_plugin_schemas(bundle.schemas.clone());
+                executor.install_mcp_bundle(bundle);
             }
             // Wire the plan repository so enter/exit_plan_mode tools work and
             // the write-tool guard can check `active_plan_id`.
@@ -5508,13 +5502,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             // ── MCP: inject manager + plugin schemas into executor ────
             if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
-                if let Some(manager) = &bundle.manager {
-                    executor.set_mcp_manager(manager.clone());
-                }
-                if let Some(agent_binding_mcp) = &bundle.agent_binding_mcp {
-                    executor.set_agent_binding_mcp(agent_binding_mcp.clone());
-                }
-                executor.set_plugin_schemas(bundle.schemas.clone());
+                executor.install_mcp_bundle(bundle);
             }
             if let Some(shared) = &self.shared_pool {
                 executor.set_context_manifest_pool(shared.clone());

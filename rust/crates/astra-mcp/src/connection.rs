@@ -335,7 +335,10 @@ impl McpConnection {
 // ── Public connection API ──────────────────────────────────────────────
 
 /// Connect to an MCP server with exponential backoff retry.
-pub async fn connect_to_server(config: McpServerConfig) -> Result<McpConnection, McpError> {
+pub async fn connect_to_server(
+    config: McpServerConfig,
+    roots: Arc<RwLock<Vec<Root>>>,
+) -> Result<McpConnection, McpError> {
     let retry = config.retry.clone();
     let name = config.name.clone();
 
@@ -353,7 +356,7 @@ pub async fn connect_to_server(config: McpServerConfig) -> Result<McpConnection,
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
 
-        match connect_once(&config).await {
+        match connect_once(&config, roots.clone()).await {
             Ok(conn) => return Ok(conn),
             Err(e) => {
                 if matches!(e, McpError::InvalidConfig(_)) {
@@ -373,8 +376,10 @@ pub async fn connect_to_server(config: McpServerConfig) -> Result<McpConnection,
 }
 
 /// Single connection attempt (no retry).
-async fn connect_once(config: &McpServerConfig) -> Result<McpConnection, McpError> {
-    let roots = Arc::new(RwLock::new(Vec::new()));
+async fn connect_once(
+    config: &McpServerConfig,
+    roots: Arc<RwLock<Vec<Root>>>,
+) -> Result<McpConnection, McpError> {
     match &config.transport {
         Transport::Stdio { command, args, env } => {
             connect_stdio(&config.name, command, args, env, config.clone(), roots).await

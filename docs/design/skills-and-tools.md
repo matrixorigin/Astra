@@ -398,9 +398,16 @@ pub struct ToolRegistry {
 
 ### 5.2 Tool Surface Layers
 
-1. **Always-load Tools** — Always included, no budget cost (bash, read_file, write_file, etc.)
+1. **Always-load Tools** — Cache-stable core schemas derived from `astra_runtime_env::ToolSpec::load_policy` (bash, read_file, write_file, etc.)
 2. **Deferred Tools** — Advertised compactly and activated explicitly with `tool_search(select:NAME)`
-3. **Injected Tools** — Runtime-injected schemas are always-load by default when required by their execution path; otherwise they remain lookupable/deferred and do not enter `tools[]`
+3. **Injected Tools** — Runtime-injected schemas, including MCP/plugin tools, are deferred by default unless the current surface assembly or additive user config explicitly promotes a known schema into always-load
+
+MCP tools are dynamic runtime discoveries, not compile-time builtin declarations.
+They therefore cannot opt into default AlwaysLoad in code via
+`ToolSpec::load_policy`; keeping them deferred preserves prompt-cache stability
+and prevents stale MCP server state from changing the static prefix. Users can
+promote a currently known MCP/plugin schema with `runtime.tool_surface.always_load_tools`
+when they intentionally want that schema in `tools[]`.
 
 ### 5.3 Surface Methods
 
@@ -484,6 +491,11 @@ activation (`paths`) still gates skills until matching files are touched.
 ### 7.1 MCP Dual Role
 
 MCP servers provide both **tools** (function call schemas) and **skills** (instruction sets):
+
+MCP tools enter the tool surface as runtime plugin schemas. They use the same
+deferred activation path as other non-core tools: compact discovery first,
+full schema only after explicit activation or an explicit user always-load
+override for the current runtime.
 
 ```
 MCP Server

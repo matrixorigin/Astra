@@ -327,15 +327,21 @@ fn runtime_env_policy_intent(
 }
 
 pub(crate) fn is_server_control_plane_tool(tool_name: &str) -> bool {
-    builtin_tool_registry()
-        .get(tool_name)
-        .is_some_and(|spec| matches!(spec.class, astra_runtime_env::ToolClass::ControlPlane))
+    builtin_tool_registry().get(tool_name).is_some_and(|spec| {
+        matches!(
+            spec.required.executor,
+            astra_runtime_env::RequiredExecutor::ControlPlane
+        )
+    })
 }
 
 pub(crate) fn is_server_runtime_tool(tool_name: &str) -> bool {
-    builtin_tool_registry()
-        .get(tool_name)
-        .is_some_and(|spec| matches!(spec.class, astra_runtime_env::ToolClass::ServerService))
+    builtin_tool_registry().get(tool_name).is_some_and(|spec| {
+        matches!(
+            spec.required.executor,
+            astra_runtime_env::RequiredExecutor::ServiceExecutor
+        )
+    })
 }
 
 fn builtin_tool_registry() -> &'static astra_runtime_env::ToolRegistry {

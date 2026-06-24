@@ -3,20 +3,40 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use rmcp::model::{
-    CallToolResult, CompleteResult, GetPromptResult, Prompt, Reference, Resource, Tool,
+    CallToolResult, CompleteResult, GetPromptResult, Prompt, Reference, Resource, Root, Tool,
 };
 use serde_json::Value;
+use tokio::sync::RwLock;
 
 use crate::connection::{self, McpConnection};
 use crate::error::McpError;
 use crate::tools::{extract_result_text, mcp_tool_to_schema, sanitize_tool_name};
 use crate::types::{ConnectionState, McpServerConfig};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpToolRoute {
+    server_name: String,
+    original_tool_name: String,
+}
+
 /// MCP client manager for multiple server connections.
-#[derive(Default)]
 pub struct McpClientManager {
     connections: HashMap<String, Arc<McpConnection>>,
     states: HashMap<String, ConnectionState>,
+    tool_routes_by_public_name: HashMap<String, McpToolRoute>,
+    /// Shared roots list — returned to servers via `roots/list`.
+    roots: Arc<RwLock<Vec<Root>>>,
+}
+
+impl Default for McpClientManager {
+    fn default() -> Self {
+        Self {
+            connections: HashMap::new(),
+            states: HashMap::new(),
+            tool_routes_by_public_name: HashMap::new(),
+            roots: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
 }
 
 impl McpClientManager {
@@ -24,7 +44,12 @@ impl McpClientManager {
         Self::default()
     }
 
-    /// Connect to an MCP server. Returns the number of tools discovered.
+    /// Get a reference to the shared roots list.
+    pub fn roots(&self) -> &Arc<RwLock<Vec<Root>>> {
+        &self.roots
+    }
+
+    /// Connect to an MCP server with retry. Returns the number of tools discovered.
     pub async fn connect(&mut self, config: McpServerConfig) -> Result<usize, McpError> {
         if !config.enabled {
             return Ok(0);
@@ -34,15 +59,45 @@ impl McpClientManager {
         self.states
             .insert(name.clone(), ConnectionState::Connecting);
 
-        match connection::connect_to_server(config).await {
+        match connection::connect_to_server(config, self.roots.clone()).await {
             Ok(conn) => {
                 let tool_count = conn.tools().len();
                 self.states.insert(name.clone(), ConnectionState::Connected);
                 self.connections.insert(name, Arc::new(conn));
+                self.rebuild_tool_route_index();
                 Ok(tool_count)
             }
             Err(e) => {
                 self.states.insert(name, ConnectionState::Failed);
+                Err(e)
+            }
+        }
+    }
+
+    /// Reconnect a server using its stored config.
+    pub async fn reconnect(&mut self, name: &str) -> Result<usize, McpError> {
+        let config = match self.connections.get(name) {
+            Some(conn) => conn.config.clone(),
+            None => return Err(McpError::ServerNotConnected(name.to_string())),
+        };
+
+        self.connections.remove(name);
+        self.states
+            .insert(name.to_string(), ConnectionState::Reconnecting);
+
+        match connection::connect_to_server(config, self.roots.clone()).await {
+            Ok(conn) => {
+                let tool_count = conn.tools().len();
+                self.states
+                    .insert(name.to_string(), ConnectionState::Connected);
+                self.connections.insert(name.to_string(), Arc::new(conn));
+                self.rebuild_tool_route_index();
+                Ok(tool_count)
+            }
+            Err(e) => {
+                self.states
+                    .insert(name.to_string(), ConnectionState::Failed);
+                self.rebuild_tool_route_index();
                 Err(e)
             }
         }
@@ -54,6 +109,7 @@ impl McpClientManager {
         if removed {
             self.states
                 .insert(name.to_string(), ConnectionState::Disconnected);
+            self.rebuild_tool_route_index();
         }
         removed
     }
@@ -75,10 +131,17 @@ impl McpClientManager {
 
     /// Get all tools from all connected servers.
     pub fn all_tools(&self) -> Vec<(&str, &Tool)> {
-        self.connections
+        let mut tools: Vec<(&str, &Tool)> = self
+            .connections
             .iter()
             .flat_map(|(name, conn)| conn.tools().iter().map(move |t| (name.as_str(), t)))
-            .collect()
+            .collect();
+        tools.sort_by(|(server_a, tool_a), (server_b, tool_b)| {
+            server_a
+                .cmp(server_b)
+                .then_with(|| tool_a.name.as_ref().cmp(tool_b.name.as_ref()))
+        });
+        tools
     }
 
     /// Get all MCP tool schemas in OpenAI function-calling format.
@@ -96,8 +159,10 @@ impl McpClientManager {
                 .to_string();
             if let Some(prev_server) = seen.get(&name) {
                 tracing::warn!(
-                    "MCP tool name collision: '{name}' from server '{server}' \
-                     conflicts with server '{prev_server}' — skipping duplicate"
+                    public_name = %name,
+                    skipped_server = %server,
+                    kept_server = %prev_server,
+                    "MCP tool name collision; keeping first server and skipping duplicate"
                 );
                 collision_count += 1;
                 continue;
@@ -115,15 +180,12 @@ impl McpClientManager {
     /// Find which server owns a sanitized MCP tool name (e.g. "mcp_moi_query_sql").
     /// Returns (server_name, original_tool_name) if found.
     pub fn find_tool_by_mcp_name(&self, mcp_name: &str) -> Option<(&str, &str)> {
-        for (server_name, conn) in &self.connections {
-            for tool in conn.tools() {
-                let sanitized = sanitize_tool_name(&format!("mcp__{}__{}", server_name, tool.name));
-                if sanitized == mcp_name {
-                    return Some((server_name, tool.name.as_ref()));
-                }
-            }
-        }
-        None
+        self.tool_routes_by_public_name.get(mcp_name).map(|route| {
+            (
+                route.server_name.as_str(),
+                route.original_tool_name.as_str(),
+            )
+        })
     }
 
     /// Find which server has a specific original tool name.
@@ -182,33 +244,6 @@ impl McpClientManager {
         Ok(extract_result_text(&result))
     }
 
-    /// Reconnect a server using its stored config.
-    pub async fn reconnect(&mut self, name: &str) -> Result<usize, McpError> {
-        let config = match self.connections.get(name) {
-            Some(conn) => conn.config.clone(),
-            None => return Err(McpError::ServerNotConnected(name.to_string())),
-        };
-
-        self.connections.remove(name);
-        self.states
-            .insert(name.to_string(), ConnectionState::Reconnecting);
-
-        match connection::connect_to_server(config).await {
-            Ok(conn) => {
-                let tool_count = conn.tools().len();
-                self.states
-                    .insert(name.to_string(), ConnectionState::Connected);
-                self.connections.insert(name.to_string(), Arc::new(conn));
-                Ok(tool_count)
-            }
-            Err(e) => {
-                self.states
-                    .insert(name.to_string(), ConnectionState::Failed);
-                Err(e)
-            }
-        }
-    }
-
     /// Number of active connections.
     pub fn connection_count(&self) -> usize {
         self.connections.len()
@@ -229,6 +264,7 @@ impl McpClientManager {
             }
         }
         if !refreshed.is_empty() {
+            self.rebuild_tool_route_index();
             tracing::info!("Refreshed tool lists for: {}", refreshed.join(", "));
         }
         refreshed
@@ -337,11 +373,45 @@ impl McpClientManager {
             .map(|(name, state)| (name.as_str(), *state))
             .collect()
     }
+
+    fn rebuild_tool_route_index(&mut self) {
+        self.tool_routes_by_public_name = build_tool_route_index(self.all_tools());
+    }
+}
+
+fn build_tool_route_index<'a, I>(tools: I) -> HashMap<String, McpToolRoute>
+where
+    I: IntoIterator<Item = (&'a str, &'a Tool)>,
+{
+    let mut routes: HashMap<String, McpToolRoute> = HashMap::new();
+    for (server_name, tool) in tools {
+        let public_name = sanitize_tool_name(&format!("mcp__{}__{}", server_name, tool.name));
+        let route = McpToolRoute {
+            server_name: server_name.to_string(),
+            original_tool_name: tool.name.to_string(),
+        };
+        if let Some(existing) = routes.get(&public_name) {
+            tracing::warn!(
+                public_name = %public_name,
+                skipped_server = %route.server_name,
+                kept_server = %existing.server_name,
+                "MCP tool route collision; keeping first server and skipping duplicate"
+            );
+            continue;
+        }
+        routes.insert(public_name, route);
+    }
+    routes
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    fn empty_schema() -> Arc<serde_json::Map<String, serde_json::Value>> {
+        Arc::new(serde_json::Map::new())
+    }
 
     #[test]
     fn manager_empty() {
@@ -355,5 +425,51 @@ mod tests {
     fn manager_disconnect_nonexistent() {
         let mut manager = McpClientManager::new();
         assert!(!manager.disconnect("nonexistent"));
+    }
+
+    #[test]
+    fn tool_route_index_maps_public_names_to_original_server_tools() {
+        let tools = vec![
+            (
+                "mock-server",
+                Tool::new("echo message", "Echo", empty_schema()),
+            ),
+            ("sql", Tool::new("query.sql", "Query", empty_schema())),
+        ];
+
+        let index = build_tool_route_index(tools.iter().map(|(server, tool)| (*server, tool)));
+
+        assert_eq!(
+            index.get("mcp__mock-server__echo_message"),
+            Some(&McpToolRoute {
+                server_name: "mock-server".to_string(),
+                original_tool_name: "echo message".to_string(),
+            })
+        );
+        assert_eq!(
+            index.get("mcp__sql__query_sql"),
+            Some(&McpToolRoute {
+                server_name: "sql".to_string(),
+                original_tool_name: "query.sql".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn tool_route_index_keeps_first_collision_winner() {
+        let tools = vec![
+            ("api", Tool::new("query.sql", "Query", empty_schema())),
+            ("api", Tool::new("query sql", "Query", empty_schema())),
+        ];
+
+        let index = build_tool_route_index(tools.iter().map(|(server, tool)| (*server, tool)));
+
+        assert_eq!(
+            index.get("mcp__api__query_sql"),
+            Some(&McpToolRoute {
+                server_name: "api".to_string(),
+                original_tool_name: "query.sql".to_string(),
+            })
+        );
     }
 }

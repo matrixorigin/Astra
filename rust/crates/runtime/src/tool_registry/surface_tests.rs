@@ -54,6 +54,10 @@ fn names(schemas: &[Value]) -> Vec<String> {
         .collect()
 }
 
+fn schema_name_set() -> std::collections::BTreeSet<String> {
+    names(&catalog_schemas()).into_iter().collect()
+}
+
 // ── 1. Defaults ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -63,7 +67,7 @@ fn every_default_always_load_has_a_schema_in_the_canonical_pool() {
 
     for always_load in default_always_load_names() {
         assert!(
-            schema_names.contains(*always_load),
+            schema_names.contains(always_load),
             "default always_load declaration contains {always_load}, but the canonical schema pool has no schema for it"
         );
     }
@@ -71,8 +75,10 @@ fn every_default_always_load_has_a_schema_in_the_canonical_pool() {
 
 #[test]
 fn catalog_always_load_metadata_matches_runtime_default_surface_for_catalog_tools() {
-    let default_always_load: std::collections::HashSet<&str> =
-        default_always_load_names().iter().copied().collect();
+    let default_always_load: std::collections::HashSet<&str> = default_always_load_names()
+        .iter()
+        .map(String::as_str)
+        .collect();
     let catalog_default_always_load: std::collections::BTreeSet<&str> = TOOL_CATALOG
         .iter()
         .filter(|tool| default_always_load.contains(tool.name))
@@ -90,8 +96,40 @@ fn catalog_always_load_metadata_matches_runtime_default_surface_for_catalog_tool
     );
 }
 
+#[test]
+fn public_schema_names_have_public_runtime_tool_specs() {
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+
+    for name in schema_name_set() {
+        let spec = registry
+            .get(&name)
+            .unwrap_or_else(|| panic!("schema tool has no runtime ToolSpec: {name}"));
+        assert!(
+            spec.load_policy.is_public_schema_policy(),
+            "schema tool must not be internal: {name}"
+        );
+    }
+}
+
+#[test]
+fn internal_runtime_tool_specs_do_not_have_public_schemas() {
+    let schema_names = schema_name_set();
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+
+    for spec in registry
+        .iter()
+        .filter(|spec| spec.load_policy == astra_runtime_env::ToolLoadPolicy::Internal)
+    {
+        assert!(
+            !schema_names.contains(&spec.name),
+            "internal runtime ToolSpec must not have a public schema: {}",
+            spec.name
+        );
+    }
+}
+
 /// The default always_load set is the 13-member core.
-/// See `tool_registry::declaration` for the per-tool classification.
+/// See `astra_runtime_env::ToolSpec::load_policy` for the per-tool classification.
 #[test]
 fn always_load_default_members_are_the_core_set() {
     let cfg = ToolSurfaceConfig::default();
@@ -132,6 +170,10 @@ fn always_load_default_members_are_the_core_set() {
     assert!(
         !always_load_names.iter().any(|n| n == "introspect"),
         "introspect is diagnostic-only and must remain deferred by default"
+    );
+    assert!(
+        !always_load_names.iter().any(|n| n == "notify"),
+        "notify is non-blocking/proactive communication; ask_user remains the always-load blocking clarification tool"
     );
 }
 

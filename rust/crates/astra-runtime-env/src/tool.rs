@@ -6,28 +6,30 @@ use thiserror::Error;
 
 use crate::{EffectiveCapabilitySet, NetworkCapability};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum ToolClass {
-    ControlPlane,
-    ServerService,
-    ProjectRead,
-    ProjectWrite,
-    Process,
-    Git,
-    CodeIntel,
-    Device,
-    Mcp,
+pub enum ToolLoadPolicy {
+    /// Visible in the default `tools[]` surface when the schema exists.
+    AlwaysLoad,
+    /// Advertised through the deferred catalog and activated with `tool_search`.
+    Deferred,
+    /// Runtime implementation detail. The model should not see this as a
+    /// standalone public schema.
+    Internal,
+}
+
+impl ToolLoadPolicy {
+    pub const fn is_public_schema_policy(self) -> bool {
+        matches!(self, Self::AlwaysLoad | Self::Deferred)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-#[non_exhaustive]
 pub enum RequiredExecutor {
     None,
-    ServiceExecutor,
     ControlPlane,
+    ServiceExecutor,
     RuntimeExecutor,
     McpExecutor,
 }
@@ -105,6 +107,13 @@ impl ToolRequirements {
     }
 
     pub const fn control_plane() -> Self {
+        Self {
+            executor: RequiredExecutor::ControlPlane,
+            ..Self::none()
+        }
+    }
+
+    pub const fn service_executor() -> Self {
         Self {
             executor: RequiredExecutor::ServiceExecutor,
             ..Self::none()
@@ -205,7 +214,7 @@ impl ToolRequirements {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolSpec {
     pub name: String,
-    pub class: ToolClass,
+    pub load_policy: ToolLoadPolicy,
     pub effect: ToolEffect,
     pub required: ToolRequirements,
 }
@@ -222,51 +231,7 @@ impl ToolRegistry {
     }
 
     pub fn builtins() -> Self {
-        Self::new(vec![
-            control_plane("ask_user"),
-            control_plane("agent"),
-            control_plane("agent_fanout"),
-            control_plane("enter_plan_mode"),
-            control_plane("exit_plan_mode"),
-            control_plane("get_agent_info"),
-            control_plane("introspect"),
-            control_plane("notify"),
-            control_plane("compress_context"),
-            control_plane("rollback_session_state"),
-            control_plane("session"),
-            control_plane("skill"),
-            control_plane("task"),
-            control_plane("task_output"),
-            control_plane("task_stop"),
-            control_plane("task_list"),
-            server_service("memory"),
-            server_service("mo_query"),
-            server_service("rollback_database_snapshots"),
-            server_service("tool_search"),
-            server_network("web_search"),
-            server_network("web_fetch"),
-            server_network_credentials("github"),
-            project_read("publish_artifact"),
-            project_read("read_file"),
-            project_read("list_dir"),
-            project_read("grep"),
-            project_read("glob"),
-            project_read("symbols"),
-            project_write("write_file"),
-            project_write("str_replace"),
-            project_write("delete_file"),
-            project_write("multi_edit"),
-            project_write("rollback_file_edits"),
-            shell("bash"),
-            shell("powershell"),
-            shell("run_script"),
-            background_shell("background_shell"),
-            git_read("git"),
-            git_clone("git_clone"),
-            lsp("lsp"),
-            lsp("find_definition"),
-            lsp("find_references"),
-        ])
+        Self::new(builtin_tool_specs())
     }
 
     pub fn get(&self, name: &str) -> Option<&ToolSpec> {
@@ -276,6 +241,54 @@ impl ToolRegistry {
     pub fn iter(&self) -> impl Iterator<Item = &ToolSpec> {
         self.tools.values()
     }
+}
+
+fn builtin_tool_specs() -> Vec<ToolSpec> {
+    vec![
+        control_plane("ask_user", ToolLoadPolicy::AlwaysLoad),
+        control_plane("agent", ToolLoadPolicy::Deferred),
+        control_plane("agent_fanout", ToolLoadPolicy::Deferred),
+        control_plane("enter_plan_mode", ToolLoadPolicy::Deferred),
+        control_plane("exit_plan_mode", ToolLoadPolicy::Deferred),
+        control_plane("get_agent_info", ToolLoadPolicy::Deferred),
+        control_plane("introspect", ToolLoadPolicy::Deferred),
+        control_plane("notify", ToolLoadPolicy::Deferred),
+        control_plane("compress_context", ToolLoadPolicy::Deferred),
+        control_plane("rollback_session_state", ToolLoadPolicy::Deferred),
+        control_plane("session", ToolLoadPolicy::Deferred),
+        control_plane("skill", ToolLoadPolicy::AlwaysLoad),
+        control_plane("task", ToolLoadPolicy::AlwaysLoad),
+        control_plane("task_output", ToolLoadPolicy::Deferred),
+        control_plane("task_stop", ToolLoadPolicy::Deferred),
+        control_plane("task_list", ToolLoadPolicy::Deferred),
+        server_service("memory", ToolLoadPolicy::AlwaysLoad),
+        server_service("mo_query", ToolLoadPolicy::Deferred),
+        server_service("rollback_database_snapshots", ToolLoadPolicy::Deferred),
+        server_service("tool_search", ToolLoadPolicy::AlwaysLoad),
+        server_network("web_search", ToolLoadPolicy::Deferred),
+        server_network("web_fetch", ToolLoadPolicy::Deferred),
+        server_network_credentials("github", ToolLoadPolicy::Deferred),
+        project_read("publish_artifact", ToolLoadPolicy::Deferred),
+        project_read("read_file", ToolLoadPolicy::AlwaysLoad),
+        project_read("list_dir", ToolLoadPolicy::AlwaysLoad),
+        project_read("grep", ToolLoadPolicy::AlwaysLoad),
+        project_read("glob", ToolLoadPolicy::AlwaysLoad),
+        project_read("symbols", ToolLoadPolicy::Deferred),
+        project_write("write_file", ToolLoadPolicy::AlwaysLoad),
+        project_write("str_replace", ToolLoadPolicy::AlwaysLoad),
+        project_write("delete_file", ToolLoadPolicy::Internal),
+        project_write("multi_edit", ToolLoadPolicy::Internal),
+        project_write("rollback_file_edits", ToolLoadPolicy::Deferred),
+        shell("bash", ToolLoadPolicy::AlwaysLoad),
+        shell("powershell", ToolLoadPolicy::Deferred),
+        shell("run_script", ToolLoadPolicy::Deferred),
+        background_shell("background_shell", ToolLoadPolicy::Internal),
+        git_read("git", ToolLoadPolicy::AlwaysLoad),
+        git_clone("git_clone", ToolLoadPolicy::Internal),
+        lsp("lsp", ToolLoadPolicy::Deferred),
+        lsp("find_definition", ToolLoadPolicy::Internal),
+        lsp("find_references", ToolLoadPolicy::Internal),
+    ]
 }
 
 impl Default for ToolRegistry {
@@ -396,11 +409,11 @@ impl CapabilityResolver {
         capabilities: &EffectiveCapabilitySet,
     ) -> Result<(), ToolUnavailableReason> {
         if tool_name == "git" && git_action_requires_write(args) {
-            let spec = git_write(tool_name);
+            let spec = git_write(tool_name, ToolLoadPolicy::AlwaysLoad);
             return self.check(&spec, capabilities);
         }
         if tool_name == "lsp" && lsp_action_requires_write(args) {
-            let spec = project_write(tool_name);
+            let spec = project_write(tool_name, ToolLoadPolicy::Deferred);
             return self.check(&spec, capabilities);
         }
         let dynamic_spec = dynamic_tool_spec(tool_name);
@@ -418,17 +431,12 @@ impl CapabilityResolver {
     ) -> Result<(), ToolUnavailableReason> {
         match spec.required.executor {
             RequiredExecutor::None => {}
-            RequiredExecutor::ServiceExecutor
+            RequiredExecutor::ControlPlane | RequiredExecutor::ServiceExecutor
                 if !(capabilities.executor.control_plane
                     || capabilities.executor.runtime_executor) =>
             {
                 return Err(ToolUnavailableReason::ExecutorUnavailable(
                     "service_executor_required".to_string(),
-                ));
-            }
-            RequiredExecutor::ControlPlane if !capabilities.executor.control_plane => {
-                return Err(ToolUnavailableReason::ExecutorUnavailable(
-                    "control_plane_executor_required".to_string(),
                 ));
             }
             RequiredExecutor::RuntimeExecutor if !capabilities.executor.runtime_executor => {
@@ -563,28 +571,28 @@ impl CapabilityResolver {
 
 pub use astra_core::tool_schema::tool_schema_name;
 
-fn control_plane(name: &str) -> ToolSpec {
+fn control_plane(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
-        class: ToolClass::ControlPlane,
+        load_policy,
         effect: ToolEffect::none(),
         required: ToolRequirements::control_plane(),
     }
 }
 
-fn server_service(name: &str) -> ToolSpec {
+fn server_service(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
-        class: ToolClass::ServerService,
+        load_policy,
         effect: ToolEffect::none(),
-        required: ToolRequirements::control_plane(),
+        required: ToolRequirements::service_executor(),
     }
 }
 
-fn server_network(name: &str) -> ToolSpec {
+fn server_network(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
-        class: ToolClass::ServerService,
+        load_policy,
         effect: ToolEffect {
             uses_network: true,
             ..ToolEffect::none()
@@ -593,10 +601,10 @@ fn server_network(name: &str) -> ToolSpec {
     }
 }
 
-fn server_network_credentials(name: &str) -> ToolSpec {
+fn server_network_credentials(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
-        class: ToolClass::ServerService,
+        load_policy,
         effect: ToolEffect {
             uses_network: true,
             uses_credentials: true,
@@ -609,7 +617,7 @@ fn server_network_credentials(name: &str) -> ToolSpec {
 fn request_scoped_mcp(name: &str) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
-        class: ToolClass::Mcp,
+        load_policy: ToolLoadPolicy::Deferred,
         effect: ToolEffect::none(),
         required: ToolRequirements::mcp(),
     }
@@ -633,10 +641,10 @@ fn lsp_action_requires_write(args: &Value) -> bool {
     matches!(args.get("dry_run").and_then(Value::as_bool), Some(false))
 }
 
-fn project_read(name: &str) -> ToolSpec {
+fn project_read(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
-        class: ToolClass::ProjectRead,
+        load_policy,
         effect: ToolEffect {
             reads_workspace: true,
             ..ToolEffect::none()
@@ -645,10 +653,10 @@ fn project_read(name: &str) -> ToolSpec {
     }
 }
 
-fn project_write(name: &str) -> ToolSpec {
+fn project_write(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
-        class: ToolClass::ProjectWrite,
+        load_policy,
         effect: ToolEffect {
             reads_workspace: true,
             writes_workspace: true,
@@ -658,10 +666,10 @@ fn project_write(name: &str) -> ToolSpec {
     }
 }
 
-fn shell(name: &str) -> ToolSpec {
+fn shell(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
-        class: ToolClass::Process,
+        load_policy,
         effect: ToolEffect {
             reads_workspace: true,
             spawns_process: true,
@@ -671,10 +679,10 @@ fn shell(name: &str) -> ToolSpec {
     }
 }
 
-fn background_shell(name: &str) -> ToolSpec {
+fn background_shell(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
-        class: ToolClass::Process,
+        load_policy,
         effect: ToolEffect {
             reads_workspace: true,
             spawns_process: true,
@@ -684,10 +692,10 @@ fn background_shell(name: &str) -> ToolSpec {
     }
 }
 
-fn git_read(name: &str) -> ToolSpec {
+fn git_read(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
-        class: ToolClass::Git,
+        load_policy,
         effect: ToolEffect {
             reads_workspace: true,
             ..ToolEffect::none()
@@ -696,10 +704,10 @@ fn git_read(name: &str) -> ToolSpec {
     }
 }
 
-fn git_write(name: &str) -> ToolSpec {
+fn git_write(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
-        class: ToolClass::Git,
+        load_policy,
         effect: ToolEffect {
             reads_workspace: true,
             writes_workspace: true,
@@ -710,10 +718,10 @@ fn git_write(name: &str) -> ToolSpec {
     }
 }
 
-fn git_clone(name: &str) -> ToolSpec {
+fn git_clone(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
-        class: ToolClass::Git,
+        load_policy,
         effect: ToolEffect {
             reads_workspace: true,
             writes_workspace: true,
@@ -725,10 +733,10 @@ fn git_clone(name: &str) -> ToolSpec {
     }
 }
 
-fn lsp(name: &str) -> ToolSpec {
+fn lsp(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
-        class: ToolClass::Device,
+        load_policy,
         effect: ToolEffect {
             reads_workspace: true,
             ..ToolEffect::none()
@@ -747,6 +755,18 @@ mod tests {
 
     fn registry() -> ToolRegistry {
         ToolRegistry::builtins()
+    }
+
+    #[test]
+    fn builtin_tool_specs_have_unique_names_before_hashmap_projection() {
+        let mut seen = std::collections::BTreeSet::new();
+        for spec in builtin_tool_specs() {
+            assert!(
+                seen.insert(spec.name.clone()),
+                "duplicate builtin ToolSpec: {}",
+                spec.name
+            );
+        }
     }
 
     #[test]
@@ -905,7 +925,7 @@ mod tests {
         let registry = registry();
         let binding = RunBinding::cloud_control_plane(&registry);
 
-        for tool in ["prioritize_tool", "deprioritize_tool"] {
+        for &tool in astra_core::tool_names::RETIRED_TOOL_NAMES {
             assert!(!binding.tool_surface.contains(tool));
             assert_eq!(
                 CapabilityResolver.check_tool_call(

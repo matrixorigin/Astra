@@ -326,11 +326,6 @@ pub(crate) async fn stream_chat_sse(
         // user-visible turn currently in progress.
         ex.journal_turn_index
             .store(current_session_turn, std::sync::atomic::Ordering::Release);
-        let ex = if let Some(ref mgr) = p.mcp_manager {
-            ex.with_mcp_manager(mgr.clone())
-        } else {
-            ex
-        };
         // Wire `agent(action='spawn'|'get_result')` context when a spawner is available.
         // The run_id MUST match what state.current_run_id uses so that
         // on_turn_completed captures the parent prefix under the same
@@ -449,7 +444,11 @@ pub(crate) async fn stream_chat_sse(
     let all_schemas = all_schemas.0;
     // Install MCP schemas on the edge executor so `tool_search(select:NAME)`
     // can resolve plugin tool schemas by name.
-    executor.set_plugin_schemas(mcp_plugin_schemas);
+    if let Some(ref mgr) = p.mcp_manager {
+        executor.install_mcp_bundle(mgr.clone(), mcp_plugin_schemas);
+    } else {
+        executor.set_plugin_schemas(mcp_plugin_schemas);
+    }
     let registry = ToolRegistry::new_runtime_surface(all_schemas.clone());
     let always_load_schema_tokens = registry.total_always_load_token_cost() as u64;
     // Full runtime inventory is used only for static allow/deny policy

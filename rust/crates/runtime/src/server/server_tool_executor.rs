@@ -445,19 +445,12 @@ impl ServerToolExecutor {
         self
     }
 
-    /// Set the MCP client manager for forwarding `mcp__*` tool calls.
-    pub fn set_mcp_manager(
-        &mut self,
-        manager: Arc<tokio::sync::RwLock<astra_mcp::McpClientManager>>,
-    ) {
-        self.mcp_manager = Some(manager);
-    }
-
-    pub(crate) fn set_agent_binding_mcp(
-        &mut self,
-        agent_binding_mcp: Arc<super::runtime_mcp::AgentBindingMcpRuntime>,
-    ) {
-        self.agent_binding_mcp = Some(agent_binding_mcp);
+    /// Install the MCP execution bundle in one step so schemas and runtime
+    /// ownership are derived from the same discovery snapshot.
+    pub(crate) fn install_mcp_bundle(&mut self, bundle: &super::runtime_mcp::RuntimeMcpBundle) {
+        self.mcp_manager = bundle.manager.clone();
+        self.agent_binding_mcp = bundle.agent_binding_mcp.clone();
+        self.set_plugin_schemas(bundle.schemas.clone());
     }
 
     /// Install plugin-registered schemas (MCP, etc.) so
@@ -776,6 +769,13 @@ impl ServerToolExecutor {
     }
 
     fn mcp_tool_has_runtime_binding(&self, name: &str) -> bool {
+        if self
+            .agent_binding_mcp
+            .as_ref()
+            .is_some_and(|runtime| runtime.owns_public_tool_name(name))
+        {
+            return true;
+        }
         let Some(manager) = &self.mcp_manager else {
             return false;
         };
@@ -1737,9 +1737,9 @@ mod tests {
                 "{name} should be registered in ToolEngine for server-local execution"
             );
         }
-        for retired in ["prioritize", "deprioritize"].map(|prefix| format!("{prefix}_tool")) {
+        for &retired in astra_core::tool_names::RETIRED_TOOL_NAMES {
             assert!(
-                !exec.tool_engine.contains(&retired),
+                !exec.tool_engine.contains(retired),
                 "{retired} must not be registered in ToolEngine"
             );
         }
@@ -4600,25 +4600,28 @@ esac
     #[tokio::test]
     async fn server_tool_search_rejects_stale_mcp_plugin_schema_not_owned_by_manager() {
         let (mut exec, _dir) = test_executor();
-        exec.set_mcp_manager(Arc::new(tokio::sync::RwLock::new(
-            astra_mcp::McpClientManager::new(),
-        )));
         exec.set_current_visible_tool_schemas(&[
             json!({"type": "function", "function": {"name": "bash"}}),
             json!({"type": "function", "function": {"name": "tool_search"}}),
         ]);
-        exec.set_plugin_schemas(vec![json!({
-            "type": "function",
-            "function": {
-                "name": "mcp__calculator",
-                "description": "Evaluate arithmetic expression.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"expr": {"type": "string"}},
-                    "required": ["expr"]
+        exec.install_mcp_bundle(&crate::server::runtime_mcp::RuntimeMcpBundle {
+            schemas: vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__calculator",
+                    "description": "Evaluate arithmetic expression.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"expr": {"type": "string"}},
+                        "required": ["expr"]
+                    }
                 }
-            }
-        })]);
+            })],
+            manager: Some(Arc::new(tokio::sync::RwLock::new(
+                astra_mcp::McpClientManager::new(),
+            ))),
+            agent_binding_mcp: None,
+        });
         exec.set_current_activatable_tool_names(HashSet::from(["mcp__calculator".to_string()]));
 
         let result = exec

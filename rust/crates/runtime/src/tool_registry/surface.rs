@@ -24,18 +24,17 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-use crate::tool_registry::declaration::{ToolLoadPolicy, all_tool_declarations};
-
 /// Default T1 always_load tool names, derived from the single authority
-/// [`crate::tool_registry::declaration::ToolDeclaration`] classification.
+/// [`astra_runtime_env::ToolSpec`] classification.
 /// Any name classified as `ToolLoadPolicy::AlwaysLoad` automatically
 /// appears here — no manual copy needed.
-pub fn default_always_load_names() -> &'static [&'static str] {
-    static NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-        let mut names: Vec<&str> = all_tool_declarations()
+pub fn default_always_load_names() -> &'static [String] {
+    static NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let mut names: Vec<String> = registry
             .iter()
-            .filter(|id| id.load_policy == ToolLoadPolicy::AlwaysLoad)
-            .map(|id| id.name)
+            .filter(|spec| spec.load_policy == astra_runtime_env::ToolLoadPolicy::AlwaysLoad)
+            .map(|spec| spec.name.clone())
             .collect();
         names.sort_unstable();
         names

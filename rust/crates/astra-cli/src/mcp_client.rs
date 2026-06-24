@@ -1126,11 +1126,19 @@ impl McpConnection {
 }
 
 /// MCP client manager for multiple server connections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpToolRoute {
+    server_name: String,
+    original_tool_name: String,
+}
+
 pub struct McpClientManager {
     /// Active connections indexed by server name.
     connections: HashMap<String, Arc<McpConnection>>,
     /// Connection state per server (tracks lifecycle across reconnects).
     states: HashMap<String, ConnectionState>,
+    /// Public `mcp__server__tool` name to original server/tool route.
+    tool_routes_by_public_name: HashMap<String, McpToolRoute>,
     /// Optional sampling config — forwarded to each new connection's handler.
     sampling: Option<Arc<SamplingConfig>>,
     /// Shared roots list — returned to servers via `roots/list`.
@@ -1142,6 +1150,7 @@ impl Default for McpClientManager {
         Self {
             connections: HashMap::new(),
             states: HashMap::new(),
+            tool_routes_by_public_name: HashMap::new(),
             sampling: None,
             roots: Arc::new(RwLock::new(Vec::new())),
         }
@@ -1205,6 +1214,7 @@ impl McpClientManager {
                 );
                 self.states.insert(name.clone(), ConnectionState::Connected);
                 self.connections.insert(name, Arc::new(connection));
+                self.rebuild_tool_route_index();
                 Ok(())
             }
             Err(e) => {
@@ -1284,6 +1294,7 @@ impl McpClientManager {
             tracing::info!(server = name, "MCP: disconnecting from server");
             self.states
                 .insert(name.to_string(), ConnectionState::Disconnected);
+            self.rebuild_tool_route_index();
             if let Err(e) = skill_registry.remove_mcp_server_skills(name).await {
                 tracing::warn!(
                     server = name,
@@ -1306,6 +1317,7 @@ impl McpClientManager {
             );
             self.states
                 .insert(name.to_string(), ConnectionState::Disconnected);
+            self.rebuild_tool_route_index();
         }
         removed
     }
@@ -1327,10 +1339,17 @@ impl McpClientManager {
 
     /// Get all tools from all connected servers.
     pub fn all_tools(&self) -> Vec<(&str, &Tool)> {
-        self.connections
+        let mut tools: Vec<(&str, &Tool)> = self
+            .connections
             .iter()
             .flat_map(|(name, conn)| conn.tools.iter().map(move |t| (name.as_str(), t)))
-            .collect()
+            .collect();
+        tools.sort_by(|(server_a, tool_a), (server_b, tool_b)| {
+            server_a
+                .cmp(server_b)
+                .then_with(|| tool_a.name.as_ref().cmp(tool_b.name.as_ref()))
+        });
+        tools
     }
 
     /// Get all MCP tool schemas suitable for LLM tool injection.
@@ -1348,10 +1367,10 @@ impl McpClientManager {
                 .to_string();
             if let Some(prev_server) = seen.get(&name) {
                 tracing::warn!(
-                    tool = %name,
-                    server = %server,
-                    prev_server = %prev_server,
-                    "MCP tool name collision; skipping duplicate"
+                    public_name = %name,
+                    skipped_server = %server,
+                    kept_server = %prev_server,
+                    "MCP tool name collision; keeping first server and skipping duplicate"
                 );
                 collision_count += 1;
                 continue;
@@ -1433,15 +1452,12 @@ impl McpClientManager {
     /// Find which server owns a sanitized MCP tool name (e.g. "mcp_fs_read_file").
     /// Returns (server_name, original_tool_name) if found.
     pub fn find_tool_by_mcp_name(&self, mcp_name: &str) -> Option<(&str, &str)> {
-        for (server_name, conn) in &self.connections {
-            for tool in &conn.tools {
-                let sanitized = sanitize_tool_name(&format!("mcp__{}__{}", server_name, tool.name));
-                if sanitized == mcp_name {
-                    return Some((server_name, tool.name.as_ref()));
-                }
-            }
-        }
-        None
+        self.tool_routes_by_public_name.get(mcp_name).map(|route| {
+            (
+                route.server_name.as_str(),
+                route.original_tool_name.as_str(),
+            )
+        })
     }
 
     /// Find which server has a specific tool.
@@ -1617,6 +1633,7 @@ impl McpClientManager {
                     .insert(name.to_string(), ConnectionState::Connected);
                 self.connections
                     .insert(name.to_string(), Arc::new(connection));
+                self.rebuild_tool_route_index();
                 Ok(tool_count)
             }
             Err(e) => {
@@ -1627,6 +1644,7 @@ impl McpClientManager {
                 );
                 self.states
                     .insert(name.to_string(), ConnectionState::Failed);
+                self.rebuild_tool_route_index();
                 Err(e)
             }
         }
@@ -1656,6 +1674,9 @@ impl McpClientManager {
                     }
                 }
             }
+        }
+        if !refreshed.is_empty() {
+            self.rebuild_tool_route_index();
         }
         refreshed
     }
@@ -1696,6 +1717,28 @@ impl McpClientManager {
             );
         }
         changed
+    }
+
+    fn rebuild_tool_route_index(&mut self) {
+        let mut routes: HashMap<String, McpToolRoute> = HashMap::new();
+        for (server_name, tool) in self.all_tools() {
+            let public_name = sanitize_tool_name(&format!("mcp__{}__{}", server_name, tool.name));
+            let route = McpToolRoute {
+                server_name: server_name.to_string(),
+                original_tool_name: tool.name.to_string(),
+            };
+            if let Some(existing) = routes.get(&public_name) {
+                tracing::warn!(
+                    public_name = %public_name,
+                    skipped_server = %route.server_name,
+                    kept_server = %existing.server_name,
+                    "MCP tool route collision; keeping first server and skipping duplicate"
+                );
+                continue;
+            }
+            routes.insert(public_name, route);
+        }
+        self.tool_routes_by_public_name = routes;
     }
 }
 
@@ -4199,6 +4242,44 @@ transport:
             3,
             "mock server should expose exactly 3 tools"
         );
+    }
+
+    #[tokio::test]
+    async fn integration_manager_indexes_public_mcp_tool_routes() {
+        let mut manager = McpClientManager::new();
+        manager
+            .connect_for_test(mock_server_config())
+            .await
+            .expect("connect mock server");
+
+        let public_name = sanitize_tool_name("mcp__mock-server__echo");
+        assert_eq!(
+            manager.find_tool_by_mcp_name(&public_name),
+            Some(("mock-server", "echo")),
+            "manager must route public MCP tool names through the route index"
+        );
+
+        let text = extract_result_text(
+            &manager
+                .call_tool("echo", serde_json::json!({"message": "indexed"}))
+                .await
+                .expect("call indexed MCP tool"),
+        );
+        assert_eq!(text, "indexed");
+
+        let (server, original) = manager
+            .find_tool_by_mcp_name(&public_name)
+            .expect("public route should still be indexed");
+        assert_eq!((server, original), ("mock-server", "echo"));
+        let text = extract_result_text(
+            &manager
+                .get(server)
+                .expect("mock server connection")
+                .call_tool(original, serde_json::json!({"message": "routed"}))
+                .await
+                .expect("call route-indexed MCP tool"),
+        );
+        assert_eq!(text, "routed");
     }
 
     #[tokio::test]

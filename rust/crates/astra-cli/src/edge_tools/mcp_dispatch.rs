@@ -107,7 +107,9 @@ mod tests {
     /// Create a ToolExecutor with an empty McpClientManager (no tools, no servers).
     fn executor_empty_mcp() -> ToolExecutor {
         let manager = Arc::new(RwLock::new(crate::mcp_client::McpClientManager::new()));
-        ToolExecutor::new("/tmp").with_mcp_manager(manager)
+        let mut executor = ToolExecutor::new("/tmp");
+        executor.install_mcp_bundle(manager, Vec::new());
+        executor
     }
 
     // ── Error path: MCP not available ─────────────────────────────────────

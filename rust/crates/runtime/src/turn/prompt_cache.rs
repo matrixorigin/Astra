@@ -866,7 +866,7 @@ mod tests {
         let always_load = default_test_always_load_tool_names();
         for name in crate::tool_registry::surface::default_always_load_names() {
             assert!(
-                always_load.contains(*name),
+                always_load.contains(name),
                 "{name} is part of the runtime default surface and must be cache-always_load"
             );
         }

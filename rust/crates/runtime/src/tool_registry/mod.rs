@@ -15,7 +15,6 @@ pub use astra_turn_core::tool_registry_meta::{IntentType, Scope, TOOL_CATALOG, T
 mod registry;
 pub mod surface;
 
-mod declaration;
 #[cfg(test)]
 mod surface_tests;
 
@@ -80,7 +79,7 @@ mod tests {
             TOOL_CATALOG.iter().map(|tool| tool.name).collect();
         let expected: std::collections::HashSet<&str> = surface::default_always_load_names()
             .iter()
-            .copied()
+            .map(String::as_str)
             .filter(|name| catalog_names.contains(name))
             .collect();
         let actual: std::collections::HashSet<&str> = TOOL_CATALOG

@@ -82,24 +82,12 @@ pub(crate) fn tool_execution_owner(
         return ToolExecutionOwner::Unknown;
     };
 
-    match spec.class {
-        astra_runtime_env::ToolClass::ControlPlane => ToolExecutionOwner::ServerControlPlane,
-        astra_runtime_env::ToolClass::ServerService => ToolExecutionOwner::ServerRuntime,
-        astra_runtime_env::ToolClass::Mcp => ToolExecutionOwner::RequestScopedMcp,
-        _ => match spec.required.executor {
-            astra_runtime_env::RequiredExecutor::ControlPlane => {
-                ToolExecutionOwner::ServerControlPlane
-            }
-            astra_runtime_env::RequiredExecutor::ServiceExecutor => {
-                ToolExecutionOwner::ServerRuntime
-            }
-            astra_runtime_env::RequiredExecutor::McpExecutor => {
-                ToolExecutionOwner::RequestScopedMcp
-            }
-            astra_runtime_env::RequiredExecutor::RuntimeExecutor
-            | astra_runtime_env::RequiredExecutor::None => ToolExecutionOwner::RuntimeExecutor,
-            _ => ToolExecutionOwner::RuntimeExecutor,
-        },
+    match spec.required.executor {
+        astra_runtime_env::RequiredExecutor::ControlPlane => ToolExecutionOwner::ServerControlPlane,
+        astra_runtime_env::RequiredExecutor::ServiceExecutor => ToolExecutionOwner::ServerRuntime,
+        astra_runtime_env::RequiredExecutor::McpExecutor => ToolExecutionOwner::RequestScopedMcp,
+        astra_runtime_env::RequiredExecutor::RuntimeExecutor
+        | astra_runtime_env::RequiredExecutor::None => ToolExecutionOwner::RuntimeExecutor,
     }
 }
 
