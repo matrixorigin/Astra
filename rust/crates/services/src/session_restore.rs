@@ -115,7 +115,6 @@ pub struct RestoredSession {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResumableSessionsResponse {
     pub sessions: Vec<RestoredSession>,
-    pub limit: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

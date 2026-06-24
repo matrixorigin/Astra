@@ -29,8 +29,6 @@ pub(super) struct ChatTurnRequestBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     selected_model: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    model: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     execution_state: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_turn: Option<serde_json::Value>,
@@ -237,7 +235,7 @@ fn validate_exact_bridge_string(
 fn validate_selected_model_shape(
     request: &ChatTurnRequestBody,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    if request.model.is_some() {
+    if request.extra.contains_key("model") {
         return Err(error_response_coded(
             StatusCode::BAD_REQUEST,
             "legacy top-level model is not accepted on /chat/turn; use selected_model.model",

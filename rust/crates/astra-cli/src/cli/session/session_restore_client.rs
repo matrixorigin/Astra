@@ -175,7 +175,6 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(ResumableSessionsResponse {
                     sessions: sessions.to_vec(),
-                    limit: 20,
                 }),
             )
             .mount(server)

@@ -358,7 +358,7 @@ pub(crate) async fn list_resumable_sessions_handler(
         sessions.truncate(limit as usize);
     }
     Ok(Json(
-        astra_services::session_restore::ResumableSessionsResponse { sessions, limit },
+        astra_services::session_restore::ResumableSessionsResponse { sessions },
     ))
 }
 

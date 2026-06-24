@@ -266,7 +266,6 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 astra_services::session_restore::ResumableSessionsResponse {
                     sessions: sessions.to_vec(),
-                    limit: 20,
                 },
             ))
             .mount(server)
