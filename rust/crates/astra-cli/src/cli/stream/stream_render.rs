@@ -8342,6 +8342,22 @@ mod tests {
         };
         assert_eq!(edge_tool_outcome_status(&outcome), "failed");
     }
+
+    #[test]
+    fn edge_tool_outcome_status_keeps_agent_interrupted_as_completed_tool_call() {
+        let outcome = crate::edge_tools::ToolExecutionOutcome {
+            output: serde_json::json!({
+                "status": "interrupted",
+                "finish_reason": "budget_exhausted",
+                "result": "partial review"
+            })
+            .to_string(),
+            tool_result_fields: None,
+            is_error: false,
+        };
+
+        assert_eq!(edge_tool_outcome_status(&outcome), "completed");
+    }
     // ── Skill/MCP output summary tests ──
 
     #[test]

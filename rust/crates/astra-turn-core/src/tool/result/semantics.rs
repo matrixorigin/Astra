@@ -18,7 +18,10 @@ fn json_tool_result_is_error(result_str: &str) -> bool {
         }
         if let Some(status) = v.get("status").and_then(|s| s.as_str()) {
             return match status.trim().to_ascii_lowercase().as_str() {
-                "completed" | "skipped" => false,
+                "completed" | "complete" | "ok" | "success" | "succeeded" | "passed" | "done"
+                | "skipped" | "launched" | "pending" | "queued" | "in_progress" | "running"
+                | "still_running" | "processing" | "starting" | "waiting" | "waiting_for_input"
+                | "interrupted" => false,
                 "failed" | "partial_failure" | "denied" | "cancelled" | "canceled" | "timeout"
                 | "timed_out" => true,
                 _ => true,
@@ -700,14 +703,23 @@ mod tests {
     }
 
     #[test]
-    fn tool_error_rejects_noncanonical_status_aliases() {
+    fn tool_error_accepts_declared_success_status_aliases() {
         for status in ["ok", "success", "succeeded", "complete", "passed"] {
             let body = format!(r#"{{"status":"{status}","data":[]}}"#);
             assert!(
-                is_tool_error(&body),
-                "noncanonical status alias {status:?} must fail closed"
+                !is_tool_error(&body),
+                "declared success status alias {status:?} must not be treated as a tool failure"
             );
         }
+    }
+
+    #[test]
+    fn tool_error_rejects_unknown_statuses() {
+        let body = r#"{"status":"mystery","data":[]}"#;
+        assert!(
+            is_tool_error(body),
+            "unknown structured statuses must still fail closed"
+        );
     }
 
     #[test]
@@ -795,6 +807,30 @@ mod tests {
     #[test]
     fn is_tool_error_json_status_completed_not_error() {
         assert!(!is_tool_error(r#"{"status": "completed", "data": []}"#));
+    }
+
+    #[test]
+    fn agent_runtime_domain_statuses_are_not_tool_execution_failures() {
+        for status in [
+            "launched",
+            "still_running",
+            "waiting",
+            "interrupted",
+            "running",
+        ] {
+            let body = json!({
+                "status": status,
+                "agent_id": "reviewer@abc",
+                "finish_reason": "budget_exhausted",
+                "result": "partial review"
+            })
+            .to_string();
+            assert!(
+                !is_tool_error(&body),
+                "domain status {status} must not be classified as malformed tool execution: {body}"
+            );
+            assert_eq!(cloud_tool_result_status_label(&body), "completed");
+        }
     }
 
     #[test]

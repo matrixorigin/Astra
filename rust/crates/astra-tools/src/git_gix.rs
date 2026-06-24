@@ -1191,7 +1191,7 @@ fn diff_stat_cli(project_root: &Path, args: &Value, limit: usize) -> String {
     }
 
     let cmd_refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
-    diff_via_git_cli(project_root, &cmd_refs, limit).unwrap_or_else(|| "No changes".to_string())
+    diff_via_git_cli_or_error(project_root, &cmd_refs, limit)
 }
 
 pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: usize) -> String {
@@ -1244,8 +1244,7 @@ pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
             path_owned = p.to_string();
             cli_args.push(&path_owned);
         }
-        return diff_via_git_cli(project_root, &cli_args, limit)
-            .unwrap_or_else(|| "No changes".to_string());
+        return diff_via_git_cli_or_error(project_root, &cli_args, limit);
     }
 
     // If a ref is given, do a tree-to-tree diff (HEAD vs ref)
@@ -1274,18 +1273,19 @@ pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
                 cli_args.push("--");
                 cli_args.push(p);
             }
-            return diff_via_git_cli(project_root, &cli_args, limit)
-                .unwrap_or_else(|| "No changes".to_string());
+            return diff_via_git_cli_or_error(project_root, &cli_args, limit);
         }
         // With path filter, use CLI for tree-to-tree as well
-        if let Some(p) = path_filter
-            && let Some(result) = diff_via_git_cli(
+        if let Some(p) = path_filter {
+            match diff_via_git_cli_result(
                 project_root,
                 &["diff", ref_str, "--no-ext-diff", "--no-color", "--", p],
                 limit,
-            )
-        {
-            return result;
+            ) {
+                GitCliDiffResult::Output(result) => return result,
+                GitCliDiffResult::Failed(error) => return error,
+                GitCliDiffResult::Unavailable => {}
+            }
         }
         return diff_tree_to_tree_str(&repo, ref_str, limit);
     }
@@ -1297,8 +1297,11 @@ pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
         } else {
             vec!["diff", "--cached", "--no-ext-diff", "--no-color"]
         };
-        let result = diff_via_git_cli(project_root, &cli_args, limit)
-            .unwrap_or_else(|| diff_index_to_head(&repo, limit));
+        let result = match diff_via_git_cli_result(project_root, &cli_args, limit) {
+            GitCliDiffResult::Output(result) => result,
+            GitCliDiffResult::Failed(error) => return error,
+            GitCliDiffResult::Unavailable => diff_index_to_head(&repo, limit),
+        };
         if result == "No changes" {
             return "No staged changes".to_string();
         }
@@ -1312,20 +1315,63 @@ pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
     } else {
         vec!["diff", "HEAD", "--no-ext-diff", "--no-color"]
     };
-    diff_via_git_cli(project_root, &cli_args, limit).unwrap_or_else(|| diff_worktree(&repo, limit))
+    match diff_via_git_cli_result(project_root, &cli_args, limit) {
+        GitCliDiffResult::Output(result) => result,
+        GitCliDiffResult::Failed(error) => error,
+        GitCliDiffResult::Unavailable => diff_worktree(&repo, limit),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GitCliDiffResult {
+    Output(String),
+    Failed(String),
+    Unavailable,
+}
+
+fn diff_via_git_cli_or_error(project_root: &Path, args: &[&str], limit: usize) -> String {
+    match diff_via_git_cli_result(project_root, args, limit) {
+        GitCliDiffResult::Output(result) => result,
+        GitCliDiffResult::Failed(error) => error,
+        GitCliDiffResult::Unavailable => {
+            format!("Error: git {} failed to start or timed out", args.join(" "))
+        }
+    }
 }
 
 fn diff_via_git_cli(project_root: &Path, args: &[&str], limit: usize) -> Option<String> {
+    match diff_via_git_cli_result(project_root, args, limit) {
+        GitCliDiffResult::Output(result) => Some(result),
+        GitCliDiffResult::Failed(_) | GitCliDiffResult::Unavailable => None,
+    }
+}
+
+fn diff_via_git_cli_result(project_root: &Path, args: &[&str], limit: usize) -> GitCliDiffResult {
     // Use timeout to prevent hangs on large diffs
-    let out = run_git_with_timeout(project_root, args)?;
+    let Some(out) = run_git_with_timeout(project_root, args) else {
+        return GitCliDiffResult::Unavailable;
+    };
     if !out.status.success() {
-        return None;
+        return GitCliDiffResult::Failed(format_git_cli_failure(args, &out));
     }
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     if stdout.trim().is_empty() {
-        return Some("No changes".to_string());
+        return GitCliDiffResult::Output("No changes".to_string());
     }
-    Some(truncate_diff_at(stdout, limit.min(tool_output_limit())))
+    GitCliDiffResult::Output(truncate_diff_at(stdout, limit.min(tool_output_limit())))
+}
+
+fn format_git_cli_failure(args: &[&str], out: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("exit status {}", out.status)
+    };
+    format!("Error: git {} failed: {detail}", args.join(" "))
 }
 
 /// Diff between two tree-ish refs (e.g., HEAD vs a branch/commit).
@@ -2988,6 +3034,25 @@ mod tests {
     }
 
     #[test]
+    fn git_action_diff_invalid_range_ref_returns_error_not_no_changes() {
+        let root = repo_root();
+        let result = diff(
+            &root,
+            &json!({"ref": "__astra_missing_ref__..HEAD"}),
+            0.0,
+            0,
+        );
+        assert!(
+            result.starts_with("Error: git diff "),
+            "invalid range refs must surface git failure instead of pretending the diff is empty: {result}"
+        );
+        assert!(
+            !result.contains("No changes"),
+            "invalid range refs are not an empty diff: {result}"
+        );
+    }
+
+    #[test]
     fn git_action_diff_default_shows_worktree() {
         let root = repo_root();
         let result = diff(&root, &json!({}), 0.0, 0);
@@ -3024,6 +3089,25 @@ mod tests {
             0,
         );
         assert!(result.contains("not both"), "{result}");
+    }
+
+    #[test]
+    fn git_action_diff_stat_only_invalid_ref_returns_error_not_no_changes() {
+        let root = repo_root();
+        let result = diff(
+            &root,
+            &json!({"stat_only": true, "ref": "__astra_missing_ref__..HEAD"}),
+            0.0,
+            0,
+        );
+        assert!(
+            result.starts_with("Error: git diff "),
+            "stat_only invalid refs must surface git failure: {result}"
+        );
+        assert!(
+            !result.contains("No changes"),
+            "stat_only invalid refs are not an empty diff: {result}"
+        );
     }
 
     #[test]
@@ -4023,6 +4107,26 @@ mod tests {
             8000,
         );
         assert!(result.is_none(), "bad ref should return None for fallback");
+    }
+
+    #[test]
+    fn diff_via_git_cli_result_exposes_bad_args_error() {
+        let root = repo_root();
+        let result = diff_via_git_cli_result(
+            &root,
+            &["diff", "not_a_valid_ref_xyzzy", "--no-ext-diff"],
+            8000,
+        );
+        match result {
+            GitCliDiffResult::Failed(error) => {
+                assert!(error.starts_with("Error: git diff "), "{error}");
+                assert!(
+                    error.contains("not_a_valid_ref_xyzzy"),
+                    "error should preserve the bad ref: {error}"
+                );
+            }
+            other => panic!("bad ref must be structured as git CLI failure, got {other:?}"),
+        }
     }
 
     #[test]

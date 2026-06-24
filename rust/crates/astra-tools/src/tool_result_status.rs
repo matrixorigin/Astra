@@ -26,7 +26,9 @@ impl ToolResultStatusKind {
     pub fn from_status_str(status: &str) -> Self {
         let normalized = status.trim().to_lowercase();
         match normalized.as_str() {
-            "completed" | "complete" | "ok" | "success" | "succeeded" | "passed" | "done" => {
+            "completed" | "complete" | "ok" | "success" | "succeeded" | "passed" | "done"
+            | "launched" | "pending" | "queued" | "in_progress" | "running" | "still_running"
+            | "processing" | "starting" | "waiting" | "waiting_for_input" | "interrupted" => {
                 Self::Completed
             }
             "skipped" => Self::Skipped,
@@ -76,6 +78,24 @@ mod tests {
             ToolResultStatusKind::from_status_str("skipped"),
             ToolResultStatusKind::Skipped
         );
+    }
+
+    #[test]
+    fn from_status_str_accepts_agent_runtime_domain_statuses() {
+        for status in [
+            "launched",
+            "still_running",
+            "waiting",
+            "running",
+            "interrupted",
+        ] {
+            let kind = ToolResultStatusKind::from_status_str(status);
+            assert_eq!(
+                kind,
+                ToolResultStatusKind::Completed,
+                "agent domain status '{status}' means the tool call returned state, not that execution failed"
+            );
+        }
     }
 
     #[test]

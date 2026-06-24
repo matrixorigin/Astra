@@ -175,6 +175,10 @@ pub fn render_preview(tool: &str, args: &Value, style: PreviewStyle, desc_budget
         "task_list" => "List background tasks".to_string(),
 
         // ── Web ─────────────────────────────────────────────────────
+        "tool_search" => {
+            let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+            format!("Searching tools: \"{}\"", trunc(query, path_budget(17)))
+        }
         "web_fetch" => {
             let url = args.get("url").and_then(Value::as_str).unwrap_or("");
             format!("Fetching: {}", trunc(url, path_budget(10)))
@@ -1024,12 +1028,9 @@ mod tests {
     }
 
     #[test]
-    fn session_tool_search() {
+    fn tool_search_with_query() {
         assert_eq!(
-            p(
-                "session",
-                json!({"action": "tool_search", "query": "github"})
-            ),
+            p("tool_search", json!({"query": "github"})),
             r#"Searching tools: "github""#
         );
     }

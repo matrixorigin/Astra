@@ -32,16 +32,34 @@ fn string_to_result(output: String) -> ToolResult {
         || parsed
             .as_ref()
             .and_then(|value| value.get("status").and_then(Value::as_str))
-            .is_some_and(|status| status == "failed" || status == "error")
+            .is_some_and(structured_status_is_error)
         || parsed
             .as_ref()
             .and_then(|value| value.get("error"))
-            .is_some();
+            .is_some_and(json_error_value_is_error);
     if structured_error || output.starts_with("Error") {
         ToolResult::error(output)
     } else {
         ToolResult::text(output)
     }
+}
+
+fn json_error_value_is_error(error: &Value) -> bool {
+    !error.is_null() && error.as_str() != Some("")
+}
+
+fn structured_status_is_error(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "failed"
+            | "error"
+            | "partial_failure"
+            | "denied"
+            | "cancelled"
+            | "canceled"
+            | "timeout"
+            | "timed_out"
+    )
 }
 
 fn outcome_to_result(outcome: crate::git_gix::ToolExecutionOutcome) -> ToolResult {
@@ -1100,6 +1118,45 @@ mod tests {
             !result.is_error,
             "completed structured JSON must not be classified by incidental text"
         );
+    }
+
+    #[test]
+    fn string_to_result_does_not_misclassify_null_or_empty_error() {
+        for error in [serde_json::Value::Null, serde_json::json!("")] {
+            let result = string_to_result(
+                serde_json::json!({
+                    "ok": true,
+                    "error": error,
+                    "output": "completed"
+                })
+                .to_string(),
+            );
+
+            assert!(
+                !result.is_error,
+                "null/empty JSON error fields are not failures"
+            );
+        }
+    }
+
+    #[test]
+    fn string_to_result_does_not_misclassify_agent_domain_status_json() {
+        for status in ["launched", "still_running", "waiting", "interrupted"] {
+            let result = string_to_result(
+                serde_json::json!({
+                    "status": status,
+                    "agent_id": "reviewer@abc",
+                    "finish_reason": "budget_exhausted",
+                    "result": "partial review",
+                })
+                .to_string(),
+            );
+
+            assert!(
+                !result.is_error,
+                "agent status {status} is a domain state, not a malformed tool call"
+            );
+        }
     }
 
     #[tokio::test]

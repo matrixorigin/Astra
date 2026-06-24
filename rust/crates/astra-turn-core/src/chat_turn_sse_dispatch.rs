@@ -1653,7 +1653,7 @@ mod tests {
         assert_eq!(a.tool_calls[0]["id"].as_str(), Some("tc-1"));
         assert_eq!(
             a.tool_calls[0]["function"]["arguments"].as_str(),
-            Some("{\"n\":5}")
+            Some("{\"action\":\"log\",\"n\":5}")
         );
         assert_eq!(a.tool_call_id_index.get("tc-1"), Some(&0));
     }
