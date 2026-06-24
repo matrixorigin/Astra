@@ -300,6 +300,33 @@ pub trait AgenticLoopHost: Send {
         astra_turn_core::capability::CapabilitySet::all()
     }
 
+    /// Whether this host has an authoritative state source for recovering a
+    /// missing post-SSE edge row for `tool_name`.
+    ///
+    /// The loop asks this before calling
+    /// [`AgenticLoopHost::recover_missing_control_tool_result`] so the runtime
+    /// stays tool-agnostic and hosts own their concrete control capabilities.
+    fn can_recover_missing_control_tool_result(&self, _tool_name: &str) -> bool {
+        false
+    }
+
+    /// Recover a host-owned control-tool result when the LLM emitted a tool
+    /// call but the post-SSE edge result row is missing.
+    ///
+    /// This is intentionally host-scoped: replaying arbitrary missing tools
+    /// would duplicate side effects. Implementations must recover only from
+    /// an authoritative host state source, such as the multi-agent fanout
+    /// registry for `agent_fanout`.
+    async fn recover_missing_control_tool_result(
+        &mut self,
+        _parent_run_id: Option<&str>,
+        _tool_call_id: &str,
+        _tool_name: &str,
+        _args: &Value,
+    ) -> Option<EdgeToolExecResult> {
+        None
+    }
+
     /// Inject an additional tool schema into the host's tool list.
     ///
     /// Called by the runtime in the loop preamble to auto-register tools
@@ -2511,6 +2538,8 @@ pub(crate) mod tests {
         pub(crate) rendered_final_text: Vec<String>,
         pub(crate) executed_messages: Vec<Vec<Value>>,
         pub(crate) turn_intent: Option<TurnIntent>,
+        pub(crate) recovered_control_results: HashMap<String, EdgeToolExecResult>,
+        pub(crate) recovered_control_requests: Vec<(Option<String>, String, String, Value)>,
         /// PR 5a test observer: number of times the turn loop has
         /// invoked the parent-turn-completed hook. Each entry is the
         /// value of `state.current_run_id` at hook time so tests can
@@ -2533,6 +2562,8 @@ pub(crate) mod tests {
                 rendered_final_text: Vec::new(),
                 executed_messages: Vec::new(),
                 turn_intent: None,
+                recovered_control_results: HashMap::new(),
+                recovered_control_requests: Vec::new(),
                 turn_completed_run_ids: Vec::new(),
                 cancelled_agent_ids: Vec::new(),
             }
@@ -2550,6 +2581,16 @@ pub(crate) mod tests {
 
         pub(crate) fn with_turn_intent(mut self, intent: TurnIntent) -> Self {
             self.turn_intent = Some(intent);
+            self
+        }
+
+        pub(crate) fn with_recovered_control_tool_result(
+            mut self,
+            tool_call_id: &str,
+            result: EdgeToolExecResult,
+        ) -> Self {
+            self.recovered_control_results
+                .insert(tool_call_id.to_string(), result);
             self
         }
 
@@ -2578,6 +2619,28 @@ pub(crate) mod tests {
 
         async fn judge_turn_intent(&mut self, _state: &AgenticLoopState) -> Option<TurnIntent> {
             self.turn_intent.clone()
+        }
+
+        fn can_recover_missing_control_tool_result(&self, tool_name: &str) -> bool {
+            self.recovered_control_results
+                .values()
+                .any(|result| result.tool == tool_name)
+        }
+
+        async fn recover_missing_control_tool_result(
+            &mut self,
+            parent_run_id: Option<&str>,
+            tool_call_id: &str,
+            tool_name: &str,
+            args: &Value,
+        ) -> Option<EdgeToolExecResult> {
+            self.recovered_control_requests.push((
+                parent_run_id.map(str::to_string),
+                tool_call_id.to_string(),
+                tool_name.to_string(),
+                args.clone(),
+            ));
+            self.recovered_control_results.remove(tool_call_id)
         }
 
         fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {

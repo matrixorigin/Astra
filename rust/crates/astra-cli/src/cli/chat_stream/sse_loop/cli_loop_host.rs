@@ -19,7 +19,10 @@ use astra_runtime::{
         interaction_scoped_tool_restrictions,
     },
 };
-use astra_turn_core::compaction_types::CompactionEvent;
+use astra_turn_core::{
+    compaction_types::CompactionEvent, sse_stream_host::EdgeToolExecResult,
+    tool_result_semantics::cloud_tool_result_status_label,
+};
 use async_trait::async_trait;
 use crossterm::style::Stylize;
 use serde_json::Value;
@@ -893,6 +896,59 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
 
     fn capabilities(&self) -> astra_turn_core::capability::CapabilitySet {
         self.capabilities.clone()
+    }
+
+    fn can_recover_missing_control_tool_result(&self, tool_name: &str) -> bool {
+        tool_name == "agent_fanout" && self.executor.spawn_context.is_some()
+    }
+
+    async fn recover_missing_control_tool_result(
+        &mut self,
+        parent_run_id: Option<&str>,
+        tool_call_id: &str,
+        tool_name: &str,
+        args: &Value,
+    ) -> Option<EdgeToolExecResult> {
+        if tool_name != "agent_fanout" {
+            return None;
+        }
+        let spawn_context = self.executor.spawn_context.as_ref()?;
+        if let Some(parent_run_id) = parent_run_id
+            && parent_run_id != spawn_context.run_id
+        {
+            tracing::warn!(
+                target: "astra_cli::agentic_loop_host",
+                parent_run_id,
+                spawn_context_run_id = %spawn_context.run_id,
+                tool_call_id,
+                "agent_fanout recovery skipped: parent run id does not match spawn context"
+            );
+            return None;
+        }
+
+        let started = Instant::now();
+        let mut exec_args = args.clone();
+        if let Some(object) = exec_args.as_object_mut() {
+            object.insert(
+                "_tool_call_id".to_string(),
+                Value::String(tool_call_id.to_string()),
+            );
+        }
+        let output = astra_runtime::orchestration::recover_agent_fanout_tool_result(
+            &exec_args,
+            Some(spawn_context),
+        )
+        .await;
+        let status = cloud_tool_result_status_label(&output).to_string();
+        Some(EdgeToolExecResult {
+            request_id: tool_call_id.to_string(),
+            tool: tool_name.to_string(),
+            args: args.clone(),
+            output,
+            tool_result_fields: None,
+            status,
+            duration_ms: started.elapsed().as_millis() as u64,
+        })
     }
 
     async fn cancel_child_agents(&mut self, agent_ids: &[String], reason: &str) -> Vec<String> {

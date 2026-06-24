@@ -286,6 +286,81 @@ pub async fn handle_agent_fanout_tool(args: &Value, ctx: Option<&AgentToolContex
     }
 }
 
+/// Recover a missing `agent_fanout` edge result from the fanout registry.
+///
+/// The recovery path is idempotent for `start`: if the start call already
+/// created a group for this parent run, return that group's results instead
+/// of replaying the start and duplicating child agents.
+pub async fn recover_agent_fanout_tool_result(
+    args: &Value,
+    ctx: Option<&AgentToolContext>,
+) -> String {
+    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+    let Some(ctx) = ctx else {
+        return render_agent_runtime_binding_error("agent_fanout", action);
+    };
+    if action != "start" {
+        return handle_agent_fanout_tool(args, Some(ctx)).await;
+    }
+
+    let tool_call_id = args
+        .get("_tool_call_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let requested_group_id = args
+        .get("group_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let groups = ctx.spawner.list_fanout_groups().await;
+    let parent_groups: Vec<_> = groups
+        .iter()
+        .filter(|group| group.parent_run_id.as_deref() == Some(ctx.run_id.as_str()))
+        .collect();
+
+    if let Some(group_id) = requested_group_id
+        && let Some(group) = parent_groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+    {
+        return render_agent_fanout_results(ctx, &group.group_id, tool_call_id.map(str::to_string))
+            .await;
+    }
+    if requested_group_id.is_some() {
+        return handle_agent_fanout_tool(args, Some(ctx)).await;
+    }
+    if let Some(tool_call_id) = tool_call_id
+        && let Some(group) = parent_groups
+            .iter()
+            .find(|group| group.created_by_tool_use_id.as_deref() == Some(tool_call_id))
+    {
+        return render_agent_fanout_results(ctx, &group.group_id, Some(tool_call_id.to_string()))
+            .await;
+    }
+    if parent_groups.len() == 1 {
+        let group = parent_groups[0];
+        return render_agent_fanout_results(ctx, &group.group_id, tool_call_id.map(str::to_string))
+            .await;
+    }
+    if parent_groups.len() > 1 {
+        let group_ids: Vec<_> = parent_groups
+            .iter()
+            .map(|group| group.group_id.as_str())
+            .collect();
+        return render_agent_tool_error(
+            None,
+            &format!(
+                "Cannot recover missing agent_fanout.start result unambiguously: parent run '{}' has multiple fanout groups: {}. Use agent_fanout(action='get_results', group_id=...) with one of those exact group_id values.",
+                ctx.run_id,
+                group_ids.join(", ")
+            ),
+        );
+    }
+
+    handle_agent_fanout_tool(args, Some(ctx)).await
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentFanoutStartInput {
@@ -1897,6 +1972,7 @@ mod tests {
     struct CapturingModelExecutor {
         captured_model: Mutex<Option<String>>,
         captured_execution_metadata: Mutex<Option<Value>>,
+        spawn_count: Mutex<usize>,
     }
 
     impl CapturingModelExecutor {
@@ -1904,6 +1980,7 @@ mod tests {
             Self {
                 captured_model: Mutex::new(None),
                 captured_execution_metadata: Mutex::new(None),
+                spawn_count: Mutex::new(0),
             }
         }
 
@@ -1914,11 +1991,16 @@ mod tests {
         fn take_captured_execution_metadata(&self) -> Option<Value> {
             self.captured_execution_metadata.lock().unwrap().take()
         }
+
+        fn spawn_count(&self) -> usize {
+            *self.spawn_count.lock().unwrap()
+        }
     }
 
     #[async_trait::async_trait]
     impl SpawnAgentExecutor for CapturingModelExecutor {
         async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            *self.spawn_count.lock().unwrap() += 1;
             *self.captured_model.lock().unwrap() = config.model.clone();
             *self.captured_execution_metadata.lock().unwrap() = config.execution_metadata.clone();
             Ok(SpawnRunResult {
@@ -2673,6 +2755,141 @@ mod tests {
         assert!(
             result.contains('\n'),
             "fanout aggregate results must be readable when persisted: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_agent_fanout_start_uses_existing_group_without_respawn() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        let start_args = json!({
+            "action": "start",
+            "_tool_call_id": "call-start",
+            "group_id": "review-recover",
+            "target_count": 2,
+            "slots": [
+                {"id": "first", "description": "Review storage", "prompt": "Review storage changes"},
+                {"id": "second", "description": "Review auth", "prompt": "Review auth changes"}
+            ]
+        });
+        let start = handle_agent_fanout_tool(&start_args, Some(&ctx)).await;
+        let start_value: Value = serde_json::from_str(&start).unwrap();
+        assert_eq!(start_value["status"], "completed");
+        assert_eq!(executor.spawn_count(), 2);
+
+        let recovered = recover_agent_fanout_tool_result(&start_args, Some(&ctx)).await;
+        let value: Value = serde_json::from_str(&recovered).unwrap();
+
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["group_id"], "review-recover");
+        assert_eq!(value["completed"], 2);
+        assert_eq!(value["results"].as_array().unwrap().len(), 2);
+        assert!(
+            value["instruction"]
+                .as_str()
+                .is_some_and(|text| text.contains("Do not call agent(action='spawn')")),
+            "{recovered}"
+        );
+        assert_eq!(
+            executor.spawn_count(),
+            2,
+            "recovering a missing edge row must not duplicate child agents"
+        );
+        assert_eq!(spawner.list_fanout_groups().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recover_agent_fanout_start_refuses_ambiguous_parent_groups() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        for group_id in ["review-one", "review-two"] {
+            let start = handle_agent_fanout_tool(
+                &json!({
+                    "action": "start",
+                    "group_id": group_id,
+                    "target_count": 1,
+                    "slots": [
+                        {"description": format!("Review {group_id}"), "prompt": "Review changes"}
+                    ]
+                }),
+                Some(&ctx),
+            )
+            .await;
+            let value: Value = serde_json::from_str(&start).unwrap();
+            assert_eq!(value["status"], "completed");
+        }
+        assert_eq!(executor.spawn_count(), 2);
+
+        let recovered = recover_agent_fanout_tool_result(
+            &json!({
+                "action": "start",
+                "target_count": 1,
+                "slots": [
+                    {"description": "Review unknown", "prompt": "Review changes"}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&recovered).unwrap();
+
+        assert_eq!(value["status"], "failed");
+        assert!(
+            value["error"]
+                .as_str()
+                .is_some_and(|text| text.contains("multiple fanout groups")),
+            "{recovered}"
+        );
+        assert_eq!(
+            executor.spawn_count(),
+            2,
+            "ambiguous recovery must not guess by spawning a replacement group"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_agent_fanout_start_respects_explicit_group_id() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let existing = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "existing-review",
+                "target_count": 1,
+                "slots": [
+                    {"description": "Review existing", "prompt": "Review existing changes"}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let existing_value: Value = serde_json::from_str(&existing).unwrap();
+        assert_eq!(existing_value["group_id"], "existing-review");
+        assert_eq!(executor.spawn_count(), 1);
+
+        let recovered = recover_agent_fanout_tool_result(
+            &json!({
+                "action": "start",
+                "group_id": "new-review",
+                "target_count": 1,
+                "slots": [
+                    {"description": "Review new", "prompt": "Review new changes"}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&recovered).unwrap();
+
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["group_id"], "new-review");
+        assert_eq!(
+            executor.spawn_count(),
+            2,
+            "explicit group_id must not recover a different parent group"
         );
     }
 

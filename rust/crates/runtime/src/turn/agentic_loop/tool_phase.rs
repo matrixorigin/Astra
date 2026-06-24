@@ -41,6 +41,7 @@ use astra_turn_core::agentic_post_tool_policy::{
 use astra_turn_core::agentic_turn_flow::{
     agentic_round_stall_preflight_with_tool_calls, append_explain_turn_batch,
 };
+use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 use astra_turn_core::tool_result_semantics::tool_dedup_signature;
 
 pub(crate) enum TurnToolPhaseControl {
@@ -185,13 +186,63 @@ fn agent_fanout_wait_reason(
         })
 }
 
-fn agent_fanout_reason_from_edge_result(
-    result: &astra_turn_core::sse_stream_host::EdgeToolExecResult,
-) -> Option<String> {
+fn agent_fanout_reason_from_edge_result(result: &EdgeToolExecResult) -> Option<String> {
     if result.tool != "agent_fanout" {
         return None;
     }
     agent_fanout_reason_from_text(&result.output)
+}
+
+async fn recover_missing_control_tool_results<H: AgenticLoopHost>(
+    host: &mut H,
+    parent_run_id: Option<&str>,
+    tool_calls: &[Value],
+    edge_tool_round: &mut Vec<EdgeToolExecResult>,
+) {
+    for tool_call in tool_calls {
+        let Some(tool_name) = tool_call_name(tool_call) else {
+            continue;
+        };
+        if !host.can_recover_missing_control_tool_result(tool_name) {
+            continue;
+        }
+        let Some(tool_call_id) = tool_call.get("id").and_then(Value::as_str) else {
+            tracing::warn!(
+                target: "astra_runtime::agentic_loop_tool_phase",
+                tool_name,
+                "control-tool recovery skipped: tool call had no id"
+            );
+            continue;
+        };
+        let args = tool_call_arguments_value(tool_call);
+        let signature = tool_dedup_signature(tool_name, &args);
+        if edge_tool_round
+            .iter()
+            .any(|edge| tool_dedup_signature(&edge.tool, &edge.args) == signature)
+        {
+            continue;
+        }
+        let Some(recovered) = host
+            .recover_missing_control_tool_result(parent_run_id, tool_call_id, tool_name, &args)
+            .await
+        else {
+            tracing::warn!(
+                target: "astra_runtime::agentic_loop_tool_phase",
+                tool_name,
+                tool_call_id,
+                "control-tool edge row missing and host could not recover it"
+            );
+            continue;
+        };
+        tracing::warn!(
+            target: "astra_runtime::agentic_loop_tool_phase",
+            tool_name,
+            tool_call_id,
+            status = %recovered.status,
+            "recovered missing control-tool edge row from host state"
+        );
+        edge_tool_round.push(recovered);
+    }
 }
 
 fn agent_fanout_reason_from_tool_result(result: &Value) -> Option<String> {
@@ -1206,13 +1257,20 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     let PreparedToolRound {
         tool_calls,
         pre_resolved_results,
-        edge_tool_round,
+        mut edge_tool_round,
     } = prepare_intercepted_tool_round(
         state,
         &turn_result,
         &effective_tool_calls,
         delegation_intercepted,
         &valid_tool_names,
+    )
+    .await;
+    recover_missing_control_tool_results(
+        host,
+        state.current_run_id.as_deref(),
+        &tool_calls,
+        &mut edge_tool_round,
     )
     .await;
     let all_tool_calls = tool_calls.as_slice();
@@ -1237,8 +1295,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         }
     }
 
-    let edge_callback_outputs: HashMap<String, String> = turn_result
-        .edge_tool_round
+    let edge_callback_outputs: HashMap<String, String> = edge_tool_round
         .iter()
         .map(|r| (tool_dedup_signature(&r.tool, &r.args), r.output.clone()))
         .collect();
@@ -1469,8 +1526,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         )));
     }
 
-    if let Some(reason) =
-        detached_background_task_wait_reason(&turn_result.edge_tool_round, &new_tool_results)
+    if let Some(reason) = detached_background_task_wait_reason(&edge_tool_round, &new_tool_results)
     {
         state.step_recorder.end_turn(false);
         finalize_turn_trace(state).await;
@@ -1480,8 +1536,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         )));
     }
 
-    if let Some(reason) = agent_fanout_wait_reason(&turn_result.edge_tool_round, &new_tool_results)
-    {
+    if let Some(reason) = agent_fanout_wait_reason(&edge_tool_round, &new_tool_results) {
         state.step_recorder.end_turn(false);
         finalize_turn_trace(state).await;
         refresh_runtime_promotion_signals_from_db(state).await;
@@ -1555,7 +1610,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
 
     {
         let turn_num = (state.max_turns - state.remaining_turns) as u32;
-        for edge_result in &turn_result.edge_tool_round {
+        for edge_result in &edge_tool_round {
             record_recent_read_file_path(
                 &mut state.recent_file_reads,
                 &edge_result.tool,
@@ -1565,11 +1620,11 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         }
     }
 
-    record_edge_tool_observability(state, &turn_result.edge_tool_round);
+    record_edge_tool_observability(state, &edge_tool_round);
 
     if let Some(ref registry) = state.skills.registry_for_activation {
         let mut any_newly_activated = false;
-        for edge_result in &turn_result.edge_tool_round {
+        for edge_result in &edge_tool_round {
             if let Some(path) = extract_file_path_from_tool(&edge_result.tool, &edge_result.args) {
                 let newly = registry.record_file_path(&path);
                 if !newly.is_empty() {
@@ -1728,8 +1783,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                     } else {
                         0
                     });
-                let last_tool = turn_result
-                    .edge_tool_round
+                let last_tool = edge_tool_round
                     .last()
                     .map(|r| r.tool.clone())
                     .unwrap_or_else(|| "thinking".to_string());
@@ -1765,11 +1819,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             ) {
                 let total_ms = prep.turn_start_time.elapsed().as_millis() as u64;
                 let ctx_asm_ms = (llm_wall_start - prep.turn_start_time).as_millis() as u64;
-                let tool_exec_ms: u64 = turn_result
-                    .edge_tool_round
-                    .iter()
-                    .map(|e| e.duration_ms)
-                    .sum();
+                let tool_exec_ms: u64 = edge_tool_round.iter().map(|e| e.duration_ms).sum();
                 let timing = crate::observability::TurnTiming {
                     turn: session_turn_number(state),
                     context_assembly_ms: ctx_asm_ms,
@@ -2080,6 +2130,73 @@ mod tests {
         })];
 
         assert!(execution_boundary_blocked_wait_reason(&results).is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_agent_fanout_edge_row_is_recovered_and_matchable() {
+        let args = json!({
+            "action": "start",
+            "target_count": 1,
+            "slots": [
+                {"description": "Review storage", "prompt": "Review storage changes"}
+            ]
+        });
+        let recovered_output = json!({
+            "status": "completed",
+            "group_id": "run-parent-fanout-1",
+            "target_count": 1,
+            "delivery_contract": "Results are in results[].result.",
+            "results": [{"slot_index": 0, "result": {"status": "completed", "result": "ok"}}],
+            "completed": 1,
+            "instruction": "Fanout target_count is complete. Do not call agent(action='spawn') to add, retry, or replace agents in this turn. Present the collected results; ask the user before starting any additional fanout."
+        })
+        .to_string();
+        let recovered = EdgeToolExecResult {
+            request_id: "call-fanout".to_string(),
+            tool: "agent_fanout".to_string(),
+            args: args.clone(),
+            output: recovered_output.clone(),
+            tool_result_fields: None,
+            status: "completed".to_string(),
+            duration_ms: 7,
+        };
+        let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(Vec::new())
+            .with_recovered_control_tool_result("call-fanout", recovered);
+        let tool_calls = vec![json!({
+            "id": "call-fanout",
+            "type": "function",
+            "function": {
+                "name": "agent_fanout",
+                "arguments": serde_json::to_string(&args).unwrap(),
+            }
+        })];
+        let mut edge_tool_round = Vec::new();
+
+        recover_missing_control_tool_results(
+            &mut host,
+            Some("run-parent"),
+            &tool_calls,
+            &mut edge_tool_round,
+        )
+        .await;
+
+        assert_eq!(edge_tool_round.len(), 1);
+        assert_eq!(edge_tool_round[0].args, args);
+        assert_eq!(host.recovered_control_requests.len(), 1);
+        let mut consumed = vec![false; edge_tool_round.len()];
+        let matched =
+            astra_turn_core::headless_tool_assembly::take_edge_output_for_tool_call_with_duration(
+                "agent_fanout",
+                &edge_tool_round[0].args,
+                &edge_tool_round,
+                &mut consumed,
+                &HashMap::new(),
+            );
+        assert_eq!(matched.output, recovered_output);
+        assert!(
+            !matched.output.contains("Error: headless edge protocol"),
+            "{matched:?}"
+        );
     }
 
     #[test]
