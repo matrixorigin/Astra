@@ -498,8 +498,6 @@ pub(crate) fn is_server_mutator_tool_name(name: &str) -> bool {
             | "mo_query"
             // session state
             | "adjust_config"
-            | "prioritize_tool"
-            | "deprioritize_tool"
             | "compress_context"
             | "task"
     )
@@ -564,7 +562,7 @@ fn server_session_state_mutator_in_round(tool_calls: &[Value]) -> bool {
     tool_calls.iter().any(|tool_call| {
         matches!(
             tool_call_name(tool_call),
-            Some("adjust_config" | "prioritize_tool" | "deprioritize_tool" | "compress_context")
+            Some("adjust_config" | "compress_context")
         ) || task_tool_call_is_session_state_mutator(tool_call)
     })
 }
@@ -1003,7 +1001,6 @@ async fn finalize_server_rollback_boundary(
                         restore_context: tool_session_state_rollback::SessionStateRestoreContext {
                             session_id: &executor.session_id,
                             observability_session: executor.observability_session.as_ref(),
-                            config: &executor.session_config.inner,
                             task_manager: &executor.task_manager(),
                         },
                     },
@@ -2916,8 +2913,6 @@ esac
         assert!(is_server_mutator_tool_name("mo_query"));
         // Session-state mutators
         assert!(is_server_mutator_tool_name("adjust_config"));
-        assert!(is_server_mutator_tool_name("prioritize_tool"));
-        assert!(is_server_mutator_tool_name("deprioritize_tool"));
         assert!(is_server_mutator_tool_name("compress_context"));
         assert!(is_server_mutator_tool_name("task"));
 

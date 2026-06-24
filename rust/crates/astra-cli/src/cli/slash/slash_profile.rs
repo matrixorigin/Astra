@@ -5,7 +5,7 @@
 //! - `/profile edit <key> <value>`: Edit a preference
 //! - `/profile scenario`: Show detected scenario
 //! - `/profile stats`: Show usage statistics
-//! - `/profile tools`: Show tool preferences
+//! - `/profile tools`: Show blocked tool policy
 //! - `/profile experiments`: Show enrolled experiments
 //! - `/profile reset`: Reset to defaults
 //! - `/profile help`: Show help
@@ -394,28 +394,15 @@ fn show_tools(ctx: &ProfileCommandContext<'_>) {
     let profile = ctx.profile_manager.get_profile(ctx.user_id);
     let prefs = &profile.preferences;
 
-    eprintln!("\n  {}", "🔧 Tool Preferences".magenta().bold());
+    eprintln!("\n  {}", "🔧 Tool Policy".magenta().bold());
     eprintln!("  {}", "─".repeat(50).dim());
 
-    if prefs.preferred_tools.is_empty() && prefs.blocked_tools.is_empty() {
-        eprintln!("  {}", "No tool preferences configured.".dim());
-        eprintln!(
-            "  {}",
-            "Preferred tools get boosted in the tool surface, blocked tools are never used.".dim()
-        );
+    if prefs.blocked_tools.is_empty() {
+        eprintln!("  {}", "No blocked tools configured.".dim());
     } else {
-        if !prefs.preferred_tools.is_empty() {
-            eprintln!("  {}", "Preferred (boosted):".bold());
-            for tool in &prefs.preferred_tools {
-                eprintln!("    {} {}", "▲".green(), tool.clone().magenta());
-            }
-        }
-
-        if !prefs.blocked_tools.is_empty() {
-            eprintln!("\n  {}", "Blocked (never used):".bold());
-            for tool in &prefs.blocked_tools {
-                eprintln!("    {} {}", theme::icon_err(), tool.clone().dim());
-            }
+        eprintln!("  {}", "Blocked (never used):".bold());
+        for tool in &prefs.blocked_tools {
+            eprintln!("    {} {}", theme::icon_err(), tool.clone().dim());
         }
     }
 
@@ -489,7 +476,7 @@ fn show_help() {
     );
     eprintln!(
         "    {}",
-        "/profile tools         Show tool preferences".magenta()
+        "/profile tools         Show blocked tool policy".magenta()
     );
     eprintln!(
         "    {}",

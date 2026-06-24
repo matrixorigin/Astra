@@ -536,42 +536,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         schema_tokens: 60,
     },
     ToolMeta {
-        name: "prioritize_tool",
-        description: "Prioritize a tool as preferred for this session",
-        triggers: &[
-            "prioritize_tool",
-            "prioritize",
-            "prefer tool",
-            "rank tool",
-            "工具优先",
-            "优先使用",
-        ],
-        always_load: false,
-        intents: &[IntentType::Introspect],
-        scope: Scope::Local,
-        requires: &[],
-        binding_validation: RuntimeBindingValidation::None,
-        schema_tokens: 25,
-    },
-    ToolMeta {
-        name: "deprioritize_tool",
-        description: "Soft-deprioritize a tool for this session",
-        triggers: &[
-            "deprioritize_tool",
-            "deprioritize",
-            "avoid tool",
-            "lower priority",
-            "不要优先",
-            "降低工具优先级",
-        ],
-        always_load: false,
-        intents: &[IntentType::Introspect],
-        scope: Scope::Local,
-        requires: &[],
-        binding_validation: RuntimeBindingValidation::None,
-        schema_tokens: 25,
-    },
-    ToolMeta {
         name: "compress_context",
         description: "Request manual context compression for this session",
         triggers: &[
@@ -1009,12 +973,7 @@ mod tests {
 
     #[test]
     fn catalog_includes_top_level_session_state_tools() {
-        for name in [
-            "prioritize_tool",
-            "deprioritize_tool",
-            "compress_context",
-            "rollback_session_state",
-        ] {
+        for name in ["compress_context", "rollback_session_state"] {
             let tool = TOOL_CATALOG
                 .iter()
                 .find(|tool| tool.name == name)

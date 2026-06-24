@@ -77,8 +77,6 @@ const SERVER_LOCAL_AVAILABLE_TOOLS: &[&str] = &[
     "multi_edit",
     "list_dir",
     "adjust_config",
-    "prioritize_tool",
-    "deprioritize_tool",
     "compress_context",
     "rollback_session_state",
     "task",

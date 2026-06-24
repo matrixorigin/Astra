@@ -72,9 +72,9 @@ pub(crate) async fn judge_turn_intent_with_llm(
 
 /// Structural fallback used when the LLM judge is unavailable, errors, or
 /// returns a malformed response. Without this, every judge failure collapses
-/// to `None` and downstream code loses *all* intent signal — scenario-based
-/// tool preferences, continuation routing, and adaptive profiles all degrade
-/// to defaults. This keeps the loop functional under judge outages.
+/// to `None` and downstream code loses *all* intent signal — scenario routing,
+/// continuation routing, and adaptive profiles all degrade to defaults. This
+/// keeps the loop functional under judge outages.
 ///
 /// First-principles: the fallback must never *fabricate* a scenario it cannot
 /// derive from structural evidence. It infers only what the tool history and
@@ -114,7 +114,7 @@ pub(crate) fn fallback_turn_intent(
     }
     // 4. If there is prior assistant context and we couldn't classify, prefer
     //    continuation over NewObjective — a wrong NewObjective resets budgets
-    //    and tool preferences mid-task, which is the more costly error.
+    //    and adaptive state mid-task, which is the more costly error.
     if has_prior_assistant_turn && intent.requested_scenario.is_none() {
         intent = intent.with_continuation_mode(TurnContinuationMode::ContinueCurrentObjective);
     }
@@ -272,7 +272,7 @@ mod tests {
     #[test]
     fn fallback_short_followup_after_assistant_continues() {
         // A bare "继续" / "yes" / "go" right after an assistant turn should not
-        // be treated as a new objective — that would wipe tool preferences.
+        // be treated as a new objective — that would wipe adaptive state.
         let intent = fallback_turn_intent("继续", &[], true);
         assert_eq!(
             intent.continuation_mode,

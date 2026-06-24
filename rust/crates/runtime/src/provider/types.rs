@@ -82,8 +82,6 @@ impl ToolCategory {
             | "exit_plan_mode"
             | "get_agent_info"
             | "introspect"
-            | "prioritize_tool"
-            | "deprioritize_tool"
             | "compress_context"
             | "memory"
             | "session"

@@ -65,7 +65,7 @@ where
 
 fn missing_action_result() -> astra_tools::ToolResult {
     astra_tools::ToolResult::error(
-        "Error: missing required parameter `action` for `session`. Use: config, sleep, history_page, history_search, history_around. Use dedicated tools: rollback_file_edits, rollback_session_state, prioritize_tool, deprioritize_tool, compress_context, ask_user, enter_plan_mode, exit_plan_mode."
+        "Error: missing required parameter `action` for `session`. Use: config, sleep, history_page, history_search, history_around. Use dedicated tools: rollback_file_edits, rollback_session_state, compress_context, ask_user, enter_plan_mode, exit_plan_mode."
             .to_string(),
     )
 }

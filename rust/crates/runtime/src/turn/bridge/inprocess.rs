@@ -555,15 +555,67 @@ fn preview_chars(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
 
+fn parse_exit_semantics_tag(tag: &str) -> Option<astra_tools::exit_semantics::ExitSemantics> {
+    serde_json::from_value::<astra_tools::exit_semantics::ExitSemantics>(Value::String(
+        tag.to_string(),
+    ))
+    .ok()
+}
+
 fn normalize_exit_semantics_tag(tag: &str) -> Option<String> {
-    let semantics = serde_json::from_value::<astra_tools::exit_semantics::ExitSemantics>(
-        Value::String(tag.to_string()),
-    )
-    .ok()?;
+    let semantics = parse_exit_semantics_tag(tag)?;
     serde_json::to_value(semantics)
         .ok()?
         .as_str()
         .map(ToString::to_string)
+}
+
+fn parse_result_class_tag(tag: &str) -> Option<astra_tools::exit_semantics::CommandResultClass> {
+    serde_json::from_value::<astra_tools::exit_semantics::CommandResultClass>(Value::String(
+        tag.to_string(),
+    ))
+    .ok()
+}
+
+fn normalize_result_class_tag(tag: &str) -> Option<String> {
+    let result_class = parse_result_class_tag(tag)?;
+    serde_json::to_value(result_class)
+        .ok()?
+        .as_str()
+        .map(ToString::to_string)
+}
+
+fn structured_tool_result_error(
+    exit_semantics: Option<astra_tools::exit_semantics::ExitSemantics>,
+    result_class: Option<astra_tools::exit_semantics::CommandResultClass>,
+) -> Option<bool> {
+    if exit_semantics.is_some_and(|semantics| semantics.is_tool_error())
+        || result_class.is_some_and(|class| class.is_tool_error())
+    {
+        return Some(true);
+    }
+    if exit_semantics.is_some() || result_class.is_some() {
+        return Some(false);
+    }
+    None
+}
+
+fn status_success(status: &str) -> bool {
+    matches!(
+        super::super::agentic_loop::tool_support::edge_tool_status_exit_code(status),
+        Some(0)
+    )
+}
+
+fn bridge_tool_result_ok(
+    status: &str,
+    exit_semantics: Option<astra_tools::exit_semantics::ExitSemantics>,
+    result_class: Option<astra_tools::exit_semantics::CommandResultClass>,
+    output_semantic_error: bool,
+) -> bool {
+    let transport_error = structured_tool_result_error(exit_semantics, result_class)
+        .unwrap_or_else(|| !status_success(status));
+    !transport_error && !output_semantic_error
 }
 
 #[cfg(test)]
@@ -650,10 +702,14 @@ fn build_bridge_tool_call_records(
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("ok");
-        let status_ok = matches!(
-            super::super::agentic_loop::tool_support::edge_tool_status_exit_code(status),
-            Some(0)
-        );
+        let exit_semantics_value = tool_result
+            .get("exit_semantics")
+            .and_then(Value::as_str)
+            .and_then(parse_exit_semantics_tag);
+        let result_class_value = tool_result
+            .get("result_class")
+            .and_then(Value::as_str)
+            .and_then(parse_result_class_tag);
         let output = tool_result.get("output").map(|output| match output {
             Value::String(s) => s.clone(),
             Value::Null => String::new(),
@@ -711,7 +767,12 @@ fn build_bridge_tool_call_records(
         let output_semantic_error = output
             .as_deref()
             .is_some_and(astra_turn_core::tool_result_semantics::is_tool_error);
-        let ok = status_ok && !output_semantic_error;
+        let ok = bridge_tool_result_ok(
+            status,
+            exit_semantics_value,
+            result_class_value,
+            output_semantic_error,
+        );
         let error = tool_result
             .get("error")
             .and_then(Value::as_str)
@@ -738,8 +799,6 @@ fn build_bridge_tool_call_records(
             ok,
             error.as_deref(),
         );
-        // Extract exit semantics from the tool_result (propagated
-        // from astra-tools shell_ops and server_tool_executor).
         let exit_semantics = tool_result
             .get("exit_semantics")
             .and_then(Value::as_str)
@@ -747,7 +806,7 @@ fn build_bridge_tool_call_records(
         let result_class = tool_result
             .get("result_class")
             .and_then(Value::as_str)
-            .map(ToString::to_string);
+            .and_then(normalize_result_class_tag);
         records.push(ToolCallRecord {
             name: tool_name,
             ok,
@@ -8016,6 +8075,72 @@ mod tests {
                 .is_some_and(|error| error.contains("unknown field `slot_id`")),
             "{records:?}"
         );
+    }
+
+    #[test]
+    fn build_bridge_records_structured_informational_exit_as_ok() {
+        let tool_calls = vec![json!({
+            "id": "call-1",
+            "function": {"name": "bash", "arguments": "{\"command\":\"grep needle haystack.txt\"}"}
+        })];
+        let tool_results = vec![json!({
+            "request_id": "call-1",
+            "name": "bash",
+            "status": "failed",
+            "output": "No matches found",
+            "duration_ms": 50,
+            "exit_semantics": "informational_failure",
+            "result_class": "domain_negative"
+        })];
+        let records = build_bridge_tool_call_records(
+            &tool_calls,
+            &tool_results,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(records.len(), 1);
+        assert!(records[0].ok, "{records:?}");
+        assert!(records[0].error.is_none(), "{records:?}");
+        assert_eq!(
+            records[0].exit_semantics.as_deref(),
+            Some("informational_failure")
+        );
+        assert_eq!(records[0].result_class.as_deref(), Some("domain_negative"));
+    }
+
+    #[test]
+    fn build_bridge_records_structured_execution_error_overrides_success_status() {
+        let tool_calls = vec![json!({
+            "id": "call-1",
+            "function": {"name": "bash", "arguments": "{\"command\":\"exit 7\"}"}
+        })];
+        let tool_results = vec![json!({
+            "request_id": "call-1",
+            "name": "bash",
+            "status": "completed",
+            "output": "Error: command failed (exit code 7)",
+            "duration_ms": 50,
+            "exit_semantics": "execution_error",
+            "result_class": "execution_error"
+        })];
+        let records = build_bridge_tool_call_records(
+            &tool_calls,
+            &tool_results,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].ok, "{records:?}");
+        assert!(
+            records[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("exit code 7")),
+            "{records:?}"
+        );
+        assert_eq!(
+            records[0].exit_semantics.as_deref(),
+            Some("execution_error")
+        );
+        assert_eq!(records[0].result_class.as_deref(), Some("execution_error"));
     }
 
     #[test]

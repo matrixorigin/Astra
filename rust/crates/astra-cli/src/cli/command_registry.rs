@@ -286,7 +286,7 @@ const PROFILE_SUBCOMMANDS: &[(&str, &str)] = &[
     ("edit", "Edit a preference"),
     ("scenario", "Show the detected working scenario"),
     ("stats", "Show profile usage stats"),
-    ("tools", "Show tool preferences"),
+    ("tools", "Show blocked tool policy"),
     ("experiments", "Show enrolled experiments"),
     ("reset", "Reset profile preferences"),
     ("help", "Show profile help"),

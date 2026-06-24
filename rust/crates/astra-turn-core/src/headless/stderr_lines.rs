@@ -32,8 +32,6 @@ fn friendly_tool_name(tool_name: &str) -> &str {
         "context_analysis" => "Analyzing context",
         "run_chain" => "Running chain",
         "adjust_config" => "Adjusting config",
-        "prioritize_tool" => "Prioritizing tool",
-        "deprioritize_tool" => "Deprioritizing tool",
         "compress_context" => "Compressing context",
         "mo_query" => "MatrixOne query",
         "memory" => "Memory",

@@ -51,10 +51,7 @@ use crate::server::tool_plan_gate::{
     PlanModeSnapshot, is_plan_mode_blocked_tool, plan_mode_authoring_active,
 };
 use crate::server::tool_route_runtime::{ToolRouteRuntimeContext, execute_tool_route_with_events};
-use crate::server::tool_session_config::{
-    ToolPreferenceAction, execute_adjust_config, execute_compress_context,
-    execute_tool_preference_update,
-};
+use crate::server::tool_session_config::{execute_adjust_config, execute_compress_context};
 use crate::server::tool_session_state_rollback::{
     self, RollbackSessionStateContext, SessionStateRestoreContext, SessionStateRollbackAction,
     SessionStateRollbackJournal,
@@ -93,36 +90,24 @@ fn resolved_server_tool_names(
         .collect()
 }
 
-/// Per-turn mutation accounting and self-modification preferences.
-/// Held inside a single [`Mutex`] so tool-preference updates and
-/// adjust_config mutation counting share the same lock — avoiding
-/// the lock-ordering hazard of three independent locks.
+/// Per-turn mutation accounting for session config changes.
+/// Held inside a [`Mutex`] so config mutation accounting stays atomic.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SessionConfigInner {
     /// Per-turn mutation accounting for adjust_config governor.
     pub(crate) mutation_counter: (u32, u32),
-    /// Self-modification prioritized tool preferences.
-    pub(crate) prioritized_tools: Vec<String>,
-    /// Self-modification deprioritized tool preferences.
-    pub(crate) deprioritized_tools: Vec<String>,
 }
 
 /// Self-modification session configuration state.
-///
-/// Groups prioritized/deprioritized tool preferences and mutation counter
-/// that were previously scattered across individual fields on
-/// [`ServerToolExecutor`].
 pub(crate) struct SessionConfigState {
     pub(crate) inner: Mutex<SessionConfigInner>,
 }
 
 impl SessionConfigState {
-    fn new(prioritized_tools: Vec<String>, deprioritized_tools: Vec<String>) -> Self {
+    fn new() -> Self {
         Self {
             inner: Mutex::new(SessionConfigInner {
                 mutation_counter: (0, 0),
-                prioritized_tools,
-                deprioritized_tools,
             }),
         }
     }
@@ -203,7 +188,7 @@ pub struct ServerToolExecutor {
     /// Optional observability session for self-mod and rollback-backed session state.
     pub(crate) observability_session:
         Option<Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>>,
-    /// Self-modification session config state (preferences + mutation counter).
+    /// Self-modification session config mutation state.
     pub(crate) session_config: SessionConfigState,
 
     // ── Plan mode ─────────────────────────────────────────────────────────────
@@ -280,11 +265,6 @@ impl ServerToolExecutor {
 
         let memoria_client =
             astra_tools::memoria::MemoriaClient::new(cloud_base.clone(), cloud_token.clone());
-        let (prioritized_tools, deprioritized_tools) =
-            astra_services::session_workspace::read_workspace(&session_id)
-                .map(|workspace| (workspace.prioritized_tools, workspace.deprioritized_tools))
-                .unwrap_or_else(|_| (Vec::new(), Vec::new()));
-
         let default_executor = DefaultToolExecutor::for_workspace(
             &workspace_root,
             user_id.clone(),
@@ -323,7 +303,7 @@ impl ServerToolExecutor {
             tool_execution_service: ToolExecutionService::builder().build(),
             observability_session: None,
             introspect_snapshot: Arc::new(std::sync::RwLock::new(None)),
-            session_config: SessionConfigState::new(prioritized_tools, deprioritized_tools),
+            session_config: SessionConfigState::new(),
             cancel_token: None,
             workspace_artifact_store: None,
             context_manifest_pool: None,
@@ -397,34 +377,6 @@ impl ServerToolExecutor {
             &self.session_config.inner,
             args,
             || self.publish_current_workspace("adjust_config"),
-            &self.session_state_journal,
-            self.journal_turn_index.load(Ordering::Relaxed),
-        );
-        outcome.output
-    }
-
-    pub(super) fn prioritize_tool(&self, args: &Value) -> String {
-        let outcome = crate::server::tool_session_config::execute_tool_preference_update(
-            &self.session_id,
-            &self.session_config.inner,
-            args,
-            crate::server::tool_session_config::ToolPreferenceAction::Prioritize,
-            |tool| self.supports_server_tool_name(tool),
-            || self.publish_current_workspace("prioritize_tool"),
-            &self.session_state_journal,
-            self.journal_turn_index.load(Ordering::Relaxed),
-        );
-        outcome.output
-    }
-
-    pub(super) fn deprioritize_tool(&self, args: &Value) -> String {
-        let outcome = crate::server::tool_session_config::execute_tool_preference_update(
-            &self.session_id,
-            &self.session_config.inner,
-            args,
-            crate::server::tool_session_config::ToolPreferenceAction::Deprioritize,
-            |tool| self.supports_server_tool_name(tool),
-            || self.publish_current_workspace("deprioritize_tool"),
             &self.session_state_journal,
             self.journal_turn_index.load(Ordering::Relaxed),
         );
@@ -1049,8 +1001,8 @@ impl ServerToolExecutor {
     /// in-memory snapshot against a MatrixOne store.
     pub fn with_task_store(mut self, store: Arc<dyn TaskStore>) -> Self {
         // Drop any TaskState rollback entries that referenced the old store.
-        // Other action kinds (ToolPreferences, ConfigOverride, Compression)
-        // are store-independent and survive the swap.
+        // Other action kinds (ConfigOverride, Compression) are store-independent
+        // and survive the swap.
         let dropped = tool_session_state_rollback::drop_task_state_entries(
             self.session_state_journal.as_ref(),
         );
@@ -1779,39 +1731,18 @@ mod tests {
     #[tokio::test]
     async fn session_state_tools_execute_from_tool_engine_registry() {
         let (exec, _dir) = test_executor();
-        for name in [
-            "prioritize_tool",
-            "deprioritize_tool",
-            "compress_context",
-            "rollback_session_state",
-        ] {
+        for name in ["compress_context", "rollback_session_state"] {
             assert!(
                 exec.tool_engine.contains(name),
                 "{name} should be registered in ToolEngine for server-local execution"
             );
         }
-
-        let prioritize = exec
-            .execute_with_metadata("prioritize_tool", &json!({}))
-            .await;
-        assert!(prioritize.is_error, "{prioritize:?}");
-        assert!(
-            prioritize
-                .output
-                .contains("Missing required parameter: tool"),
-            "{prioritize:?}"
-        );
-
-        let deprioritize = exec
-            .execute_with_metadata("deprioritize_tool", &json!({}))
-            .await;
-        assert!(deprioritize.is_error, "{deprioritize:?}");
-        assert!(
-            deprioritize
-                .output
-                .contains("Missing required parameter: tool"),
-            "{deprioritize:?}"
-        );
+        for retired in ["prioritize", "deprioritize"].map(|prefix| format!("{prefix}_tool")) {
+            assert!(
+                !exec.tool_engine.contains(&retired),
+                "{retired} must not be registered in ToolEngine"
+            );
+        }
 
         let compress = exec
             .execute_with_metadata("compress_context", &json!({}))
@@ -4014,14 +3945,6 @@ esac
         assert!(
             source.contains("publish_current_workspace(\"adjust_config\")"),
             "adjust_config should publish remote workspace artifacts"
-        );
-        assert!(
-            source.contains("publish_current_workspace(\"prioritize_tool\")"),
-            "prioritize_tool should publish remote workspace artifacts"
-        );
-        assert!(
-            source.contains("publish_current_workspace(\"deprioritize_tool\")"),
-            "deprioritize_tool should publish remote workspace artifacts"
         );
         let handlers = include_str!("server_tool_executor/tool_handlers.rs");
         assert!(
@@ -7978,12 +7901,8 @@ esac
     }
 
     #[test]
-    fn with_task_store_preserves_tool_preferences_entries() {
-        // ToolPreferences is a store-independent action and must survive
-        // a task-store swap. (Compression / ConfigOverride carry an
-        // ObservabilitySession snapshot that's not trivially constructible
-        // in a unit test, so we exercise the retain predicate via the
-        // simpler ToolPreferences variant.)
+    fn with_task_store_preserves_compression_entries() {
+        // Compression is store-independent and must survive a task-store swap.
         let (exec, _dir) = test_executor();
 
         tool_session_state_rollback::record(
@@ -8002,10 +7921,21 @@ esac
         tool_session_state_rollback::record(
             exec.session_state_journal.as_ref(),
             exec.journal_turn_index.load(Ordering::Relaxed),
-            "prefs-seed".to_string(),
-            SessionStateRollbackAction::ToolPreferences {
-                previous_prioritized_tools: vec!["bash".into()],
-                previous_deprioritized_tools: vec![],
+            "compression-seed".to_string(),
+            SessionStateRollbackAction::Compression {
+                turn: 1,
+                snapshot: crate::observability::ObservabilitySessionRollbackSnapshot {
+                    config: astra_config::runtime_config::RuntimeConfig::default(),
+                    original_query: None,
+                    recent_queries: vec![],
+                    compressed_turns: vec![],
+                    user_corrections: vec![],
+                    context_traces: vec![],
+                    drift_min_severity_threshold: 0.5,
+                    drift_analysis_window: 5,
+                    last_reported_drift_turn: None,
+                    last_query_at: None,
+                },
             },
         );
         assert_eq!(
@@ -8020,11 +7950,11 @@ esac
         assert_eq!(
             surviving.len(),
             1,
-            "exactly the ToolPreferences entry should survive"
+            "exactly the Compression entry should survive"
         );
         assert!(matches!(
             surviving[0].action,
-            SessionStateRollbackAction::ToolPreferences { .. }
+            SessionStateRollbackAction::Compression { .. }
         ));
     }
 

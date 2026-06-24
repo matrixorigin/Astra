@@ -644,7 +644,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "session",
-                "description": "Session lifecycle and history. Actions: config(path+value), sleep, history_page, history_search, history_around. Use dedicated tools for file rollback (`rollback_file_edits`), session-state rollback (`rollback_session_state`), tool preferences (`prioritize_tool`/`deprioritize_tool`), context compression (`compress_context`), plan mode (`enter_plan_mode`/`exit_plan_mode`), and user questions (`ask_user`).",
+                "description": "Session lifecycle and history. Actions: config(path+value), sleep, history_page, history_search, history_around. Use dedicated tools for file rollback (`rollback_file_edits`), session-state rollback (`rollback_session_state`), context compression (`compress_context`), plan mode (`enter_plan_mode`/`exit_plan_mode`), and user questions (`ask_user`).",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -677,36 +677,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
-                "name": "prioritize_tool",
-                "description": "Pin a tool as preferred for this session when it is clearly more useful than alternatives. This updates server-side session preferences and can be rolled back with rollback_session_state.",
-                "parameters": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "tool": {"type": "string", "description": "Tool name to prioritize."}
-                    },
-                    "required": ["tool"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "deprioritize_tool",
-                "description": "Soft-deprioritize a tool for this session when it is unreliable, irrelevant, or repeatedly less suitable than another available tool. This updates server-side session preferences and can be rolled back with rollback_session_state.",
-                "parameters": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "tool": {"type": "string", "description": "Tool name to deprioritize."}
-                    },
-                    "required": ["tool"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
                 "name": "compress_context",
                 "description": "Record a manual context-compression request for the current turn. Use when the session is carrying stale or bulky context and future turns should prefer a compacted history.",
                 "parameters": {
@@ -722,7 +692,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "rollback_session_state",
-                "description": "List or restore server-side session-state mutations such as tool preference changes, config overrides, task-state snapshots, and manual context-compression markers. This is for session state, not file contents; use rollback_file_edits for file rollback.",
+                "description": "List or restore server-side session-state mutations such as config overrides, task-state snapshots, and manual context-compression markers. This is for session state, not file contents; use rollback_file_edits for file rollback.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -1826,26 +1796,15 @@ mod tests {
     #[test]
     fn self_mod_session_state_top_level_schemas_exist() {
         let schemas = all_tool_schemas_with_env(|_| None);
-        for name in [
-            "prioritize_tool",
-            "deprioritize_tool",
-            "compress_context",
-            "rollback_session_state",
-        ] {
+        for name in ["compress_context", "rollback_session_state"] {
             find_schema(&schemas, name)
                 .expect("top-level schema must exist for ToolEngine routing");
         }
 
-        let prioritize = find_schema(&schemas, "prioritize_tool").expect("prioritize_tool schema");
-        let deprioritize =
-            find_schema(&schemas, "deprioritize_tool").expect("deprioritize_tool schema");
-        for schema in [prioritize, deprioritize] {
-            let required = schema["function"]["parameters"]["required"]
-                .as_array()
-                .expect("tool preference schemas should declare required fields");
+        for retired in ["prioritize", "deprioritize"].map(|prefix| format!("{prefix}_tool")) {
             assert!(
-                required.iter().any(|value| value.as_str() == Some("tool")),
-                "tool preference schemas must require tool: {schema:?}"
+                find_schema(&schemas, &retired).is_none(),
+                "{retired} must not remain in the tool schema surface"
             );
         }
     }

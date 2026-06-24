@@ -814,8 +814,6 @@ mod tests {
             ("rollback_file_edits", Some(r#"{"scope":"current_turn"}"#)),
             ("rollback_session_state", Some(r#"{"scope":"last_turn"}"#)),
             ("adjust_config", Some(r#"{"key":"model","value":"fast"}"#)),
-            ("prioritize_tool", Some(r#"{"tool":"bash"}"#)),
-            ("deprioritize_tool", Some(r#"{"tool":"grep"}"#)),
             ("compress_context", Some(r#"{"target_tokens":1000}"#)),
             ("task", Some(r#"{"action":"stop","task_id":"bg-shell-1"}"#)),
         ] {

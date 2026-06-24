@@ -4,15 +4,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use astra_tools::task_mgmt::{TaskManager, TaskManagerSnapshot};
 use serde_json::Value;
 
-use crate::server::server_tool_executor::SessionConfigInner;
-use crate::server::tool_session_config::{persist_config_override, persist_tool_preferences};
+use crate::server::tool_session_config::persist_config_override;
 
 #[derive(Debug, Clone)]
 pub(crate) enum SessionStateRollbackAction {
-    ToolPreferences {
-        previous_prioritized_tools: Vec<String>,
-        previous_deprioritized_tools: Vec<String>,
-    },
     ConfigOverride {
         path: String,
         old_value: Value,
@@ -40,7 +35,6 @@ pub(crate) struct SessionStateRestoreContext<'a> {
     pub(crate) session_id: &'a str,
     pub(crate) observability_session:
         Option<&'a Arc<RwLock<crate::observability::ObservabilitySession>>>,
-    pub(crate) config: &'a Mutex<SessionConfigInner>,
     pub(crate) task_manager: &'a TaskManager,
 }
 
@@ -213,7 +207,6 @@ pub(crate) fn drop_task_state_entries(journal: &Mutex<SessionStateRollbackJourna
 
 pub(crate) fn action_kind(action: &SessionStateRollbackAction) -> &'static str {
     match action {
-        SessionStateRollbackAction::ToolPreferences { .. } => "tool_preferences",
         SessionStateRollbackAction::ConfigOverride { .. } => "config_override",
         SessionStateRollbackAction::Compression { .. } => "compression",
         SessionStateRollbackAction::TaskState { .. } => "task_state",
@@ -270,8 +263,7 @@ pub(crate) fn rollback_session_state_entry_json(entry: &SessionStateRollbackEntr
                 Value::Number(serde_json::Number::from(*turn)),
             );
         }
-        SessionStateRollbackAction::ToolPreferences { .. }
-        | SessionStateRollbackAction::TaskState { .. } => {}
+        SessionStateRollbackAction::TaskState { .. } => {}
     }
     Value::Object(value)
 }
@@ -283,32 +275,6 @@ pub(crate) async fn restore_entry(
     const ROLLBACK_STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
     match &entry.action {
-        SessionStateRollbackAction::ToolPreferences {
-            previous_prioritized_tools,
-            previous_deprioritized_tools,
-        } => {
-            let mut inner = context
-                .config
-                .lock()
-                .map_err(|_| "Failed to access session config".to_string())?;
-            let current_prioritized = inner.prioritized_tools.clone();
-            let current_deprioritized = inner.deprioritized_tools.clone();
-            inner.prioritized_tools = previous_prioritized_tools.clone();
-            inner.deprioritized_tools = previous_deprioritized_tools.clone();
-            if let Err(error) = persist_tool_preferences(
-                context.session_id,
-                &inner.prioritized_tools,
-                &inner.deprioritized_tools,
-                "tool_session_state_rollback:restore_entry",
-            ) {
-                inner.prioritized_tools = current_prioritized;
-                inner.deprioritized_tools = current_deprioritized;
-                return Err(format!(
-                    "failed to persist restored tool preferences: {error}"
-                ));
-            }
-            Ok(())
-        }
         SessionStateRollbackAction::ConfigOverride {
             path,
             old_value,
@@ -550,9 +516,9 @@ mod tests {
         journal.record(
             3,
             "first".to_string(),
-            SessionStateRollbackAction::ToolPreferences {
-                previous_prioritized_tools: vec!["bash".to_string()],
-                previous_deprioritized_tools: vec![],
+            SessionStateRollbackAction::Compression {
+                turn: 3,
+                snapshot: observability_snapshot(),
             },
         );
         journal.record(
@@ -594,10 +560,10 @@ mod tests {
         record(
             &journal,
             5,
-            "prefs".to_string(),
-            SessionStateRollbackAction::ToolPreferences {
-                previous_prioritized_tools: vec!["bash".to_string()],
-                previous_deprioritized_tools: vec![],
+            "compression".to_string(),
+            SessionStateRollbackAction::Compression {
+                turn: 5,
+                snapshot: observability_snapshot(),
             },
         );
 
@@ -623,10 +589,10 @@ mod tests {
         );
         journal.record(
             1,
-            "prefs".to_string(),
-            SessionStateRollbackAction::ToolPreferences {
-                previous_prioritized_tools: vec!["bash".to_string()],
-                previous_deprioritized_tools: vec![],
+            "compression".to_string(),
+            SessionStateRollbackAction::Compression {
+                turn: 1,
+                snapshot: observability_snapshot(),
             },
         );
 
@@ -635,7 +601,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert!(matches!(
             entries[0].action,
-            SessionStateRollbackAction::ToolPreferences { .. }
+            SessionStateRollbackAction::Compression { .. }
         ));
     }
 
@@ -645,17 +611,17 @@ mod tests {
             sequence: 0,
             turn_index: 9,
             timestamp: UNIX_EPOCH - Duration::from_millis(1),
-            label: "prefs".to_string(),
-            action: SessionStateRollbackAction::ToolPreferences {
-                previous_prioritized_tools: vec![],
-                previous_deprioritized_tools: vec![],
+            label: "compression".to_string(),
+            action: SessionStateRollbackAction::Compression {
+                turn: 9,
+                snapshot: observability_snapshot(),
             },
         };
 
         let value = rollback_session_state_entry_json(&entry);
 
-        assert_eq!(value["label"], "prefs");
-        assert_eq!(value["kind"], "tool_preferences");
+        assert_eq!(value["label"], "compression");
+        assert_eq!(value["kind"], "compression");
         assert_eq!(value["turn_index"], 9);
         assert!(value.get("timestamp_ms").is_none());
     }
@@ -665,10 +631,10 @@ mod tests {
         let mut journal = SessionStateRollbackJournal::default();
         journal.record(
             1,
-            "prefs".to_string(),
-            SessionStateRollbackAction::ToolPreferences {
-                previous_prioritized_tools: vec![],
-                previous_deprioritized_tools: vec![],
+            "compression".to_string(),
+            SessionStateRollbackAction::Compression {
+                turn: 1,
+                snapshot: observability_snapshot(),
             },
         );
 
@@ -691,12 +657,10 @@ mod tests {
             },
         };
         let task_manager = TaskManager::in_memory();
-        let config = Mutex::new(SessionConfigInner::default());
 
         let context = SessionStateRestoreContext {
             session_id: "session-1",
             observability_session: None,
-            config: &config,
             task_manager: &task_manager,
         };
 
@@ -710,7 +674,6 @@ mod tests {
     #[tokio::test]
     async fn execute_rollback_session_state_requires_turn_index_for_turn_scope() {
         let journal = Mutex::new(SessionStateRollbackJournal::default());
-        let config = Mutex::new(SessionConfigInner::default());
         let task_manager = TaskManager::in_memory();
 
         let output = execute_rollback_session_state(
@@ -720,7 +683,6 @@ mod tests {
                 restore_context: SessionStateRestoreContext {
                     session_id: "session-1",
                     observability_session: None,
-                    config: &config,
                     task_manager: &task_manager,
                 },
             },
@@ -741,7 +703,6 @@ mod tests {
     async fn execute_rollback_session_state_does_not_publish_when_plan_is_empty() {
         let journal = Mutex::new(SessionStateRollbackJournal::default());
         let task_manager = TaskManager::in_memory();
-        let config = Mutex::new(SessionConfigInner::default());
         let publish_calls = std::sync::atomic::AtomicUsize::new(0);
 
         let output = execute_rollback_session_state(
@@ -751,7 +712,6 @@ mod tests {
                 restore_context: SessionStateRestoreContext {
                     session_id: "session-1",
                     observability_session: None,
-                    config: &config,
                     task_manager: &task_manager,
                 },
             },
@@ -785,7 +745,6 @@ mod tests {
             },
         );
         let task_manager = TaskManager::in_memory();
-        let config = Mutex::new(SessionConfigInner::default());
 
         let output = execute_rollback_session_state(
             RollbackSessionStateContext {
@@ -794,7 +753,6 @@ mod tests {
                 restore_context: SessionStateRestoreContext {
                     session_id: "session-1",
                     observability_session: None,
-                    config: &config,
                     task_manager: &task_manager,
                 },
             },

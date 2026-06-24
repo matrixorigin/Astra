@@ -3,7 +3,7 @@
 //! Provides per-user preferences, learned patterns, and scenario detection.
 //!
 //! Key features:
-//! - User preferences (verbosity, tools, language style)
+//! - User preferences (verbosity, language style, explicit tool blocks)
 //! - Scenario detection (code review, debugging, exploration, planning)
 //! - Config overrides per user
 //! - A/B experiment enrollment
@@ -96,9 +96,6 @@ pub struct UserPreferences {
     /// Output verbosity level.
     pub verbosity: Verbosity,
 
-    /// Preferred tools (boost in tool-surface assembly).
-    pub preferred_tools: Vec<String>,
-
     /// Blocked tools (never select).
     pub blocked_tools: Vec<String>,
 
@@ -121,7 +118,6 @@ impl Default for UserPreferences {
     fn default() -> Self {
         Self {
             verbosity: Verbosity::Normal,
-            preferred_tools: Vec::new(),
             blocked_tools: Vec::new(),
             language_style: LanguageStyle::default(),
             response_length: ResponseLength::Medium,
@@ -137,13 +133,6 @@ impl UserPreferences {
         for (key, value) in &self.config_overrides {
             apply_preference_override(config, key, value);
         }
-    }
-
-    /// Check if a tool is preferred.
-    pub fn is_preferred_tool(&self, tool_name: &str) -> bool {
-        self.preferred_tools
-            .iter()
-            .any(|t| t == tool_name || tool_name.starts_with(t))
     }
 
     /// Check if a tool is blocked.
@@ -1087,16 +1076,11 @@ mod tests {
     }
 
     #[test]
-    fn test_preference_tool_check() {
+    fn test_blocked_tool_check() {
         let prefs = UserPreferences {
-            preferred_tools: vec!["view".to_string(), "grep".to_string()],
             blocked_tools: vec!["bash".to_string()],
             ..UserPreferences::default()
         };
-
-        assert!(prefs.is_preferred_tool("view"));
-        assert!(prefs.is_preferred_tool("grep"));
-        assert!(!prefs.is_preferred_tool("edit"));
 
         assert!(prefs.is_blocked_tool("bash"));
         assert!(!prefs.is_blocked_tool("view"));

@@ -82,8 +82,6 @@ pub(super) fn server_tool_engine() -> ToolEngine<ServerToolExecutor> {
     register_handler_or_log!(engine, "enter_plan_mode", EnterPlanModeToolHandler);
     register_handler_or_log!(engine, "exit_plan_mode", ExitPlanModeToolHandler);
     register_handler_or_log!(engine, "introspect", IntrospectToolHandler);
-    register_handler_or_log!(engine, "prioritize_tool", PrioritizeToolHandler);
-    register_handler_or_log!(engine, "deprioritize_tool", DeprioritizeToolHandler);
     register_handler_or_log!(engine, "compress_context", CompressContextToolHandler);
     register_handler_or_log!(
         engine,
@@ -542,36 +540,6 @@ impl ToolHandler<ServerToolExecutor> for BashToolHandler {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct PrioritizeToolHandler;
-
-#[async_trait]
-impl ToolHandler<ServerToolExecutor> for PrioritizeToolHandler {
-    async fn execute(
-        &self,
-        context: &ServerToolExecutor,
-        args: &Value,
-        _cancel_token: Option<&CancellationToken>,
-    ) -> astra_tools::ToolResult {
-        tool_result_from_output(context.prioritize_tool(args))
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct DeprioritizeToolHandler;
-
-#[async_trait]
-impl ToolHandler<ServerToolExecutor> for DeprioritizeToolHandler {
-    async fn execute(
-        &self,
-        context: &ServerToolExecutor,
-        args: &Value,
-        _cancel_token: Option<&CancellationToken>,
-    ) -> astra_tools::ToolResult {
-        tool_result_from_output(context.deprioritize_tool(args))
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
 struct CompressContextToolHandler;
 
 #[async_trait]
@@ -611,7 +579,6 @@ impl ToolHandler<ServerToolExecutor> for RollbackSessionStateToolHandler {
                     restore_context: SessionStateRestoreContext {
                         session_id: &context.session_id,
                         observability_session: context.observability_session.as_ref(),
-                        config: &context.session_config.inner,
                         task_manager: &context.task_manager(),
                     },
                 },

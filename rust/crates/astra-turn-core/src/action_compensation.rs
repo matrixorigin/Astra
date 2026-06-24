@@ -409,17 +409,6 @@ fn adjust_config_compensation_summary(path: Option<&str>) -> String {
     )
 }
 
-fn tool_priority_compensation_summary(tool: Option<&str>) -> String {
-    let target = tool
-        .filter(|tool| !tool.is_empty())
-        .map(|tool| format!("tool `{tool}`"))
-        .unwrap_or_else(|| "the affected tool".to_string());
-    format!(
-        "prefer `rollback_session_state` with scope=`current_turn` to restore {}'s prior preference state; the `previous_prioritized_tools` and `previous_deprioritized_tools` fields remain the manual fallback",
-        target
-    )
-}
-
 fn compress_context_compensation_summary() -> &'static str {
     "prefer `rollback_session_state` with scope=`current_turn` to restore session-local compression state; manual compression journal markers remain append-only if you inspect the persisted journal later"
 }
@@ -620,10 +609,6 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
         "adjust_config" => session_state_action_profile(
             ActionCategory::Write,
             adjust_config_compensation_summary(string_arg(&normalized_args, "path")),
-        ),
-        "prioritize_tool" | "deprioritize_tool" => session_state_action_profile(
-            ActionCategory::Write,
-            tool_priority_compensation_summary(string_arg(&normalized_args, "tool")),
         ),
         "compress_context" => session_state_action_profile(
             ActionCategory::Write,
@@ -969,22 +954,6 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("rollback_session_state")
-        );
-
-        let prioritize = tool_action_profile("prioritize_tool", &json!({"tool": "bash"}));
-        assert!(prioritize.bounded);
-        assert_eq!(prioritize.category, ActionCategory::Write);
-        assert!(prioritize.reversible);
-        assert_eq!(
-            prioritize.compensation_kind,
-            Some(CompensationKind::RestoreSessionState)
-        );
-        assert!(
-            prioritize
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("prior preference state")
         );
 
         let compress = tool_action_profile("compress_context", &json!({"turns": 4}));

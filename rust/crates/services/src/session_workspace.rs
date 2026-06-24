@@ -353,12 +353,6 @@ pub struct WorkspaceMetadata {
     /// Skills discovered during this session.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discovered_skills: Vec<String>,
-    /// Tools manually prioritized by self-modification actions for this session.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub prioritized_tools: Vec<String>,
-    /// Tools manually deprioritized by self-modification actions for this session.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub deprioritized_tools: Vec<String>,
 
     // ─── Adaptive engine state (for resume without oscillation) ───
     /// Last turn where a scenario change occurred (anti-flap cooldown).
@@ -489,8 +483,6 @@ impl WorkspaceMetadata {
             background_local_agent_tasks: Vec::new(),
             last_persistence_error: None,
             discovered_skills: Vec::new(),
-            prioritized_tools: Vec::new(),
-            deprioritized_tools: Vec::new(),
             last_scenario_change_turn: None,
             last_token_budget_direction: 0,
             last_token_budget_change_turn: None,
@@ -541,8 +533,6 @@ impl WorkspaceMetadata {
             background_local_agent_tasks: Vec::new(),
             last_persistence_error: None,
             discovered_skills: Vec::new(),
-            prioritized_tools: Vec::new(),
-            deprioritized_tools: Vec::new(),
             last_scenario_change_turn: None,
             last_token_budget_direction: 0,
             last_token_budget_change_turn: None,
@@ -1049,8 +1039,6 @@ mod tests {
         ws.record_turn(100, 50, 25, 4);
         ws.record_checkpoint();
         ws.mark_completed(Some("Done"));
-        ws.prioritized_tools = vec!["bash".into()];
-        ws.deprioritized_tools = vec!["web_fetch".into()];
 
         let yaml = serde_yaml_ng::to_string(&ws).unwrap();
         let parsed: WorkspaceMetadata = serde_yaml_ng::from_str(&yaml).unwrap();
@@ -1062,8 +1050,9 @@ mod tests {
         assert_eq!(parsed.summary, Some("Done".to_string()));
         assert_eq!(parsed.total_cache_read_tokens, 25);
         assert_eq!(parsed.total_cache_creation_tokens, 4);
-        assert_eq!(parsed.prioritized_tools, vec!["bash".to_string()]);
-        assert_eq!(parsed.deprioritized_tools, vec!["web_fetch".to_string()]);
+        for removed in ["prioritized", "deprioritized"].map(|prefix| format!("{prefix}_tools")) {
+            assert!(!yaml.contains(&removed));
+        }
     }
 
     #[test]
@@ -1535,8 +1524,6 @@ mod tests {
         assert_eq!(ws.active_experiment_id, None);
         assert_eq!(ws.active_variant, None);
         assert_eq!(ws.tuned_config_json, None);
-        assert!(ws.prioritized_tools.is_empty());
-        assert!(ws.deprioritized_tools.is_empty());
     }
 
     #[test]
@@ -1560,14 +1547,9 @@ mod tests {
             !yaml.contains("tuned_config_json"),
             "should omit None fields"
         );
-        assert!(
-            !yaml.contains("prioritized_tools"),
-            "should omit empty vectors"
-        );
-        assert!(
-            !yaml.contains("deprioritized_tools"),
-            "should omit empty vectors"
-        );
+        for removed in ["prioritized", "deprioritized"].map(|prefix| format!("{prefix}_tools")) {
+            assert!(!yaml.contains(&removed), "removed workspace field leaked");
+        }
     }
 
     #[test]

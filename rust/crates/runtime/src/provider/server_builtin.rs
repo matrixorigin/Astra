@@ -58,9 +58,6 @@ pub const SERVER_BUILTIN_TOOL_NAMES: &[&str] = &[
     "get_agent_info",
     "symbols",
     "introspect",
-    // Tool preference
-    "prioritize_tool",
-    "deprioritize_tool",
     // Context management
     "compress_context",
     // Artifact publishing

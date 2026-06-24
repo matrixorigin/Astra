@@ -515,47 +515,6 @@ pub(crate) fn persist_config_override(
     serde_json::to_value(&preview).map_err(|e| e.to_string())
 }
 
-pub(crate) fn persist_tool_preferences(
-    session_id: &str,
-    prioritized_tools: &[String],
-    deprioritized_tools: &[String],
-) -> Result<(), String> {
-    let mut ws = session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
-    let mut prioritized = prioritized_tools.to_vec();
-    prioritized.sort();
-    prioritized.dedup();
-    let mut deprioritized = deprioritized_tools.to_vec();
-    deprioritized.sort();
-    deprioritized.dedup();
-
-    let old_prioritized = ws.prioritized_tools.clone();
-    let old_deprioritized = ws.deprioritized_tools.clone();
-    ws.prioritized_tools = prioritized.clone();
-    ws.deprioritized_tools = deprioritized.clone();
-    ws.updated_at = Utc::now().to_rfc3339();
-    session_workspace::write_workspace(&ws).map_err(|e| e.to_string())?;
-
-    if old_prioritized != prioritized {
-        append_config_change_event(
-            session_id,
-            ws.turn_count,
-            "prioritized_tools",
-            &serde_json::json!(prioritized),
-            Some(serde_json::json!(old_prioritized)),
-        )?;
-    }
-    if old_deprioritized != deprioritized {
-        append_config_change_event(
-            session_id,
-            ws.turn_count,
-            "deprioritized_tools",
-            &serde_json::json!(deprioritized),
-            Some(serde_json::json!(old_deprioritized)),
-        )?;
-    }
-    Ok(())
-}
-
 pub(crate) fn persist_manual_compression(
     session_id: &str,
     turn: u32,
@@ -1262,7 +1221,6 @@ mod tests {
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "self-health-session";
         let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
-        ws.deprioritized_tools = vec!["bash".to_string()];
         ws.last_context_trace = Some(ContextTraceSignal {
             turn_id: "turn-3".to_string(),
             captured_at: Some(Utc::now().to_rfc3339()),
@@ -1408,7 +1366,6 @@ mod tests {
         let mut workspace =
             WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/srv/cloud-repo", Some("main"));
         workspace.plan_goal = Some("ship cloud restore".to_string());
-        workspace.prioritized_tools = vec!["bash".to_string()];
         workspace.discovered_skills = vec!["session-recovery".to_string()];
         let restored = astra_services::session_restore::RestoredSession {
             session_id: session_id.to_string(),

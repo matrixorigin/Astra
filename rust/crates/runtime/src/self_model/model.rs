@@ -187,8 +187,6 @@ pub struct CapabilityView {
     pub tool_health: Vec<ToolHealthSummary>,
     /// Currently deprioritized tools.
     pub deprioritized_tools: Vec<String>,
-    /// Manually prioritized tools.
-    pub prioritized_tools: Vec<String>,
     /// Discovered skills.
     pub skills: Vec<String>,
     /// Tools currently boosted by the last auto-reflection strategy delta.
@@ -318,8 +316,6 @@ impl SelfModel {
     /// sections rather than errors.
     pub fn snapshot(
         tool_names: &[&str],
-        prioritized_tools: &[String],
-        manual_deprioritized_tools: &[String],
         skills: &[String],
         tool_health: Option<&ToolHealthTracker>,
         turn_number: u32,
@@ -335,8 +331,6 @@ impl SelfModel {
     ) -> Self {
         Self::snapshot_with_strategy(
             tool_names,
-            prioritized_tools,
-            manual_deprioritized_tools,
             skills,
             tool_health,
             turn_number,
@@ -359,8 +353,6 @@ impl SelfModel {
     #[allow(clippy::too_many_arguments)]
     pub fn snapshot_with_strategy(
         tool_names: &[&str],
-        prioritized_tools: &[String],
-        manual_deprioritized_tools: &[String],
         skills: &[String],
         tool_health: Option<&ToolHealthTracker>,
         turn_number: u32,
@@ -422,11 +414,6 @@ impl SelfModel {
                 .collect();
         }
 
-        for tool in manual_deprioritized_tools {
-            if !deprioritized.contains(tool) {
-                deprioritized.push(tool.clone());
-            }
-        }
         deprioritized.sort();
 
         let (boosted_tools, widen_surface_pending) = match last_strategy {
@@ -449,7 +436,6 @@ impl SelfModel {
             tool_names: tool_names.iter().map(|s| s.to_string()).collect(),
             tool_health: tool_health_summaries,
             deprioritized_tools: deprioritized,
-            prioritized_tools: prioritized_tools.to_vec(),
             skills: skills.to_vec(),
             boosted_tools,
             widen_surface_pending,
@@ -1199,13 +1185,6 @@ impl SelfModel {
         // ── Capabilities ──
         s.push_str("\n## Capabilities\n");
         let _ = writeln!(s, "- Total tools: {}", self.capabilities.total_tools);
-        if !self.capabilities.prioritized_tools.is_empty() {
-            let _ = writeln!(
-                s,
-                "- Prioritized tools: {}",
-                self.capabilities.prioritized_tools.join(", ")
-            );
-        }
         if !self.capabilities.deprioritized_tools.is_empty() {
             let _ = writeln!(
                 s,
@@ -1342,8 +1321,6 @@ mod tests {
         let model = SelfModel::snapshot(
             &["bash", "read_file", "write_file"],
             &[],
-            &[],
-            &[],
             None,
             3,
             None,
@@ -1368,8 +1345,6 @@ mod tests {
         let config = RuntimeConfig::default();
         let model = SelfModel::snapshot(
             &["bash"],
-            &[],
-            &[],
             &[],
             None,
             8,
@@ -1407,8 +1382,6 @@ mod tests {
         let model = SelfModel::snapshot(
             &["bash", "write_file"],
             &[],
-            &[],
-            &[],
             Some(&health),
             1,
             None,
@@ -1436,8 +1409,6 @@ mod tests {
 
         let model = SelfModel::snapshot(
             &["bash", "read_file"],
-            &[],
-            &[],
             &[],
             Some(&health),
             1,
@@ -1493,8 +1464,6 @@ mod tests {
         let model = SelfModel::snapshot(
             &["bash", "grep"],
             &[],
-            &[],
-            &[],
             Some(&health),
             2,
             None,
@@ -1548,8 +1517,6 @@ mod tests {
         };
         let model = SelfModel::snapshot(
             &["bash", "read_file", "write_file", "grep", "glob"],
-            &[],
-            &[],
             &["debugging".to_string()],
             None,
             5,
@@ -1589,8 +1556,6 @@ mod tests {
         let model = SelfModel::snapshot(
             &["bash", "write_file"],
             &[],
-            &[],
-            &[],
             None,
             3,
             None,
@@ -1617,8 +1582,6 @@ mod tests {
         let config = RuntimeConfig::default();
         let model = SelfModel::snapshot(
             &["bash", "read_file"],
-            &["bash".to_string()],
-            &[],
             &[],
             None,
             10,
@@ -1637,7 +1600,6 @@ mod tests {
         assert!(text.contains("Turn: 10"));
         assert!(text.contains("exp-123"));
         assert!(text.contains("User corrections: 2"));
-        assert!(text.contains("Prioritized tools: bash"));
         assert!(text.contains("Implement feature X"));
     }
 
@@ -1648,8 +1610,6 @@ mod tests {
             .map(|_| FeedbackSignal::new(SignalType::Acceptance))
             .collect();
         let model = SelfModel::snapshot(
-            &[],
-            &[],
             &[],
             &[],
             None,
@@ -1689,8 +1649,6 @@ mod tests {
         };
         let model = SelfModel::snapshot_with_strategy(
             &["bash", "read_file", "grep"],
-            &[],
-            &[],
             &[],
             None,
             3,
@@ -1738,8 +1696,6 @@ mod tests {
         let model = SelfModel::snapshot(
             &["bash"],
             &[],
-            &[],
-            &[],
             None,
             1,
             None,
@@ -1764,8 +1720,6 @@ mod tests {
         let config = RuntimeConfig::default();
         let model = SelfModel::snapshot(
             &["bash"],
-            &[],
-            &[],
             &[],
             None,
             1,
@@ -1795,8 +1749,6 @@ mod tests {
         let model = SelfModel::snapshot(
             &["bash"],
             &[],
-            &[],
-            &[],
             None,
             1,
             None,
@@ -1819,8 +1771,6 @@ mod tests {
         let config = RuntimeConfig::default();
         let model = SelfModel::snapshot(
             &["bash"],
-            &[],
-            &[],
             &[],
             None,
             6,
@@ -1858,8 +1808,6 @@ mod tests {
         let model = SelfModel::snapshot(
             &["bash"],
             &[],
-            &[],
-            &[],
             None,
             2,
             None,
@@ -1890,8 +1838,6 @@ mod tests {
         let config = RuntimeConfig::default();
         SelfModel::snapshot(
             &["bash"],
-            &[],
-            &[],
             &[],
             None,
             0,
@@ -2084,8 +2030,6 @@ mod tests {
         let config = RuntimeConfig::default();
         let model = SelfModel::snapshot(
             &["bash"],
-            &[],
-            &[],
             &[],
             None,
             0,

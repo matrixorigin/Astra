@@ -713,10 +713,6 @@ fn fmt_utility_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
             .get("path")
             .and_then(|v| v.as_str())
             .map(|path| truncate_str(path, 40)),
-        "prioritize_tool" | "deprioritize_tool" => obj
-            .get("tool")
-            .and_then(|v| v.as_str())
-            .map(|tool| truncate_str(tool, 30)),
         "compress_context" => obj
             .get("reason")
             .and_then(|v| v.as_str())

@@ -117,7 +117,6 @@ const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "config",
     "context_analysis",
     "dead_code",
-    "deprioritize_tool",
     "diagnose",
     "enter_plan_mode",
     "env",
@@ -132,7 +131,6 @@ const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "mo_query",
     "notebook_edit",
     "notify",
-    "prioritize_tool",
     "query_context",
     "reflect",
     "rename_symbol",
@@ -1006,10 +1004,6 @@ pub struct ToolExecutor {
     /// source used by self-introspection tools; it is set by the CLI turn
     /// boundary and never inferred from a tool surface default.
     current_model: std::sync::RwLock<Option<String>>,
-    /// Self-modification prioritized tool preferences (manual override hints).
-    self_mod_prioritized_tools: std::sync::Mutex<Vec<String>>,
-    /// Self-modification deprioritized tool preferences (manual override hints).
-    self_mod_deprioritized_tools: std::sync::Mutex<Vec<String>>,
     /// P3.1 seam: cross-session lessons loaded at session bootstrap.
     /// Populated once via `set_session_lessons`, then passed through on
     /// every `build_self_model_snapshot` for the session's lifetime.
@@ -1152,8 +1146,6 @@ impl ToolExecutor {
             session_memory_observatory: None,
             active_session_id: std::sync::Mutex::new(None),
             current_model: std::sync::RwLock::new(None),
-            self_mod_prioritized_tools: std::sync::Mutex::new(Vec::new()),
-            self_mod_deprioritized_tools: std::sync::Mutex::new(Vec::new()),
             session_lessons: std::sync::Mutex::new(Vec::new()),
             latest_skill_diagnosis: std::sync::Mutex::new(None),
             latest_turn_quality_feedback: std::sync::Mutex::new(None),
@@ -1737,25 +1729,6 @@ impl ToolExecutor {
     pub fn set_active_session_id(&self, session_id: impl Into<String>) {
         let session_id = session_id.into();
         let session_changed = self.active_session_id().as_deref() != Some(session_id.as_str());
-        let (prioritized_tools, deprioritized_tools) =
-            match astra_services::session_workspace::read_workspace_optional(&session_id) {
-                Ok(Some(ws)) => (ws.prioritized_tools, ws.deprioritized_tools),
-                Ok(None) => (Vec::new(), Vec::new()),
-                Err(error) => {
-                    tracing::warn!(
-                        "active session {} has unreadable workspace metadata; clearing self-mod tool preferences: {}",
-                        session_id,
-                        error
-                    );
-                    (Vec::new(), Vec::new())
-                }
-            };
-        if let Ok(mut prioritized) = self.self_mod_prioritized_tools.lock() {
-            *prioritized = prioritized_tools;
-        }
-        if let Ok(mut deprioritized) = self.self_mod_deprioritized_tools.lock() {
-            *deprioritized = deprioritized_tools;
-        }
         // File-edit checkpoint persistence: on session-id set, rebind the
         // journal to an auto-persist directory keyed by session.
         //
@@ -4481,8 +4454,6 @@ impl ToolExecutor {
                 "enter_plan_mode" => self.enter_plan_mode_remote(args).await,
                 "exit_plan_mode" => self.exit_plan_mode_remote(args).await,
                 "adjust_config" => self.adjust_config(args),
-                "prioritize_tool" => self.prioritize_tool(args),
-                "deprioritize_tool" => self.deprioritize_tool(args),
                 "compress_context" => self.compress_context(args),
                 "get_agent_info" => self.get_agent_info(args).await,
                 "reflect" => {
@@ -4603,8 +4574,8 @@ impl ToolExecutor {
                         "sleep" => self.sleep_tool(args).await,
                         "history_page" | "history_search" => self.render_session_history(args),
                         "history_around" => self.render_session_history_around(args),
-                        "" => "Missing required parameter: action. Use: config, sleep, history_page, history_search, history_around. Use dedicated tools: rollback_file_edits, rollback_session_state, prioritize_tool, deprioritize_tool, compress_context, ask_user, enter_plan_mode, exit_plan_mode.".to_string(),
-                        other => format!("Error: unknown `session` action '{other}'. Valid: config, sleep, history_page, history_search, history_around. Use dedicated tools: rollback_file_edits, rollback_session_state, prioritize_tool, deprioritize_tool, compress_context, ask_user, enter_plan_mode, exit_plan_mode."),
+                        "" => "Missing required parameter: action. Use: config, sleep, history_page, history_search, history_around. Use dedicated tools: rollback_file_edits, rollback_session_state, compress_context, ask_user, enter_plan_mode, exit_plan_mode.".to_string(),
+                        other => format!("Error: unknown `session` action '{other}'. Valid: config, sleep, history_page, history_search, history_around. Use dedicated tools: rollback_file_edits, rollback_session_state, compress_context, ask_user, enter_plan_mode, exit_plan_mode."),
                     }
                 }
                 // Task management (unified tool with action param)
@@ -5114,7 +5085,6 @@ impl ToolExecutor {
                 "tool_count": model.capabilities.total_tools,
                 "deprioritized_tools": model.capabilities.deprioritized_tools,
                 "skills": model.capabilities.skills,
-                "prioritized_tools": model.capabilities.prioritized_tools,
                 "tool_health": model.capabilities.tool_health.iter().map(|t| {
                     json!({
                         "name": t.name,
@@ -5265,16 +5235,6 @@ impl ToolExecutor {
             visible_tools
         };
         let tool_name_refs: Vec<&str> = tool_name_strs.iter().map(|s| s.as_str()).collect();
-        let prioritized_tools = self
-            .self_mod_prioritized_tools
-            .lock()
-            .map(|v| v.clone())
-            .unwrap_or_default();
-        let deprioritized_tools = self
-            .self_mod_deprioritized_tools
-            .lock()
-            .map(|v| v.clone())
-            .unwrap_or_default();
 
         let elapsed = session.started_at.elapsed().as_secs();
 
@@ -5296,8 +5256,6 @@ impl ToolExecutor {
 
         let mut snapshot = astra_runtime::self_model::SelfModel::snapshot_with_strategy(
             &tool_name_refs,
-            &prioritized_tools,
-            &deprioritized_tools,
             skills_slice,
             tool_health_tracker.as_ref(),
             session.turn_number,

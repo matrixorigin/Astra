@@ -63,13 +63,8 @@ const BASH_BACKGROUND_TASK_CONTROL_TOOLS: &[&str] = &["task_output", "task_list"
 /// Session-control tools injected unconditionally to prevent schema thrashing.
 /// Their combined cost is < 200 tokens but toggling them on/off breaks prompt
 /// caching at every plan-mode transition or tool surface variance.
-const CACHE_STABLE_SESSION_TOOLS: &[&str] = &[
-    "enter_plan_mode",
-    "exit_plan_mode",
-    "prioritize_tool",
-    "deprioritize_tool",
-    "compress_context",
-];
+const CACHE_STABLE_SESSION_TOOLS: &[&str] =
+    &["enter_plan_mode", "exit_plan_mode", "compress_context"];
 
 /// Per-phase stderr timings for `/chat/turn`. Disabled — use `RUST_LOG=debug` instead.
 pub(crate) fn chat_turn_timing_stderr_enabled() -> bool {

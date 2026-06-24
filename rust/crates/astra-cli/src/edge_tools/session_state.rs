@@ -7,10 +7,6 @@ use super::{ToolExecutor, task_mgmt::TaskManagerSnapshot};
 
 #[derive(Debug, Clone)]
 pub(crate) enum SessionStateRollbackAction {
-    ToolPreferences {
-        previous_prioritized_tools: Vec<String>,
-        previous_deprioritized_tools: Vec<String>,
-    },
     ConfigOverride {
         path: String,
         old_value: Value,
@@ -93,7 +89,6 @@ impl SessionStateRollbackJournal {
 
 fn action_kind(action: &SessionStateRollbackAction) -> &'static str {
     match action {
-        SessionStateRollbackAction::ToolPreferences { .. } => "tool_preferences",
         SessionStateRollbackAction::ConfigOverride { .. } => "config_override",
         SessionStateRollbackAction::Compression { .. } => "compression",
         SessionStateRollbackAction::TaskState { .. } => "task_state",
@@ -109,21 +104,6 @@ impl ToolExecutor {
             Ok(mut journal) => journal.record(turn_index, label, action),
             Err(poisoned) => poisoned.into_inner().record(turn_index, label, action),
         }
-    }
-
-    pub(crate) fn record_tool_preferences_rollback(
-        &self,
-        previous_prioritized_tools: Vec<String>,
-        previous_deprioritized_tools: Vec<String>,
-        label: impl Into<String>,
-    ) {
-        self.record_session_state_rollback(
-            label.into(),
-            SessionStateRollbackAction::ToolPreferences {
-                previous_prioritized_tools,
-                previous_deprioritized_tools,
-            },
-        );
     }
 
     pub(crate) fn record_adjust_config_rollback(
@@ -249,8 +229,7 @@ impl ToolExecutor {
                     Value::Number(serde_json::Number::from(*turn)),
                 );
             }
-            SessionStateRollbackAction::ToolPreferences { .. }
-            | SessionStateRollbackAction::TaskState { .. } => {}
+            SessionStateRollbackAction::TaskState { .. } => {}
         }
         Value::Object(value)
     }
@@ -260,37 +239,6 @@ impl ToolExecutor {
         entry: &SessionStateRollbackEntry,
     ) -> Result<(), String> {
         match &entry.action {
-            SessionStateRollbackAction::ToolPreferences {
-                previous_prioritized_tools,
-                previous_deprioritized_tools,
-            } => {
-                let mut prioritized = self
-                    .self_mod_prioritized_tools
-                    .lock()
-                    .map_err(|_| "Failed to access prioritized tools".to_string())?;
-                let mut deprioritized = self
-                    .self_mod_deprioritized_tools
-                    .lock()
-                    .map_err(|_| "Failed to access deprioritized tools".to_string())?;
-                let current_prioritized = prioritized.clone();
-                let current_deprioritized = deprioritized.clone();
-                *prioritized = previous_prioritized_tools.clone();
-                *deprioritized = previous_deprioritized_tools.clone();
-                if let Some(session_id) = self.active_session_id()
-                    && let Err(error) = crate::cli::self_command::persist_tool_preferences(
-                        &session_id,
-                        &prioritized,
-                        &deprioritized,
-                    )
-                {
-                    *prioritized = current_prioritized;
-                    *deprioritized = current_deprioritized;
-                    return Err(format!(
-                        "failed to persist restored tool preferences: {error}"
-                    ));
-                }
-                Ok(())
-            }
             SessionStateRollbackAction::ConfigOverride {
                 path,
                 old_value,

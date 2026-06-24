@@ -292,8 +292,6 @@ mod tests {
             ("rollback_file_edits", json!({"scope": "current_turn"})),
             ("rollback_session_state", json!({"scope": "last_turn"})),
             ("adjust_config", json!({"key": "model", "value": "fast"})),
-            ("prioritize_tool", json!({"tool": "bash"})),
-            ("deprioritize_tool", json!({"tool": "grep"})),
             ("compress_context", json!({"target_tokens": 1000})),
             ("publish_artifact", json!({"path": "report.md"})),
             ("run_script", json!({"script": "touch plan.txt"})),

@@ -70,8 +70,6 @@ fn is_server_local_mutation_tool(tool_name: &str) -> bool {
             | "rollback_file_edits"
             | "rollback_session_state"
             | "adjust_config"
-            | "prioritize_tool"
-            | "deprioritize_tool"
             | "compress_context"
             | "publish_artifact"
             | "run_script"

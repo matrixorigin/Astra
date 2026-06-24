@@ -279,8 +279,6 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("run_build_test", MU, OR),
     tool("config", MU, OR),
     tool("adjust_config", MU, OR),
-    tool("prioritize_tool", MU, OR),
-    tool("deprioritize_tool", MU, OR),
     tool("compress_context", MU, OR),
     tool("env", MU, OR),
     // ── Mutating — task management (immune to deprioritization) ───────
@@ -2438,8 +2436,6 @@ mod tests {
             "rollback_file_edits",
             "rollback_database_snapshots",
             "rollback_session_state",
-            "prioritize_tool",
-            "deprioritize_tool",
             "reflect",
             "get_agent_info",
             "skill",

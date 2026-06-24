@@ -85,45 +85,9 @@ async fn adjust_config_respects_drift_ceiling_without_force() {
 }
 
 #[tokio::test]
-async fn tool_priority_updates_self_model_snapshot() {
-    let (exe, _session) = executor_with_session();
-    let out1 = exe
-        .execute("prioritize_tool", &json!({"tool": "bash"}))
-        .await;
-    let out2 = exe
-        .execute("deprioritize_tool", &json!({"tool": "web_fetch"}))
-        .await;
-    let parsed1: Value = serde_json::from_str(&out1).unwrap();
-    let parsed2: Value = serde_json::from_str(&out2).unwrap();
-    assert_eq!(parsed1["status"], "completed");
-    assert_eq!(parsed2["status"], "completed");
-    assert_eq!(parsed1["previous_prioritized_tools"], json!([]));
-    assert_eq!(parsed1["previous_deprioritized_tools"], json!([]));
-    assert_eq!(parsed2["previous_prioritized_tools"], json!(["bash"]));
-    assert_eq!(parsed2["previous_deprioritized_tools"], json!([]));
-
-    let model = exe.build_self_model_snapshot().unwrap();
-    assert!(
-        model
-            .capabilities
-            .prioritized_tools
-            .contains(&"bash".to_string())
-    );
-    assert!(
-        model
-            .capabilities
-            .deprioritized_tools
-            .contains(&"web_fetch".to_string())
-    );
-}
-
-#[tokio::test]
-async fn self_mod_persists_config_and_tool_preferences() {
+async fn self_mod_persists_config() {
     let (_tmp, _guard, exe, _session, session_id) = executor_with_persisted_session();
 
-    let prioritize_out = exe
-        .execute("prioritize_tool", &json!({"tool": "bash"}))
-        .await;
     let adjust_out = exe
         .execute(
             "adjust_config",
@@ -134,120 +98,11 @@ async fn self_mod_persists_config_and_tool_preferences() {
         )
         .await;
 
-    let parsed_prioritize: Value = serde_json::from_str(&prioritize_out).unwrap();
     let parsed_adjust: Value = serde_json::from_str(&adjust_out).unwrap();
-    assert_eq!(parsed_prioritize["status"], "completed");
     assert_eq!(parsed_adjust["status"], "completed");
 
     let ws = session_workspace::read_workspace(&session_id).unwrap();
-    assert!(ws.prioritized_tools.contains(&"bash".to_string()));
     assert!(ws.tuned_config_json.is_some());
-}
-
-#[test]
-fn switching_to_session_without_workspace_clears_self_mod_preferences() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _guard = JournalDirGuard::new(tmp.path());
-    let session_id = "prefs-source-session".to_string();
-    let mut ws = session_workspace::WorkspaceMetadata::with_context(
-        &session_id,
-        "gpt-5.4",
-        "/repo",
-        Some("main"),
-    );
-    ws.prioritized_tools = vec!["bash".to_string()];
-    ws.deprioritized_tools = vec!["web_fetch".to_string()];
-    session_workspace::write_workspace(&ws).unwrap();
-
-    let session = std::sync::Arc::new(std::sync::RwLock::new(
-        astra_runtime::observability::ObservabilitySession::new_simple("test-session"),
-    ));
-    let exe = ToolExecutor::new(tmp.path())
-        .with_active_session_id(session_id)
-        .with_observability_session(session);
-    let model = exe.build_self_model_snapshot().unwrap();
-    assert!(
-        model
-            .capabilities
-            .prioritized_tools
-            .contains(&"bash".to_string())
-    );
-    assert!(
-        model
-            .capabilities
-            .deprioritized_tools
-            .contains(&"web_fetch".to_string())
-    );
-
-    exe.set_active_session_id("prefs-empty-session");
-
-    let model = exe.build_self_model_snapshot().unwrap();
-    assert!(
-        model.capabilities.prioritized_tools.is_empty(),
-        "session switch without workspace must clear prioritized tool carry-over"
-    );
-    assert!(
-        model.capabilities.deprioritized_tools.is_empty(),
-        "session switch without workspace must clear deprioritized tool carry-over"
-    );
-}
-
-#[test]
-fn switching_to_session_with_corrupt_workspace_clears_self_mod_preferences() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _guard = JournalDirGuard::new(tmp.path());
-    let source_session_id = "prefs-source-session".to_string();
-    let target_session_id = "prefs-corrupt-session".to_string();
-
-    let mut ws = session_workspace::WorkspaceMetadata::with_context(
-        &source_session_id,
-        "gpt-5.4",
-        "/repo",
-        Some("main"),
-    );
-    ws.prioritized_tools = vec!["bash".to_string()];
-    ws.deprioritized_tools = vec!["web_fetch".to_string()];
-    session_workspace::write_workspace(&ws).unwrap();
-
-    let corrupt_workspace_dir = session_workspace::workspace_dir_for(&target_session_id);
-    std::fs::create_dir_all(&corrupt_workspace_dir).unwrap();
-    std::fs::write(
-        corrupt_workspace_dir.join("workspace.yaml"),
-        ":\nnot-valid-yaml",
-    )
-    .unwrap();
-
-    let session = std::sync::Arc::new(std::sync::RwLock::new(
-        astra_runtime::observability::ObservabilitySession::new_simple("test-session"),
-    ));
-    let exe = ToolExecutor::new(tmp.path())
-        .with_active_session_id(source_session_id)
-        .with_observability_session(session);
-    let model = exe.build_self_model_snapshot().unwrap();
-    assert!(
-        model
-            .capabilities
-            .prioritized_tools
-            .contains(&"bash".to_string())
-    );
-    assert!(
-        model
-            .capabilities
-            .deprioritized_tools
-            .contains(&"web_fetch".to_string())
-    );
-
-    exe.set_active_session_id(target_session_id);
-
-    let model = exe.build_self_model_snapshot().unwrap();
-    assert!(
-        model.capabilities.prioritized_tools.is_empty(),
-        "corrupt target workspace must not leak prioritized tools from prior session"
-    );
-    assert!(
-        model.capabilities.deprioritized_tools.is_empty(),
-        "corrupt target workspace must not leak deprioritized tools from prior session"
-    );
 }
 
 #[tokio::test]
@@ -306,100 +161,6 @@ async fn switching_sessions_clears_session_scoped_self_model_context() {
         after.turn_quality_feedback.is_none(),
         "latest turn quality feedback must not bleed into another session"
     );
-}
-
-#[tokio::test]
-async fn prioritize_tool_preserves_existing_state_when_persist_fails() {
-    let tmp = tempfile::tempdir().unwrap();
-    let guard = JournalDirGuard::new(tmp.path());
-    let session_id = "persisted-prioritize-rollback".to_string();
-    let mut ws = session_workspace::WorkspaceMetadata::with_context(
-        &session_id,
-        "gpt-5.4",
-        "/repo",
-        Some("main"),
-    );
-    ws.prioritized_tools = vec!["bash".to_string()];
-    session_workspace::write_workspace(&ws).unwrap();
-
-    let session = std::sync::Arc::new(std::sync::RwLock::new(
-        astra_runtime::observability::ObservabilitySession::new_simple("test-session"),
-    ));
-    let exe = ToolExecutor::new(tmp.path())
-        .with_active_session_id(session_id.clone())
-        .with_observability_session(session);
-
-    let workspace_path = session_workspace::workspace_dir_for(&session_id).join("workspace.yaml");
-    std::fs::remove_file(workspace_path).unwrap();
-
-    let out = exe
-        .execute("prioritize_tool", &json!({"tool": "bash"}))
-        .await;
-    let parsed: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(parsed["error"], "failed_to_persist_tool_preferences");
-
-    let model = exe.build_self_model_snapshot().unwrap();
-    assert!(
-        model
-            .capabilities
-            .prioritized_tools
-            .contains(&"bash".to_string())
-    );
-    assert!(
-        !model
-            .capabilities
-            .deprioritized_tools
-            .contains(&"bash".to_string())
-    );
-
-    drop(guard);
-}
-
-#[tokio::test]
-async fn deprioritize_tool_preserves_existing_state_when_persist_fails() {
-    let tmp = tempfile::tempdir().unwrap();
-    let guard = JournalDirGuard::new(tmp.path());
-    let session_id = "persisted-deprioritize-rollback".to_string();
-    let mut ws = session_workspace::WorkspaceMetadata::with_context(
-        &session_id,
-        "gpt-5.4",
-        "/repo",
-        Some("main"),
-    );
-    ws.deprioritized_tools = vec!["bash".to_string()];
-    session_workspace::write_workspace(&ws).unwrap();
-
-    let session = std::sync::Arc::new(std::sync::RwLock::new(
-        astra_runtime::observability::ObservabilitySession::new_simple("test-session"),
-    ));
-    let exe = ToolExecutor::new(tmp.path())
-        .with_active_session_id(session_id.clone())
-        .with_observability_session(session);
-
-    let workspace_path = session_workspace::workspace_dir_for(&session_id).join("workspace.yaml");
-    std::fs::remove_file(workspace_path).unwrap();
-
-    let out = exe
-        .execute("deprioritize_tool", &json!({"tool": "bash"}))
-        .await;
-    let parsed: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(parsed["error"], "failed_to_persist_tool_preferences");
-
-    let model = exe.build_self_model_snapshot().unwrap();
-    assert!(
-        model
-            .capabilities
-            .deprioritized_tools
-            .contains(&"bash".to_string())
-    );
-    assert!(
-        !model
-            .capabilities
-            .prioritized_tools
-            .contains(&"bash".to_string())
-    );
-
-    drop(guard);
 }
 
 #[tokio::test]

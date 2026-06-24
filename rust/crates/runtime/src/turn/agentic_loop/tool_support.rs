@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 
@@ -10,6 +10,40 @@ pub(crate) fn edge_tool_status_exit_code(status: &str) -> Option<i32> {
         "failed" | "partial_failure" | "denied" | "cancelled" | "timeout" | "timed_out" => Some(1),
         _ => None,
     }
+}
+
+fn structured_edge_exit_code(fields: Option<&Map<String, Value>>) -> Option<i32> {
+    let fields = fields?;
+    if let Some(semantics) = fields
+        .get("exit_semantics")
+        .and_then(Value::as_str)
+        .and_then(|tag| {
+            serde_json::from_value::<astra_tools::exit_semantics::ExitSemantics>(Value::String(
+                tag.to_string(),
+            ))
+            .ok()
+        })
+    {
+        return Some(if semantics.is_tool_error() { 1 } else { 0 });
+    }
+    if let Some(result_class) = fields
+        .get("result_class")
+        .and_then(Value::as_str)
+        .and_then(|tag| {
+            serde_json::from_value::<astra_tools::exit_semantics::CommandResultClass>(
+                Value::String(tag.to_string()),
+            )
+            .ok()
+        })
+    {
+        return Some(if result_class.is_tool_error() { 1 } else { 0 });
+    }
+    None
+}
+
+fn edge_tool_observability_exit_code(edge_result: &EdgeToolExecResult) -> Option<i32> {
+    structured_edge_exit_code(edge_result.tool_result_fields.as_ref())
+        .or_else(|| edge_tool_status_exit_code(&edge_result.status))
 }
 
 pub(crate) fn record_edge_tool_observability(
@@ -24,7 +58,7 @@ pub(crate) fn record_edge_tool_observability(
                 .record_tool_result(
                     &edge_result.tool,
                     &edge_result.output,
-                    edge_tool_status_exit_code(&edge_result.status),
+                    edge_tool_observability_exit_code(edge_result),
                 );
         }
     }
@@ -122,6 +156,42 @@ mod tests {
         assert_eq!(edge_tool_status_exit_code("success"), None);
         assert_eq!(edge_tool_status_exit_code("error"), None);
         assert_eq!(edge_tool_status_exit_code("unknown"), None);
+    }
+
+    #[test]
+    fn edge_tool_observability_exit_code_uses_structured_exit_semantics() {
+        let result = EdgeToolExecResult {
+            request_id: "call-1".into(),
+            tool: "bash".into(),
+            args: json!({"command": "grep needle haystack.txt"}),
+            output: "No matches found".into(),
+            tool_result_fields: Some(serde_json::Map::from_iter([
+                ("exit_semantics".to_string(), json!("informational_failure")),
+                ("result_class".to_string(), json!("domain_negative")),
+            ])),
+            status: "failed".into(),
+            duration_ms: 10,
+        };
+
+        assert_eq!(edge_tool_observability_exit_code(&result), Some(0));
+    }
+
+    #[test]
+    fn edge_tool_observability_exit_code_structured_error_overrides_status() {
+        let result = EdgeToolExecResult {
+            request_id: "call-1".into(),
+            tool: "bash".into(),
+            args: json!({"command": "exit 7"}),
+            output: "Error: command failed (exit code 7)".into(),
+            tool_result_fields: Some(serde_json::Map::from_iter([
+                ("exit_semantics".to_string(), json!("execution_error")),
+                ("result_class".to_string(), json!("execution_error")),
+            ])),
+            status: "completed".into(),
+            duration_ms: 10,
+        };
+
+        assert_eq!(edge_tool_observability_exit_code(&result), Some(1));
     }
 
     #[test]
