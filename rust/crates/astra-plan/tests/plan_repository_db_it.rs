@@ -314,34 +314,44 @@ async fn set_active_plan_enforces_single_session_invariant() {
     repo.save(&plan_id, &mut state, None).await.unwrap();
 
     // Session A takes the plan.
-    repo.set_active_plan(&sess_a, Some(&plan_id)).await.unwrap();
+    repo.set_active_plan(&user, &sess_a, Some(&plan_id))
+        .await
+        .unwrap();
     assert_eq!(
-        repo.active_plan_for_session(&sess_a)
+        repo.active_plan_for_session(&user, &sess_a)
             .await
             .unwrap()
             .as_deref(),
         Some(plan_id.as_str())
     );
-    assert_eq!(repo.active_plan_for_session(&sess_b).await.unwrap(), None);
+    assert_eq!(
+        repo.active_plan_for_session(&user, &sess_b).await.unwrap(),
+        None
+    );
 
     // Session B takes over — A must be cleared atomically.
-    repo.set_active_plan(&sess_b, Some(&plan_id)).await.unwrap();
+    repo.set_active_plan(&user, &sess_b, Some(&plan_id))
+        .await
+        .unwrap();
     assert_eq!(
-        repo.active_plan_for_session(&sess_b)
+        repo.active_plan_for_session(&user, &sess_b)
             .await
             .unwrap()
             .as_deref(),
         Some(plan_id.as_str()),
     );
     assert_eq!(
-        repo.active_plan_for_session(&sess_a).await.unwrap(),
+        repo.active_plan_for_session(&user, &sess_a).await.unwrap(),
         None,
         "session A must have been cleared when B took the plan"
     );
 
     // Clearing with None releases the plan from B.
-    repo.set_active_plan(&sess_b, None).await.unwrap();
-    assert_eq!(repo.active_plan_for_session(&sess_b).await.unwrap(), None);
+    repo.set_active_plan(&user, &sess_b, None).await.unwrap();
+    assert_eq!(
+        repo.active_plan_for_session(&user, &sess_b).await.unwrap(),
+        None
+    );
 
     cleanup_plans(&pool, &plan_id).await;
     cleanup_sessions(&pool, "sit-").await;
@@ -611,7 +621,9 @@ async fn delete_cascades_step_runs_and_clears_active_plan_id() {
 
     let mut state = make_state_with_subtasks(&user, "del", &["s1"]);
     repo.save(&plan_id, &mut state, None).await.unwrap();
-    repo.set_active_plan(&sess, Some(&plan_id)).await.unwrap();
+    repo.set_active_plan(&user, &sess, Some(&plan_id))
+        .await
+        .unwrap();
     let _ = repo
         .record_step_run(NewStepRun {
             plan_id: &plan_id,
@@ -638,7 +650,7 @@ async fn delete_cascades_step_runs_and_clears_active_plan_id() {
 
     // Session's active_plan_id must be cleared so we don't dangle.
     assert_eq!(
-        repo.active_plan_for_session(&sess).await.unwrap(),
+        repo.active_plan_for_session(&user, &sess).await.unwrap(),
         None,
         "delete must clear active_plan_id on any session pointing at the plan"
     );
@@ -899,7 +911,7 @@ async fn plan_resume_hint_for_session_returns_active_plans_digest() {
     ensure_session(&pool, &sess, &user).await;
 
     // No plan yet → hint is None.
-    let before = plan_resume_hint_for_session(&repo, &sess).await;
+    let before = plan_resume_hint_for_session(&repo, &user, &sess).await;
     assert!(before.is_none(), "no active plan must yield no hint");
 
     // Seed a plan with an in-progress subtask and pin to the session.
@@ -907,9 +919,11 @@ async fn plan_resume_hint_for_session_returns_active_plans_digest() {
     state.plan.subtasks[0].status = TaskStatus::Completed;
     state.plan.subtasks[1].status = TaskStatus::InProgress;
     repo.save(&plan_id, &mut state, None).await.unwrap();
-    repo.set_active_plan(&sess, Some(&plan_id)).await.unwrap();
+    repo.set_active_plan(&user, &sess, Some(&plan_id))
+        .await
+        .unwrap();
 
-    let hint = plan_resume_hint_for_session(&repo, &sess)
+    let hint = plan_resume_hint_for_session(&repo, &user, &sess)
         .await
         .expect("active plan must yield a hint");
     assert!(hint.contains("[plan-resume]"), "hint body: {hint}");
@@ -923,8 +937,8 @@ async fn plan_resume_hint_for_session_returns_active_plans_digest() {
     );
 
     // Clear the active plan → hint goes back to None.
-    repo.set_active_plan(&sess, None).await.unwrap();
-    let cleared = plan_resume_hint_for_session(&repo, &sess).await;
+    repo.set_active_plan(&user, &sess, None).await.unwrap();
+    let cleared = plan_resume_hint_for_session(&repo, &user, &sess).await;
     assert!(
         cleared.is_none(),
         "hint must clear when session's active_plan_id is None"

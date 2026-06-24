@@ -36,7 +36,9 @@ use astra_runtime::{
 };
 
 use crate::{
-    ExplainMode, StreamResult, cli::cli_config::cli_utils::terminal_width_usize, edge_tools,
+    ExplainMode, StreamResult,
+    cli::cli_config::cli_utils::{cli_user_id, terminal_width_usize},
+    edge_tools,
 };
 
 use crate::cli::chat_stream::ChatTurnParams;
@@ -556,8 +558,10 @@ pub(crate) async fn stream_chat_sse(
         let cfg = astra_config::RuntimeConfig::cached();
         cfg.runtime_limits.resolve_turn_ceiling(p.is_plan_subtask)
     };
+    let current_user_id = cli_user_id();
     let step_recorder = if let Some(session_id) = current_session_id.as_deref() {
         StepRecorder::with_persistence(
+            &current_user_id,
             session_id,
             step_recorder_chat_ephemeral_run_id(start.elapsed().as_millis()).as_str(),
         )
@@ -715,7 +719,7 @@ pub(crate) async fn stream_chat_sse(
         current_session_id,
         current_run_id: Some(parent_turn_run_id.clone()),
         context_manifest_pool: None,
-        context_manifest_user_id: None,
+        context_manifest_user_id: Some(current_user_id),
         context_manifest_model_name: model_id_for_policy.map(str::to_string),
         runtime_manifest,
         recursion_depth: 0,

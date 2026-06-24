@@ -225,11 +225,15 @@ pub fn record_headless_cacheable_success_and_semantic_hint(
 }
 
 /// Best-effort light checkpoint after each tool (matches CLI headless path).
-pub fn try_write_light_headless_step_checkpoint(session_id: &str, step_recorder: &StepRecorder) {
+pub fn try_write_light_headless_step_checkpoint(
+    user_id: &str,
+    session_id: &str,
+    step_recorder: &StepRecorder,
+) {
     if let Some(light) = step_recorder.build_light_checkpoint() {
         let cp = StepCheckpoint::Light(light);
         let n = step_recorder.summary().checkpoints;
-        let _ = step_checkpoint::write_step_checkpoint(session_id, n, &cp);
+        let _ = step_checkpoint::write_step_checkpoint(user_id, session_id, n, &cp);
     }
 }
 

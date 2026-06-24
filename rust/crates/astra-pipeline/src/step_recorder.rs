@@ -273,10 +273,10 @@ impl StepRecorder {
     ///
     /// Scans existing checkpoints so `checkpoint_count` starts after the
     /// highest existing file number, preventing cross-turn overwrites.
-    pub fn with_persistence(session_id: &str, task_id: &str) -> Self {
-        let file_store = FileBackedEventStore::empty(session_id);
-        let persisted_summary = persisted_event_summary(session_id);
-        let existing_max = crate::step_checkpoint::list_checkpoints(session_id)
+    pub fn with_persistence(user_id: &str, session_id: &str, task_id: &str) -> Self {
+        let file_store = FileBackedEventStore::empty(user_id, session_id);
+        let persisted_summary = persisted_event_summary(user_id, session_id);
+        let existing_max = crate::step_checkpoint::list_checkpoints(user_id, session_id)
             .unwrap_or_default()
             .iter()
             .map(|(n, _)| *n)
@@ -297,14 +297,14 @@ impl StepRecorder {
     ///
     /// Existing in-memory events are rebound to the adopted session id before being
     /// flushed to disk so first-turn forensic artifacts land under the real session.
-    pub fn attach_persistence(&mut self, session_id: &str) {
+    pub fn attach_persistence(&mut self, user_id: &str, session_id: &str) {
         if self.file_store.is_some() && self.session_id == session_id {
             return;
         }
 
         self.rebind_session_id(session_id);
 
-        let existing_max = crate::step_checkpoint::list_checkpoints(session_id)
+        let existing_max = crate::step_checkpoint::list_checkpoints(user_id, session_id)
             .unwrap_or_default()
             .iter()
             .map(|(n, _)| *n)
@@ -312,14 +312,14 @@ impl StepRecorder {
             .unwrap_or(0);
         self.checkpoint_count = self.checkpoint_count.max(existing_max.saturating_add(1));
 
-        let persisted_summary = persisted_event_summary(session_id);
+        let persisted_summary = persisted_event_summary(user_id, session_id);
         self.step_sequence = self.step_sequence.max(persisted_summary.next_step_sequence);
         self.persisted_tail_event_id = if self.events.is_empty() {
             persisted_summary.tail_event_id
         } else {
             None
         };
-        let mut file_store = FileBackedEventStore::empty(session_id);
+        let mut file_store = FileBackedEventStore::empty(user_id, session_id);
         self.persistence_required = true;
         for event in &self.events {
             if let Err(error) = file_store.append(event.clone()) {
@@ -1438,10 +1438,10 @@ struct PersistedEventSummary {
     tail_event_id: Option<String>,
 }
 
-fn persisted_event_summary(session_id: &str) -> PersistedEventSummary {
+fn persisted_event_summary(user_id: &str, session_id: &str) -> PersistedEventSummary {
     let mut max_sequence = None;
     let mut tail_event_id = None;
-    if let Err(error) = FileBackedEventStore::for_each_event(session_id, |event| {
+    if let Err(error) = FileBackedEventStore::for_each_event(user_id, session_id, |event| {
         if let Some(sequence) = step_sequence_from_event(event) {
             max_sequence = Some(max_sequence.map_or(sequence, |max: u32| max.max(sequence)));
         }
@@ -1503,6 +1503,8 @@ fn epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_USER_ID: &str = "test-user";
 
     #[test]
     fn redact_credentials_redacts_assignments_but_keeps_token_counters() {
@@ -2026,13 +2028,22 @@ mod tests {
         let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
         let sid = "test-cp-resume";
 
-        // Create checkpoint files directly (simulating previous turns)
-        let cp_dir = tmp.path().join(sid).join("step_checkpoints");
-        std::fs::create_dir_all(&cp_dir).unwrap();
-        std::fs::write(cp_dir.join("000003-light.json"), "{}").unwrap();
-        std::fs::write(cp_dir.join("000005-heavy.json"), "{}").unwrap();
+        let light = crate::step_protocol::StepCheckpoint::light(
+            "step-3".to_string(),
+            "task-1".to_string(),
+            sid.to_string(),
+            crate::step_protocol::ExecutionCursor::default(),
+        );
+        crate::step_checkpoint::write_step_checkpoint(TEST_USER_ID, sid, 3, &light).unwrap();
+        let heavy = crate::step_protocol::StepCheckpoint::heavy(
+            "step-5".to_string(),
+            "task-1".to_string(),
+            sid.to_string(),
+            crate::step_protocol::ExecutionCursor::default(),
+        );
+        crate::step_checkpoint::write_step_checkpoint(TEST_USER_ID, sid, 5, &heavy).unwrap();
 
-        let rec = StepRecorder::with_persistence(sid, "task-1");
+        let rec = StepRecorder::with_persistence(TEST_USER_ID, sid, "task-1");
         // checkpoint_count should be max(5,3) + 1 = 6
         assert_eq!(
             rec.summary().checkpoints,
@@ -2050,7 +2061,7 @@ mod tests {
         let mut rec = StepRecorder::new("ephemeral", "task-1");
         rec.begin_turn(0);
         rec.record_plan(&["bash".into()], 0.9, 0.0, 4000);
-        rec.attach_persistence("sess-adopted");
+        rec.attach_persistence(TEST_USER_ID, "sess-adopted");
         rec.end_turn(true);
 
         assert_eq!(rec.summary().session_id, "sess-adopted");
@@ -2064,22 +2075,18 @@ mod tests {
                 .all(|event| event.step_id == "sess-adopted-turn-0-step-0")
         );
 
-        let adopted_path = tmp.path().join("sess-adopted").join("step_events.jsonl");
-        let persisted = std::fs::read_to_string(adopted_path).unwrap();
-        let parsed: Vec<StepEvent> = persisted
-            .lines()
-            .map(serde_json::from_str)
-            .collect::<Result<_, _>>()
-            .expect("step_events.jsonl should be plaintext JSONL");
+        let parsed =
+            crate::step_checkpoint::FileBackedEventStore::new(TEST_USER_ID, "sess-adopted")
+                .all_events()
+                .to_vec();
         assert!(
             parsed
                 .iter()
                 .any(|event| event.step_id == "sess-adopted-turn-0-step-0")
         );
         assert!(
-            !tmp.path()
-                .join("ephemeral")
-                .join("step_events.jsonl")
+            !crate::step_checkpoint::owner_session_dir_for(TEST_USER_ID, "ephemeral")
+                .unwrap()
                 .exists()
         );
     }
@@ -2088,7 +2095,7 @@ mod tests {
     fn required_persistence_drops_new_events_after_attach_failure() {
         let mut rec = StepRecorder::new("ephemeral", "task-1");
         rec.begin_turn(0);
-        rec.attach_persistence("../invalid-session-id");
+        rec.attach_persistence(TEST_USER_ID, "../invalid-session-id");
         let events_after_failed_attach = rec.events().len();
 
         rec.record_plan(&["bash".into()], 0.9, 0.0, 4000);
@@ -2107,13 +2114,13 @@ mod tests {
         let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
         let sid = "sess-continued";
 
-        let mut first = StepRecorder::with_persistence(sid, "task-1");
+        let mut first = StepRecorder::with_persistence(TEST_USER_ID, sid, "task-1");
         first.begin_turn_with_context(0, 0);
         first.end_turn(false);
         let previous_tail = first.events().last().unwrap().event_id.clone();
         drop(first);
 
-        let mut second = StepRecorder::with_persistence(sid, "task-2");
+        let mut second = StepRecorder::with_persistence(TEST_USER_ID, sid, "task-2");
         assert!(
             second.events().is_empty(),
             "persistent recorder must not materialize historical journals into memory"

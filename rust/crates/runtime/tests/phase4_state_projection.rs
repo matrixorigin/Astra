@@ -915,6 +915,111 @@ async fn l3_11_s05_plan_thrashing_keeps_active_todos_bounded() {
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn can_compact_session_ignores_active_runs_from_other_owners() {
+    let pool = setup_pool().await;
+    let (session_id, user_id, run_id) = ids();
+    let other_user_id = format!("other-{user_id}");
+    let other_run_id = format!("other-{run_id}");
+    insert_session(&pool, &session_id, &user_id).await;
+    insert_run(
+        &pool,
+        &session_id,
+        &other_user_id,
+        &other_run_id,
+        None,
+        &other_run_id,
+        &other_run_id,
+        0,
+        "running",
+    )
+    .await;
+
+    let store = DatabaseStateProjectionStore::new(pool.clone());
+    store
+        .can_compact_session(&user_id, &session_id)
+        .await
+        .expect("other-owner active runs must not block owner compaction");
+
+    let err = store
+        .can_compact_session(&other_user_id, &session_id)
+        .await
+        .expect_err("the other owner still has an active run in that session id");
+    assert!(
+        err.to_string().contains(&session_id),
+        "compaction denial should include the session id for observability: {err}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn supersede_session_plan_todos_updates_only_owner_rows() {
+    let pool = setup_pool().await;
+    let (session_id, user_id, _) = ids();
+    let other_user_id = format!("other-{user_id}");
+    let keep_plan_id = format!("plan-keep-{session_id}");
+    let old_plan_id = format!("plan-old-{session_id}");
+    insert_session(&pool, &session_id, &user_id).await;
+
+    for (todo_id, owner, plan_id) in [
+        ("owner-keep", user_id.as_str(), keep_plan_id.as_str()),
+        ("owner-old", user_id.as_str(), old_plan_id.as_str()),
+        ("other-old", other_user_id.as_str(), old_plan_id.as_str()),
+    ] {
+        let todo_id = format!("{todo_id}-{session_id}");
+        insert_todo(
+            &pool,
+            &session_id,
+            owner,
+            &todo_id,
+            None,
+            None,
+            &todo_id,
+            "active",
+            0,
+        )
+        .await;
+        sqlx::query("UPDATE session_plan_todos SET plan_id = ? WHERE todo_id = ?")
+            .bind(plan_id)
+            .bind(&todo_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+
+    let changed = DatabaseStateProjectionStore::new(pool.clone())
+        .supersede_session_plan_todos(&user_id, &session_id, &keep_plan_id)
+        .await
+        .unwrap();
+    assert_eq!(changed, 1);
+
+    let row = sqlx::query(
+        "SELECT
+          (SELECT COUNT(*) FROM session_plan_todos
+           WHERE user_id = ? AND session_id = ? AND plan_id = ? AND status = 'active') AS owner_keep,
+          (SELECT COUNT(*) FROM session_plan_todos
+           WHERE user_id = ? AND session_id = ? AND plan_id = ? AND status = 'superseded') AS owner_old,
+          (SELECT COUNT(*) FROM session_plan_todos
+           WHERE user_id = ? AND session_id = ? AND plan_id = ? AND status = 'active') AS other_old",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&keep_plan_id)
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&old_plan_id)
+    .bind(&other_user_id)
+    .bind(&session_id)
+    .bind(&old_plan_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(row.try_get::<i64, _>("owner_keep").unwrap(), 1);
+    assert_eq!(row.try_get::<i64, _>("owner_old").unwrap(), 1);
+    assert_eq!(row.try_get::<i64, _>("other_old").unwrap(), 1);
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l3_12_s06_compaction_preserves_sixty_todo_tree_skeleton() {
     let pool = setup_pool().await;
     let (session_id, user_id, run_id) = ids();

@@ -99,7 +99,6 @@ pub async fn run_stream_session_and_run_status() {
     let auth = &b.auth_header;
     let pool = &ctx.pool;
     let user_id = &ctx.user_id;
-    let user_id = &ctx.user_id;
 
     // Create a fresh session for isolation.
     let (st_sess, sess) = post_json(
@@ -193,6 +192,7 @@ pub async fn run_stream_context_trace_persistence() {
     let app = &ctx.app;
     let auth = &b.auth_header;
     let pool = &ctx.pool;
+    let user_id = &ctx.user_id;
 
     let (st_sess, sess) = post_json(
         app,

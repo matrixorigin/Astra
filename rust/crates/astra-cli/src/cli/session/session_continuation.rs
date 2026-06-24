@@ -12,12 +12,14 @@
 pub(crate) fn load_session_messages_for_continuation(
     session_id: &str,
 ) -> Option<Vec<serde_json::Value>> {
-    match astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(session_id) {
+    let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
+    match astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(&user_id, session_id) {
         Ok(Some(cp)) if !cp.messages.is_empty() => {
             Some(sanitize_continuation_messages(cp.messages))
         }
         Err(error) => {
             tracing::warn!(
+                user_id = %user_id,
                 session_id = %session_id,
                 error = %error,
                 "failed to read continuation checkpoint"
@@ -185,13 +187,20 @@ mod tests {
         ];
         heavy.budget_remaining_tokens = 100000;
         heavy.budget_remaining_rounds = 50;
-        astra_pipeline::step_checkpoint::write_step_checkpoint(&session_id, 2, &checkpoint)
-            .unwrap();
+        let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
+        astra_pipeline::step_checkpoint::write_step_checkpoint(
+            &user_id,
+            &session_id,
+            2,
+            &checkpoint,
+        )
+        .unwrap();
 
         let messages = super::load_session_messages_for_continuation(&session_id);
 
-        let home = dirs::home_dir().unwrap();
-        let _ = std::fs::remove_dir_all(home.join(".astra/sessions").join(&session_id));
+        let _ = std::fs::remove_dir_all(
+            astra_pipeline::step_checkpoint::owner_session_dir_for(&user_id, &session_id).unwrap(),
+        );
 
         let messages = messages.expect("should load messages from checkpoint");
         assert_eq!(messages.len(), 2);

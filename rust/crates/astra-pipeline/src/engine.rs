@@ -6,7 +6,6 @@
 
 use super::event::{EventKind, EventLog};
 use super::state::{AgentPhase, TurnState};
-use super::trace_retention::RetentionPolicy;
 use super::trace_volume::TraceVolume;
 
 // ─── Stage trait ─────────────────────────────────────────────────────────────
@@ -173,12 +172,8 @@ impl ExecutionEngine {
             "Turn trace volume summary"
         );
 
-        // Apply retention cleanup if session is known.
-        if let Some(ref sid) = state.session_id
-            && RetentionPolicy::default().needs_cleanup(sid)
-        {
-            let _ = RetentionPolicy::default().cleanup(sid);
-        }
+        // Local step trace retention is owner-bound. This pipeline state only
+        // knows session_id, so cleanup is handled by callers that have user_id.
 
         Ok(())
     }

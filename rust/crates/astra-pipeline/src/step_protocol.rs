@@ -1533,6 +1533,8 @@ fn compute_idempotency_key(
 mod tests {
     use super::*;
 
+    const TEST_USER_ID: &str = "test-user";
+
     // ── Protocol Version ──
 
     #[test]
@@ -2281,7 +2283,7 @@ mod tests {
     #[test]
     fn event_store_trait_append_and_len() {
         use crate::step_checkpoint::FileBackedEventStore;
-        let mut store = FileBackedEventStore::empty("test-trait");
+        let mut store = FileBackedEventStore::empty(TEST_USER_ID, "test-trait");
         let _ = <FileBackedEventStore as StepEventStore>::append(
             &mut store,
             StepEvent {
@@ -2301,7 +2303,7 @@ mod tests {
     #[test]
     fn event_store_events_for_step() {
         use crate::step_checkpoint::FileBackedEventStore;
-        let mut store = FileBackedEventStore::empty("test-events-for-step");
+        let mut store = FileBackedEventStore::empty(TEST_USER_ID, "test-events-for-step");
         let _ = store.append(StepEvent {
             event_id: "e1".into(),
             canonical_event_id: None,
@@ -2341,7 +2343,7 @@ mod tests {
     #[test]
     fn event_store_single_parent_chain() {
         use crate::step_checkpoint::FileBackedEventStore;
-        let mut store = FileBackedEventStore::empty("test-chain");
+        let mut store = FileBackedEventStore::empty(TEST_USER_ID, "test-chain");
         let _ = store.append(StepEvent {
             event_id: "e1".into(),
             canonical_event_id: None,
@@ -2385,7 +2387,7 @@ mod tests {
     #[test]
     fn event_store_multi_parent_convergence() {
         use crate::step_checkpoint::FileBackedEventStore;
-        let mut store = FileBackedEventStore::empty("test-convergence");
+        let mut store = FileBackedEventStore::empty(TEST_USER_ID, "test-convergence");
         let _ = store.append(StepEvent {
             event_id: "start".into(),
             canonical_event_id: None,
@@ -2447,7 +2449,7 @@ mod tests {
     #[test]
     fn event_store_empty() {
         use crate::step_checkpoint::FileBackedEventStore;
-        let store = FileBackedEventStore::empty("test-empty");
+        let store = FileBackedEventStore::empty(TEST_USER_ID, "test-empty");
         assert!(store.is_empty());
         assert!(store.leaves().is_empty());
     }

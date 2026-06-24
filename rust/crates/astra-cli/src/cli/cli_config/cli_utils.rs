@@ -134,9 +134,10 @@ pub(crate) fn local_session_is_resumable(session_id: &str) -> bool {
     if session_journal::validate_session_id(session_id).is_err() {
         return false;
     }
+    let user_id = cli_user_id();
     let journal_exists = session_journal::journal_file_path(session_id).exists();
     let has_heavy_checkpoint =
-        astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(session_id)
+        astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(&user_id, session_id)
             .map(|checkpoint| checkpoint.is_some())
             .unwrap_or(false);
     let workspace = match astra_services::session_workspace::read_workspace_optional(session_id) {
@@ -839,13 +840,13 @@ pub(crate) fn git_snapshot(cwd: Option<&str>) -> (Option<String>, Option<String>
 #[cfg(test)]
 mod tests {
     use super::{
-        CredentialsFile, Profile, clear_profile_last_session_if_matches, compact_or_raw,
-        credentials_path, format_error_with_context, git_snapshot, is_astra_session_auth_error,
-        load_credentials, local_resumable_last_session_id, local_session_is_resumable,
-        mutate_credentials, normalize_model_override, persist_profile_last_session,
-        persist_profile_memoria_api_key, profile_name, read_api_error, save_credentials,
-        session_is_resumable, status_hint, status_hint_for, urlencoding,
-        validated_resumable_last_session_id,
+        CredentialsFile, Profile, clear_profile_last_session_if_matches, cli_user_id,
+        compact_or_raw, credentials_path, format_error_with_context, git_snapshot,
+        is_astra_session_auth_error, load_credentials, local_resumable_last_session_id,
+        local_session_is_resumable, mutate_credentials, normalize_model_override,
+        persist_profile_last_session, persist_profile_memoria_api_key, profile_name,
+        read_api_error, save_credentials, session_is_resumable, status_hint, status_hint_for,
+        urlencoding, validated_resumable_last_session_id,
     };
     use astra_services::session_journal;
     use std::sync::{Mutex, OnceLock};
@@ -1411,6 +1412,7 @@ mod tests {
             config_version_id: None,
         };
         astra_pipeline::step_checkpoint::write_step_checkpoint(
+            &cli_user_id(),
             &sid,
             1,
             &astra_pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy)),

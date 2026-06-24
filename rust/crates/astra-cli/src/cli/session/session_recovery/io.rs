@@ -10,11 +10,16 @@ pub(crate) fn workspace_path_for(session_id: &str) -> std::path::PathBuf {
     astra_services::session_workspace::workspace_dir_for(session_id).join("workspace.yaml")
 }
 
-pub(crate) fn composite_index_path_for(session_id: &str) -> std::path::PathBuf {
-    session_journal::local_sessions_dir()
-        .join(session_id)
-        .join("step_checkpoints")
-        .join("composite_snapshots.json")
+pub(crate) fn composite_index_path_for(
+    user_id: &str,
+    session_id: &str,
+) -> Result<std::path::PathBuf, String> {
+    astra_pipeline::step_checkpoint::owner_session_dir_for(user_id, session_id)
+        .map(|dir| {
+            dir.join("step_checkpoints")
+                .join("composite_snapshots.json")
+        })
+        .map_err(|error| format!("owner-bound composite snapshot index path: {error}"))
 }
 
 pub(crate) fn workspace_lock_path_for(session_id: &str) -> std::path::PathBuf {

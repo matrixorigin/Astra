@@ -78,14 +78,15 @@ pub fn plan_resume_prompt_hint(state: &PlanModeState) -> Option<String> {
 /// turns — the worst-case failure mode is a missing hint on one turn.
 pub async fn plan_resume_hint_for_session(
     repo: &dyn PlanRepository,
+    user_id: &str,
     session_id: &str,
 ) -> Option<String> {
     let plan_id = repo
-        .active_plan_for_session(session_id)
+        .active_plan_for_session(user_id, session_id)
         .await
         .ok()
         .flatten()?;
-    let state = repo.load(&plan_id).await.ok()?;
+    let state = repo.load_owned(&plan_id, user_id).await.ok()?;
     plan_resume_prompt_hint(&state)
 }
 

@@ -125,18 +125,23 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
 
     assert_eq!(result.session_id.as_deref(), Some("sess-step-adopt"));
 
-    let adopted_path = temp
-        .path()
-        .join("sess-step-adopt")
-        .join("step_events.jsonl");
-    let ephemeral_path = temp.path().join("ephemeral").join("step_events.jsonl");
+    let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
+    let adopted_path =
+        astra_pipeline::step_checkpoint::owner_session_dir_for(&user_id, "sess-step-adopt")
+            .unwrap()
+            .join("step_events.jsonl");
+    let ephemeral_path =
+        astra_pipeline::step_checkpoint::owner_session_dir_for(&user_id, "ephemeral")
+            .unwrap()
+            .join("step_events.jsonl");
     let adopted_events = std::fs::read_to_string(&adopted_path)
         .expect("step events should persist under adopted session");
 
     assert!(!adopted_events.trim().is_empty());
 
     // Load events via FileBackedEventStore (handles hex-decode + decrypt)
-    let store = astra_pipeline::step_checkpoint::FileBackedEventStore::new("sess-step-adopt");
+    let store =
+        astra_pipeline::step_checkpoint::FileBackedEventStore::new(&user_id, "sess-step-adopt");
     let events = store.all_events();
     assert!(
         events

@@ -1025,6 +1025,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         prep.quiet,
         AgenticTurnIngestMut {
             task_profile: state.task_profile,
+            persistence_user_id: state.context_manifest_user_id.as_deref(),
             first_ttft_ms: &mut state.telemetry.first_ttft_ms,
             current_session_id: &mut state.current_session_id,
             current_run_id: &mut state.current_run_id,

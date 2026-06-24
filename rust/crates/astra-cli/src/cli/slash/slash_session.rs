@@ -5465,11 +5465,17 @@ async fn apply_restored_session(
     let prepared_workspace = load_prepared_workspace_restore(&restored)?;
     let prepared_history = prepared_fork_restore_from_journal(&restored.session_id).await?;
     let last_turn_event = local_journal.last_turn_event;
+    let user_id = state
+        .ingestion_user_id
+        .as_deref()
+        .filter(|user_id| !user_id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(crate::cli::cli_config::cli_utils::cli_user_id);
 
     let mut step_restore_error = None;
     // Try new crash recovery state machine first; fall back to legacy restore
     let step_restored =
-        match astra_pipeline::crash_recovery::recover_from_crash(&restored.session_id) {
+        match astra_pipeline::crash_recovery::recover_from_crash(&user_id, &restored.session_id) {
             Ok(Some(astra_pipeline::crash_recovery::RecoveryOutcome::AutoRecovered {
                 restored: cr_restored,
                 ..
@@ -5563,12 +5569,13 @@ async fn apply_restored_session(
             }
             Ok(None) => {
                 // No crash detected — use legacy restore
-                match astra_pipeline::step_restore::restore_session(&restored.session_id) {
+                match astra_pipeline::step_restore::restore_session(&user_id, &restored.session_id)
+                {
                     Ok(r) => r,
                     Err(astra_pipeline::step_restore::RestoreError::IoError(error)) => {
                         return Err(format!(
-                            "Failed to read local step checkpoint for {}: {}",
-                            restored.session_id, error
+                            "Failed to read local step checkpoint for user_id={} session_id={}: {}",
+                            user_id, restored.session_id, error
                         ));
                     }
                     Err(error) => {
@@ -5582,12 +5589,13 @@ async fn apply_restored_session(
                     error = %cr_err,
                     "crash recovery state machine failed, falling back to legacy restore"
                 );
-                match astra_pipeline::step_restore::restore_session(&restored.session_id) {
+                match astra_pipeline::step_restore::restore_session(&user_id, &restored.session_id)
+                {
                     Ok(r) => r,
                     Err(astra_pipeline::step_restore::RestoreError::IoError(error)) => {
                         return Err(format!(
-                            "Failed to read local step checkpoint for {}: {}",
-                            restored.session_id, error
+                            "Failed to read local step checkpoint for user_id={} session_id={}: {}",
+                            user_id, restored.session_id, error
                         ));
                     }
                     Err(error) => {
@@ -5607,8 +5615,8 @@ async fn apply_restored_session(
         && let Some(error) = step_restore_error.as_ref()
     {
         return Err(format!(
-            "Failed to restore local step checkpoint for {}: {}",
-            restored.session_id, error
+            "Failed to restore local step checkpoint for user_id={} session_id={}: {}",
+            user_id, restored.session_id, error
         ));
     }
     if let Some(error) = step_restore_error.as_ref() {
@@ -6395,7 +6403,9 @@ mod resume_tests {
             "turns_completed": turn_count,
             "remaining_turns": 2,
         }));
+        let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         astra_pipeline::step_checkpoint::write_step_checkpoint(
+            &user_id,
             session_id,
             turn_count,
             &astra_pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy)),
@@ -6422,7 +6432,9 @@ mod resume_tests {
             serde_json::json!({"role": "assistant", "content": "restoring session approvals"}),
         ];
         heavy.approval_overrides = Some(approval_overrides);
+        let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         astra_pipeline::step_checkpoint::write_step_checkpoint(
+            &user_id,
             session_id,
             turn_count,
             &astra_pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy)),
@@ -6507,8 +6519,9 @@ mod resume_tests {
     fn write_completed_read_step_event(session_id: &str, turn_count: u32, created_at: u64) {
         let args = serde_json::json!({"path": "src/lib.rs"});
         let idem_key = astra_pipeline::step_protocol::IdempotencyKey::semantic("read_file", &args);
+        let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         let mut event_store =
-            astra_pipeline::step_checkpoint::FileBackedEventStore::empty(session_id);
+            astra_pipeline::step_checkpoint::FileBackedEventStore::empty(&user_id, session_id);
         let _ = <astra_pipeline::step_checkpoint::FileBackedEventStore as astra_pipeline::step_protocol::StepEventStore>::append(
             &mut event_store,
             astra_pipeline::step_protocol::StepEvent {
@@ -6563,7 +6576,9 @@ mod resume_tests {
         }));
         heavy.consecutive_context_window_errors = 2;
         let completed_event_created_at = heavy.light.created_at.saturating_add(1);
+        let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         astra_pipeline::step_checkpoint::write_step_checkpoint(
+            &user_id,
             session_id,
             turn_count,
             &astra_pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy)),
@@ -6583,7 +6598,9 @@ mod resume_tests {
             _ => unreachable!("heavy checkpoint constructor should yield Heavy"),
         };
         heavy.light.protocol_version = 0;
+        let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         astra_pipeline::step_checkpoint::write_step_checkpoint(
+            &user_id,
             session_id,
             turn_count,
             &astra_pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy)),

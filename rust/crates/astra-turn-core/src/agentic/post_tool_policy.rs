@@ -28,6 +28,7 @@ pub struct AgenticPostToolPolicyRequest<'a> {
     pub restricted_tools: &'a mut HashSet<String>,
     pub remaining_turns: &'a mut usize,
     pub step_recorder: &'a mut StepRecorder,
+    pub current_user_id: Option<&'a str>,
     pub current_session_id: Option<&'a String>,
     pub max_turns: usize,
     pub loop_turn: usize,
@@ -81,6 +82,7 @@ pub fn apply_agentic_post_tool_policy(
         restricted_tools,
         remaining_turns,
         step_recorder,
+        current_user_id,
         current_session_id,
         max_turns,
         loop_turn,
@@ -193,7 +195,7 @@ pub fn apply_agentic_post_tool_policy(
         );
 
         let checkpoint_blocked_tools = checkpoint_blocked_tools(restricted_tools);
-        if let Some(sid) = current_session_id
+        if let (Some(user_id), Some(sid)) = (current_user_id, current_session_id)
             && let Some(heavy) = step_recorder.build_heavy_checkpoint(
                 messages,
                 0,
@@ -204,6 +206,7 @@ pub fn apply_agentic_post_tool_policy(
         {
             let cp = StepCheckpoint::Heavy(Box::new(heavy));
             let _ = step_checkpoint::write_step_checkpoint(
+                user_id,
                 sid,
                 step_recorder.summary().checkpoints,
                 &cp,
@@ -237,6 +240,8 @@ fn checkpoint_blocked_tools(restricted_tools: &HashSet<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_USER_ID: &str = "test-user";
     use serde_json::json;
 
     #[test]
@@ -247,7 +252,7 @@ mod tests {
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
-        let mut step_recorder = StepRecorder::with_persistence("sid", "tid");
+        let mut step_recorder = StepRecorder::with_persistence(TEST_USER_ID, "sid", "tid");
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
         let tool_calls: Vec<Value> = Vec::new();
@@ -264,6 +269,7 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             remaining_turns: &mut remaining_turns,
             step_recorder: &mut step_recorder,
+            current_user_id: None,
             current_session_id: None,
             max_turns: 8,
             loop_turn: 0,
@@ -300,7 +306,7 @@ mod tests {
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
-        let mut step_recorder = StepRecorder::with_persistence("sid", "tid");
+        let mut step_recorder = StepRecorder::with_persistence(TEST_USER_ID, "sid", "tid");
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
         let tool_calls = vec![
@@ -323,6 +329,7 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             remaining_turns: &mut remaining_turns,
             step_recorder: &mut step_recorder,
+            current_user_id: None,
             current_session_id: None,
             max_turns: 8,
             loop_turn: 0,
@@ -355,7 +362,7 @@ mod tests {
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
-        let mut step_recorder = StepRecorder::with_persistence("sid", "tid");
+        let mut step_recorder = StepRecorder::with_persistence(TEST_USER_ID, "sid", "tid");
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
         let tool_calls = vec![json!({"name": "read_file", "arguments": {"path": "src/lib.rs"}})];
@@ -375,6 +382,7 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             remaining_turns: &mut remaining_turns,
             step_recorder: &mut step_recorder,
+            current_user_id: None,
             current_session_id: None,
             max_turns: 8,
             loop_turn: 0,
@@ -406,7 +414,7 @@ mod tests {
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
-        let mut step_recorder = StepRecorder::with_persistence("sid", "tid");
+        let mut step_recorder = StepRecorder::with_persistence(TEST_USER_ID, "sid", "tid");
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
         let tool_calls = vec![
@@ -428,6 +436,7 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             remaining_turns: &mut remaining_turns,
             step_recorder: &mut step_recorder,
+            current_user_id: None,
             current_session_id: None,
             max_turns: 8,
             loop_turn: 0,
@@ -461,7 +470,7 @@ mod tests {
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
-        let mut step_recorder = StepRecorder::with_persistence("sid", "tid");
+        let mut step_recorder = StepRecorder::with_persistence(TEST_USER_ID, "sid", "tid");
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
         for _ in 0..3 {
@@ -480,6 +489,7 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             remaining_turns: &mut remaining_turns,
             step_recorder: &mut step_recorder,
+            current_user_id: None,
             current_session_id: None,
             max_turns: 8,
             loop_turn: 0,
@@ -524,7 +534,7 @@ mod tests {
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
-        let mut step_recorder = StepRecorder::with_persistence("sid", "tid");
+        let mut step_recorder = StepRecorder::with_persistence(TEST_USER_ID, "sid", "tid");
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
         let tool_calls = vec![json!({
@@ -548,6 +558,7 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             remaining_turns: &mut remaining_turns,
             step_recorder: &mut step_recorder,
+            current_user_id: None,
             current_session_id: None,
             max_turns: 8,
             loop_turn: 0,

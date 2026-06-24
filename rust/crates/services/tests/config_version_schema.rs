@@ -10,20 +10,17 @@
 //!      ids. created_at + first_seen_session are forensic metadata.
 //!
 //!   2. `agent_sessions.config_version_id` — foreign pointer to the
-//!      version_id a session ran under. Null for legacy rows.
+//!      version_id a session ran under.
 //!
-//! Both are wired as additive `ensure_core_schema` + migration steps
-//! so fresh DBs get the new shape via CREATE TABLE and existing DBs
-//! catch up via ALTER.
+//! Both are installed by the current `ensure_core_schema` DDL. Historical
+//! auto-migration is intentionally not part of this contract.
 //!
 //! The live DB test is `#[ignore]` and runs under
 //! `ASTRA_TEST_DB_IT=1`, matching the existing services_db_integration.
 //! A pure builder test verifies the SQL shape without touching the DB.
 //!
-//! The fact that `ensure_core_schema` is the only path to install both
-//! the CREATE TABLE and the migrations means a fresh test DB that has
-//! never run the legacy pre-Step-4 schema must still end up with the
-//! final column set.
+//! The live test uses a current-schema database and verifies the final
+//! column set directly.
 
 use astra_services::config_version_cloud::{
     CONFIG_VERSIONS_CREATE_SQL, CONFIG_VERSIONS_LIST_SQL, CONFIG_VERSIONS_SELECT_TOML_SQL,
@@ -105,10 +102,9 @@ fn insert_params_roundtrip_preserves_every_field() {
 }
 
 #[test]
-fn parse_row_tolerates_missing_first_seen_session() {
-    // Legacy rows (or rows produced by a user without a pinned
-    // session at save time) may leave first_seen_session NULL.
-    // The parser must accept that, not panic.
+fn parse_row_accepts_optional_first_seen_session() {
+    // A version can be saved before it is associated with a concrete session.
+    // The parser must preserve that as an explicit None, not panic.
     let row = ConfigVersionRow {
         version_id: "cfg_no_session_row".to_string(),
         user_id: "user_x".to_string(),

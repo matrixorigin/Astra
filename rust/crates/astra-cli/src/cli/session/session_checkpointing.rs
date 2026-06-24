@@ -1,3 +1,4 @@
+use crate::cli::cli_config::cli_utils::cli_user_id;
 use crate::cli::session::session_recovery;
 use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
 use crate::cli::session::session_state::SessionState;
@@ -123,11 +124,18 @@ pub(crate) fn create_manual_checkpoint(
         "" => "Manual checkpoint".to_string(),
         trimmed => trimmed.to_string(),
     };
+    let user_id = state
+        .ingestion_user_id
+        .as_deref()
+        .filter(|user_id| !user_id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(cli_user_id);
 
     let mut workspace = session_recovery::workspace_metadata_from_live_state(state, sid);
-    let next_step = session_recovery::next_step_checkpoint_number(sid)?;
-    let previous_heavy = astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(sid)
-        .map_err(|error| format!("read latest heavy checkpoint: {error}"))?;
+    let next_step = session_recovery::next_step_checkpoint_number(&user_id, sid)?;
+    let previous_heavy =
+        astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(&user_id, sid)
+            .map_err(|error| format!("read latest heavy checkpoint: {error}"))?;
     let session_state = previous_heavy
         .as_ref()
         .map(session_recovery::session_state_compact_from_heavy_checkpoint)
@@ -144,6 +152,7 @@ pub(crate) fn create_manual_checkpoint(
         previous_heavy.as_ref(),
     );
     let heavy_path = session_recovery::persist_manual_heavy_and_composite(
+        &user_id,
         sid,
         workspace.turn_count,
         &title,
@@ -305,9 +314,17 @@ mod tests {
         workspace.turn_count = 2;
         astra_services::session_workspace::write_workspace(&workspace).unwrap();
 
-        let session_dir = session_journal::local_sessions_dir().join(&sid);
-        std::fs::create_dir_all(&session_dir).unwrap();
-        std::fs::write(session_dir.join("step_checkpoints"), "not-a-directory").unwrap();
+        let owner_session_dir = astra_pipeline::step_checkpoint::owner_session_dir_for(
+            &crate::cli::cli_config::cli_utils::cli_user_id(),
+            &sid,
+        )
+        .unwrap();
+        std::fs::create_dir_all(&owner_session_dir).unwrap();
+        std::fs::write(
+            owner_session_dir.join("step_checkpoints"),
+            "not-a-directory",
+        )
+        .unwrap();
 
         let mut state = SessionState {
             session_id: Some(sid),
@@ -409,6 +426,7 @@ mod tests {
             config_version_id: None,
         };
         astra_pipeline::step_checkpoint::write_step_checkpoint(
+            "test-user",
             &sid,
             1,
             &StepCheckpoint::Heavy(Box::new(previous_heavy)),
@@ -423,6 +441,7 @@ mod tests {
             runtime_pipeline_state: Some(serde_json::json!({"stale": "pipeline"})),
             runtime_compaction_state: Some(serde_json::json!({"attempt_count": 99})),
             runtime_consecutive_context_window_errors: 9,
+            ingestion_user_id: Some("test-user".to_string()),
             ..Default::default()
         };
         state.history.push(("hi".into(), "hello".into()));
@@ -430,7 +449,7 @@ mod tests {
         let summary = create_manual_checkpoint(&mut state, "manual").unwrap();
         assert!(summary.heavy_path.exists());
 
-        let restored = astra_pipeline::step_restore::restore_session(&sid)
+        let restored = astra_pipeline::step_restore::restore_session("test-user", &sid)
             .unwrap()
             .expect("restored session");
         assert!(restored.blocked_tools.is_empty());

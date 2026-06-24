@@ -5,8 +5,18 @@ use super::io::{
     read_optional_file_bytes, restore_optional_file_bytes, sync_parent_dir, workspace_path_for,
 };
 use super::workspace::persist_recovery_workspace_snapshot;
+use crate::cli::cli_config::cli_utils::cli_user_id;
 use crate::cli::session::session_projection::history_as_messages;
 use crate::cli::session::session_state::SessionState;
+
+fn recovery_user_id(state: &SessionState) -> String {
+    state
+        .ingestion_user_id
+        .as_deref()
+        .filter(|user_id| !user_id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(cli_user_id)
+}
 
 pub(crate) fn delegation_from_heavy_checkpoint(
     heavy: &astra_pipeline::step_protocol::HeavyCheckpoint,
@@ -49,6 +59,7 @@ pub(crate) fn previous_session_state_for_history_sync(
 
 pub(crate) async fn load_previous_recovery_state(
     state: &mut SessionState,
+    user_id: &str,
     sid: &str,
 ) -> Result<
     (
@@ -57,16 +68,17 @@ pub(crate) async fn load_previous_recovery_state(
     ),
     String,
 > {
-    let previous_heavy = astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(sid)
-        .map_err(|e| format!("read latest heavy checkpoint: {e}"))?;
+    let previous_heavy =
+        astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(user_id, sid)
+            .map_err(|e| format!("read latest heavy checkpoint: {e}"))?;
     let csl_state = ensure_loaded_csl_state(state, sid).await?;
     let prev_state = previous_session_state_for_history_sync(previous_heavy.as_ref(), csl_state);
     Ok((previous_heavy, prev_state))
 }
 
 /// Copy plan / durable-task fields from REPL into workspace before checkpointing.
-pub(crate) fn next_step_checkpoint_number(sid: &str) -> Result<u32, String> {
-    let existing = astra_pipeline::step_checkpoint::list_checkpoints(sid)
+pub(crate) fn next_step_checkpoint_number(user_id: &str, sid: &str) -> Result<u32, String> {
+    let existing = astra_pipeline::step_checkpoint::list_checkpoints(user_id, sid)
         .map_err(|e| format!("list step checkpoints: {e}"))?;
     Ok(existing
         .iter()
@@ -181,6 +193,7 @@ pub(crate) fn build_manual_heavy_step_checkpoint(
 
 /// Persist heavy JSON + composite snapshot index before any workspace/journal mutation.
 pub(crate) fn persist_manual_heavy_and_composite(
+    user_id: &str,
     sid: &str,
     turn: u32,
     title: &str,
@@ -191,9 +204,9 @@ pub(crate) fn persist_manual_heavy_and_composite(
         read_composite_snapshot_index, write_composite_snapshot_index, write_step_checkpoint,
     };
 
-    let heavy_path = write_step_checkpoint(sid, next_step, step_cp)
+    let heavy_path = write_step_checkpoint(user_id, sid, next_step, step_cp)
         .map_err(|e| format!("write heavy step checkpoint: {e}"))?;
-    let composite_index_path = composite_index_path_for(sid);
+    let composite_index_path = composite_index_path_for(user_id, sid)?;
     let composite_index_backup = read_optional_file_bytes(&composite_index_path)
         .map_err(|e| format!("backup composite snapshot index: {e}"))?;
 
@@ -203,12 +216,12 @@ pub(crate) fn persist_manual_heavy_and_composite(
             .session_state(format!("{next_step:06}-heavy.json"))
             .workspace_state(sid.to_string())
             .build();
-    let mut index = read_composite_snapshot_index(sid)
+    let mut index = read_composite_snapshot_index(user_id, sid)
         .map_err(|e| format!("read composite snapshot index: {e}"))?;
     index
         .append(&mut snapshot)
         .map_err(|e| format!("append snapshot version: {e}"))?;
-    if let Err(e) = write_composite_snapshot_index(sid, &index) {
+    if let Err(e) = write_composite_snapshot_index(user_id, sid, &index) {
         let mut error_message = format!("write composite snapshot index: {e}");
         append_rollback_error(
             &mut error_message,
@@ -235,14 +248,23 @@ pub(crate) fn persist_manual_heavy_and_composite(
 
 pub(crate) fn persist_recovery_checkpoint(
     state: &SessionState,
+    user_id: &str,
     sid: &str,
     session_state: &astra_turn_core::conversation_log::SessionStateCompact,
     previous_heavy: Option<&astra_pipeline::step_protocol::HeavyCheckpoint>,
 ) -> Result<RecoveryCheckpointRollback, String> {
-    let next_step = next_step_checkpoint_number(sid)?;
-    let composite_index_backup = read_optional_file_bytes(&composite_index_path_for(sid))?;
+    let next_step = next_step_checkpoint_number(user_id, sid)?;
+    let composite_index_path = composite_index_path_for(user_id, sid)?;
+    let composite_index_backup = read_optional_file_bytes(&composite_index_path)?;
     let step_cp = build_manual_heavy_step_checkpoint(state, sid, session_state, previous_heavy);
-    persist_manual_heavy_and_composite(sid, state.turn, "history-sync", next_step, &step_cp)?;
+    persist_manual_heavy_and_composite(
+        user_id,
+        sid,
+        state.turn,
+        "history-sync",
+        next_step,
+        &step_cp,
+    )?;
     Ok(RecoveryCheckpointRollback {
         step_number: next_step,
         composite_index_backup,
@@ -250,24 +272,29 @@ pub(crate) fn persist_recovery_checkpoint(
 }
 
 pub(crate) fn rollback_recovery_checkpoint(
+    user_id: &str,
     sid: &str,
     rollback: &RecoveryCheckpointRollback,
 ) -> Result<(), String> {
     let mut rollback_error = String::new();
-    if let Err(error) = restore_optional_file_bytes(
-        &composite_index_path_for(sid),
-        rollback.composite_index_backup.clone(),
-    ) {
+    let restore_index_result = composite_index_path_for(user_id, sid).and_then(|path| {
+        restore_optional_file_bytes(&path, rollback.composite_index_backup.clone())
+    });
+    if let Err(error) = restore_index_result {
         rollback_error = format!("restore composite snapshot index: {error}");
     }
-    let delete_result =
-        astra_pipeline::step_checkpoint::delete_step_checkpoint(sid, rollback.step_number, "heavy")
-            .map_err(|e| {
-                format!(
-                    "delete heavy step checkpoint {:06}: {e}",
-                    rollback.step_number
-                )
-            });
+    let delete_result = astra_pipeline::step_checkpoint::delete_step_checkpoint(
+        user_id,
+        sid,
+        rollback.step_number,
+        "heavy",
+    )
+    .map_err(|e| {
+        format!(
+            "delete heavy step checkpoint {:06}: {e}",
+            rollback.step_number
+        )
+    });
     if let Err(error) = delete_result {
         if rollback_error.is_empty() {
             rollback_error = error;
@@ -293,7 +320,8 @@ pub(crate) async fn sync_recovery_snapshot_after_history_edit(
     };
 
     super::super::session_projection::rebuild_continuation_anchor_from_live_state(state).await;
-    let (previous_heavy, prev_state) = load_previous_recovery_state(state, &sid).await?;
+    let user_id = recovery_user_id(state);
+    let (previous_heavy, prev_state) = load_previous_recovery_state(state, &user_id, &sid).await?;
     let session_state = super::super::session_projection::build_full_session_state_compact(
         state,
         super::super::session_projection::CslCheckpointFields,
@@ -303,8 +331,13 @@ pub(crate) async fn sync_recovery_snapshot_after_history_edit(
     let workspace_path = workspace_path_for(&sid);
     let workspace_backup = read_optional_file_bytes(&workspace_path)?;
 
-    let checkpoint_rollback =
-        persist_recovery_checkpoint(state, &sid, &session_state, previous_heavy.as_ref())?;
+    let checkpoint_rollback = persist_recovery_checkpoint(
+        state,
+        &user_id,
+        &sid,
+        &session_state,
+        previous_heavy.as_ref(),
+    )?;
     if let Err(error) = persist_recovery_workspace_snapshot(state, &sid) {
         let mut error_message = error;
         append_rollback_error(
@@ -315,7 +348,7 @@ pub(crate) async fn sync_recovery_snapshot_after_history_edit(
         append_rollback_error(
             &mut error_message,
             "recovery checkpoint",
-            rollback_recovery_checkpoint(&sid, &checkpoint_rollback),
+            rollback_recovery_checkpoint(&user_id, &sid, &checkpoint_rollback),
         );
         return Err(error_message);
     }
@@ -329,7 +362,7 @@ pub(crate) async fn sync_recovery_snapshot_after_history_edit(
         append_rollback_error(
             &mut error_message,
             "recovery checkpoint",
-            rollback_recovery_checkpoint(&sid, &checkpoint_rollback),
+            rollback_recovery_checkpoint(&user_id, &sid, &checkpoint_rollback),
         );
         return Err(error_message);
     }

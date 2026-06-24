@@ -53,6 +53,27 @@ async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str) {
         .bind(session_id)
         .execute(pool)
         .await;
+    let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ?")
+        .bind(session_id)
+        .execute(pool)
+        .await;
+}
+
+async fn create_session(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str, user_id: &str) {
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, agent_id, title, status, metadata)
+         VALUES (?, ?, 'session-todos-test', 'session todos test', 'active', '{}')",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("insert agent_sessions owner root");
+}
+
+async fn prepare_session(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str, user_id: &str) {
+    cleanup(pool, session_id).await;
+    create_session(pool, session_id, user_id).await;
 }
 
 #[tokio::test]
@@ -61,7 +82,7 @@ async fn edge_created_task_visible_on_cloud() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-x-client-{}", uuid::Uuid::new_v4());
     let user_id = format!("u-{}", session_id);
-    cleanup(&pool, &session_id).await;
+    prepare_session(&pool, &session_id, &user_id).await;
 
     let edge_store: Arc<dyn TaskStore> =
         Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), user_id.clone()).unwrap());
@@ -101,7 +122,7 @@ async fn matrixone_task_store_refuses_mixed_owner_counter_without_overwrite() {
     let session_id = format!("s-mixed-counter-store-{}", uuid::Uuid::new_v4());
     let owner_user_id = format!("u-owner-{}", uuid::Uuid::new_v4());
     let other_user_id = format!("u-other-{}", uuid::Uuid::new_v4());
-    cleanup(&pool, &session_id).await;
+    prepare_session(&pool, &session_id, &owner_user_id).await;
 
     sqlx::query(
         "INSERT INTO session_todo_counters (session_id, user_id, next_id, version) \
@@ -173,11 +194,11 @@ async fn matrixone_task_store_refuses_mixed_owner_counter_without_overwrite() {
 async fn unknown_task_fields_are_rejected_through_matrixone_store() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-unknown-fields-{}", uuid::Uuid::new_v4());
-    cleanup(&pool, &session_id).await;
+    let user_id = format!("u-{}", session_id);
+    prepare_session(&pool, &session_id, &user_id).await;
 
-    let store: Arc<dyn TaskStore> = Arc::new(
-        MatrixOneTaskStore::new_for_user(pool.clone(), format!("u-{}", session_id)).unwrap(),
-    );
+    let store: Arc<dyn TaskStore> =
+        Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
     let mgr = TaskManager::new(session_id.clone(), store);
 
     let create_typo = mgr
@@ -229,11 +250,11 @@ async fn unknown_task_fields_are_rejected_through_matrixone_store() {
 async fn matrixone_update_title_refuses_duplicate_open_task() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-dup-rename-{}", uuid::Uuid::new_v4());
-    cleanup(&pool, &session_id).await;
+    let user_id = format!("u-{}", session_id);
+    prepare_session(&pool, &session_id, &user_id).await;
 
-    let store: Arc<dyn TaskStore> = Arc::new(
-        MatrixOneTaskStore::new_for_user(pool.clone(), format!("u-{}", session_id)).unwrap(),
-    );
+    let store: Arc<dyn TaskStore> =
+        Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
     let mgr = TaskManager::new(session_id.clone(), store);
 
     let first = mgr
@@ -275,11 +296,11 @@ async fn matrixone_update_title_refuses_duplicate_open_task() {
 async fn snapshot_restore_roundtrips_through_mo() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-snap-{}", uuid::Uuid::new_v4());
-    cleanup(&pool, &session_id).await;
+    let user_id = format!("u-{}", session_id);
+    prepare_session(&pool, &session_id, &user_id).await;
 
-    let store: Arc<dyn TaskStore> = Arc::new(
-        MatrixOneTaskStore::new_for_user(pool.clone(), format!("u-{}", session_id)).unwrap(),
-    );
+    let store: Arc<dyn TaskStore> =
+        Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
     let mgr = TaskManager::new(session_id.clone(), store);
     mgr.create(&json!({"title": "t1"})).await;
     let mut snap = mgr
@@ -313,7 +334,7 @@ async fn snapshot_restore_uses_existing_rows_when_matrixone_counter_is_zero() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-zero-counter-snapshot-{}", uuid::Uuid::new_v4());
     let user_id = format!("u-{}", session_id);
-    cleanup(&pool, &session_id).await;
+    prepare_session(&pool, &session_id, &user_id).await;
 
     let store: Arc<dyn TaskStore> =
         Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), user_id.clone()).unwrap());
@@ -348,11 +369,11 @@ async fn snapshot_restore_uses_existing_rows_when_matrixone_counter_is_zero() {
 async fn matrixone_restore_snapshot_rolls_back_counter_when_task_insert_fails() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-restore-atomic-{}", uuid::Uuid::new_v4());
-    cleanup(&pool, &session_id).await;
+    let user_id = format!("u-{}", session_id);
+    prepare_session(&pool, &session_id, &user_id).await;
 
-    let store: Arc<dyn TaskStore> = Arc::new(
-        MatrixOneTaskStore::new_for_user(pool.clone(), format!("u-{}", session_id)).unwrap(),
-    );
+    let store: Arc<dyn TaskStore> =
+        Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
     let mgr = TaskManager::new(session_id.clone(), store.clone());
     let create = mgr.create(&json!({"title": "surviving task"})).await;
     assert!(create.contains("\"success\":true"), "{create}");
@@ -422,9 +443,9 @@ async fn load_open_sessions_is_bounded_open_work_and_user_scoped() {
     let session_a = format!("s-open-sessions-a-{}", uuid::Uuid::new_v4());
     let session_b = format!("s-open-sessions-b-{}", uuid::Uuid::new_v4());
     let session_other = format!("s-open-sessions-other-{}", uuid::Uuid::new_v4());
-    for session_id in [&session_a, &session_b, &session_other] {
-        cleanup(&pool, session_id).await;
-    }
+    prepare_session(&pool, &session_a, &user_id).await;
+    prepare_session(&pool, &session_b, &user_id).await;
+    prepare_session(&pool, &session_other, &other_user).await;
 
     let store_a: Arc<dyn TaskStore> =
         Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
@@ -495,11 +516,11 @@ async fn load_open_sessions_is_bounded_open_work_and_user_scoped() {
 async fn active_list_includes_paused_open_work_in_matrixone() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-active-list-paused-{}", uuid::Uuid::new_v4());
-    cleanup(&pool, &session_id).await;
+    let user_id = format!("u-{}", session_id);
+    prepare_session(&pool, &session_id, &user_id).await;
 
-    let store: Arc<dyn TaskStore> = Arc::new(
-        MatrixOneTaskStore::new_for_user(pool.clone(), format!("u-{}", session_id)).unwrap(),
-    );
+    let store: Arc<dyn TaskStore> =
+        Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
     let manager = TaskManager::new(session_id.clone(), store);
 
     let pending = manager
@@ -576,14 +597,13 @@ async fn snapshot_restore_after_cross_client_allocations_rejects_stale_snapshot_
 {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-snap-x-client-{}", uuid::Uuid::new_v4());
-    cleanup(&pool, &session_id).await;
+    let user_id = format!("u-{}", session_id);
+    prepare_session(&pool, &session_id, &user_id).await;
 
-    let edge_store: Arc<dyn TaskStore> = Arc::new(
-        MatrixOneTaskStore::new_for_user(pool.clone(), format!("u-{}", session_id)).unwrap(),
-    );
-    let cloud_store: Arc<dyn TaskStore> = Arc::new(
-        MatrixOneTaskStore::new_for_user(pool.clone(), format!("u-{}", session_id)).unwrap(),
-    );
+    let edge_store: Arc<dyn TaskStore> =
+        Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
+    let cloud_store: Arc<dyn TaskStore> =
+        Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
     let edge = TaskManager::new(session_id.clone(), edge_store);
     let cloud = TaskManager::new(session_id.clone(), cloud_store);
 
@@ -623,11 +643,11 @@ async fn snapshot_restore_after_cross_client_allocations_rejects_stale_snapshot_
 async fn deleted_and_cancelled_are_distinct_transitions() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-states-{}", uuid::Uuid::new_v4());
-    cleanup(&pool, &session_id).await;
+    let user_id = format!("u-{}", session_id);
+    prepare_session(&pool, &session_id, &user_id).await;
 
-    let store: Arc<dyn TaskStore> = Arc::new(
-        MatrixOneTaskStore::new_for_user(pool.clone(), format!("u-{}", session_id)).unwrap(),
-    );
+    let store: Arc<dyn TaskStore> =
+        Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
     let mgr = TaskManager::new(session_id.clone(), store);
     mgr.create(&json!({"title": "to-cancel"})).await;
     mgr.create(&json!({"title": "to-delete"})).await;
@@ -679,10 +699,10 @@ async fn bulk_archive_is_scoped_to_current_session_even_with_user_store() {
     let pool = bootstrap_pool().await;
     let session_a = format!("s-archive-a-{}", uuid::Uuid::new_v4());
     let session_b = format!("s-archive-b-{}", uuid::Uuid::new_v4());
-    cleanup(&pool, &session_a).await;
-    cleanup(&pool, &session_b).await;
 
     let user_id = format!("u-archive-{}", uuid::Uuid::new_v4());
+    prepare_session(&pool, &session_a, &user_id).await;
+    prepare_session(&pool, &session_b, &user_id).await;
     let store_a: Arc<dyn TaskStore> =
         Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
     let store_b: Arc<dyn TaskStore> =
@@ -763,9 +783,8 @@ async fn bulk_archive_is_scoped_to_current_session_even_with_user_store() {
 async fn dependency_edges_remain_symmetric_across_matrixone_clients() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-edge-symmetric-{}", uuid::Uuid::new_v4());
-    cleanup(&pool, &session_id).await;
-
     let user_id = format!("u-edge-symmetric-{}", uuid::Uuid::new_v4());
+    prepare_session(&pool, &session_id, &user_id).await;
     let edge_store: Arc<dyn TaskStore> =
         Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
     let cloud_store: Arc<dyn TaskStore> =
@@ -806,9 +825,8 @@ async fn dependency_edges_remain_symmetric_across_matrixone_clients() {
 async fn blocked_task_cannot_start_until_dependency_completes_in_matrixone() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-blocked-start-{}", uuid::Uuid::new_v4());
-    cleanup(&pool, &session_id).await;
-
     let user_id = format!("u-blocked-start-{}", uuid::Uuid::new_v4());
+    prepare_session(&pool, &session_id, &user_id).await;
     let edge_store: Arc<dyn TaskStore> =
         Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
     let cloud_store: Arc<dyn TaskStore> =
@@ -857,9 +875,8 @@ async fn blocked_task_cannot_start_until_dependency_completes_in_matrixone() {
 async fn in_progress_task_rejects_new_unresolved_blocker_in_matrixone() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-running-blocker-{}", uuid::Uuid::new_v4());
-    cleanup(&pool, &session_id).await;
-
     let user_id = format!("u-running-blocker-{}", uuid::Uuid::new_v4());
+    prepare_session(&pool, &session_id, &user_id).await;
     let edge_store: Arc<dyn TaskStore> =
         Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
     let cloud_store: Arc<dyn TaskStore> =
@@ -901,9 +918,8 @@ async fn in_progress_task_rejects_new_unresolved_blocker_in_matrixone() {
 async fn dangling_blocked_by_dependency_blocks_start_in_matrixone() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-dangling-blocked-by-{}", uuid::Uuid::new_v4());
-    cleanup(&pool, &session_id).await;
-
     let user_id = format!("u-dangling-blocked-by-{}", uuid::Uuid::new_v4());
+    prepare_session(&pool, &session_id, &user_id).await;
     let store: Arc<dyn TaskStore> =
         Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
     let mgr = TaskManager::new(session_id.clone(), store);
@@ -938,9 +954,8 @@ async fn dangling_blocked_by_dependency_blocks_start_in_matrixone() {
 async fn corrupt_dependency_json_fails_closed_in_matrixone() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-corrupt-blocked-by-{}", uuid::Uuid::new_v4());
-    cleanup(&pool, &session_id).await;
-
     let user_id = format!("u-corrupt-blocked-by-{}", uuid::Uuid::new_v4());
+    prepare_session(&pool, &session_id, &user_id).await;
     let store: Arc<dyn TaskStore> =
         Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
     let mgr = TaskManager::new(session_id.clone(), store);
@@ -977,9 +992,8 @@ async fn corrupt_dependency_json_fails_closed_in_matrixone() {
 async fn matrixone_load_rejects_unknown_persisted_task_status() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-corrupt-status-{}", uuid::Uuid::new_v4());
-    cleanup(&pool, &session_id).await;
-
     let user_id = format!("u-corrupt-status-{}", uuid::Uuid::new_v4());
+    prepare_session(&pool, &session_id, &user_id).await;
     let store: Arc<dyn TaskStore> =
         Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
     let mgr = TaskManager::new(session_id.clone(), store);
@@ -1026,9 +1040,8 @@ async fn matrixone_load_rejects_unknown_persisted_task_status() {
 async fn subtask_depends_on_blocks_out_of_order_start_in_matrixone() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-subtask-deps-{}", uuid::Uuid::new_v4());
-    cleanup(&pool, &session_id).await;
-
     let user_id = format!("u-subtask-deps-{}", uuid::Uuid::new_v4());
+    prepare_session(&pool, &session_id, &user_id).await;
     let edge_store: Arc<dyn TaskStore> =
         Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
     let cloud_store: Arc<dyn TaskStore> =
@@ -1089,9 +1102,8 @@ async fn subtask_depends_on_blocks_out_of_order_start_in_matrixone() {
 async fn second_in_progress_task_is_rejected_across_matrixone_clients() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-single-running-{}", uuid::Uuid::new_v4());
-    cleanup(&pool, &session_id).await;
-
     let user_id = format!("u-single-running-{}", uuid::Uuid::new_v4());
+    prepare_session(&pool, &session_id, &user_id).await;
     let edge_store: Arc<dyn TaskStore> =
         Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
     let cloud_store: Arc<dyn TaskStore> =
@@ -1136,9 +1148,8 @@ async fn second_in_progress_task_is_rejected_across_matrixone_clients() {
 async fn archive_detaches_dependency_edges_through_matrixone_store() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-archive-edges-{}", uuid::Uuid::new_v4());
-    cleanup(&pool, &session_id).await;
-
     let user_id = format!("u-archive-edges-{}", uuid::Uuid::new_v4());
+    prepare_session(&pool, &session_id, &user_id).await;
     let store: Arc<dyn TaskStore> =
         Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
     let mgr = TaskManager::new(session_id.clone(), store);
@@ -1184,11 +1195,11 @@ async fn load_all_sessions_is_scoped_to_user_store() {
     let pool = bootstrap_pool().await;
     let session_a = format!("s-load-all-a-{}", uuid::Uuid::new_v4());
     let session_b = format!("s-load-all-b-{}", uuid::Uuid::new_v4());
-    cleanup(&pool, &session_a).await;
-    cleanup(&pool, &session_b).await;
 
     let user_a = format!("u-load-all-a-{}", uuid::Uuid::new_v4());
     let user_b = format!("u-load-all-b-{}", uuid::Uuid::new_v4());
+    prepare_session(&pool, &session_a, &user_a).await;
+    prepare_session(&pool, &session_b, &user_b).await;
     let store_a: Arc<dyn TaskStore> =
         Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_a).unwrap());
     let store_b: Arc<dyn TaskStore> =
@@ -1236,15 +1247,14 @@ async fn load_all_sessions_is_scoped_to_user_store() {
 async fn concurrent_next_task_id_is_unique() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-race-{}", uuid::Uuid::new_v4());
-    cleanup(&pool, &session_id).await;
+    let user_id = format!("u-{}", session_id);
+    prepare_session(&pool, &session_id, &user_id).await;
 
     // Two independent stores sharing the pool — mirrors prod cross-host.
-    let store_a: Arc<dyn TaskStore> = Arc::new(
-        MatrixOneTaskStore::new_for_user(pool.clone(), format!("u-{}", session_id)).unwrap(),
-    );
-    let store_b: Arc<dyn TaskStore> = Arc::new(
-        MatrixOneTaskStore::new_for_user(pool.clone(), format!("u-{}", session_id)).unwrap(),
-    );
+    let store_a: Arc<dyn TaskStore> =
+        Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
+    let store_b: Arc<dyn TaskStore> =
+        Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
 
     const CONCURRENCY: u32 = 16;
     let mut handles = Vec::with_capacity(CONCURRENCY as usize);

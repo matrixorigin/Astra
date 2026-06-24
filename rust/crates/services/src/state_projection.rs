@@ -223,6 +223,7 @@ pub trait PlanTodoSink: Send + Sync + std::fmt::Debug {
     /// plan_id (e.g. legacy tests).
     async fn supersede_other_plans(
         &self,
+        _user_id: &str,
         _session_id: &str,
         _keep_plan_id: &str,
     ) -> Result<u64, String> {
@@ -257,11 +258,12 @@ impl PlanTodoSink for DatabasePlanTodoSink {
 
     async fn supersede_other_plans(
         &self,
+        user_id: &str,
         session_id: &str,
         keep_plan_id: &str,
     ) -> Result<u64, String> {
         self.store
-            .supersede_session_plan_todos(session_id, keep_plan_id)
+            .supersede_session_plan_todos(user_id, session_id, keep_plan_id)
             .await
             .map_err(|e| e.to_string())
     }
@@ -277,11 +279,16 @@ impl DatabaseStateProjectionStore {
         Self { pool }
     }
 
-    pub async fn can_compact_session(&self, session_id: &str) -> Result<(), StateProjectionError> {
+    pub async fn can_compact_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<(), StateProjectionError> {
         let row = sqlx::query(
             "SELECT COUNT(*) AS active_count FROM agent_runs \
-             WHERE session_id = ? AND status IN ('running', 'waiting')",
+             WHERE user_id = ? AND session_id = ? AND status IN ('running', 'waiting')",
         )
+        .bind(user_id)
         .bind(session_id)
         .fetch_one(self.pool.get())
         .await
@@ -333,7 +340,7 @@ impl DatabaseStateProjectionStore {
         compaction_run_id: &str,
         plan_todo_tokens: u32,
     ) -> Result<Vec<(String, i64)>, StateProjectionError> {
-        self.can_compact_session(session_id).await?;
+        self.can_compact_session(user_id, session_id).await?;
         let budget = BudgetV1_8k::standard();
         let manifest_id = format!("manifest-{}", Uuid::new_v4());
         let manifest = ContextManifestWrite {
@@ -1086,16 +1093,19 @@ impl DatabaseStateProjectionStore {
     /// careless mass-supersede.
     pub async fn supersede_session_plan_todos(
         &self,
+        user_id: &str,
         session_id: &str,
         keep_plan_id: &str,
     ) -> Result<u64, StateProjectionError> {
         let result = sqlx::query(
             "UPDATE session_plan_todos \
              SET status = 'superseded', updated_at = CURRENT_TIMESTAMP(6) \
-             WHERE session_id = ? \
+             WHERE user_id = ? \
+               AND session_id = ? \
                AND status = 'active' \
                AND (plan_id IS NULL OR plan_id <> ?)",
         )
+        .bind(user_id)
         .bind(session_id)
         .bind(keep_plan_id)
         .execute(self.pool.get())
@@ -1464,5 +1474,27 @@ mod tests {
                 invariant.id
             );
         }
+    }
+
+    #[test]
+    fn state_mutation_validator_accepts_only_current_operations() {
+        for mutation in [
+            "insert",
+            "update",
+            "replace",
+            "archive",
+            "delete",
+            "bubble_up",
+            "apply_suggestion",
+            "activate",
+        ] {
+            validate_state_mutation(mutation).expect("valid mutation");
+        }
+
+        let error = validate_state_mutation("teleport").expect_err("unknown mutation");
+        assert!(matches!(
+            error,
+            StateProjectionError::InvalidMutation { mutation } if mutation == "teleport"
+        ));
     }
 }

@@ -51,9 +51,9 @@ impl RetentionPolicy {
     /// Apply retention policy to a session's trace data.
     ///
     /// Returns statistics about what was removed.
-    pub fn cleanup(&self, session_id: &str) -> io::Result<CleanupStats> {
+    pub fn cleanup(&self, user_id: &str, session_id: &str) -> io::Result<CleanupStats> {
         let mut stats = CleanupStats::default();
-        let dir = session_dir_for(session_id)?;
+        let dir = session_dir_for(user_id, session_id)?;
 
         if !dir.exists() {
             return Ok(stats);
@@ -109,7 +109,7 @@ impl RetentionPolicy {
         let mut total_size = 0u64;
 
         // Current events file
-        let events_path = events_path_for(session_id)?;
+        let events_path = events_path_for(user_id, session_id)?;
         if let Ok(meta) = std::fs::metadata(&events_path) {
             total_size += meta.len();
         }
@@ -164,8 +164,8 @@ impl RetentionPolicy {
     }
 
     /// Check if a session needs cleanup (has exceeded limits).
-    pub fn needs_cleanup(&self, session_id: &str) -> bool {
-        let dir = match session_dir_for(session_id) {
+    pub fn needs_cleanup(&self, user_id: &str, session_id: &str) -> bool {
+        let dir = match session_dir_for(user_id, session_id) {
             Ok(dir) => dir,
             Err(_) => return false,
         };
@@ -189,7 +189,7 @@ impl RetentionPolicy {
 
         // Check total size
         let mut total_size = 0u64;
-        let events_path = match events_path_for(session_id) {
+        let events_path = match events_path_for(user_id, session_id) {
             Ok(path) => path,
             Err(_) => return false,
         };
@@ -220,6 +220,8 @@ fn archive_exceeds_max_age(now: u64, mtime: u64, max_age_secs: u64) -> bool {
 mod tests {
     use super::*;
 
+    const TEST_USER_ID: &str = "test-user";
+
     #[test]
     fn default_policy_reasonable_values() {
         let policy = RetentionPolicy::default();
@@ -231,7 +233,7 @@ mod tests {
     #[test]
     fn cleanup_nonexistent_session() {
         let policy = RetentionPolicy::default();
-        let result = policy.cleanup("nonexistent-session-id");
+        let result = policy.cleanup(TEST_USER_ID, "nonexistent-session-id");
         assert!(result.is_ok());
         let stats = result.unwrap();
         assert_eq!(stats.archives_removed, 0);
@@ -240,7 +242,7 @@ mod tests {
     #[test]
     fn needs_cleanup_returns_false_for_missing_dir() {
         let policy = RetentionPolicy::default();
-        assert!(!policy.needs_cleanup("nonexistent-session-id"));
+        assert!(!policy.needs_cleanup(TEST_USER_ID, "nonexistent-session-id"));
     }
 
     #[test]

@@ -29,6 +29,7 @@ use astra_services::coordination::AgentResult;
 use astra_turn_core::tool::schema::tool_names_from_schemas;
 
 use super::skill_subrun::{SubRunHost, persist_failed_subrun};
+use crate::cli::cli_config::cli_utils::cli_user_id;
 use crate::edge_tools;
 
 const DELEGATE_MAX_TURNS: usize = 25;
@@ -362,8 +363,12 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
 
         let task_profile = infer_task_execution_profile(&config.task);
         let subrun_session_id = format!("delegate-{}-{}", config.run_id, profile.agent_id);
-        let step_recorder =
-            StepRecorder::with_persistence(&subrun_session_id, &format!("{}-run", config.run_id));
+        let user_id = cli_user_id();
+        let step_recorder = StepRecorder::with_persistence(
+            &user_id,
+            &subrun_session_id,
+            &format!("{}-run", config.run_id),
+        );
 
         let mut state = AgenticLoopState {
             messages,
@@ -375,7 +380,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             current_session_id: Some(config.session_id.clone()),
             current_run_id: Some(config.run_id.clone()),
             context_manifest_pool: None,
-            context_manifest_user_id: None,
+            context_manifest_user_id: Some(user_id),
             context_manifest_model_name: effective_model.clone(),
             runtime_manifest: runtime_manifest_for_model(
                 "cli_delegate_subrun",

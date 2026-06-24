@@ -10,7 +10,7 @@
 //! # Usage
 //!
 //! ```ignore
-//! let restored = restore_session("session-123")?;
+//! let restored = restore_session("user-123", "session-123")?;
 //! if let Some(state) = restored {
 //!     // Resume from checkpoint
 //!     let messages = state.messages;
@@ -99,17 +99,21 @@ impl std::fmt::Display for RestoreError {
 ///
 /// Returns `Ok(Some(RestoredSession))` if a valid checkpoint exists,
 /// `Ok(None)` if no checkpoint found, or `Err` on version mismatch/corruption.
-pub fn restore_session(session_id: &str) -> Result<Option<RestoredSession>, RestoreError> {
-    restore_session_with_policy(session_id, VersionPolicy::Compatible)
+pub fn restore_session(
+    user_id: &str,
+    session_id: &str,
+) -> Result<Option<RestoredSession>, RestoreError> {
+    restore_session_with_policy(user_id, session_id, VersionPolicy::Compatible)
 }
 
 /// Restore with explicit version policy.
 pub fn restore_session_with_policy(
+    user_id: &str,
     session_id: &str,
     policy: VersionPolicy,
 ) -> Result<Option<RestoredSession>, RestoreError> {
     // Step 1: Load latest heavy checkpoint
-    let heavy = match read_latest_heavy_checkpoint(session_id) {
+    let heavy = match read_latest_heavy_checkpoint(user_id, session_id) {
         Ok(Some(h)) => h,
         Ok(None) => return Ok(None),
         Err(e) => return Err(RestoreError::IoError(e.to_string())),
@@ -119,16 +123,17 @@ pub fn restore_session_with_policy(
     validate_checkpoint_version(&heavy, policy)?;
 
     // Step 3: Extract resume turn and warm cache
-    build_restored_session(session_id, heavy)
+    build_restored_session(user_id, session_id, heavy)
 }
 
 /// Shared: build RestoredSession from a validated checkpoint.
 fn build_restored_session(
+    user_id: &str,
     session_id: &str,
     heavy: HeavyCheckpoint,
 ) -> Result<Option<RestoredSession>, RestoreError> {
     let resume_turn = extract_resume_turn(&heavy);
-    let (cache, completed_results) = warm_cache_from_events(session_id);
+    let (cache, completed_results) = warm_cache_from_events(user_id, session_id);
 
     Ok(Some(RestoredSession {
         messages: heavy.messages,
@@ -189,12 +194,13 @@ fn extract_resume_turn(heavy: &HeavyCheckpoint) -> u32 {
 /// on resume, already-executed tools are skipped (especially important
 /// for non-idempotent tools like bash).
 pub fn warm_cache_from_events(
+    user_id: &str,
     session_id: &str,
 ) -> (InMemoryIdempotencyCache, HashMap<String, Vec<String>>) {
     let mut cache = InMemoryIdempotencyCache::new();
     let mut completed_results: HashMap<String, Vec<String>> = HashMap::new();
 
-    let result = FileBackedEventStore::for_each_event(session_id, |event| {
+    let result = FileBackedEventStore::for_each_event(user_id, session_id, |event| {
         if let StepEventType::ToolCallCompleted = &event.event_type {
             let Some(payload) = &event.payload else {
                 return;
@@ -240,6 +246,7 @@ pub fn warm_cache_from_events(
 
     if let Err(error) = result {
         tracing::warn!(
+            user_id,
             session_id,
             error = %error,
             "failed to stream step events while warming idempotency cache"
@@ -371,6 +378,8 @@ mod tests {
     use crate::step_protocol::{
         ExecutionCursor, IdempotencyKey, LightCheckpoint, StepEventStore, epoch_ms,
     };
+
+    const TEST_USER_ID: &str = "test-user";
 
     // ── Helper: build a heavy checkpoint for testing ──
 
@@ -526,7 +535,7 @@ mod tests {
     #[test]
     fn warm_cache_from_empty_events() {
         // Non-existent session → empty cache
-        let (cache, results) = warm_cache_from_events("nonexistent-session-xyz");
+        let (cache, results) = warm_cache_from_events(TEST_USER_ID, "nonexistent-session-xyz");
         assert!(cache.is_empty());
         assert!(results.is_empty());
     }
@@ -536,7 +545,7 @@ mod tests {
         let session_id = format!("warm-cache-key-{}-{}", std::process::id(), epoch_ms());
         let args = serde_json::json!({"path": "src/lib.rs"});
         let key = IdempotencyKey::semantic("read_file", &args);
-        let mut store = FileBackedEventStore::empty(&session_id);
+        let mut store = FileBackedEventStore::empty(TEST_USER_ID, &session_id);
         let _ = store.append(StepEvent {
             event_id: "completed-read".to_string(),
             canonical_event_id: None,
@@ -554,7 +563,7 @@ mod tests {
         });
         drop(store);
 
-        let (cache, results) = warm_cache_from_events(&session_id);
+        let (cache, results) = warm_cache_from_events(TEST_USER_ID, &session_id);
         let cached = cache
             .check(&key)
             .expect("warm cache must restore the exact persisted idempotency key");
@@ -565,7 +574,7 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(
-            crate::step_checkpoint::session_dir_for(&session_id)
+            crate::step_checkpoint::session_dir_for(TEST_USER_ID, &session_id)
                 .expect("valid session id for test cleanup"),
         );
     }

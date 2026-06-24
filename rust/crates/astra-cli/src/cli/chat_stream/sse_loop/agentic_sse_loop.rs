@@ -327,7 +327,7 @@ mod tests {
     use crate::VerdictEvent;
 
     fn make_step_recorder() -> StepRecorder {
-        StepRecorder::with_persistence("test-session", "test-task")
+        StepRecorder::with_persistence("test-user", "test-session", "test-task")
     }
 
     fn make_turn_guard() -> TurnGuard {

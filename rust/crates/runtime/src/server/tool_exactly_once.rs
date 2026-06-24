@@ -38,6 +38,7 @@ fn base16_encode_lower(bytes: &[u8]) -> String {
 pub(crate) struct ExactlyOnceState {
     pub(crate) in_memory: Mutex<astra_pipeline::exactly_once::ExactlyOnceExecutor>,
     pool: Option<SharedPool>,
+    user_id: String,
     session_id: String,
 }
 
@@ -50,23 +51,20 @@ pub(crate) struct ExactlyOnceState {
 /// recovery path: after a crash, the in-memory cache is empty but the DB holds
 /// results from the pre-crash execution.
 pub(crate) async fn enable_exactly_once(
+    user_id: &str,
     session_id: &str,
     pool: Option<SharedPool>,
 ) -> ExactlyOnceState {
     let mut executor = astra_pipeline::exactly_once::ExactlyOnceExecutor::new();
 
-    // Phase 1: warm from event stream (existing path).
-    let (warmed_cache, _completed) =
-        astra_pipeline::step_restore::warm_cache_from_events(session_id);
-    merge_warmed_event_cache(&mut executor, warmed_cache, session_id);
-
-    // Phase 2: warm from DB (crash recovery).
-    // This intentionally runs after event replay and merges into the same
-    // executor cache. DB records cover the crash window where a tool succeeded
-    // and persisted exactly-once state before the local event stream caught up.
+    // Owner-bound server recovery must not hydrate from local event streams:
+    // those artifacts are keyed by session_id only and carry no trustworthy
+    // owner metadata. The DB table is the authoritative server cache because
+    // every row is scoped by (user_id, session_id).
     if let Some(ref pool) = pool {
-        if let Err(e) = warm_cache_from_db(&mut executor, session_id, pool).await {
+        if let Err(e) = warm_cache_from_db(&mut executor, user_id, session_id, pool).await {
             tracing::warn!(
+                user_id = %user_id,
                 session_id = %session_id,
                 error = %e,
                 "failed to warm exactly-once cache from DB; falling back to in-memory only"
@@ -77,36 +75,24 @@ pub(crate) async fn enable_exactly_once(
     ExactlyOnceState {
         in_memory: Mutex::new(executor),
         pool,
+        user_id: user_id.to_string(),
         session_id: session_id.to_string(),
-    }
-}
-
-fn merge_warmed_event_cache(
-    executor: &mut astra_pipeline::exactly_once::ExactlyOnceExecutor,
-    warmed_cache: astra_pipeline::step_protocol::InMemoryIdempotencyCache,
-    session_id: &str,
-) {
-    let warmed_len = warmed_cache.len();
-    if warmed_len > 0 {
-        executor.cache_mut().merge_from(warmed_cache);
-        tracing::info!(
-            session_id = %session_id,
-            entries = warmed_len,
-            "exactly-once cache warmed from event store"
-        );
     }
 }
 
 async fn warm_cache_from_db(
     executor: &mut astra_pipeline::exactly_once::ExactlyOnceExecutor,
+    user_id: &str,
     session_id: &str,
     pool: &SharedPool,
 ) -> Result<(), sqlx::Error> {
     use sqlx::Row;
 
     let rows = sqlx::query(
-        "SELECT dedup_key, key_json, result_json FROM tool_exactly_once_results WHERE session_id = ?",
+        "SELECT dedup_key, key_json, result_json FROM tool_exactly_once_results \
+         WHERE user_id = ? AND session_id = ?",
     )
+    .bind(user_id)
     .bind(session_id)
     .fetch_all(pool.get())
     .await?;
@@ -145,6 +131,7 @@ async fn warm_cache_from_db(
 
     if count > 0 {
         tracing::info!(
+            user_id = %user_id,
             session_id = %session_id,
             count,
             "warmed exactly-once cache from DB"
@@ -302,6 +289,7 @@ pub(crate) async fn record_result(
     // current session.
     if let Some(ref pool) = state.pool {
         let pool = pool.clone();
+        let user_id = state.user_id.clone();
         let session_id = state.session_id.clone();
         let dedup_key = dedup_key_hash(&cache_key);
         let cached_for_persist = CachedToolResult {
@@ -317,11 +305,19 @@ pub(crate) async fn record_result(
             dedup_key = %dedup_key,
             "Exactly-once: persisting result for crash recovery"
         );
-        let persist_fut = persist_result(&pool, &session_id, &dedup_key, &key, &cached_for_persist);
+        let persist_fut = persist_result(
+            &pool,
+            &user_id,
+            &session_id,
+            &dedup_key,
+            &key,
+            &cached_for_persist,
+        );
         match tokio::time::timeout(Duration::from_millis(500), persist_fut).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 tracing::warn!(
+                    user_id = %user_id,
                     session_id = %session_id,
                     dedup_key = %dedup_key,
                     error = %e,
@@ -330,6 +326,7 @@ pub(crate) async fn record_result(
             }
             Err(_elapsed) => {
                 tracing::warn!(
+                    user_id = %user_id,
                     session_id = %session_id,
                     dedup_key = %dedup_key,
                     "timed out persisting exactly-once result to DB"
@@ -341,6 +338,7 @@ pub(crate) async fn record_result(
 
 async fn persist_result(
     pool: &SharedPool,
+    user_id: &str,
     session_id: &str,
     dedup_key: &str,
     key: &astra_pipeline::step_protocol::IdempotencyKey,
@@ -353,9 +351,11 @@ async fn persist_result(
     // a replay or concurrent execution), silently skip the insert rather than
     // failing with a duplicate-key error.
     sqlx::query(
-        "INSERT IGNORE INTO tool_exactly_once_results (session_id, dedup_key, key_json, result_json, recorded_at)
-         VALUES (?, ?, ?, ?, UNIX_TIMESTAMP() * 1000)",
+        "INSERT IGNORE INTO tool_exactly_once_results \
+         (user_id, session_id, dedup_key, key_json, result_json, recorded_at)
+         VALUES (?, ?, ?, ?, ?, UNIX_TIMESTAMP() * 1000)",
     )
+    .bind(user_id)
     .bind(session_id)
     .bind(dedup_key)
     .bind(&key_json)
@@ -364,53 +364,4 @@ async fn persist_result(
     .await?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use astra_pipeline::step_protocol::{CachedToolResult, InMemoryIdempotencyCache};
-    use serde_json::json;
-
-    fn cached_result(tool_name: &str, output: &str, cached_at: u64) -> CachedToolResult {
-        CachedToolResult {
-            tool_name: tool_name.to_string(),
-            output: output.to_string(),
-            is_error: false,
-            cached_at,
-            context_signature: None,
-        }
-    }
-
-    #[test]
-    fn event_cache_warm_merges_without_discarding_db_warmed_entries() {
-        let mut executor = astra_pipeline::exactly_once::ExactlyOnceExecutor::new();
-        let db_args = json!({"command": "create remote issue"});
-        let db_key = exactly_once_key("bash", &db_args);
-        executor
-            .cache_mut()
-            .record(&db_key, cached_result("bash", "db-only", 10));
-
-        let event_args = json!({"command": "write local file"});
-        let event_key = exactly_once_key("bash", &event_args);
-        let mut event_cache = InMemoryIdempotencyCache::new();
-        event_cache.record(&event_key, cached_result("bash", "event-only", 11));
-
-        merge_warmed_event_cache(&mut executor, event_cache, "session-merge");
-
-        assert_eq!(
-            executor
-                .cache()
-                .check(&db_key)
-                .map(|cached| cached.output.as_str()),
-            Some("db-only")
-        );
-        assert_eq!(
-            executor
-                .cache()
-                .check(&event_key)
-                .map(|cached| cached.output.as_str()),
-            Some("event-only")
-        );
-    }
 }

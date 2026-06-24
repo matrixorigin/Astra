@@ -145,21 +145,23 @@ pub trait PlanRepository: Send + Sync {
     /// Delete a plan (and, for cloud, cascade its `plan_step_runs`).
     async fn delete(&self, plan_id: &str) -> Result<(), PlanLoadError>;
 
-    /// Mark `plan_id` as the active plan for `session_id`, atomically clearing
-    /// any other session currently pointing at the same plan. Passing
-    /// `plan_id = None` clears the session's active plan.
+    /// Mark `plan_id` as the active plan for an owned session, atomically
+    /// clearing any other session currently pointing at the same plan. Passing
+    /// `plan_id = None` clears the owned session's active plan.
     ///
     /// No-op (and returns Ok) if the session does not exist yet, so CLI can
     /// invoke it before a session row is created.
     async fn set_active_plan(
         &self,
+        user_id: &str,
         session_id: &str,
         plan_id: Option<&str>,
     ) -> Result<(), PlanLoadError>;
 
-    /// Return the currently active `plan_id` for `session_id`, if any.
+    /// Return the currently active `plan_id` for an owned session, if any.
     async fn active_plan_for_session(
         &self,
+        user_id: &str,
         session_id: &str,
     ) -> Result<Option<String>, PlanLoadError>;
 
@@ -610,39 +612,52 @@ impl PlanRepository for CloudPlanRepository {
 
     async fn set_active_plan(
         &self,
+        user_id: &str,
         session_id: &str,
         plan_id: Option<&str>,
     ) -> Result<(), PlanLoadError> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
 
         if let Some(pid) = plan_id {
+            validate_plan_id(pid)?;
             // Clear any OTHER session currently pointing at this plan.
             sqlx::query(
                 "UPDATE agent_sessions SET active_plan_id = NULL \
-                 WHERE active_plan_id = ? AND session_id <> ?",
+                 WHERE active_plan_id = ? AND NOT (user_id = ? AND session_id = ?)",
             )
             .bind(pid)
+            .bind(user_id)
             .bind(session_id)
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx)?;
 
             // Refresh the plans.session_id routing hint.
-            sqlx::query("UPDATE plans SET session_id = ?, updated_at = NOW(6) WHERE plan_id = ?")
-                .bind(session_id)
-                .bind(pid)
-                .execute(&mut *tx)
-                .await
-                .map_err(map_sqlx)?;
-        }
-
-        // Session row may not exist yet — no-op in that case.
-        sqlx::query("UPDATE agent_sessions SET active_plan_id = ? WHERE session_id = ?")
-            .bind(plan_id)
+            let updated = sqlx::query(
+                "UPDATE plans SET session_id = ?, updated_at = NOW(6) \
+                 WHERE plan_id = ? AND user_id = ?",
+            )
             .bind(session_id)
+            .bind(pid)
+            .bind(user_id)
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx)?;
+            if updated.rows_affected() == 0 {
+                return Err(PlanLoadError::NotFound(pid.to_string()));
+            }
+        }
+
+        // Session row may not exist yet — no-op in that case.
+        sqlx::query(
+            "UPDATE agent_sessions SET active_plan_id = ? WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(plan_id)
+        .bind(user_id)
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
 
         tx.commit().await.map_err(map_sqlx)?;
         Ok(())
@@ -650,14 +665,17 @@ impl PlanRepository for CloudPlanRepository {
 
     async fn active_plan_for_session(
         &self,
+        user_id: &str,
         session_id: &str,
     ) -> Result<Option<String>, PlanLoadError> {
-        let row: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT active_plan_id FROM agent_sessions WHERE session_id = ?")
-                .bind(session_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(map_sqlx)?;
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT active_plan_id FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         Ok(row.and_then(|(id,)| id))
     }
 
@@ -972,7 +990,7 @@ impl PlanRepository for CloudPlanRepository {
 #[derive(Debug, Default)]
 struct InMemoryPlanRepositoryState {
     plans: HashMap<String, PlanModeState>,
-    active_plans: HashMap<String, String>,
+    active_plans: HashMap<(String, String), String>,
     step_runs: HashMap<String, PlanStepRun>,
 }
 
@@ -1110,23 +1128,28 @@ impl PlanRepository for InMemoryPlanRepository {
 
     async fn set_active_plan(
         &self,
+        user_id: &str,
         session_id: &str,
         plan_id: Option<&str>,
     ) -> Result<(), PlanLoadError> {
         let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
-        guard.active_plans.remove(session_id);
+        guard
+            .active_plans
+            .remove(&(user_id.to_string(), session_id.to_string()));
         if let Some(plan_id) = plan_id {
             validate_plan_id(plan_id)?;
             guard.active_plans.retain(|_, active| active != plan_id);
-            guard
-                .active_plans
-                .insert(session_id.to_string(), plan_id.to_string());
+            guard.active_plans.insert(
+                (user_id.to_string(), session_id.to_string()),
+                plan_id.to_string(),
+            );
         }
         Ok(())
     }
 
     async fn active_plan_for_session(
         &self,
+        user_id: &str,
         session_id: &str,
     ) -> Result<Option<String>, PlanLoadError> {
         Ok(self
@@ -1134,7 +1157,7 @@ impl PlanRepository for InMemoryPlanRepository {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .active_plans
-            .get(session_id)
+            .get(&(user_id.to_string(), session_id.to_string()))
             .cloned())
     }
 

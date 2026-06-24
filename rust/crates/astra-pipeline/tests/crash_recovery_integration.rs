@@ -16,6 +16,8 @@ use astra_pipeline::step_protocol::{
 };
 use astra_services::session_journal::JournalDirGuard;
 
+const TEST_USER_ID: &str = "test-user";
+
 /// Helper: write a minimal heavy checkpoint for a session.
 fn write_test_heavy_checkpoint(session_id: &str, step_id: &str, created_at: u64) {
     let light = LightCheckpoint {
@@ -48,14 +50,14 @@ fn write_test_heavy_checkpoint(session_id: &str, step_id: &str, created_at: u64)
         config_version_id: None,
     }));
 
-    write_step_checkpoint(session_id, 1, &checkpoint).unwrap();
+    write_step_checkpoint(TEST_USER_ID, session_id, 1, &checkpoint).unwrap();
 }
 
 /// Helper: write tool-call events to the session journal.
 fn write_tool_events(session_id: &str, events: &[StepEvent]) {
     use astra_pipeline::step_checkpoint::FileBackedEventStore;
     use astra_pipeline::step_protocol::StepEventStore;
-    let mut store = FileBackedEventStore::empty(session_id);
+    let mut store = FileBackedEventStore::empty(TEST_USER_ID, session_id);
     for event in events {
         let _ = store.append(event.clone());
     }
@@ -125,7 +127,7 @@ fn auto_recovery_pure_read_tools_all_completed() {
     ];
     write_tool_events(sid, &events);
 
-    let outcome = recover_from_crash(sid).unwrap();
+    let outcome = recover_from_crash(TEST_USER_ID, sid).unwrap();
     assert!(
         matches!(outcome, Some(RecoveryOutcome::AutoRecovered { .. })),
         "expected AutoRecovered for all-completed pure-read tools, got {:?}",
@@ -161,7 +163,7 @@ fn auto_recovery_idempotent_write_tools_completed() {
     ];
     write_tool_events(sid, &events);
 
-    let outcome = recover_from_crash(sid).unwrap();
+    let outcome = recover_from_crash(TEST_USER_ID, sid).unwrap();
     assert!(
         matches!(outcome, Some(RecoveryOutcome::AutoRecovered { .. })),
         "expected AutoRecovered for completed idempotent writes, got {:?}",
@@ -189,7 +191,7 @@ fn requires_user_input_side_effect_tool_in_flight() {
     )];
     write_tool_events(sid, &events);
 
-    let outcome = recover_from_crash(sid).unwrap();
+    let outcome = recover_from_crash(TEST_USER_ID, sid).unwrap();
     match outcome {
         Some(RecoveryOutcome::RequiresUserInput {
             pending_decisions, ..
@@ -241,7 +243,7 @@ fn requires_user_input_side_effect_completed_no_cache() {
     ];
     write_tool_events(sid, &events);
 
-    let outcome = recover_from_crash(sid).unwrap();
+    let outcome = recover_from_crash(TEST_USER_ID, sid).unwrap();
     // Side-effect tools that completed without cached results require user confirmation
     match outcome {
         Some(RecoveryOutcome::RequiresUserInput {
@@ -264,7 +266,7 @@ fn no_checkpoint_returns_none() {
     let _guard = JournalDirGuard::new(temp.path());
     let sid = "cr-int-no-checkpoint";
 
-    let outcome = recover_from_crash(sid).unwrap();
+    let outcome = recover_from_crash(TEST_USER_ID, sid).unwrap();
     assert!(
         outcome.is_none(),
         "expected None when no checkpoint exists, got {:?}",
@@ -309,7 +311,7 @@ fn mixed_tools_partial_auto_recover_blocked() {
     ];
     write_tool_events(sid, &events);
 
-    let outcome = recover_from_crash(sid).unwrap();
+    let outcome = recover_from_crash(TEST_USER_ID, sid).unwrap();
     match outcome {
         Some(RecoveryOutcome::RequiresUserInput {
             pending_decisions, ..
@@ -369,7 +371,7 @@ fn failed_side_effect_tool_requires_user_input() {
         ],
     );
 
-    let outcome = recover_from_crash(sid).unwrap();
+    let outcome = recover_from_crash(TEST_USER_ID, sid).unwrap();
     // Failed SideEffect tool must NOT auto-recover — may have partial mutations.
     assert!(
         matches!(outcome, Some(RecoveryOutcome::RequiresUserInput { .. })),
@@ -397,7 +399,7 @@ fn pure_read_in_flight_is_safe() {
     )];
     write_tool_events(sid, &events);
 
-    let outcome = recover_from_crash(sid).unwrap();
+    let outcome = recover_from_crash(TEST_USER_ID, sid).unwrap();
     assert!(
         matches!(outcome, Some(RecoveryOutcome::AutoRecovered { .. })),
         "in-flight pure-read tools should auto-recover, got {:?}",
@@ -433,7 +435,7 @@ fn skipped_tool_auto_recovers() {
     ];
     write_tool_events(sid, &events);
 
-    let outcome = recover_from_crash(sid).unwrap();
+    let outcome = recover_from_crash(TEST_USER_ID, sid).unwrap();
     // Skipped tools are ignored → auto-recover
     assert!(
         matches!(outcome, Some(RecoveryOutcome::AutoRecovered { .. })),

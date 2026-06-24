@@ -37,6 +37,7 @@ use serde_json::{Value, json};
 use super::effects::ChatTurnPrepLineGuard;
 use super::permission_manager::PermissionManager;
 use crate::cli::chat_stream::turn_policy_from_payload_edge_tools;
+use crate::cli::cli_config::cli_utils::cli_user_id;
 use crate::cli::stream::stream_render::{EdgeSseContext, RenderPolicy, consume_turn_sse};
 use crate::edge_tools;
 
@@ -147,7 +148,15 @@ pub(crate) fn persist_failed_subrun(state: &mut AgenticLoopState, error: &str) -
         &state.recent_tools,
     ) {
         let checkpoint = astra_pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy));
+        let Some(user_id) = state.context_manifest_user_id.as_deref() else {
+            tracing::warn!(
+                session_id = %summary.session_id,
+                "skipping failed subrun checkpoint because owner user_id is unavailable"
+            );
+            return failure_output;
+        };
         let _ = astra_pipeline::step_checkpoint::write_step_checkpoint(
+            user_id,
             &summary.session_id,
             summary.checkpoints,
             &checkpoint,
@@ -609,7 +618,9 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
                 .unwrap_or_default()
                 .as_micros()
         );
+        let user_id = cli_user_id();
         let step_recorder = StepRecorder::with_persistence(
+            &user_id,
             &subrun_session_id,
             &format!("{}-task", subrun_session_id),
         );
@@ -624,7 +635,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             current_session_id: None,
             current_run_id: None,
             context_manifest_pool: None,
-            context_manifest_user_id: None,
+            context_manifest_user_id: Some(user_id),
             context_manifest_model_name: effective_model.clone(),
             runtime_manifest: runtime_manifest_for_model(
                 "cli_skill_subrun",

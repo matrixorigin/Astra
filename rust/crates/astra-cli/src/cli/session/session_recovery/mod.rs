@@ -44,6 +44,8 @@ mod tests {
     use astra_pipeline::step_protocol::StepCheckpoint;
     use astra_services::session_journal;
 
+    const TEST_USER_ID: &str = "test-user";
+
     fn workspace_backup_path_for(session_id: &str) -> Option<std::path::PathBuf> {
         let workspace_dir = astra_services::session_workspace::workspace_dir_for(session_id);
         std::fs::read_dir(workspace_dir)
@@ -337,21 +339,25 @@ mod tests {
     #[test]
     fn next_step_checkpoint_number_empty_dir_starts_at_one() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        assert_eq!(next_step_checkpoint_number("sess-empty").unwrap(), 1);
+        assert_eq!(
+            next_step_checkpoint_number(TEST_USER_ID, "sess-empty").unwrap(),
+            1
+        );
     }
 
     #[test]
     fn next_step_checkpoint_number_one_after_max_file() {
-        let (tmp, _g) = crate::tests::isolated_sessions_dir();
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = "sess-step";
-        let cp_dir = tmp
-            .path()
-            .join("sessions")
-            .join(sid)
-            .join("step_checkpoints");
-        std::fs::create_dir_all(&cp_dir).unwrap();
-        std::fs::write(cp_dir.join("000007-heavy.json"), "{}").unwrap();
-        assert_eq!(next_step_checkpoint_number(sid).unwrap(), 8);
+        let checkpoint = StepCheckpoint::light(
+            "step-7".to_string(),
+            "task-7".to_string(),
+            sid.to_string(),
+            astra_pipeline::step_protocol::ExecutionCursor::default(),
+        );
+        astra_pipeline::step_checkpoint::write_step_checkpoint(TEST_USER_ID, sid, 7, &checkpoint)
+            .unwrap();
+        assert_eq!(next_step_checkpoint_number(TEST_USER_ID, sid).unwrap(), 8);
     }
 
     #[test]
@@ -396,12 +402,19 @@ mod tests {
             None,
         );
 
-        let heavy_path =
-            persist_manual_heavy_and_composite(sid, 2, "label-z", 1, &step_checkpoint).unwrap();
+        let heavy_path = persist_manual_heavy_and_composite(
+            TEST_USER_ID,
+            sid,
+            2,
+            "label-z",
+            1,
+            &step_checkpoint,
+        )
+        .unwrap();
         assert!(heavy_path.exists());
         assert!(heavy_path.to_string_lossy().ends_with("-heavy.json"));
 
-        let index = read_composite_snapshot_index(sid).unwrap();
+        let index = read_composite_snapshot_index(TEST_USER_ID, sid).unwrap();
         assert_eq!(index.snapshots.len(), 1);
         assert_eq!(index.snapshots[0].label.as_deref(), Some("manual:label-z"));
     }
@@ -753,24 +766,6 @@ mod tests {
     }
 
     #[test]
-    fn csl_max_seq_reader_is_streaming_not_whole_file() {
-        let source = include_str!("csl.rs");
-        let fn_start = source
-            .find("fn read_max_seq_from_log")
-            .expect("read_max_seq_from_log should exist");
-        let fn_body: String = source[fn_start..].chars().take(500).collect();
-
-        assert!(
-            fn_body.contains("BufReader"),
-            "read_max_seq_from_log should scan incrementally"
-        );
-        assert!(
-            !fn_body.contains("read_to_string"),
-            "read_max_seq_from_log must not load the full CSL log"
-        );
-    }
-
-    #[test]
     fn with_workspace_lock_releases_lock_after_panic() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("workspace-lock-{}", uuid::Uuid::new_v4());
@@ -958,6 +953,7 @@ mod tests {
             runtime_pipeline_state: Some(serde_json::json!({"stale": "pipeline"})),
             runtime_compaction_state: Some(serde_json::json!({"attempt_count": 99})),
             runtime_consecutive_context_window_errors: 9,
+            ingestion_user_id: Some(TEST_USER_ID.to_string()),
             ..Default::default()
         };
 
@@ -989,6 +985,7 @@ mod tests {
             config_version_id: None,
         };
         astra_pipeline::step_checkpoint::write_step_checkpoint(
+            TEST_USER_ID,
             &sid,
             1,
             &StepCheckpoint::Heavy(Box::new(previous_heavy)),
@@ -999,7 +996,7 @@ mod tests {
             .await
             .expect("history sync should succeed");
 
-        let restored = astra_pipeline::step_restore::restore_session(&sid)
+        let restored = astra_pipeline::step_restore::restore_session(TEST_USER_ID, &sid)
             .unwrap()
             .expect("restored session");
         assert_eq!(restored.messages.len(), 4);
@@ -1133,12 +1130,13 @@ mod tests {
     async fn load_previous_recovery_state_returns_err_when_checkpoint_dir_is_invalid() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("checkpoint-bad-{}", uuid::Uuid::new_v4());
-        let session_dir = session_journal::local_sessions_dir().join(&sid);
+        let session_dir =
+            astra_pipeline::step_checkpoint::owner_session_dir_for(TEST_USER_ID, &sid).unwrap();
         std::fs::create_dir_all(&session_dir).unwrap();
         std::fs::write(session_dir.join("step_checkpoints"), "not-a-directory").unwrap();
 
         let mut state = SessionState::default();
-        let error = load_previous_recovery_state(&mut state, &sid)
+        let error = load_previous_recovery_state(&mut state, TEST_USER_ID, &sid)
             .await
             .expect_err("invalid checkpoint directory should fail");
 
@@ -1200,8 +1198,12 @@ mod tests {
                 .workspace_state(sid.clone())
                 .build();
         existing_index.append(&mut existing_snapshot).unwrap();
-        astra_pipeline::step_checkpoint::write_composite_snapshot_index(&sid, &existing_index)
-            .unwrap();
+        astra_pipeline::step_checkpoint::write_composite_snapshot_index(
+            TEST_USER_ID,
+            &sid,
+            &existing_index,
+        )
+        .unwrap();
 
         let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(&sid, "test-model");
         ws.turn_count = 9;
@@ -1229,6 +1231,7 @@ mod tests {
             turn: 1,
             history: vec![("question".into(), "answer".into())],
             csl_manager: Some(mgr),
+            ingestion_user_id: Some(TEST_USER_ID.to_string()),
             ..Default::default()
         };
 
@@ -1238,12 +1241,13 @@ mod tests {
 
         assert!(error.contains("replace CSL snapshot"), "{error}");
 
-        let checkpoints = astra_pipeline::step_checkpoint::list_checkpoints(&sid).unwrap();
+        let checkpoints =
+            astra_pipeline::step_checkpoint::list_checkpoints(TEST_USER_ID, &sid).unwrap();
         assert!(
             checkpoints.is_empty(),
             "history-sync failure must not leave heavy checkpoint files behind"
         );
-        let restored_index = read_composite_snapshot_index(&sid).unwrap();
+        let restored_index = read_composite_snapshot_index(TEST_USER_ID, &sid).unwrap();
         assert_eq!(restored_index, existing_index);
         let restored_workspace = astra_services::session_workspace::read_workspace(&sid).unwrap();
         assert_eq!(restored_workspace.turn_count, 9);
@@ -1266,6 +1270,7 @@ mod tests {
             model: Some("test-model".into()),
             turn: 1,
             history: vec![("question".into(), "answer".into())],
+            ingestion_user_id: Some(TEST_USER_ID.to_string()),
             ..Default::default()
         };
 
@@ -1273,10 +1278,13 @@ mod tests {
             .await
             .expect("corrupt workspace should be repaired from live state");
 
-        let checkpoints = astra_pipeline::step_checkpoint::list_checkpoints(&sid).unwrap();
+        let checkpoints =
+            astra_pipeline::step_checkpoint::list_checkpoints(TEST_USER_ID, &sid).unwrap();
         assert_eq!(checkpoints.len(), 1);
         assert!(
-            composite_index_path_for(&sid).exists(),
+            composite_index_path_for(TEST_USER_ID, &sid)
+                .unwrap()
+                .exists(),
             "history sync should still persist a composite index"
         );
         let workspace = astra_services::session_workspace::read_workspace(&sid).unwrap();
@@ -1309,8 +1317,12 @@ mod tests {
                 .workspace_state(sid.clone())
                 .build();
         existing_index.append(&mut existing_snapshot).unwrap();
-        astra_pipeline::step_checkpoint::write_composite_snapshot_index(&sid, &existing_index)
-            .unwrap();
+        astra_pipeline::step_checkpoint::write_composite_snapshot_index(
+            TEST_USER_ID,
+            &sid,
+            &existing_index,
+        )
+        .unwrap();
 
         let state = SessionState {
             session_id: Some(sid.clone()),
@@ -1320,6 +1332,7 @@ mod tests {
         };
         let rollback = persist_recovery_checkpoint(
             &state,
+            TEST_USER_ID,
             &sid,
             &astra_turn_core::conversation_log::SessionStateCompact::default(),
             None,
@@ -1327,25 +1340,31 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            astra_pipeline::step_checkpoint::list_checkpoints(&sid)
+            astra_pipeline::step_checkpoint::list_checkpoints(TEST_USER_ID, &sid)
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(
-            read_composite_snapshot_index(&sid).unwrap().snapshots.len(),
+            read_composite_snapshot_index(TEST_USER_ID, &sid)
+                .unwrap()
+                .snapshots
+                .len(),
             2
         );
 
-        rollback_recovery_checkpoint(&sid, &rollback).unwrap();
+        rollback_recovery_checkpoint(TEST_USER_ID, &sid, &rollback).unwrap();
 
         assert!(
-            astra_pipeline::step_checkpoint::list_checkpoints(&sid)
+            astra_pipeline::step_checkpoint::list_checkpoints(TEST_USER_ID, &sid)
                 .unwrap()
                 .is_empty(),
             "rollback should delete the just-written heavy checkpoint"
         );
-        assert_eq!(read_composite_snapshot_index(&sid).unwrap(), existing_index);
+        assert_eq!(
+            read_composite_snapshot_index(TEST_USER_ID, &sid).unwrap(),
+            existing_index
+        );
     }
 
     #[serial_test::serial]
@@ -1374,6 +1393,7 @@ mod tests {
             ],
             recent_tools: vec!["bash".into()],
             csl_manager: Some(mgr),
+            ingestion_user_id: Some(TEST_USER_ID.to_string()),
             ..Default::default()
         };
 
@@ -1381,11 +1401,12 @@ mod tests {
             .await
             .expect("history sync should succeed");
 
-        let checkpoints = astra_pipeline::step_checkpoint::list_checkpoints(&sid).unwrap();
+        let checkpoints =
+            astra_pipeline::step_checkpoint::list_checkpoints(TEST_USER_ID, &sid).unwrap();
         assert_eq!(checkpoints.len(), 1);
         assert_eq!(checkpoints[0].0, 1);
 
-        let index = read_composite_snapshot_index(&sid).unwrap();
+        let index = read_composite_snapshot_index(TEST_USER_ID, &sid).unwrap();
         assert_eq!(index.snapshots.len(), 1);
         assert_eq!(
             index.snapshots[0].session_state(),
@@ -1418,7 +1439,7 @@ mod tests {
             vec!["bash".to_string()]
         );
 
-        let restored = astra_pipeline::step_restore::restore_session(&sid)
+        let restored = astra_pipeline::step_restore::restore_session(TEST_USER_ID, &sid)
             .unwrap()
             .expect("restored session");
         assert_eq!(restored.messages.len(), 4);

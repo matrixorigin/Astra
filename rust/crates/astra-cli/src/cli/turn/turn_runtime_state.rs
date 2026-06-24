@@ -1,5 +1,6 @@
 //! Runtime checkpoint state carried between turns.
 
+use crate::cli::cli_config::cli_utils::cli_user_id;
 use crate::cli::session::session_state::SessionState;
 
 fn apply_heavy_checkpoint_runtime_state(
@@ -44,8 +45,14 @@ pub(crate) fn update_from_turn_failure(state: &mut SessionState, failure: &crate
     if let Some(checkpoint) = failure.partial.last_heavy_checkpoint.as_ref() {
         apply_heavy_checkpoint_runtime_state(state, checkpoint);
         if let Some(session_id) = failure.partial.session_id.as_deref() {
+            let user_id = state
+                .ingestion_user_id
+                .as_deref()
+                .filter(|user_id| !user_id.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(cli_user_id);
             state.runtime_idempotency_cache =
-                astra_pipeline::step_restore::restore_session(session_id)
+                astra_pipeline::step_restore::restore_session(&user_id, session_id)
                     .ok()
                     .flatten()
                     .map(|restored| restored.idempotency_cache);

@@ -172,8 +172,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             );
         self.executed_this_turn += 1;
 
-        if let Some(sid) = self.ctx.current_session_id {
-            try_write_light_headless_step_checkpoint(sid, self.ctx.step_recorder);
+        if let (Some(user_id), Some(sid)) = (self.ctx.current_user_id, self.ctx.current_session_id)
+        {
+            try_write_light_headless_step_checkpoint(user_id, sid, self.ctx.step_recorder);
         }
 
         if !is_err

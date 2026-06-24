@@ -143,6 +143,7 @@ pub async fn persist_prompt_request(
     plan: &PromptRequestPlan,
 ) -> Result<PromptRequestPersistResult, String> {
     let db = pool.get();
+    ensure_session_owner(db, &input.session_id, &input.user_id).await?;
     if let Some(existing) = load_existing_request(db, input, &plan.request_id).await? {
         return Ok(existing);
     }
@@ -432,6 +433,28 @@ async fn load_existing_request(
     .transpose()
 }
 
+async fn ensure_session_owner(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    session_id: &str,
+    user_id: &str,
+) -> Result<(), String> {
+    let exists: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM agent_sessions WHERE session_id = ? AND user_id = ? LIMIT 1",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    if exists.is_some() {
+        Ok(())
+    } else {
+        Err(format!(
+            "prompt_request_records owner mismatch for session_id={session_id} user_id={user_id}: agent_sessions owner root missing or belongs to another user"
+        ))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ExistingPromptChunk {
     logical_key: String,
@@ -698,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_prompt_request_id_is_owner_bound() {
+    fn plan_prompt_request_id_is_owner_session_attempt_bound() {
         let messages = [json!({"role": "user", "content": "same prompt"})];
         let owner_a = plan_prompt_request(PromptRequestPlanInput {
             user_id: "owner-a",
@@ -727,7 +750,7 @@ mod tests {
 
         assert_ne!(
             owner_a.request_id, owner_b.request_id,
-            "prompt request ids must not be session-global across owners"
+            "prompt request ids must include owner identity so two owners with the same external session id never collide"
         );
         assert_eq!(
             owner_a.request_hash, owner_b.request_hash,

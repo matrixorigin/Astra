@@ -224,7 +224,14 @@ mod tests {
             compaction_state: None,
             config_version_id: None,
         };
-        write_step_checkpoint(session_id, 1, &StepCheckpoint::Heavy(Box::new(heavy))).unwrap();
+        let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
+        write_step_checkpoint(
+            &user_id,
+            session_id,
+            1,
+            &StepCheckpoint::Heavy(Box::new(heavy)),
+        )
+        .unwrap();
     }
 
     async fn mock_empty_cloud_resumable_list(server: &MockServer) {

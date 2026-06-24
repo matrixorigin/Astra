@@ -356,6 +356,7 @@ impl ToolHandler<ServerToolExecutor> for ExitPlanModeToolHandler {
         astra_tools::ToolResult::text(
             execute_exit_plan_mode(
                 context.plan_repo.as_ref(),
+                &context.user_id,
                 &context.session_id,
                 context.plan_mode_cache.as_ref(),
                 context.plan_resume_hint_handle.as_ref(),

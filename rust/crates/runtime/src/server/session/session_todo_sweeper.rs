@@ -1236,8 +1236,21 @@ mod tests {
                 .bind(&session_id)
                 .execute(&pool)
                 .await;
+            let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ?")
+                .bind(&session_id)
+                .execute(&pool)
+                .await;
         };
         cleanup().await;
+        sqlx::query(
+            "INSERT INTO agent_sessions (session_id, user_id, agent_id, title, status, metadata)
+             VALUES (?, ?, 'session-todo-sweeper-test', 'session todo sweeper test', 'active', '{}')",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("insert agent_sessions owner root");
 
         let store: std::sync::Arc<dyn astra_tools::task_mgmt::TaskStore> = std::sync::Arc::new(
             astra_tools::task_mgmt_matrixone::MatrixOneTaskStore::from_shared_for_user(

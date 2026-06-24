@@ -1632,6 +1632,18 @@ mod state_command_tests {
         );
     }
 
+    fn make_owner_bound_step_checkpoint_path_invalid(session_id: &str) {
+        let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
+        let owner_session_dir =
+            astra_pipeline::step_checkpoint::owner_session_dir_for(&user_id, session_id).unwrap();
+        std::fs::create_dir_all(&owner_session_dir).unwrap();
+        std::fs::write(
+            owner_session_dir.join("step_checkpoints"),
+            "not-a-directory",
+        )
+        .unwrap();
+    }
+
     #[serial_test::serial]
     #[tokio::test]
     async fn undo_rolls_back_live_state_when_recovery_persist_fails() {
@@ -1640,9 +1652,7 @@ mod state_command_tests {
         let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(&sid, "test-model");
         ws.turn_count = 2;
         astra_services::session_workspace::write_workspace(&ws).unwrap();
-        let session_dir = session_journal::local_sessions_dir().join(&sid);
-        std::fs::create_dir_all(&session_dir).unwrap();
-        std::fs::write(session_dir.join("step_checkpoints"), "not-a-directory").unwrap();
+        make_owner_bound_step_checkpoint_path_invalid(&sid);
         let journal = session_journal::JournalWriter::new(&sid).unwrap();
 
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
@@ -1692,9 +1702,7 @@ mod state_command_tests {
         let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(&sid, "test-model");
         ws.turn_count = 1;
         astra_services::session_workspace::write_workspace(&ws).unwrap();
-        let session_dir = session_journal::local_sessions_dir().join(&sid);
-        std::fs::create_dir_all(&session_dir).unwrap();
-        std::fs::write(session_dir.join("step_checkpoints"), "not-a-directory").unwrap();
+        make_owner_bound_step_checkpoint_path_invalid(&sid);
 
         let mut state = SessionState::default();
         state.set_session_id(sid);
@@ -1835,9 +1843,7 @@ mod state_command_tests {
         let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
         ws.turn_count = 1;
         astra_services::session_workspace::write_workspace(&ws).unwrap();
-        let session_dir = session_journal::local_sessions_dir().join(&sid);
-        std::fs::create_dir_all(&session_dir).unwrap();
-        std::fs::write(session_dir.join("step_checkpoints"), "not-a-directory").unwrap();
+        make_owner_bound_step_checkpoint_path_invalid(&sid);
 
         let mock = crate::cli::mock_llm::MockLlmServer::start(
             crate::cli::mock_llm::MockScenario::TextOnly,

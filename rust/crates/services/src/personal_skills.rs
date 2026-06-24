@@ -765,3 +765,21 @@ fn evaluation_from_row(
         created_at: row.try_get("created_at").unwrap_or_default(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_status_validator_accepts_only_lifecycle_states() {
+        for status in ["draft", "published", "superseded", "quarantined"] {
+            validate_version_status(status).expect("valid version status");
+        }
+
+        let error = validate_version_status("archived").expect_err("unknown status");
+        assert!(matches!(
+            error,
+            PersonalSkillError::InvalidStatus { status } if status == "archived"
+        ));
+    }
+}

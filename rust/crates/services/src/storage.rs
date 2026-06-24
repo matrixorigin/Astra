@@ -5,7 +5,7 @@ use astra_core::{
 };
 use axum::{Json, http::StatusCode};
 use fs2::FileExt;
-use sqlx::{Executor, MySql, Pool, QueryBuilder, Row, query};
+use sqlx::{Executor, MySql, QueryBuilder, Row, query};
 use std::collections::HashSet;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::OpenOptions;
@@ -167,35 +167,23 @@ pub async fn upsert_agent_session_event_count<'e, E>(
 where
     E: Executor<'e, Database = MySql>,
 {
+    // MatrixOne rejects updating key columns in ON DUPLICATE KEY UPDATE.
+    // Owner mismatch still fails atomically by assigning NULL to NOT NULL
+    // event_count, rolling back the caller's transaction before side effects persist.
     query(
         "INSERT INTO agent_sessions \
          (session_id, user_id, status, event_count, created_at, updated_at, last_active_at) \
-         SELECT ?, ?, 'active', ?, NOW(6), NOW(6), NOW(6) \
-         FROM DUAL \
-         WHERE NOT EXISTS ( \
-             SELECT 1 FROM agent_sessions \
-             WHERE session_id = ? AND user_id <> ? \
-             LIMIT 1 \
-         ) \
+         VALUES (?, ?, 'active', ?, NOW(6), NOW(6), NOW(6)) \
          ON DUPLICATE KEY UPDATE \
-         event_count = VALUES(event_count), \
-         updated_at = NOW(6), \
-         last_active_at = NOW(6)",
+         event_count = CASE WHEN user_id = VALUES(user_id) THEN VALUES(event_count) ELSE NULL END, \
+         updated_at = CASE WHEN user_id = VALUES(user_id) THEN NOW(6) ELSE updated_at END, \
+         last_active_at = CASE WHEN user_id = VALUES(user_id) THEN NOW(6) ELSE last_active_at END",
     )
     .bind(session_id)
     .bind(user_id)
     .bind(event_count)
-    .bind(session_id)
-    .bind(user_id)
     .execute(executor)
-    .await
-    .and_then(|result| {
-        if result.rows_affected() == 0 {
-            Err(sqlx::Error::RowNotFound)
-        } else {
-            Ok(result)
-        }
-    })?;
+    .await?;
     Ok(())
 }
 
@@ -336,231 +324,12 @@ async fn ensure_matrixone_database_exists(
     Ok(())
 }
 
-async fn column_exists(
-    pool: &Pool<MySql>,
-    schema: &str,
-    table: &str,
-    column: &str,
-) -> Result<bool, sqlx::Error> {
-    let row = query(
-        "SELECT COUNT(*) AS count FROM INFORMATION_SCHEMA.COLUMNS
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?",
-    )
-    .bind(schema)
-    .bind(table)
-    .bind(column)
-    .fetch_one(pool)
-    .await?;
-    Ok(row.try_get::<i64, _>("count").unwrap_or(0) > 0)
-}
-
-async fn varchar_column_max_len(
-    pool: &Pool<MySql>,
-    schema: &str,
-    table: &str,
-    column: &str,
-) -> Result<Option<i64>, sqlx::Error> {
-    let row = query(
-        "SELECT CHARACTER_MAXIMUM_LENGTH AS max_len
-         FROM INFORMATION_SCHEMA.COLUMNS
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?
-         LIMIT 1",
-    )
-    .bind(schema)
-    .bind(table)
-    .bind(column)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.and_then(|row| row.try_get::<i64, _>("max_len").ok()))
-}
-
-async fn widen_varchar_if_shorter(
-    pool: &Pool<MySql>,
-    schema: &str,
-    table: &str,
-    column: &str,
-    min_len: i64,
-    ddl: &str,
-) -> Result<(), sqlx::Error> {
-    if let Some(current_len) = varchar_column_max_len(pool, schema, table, column).await?
-        && current_len < min_len
-    {
-        query(ddl).execute(pool).await?;
-    }
-    Ok(())
-}
-
-async fn index_exists(
-    pool: &Pool<MySql>,
-    schema: &str,
-    table: &str,
-    index: &str,
-) -> Result<bool, sqlx::Error> {
-    let row = query(
-        "SELECT COUNT(*) AS count FROM INFORMATION_SCHEMA.STATISTICS
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = ?",
-    )
-    .bind(schema)
-    .bind(table)
-    .bind(index)
-    .fetch_one(pool)
-    .await?;
-    Ok(row.try_get::<i64, _>("count").unwrap_or(0) > 0)
-}
-
-async fn add_column_if_missing(
-    pool: &Pool<MySql>,
-    schema: &str,
-    table: &str,
-    column: &str,
-    ddl: &str,
-) -> Result<(), sqlx::Error> {
-    if !column_exists(pool, schema, table, column).await? {
-        query(ddl).execute(pool).await?;
-    }
-    Ok(())
-}
-
-async fn drop_column_if_exists(
-    pool: &Pool<MySql>,
-    schema: &str,
-    table: &str,
-    column: &str,
-) -> Result<(), sqlx::Error> {
-    debug_assert!(
-        !table.contains('`') && !column.contains('`'),
-        "identifiers must not contain backticks"
-    );
-    if column_exists(pool, schema, table, column).await? {
-        let ddl = format!("ALTER TABLE `{table}` DROP COLUMN `{column}`");
-        query(&ddl).execute(pool).await?;
-    }
-    Ok(())
-}
-
-async fn add_index_if_missing(
-    pool: &Pool<MySql>,
-    schema: &str,
-    table: &str,
-    index: &str,
-    ddl: &str,
-) -> Result<(), sqlx::Error> {
-    if !index_exists(pool, schema, table, index).await? {
-        query(ddl).execute(pool).await?;
-    }
-    Ok(())
-}
-
-async fn drop_index_if_exists(
-    pool: &Pool<MySql>,
-    schema: &str,
-    table: &str,
-    index: &str,
-) -> Result<(), sqlx::Error> {
-    debug_assert!(
-        !table.contains('`') && !index.contains('`'),
-        "identifiers must not contain backticks"
-    );
-    if index_exists(pool, schema, table, index).await? {
-        let ddl = format!("ALTER TABLE `{table}` DROP INDEX `{index}`");
-        query(&ddl).execute(pool).await?;
-    }
-    Ok(())
-}
-
-fn sql_decode_error(message: impl Into<String>) -> sqlx::Error {
-    sqlx::Error::Decode(Box::new(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        message.into(),
-    )))
-}
-
-fn json_value_type(value: &serde_json::Value) -> &'static str {
-    match value {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "boolean",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
-    }
-}
-
-fn promote_legacy_fallback_model_quirks(raw: &str) -> Result<Option<String>, String> {
-    let mut value: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| format!("parse quirks JSON: {e}"))?;
-    let Some(object) = value.as_object_mut() else {
-        return Ok(None);
-    };
-    let Some(legacy_value) = object.remove("fallback_model") else {
-        return Ok(None);
-    };
-
-    let fallback_model = match legacy_value {
-        serde_json::Value::String(model) => model.trim().to_string(),
-        serde_json::Value::Null => String::new(),
-        other => {
-            return Err(format!(
-                "legacy fallback_model must be a string, got {}",
-                json_value_type(&other)
-            ));
-        }
-    };
-
-    if !fallback_model.is_empty() && !object.contains_key("fallback_chain") {
-        object.insert(
-            "fallback_chain".to_string(),
-            serde_json::Value::Array(vec![serde_json::Value::String(fallback_model)]),
-        );
-    }
-
-    serde_json::to_string(&value)
-        .map(Some)
-        .map_err(|e| format!("serialize migrated quirks JSON: {e}"))
-}
-
-async fn migrate_model_fallback_chain(pool: &Pool<MySql>) -> Result<u64, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    let rows = query(
-        "SELECT model_id, CAST(quirks AS CHAR) AS quirks_json \
-         FROM infra_llm_models \
-         WHERE quirks IS NOT NULL",
-    )
-    .fetch_all(&mut *tx)
-    .await?;
-
-    let mut migrated = 0;
-    for row in rows {
-        let model_id: String = row.try_get("model_id")?;
-        let quirks_json: String = row.try_get("quirks_json")?;
-        let Some(updated_quirks) =
-            promote_legacy_fallback_model_quirks(&quirks_json).map_err(|e| {
-                sql_decode_error(format!(
-                    "fallback_model to fallback_chain migration failed for model_id={model_id}: {e}"
-                ))
-            })?
-        else {
-            continue;
-        };
-
-        let result = query("UPDATE infra_llm_models SET quirks = ? WHERE model_id = ?")
-            .bind(updated_quirks)
-            .bind(&model_id)
-            .execute(&mut *tx)
-            .await?;
-        migrated += result.rows_affected();
-    }
-
-    tx.commit().await?;
-    Ok(migrated)
-}
-
 pub async fn ensure_core_schema(
     settings: &MatrixOneSettings,
     bootstrap_catalog: &str,
 ) -> Result<(), sqlx::Error> {
     // Tests and startup paths can race on schema bootstrap inside the same process.
-    // Serialize schema setup so migration markers and DDL stay idempotent.
+    // Serialize schema setup so version markers and DDL stay idempotent.
     let _init_guard = CORE_SCHEMA_INIT_LOCK
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
@@ -664,7 +433,8 @@ pub async fn ensure_core_schema(
             details JSON NULL,
             ip_address VARCHAR(45) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_auth_audit_logs_user_created (user_id, created_at)
+            INDEX idx_auth_audit_logs_user_created (user_id, created_at),
+            INDEX idx_auth_audit_logs_user_resource_created (user_id, resource_type, resource_id, created_at)
         )",
     )
     .execute(&pool)
@@ -684,15 +454,20 @@ pub async fn ensure_core_schema(
             summary_job_id VARCHAR(64) NULL,
             vector_db_snapshot_id VARCHAR(64) NULL,
             metadata JSON NULL,
+            project_id VARCHAR(128) NULL,
+            project_retention_policy VARCHAR(32) NOT NULL DEFAULT 'session',
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             ended_at DATETIME(6) NULL,
             last_active_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             active_plan_id VARCHAR(64) NULL,
+            config_version_id VARCHAR(24) NULL,
             INDEX idx_agent_sessions_user_status_updated (user_id, status, updated_at),
             INDEX idx_agent_sessions_user_last_active (user_id, last_active_at),
             INDEX idx_agent_sessions_agent_status (agent_id, status),
-            INDEX idx_agent_sessions_active_plan_id (active_plan_id)
+            INDEX idx_agent_sessions_active_plan_id (active_plan_id),
+            INDEX idx_agent_sessions_config_version (config_version_id),
+            INDEX idx_sessions_project (user_id, project_id, updated_at)
         )",
     )
     .execute(&pool)
@@ -749,64 +524,6 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
-    for (column, ddl) in [
-        (
-            "run_id",
-            "ALTER TABLE agent_events ADD COLUMN run_id VARCHAR(64) NULL",
-        ),
-        (
-            "parent_run_id",
-            "ALTER TABLE agent_events ADD COLUMN parent_run_id VARCHAR(64) NULL",
-        ),
-        (
-            "turn_id",
-            "ALTER TABLE agent_events ADD COLUMN turn_id VARCHAR(64) NULL",
-        ),
-        (
-            "turn_seq",
-            "ALTER TABLE agent_events ADD COLUMN turn_seq BIGINT NULL",
-        ),
-        (
-            "round_index",
-            "ALTER TABLE agent_events ADD COLUMN round_index BIGINT NULL",
-        ),
-        (
-            "tool_call_id",
-            "ALTER TABLE agent_events ADD COLUMN tool_call_id VARCHAR(128) NULL",
-        ),
-        (
-            "parent_agent_id",
-            "ALTER TABLE agent_events ADD COLUMN parent_agent_id VARCHAR(255) NULL",
-        ),
-        (
-            "trace_kind",
-            "ALTER TABLE agent_events ADD COLUMN trace_kind VARCHAR(64) NULL",
-        ),
-    ] {
-        add_column_if_missing(&pool, &settings.database, "agent_events", column, ddl).await?;
-    }
-
-    for (index, ddl) in [
-        (
-            "idx_agent_events_trace",
-            "ALTER TABLE agent_events ADD INDEX idx_agent_events_trace (session_id, turn_id, created_at)",
-        ),
-        (
-            "idx_agent_events_run",
-            "ALTER TABLE agent_events ADD INDEX idx_agent_events_run (session_id, run_id, created_at)",
-        ),
-        (
-            "idx_agent_events_parent_run",
-            "ALTER TABLE agent_events ADD INDEX idx_agent_events_parent_run (session_id, parent_run_id, created_at)",
-        ),
-        (
-            "idx_agent_events_tool_call",
-            "ALTER TABLE agent_events ADD INDEX idx_agent_events_tool_call (session_id, tool_call_id)",
-        ),
-    ] {
-        add_index_if_missing(&pool, &settings.database, "agent_events", index, ddl).await?;
-    }
-
     // ── Durable web-agent run state (Phase 1 / G15 + G19) ────────────────
     query(
         "CREATE TABLE IF NOT EXISTS agent_runs (
@@ -853,6 +570,7 @@ pub async fn ensure_core_schema(
             CONSTRAINT chk_agent_runs_retry_scope CHECK (retry_scope IN ('node', 'subtree', 'siblings')),
             INDEX idx_agent_runs_user_updated (user_id, updated_at),
             INDEX idx_agent_runs_session_updated (session_id, updated_at),
+            INDEX idx_agent_runs_user_session_status_updated (user_id, session_id, status, updated_at),
             INDEX idx_agent_runs_root_depth (root_run_id, depth, created_at),
             INDEX idx_agent_runs_parent (parent_run_id, created_at),
             INDEX idx_agent_runs_retry_of (retry_of),
@@ -864,60 +582,6 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
-
-    for (column, ddl) in [
-        (
-            "agent_binding_id",
-            "ALTER TABLE agent_runs ADD COLUMN agent_binding_id VARCHAR(64) NULL",
-        ),
-        (
-            "agent_binding_name",
-            "ALTER TABLE agent_runs ADD COLUMN agent_binding_name VARCHAR(255) NULL",
-        ),
-        (
-            "agent_binding_schema_version",
-            "ALTER TABLE agent_runs ADD COLUMN agent_binding_schema_version VARCHAR(32) NULL",
-        ),
-        (
-            "selected_model_json",
-            "ALTER TABLE agent_runs ADD COLUMN selected_model_json LONGTEXT NULL",
-        ),
-        (
-            "selected_model_name",
-            "ALTER TABLE agent_runs ADD COLUMN selected_model_name VARCHAR(255) NULL",
-        ),
-        (
-            "selected_model_gateway",
-            "ALTER TABLE agent_runs ADD COLUMN selected_model_gateway VARCHAR(128) NULL",
-        ),
-        (
-            "capability_server_refs_json",
-            "ALTER TABLE agent_runs ADD COLUMN capability_server_refs_json LONGTEXT NULL",
-        ),
-        (
-            "runtime_profile",
-            "ALTER TABLE agent_runs ADD COLUMN runtime_profile VARCHAR(64) NULL",
-        ),
-    ] {
-        add_column_if_missing(&pool, &settings.database, "agent_runs", column, ddl).await?;
-    }
-
-    for (index, ddl) in [
-        (
-            "idx_agent_runs_binding",
-            "ALTER TABLE agent_runs ADD INDEX idx_agent_runs_binding (agent_binding_id, created_at)",
-        ),
-        (
-            "idx_agent_runs_model_gateway",
-            "ALTER TABLE agent_runs ADD INDEX idx_agent_runs_model_gateway (selected_model_gateway, created_at)",
-        ),
-        (
-            "idx_agent_runs_user_session_status_updated",
-            "ALTER TABLE agent_runs ADD INDEX idx_agent_runs_user_session_status_updated (user_id, session_id, status, updated_at)",
-        ),
-    ] {
-        add_index_if_missing(&pool, &settings.database, "agent_runs", index, ddl).await?;
-    }
 
     query(
         "CREATE TABLE IF NOT EXISTS agent_run_events (
@@ -947,15 +611,6 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
-    add_index_if_missing(
-        &pool,
-        &settings.database,
-        "agent_run_events",
-        "idx_agent_run_events_owner_session_run_idx",
-        "ALTER TABLE agent_run_events ADD INDEX idx_agent_run_events_owner_session_run_idx (user_id, session_id, run_id, event_idx)",
-    )
-    .await?;
-
     query(
         "CREATE TABLE IF NOT EXISTS run_checkpoints (
             checkpoint_id VARCHAR(64) PRIMARY KEY,
@@ -1050,70 +705,20 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
-    for (table, column, ddl) in [
-        (
-            "session_tool_outputs",
-            "parent_output_id",
-            "ALTER TABLE session_tool_outputs ADD COLUMN parent_output_id VARCHAR(64) NULL",
-        ),
-        (
-            "session_tool_outputs",
-            "preview_text",
-            "ALTER TABLE session_tool_outputs ADD COLUMN preview_text LONGTEXT NULL",
-        ),
-        (
-            "session_tool_outputs",
-            "preview_status",
-            "ALTER TABLE session_tool_outputs ADD COLUMN preview_status VARCHAR(32) NOT NULL DEFAULT 'template'",
-        ),
-        (
-            "session_tool_outputs",
-            "artifact_ref",
-            "ALTER TABLE session_tool_outputs ADD COLUMN artifact_ref VARCHAR(255) NULL",
-        ),
-        (
-            "session_tool_outputs",
-            "content_hash",
-            "ALTER TABLE session_tool_outputs ADD COLUMN content_hash VARCHAR(128) NULL",
-        ),
-        (
-            "session_tool_outputs",
-            "normalize_version",
-            "ALTER TABLE session_tool_outputs ADD COLUMN normalize_version VARCHAR(32) NOT NULL DEFAULT 'raw_v1'",
-        ),
-    ] {
-        if let Err(e) = add_column_if_missing(&pool, &settings.database, table, column, ddl).await {
-            tracing::warn!(
-                target: "astra_services::storage",
-                table,
-                column,
-                error = %e,
-                "failed to migrate session_tool_outputs Phase 6 column"
-            );
-        }
-    }
-    for (table, index, ddl) in [
-        (
-            "session_tool_outputs",
-            "idx_tool_outputs_parent",
-            "ALTER TABLE session_tool_outputs ADD INDEX idx_tool_outputs_parent (parent_output_id)",
-        ),
-        (
-            "session_tool_outputs",
-            "idx_tool_outputs_artifact_ref",
-            "ALTER TABLE session_tool_outputs ADD INDEX idx_tool_outputs_artifact_ref (artifact_ref)",
-        ),
-    ] {
-        if let Err(e) = add_index_if_missing(&pool, &settings.database, table, index, ddl).await {
-            tracing::warn!(
-                target: "astra_services::storage",
-                table,
-                index,
-                error = %e,
-                "failed to migrate session_tool_outputs Phase 6 index"
-            );
-        }
-    }
+    query(
+        "CREATE TABLE IF NOT EXISTS tool_exactly_once_results (
+            user_id      VARCHAR(128) NOT NULL,
+            session_id   VARCHAR(128) NOT NULL,
+            dedup_key    VARCHAR(128) NOT NULL,
+            key_json     JSON NOT NULL,
+            result_json  JSON NOT NULL,
+            recorded_at  BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_id, session_id, dedup_key),
+            INDEX idx_tool_exactly_once_session (session_id, user_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
 
     // ── Web transcript hydration + device lease state (Phase 2 / G13+G19+G25) ──
     query(
@@ -1135,16 +740,6 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
-    widen_varchar_if_shorter(
-        &pool,
-        &settings.database,
-        "session_transcript_items",
-        "content_hash",
-        128,
-        "ALTER TABLE session_transcript_items MODIFY COLUMN content_hash VARCHAR(128) NOT NULL",
-    )
-    .await?;
-
     query(
         "CREATE TABLE IF NOT EXISTS transcript_pages (
             user_id VARCHAR(64) NOT NULL,
@@ -1165,27 +760,6 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "transcript_pages",
-        "user_id",
-        "ALTER TABLE transcript_pages ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT ''",
-    )
-    .await?;
-    for (index, ddl) in [
-        (
-            "idx_transcript_pages_owner_session_end",
-            "ALTER TABLE transcript_pages ADD INDEX idx_transcript_pages_owner_session_end (user_id, session_id, end_item_seq)",
-        ),
-        (
-            "idx_transcript_pages_owner_session_updated",
-            "ALTER TABLE transcript_pages ADD INDEX idx_transcript_pages_owner_session_updated (user_id, session_id, updated_at)",
-        ),
-    ] {
-        add_index_if_missing(&pool, &settings.database, "transcript_pages", index, ddl).await?;
-    }
-
     query(
         "CREATE TABLE IF NOT EXISTS prompt_request_records (
             request_id VARCHAR(64) PRIMARY KEY,
@@ -1205,7 +779,7 @@ pub async fn ensure_core_schema(
             request_hash VARCHAR(64) NOT NULL,
             summary_json LONGTEXT NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_prompt_request_owner_attempt (user_id, session_id, turn, round, source, attempt),
+            UNIQUE KEY uq_prompt_request_attempt (user_id, session_id, turn, round, source, attempt),
             INDEX idx_prompt_requests_owner_session_created (user_id, session_id, created_at, turn, round, attempt),
             INDEX idx_prompt_requests_owner_run_created (user_id, run_id, created_at, turn, round, attempt),
             INDEX idx_prompt_requests_session_created (session_id, created_at),
@@ -1214,37 +788,6 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
-    drop_index_if_exists(
-        &pool,
-        &settings.database,
-        "prompt_request_records",
-        "uq_prompt_request_attempt",
-    )
-    .await?;
-    for (index, ddl) in [
-        (
-            "uq_prompt_request_owner_attempt",
-            "ALTER TABLE prompt_request_records ADD UNIQUE KEY uq_prompt_request_owner_attempt (user_id, session_id, turn, round, source, attempt)",
-        ),
-        (
-            "idx_prompt_requests_owner_session_created",
-            "ALTER TABLE prompt_request_records ADD INDEX idx_prompt_requests_owner_session_created (user_id, session_id, created_at, turn, round, attempt)",
-        ),
-        (
-            "idx_prompt_requests_owner_run_created",
-            "ALTER TABLE prompt_request_records ADD INDEX idx_prompt_requests_owner_run_created (user_id, run_id, created_at, turn, round, attempt)",
-        ),
-    ] {
-        add_index_if_missing(
-            &pool,
-            &settings.database,
-            "prompt_request_records",
-            index,
-            ddl,
-        )
-        .await?;
-    }
-
     query(
         "CREATE TABLE IF NOT EXISTS prompt_deltas (
             delta_id VARCHAR(64) PRIMARY KEY,
@@ -1264,8 +807,6 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
-    drop_column_if_exists(&pool, &settings.database, "prompt_deltas", "payload_json").await?;
-
     query(
         "CREATE TABLE IF NOT EXISTS session_state_revisions (
             session_id VARCHAR(64) PRIMARY KEY,
@@ -1283,16 +824,6 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
-    widen_varchar_if_shorter(
-        &pool,
-        &settings.database,
-        "session_state_revisions",
-        "revision_hash",
-        96,
-        "ALTER TABLE session_state_revisions MODIFY COLUMN revision_hash VARCHAR(96) NOT NULL",
-    )
-    .await?;
-
     query(
         "CREATE TABLE IF NOT EXISTS session_device_leases (
             lease_id VARCHAR(128) PRIMARY KEY,
@@ -1317,7 +848,6 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
-
     query(
         "CREATE TABLE IF NOT EXISTS session_device_lease_events (
             lease_event_id VARCHAR(128) PRIMARY KEY,
@@ -1392,19 +922,6 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
-    for (index, ddl) in [
-        (
-            "idx_ctx_manifest_owner_session_created",
-            "ALTER TABLE context_manifests ADD INDEX idx_ctx_manifest_owner_session_created (user_id, session_id, created_at, manifest_id)",
-        ),
-        (
-            "idx_ctx_manifest_owner_session_run_created",
-            "ALTER TABLE context_manifests ADD INDEX idx_ctx_manifest_owner_session_run_created (user_id, session_id, run_id, created_at, manifest_id)",
-        ),
-    ] {
-        add_index_if_missing(&pool, &settings.database, "context_manifests", index, ddl).await?;
-    }
-
     query(
         "CREATE TABLE IF NOT EXISTS context_manifest_items (
             id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -1615,15 +1132,6 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
-    add_index_if_missing(
-        &pool,
-        &settings.database,
-        "session_state_items",
-        "idx_state_owner_session_status_category",
-        "ALTER TABLE session_state_items ADD INDEX idx_state_owner_session_status_category (user_id, session_id, status, category)",
-    )
-    .await?;
-
     query(
         "CREATE TABLE IF NOT EXISTS session_state_item_events (
             id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -1932,58 +1440,6 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
-    for (table, column, ddl) in [
-        (
-            "harness_items",
-            "decision_history_json",
-            "ALTER TABLE harness_items ADD COLUMN decision_history_json LONGTEXT NULL",
-        ),
-        (
-            "harness_skill_drafts",
-            "decision_history_json",
-            "ALTER TABLE harness_skill_drafts ADD COLUMN decision_history_json LONGTEXT NULL",
-        ),
-        (
-            "harness_skill_rules",
-            "decision_history_json",
-            "ALTER TABLE harness_skill_rules ADD COLUMN decision_history_json LONGTEXT NULL",
-        ),
-        (
-            "harness_citations",
-            "skill_draft_id",
-            "ALTER TABLE harness_citations ADD COLUMN skill_draft_id VARCHAR(128) NULL",
-        ),
-        (
-            "harness_citations",
-            "skill_rule_id",
-            "ALTER TABLE harness_citations ADD COLUMN skill_rule_id VARCHAR(128) NULL",
-        ),
-        (
-            "harness_citations",
-            "source_snapshot_ref",
-            "ALTER TABLE harness_citations ADD COLUMN source_snapshot_ref VARCHAR(128) NULL",
-        ),
-        (
-            "harness_citations",
-            "source_content_hash",
-            "ALTER TABLE harness_citations ADD COLUMN source_content_hash VARCHAR(128) NULL",
-        ),
-        (
-            "harness_citations",
-            "source_metadata_json",
-            "ALTER TABLE harness_citations ADD COLUMN source_metadata_json LONGTEXT NULL",
-        ),
-    ] {
-        add_column_if_missing(&pool, &settings.database, table, column, ddl).await?;
-    }
-    for (table, index, ddl) in [(
-        "harness_citations",
-        "idx_harness_citations_skill_rule",
-        "ALTER TABLE harness_citations ADD INDEX idx_harness_citations_skill_rule (skill_rule_id, created_at)",
-    )] {
-        add_index_if_missing(&pool, &settings.database, table, index, ddl).await?;
-    }
-
     // Context / decisions / evaluation essentials used by turn persistence
     query(
         "CREATE TABLE IF NOT EXISTS ctx_snapshots (
@@ -2032,50 +1488,6 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
-
-    for (table, column, ddl) in [
-        (
-            "ctx_snapshots",
-            "user_id",
-            "ALTER TABLE ctx_snapshots ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT ''",
-        ),
-        (
-            "ctx_decision_audits",
-            "user_id",
-            "ALTER TABLE ctx_decision_audits ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT ''",
-        ),
-    ] {
-        add_column_if_missing(&pool, &settings.database, table, column, ddl).await?;
-    }
-    for (table, index, ddl) in [
-        (
-            "ctx_snapshots",
-            "idx_ctx_snapshots_owner_session_created",
-            "ALTER TABLE ctx_snapshots ADD INDEX idx_ctx_snapshots_owner_session_created (user_id, session_id, created_at)",
-        ),
-        (
-            "ctx_snapshots",
-            "idx_ctx_snapshots_owner_event_id",
-            "ALTER TABLE ctx_snapshots ADD INDEX idx_ctx_snapshots_owner_event_id (user_id, event_id)",
-        ),
-        (
-            "ctx_decision_audits",
-            "idx_ctx_decisions_owner_session_type_created",
-            "ALTER TABLE ctx_decision_audits ADD INDEX idx_ctx_decisions_owner_session_type_created (user_id, session_id, decision_type, created_at)",
-        ),
-        (
-            "ctx_decision_audits",
-            "idx_ctx_decisions_owner_event_id",
-            "ALTER TABLE ctx_decision_audits ADD INDEX idx_ctx_decisions_owner_event_id (user_id, event_id)",
-        ),
-        (
-            "ctx_decision_audits",
-            "idx_ctx_decisions_owner_context_capture_id",
-            "ALTER TABLE ctx_decision_audits ADD INDEX idx_ctx_decisions_owner_context_capture_id (user_id, context_capture_id)",
-        ),
-    ] {
-        add_index_if_missing(&pool, &settings.database, table, index, ddl).await?;
-    }
 
     query(
         "CREATE TABLE IF NOT EXISTS skill_selection_events (
@@ -2128,34 +1540,6 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
-
-    // Migration: add thinking_capability columns for existing deployments.
-    // MatrixOne does not support MySQL's `ADD COLUMN IF NOT EXISTS`, so use
-    // INFORMATION_SCHEMA first and only issue plain ALTER when the column is
-    // absent. This keeps startup logs clean and avoids swallowing syntax errors.
-    for (column, ddl) in [
-        (
-            "thinking_capability",
-            "ALTER TABLE infra_llm_models ADD COLUMN thinking_capability VARCHAR(20) NULL",
-        ),
-        (
-            "thinking_probe_error",
-            "ALTER TABLE infra_llm_models ADD COLUMN thinking_probe_error TEXT NULL",
-        ),
-    ] {
-        add_column_if_missing(&pool, &settings.database, "infra_llm_models", column, ddl).await?;
-    }
-
-    // Migration: promote legacy quirks.fallback_model into quirks.fallback_chain.
-    // Keep this in Rust instead of SQL JSON functions because MatrixOne does not
-    // support the full MySQL JSON mutation surface.
-    let migrated_model_rows = migrate_model_fallback_chain(&pool).await?;
-    if migrated_model_rows > 0 {
-        tracing::info!(
-            rows = migrated_model_rows,
-            "migrated legacy model fallback_chain config"
-        );
-    }
 
     query(
         "CREATE TABLE IF NOT EXISTS model_gateways (
@@ -2264,18 +1648,6 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
-    widen_varchar_if_shorter(
-        &pool,
-        &settings.database,
-        "skills_registry",
-        "created_by",
-        128,
-        "ALTER TABLE skills_registry MODIFY COLUMN created_by VARCHAR(128) NULL",
-    )
-    .await?;
-    // Skill triggers were removed; drop the dead column from existing dev/CI databases.
-    drop_column_if_exists(&pool, &settings.database, "skills_registry", "triggers").await?;
-
     query(
         "CREATE TABLE IF NOT EXISTS skill_metrics (
             metric_id            VARCHAR(255) PRIMARY KEY,
@@ -2305,33 +1677,6 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "skill_metrics",
-        "metric_slot",
-        "ALTER TABLE skill_metrics ADD COLUMN metric_slot VARCHAR(255) NOT NULL DEFAULT 'legacy'",
-    )
-    .await?;
-    query(
-        "UPDATE skill_metrics
-         SET metric_slot = CASE
-             WHEN metric_type = 'aggregate' THEN 'aggregate'
-             ELSE metric_id
-         END
-         WHERE metric_slot = 'legacy' OR metric_slot IS NULL OR metric_slot = ''",
-    )
-    .execute(&pool)
-    .await?;
-    add_index_if_missing(
-        &pool,
-        &settings.database,
-        "skill_metrics",
-        "uq_skill_metrics_slot",
-        "ALTER TABLE skill_metrics ADD UNIQUE INDEX uq_skill_metrics_slot (skill_name, metric_type, metric_slot)",
-    )
-    .await?;
-
     // ── Long-task orchestration (Phase H) ──
 
     query(
@@ -2408,51 +1753,6 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
-    // Migration: enforce request_id uniqueness on edge_pending_dispatch
-    add_index_if_missing(
-        &pool,
-        &settings.database,
-        "edge_pending_dispatch",
-        "uq_edge_dispatch_request_id",
-        "ALTER TABLE edge_pending_dispatch ADD UNIQUE KEY uq_edge_dispatch_request_id (request_id)",
-    )
-    .await?;
-
-    // Migration: add columns that may be missing on tables created by
-    // earlier iterations of this branch's DDL (before schema was finalised).
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "edge_pending_dispatch",
-        "result_json",
-        "ALTER TABLE edge_pending_dispatch ADD COLUMN result_json JSON NULL",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "edge_pending_dispatch",
-        "pod_id",
-        "ALTER TABLE edge_pending_dispatch ADD COLUMN pod_id VARCHAR(128) NULL",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "edge_pending_dispatch",
-        "dispatched_at",
-        "ALTER TABLE edge_pending_dispatch ADD COLUMN dispatched_at DATETIME(6) NULL",
-    )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "edge_pending_dispatch",
-        "completed_at",
-        "ALTER TABLE edge_pending_dispatch ADD COLUMN completed_at DATETIME(6) NULL",
-    )
-    .await?;
-
     query(
         "CREATE TABLE IF NOT EXISTS agent_bindings (
             id VARCHAR(64) PRIMARY KEY,
@@ -2511,31 +1811,6 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "mcp_bindings",
-        "key_hash",
-        "ALTER TABLE mcp_bindings ADD COLUMN key_hash VARCHAR(128) NULL",
-    )
-    .await?;
-    drop_index_if_exists(
-        &pool,
-        &settings.database,
-        "mcp_bindings",
-        "uq_mcp_bindings_owner_alias",
-    )
-    .await?;
-    drop_column_if_exists(&pool, &settings.database, "mcp_bindings", "alias").await?;
-    add_index_if_missing(
-        &pool,
-        &settings.database,
-        "mcp_bindings",
-        "uq_mcp_bindings_owner_mcp_key",
-        "ALTER TABLE mcp_bindings ADD UNIQUE KEY uq_mcp_bindings_owner_mcp_key (owner_user_id, mcp_id, key_hash)",
-    )
-    .await?;
-
     query(
         "CREATE TABLE IF NOT EXISTS mcp_tools (
             id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -2707,45 +1982,6 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
-    for (table, column, ddl) in [
-        (
-            "agent_sessions",
-            "project_id",
-            "ALTER TABLE agent_sessions ADD COLUMN project_id VARCHAR(128) NULL",
-        ),
-        (
-            "agent_sessions",
-            "project_retention_policy",
-            "ALTER TABLE agent_sessions ADD COLUMN project_retention_policy VARCHAR(32) NOT NULL DEFAULT 'session'",
-        ),
-    ] {
-        if let Err(e) = add_column_if_missing(&pool, &settings.database, table, column, ddl).await {
-            tracing::warn!("phase4 additive column migration skipped: {table}.{column}: {e}");
-        }
-    }
-
-    for (table, index, ddl) in [
-        (
-            "agent_sessions",
-            "idx_sessions_project",
-            "ALTER TABLE agent_sessions ADD INDEX idx_sessions_project (user_id, project_id, updated_at)",
-        ),
-        (
-            "session_artifacts",
-            "idx_session_artifacts_owner_kind_order",
-            "ALTER TABLE session_artifacts ADD INDEX idx_session_artifacts_owner_kind_order (user_id, session_id, artifact_kind, created_at, artifact_id)",
-        ),
-        (
-            "session_artifacts",
-            "idx_session_artifacts_owner_session_order",
-            "ALTER TABLE session_artifacts ADD INDEX idx_session_artifacts_owner_session_order (user_id, session_id, created_at, artifact_id)",
-        ),
-    ] {
-        if let Err(e) = add_index_if_missing(&pool, &settings.database, table, index, ddl).await {
-            tracing::debug!("phase4 additive index migration skipped: {table}.{index}: {e}");
-        }
-    }
-
     // Session task scratchpad (Tier 1 — ClaudeCode-style task board).
     // Authoritative store for the live task board. Both edge and cloud read
     // the same rows for a given session_id; per-host `TaskManager` instances
@@ -2794,29 +2030,21 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "session_todo_counters",
-        "user_id",
-        "ALTER TABLE session_todo_counters ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT ''",
+
+    query(
+        "CREATE TABLE IF NOT EXISTS session_todo_idempotency (
+            session_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(64) NOT NULL,
+            action VARCHAR(32) NOT NULL,
+            idempotency_key VARCHAR(128) NOT NULL,
+            args_json LONGTEXT NOT NULL,
+            output LONGTEXT NULL,
+            created_at DATETIME(6) NOT NULL,
+            updated_at DATETIME(6) NOT NULL,
+            PRIMARY KEY (session_id, user_id, action, idempotency_key)
+        )",
     )
-    .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "session_todo_counters",
-        "version",
-        "ALTER TABLE session_todo_counters ADD COLUMN version BIGINT NOT NULL DEFAULT 0",
-    )
-    .await?;
-    add_index_if_missing(
-        &pool,
-        &settings.database,
-        "session_todo_counters",
-        "idx_session_todo_counters_owner_session",
-        "ALTER TABLE session_todo_counters ADD INDEX idx_session_todo_counters_owner_session (user_id, session_id)",
-    )
+    .execute(&pool)
     .await?;
 
     // ── Durable Task System ─────────────────────────────────────────────────
@@ -2940,69 +2168,20 @@ pub async fn ensure_core_schema(
             skill_version    VARCHAR(32) NOT NULL,
             status           VARCHAR(32) NOT NULL DEFAULT 'active',
             previous_version VARCHAR(32),
+            scope            VARCHAR(32) NOT NULL DEFAULT 'user',
+            session_id       VARCHAR(128) NULL,
+            workspace_id     VARCHAR(128) NULL,
+            auto_activate_on_topic_match SMALLINT NOT NULL DEFAULT 0,
             installed_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at       DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
             UNIQUE INDEX idx_si_user_skill (user_id, skill_name),
-            INDEX idx_si_status (status)
+            INDEX idx_si_status (status),
+            INDEX idx_si_scope_target (user_id, scope, session_id, workspace_id, skill_name),
+            INDEX idx_si_auto_activate (user_id, auto_activate_on_topic_match, status)
         )",
     )
     .execute(&pool)
     .await?;
-
-    for (table, column, ddl) in [
-        (
-            "skill_installations",
-            "scope",
-            "ALTER TABLE skill_installations ADD COLUMN scope VARCHAR(32) NOT NULL DEFAULT 'user'",
-        ),
-        (
-            "skill_installations",
-            "session_id",
-            "ALTER TABLE skill_installations ADD COLUMN session_id VARCHAR(128) NULL",
-        ),
-        (
-            "skill_installations",
-            "workspace_id",
-            "ALTER TABLE skill_installations ADD COLUMN workspace_id VARCHAR(128) NULL",
-        ),
-        (
-            "skill_installations",
-            "auto_activate_on_topic_match",
-            "ALTER TABLE skill_installations ADD COLUMN auto_activate_on_topic_match SMALLINT NOT NULL DEFAULT 0",
-        ),
-    ] {
-        if let Err(e) = add_column_if_missing(&pool, &settings.database, table, column, ddl).await {
-            tracing::warn!(
-                target: "astra_services::storage",
-                table,
-                column,
-                error = %e,
-                "failed to migrate skill_installations column"
-            );
-        }
-    }
-    for (table, index, ddl) in [
-        (
-            "skill_installations",
-            "idx_si_scope_target",
-            "ALTER TABLE skill_installations ADD INDEX idx_si_scope_target (user_id, scope, session_id, workspace_id, skill_name)",
-        ),
-        (
-            "skill_installations",
-            "idx_si_auto_activate",
-            "ALTER TABLE skill_installations ADD INDEX idx_si_auto_activate (user_id, auto_activate_on_topic_match, status)",
-        ),
-    ] {
-        if let Err(e) = add_index_if_missing(&pool, &settings.database, table, index, ddl).await {
-            tracing::warn!(
-                target: "astra_services::storage",
-                table,
-                index,
-                error = %e,
-                "failed to migrate skill_installations index"
-            );
-        }
-    }
 
     query(
         "CREATE TABLE IF NOT EXISTS skill_settings (
@@ -3302,38 +2481,13 @@ pub async fn ensure_core_schema(
             message_count INT DEFAULT NULL,
             payload       MEDIUMTEXT NOT NULL,
             created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (session_id, seq),
+            PRIMARY KEY (user_id, session_id, seq),
             INDEX idx_csl_owner_snapshot (user_id, session_id, entry_type, seq DESC),
             INDEX idx_csl_owner_turn (user_id, session_id, turn)
         )",
     )
     .execute(&pool)
     .await?;
-    add_column_if_missing(
-        &pool,
-        &settings.database,
-        "conversation_log",
-        "user_id",
-        "ALTER TABLE conversation_log ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT ''",
-    )
-    .await?;
-    add_index_if_missing(
-        &pool,
-        &settings.database,
-        "conversation_log",
-        "idx_csl_owner_snapshot",
-        "ALTER TABLE conversation_log ADD INDEX idx_csl_owner_snapshot (user_id, session_id, entry_type, seq DESC)",
-    )
-    .await?;
-    add_index_if_missing(
-        &pool,
-        &settings.database,
-        "conversation_log",
-        "idx_csl_owner_turn",
-        "ALTER TABLE conversation_log ADD INDEX idx_csl_owner_turn (user_id, session_id, turn)",
-    )
-    .await?;
-
     // ─── Content-addressed config versions (Step 4a) ────────────────────────────
     //
     // One row per unique RuntimeConfig hash per tenant. Populated by
@@ -3345,361 +2499,6 @@ pub async fn ensure_core_schema(
     query(crate::config_version_cloud::CONFIG_VERSIONS_CREATE_SQL)
         .execute(&pool)
         .await?;
-
-    // ─── Schema migration tracking ──────────────────────────────────────────────
-
-    query(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (
-            version     INT PRIMARY KEY,
-            description VARCHAR(255) NOT NULL,
-            applied_at  DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    run_migrations(&pool).await?;
-
-    Ok(())
-}
-
-async fn run_migration(
-    pool: &sqlx::Pool<MySql>,
-    version: i32,
-    description: &str,
-    sql: &str,
-) -> Result<(), sqlx::Error> {
-    let already_applied: bool = query("SELECT 1 FROM schema_migrations WHERE version = ?")
-        .bind(version)
-        .fetch_optional(pool)
-        .await?
-        .is_some();
-
-    if already_applied {
-        return Ok(());
-    }
-
-    execute_idempotent_migration_sql(pool, sql).await?;
-
-    query("INSERT IGNORE INTO schema_migrations (version, description) VALUES (?, ?)")
-        .bind(version)
-        .bind(description)
-        .execute(pool)
-        .await?;
-
-    Ok(())
-}
-
-async fn run_migration_batch(
-    pool: &sqlx::Pool<MySql>,
-    version: i32,
-    description: &str,
-    statements: &[&str],
-) -> Result<(), sqlx::Error> {
-    let already_applied: bool = query("SELECT 1 FROM schema_migrations WHERE version = ?")
-        .bind(version)
-        .fetch_optional(pool)
-        .await?
-        .is_some();
-
-    if already_applied {
-        return Ok(());
-    }
-
-    for statement in statements {
-        execute_idempotent_migration_sql(pool, statement).await?;
-    }
-
-    query("INSERT IGNORE INTO schema_migrations (version, description) VALUES (?, ?)")
-        .bind(version)
-        .bind(description)
-        .execute(pool)
-        .await?;
-
-    Ok(())
-}
-
-async fn execute_idempotent_migration_sql(
-    pool: &sqlx::Pool<MySql>,
-    sql: &str,
-) -> Result<(), sqlx::Error> {
-    // Idempotent migrations need tolerance for vendor-specific error codes
-    // when the target is already in the desired state:
-    //   * 1060 — ALTER ADD COLUMN on an existing column (fresh DB where
-    //     CREATE TABLE already installed it).
-    //   * 1061 — ALTER ADD INDEX on an existing index (same reason).
-    //   * 1091 — MySQL's "Can't DROP; check column/key exists".
-    //   * 20101 — MatrixOne's internal error for the same DROP-missing case.
-    //   * 1062 — duplicate key value on an index being added; handled by
-    //     explicit dedupe migrations, not here.
-    //
-    // MySQL's SQLSTATE is a generic "HY000" for these; the real signal is
-    // the numeric error code, which we read via downcast to the driver's
-    // `MySqlDatabaseError`.
-    match query(sql).execute(pool).await {
-        Ok(_) => {}
-        Err(sqlx::Error::Database(db_err)) => {
-            let number = db_err
-                .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
-                .map(|e| e.number());
-            if matches!(number, Some(1060) | Some(1061) | Some(1091) | Some(20101)) {
-                // Already present (or already absent for DROP) — fresh DB
-                // created the schema via CREATE TABLE. Record and continue.
-            } else {
-                return Err(sqlx::Error::Database(db_err));
-            }
-        }
-        Err(e) => return Err(e),
-    }
-    Ok(())
-}
-
-async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
-    run_migration(
-        pool,
-        2,
-        "add covering index on skills_registry for listing queries",
-        "SELECT 1", // index already in CREATE TABLE above; marker only
-    )
-    .await?;
-
-    run_migration(
-        pool,
-        3,
-        "add active_plan_id to agent_sessions for plan-mode linkage",
-        "ALTER TABLE agent_sessions ADD COLUMN active_plan_id VARCHAR(64) NULL",
-    )
-    .await?;
-
-    run_migration(
-        pool,
-        4,
-        "add subtask_count to plans for denormalized list rendering",
-        "ALTER TABLE plans ADD COLUMN subtask_count INT NOT NULL DEFAULT 0",
-    )
-    .await?;
-
-    // Index on active_plan_id covers the cascade clear in `delete_plan` and
-    // `set_active_plan` (`UPDATE agent_sessions SET active_plan_id = NULL
-    // WHERE active_plan_id = ?`). Without it, every plan deletion triggers a
-    // full table scan of `agent_sessions`.
-    run_migration(
-        pool,
-        5,
-        "add index on agent_sessions.active_plan_id for cascade clears",
-        "ALTER TABLE agent_sessions \
-         ADD INDEX idx_agent_sessions_active_plan_id (active_plan_id)",
-    )
-    .await?;
-
-    // Enforce uniqueness on (plan_id, subtask_id, attempt). Two concurrent
-    // `redo_step` calls would each compute `next_attempt = max+1` from a
-    // stale read and both insert the same tuple; the UNIQUE index makes
-    // exactly one INSERT win so `record_step_run` can surface a Conflict.
-    //
-    // Migrations 6-8 are sequenced for safety on DBs that already
-    // accumulated duplicates under the prior non-unique index:
-    //   6: drop the old non-unique index (1091/20101 tolerance covers the
-    //      fresh-DB case where CREATE TABLE never installed it).
-    //   7: DELETE duplicate rows, keeping the lexicographically smallest
-    //      run_id per (plan_id, subtask_id, attempt). Idempotent — on a
-    //      DB with no dupes this is a no-op DELETE.
-    //   8: ADD UNIQUE. With 7 finished no 1062 can occur; the 1061
-    //      tolerance handles fresh DBs whose CREATE TABLE already installed
-    //      the unique key.
-    run_migration(
-        pool,
-        6,
-        "drop non-unique idx_step_runs_subtask_attempt before upgrading to UNIQUE",
-        "ALTER TABLE plan_step_runs DROP INDEX idx_step_runs_subtask_attempt",
-    )
-    .await?;
-
-    run_migration(
-        pool,
-        7,
-        "dedupe plan_step_runs on (plan_id, subtask_id, attempt) keeping oldest run_id",
-        // MatrixOne silently no-ops the MySQL `DELETE t FROM t JOIN ...`
-        // form, so we use a NOT IN subquery. Plain MySQL also forbids
-        // SELECT from the same target table in a direct subquery, which we
-        // dodge by wrapping the GROUP BY in a derived table.
-        "DELETE FROM plan_step_runs WHERE run_id NOT IN ( \
-             SELECT keep_id FROM ( \
-                 SELECT MIN(run_id) AS keep_id FROM plan_step_runs \
-                 GROUP BY plan_id, subtask_id, attempt \
-             ) keep \
-         )",
-    )
-    .await?;
-
-    run_migration(
-        pool,
-        8,
-        "add UNIQUE (plan_id, subtask_id, attempt) on plan_step_runs",
-        "ALTER TABLE plan_step_runs \
-         ADD UNIQUE KEY uq_step_runs_subtask_attempt (plan_id, subtask_id, attempt)",
-    )
-    .await?;
-
-    run_migration(
-        pool,
-        9,
-        "add trace_id, message_count, idx_csl_turn to conversation_log",
-        "ALTER TABLE conversation_log \
-         ADD COLUMN trace_id VARCHAR(64) DEFAULT NULL, \
-         ADD COLUMN message_count INT DEFAULT NULL, \
-         ADD INDEX idx_csl_turn (session_id, turn)",
-    )
-    .await?;
-
-    // Step 4a — content-addressed config versions.
-    //
-    // Two migrations so fresh DBs get everything via the CREATE TABLE
-    // above and existing DBs catch up here.
-
-    run_migration(
-        pool,
-        10,
-        "create config_versions table (Step 4a cloud mirror of local version store)",
-        crate::config_version_cloud::CONFIG_VERSIONS_CREATE_SQL,
-    )
-    .await?;
-
-    run_migration(
-        pool,
-        11,
-        "add config_version_id pointer column to agent_sessions",
-        "ALTER TABLE agent_sessions \
-         ADD COLUMN config_version_id VARCHAR(24) DEFAULT NULL",
-    )
-    .await?;
-
-    run_migration(
-        pool,
-        12,
-        "add config_version_id index on agent_sessions",
-        "ALTER TABLE agent_sessions \
-         ADD INDEX idx_agent_sessions_config_version (config_version_id)",
-    )
-    .await?;
-
-    run_migration(
-        pool,
-        13,
-        "widen session_todo_counters.next_id for exhausted task id sentinel",
-        "ALTER TABLE session_todo_counters MODIFY COLUMN next_id BIGINT NOT NULL",
-    )
-    .await?;
-
-    run_migration(
-        pool,
-        14,
-        "add DB traceability columns and indexes to agent_events",
-        "SELECT 1",
-    )
-    .await?;
-
-    run_migration_batch(
-        pool,
-        15,
-        "drop obsolete harness and memory tables once",
-        &[
-            "DROP TABLE IF EXISTS harness_artifacts",
-            "DROP TABLE IF EXISTS harness_agent_roles",
-            "DROP TABLE IF EXISTS harness_subagent_runs",
-            "DROP TABLE IF EXISTS harness_blackboard_entries",
-            "DROP TABLE IF EXISTS prompt_chunks",
-            "DROP TABLE IF EXISTS harness_sources",
-            "DROP TABLE IF EXISTS harness_decisions",
-            "DROP TABLE IF EXISTS wf_definitions",
-            "DROP TABLE IF EXISTS wf_runs",
-            "DROP TABLE IF EXISTS skill_marketplace_stats",
-            "DROP TABLE IF EXISTS skill_quality_reports",
-            "DROP TABLE IF EXISTS step_idempotency_cache",
-            "DROP TABLE IF EXISTS mem_memories",
-            "DROP TABLE IF EXISTS sk_knowledge_entries",
-            "DROP TABLE IF EXISTS governance_runs",
-            "DROP TABLE IF EXISTS eval_llm_feedback",
-            "DROP TABLE IF EXISTS user_preference_history",
-        ],
-    )
-    .await?;
-
-    run_migration_batch(
-        pool,
-        16,
-        "store session_todos structured fields as LONGTEXT for MatrixOne parameter writes",
-        &[
-            "ALTER TABLE session_todos MODIFY COLUMN metadata LONGTEXT NULL",
-            "ALTER TABLE session_todos MODIFY COLUMN blocks LONGTEXT NULL",
-            "ALTER TABLE session_todos MODIFY COLUMN blocked_by LONGTEXT NULL",
-            "ALTER TABLE session_todos MODIFY COLUMN subtasks LONGTEXT NULL",
-        ],
-    )
-    .await?;
-
-    run_migration(
-        pool,
-        17,
-        "add session_todo_counters.version for task-board CAS rollback",
-        "ALTER TABLE session_todo_counters ADD COLUMN version BIGINT NOT NULL DEFAULT 0",
-    )
-    .await?;
-
-    run_migration(
-        pool,
-        18,
-        "create session_todo_idempotency ledger",
-        "CREATE TABLE session_todo_idempotency (
-            session_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(64) NOT NULL,
-            action VARCHAR(32) NOT NULL,
-            idempotency_key VARCHAR(128) NOT NULL,
-            args_json LONGTEXT NOT NULL,
-            output LONGTEXT NULL,
-            created_at DATETIME(6) NOT NULL,
-            updated_at DATETIME(6) NOT NULL,
-            PRIMARY KEY (session_id, user_id, action, idempotency_key)
-        )",
-    )
-    .await?;
-
-    // Migration 19: tool_exactly_once_results for crash-recovery tool dedup.
-    //
-    // `dedup_key` is the SHA-256 hex of the logical cache_key
-    // (see `dedup_key_hash` in tool_exactly_once.rs), so 64 chars is always
-    // sufficient. The earlier VARCHAR(1024) form silently truncated long
-    // cache_keys under non-strict MySQL modes, which could let two distinct
-    // tool calls collide on the PRIMARY KEY and return the wrong cached
-    // result. Keep VARCHAR(128) for defensive headroom.
-    run_migration(
-        pool,
-        19,
-        "create tool_exactly_once_results for tool dedup",
-        "CREATE TABLE tool_exactly_once_results (
-            session_id   VARCHAR(128) NOT NULL,
-            dedup_key    VARCHAR(128) NOT NULL,
-            key_json     JSON NOT NULL,
-            result_json  JSON NOT NULL,
-            recorded_at  BIGINT UNSIGNED NOT NULL DEFAULT 0,
-            PRIMARY KEY (session_id, dedup_key)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
-    )
-    .await?;
-
-    run_migration_batch(
-        pool,
-        20,
-        "bind conversation_log to owner scope",
-        &[
-            "ALTER TABLE conversation_log ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT ''",
-            "ALTER TABLE conversation_log ADD INDEX idx_csl_owner_snapshot (user_id, session_id, entry_type, seq DESC)",
-            "ALTER TABLE conversation_log ADD INDEX idx_csl_owner_turn (user_id, session_id, turn)",
-            "ALTER TABLE conversation_log DROP INDEX idx_csl_snapshot",
-            "ALTER TABLE conversation_log DROP INDEX idx_csl_turn",
-        ],
-    )
-    .await?;
 
     Ok(())
 }
@@ -4007,55 +2806,6 @@ pub async fn cleanup_expired_data(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn migrate(raw: &str) -> serde_json::Value {
-        let updated = promote_legacy_fallback_model_quirks(raw)
-            .expect("migration should parse")
-            .expect("migration should update");
-        serde_json::from_str(&updated).expect("updated quirks should be valid JSON")
-    }
-
-    #[test]
-    fn fallback_model_migration_creates_fallback_chain() {
-        let value = migrate(r#"{"fallback_model":"model-b","no_system_message":true}"#);
-
-        assert_eq!(value.get("fallback_model"), None);
-        assert_eq!(
-            value.get("fallback_chain"),
-            Some(&serde_json::json!(["model-b"]))
-        );
-        assert_eq!(
-            value.get("no_system_message"),
-            Some(&serde_json::Value::Bool(true))
-        );
-    }
-
-    #[test]
-    fn fallback_model_migration_preserves_existing_fallback_chain() {
-        let value = migrate(r#"{"fallback_model":"model-b","fallback_chain":["model-c"]}"#);
-
-        assert_eq!(value.get("fallback_model"), None);
-        assert_eq!(
-            value.get("fallback_chain"),
-            Some(&serde_json::json!(["model-c"]))
-        );
-    }
-
-    #[test]
-    fn fallback_model_migration_ignores_rows_without_legacy_key() {
-        let updated = promote_legacy_fallback_model_quirks(r#"{"fallback_chain":["model-c"]}"#)
-            .expect("migration should parse");
-
-        assert!(updated.is_none());
-    }
-
-    #[test]
-    fn fallback_model_migration_rejects_non_string_legacy_key() {
-        let error = promote_legacy_fallback_model_quirks(r#"{"fallback_model":["model-b"]}"#)
-            .expect_err("non-string legacy fallback_model should fail");
-
-        assert!(error.contains("must be a string"));
-    }
 
     /// Every `agent_id`, `edge_agent_id`, `holder_agent_id`, and
     /// `parent_agent_id` column in DDL MUST use the width encoded in

@@ -385,11 +385,41 @@ fn parse_next_task_counter(raw: i64, session_id: &str) -> Result<(u32, i64), Str
     Ok((current, next_stored as i64))
 }
 
+fn session_todo_owner_mismatch_error(session_id: &str, user_id: &str, reason: &str) -> String {
+    format!(
+        "session_todo_counters owner mismatch for session_id={session_id} user_id={user_id}: {reason}"
+    )
+}
+
+async fn ensure_session_todo_session_owner(
+    executor: &mut sqlx::MySqlConnection,
+    session_id: &str,
+    user_id: &str,
+) -> Result<(), String> {
+    let session_owner: Option<(String,)> =
+        sqlx::query_as("SELECT user_id FROM agent_sessions WHERE session_id = ? FOR UPDATE")
+            .bind(session_id)
+            .fetch_optional(&mut *executor)
+            .await
+            .map_err(|e| e.to_string())?;
+    if session_owner.as_ref().map(|(owner,)| owner.as_str()) == Some(user_id) {
+        Ok(())
+    } else {
+        Err(session_todo_owner_mismatch_error(
+            session_id,
+            user_id,
+            "agent_sessions owner root missing or belongs to another user",
+        ))
+    }
+}
+
 async fn ensure_session_todo_counter_owner_available(
     executor: &mut sqlx::MySqlConnection,
     session_id: &str,
     user_id: &str,
 ) -> Result<(), String> {
+    ensure_session_todo_session_owner(executor, session_id, user_id).await?;
+
     let existing: Option<(String,)> =
         sqlx::query_as("SELECT user_id FROM session_todo_counters WHERE session_id = ? FOR UPDATE")
             .bind(session_id)
@@ -397,9 +427,13 @@ async fn ensure_session_todo_counter_owner_available(
             .await
             .map_err(|e| e.to_string())?;
     match existing {
-        Some((existing_user_id,)) if existing_user_id != user_id => Err(format!(
-            "session_todo_counters owner mismatch for {session_id}"
-        )),
+        Some((existing_user_id,)) if existing_user_id != user_id => {
+            Err(session_todo_owner_mismatch_error(
+                session_id,
+                user_id,
+                &format!("counter row belongs to {existing_user_id}"),
+            ))
+        }
         _ => Ok(()),
     }
 }
@@ -412,6 +446,10 @@ async fn adopt_task_into_session_atomic(
     target_session: &str,
 ) -> Result<String, String> {
     let mut tx = shared.get().begin().await.map_err(|e| e.to_string())?;
+
+    ensure_session_todo_session_owner(&mut tx, source_session, user_id)
+        .await
+        .map_err(|e| format!("source task owner check failed: {e}"))?;
 
     let source_row: Option<(String, Option<String>, Option<String>, String)> = sqlx::query_as(
         "SELECT title, description, subtasks, status FROM session_todos \
@@ -1811,6 +1849,27 @@ mod tests {
             .bind(session_id)
             .execute(pool)
             .await;
+        let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ?")
+            .bind(session_id)
+            .execute(pool)
+            .await;
+    }
+
+    async fn prepare_session_todo_owner(
+        pool: &sqlx::Pool<sqlx::MySql>,
+        session_id: &str,
+        user_id: &str,
+    ) {
+        cleanup_session_rows(pool, session_id).await;
+        sqlx::query(
+            "INSERT INTO agent_sessions (session_id, user_id, agent_id, title, status, metadata)
+             VALUES (?, ?, 'session-todo-handler-test', 'session todo handler test', 'active', '{}')",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("insert agent_sessions owner root");
     }
 
     #[tokio::test]
@@ -1821,8 +1880,8 @@ mod tests {
         let user_id = format!("u-adopt-{}", uuid::Uuid::new_v4());
         let source_session = format!("s-adopt-source-{}", uuid::Uuid::new_v4());
         let target_session = format!("s-adopt-target-{}", uuid::Uuid::new_v4());
-        cleanup_session_rows(&pool, &source_session).await;
-        cleanup_session_rows(&pool, &target_session).await;
+        prepare_session_todo_owner(&pool, &source_session, &user_id).await;
+        prepare_session_todo_owner(&pool, &target_session, &user_id).await;
 
         let source_store: Arc<dyn TaskStore> =
             Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
@@ -1893,8 +1952,8 @@ mod tests {
         let user_id = format!("u-fork-copy-{}", uuid::Uuid::new_v4());
         let source_session = format!("s-fork-copy-source-{}", uuid::Uuid::new_v4());
         let target_session = format!("s-fork-copy-target-{}", uuid::Uuid::new_v4());
-        cleanup_session_rows(&pool, &source_session).await;
-        cleanup_session_rows(&pool, &target_session).await;
+        prepare_session_todo_owner(&pool, &source_session, &user_id).await;
+        prepare_session_todo_owner(&pool, &target_session, &user_id).await;
 
         let source_store: Arc<dyn TaskStore> =
             Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
@@ -2000,7 +2059,7 @@ mod tests {
             &paused_session,
             &completed_session,
         ] {
-            cleanup_session_rows(&pool, session_id).await;
+            prepare_session_todo_owner(&pool, session_id, &user_id).await;
         }
 
         let make_manager = |session_id: &str| {
@@ -2102,7 +2161,7 @@ mod tests {
         let pool = shared.get().clone();
         let user_id = format!("u-user-todos-corrupt-status-{}", uuid::Uuid::new_v4());
         let session_id = format!("s-user-todos-corrupt-status-{}", uuid::Uuid::new_v4());
-        cleanup_session_rows(&pool, &session_id).await;
+        prepare_session_todo_owner(&pool, &session_id, &user_id).await;
 
         let store: Arc<dyn TaskStore> =
             Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
@@ -2158,8 +2217,8 @@ mod tests {
         let user_id = format!("u-adopt-empty-desc-{}", uuid::Uuid::new_v4());
         let source_session = format!("s-adopt-empty-desc-source-{}", uuid::Uuid::new_v4());
         let target_session = format!("s-adopt-empty-desc-target-{}", uuid::Uuid::new_v4());
-        cleanup_session_rows(&pool, &source_session).await;
-        cleanup_session_rows(&pool, &target_session).await;
+        prepare_session_todo_owner(&pool, &source_session, &user_id).await;
+        prepare_session_todo_owner(&pool, &target_session, &user_id).await;
 
         let source_store: Arc<dyn TaskStore> =
             Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
@@ -2231,8 +2290,8 @@ mod tests {
         let user_id = format!("u-adopt-bad-subtasks-{}", uuid::Uuid::new_v4());
         let source_session = format!("s-adopt-bad-src-{}", uuid::Uuid::new_v4());
         let target_session = format!("s-adopt-bad-dst-{}", uuid::Uuid::new_v4());
-        cleanup_session_rows(&pool, &source_session).await;
-        cleanup_session_rows(&pool, &target_session).await;
+        prepare_session_todo_owner(&pool, &source_session, &user_id).await;
+        prepare_session_todo_owner(&pool, &target_session, &user_id).await;
 
         let source_store: Arc<dyn TaskStore> =
             Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
@@ -2319,8 +2378,8 @@ mod tests {
         let user_id = format!("u-adopt-clean-edges-{}", uuid::Uuid::new_v4());
         let source_session = format!("s-adopt-clean-edges-src-{}", uuid::Uuid::new_v4());
         let target_session = format!("s-adopt-clean-edges-dst-{}", uuid::Uuid::new_v4());
-        cleanup_session_rows(&pool, &source_session).await;
-        cleanup_session_rows(&pool, &target_session).await;
+        prepare_session_todo_owner(&pool, &source_session, &user_id).await;
+        prepare_session_todo_owner(&pool, &target_session, &user_id).await;
 
         let source_store: Arc<dyn TaskStore> =
             Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
@@ -2382,7 +2441,7 @@ mod tests {
         let pool = shared.get().clone();
         let user_id = format!("u-canonical-{}", uuid::Uuid::new_v4());
         let session_id = format!("s-canonical-{}", uuid::Uuid::new_v4());
-        cleanup_session_rows(&pool, &session_id).await;
+        prepare_session_todo_owner(&pool, &session_id, &user_id).await;
 
         let state = crate::AppState::new(crate::ServiceInfo::default(), Arc::new(Healthy))
             .with_shared_pool(shared.clone())
@@ -2458,7 +2517,7 @@ mod tests {
         let pool = shared.get().clone();
         let user_id = format!("u-terminal-{}", uuid::Uuid::new_v4());
         let session_id = format!("s-terminal-{}", uuid::Uuid::new_v4());
-        cleanup_session_rows(&pool, &session_id).await;
+        prepare_session_todo_owner(&pool, &session_id, &user_id).await;
 
         let state = crate::AppState::new(crate::ServiceInfo::default(), Arc::new(Healthy))
             .with_shared_pool(shared.clone())
@@ -2595,7 +2654,7 @@ mod tests {
         let pool = shared.get().clone();
         let user_id = format!("u-sub-reopen-{}", uuid::Uuid::new_v4());
         let session_id = format!("s-sub-reopen-{}", uuid::Uuid::new_v4());
-        cleanup_session_rows(&pool, &session_id).await;
+        prepare_session_todo_owner(&pool, &session_id, &user_id).await;
 
         let state = crate::AppState::new(crate::ServiceInfo::default(), Arc::new(Healthy))
             .with_shared_pool(shared.clone())
@@ -2738,7 +2797,7 @@ mod tests {
         let pool = shared.get().clone();
         let user_id = format!("u-auto-sub-reopen-{}", uuid::Uuid::new_v4());
         let session_id = format!("s-auto-sub-reopen-{}", uuid::Uuid::new_v4());
-        cleanup_session_rows(&pool, &session_id).await;
+        prepare_session_todo_owner(&pool, &session_id, &user_id).await;
 
         let state = crate::AppState::new(crate::ServiceInfo::default(), Arc::new(Healthy))
             .with_shared_pool(shared.clone())
@@ -2872,7 +2931,7 @@ mod tests {
         let pool = shared.get().clone();
         let user_id = format!("u-error-message-{}", uuid::Uuid::new_v4());
         let session_id = format!("s-error-message-{}", uuid::Uuid::new_v4());
-        cleanup_session_rows(&pool, &session_id).await;
+        prepare_session_todo_owner(&pool, &session_id, &user_id).await;
 
         let state = crate::AppState::new(crate::ServiceInfo::default(), Arc::new(Healthy))
             .with_shared_pool(shared.clone())
@@ -3019,8 +3078,8 @@ mod tests {
         let user_id = format!("u-adopt-terminal-{}", uuid::Uuid::new_v4());
         let source_session = format!("s-adopt-terminal-source-{}", uuid::Uuid::new_v4());
         let target_session = format!("s-adopt-terminal-target-{}", uuid::Uuid::new_v4());
-        cleanup_session_rows(&pool, &source_session).await;
-        cleanup_session_rows(&pool, &target_session).await;
+        prepare_session_todo_owner(&pool, &source_session, &user_id).await;
+        prepare_session_todo_owner(&pool, &target_session, &user_id).await;
 
         let source_store: Arc<dyn TaskStore> =
             Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());

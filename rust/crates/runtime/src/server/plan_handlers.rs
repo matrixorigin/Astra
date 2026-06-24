@@ -728,7 +728,7 @@ pub(super) async fn create_plan_handler(
     if let Some(sid) = req.session_id.as_deref() {
         state
             .plan_repo
-            .set_active_plan(sid, Some(&plan_id))
+            .set_active_plan(&user.user_id, sid, Some(&plan_id))
             .await
             .map_err(map_plan_load_err)?;
     }
@@ -782,7 +782,7 @@ pub(super) async fn list_plans_handler(
             .expect("checked above: active_session_only requires session_id");
         let Some(active_plan_id) = state
             .plan_repo
-            .active_plan_for_session(session_id)
+            .active_plan_for_session(&user.user_id, session_id)
             .await
             .map_err(map_plan_load_err)?
         else {
@@ -1030,7 +1030,7 @@ pub(super) async fn execute_plan_handler(
 
     if let Err(error) = state
         .plan_repo
-        .set_active_plan(&req.session_id, Some(&plan_id))
+        .set_active_plan(&user.user_id, &req.session_id, Some(&plan_id))
         .await
     {
         let mut restore_errors = Vec::new();
@@ -1172,7 +1172,7 @@ pub(super) async fn exit_plan_mode_handler(
         if let Some(sid) = session_hint.as_deref() {
             state
                 .plan_repo
-                .set_active_plan(sid, None)
+                .set_active_plan(&user.user_id, sid, None)
                 .await
                 .map_err(map_plan_load_err)?;
         }
@@ -2135,6 +2135,27 @@ mod tests {
             .bind(session_id)
             .execute(pool)
             .await;
+        let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ?")
+            .bind(session_id)
+            .execute(pool)
+            .await;
+    }
+
+    async fn prepare_session_todo_owner(
+        pool: &sqlx::Pool<sqlx::MySql>,
+        session_id: &str,
+        user_id: &str,
+    ) {
+        cleanup_session_todos(pool, session_id).await;
+        sqlx::query(
+            "INSERT INTO agent_sessions (session_id, user_id, agent_id, title, status, metadata)
+             VALUES (?, ?, 'plan-handler-test', 'plan handler test', 'active', '{}')",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("insert agent_sessions owner root");
     }
 
     // ── infer_phase tests ─────────────────────────────────────────────
@@ -2822,7 +2843,7 @@ mod tests {
         let pool = shared.get().clone();
         let user_id = format!("u-plan-mirror-{}", uuid::Uuid::new_v4());
         let session_id = format!("s-plan-mirror-{}", uuid::Uuid::new_v4());
-        cleanup_session_todos(&pool, &session_id).await;
+        prepare_session_todo_owner(&pool, &session_id, &user_id).await;
 
         let store: Arc<dyn TaskStore> =
             Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
@@ -2881,7 +2902,7 @@ mod tests {
         let pool = shared.get().clone();
         let user_id = format!("u-plan-rollback-{}", uuid::Uuid::new_v4());
         let session_id = format!("s-plan-rollback-{}", uuid::Uuid::new_v4());
-        cleanup_session_todos(&pool, &session_id).await;
+        prepare_session_todo_owner(&pool, &session_id, &user_id).await;
 
         let store: Arc<dyn TaskStore> =
             Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
@@ -2939,7 +2960,7 @@ mod tests {
         let pool = shared.get().clone();
         let user_id = format!("u-plan-reuse-cli-{}", uuid::Uuid::new_v4());
         let session_id = format!("s-plan-reuse-cli-{}", uuid::Uuid::new_v4());
-        cleanup_session_todos(&pool, &session_id).await;
+        prepare_session_todo_owner(&pool, &session_id, &user_id).await;
 
         let store: Arc<dyn TaskStore> =
             Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
@@ -3018,7 +3039,7 @@ mod tests {
         let pool = shared.get().clone();
         let user_id = format!("u-plan-repeat-{}", uuid::Uuid::new_v4());
         let session_id = format!("s-plan-repeat-{}", uuid::Uuid::new_v4());
-        cleanup_session_todos(&pool, &session_id).await;
+        prepare_session_todo_owner(&pool, &session_id, &user_id).await;
 
         let store: Arc<dyn TaskStore> =
             Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
@@ -3088,7 +3109,7 @@ mod tests {
         let pool = shared.get().clone();
         let user_id = format!("u-plan-handoff-{}", uuid::Uuid::new_v4());
         let session_id = format!("s-plan-handoff-{}", uuid::Uuid::new_v4());
-        cleanup_session_todos(&pool, &session_id).await;
+        prepare_session_todo_owner(&pool, &session_id, &user_id).await;
 
         let store: Arc<dyn TaskStore> =
             Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
@@ -3163,7 +3184,7 @@ mod tests {
         let pool = shared.get().clone();
         let user_id = format!("u-plan-redo-{}", uuid::Uuid::new_v4());
         let session_id = format!("s-plan-redo-{}", uuid::Uuid::new_v4());
-        cleanup_session_todos(&pool, &session_id).await;
+        prepare_session_todo_owner(&pool, &session_id, &user_id).await;
 
         let store: Arc<dyn TaskStore> =
             Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());

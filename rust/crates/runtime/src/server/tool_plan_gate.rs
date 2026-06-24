@@ -39,13 +39,14 @@ pub(crate) fn plan_mode_blocked_tool_result(tool: &str) -> astra_tools::ToolResu
 
 pub(crate) async fn plan_mode_authoring_active(
     repo: Option<&Arc<dyn astra_plan::PlanRepository>>,
+    user_id: &str,
     session_id: &str,
     cache: &tokio::sync::RwLock<PlanModeSnapshot>,
 ) -> bool {
     if let Some(cached) = cache.read().await.authoring_active {
         return cached;
     }
-    let (authoring, hint) = recompute_plan_mode_snapshot(repo, session_id).await;
+    let (authoring, hint) = recompute_plan_mode_snapshot(repo, user_id, session_id).await;
     let mut writer = cache.write().await;
     writer.authoring_active = Some(authoring);
     writer.resume_hint = hint;
@@ -54,15 +55,16 @@ pub(crate) async fn plan_mode_authoring_active(
 
 pub(crate) async fn recompute_plan_mode_snapshot(
     repo: Option<&Arc<dyn astra_plan::PlanRepository>>,
+    user_id: &str,
     session_id: &str,
 ) -> (bool, Option<String>) {
     let Some(repo) = repo else {
         return (false, None);
     };
-    let Ok(Some(plan_id)) = repo.active_plan_for_session(session_id).await else {
+    let Ok(Some(plan_id)) = repo.active_plan_for_session(user_id, session_id).await else {
         return (false, None);
     };
-    match repo.load(&plan_id).await {
+    match repo.load_owned(&plan_id, user_id).await {
         Ok(state) => {
             let has_subtasks = !state.plan.subtasks.is_empty();
             let any_in_progress = state.plan.subtasks.iter().any(|subtask| {
@@ -81,6 +83,7 @@ pub(crate) async fn recompute_plan_mode_snapshot(
 
 pub(crate) async fn invalidate_plan_mode_cache(
     repo: Option<&Arc<dyn astra_plan::PlanRepository>>,
+    user_id: &str,
     session_id: &str,
     cache: &tokio::sync::RwLock<PlanModeSnapshot>,
     resume_hint_handle: Option<&Arc<std::sync::RwLock<Option<String>>>>,
@@ -90,7 +93,7 @@ pub(crate) async fn invalidate_plan_mode_cache(
         *writer = PlanModeSnapshot::default();
     }
     if let Some(handle) = resume_hint_handle {
-        let (authoring, hint) = recompute_plan_mode_snapshot(repo, session_id).await;
+        let (authoring, hint) = recompute_plan_mode_snapshot(repo, user_id, session_id).await;
         if let Ok(mut slot) = handle.write() {
             *slot = hint.clone();
         }
@@ -165,11 +168,14 @@ pub(crate) async fn execute_enter_plan_mode(
         return format!("Error: save plan after {MAX_CAS_RETRIES} retries: {conflict}");
     }
 
-    if let Err(error) = repo.set_active_plan(session_id, Some(&plan_id)).await {
+    if let Err(error) = repo
+        .set_active_plan(user_id, session_id, Some(&plan_id))
+        .await
+    {
         return format!("Error: link plan to session: {error}");
     }
 
-    invalidate_plan_mode_cache(Some(&repo), session_id, cache, resume_hint_handle).await;
+    invalidate_plan_mode_cache(Some(&repo), user_id, session_id, cache, resume_hint_handle).await;
 
     if let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) {
         let _ = writer.append(
@@ -193,6 +199,7 @@ pub(crate) async fn execute_enter_plan_mode(
 
 pub(crate) async fn execute_exit_plan_mode(
     repo: Option<&Arc<dyn astra_plan::PlanRepository>>,
+    user_id: &str,
     session_id: &str,
     cache: &tokio::sync::RwLock<PlanModeSnapshot>,
     resume_hint_handle: Option<&Arc<std::sync::RwLock<Option<String>>>>,
@@ -202,7 +209,7 @@ pub(crate) async fn execute_exit_plan_mode(
         return "Error: plan repository not configured on this executor".to_string();
     };
 
-    let active = match repo.active_plan_for_session(session_id).await {
+    let active = match repo.active_plan_for_session(user_id, session_id).await {
         Ok(Some(id)) => id,
         Ok(None) => {
             return "Note: session has no active plan; nothing to exit.".to_string();
@@ -218,7 +225,7 @@ pub(crate) async fn execute_exit_plan_mode(
         const MAX_CAS_RETRIES: u32 = 3;
         let mut last_conflict: Option<String> = None;
         for _attempt in 0..MAX_CAS_RETRIES {
-            let mut state = match repo.load(&active).await {
+            let mut state = match repo.load_owned(&active, user_id).await {
                 Ok(state) => state,
                 Err(error) => return format!("Error: load active plan: {error}"),
             };
@@ -245,7 +252,7 @@ pub(crate) async fn execute_exit_plan_mode(
         }
     }
 
-    invalidate_plan_mode_cache(Some(&repo), session_id, cache, resume_hint_handle).await;
+    invalidate_plan_mode_cache(Some(&repo), user_id, session_id, cache, resume_hint_handle).await;
 
     if let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) {
         let _ = writer.append(

@@ -1,6 +1,6 @@
 //! Database-backed [`CslStore`] for web-agent deployments.
 //!
-//! Uses the `conversation_log` table with composite PK `(session_id, seq)`.
+//! Uses the `conversation_log` table with composite PK `(user_id, session_id, seq)`.
 //! All writes are INSERT-only; GC is a batch DELETE.
 //!
 //! ## Pool lifecycle
@@ -22,8 +22,7 @@ use astra_core::{MatrixOneSettings, SharedPool, connect_matrixone};
 use super::{CslEntry, CslStore, CslStoreError, materialize, validate_session_id};
 
 /// Database-backed CSL store. Each session's entries live in the
-/// `conversation_log` table, keyed by `(session_id, seq)` and physically
-/// scoped by the store's bound `user_id`.
+/// `conversation_log` table, keyed by `(user_id, session_id, seq)`.
 ///
 /// Clone is cheap — both `SharedPool` and the lazy `OnceCell` are `Arc`-wrapped.
 #[derive(Clone, Debug)]
@@ -88,6 +87,19 @@ impl DbCslStore {
         pool: &sqlx::Pool<sqlx::MySql>,
         session_id: &str,
     ) -> Result<(), CslStoreError> {
+        let session_owner: Option<String> =
+            sqlx::query_scalar("SELECT user_id FROM agent_sessions WHERE session_id = ? LIMIT 1")
+                .bind(session_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| CslStoreError::Other(format!("session owner check: {e}")))?;
+        if session_owner.as_deref() != Some(self.user_id.as_str()) {
+            return Err(owner_mismatch_error(
+                session_id,
+                &self.user_id,
+                "agent_sessions owner root missing or belongs to another user",
+            ));
+        }
         let foreign_rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM conversation_log \
              WHERE session_id = ? AND user_id <> ?",
@@ -98,7 +110,11 @@ impl DbCslStore {
         .await
         .map_err(|e| CslStoreError::Other(format!("owner check: {e}")))?;
         if foreign_rows > 0 {
-            return Err(owner_mismatch_error(session_id));
+            return Err(owner_mismatch_error(
+                session_id,
+                &self.user_id,
+                "conversation_log contains rows for another owner",
+            ));
         }
         Ok(())
     }
@@ -119,8 +135,10 @@ fn validate_user_id(user_id: &str) -> Result<(), CslStoreError> {
     Ok(())
 }
 
-fn owner_mismatch_error(session_id: &str) -> CslStoreError {
-    CslStoreError::Other(format!("conversation_log owner mismatch for {session_id}"))
+fn owner_mismatch_error(session_id: &str, user_id: &str, reason: &str) -> CslStoreError {
+    CslStoreError::Other(format!(
+        "conversation_log owner mismatch for session_id={session_id} user_id={user_id}: {reason}"
+    ))
 }
 
 #[async_trait]
@@ -421,7 +439,7 @@ mod tests {
                 message_count INT DEFAULT NULL,
                 payload       MEDIUMTEXT NOT NULL,
                 created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-                PRIMARY KEY (session_id, seq),
+                PRIMARY KEY (user_id, session_id, seq),
                 INDEX idx_csl_owner_snapshot (user_id, session_id, entry_type, seq DESC),
                 INDEX idx_csl_owner_turn (user_id, session_id, turn)
             )",
@@ -429,23 +447,20 @@ mod tests {
         .execute(&pool)
         .await
         .expect("create table");
-        let _ = query(
-            "ALTER TABLE conversation_log ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT ''",
+        query(
+            "CREATE TABLE IF NOT EXISTS agent_sessions (
+                session_id VARCHAR(64) PRIMARY KEY,
+                user_id VARCHAR(64) NOT NULL,
+                title VARCHAR(255) NULL,
+                status VARCHAR(20) NOT NULL DEFAULT 'active',
+                event_count BIGINT NOT NULL DEFAULT 0,
+                created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+            )",
         )
         .execute(&pool)
-        .await;
-        let _ = query(
-            "ALTER TABLE conversation_log ADD INDEX idx_csl_owner_snapshot \
-             (user_id, session_id, entry_type, seq DESC)",
-        )
-        .execute(&pool)
-        .await;
-        let _ = query(
-            "ALTER TABLE conversation_log ADD INDEX idx_csl_owner_turn \
-             (user_id, session_id, turn)",
-        )
-        .execute(&pool)
-        .await;
+        .await
+        .expect("create agent_sessions table");
 
         store
     }
@@ -457,6 +472,28 @@ mod tests {
             .execute(&pool)
             .await
             .ok();
+        query("DELETE FROM agent_sessions WHERE session_id = ?")
+            .bind(session_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    async fn create_session(store: &DbCslStore, session_id: &str) {
+        create_session_for(store, session_id, &store.user_id).await;
+    }
+
+    async fn create_session_for(store: &DbCslStore, session_id: &str, user_id: &str) {
+        let pool = store.get_pool().await.unwrap();
+        query(
+            "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count)
+             VALUES (?, ?, 'csl test', 'active', 0)",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert test session");
     }
 
     #[tokio::test]
@@ -465,6 +502,7 @@ mod tests {
         let store = test_store().await;
         let sid = &format!("db-test-roundtrip-{}", uuid::Uuid::new_v4());
         cleanup(&store, sid).await;
+        create_session(&store, sid).await;
 
         let snap = make_snapshot(0, 1, vec![user_msg("hello")]);
         store.append(sid, &snap, &meta()).await.unwrap();
@@ -509,6 +547,7 @@ mod tests {
         let other_store = test_store_for(&other_user_id).await;
         let sid = &format!("db-test-owner-scope-{}", uuid::Uuid::new_v4());
         cleanup(&owner_store, sid).await;
+        create_session_for(&owner_store, sid, &owner_user_id).await;
 
         owner_store
             .append(sid, &make_snapshot(0, 1, vec![user_msg("owner")]), &meta())
@@ -578,6 +617,7 @@ mod tests {
         let child = &format!("db-test-fork-child-{}", uuid::Uuid::new_v4());
         cleanup(&owner_store, parent).await;
         cleanup(&owner_store, child).await;
+        create_session_for(&owner_store, parent, &owner_user_id).await;
 
         owner_store
             .append(
@@ -599,6 +639,7 @@ mod tests {
             "unexpected parent fork error: {parent_err}"
         );
 
+        create_session_for(&other_store, child, &other_user_id).await;
         other_store
             .append(
                 child,
@@ -640,6 +681,7 @@ mod tests {
         let store = test_store().await;
         let sid = &format!("db-test-snap-latest-{}", uuid::Uuid::new_v4());
         cleanup(&store, sid).await;
+        create_session(&store, sid).await;
 
         // Two snapshots with deltas between.
         store
@@ -682,6 +724,7 @@ mod tests {
         let store = test_store().await;
         let sid = &format!("db-test-truncate-{}", uuid::Uuid::new_v4());
         cleanup(&store, sid).await;
+        create_session(&store, sid).await;
 
         store
             .append(sid, &make_snapshot(0, 1, vec![user_msg("old")]), &meta())
@@ -723,6 +766,8 @@ mod tests {
         let child = &format!("db-test-fork-child-{}", uuid::Uuid::new_v4());
         cleanup(&store, parent).await;
         cleanup(&store, child).await;
+        create_session(&store, parent).await;
+        create_session(&store, child).await;
 
         store
             .append(
@@ -771,6 +816,7 @@ mod tests {
         let store = test_store().await;
         let sid = &format!("db-test-load-after-{}", uuid::Uuid::new_v4());
         cleanup(&store, sid).await;
+        create_session(&store, sid).await;
 
         store
             .append(sid, &make_snapshot(0, 1, vec![]), &meta())
@@ -794,11 +840,19 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires live DB"]
-    async fn db_load_nonexistent_returns_empty() {
+    async fn db_load_missing_parent_session_fails_closed() {
         let store = test_store().await;
         let sid = &format!("db-test-nonexistent-{}", uuid::Uuid::new_v4());
-        let entries = store.load_from_latest_snapshot(sid).await.unwrap();
-        assert!(entries.is_empty());
+        let error = store
+            .load_from_latest_snapshot(sid)
+            .await
+            .expect_err("missing parent session must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("conversation_log owner mismatch"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
@@ -809,6 +863,8 @@ mod tests {
         let child = &format!("db-test-fork-tool-child-{}", uuid::Uuid::new_v4());
         cleanup(&store, parent).await;
         cleanup(&store, child).await;
+        create_session(&store, parent).await;
+        create_session(&store, child).await;
 
         store
             .append(

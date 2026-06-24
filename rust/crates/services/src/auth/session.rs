@@ -411,8 +411,9 @@ impl SessionService for DatabaseSessionService {
 
         let count_row = query(
             "SELECT COUNT(*) as cnt FROM auth_audit_logs \
-             WHERE resource_type = 'session' AND resource_id = ?",
+             WHERE user_id = ? AND resource_type = 'session' AND resource_id = ?",
         )
+        .bind(&user_id)
         .bind(&session_id)
         .fetch_one(&pool)
         .await
@@ -421,9 +422,10 @@ impl SessionService for DatabaseSessionService {
 
         let rows = query(
             "SELECT log_id, action, details, created_at FROM auth_audit_logs \
-             WHERE resource_type = 'session' AND resource_id = ? \
+             WHERE user_id = ? AND resource_type = 'session' AND resource_id = ? \
              ORDER BY created_at DESC LIMIT ? OFFSET ?",
         )
+        .bind(&user_id)
         .bind(&session_id)
         .bind(limit)
         .bind(offset)
@@ -595,7 +597,7 @@ async fn ensure_session_delete_owner_consistency(
         ),
         (
             "skill_selection_events",
-            "SELECT COUNT(*) AS c FROM skill_selection_events WHERE session_id = ? AND COALESCE(user_id, '') <> ?",
+            "SELECT COUNT(*) AS c FROM skill_selection_events WHERE session_id = ? AND user_id <> ?",
         ),
         (
             "session_sync_log",
@@ -640,6 +642,10 @@ async fn ensure_session_delete_owner_consistency(
         (
             "team_snapshots",
             "SELECT COUNT(*) AS c FROM team_snapshots WHERE session_id = ? AND user_id <> ?",
+        ),
+        (
+            "tool_exactly_once_results",
+            "SELECT COUNT(*) AS c FROM tool_exactly_once_results WHERE session_id = ? AND user_id <> ?",
         ),
     ] {
         let row = query(statement)
@@ -876,6 +882,10 @@ async fn hard_delete_session_rows(
         (
             "team_snapshots",
             "DELETE FROM team_snapshots WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "tool_exactly_once_results",
+            "DELETE FROM tool_exactly_once_results WHERE session_id = ? AND user_id = ?",
         ),
     ] {
         deleted +=

@@ -4562,7 +4562,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // active plan → None, transient errors → None (best-effort).
         let plan_resume_hint = if let Some(shared) = &self.shared_pool {
             let repo = astra_plan::CloudPlanRepository::new(shared.get().clone());
-            astra_plan::plan_resume_hint_for_session(&repo, &session_id).await
+            astra_plan::plan_resume_hint_for_session(&repo, &user_id, &session_id).await
         } else {
             None
         };
@@ -4626,12 +4626,23 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // compaction, and context-window counters. Without this, server-side
         // session resume starts cold even though finalization persisted the
         // state needed for long-running sessions.
-        if let Ok(Some(restored)) = astra_pipeline::step_restore::restore_session(&session_id) {
-            restore_step_checkpoint_runtime_state(
-                restored,
-                &fresh_session_current_date,
-                &mut loop_state,
-            );
+        match astra_pipeline::step_restore::restore_session(&user_id, &session_id) {
+            Ok(Some(restored)) => {
+                restore_step_checkpoint_runtime_state(
+                    restored,
+                    &fresh_session_current_date,
+                    &mut loop_state,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %user_id,
+                    %session_id,
+                    %error,
+                    "failed to restore owner-bound local step checkpoint"
+                );
+            }
         }
 
         // ── CSL: Load conversation history from the log ─────────────
@@ -5305,12 +5316,23 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // ── Runtime warm-start from step checkpoint ────────────────
         if request.session_id.is_some() {
-            if let Ok(Some(restored)) = astra_pipeline::step_restore::restore_session(&session_id) {
-                restore_step_checkpoint_runtime_state(
-                    restored,
-                    &fresh_session_current_date,
-                    &mut state,
-                );
+            match astra_pipeline::step_restore::restore_session(&user_id, &session_id) {
+                Ok(Some(restored)) => {
+                    restore_step_checkpoint_runtime_state(
+                        restored,
+                        &fresh_session_current_date,
+                        &mut state,
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        %user_id,
+                        %session_id,
+                        %error,
+                        "failed to restore owner-bound local step checkpoint"
+                    );
+                }
             }
         }
 
@@ -5324,7 +5346,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         let plan_resume_hint = if let Some(shared) = &self.shared_pool {
             let repo = astra_plan::CloudPlanRepository::new(shared.get().clone());
-            astra_plan::plan_resume_hint_for_session(&repo, &session_id).await
+            astra_plan::plan_resume_hint_for_session(&repo, &user_id, &session_id).await
         } else {
             None
         };

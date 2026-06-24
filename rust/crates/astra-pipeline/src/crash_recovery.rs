@@ -57,14 +57,17 @@ use crate::step_restore::RestoredSession;
 ///
 /// Returns `Ok(None)` if no checkpoint exists or session is already completed.
 /// Returns `Err` if recovery fails (corruption, version mismatch, etc).
-pub fn recover_from_crash(session_id: &str) -> Result<Option<RecoveryOutcome>, RecoveryError> {
+pub fn recover_from_crash(
+    user_id: &str,
+    session_id: &str,
+) -> Result<Option<RecoveryOutcome>, RecoveryError> {
     let mut manager = CrashRecoveryManager::new();
 
     // Phase 1: Begin recovery
     manager.begin_recovery()?;
 
     // Load checkpoint from disk
-    let heavy = match read_latest_heavy_checkpoint(session_id) {
+    let heavy = match read_latest_heavy_checkpoint(user_id, session_id) {
         Ok(Some(h)) => h,
         Ok(None) => return Ok(None), // No checkpoint, nothing to recover
         Err(e) => {
@@ -80,9 +83,12 @@ pub fn recover_from_crash(session_id: &str) -> Result<Option<RecoveryOutcome>, R
     // Stream only the recovery window from the checkpoint timestamp onward.
     // Long sessions may have very large journals; recovery should not
     // materialize historical events that cannot affect the current replay.
-    let events =
-        FileBackedEventStore::load_events_created_at_or_after(session_id, heavy.light.created_at)
-            .map_err(|e| RecoveryError::JournalRead(format!("Failed to read event journal: {e}")))?;
+    let events = FileBackedEventStore::load_events_created_at_or_after(
+        user_id,
+        session_id,
+        heavy.light.created_at,
+    )
+    .map_err(|e| RecoveryError::JournalRead(format!("Failed to read event journal: {e}")))?;
 
     // Serialize checkpoint for scan_journal (must be StepCheckpoint enum JSON)
     let light_cp = StepCheckpoint::Light(heavy.light.clone());

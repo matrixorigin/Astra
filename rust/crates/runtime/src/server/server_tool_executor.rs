@@ -371,6 +371,7 @@ impl ServerToolExecutor {
     pub async fn enable_exactly_once(&mut self) {
         self.exactly_once_executor = Some(
             tool_exactly_once::enable_exactly_once(
+                &self.user_id,
                 &self.session_id,
                 self.context_manifest_pool.clone(),
             )
@@ -1203,6 +1204,7 @@ impl ServerToolExecutor {
         let plan_mode_authoring_active = if is_plan_mode_blocked_tool(name, args) {
             plan_mode_authoring_active(
                 self.plan_repo.as_ref(),
+                &self.user_id,
                 &self.session_id,
                 self.plan_mode_cache.as_ref(),
             )
@@ -6375,17 +6377,23 @@ esac
         }
         async fn set_active_plan(
             &self,
+            user_id: &str,
             session_id: &str,
             plan_id: Option<&str>,
         ) -> Result<(), astra_plan::PlanLoadError> {
-            self.inner.set_active_plan(session_id, plan_id).await
+            self.inner
+                .set_active_plan(user_id, session_id, plan_id)
+                .await
         }
         async fn active_plan_for_session(
             &self,
+            user_id: &str,
             session_id: &str,
         ) -> Result<Option<String>, astra_plan::PlanLoadError> {
             self.active_calls.fetch_add(1, Ordering::Relaxed);
-            self.inner.active_plan_for_session(session_id).await
+            self.inner
+                .active_plan_for_session(user_id, session_id)
+                .await
         }
         async fn record_step_run(
             &self,
@@ -6476,6 +6484,7 @@ esac
         assert!(
             !plan_mode_authoring_active(
                 exec.plan_repo.as_ref(),
+                &exec.user_id,
                 &exec.session_id,
                 exec.plan_mode_cache.as_ref(),
             )
@@ -6492,6 +6501,7 @@ esac
             assert!(
                 !plan_mode_authoring_active(
                     exec.plan_repo.as_ref(),
+                    &exec.user_id,
                     &exec.session_id,
                     exec.plan_mode_cache.as_ref(),
                 )
@@ -6648,6 +6658,7 @@ esac
         assert!(
             !plan_mode_authoring_active(
                 exec.plan_repo.as_ref(),
+                &exec.user_id,
                 &exec.session_id,
                 exec.plan_mode_cache.as_ref(),
             )
@@ -6668,6 +6679,7 @@ esac
         assert!(
             plan_mode_authoring_active(
                 exec.plan_repo.as_ref(),
+                &exec.user_id,
                 &exec.session_id,
                 exec.plan_mode_cache.as_ref(),
             )
@@ -6700,6 +6712,7 @@ esac
         assert!(
             plan_mode_authoring_active(
                 exec.plan_repo.as_ref(),
+                &exec.user_id,
                 &exec.session_id,
                 exec.plan_mode_cache.as_ref(),
             )
@@ -6772,6 +6785,7 @@ esac
         }
         async fn set_active_plan(
             &self,
+            _user_id: &str,
             _session_id: &str,
             plan_id: Option<&str>,
         ) -> Result<(), astra_plan::PlanLoadError> {
@@ -6780,6 +6794,7 @@ esac
         }
         async fn active_plan_for_session(
             &self,
+            _user_id: &str,
             _session_id: &str,
         ) -> Result<Option<String>, astra_plan::PlanLoadError> {
             Ok(self.active_plan.read().await.clone())
@@ -6880,7 +6895,7 @@ esac
             .await
             .unwrap();
         // Pin the plan as active for the session.
-        repo.set_active_plan("test-session", Some("plan-guard-test"))
+        repo.set_active_plan("test-user", "test-session", Some("plan-guard-test"))
             .await
             .unwrap();
 
@@ -6954,7 +6969,7 @@ esac
         repo.save("plan-visible-task", &mut state, None)
             .await
             .unwrap();
-        repo.set_active_plan("visible-session", Some("plan-visible-task"))
+        repo.set_active_plan("alice", "visible-session", Some("plan-visible-task"))
             .await
             .unwrap();
 
@@ -6977,7 +6992,7 @@ esac
             "model-submitted exit_plan_mode must not mirror approved-plan tasks locally: {tasks:?}"
         );
         let active = repo
-            .active_plan_for_session("visible-session")
+            .active_plan_for_session("alice", "visible-session")
             .await
             .expect("active plan lookup after submission");
         assert!(
@@ -7014,9 +7029,13 @@ esac
         repo.save("plan-rollback-task-board", &mut state, None)
             .await
             .unwrap();
-        repo.set_active_plan("rollback-session", Some("plan-rollback-task-board"))
-            .await
-            .unwrap();
+        repo.set_active_plan(
+            "alice",
+            "rollback-session",
+            Some("plan-rollback-task-board"),
+        )
+        .await
+        .unwrap();
 
         let (mut exec, _dir) = test_executor();
         exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
@@ -7049,7 +7068,7 @@ esac
             "existing server task must remain untouched: {tasks:?}"
         );
         let active = repo
-            .active_plan_for_session("rollback-session")
+            .active_plan_for_session("alice", "rollback-session")
             .await
             .expect("active plan lookup after submission");
         assert_eq!(
@@ -7124,7 +7143,7 @@ esac
         repo.save("plan-reload-fails", &mut state, None)
             .await
             .unwrap();
-        repo.set_active_plan("reload-fails-session", Some("plan-reload-fails"))
+        repo.set_active_plan("alice", "reload-fails-session", Some("plan-reload-fails"))
             .await
             .unwrap();
 
@@ -7158,7 +7177,7 @@ esac
             "model-submitted exit_plan_mode must not even read the task board before trusted approval"
         );
         let active = repo
-            .active_plan_for_session("reload-fails-session")
+            .active_plan_for_session("alice", "reload-fails-session")
             .await
             .expect("active plan lookup after submission");
         assert_eq!(
@@ -7187,7 +7206,7 @@ esac
         repo.save("plan-title-collision", &mut state, None)
             .await
             .unwrap();
-        repo.set_active_plan("collision-session", Some("plan-title-collision"))
+        repo.set_active_plan("alice", "collision-session", Some("plan-title-collision"))
             .await
             .unwrap();
 
@@ -7258,7 +7277,7 @@ esac
         repo.save("plan-reuse-cli-tree", &mut state, None)
             .await
             .unwrap();
-        repo.set_active_plan("reuse-session", Some("plan-reuse-cli-tree"))
+        repo.set_active_plan("alice", "reuse-session", Some("plan-reuse-cli-tree"))
             .await
             .unwrap();
 
@@ -7335,7 +7354,7 @@ esac
         repo.save("plan-repeat-server", &mut state, None)
             .await
             .unwrap();
-        repo.set_active_plan("repeat-server-session", Some("plan-repeat-server"))
+        repo.set_active_plan("alice", "repeat-server-session", Some("plan-repeat-server"))
             .await
             .unwrap();
 
@@ -7377,7 +7396,7 @@ esac
             "first submission must stay pending for trusted approval; got: {result}"
         );
 
-        repo.set_active_plan("repeat-server-session", Some("plan-repeat-server"))
+        repo.set_active_plan("alice", "repeat-server-session", Some("plan-repeat-server"))
             .await
             .unwrap();
         let result = exec
@@ -7432,9 +7451,13 @@ esac
         repo.save("plan-new-visible-goal", &mut state, None)
             .await
             .unwrap();
-        repo.set_active_plan("different-goal-session", Some("plan-new-visible-goal"))
-            .await
-            .unwrap();
+        repo.set_active_plan(
+            "alice",
+            "different-goal-session",
+            Some("plan-new-visible-goal"),
+        )
+        .await
+        .unwrap();
 
         let (mut exec, _dir) = test_executor();
         exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
@@ -7527,7 +7550,7 @@ esac
         repo.save("plan-same-id-new-steps", &mut state, None)
             .await
             .unwrap();
-        repo.set_active_plan("same-id-session", Some("plan-same-id-new-steps"))
+        repo.set_active_plan("alice", "same-id-session", Some("plan-same-id-new-steps"))
             .await
             .unwrap();
 
@@ -7636,7 +7659,7 @@ esac
         repo.save("plan-same-id-new-deps", &mut state, None)
             .await
             .unwrap();
-        repo.set_active_plan("same-deps-session", Some("plan-same-id-new-deps"))
+        repo.set_active_plan("alice", "same-deps-session", Some("plan-same-id-new-deps"))
             .await
             .unwrap();
 
@@ -7727,7 +7750,7 @@ esac
         repo.save("plan-reject-test", &mut state, None)
             .await
             .unwrap();
-        repo.set_active_plan("reject-session", Some("plan-reject-test"))
+        repo.set_active_plan("alice", "reject-session", Some("plan-reject-test"))
             .await
             .unwrap();
 
@@ -7756,7 +7779,7 @@ esac
         repo.save("plan-empty-test", &mut state, None)
             .await
             .unwrap();
-        repo.set_active_plan("empty-session", Some("plan-empty-test"))
+        repo.set_active_plan("alice", "empty-session", Some("plan-empty-test"))
             .await
             .unwrap();
 
@@ -7794,7 +7817,7 @@ esac
             "empty enter_plan_mode args should use the same default goal label as CLI: {result}"
         );
         let active = repo
-            .active_plan_for_session("server-empty-goal-session")
+            .active_plan_for_session("alice", "server-empty-goal-session")
             .await
             .expect("active plan lookup");
         assert!(
@@ -7868,9 +7891,13 @@ esac
         repo.save("plan-reject-lock-test", &mut state, None)
             .await
             .unwrap();
-        repo.set_active_plan("reject-lock-session", Some("plan-reject-lock-test"))
-            .await
-            .unwrap();
+        repo.set_active_plan(
+            "alice",
+            "reject-lock-session",
+            Some("plan-reject-lock-test"),
+        )
+        .await
+        .unwrap();
 
         let (mut exec, _dir) = test_executor();
         exec.set_plan_repository(repo as Arc<dyn astra_plan::PlanRepository>);

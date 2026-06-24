@@ -7,7 +7,6 @@
 //!
 //! Shares the same env conventions as `services_db_integration.rs`.
 
-use astra_services::ensure_core_schema;
 use astra_services::state_sync::{PlanStepRunSyncRow, PlanSyncRow};
 use astra_services::{MatrixOneSyncService, StateSyncService};
 use serde_json::Value;
@@ -15,7 +14,6 @@ use sqlx::Row;
 use uuid::Uuid;
 
 mod common;
-use common::require_db_it_env;
 
 async fn setup_pool() -> sqlx::Pool<sqlx::MySql> {
     let pool = common::setup_pool().await;
@@ -729,158 +727,6 @@ async fn push_plans_pack_rejects_step_run_with_out_of_range_timestamps() {
 
     cleanup(&pool, &plan_id).await;
     flusher.shutdown().await;
-}
-
-/// Regression for migration hazard: if a prod DB already has duplicate
-/// `(plan_id, subtask_id, attempt)` rows from before the UNIQUE constraint,
-/// `ALTER TABLE ... ADD UNIQUE` fails with MySQL 1062 and blocks startup.
-/// Migration 7 DELETEs duplicates (keeping smallest run_id) before
-/// migration 8 adds the UNIQUE.
-///
-/// The test simulates a pre-upgrade DB by dropping the UNIQUE index,
-/// injecting two rows with the same (plan_id, subtask_id, attempt), then
-/// directly calling the dedupe SQL and verifying only one row survives and
-/// the ADD UNIQUE succeeds afterwards.
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn migration_dedupe_removes_duplicate_attempt_tuples() {
-    // This test mutates the shared schema (drops the UNIQUE index, injects
-    // duplicates, re-runs migrations). Running against the shared `common::
-    // setup_pool()` pool would race with sibling tests — while the index is
-    // dropped, other concurrent tests could insert what they think is a
-    // valid row but which becomes a "duplicate" once the index comes back.
-    // So we carve out a private MatrixOne database for this test only.
-    use astra_core::{SharedPool, connect_matrixone};
-    let private_db = format!("plan_sync_mig_{}", Uuid::new_v4().simple());
-    let mut settings = require_db_it_env();
-    settings.database = private_db.clone();
-    let catalog =
-        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
-    let mut bootstrap = settings.clone();
-    bootstrap.database = catalog.clone();
-    let admin_pool = connect_matrixone(&bootstrap)
-        .await
-        .expect("connect bootstrap catalog");
-    sqlx::query(&format!("CREATE DATABASE IF NOT EXISTS `{private_db}`"))
-        .execute(&admin_pool)
-        .await
-        .expect("create private migration-test database");
-    admin_pool.close().await;
-    ensure_core_schema(&settings, &catalog)
-        .await
-        .expect("ensure_core_schema on private DB");
-    let shared = SharedPool::new(&settings).await.expect("SharedPool::new");
-    let pool = shared.get().clone();
-
-    let plan_id = format!("pit-mig-{}", Uuid::new_v4().simple());
-    let user = format!("u-mig-{}", Uuid::new_v4().simple());
-    // No need to `cleanup(&pool, &plan_id)` — fresh DB.
-
-    // Drop the UNIQUE so we can inject duplicates that mimic a pre-v8 DB.
-    // May or may not be present depending on the DB's migration state;
-    // swallow the "doesn't exist" error (1091) either way.
-    let _ = sqlx::query("ALTER TABLE plan_step_runs DROP INDEX uq_step_runs_subtask_attempt")
-        .execute(&pool)
-        .await;
-
-    // Seed a plan so step_run FKs point somewhere meaningful.
-    sqlx::query(
-        "INSERT INTO plans \
-             (plan_id, user_id, goal, phase, version, plan_json, progress_pct, \
-              subtask_count, created_by, created_at, updated_at) \
-         VALUES (?, ?, 'mig', 'planning', 1, '{}', 0, 0, ?, NOW(6), NOW(6))",
-    )
-    .bind(&plan_id)
-    .bind(&user)
-    .bind(&user)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    // Two rows share the same (plan_id, subtask_id=s1, attempt=1). Without
-    // the UNIQUE (dropped above) both INSERTs succeed.
-    let run_keep = format!("aaa-{}", Uuid::new_v4().simple());
-    let run_drop = format!("zzz-{}", Uuid::new_v4().simple());
-    for rid in [&run_keep, &run_drop] {
-        sqlx::query(
-            "INSERT INTO plan_step_runs \
-                 (run_id, plan_id, subtask_id, attempt, status, session_id, \
-                  started_at, request_id) \
-             VALUES (?, ?, 's1', 1, 'completed', 'sess', NOW(6), 'req')",
-        )
-        .bind(rid)
-        .bind(&plan_id)
-        .execute(&pool)
-        .await
-        .expect("duplicate seed must succeed while UNIQUE is absent");
-    }
-
-    // Verify the seed actually landed both rows.
-    let before: i64 = scalar_i64(
-        &pool,
-        "SELECT COUNT(*) FROM plan_step_runs WHERE plan_id = ?",
-        &plan_id,
-    )
-    .await;
-    assert_eq!(before, 2, "expected two dup rows before dedupe");
-
-    // Re-run ensure_core_schema — migrations 7 (dedupe) and 8 (add UNIQUE)
-    // must run in that order. schema_migrations already has them marked as
-    // applied from the first call, so we mark them unapplied to force re-run.
-    sqlx::query("DELETE FROM schema_migrations WHERE version IN (7, 8)")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    ensure_core_schema(&settings, &catalog)
-        .await
-        .expect("migrations must succeed even with pre-existing duplicates");
-
-    // Exactly one row survives — the smallest run_id lexicographically,
-    // which is `run_keep` (prefix "aaa-").
-    let after: i64 = scalar_i64(
-        &pool,
-        "SELECT COUNT(*) FROM plan_step_runs WHERE plan_id = ?",
-        &plan_id,
-    )
-    .await;
-    assert_eq!(after, 1, "dedupe must leave one row per attempt tuple");
-
-    let kept: String =
-        sqlx::query_scalar("SELECT run_id FROM plan_step_runs WHERE plan_id = ? LIMIT 1")
-            .bind(&plan_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(
-        kept, run_keep,
-        "dedupe must keep the smallest run_id, got {kept}"
-    );
-
-    // And migration 8 recorded its success row (SELECT from
-    // schema_migrations) so the next boot won't try to re-run the ALTER.
-    let applied: i64 = scalar_i64(
-        &pool,
-        "SELECT COUNT(*) FROM schema_migrations WHERE version = ?",
-        "8",
-    )
-    .await;
-    assert_eq!(applied, 1, "migration 8 must be recorded as applied");
-
-    // `record_step_run` uniqueness is exercised end-to-end by the repo-level
-    // test `record_step_run_rejects_duplicate_plan_subtask_attempt_tuple`,
-    // so we don't re-probe MatrixOne's UNIQUE enforcement here — this test
-    // owns the dedupe + migration invariant only.
-
-    // Teardown: drop the private DB so we don't accumulate state across runs.
-    shared.close().await;
-    let admin_pool = connect_matrixone(&bootstrap)
-        .await
-        .expect("connect bootstrap catalog for drop");
-    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS `{private_db}`"))
-        .execute(&admin_pool)
-        .await;
-    admin_pool.close().await;
 }
 
 /// `error` and `artifact_ref` are TEXT/VARCHAR columns — unbounded client

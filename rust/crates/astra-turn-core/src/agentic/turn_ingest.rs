@@ -109,6 +109,7 @@ pub fn agentic_turn_stream_snapshot_with_kind<'a>(
 /// Mutable agentic-loop fields updated by [`ingest_agentic_turn_stream`].
 pub struct AgenticTurnIngestMut<'a> {
     pub task_profile: TaskExecutionProfile,
+    pub persistence_user_id: Option<&'a str>,
     pub first_ttft_ms: &'a mut Option<u64>,
     pub current_session_id: &'a mut Option<String>,
     pub current_run_id: &'a mut Option<String>,
@@ -179,7 +180,9 @@ pub fn ingest_agentic_turn_stream(
 
     if let Some(sid) = snap.session_id.as_ref() {
         *st.current_session_id = Some(sid.clone());
-        st.step_recorder.attach_persistence(sid);
+        if let Some(user_id) = st.persistence_user_id {
+            st.step_recorder.attach_persistence(user_id, sid);
+        }
     }
     if snap.run_id.is_some() {
         *st.current_run_id = snap.run_id.clone();
@@ -348,6 +351,8 @@ fn persist_final_assistant_message(messages: &mut Vec<Value>, final_text: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_USER_ID: &str = "test-user";
     use crate::interaction_types::TurnInteractionMode;
     use serde_json::json;
 
@@ -385,7 +390,7 @@ mod tests {
                 total_cache_creation: 0,
                 total_tool_calls: 0,
                 total_evidence_tool_calls: 0,
-                step_recorder: StepRecorder::with_persistence("s", "t"),
+                step_recorder: StepRecorder::with_persistence(TEST_USER_ID, "s", "t"),
                 all_tools_used: HashSet::new(),
                 has_any_usage: false,
                 forced_factual_retry: false,
@@ -402,6 +407,7 @@ mod tests {
         fn ingest_mut(&mut self) -> AgenticTurnIngestMut<'_> {
             AgenticTurnIngestMut {
                 task_profile: TaskExecutionProfile::default(),
+                persistence_user_id: None,
                 first_ttft_ms: &mut self.first_ttft_ms,
                 current_session_id: &mut self.current_session_id,
                 current_run_id: &mut self.current_run_id,

@@ -176,10 +176,10 @@ async fn query_session_history_rows(
     };
 
     let mut sql = String::from(
-        "SELECT item_seq, user_id, role, content, run_id, \
+        "SELECT item_seq, role, content, run_id, \
                 DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
          FROM session_transcript_items \
-         WHERE session_id = ?",
+         WHERE user_id = ? AND session_id = ?",
     );
     if before_seq.is_some() {
         sql.push_str(" AND item_seq < ?");
@@ -191,7 +191,9 @@ async fn query_session_history_rows(
     sql.push_str(if order == "asc" { "ASC" } else { "DESC" });
     sql.push_str(&format!(" LIMIT {}", limit.max(1)));
 
-    let mut query = sqlx::query(&sql).bind(context.session_id);
+    let mut query = sqlx::query(&sql)
+        .bind(context.user_id)
+        .bind(context.session_id);
     if let Some(before_seq) = before_seq {
         query = query.bind(before_seq);
     }
@@ -202,10 +204,6 @@ async fn query_session_history_rows(
     let rows = query.fetch_all(pool.get()).await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let row_user_id: String = row.try_get("user_id")?;
-        if row_user_id != context.user_id {
-            continue;
-        }
         let role: String = row.try_get("role")?;
         if !matches!(role.as_str(), "user" | "assistant" | "system") {
             continue;
@@ -260,11 +258,11 @@ async fn query_session_history_chunk_rows(
     patterns.dedup();
 
     let mut sql = String::from(
-        "SELECT user_id, chunk_type, source_id, content_text, \
+        "SELECT chunk_type, source_id, content_text, \
                 COALESCE(item_seq_start, seq_start) AS item_seq, \
                 DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
          FROM session_history_chunks \
-         WHERE session_id = ? AND (",
+         WHERE user_id = ? AND session_id = ? AND (",
     );
     for idx in 0..patterns.len() {
         if idx > 0 {
@@ -277,7 +275,9 @@ async fn query_session_history_chunk_rows(
         limit.max(1)
     ));
 
-    let mut query = sqlx::query(&sql).bind(context.session_id);
+    let mut query = sqlx::query(&sql)
+        .bind(context.user_id)
+        .bind(context.session_id);
     for pattern in patterns {
         query = query.bind(pattern);
     }
@@ -285,10 +285,6 @@ async fn query_session_history_chunk_rows(
     let rows = query.fetch_all(pool.get()).await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let row_user_id: String = row.try_get("user_id")?;
-        if row_user_id != context.user_id {
-            continue;
-        }
         let content: String = row.try_get("content_text")?;
         if content.trim().is_empty() {
             continue;

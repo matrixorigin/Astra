@@ -365,6 +365,13 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     let Some(sid) = state.current_session_id.as_ref() else {
         return;
     };
+    let Some(user_id) = state.context_manifest_user_id.as_deref() else {
+        astra_core::agent_warn!(
+            "checkpoint",
+            "Skipping local step checkpoint for session {sid}: missing user_id"
+        );
+        return;
+    };
     let ckpt_num = state.step_recorder.summary().checkpoints;
 
     // Serialize the interruption record (if any) for checkpoint persistence.
@@ -409,7 +416,7 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         };
     }
     let cp = StepCheckpoint::Heavy(Box::new(heavy));
-    if let Err(e) = step_checkpoint::write_step_checkpoint(sid, ckpt_num, &cp) {
+    if let Err(e) = step_checkpoint::write_step_checkpoint(user_id, sid, ckpt_num, &cp) {
         astra_core::agent_warn!(
             "checkpoint",
             "Failed to write step checkpoint {ckpt_num}: {e}"
@@ -429,12 +436,21 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
             .workspace_state(sid.clone())
             .build();
 
-    let mut index = step_checkpoint::read_composite_snapshot_index(sid).unwrap_or_default();
+    let mut index = match step_checkpoint::read_composite_snapshot_index(user_id, sid) {
+        Ok(index) => index,
+        Err(error) => {
+            astra_core::agent_warn!(
+                "checkpoint",
+                "Failed to read snapshot index for session {sid}: {error}"
+            );
+            return;
+        }
+    };
     if let Err(e) = index.append(&mut snapshot) {
         astra_core::agent_warn!("checkpoint", "Failed to append snapshot version: {e}");
         return;
     }
-    if let Err(e) = step_checkpoint::write_composite_snapshot_index(sid, &index) {
+    if let Err(e) = step_checkpoint::write_composite_snapshot_index(user_id, sid, &index) {
         astra_core::agent_warn!("checkpoint", "Failed to write snapshot index: {e}");
         // Index write failed: leave snapshot state untouched so a subsequent
         // checkpoint can re-attempt without referencing a half-written index.
@@ -1487,6 +1503,7 @@ mod tests {
         let session_id = format!("wm-checkpoint-{}", uuid::Uuid::new_v4());
         let _guard = SessionDirGuard::new(&session_id);
         let mut state = make_state();
+        state.context_manifest_user_id = Some("test-user".to_string());
         state.current_session_id = Some(session_id.clone());
         state.step_recorder.begin_turn(0);
         state.restricted_tools.insert("write_file".to_string());
@@ -1497,9 +1514,10 @@ mod tests {
 
         try_write_heavy_checkpoint(&mut state);
 
-        let heavy = astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(&session_id)
-            .expect("read checkpoint")
-            .expect("heavy checkpoint");
+        let heavy =
+            astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint("test-user", &session_id)
+                .expect("read checkpoint")
+                .expect("heavy checkpoint");
         assert_eq!(heavy.blocked_tools, vec!["write_file".to_string()]);
     }
 

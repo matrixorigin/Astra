@@ -1095,16 +1095,25 @@ mod tests {
 
     #[tokio::test]
     async fn execute_isolated_caps_combined_output_from_config() {
-        let mut config = IsolationConfig::disabled(PathBuf::from("/tmp"));
-        config.max_output_bytes = 4;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = IsolationConfig::disabled(tmp.path().to_path_buf());
+        config.memory_limit_bytes = 0;
+        config.cpu_quota = 0.0;
+        config.max_output_bytes = 5;
         let env =
             std::collections::HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
 
-        let out = execute_isolated("printf 'a\\nb\\nc\\n'", &env, &config).await;
+        let out = execute_isolated("printf 'abcd\\nefgh\\n'", &env, &config).await;
 
         assert!(out.stdout_capped, "{out:?}");
-        assert_eq!(out.stdout, "a\nb\n");
-        assert_eq!(out.stdout.len() + out.stderr.len(), 4);
+        assert!(!out.stderr_capped, "{out:?}");
+        assert_eq!(out.stdout, "abcd\n");
+        assert_eq!(out.stdout.len() + out.stderr.len(), config.max_output_bytes);
+        assert!(
+            out.combined_output()
+                .contains("(output capped: stdout limit reached)"),
+            "{out:?}"
+        );
     }
 
     #[tokio::test]
