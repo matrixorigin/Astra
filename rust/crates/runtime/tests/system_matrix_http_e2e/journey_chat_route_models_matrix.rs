@@ -27,14 +27,7 @@ pub async fn run_chat_route_and_models_smoke() {
     route_keys.sort_unstable();
     assert_eq!(
         route_keys,
-        [
-            "confidence",
-            "intent",
-            "matched_by",
-            "query",
-            "task_type",
-            "tier"
-        ],
+        ["intent", "matched_by", "query", "task_type", "tier"],
         "chat/route shape: {route_j}"
     );
 

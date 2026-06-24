@@ -1076,14 +1076,7 @@ pub async fn run_product_matrix_full_journey(
     route_keys.sort_unstable();
     assert_eq!(
         route_keys,
-        [
-            "confidence",
-            "intent",
-            "matched_by",
-            "query",
-            "task_type",
-            "tier"
-        ],
+        ["intent", "matched_by", "query", "task_type", "tier"],
         "chat/route shape: {route_j}"
     );
 

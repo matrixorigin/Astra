@@ -334,8 +334,8 @@ mod multi_file_edit_regression {
         let mut report = ToolSurfaceReport {
             visible_tools: vec!["bash".into(), "read_file".into()],
             visible_count: 2,
-            budget_used: 0,
-            budget_total: 1000,
+            schema_budget_used: 0,
+            schema_budget_total: 1000,
         };
 
         // 12 tool_results for git (different file paths, same tool)

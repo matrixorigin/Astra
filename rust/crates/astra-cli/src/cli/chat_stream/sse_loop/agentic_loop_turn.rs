@@ -267,8 +267,8 @@ pub(crate) fn final_visible_tool_schemas_from_payload(payload: &Value) -> Vec<Va
 
 fn surface_report_from_visible_schemas(
     schemas: &[Value],
-    budget_used: u32,
-    budget_total: u32,
+    schema_budget_used: u32,
+    schema_budget_total: u32,
 ) -> tool_registry::ToolSurfaceReport {
     let visible_tools: Vec<String> = schemas
         .iter()
@@ -277,8 +277,8 @@ fn surface_report_from_visible_schemas(
     tool_registry::ToolSurfaceReport {
         visible_count: visible_tools.len() as u32,
         visible_tools,
-        budget_used,
-        budget_total,
+        schema_budget_used,
+        schema_budget_total,
     }
 }
 
@@ -332,7 +332,7 @@ fn tool_surface_should_inject(
     if plan_mode_active {
         return (true, "plan_mode_active");
     }
-    if surface_report.budget_total == 0 {
+    if surface_report.schema_budget_total == 0 {
         return (true, "budget_starved_surface");
     }
     (false, "")
@@ -590,10 +590,10 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         &mut turn_schemas,
         &mut surface_report,
     );
-    // NOTE: `budget_used` is intentionally NOT recomputed here. The
+    // NOTE: `schema_budget_used` is intentionally NOT recomputed here. The
     // `surface_report_from_visible_schemas` call below is the single source
     // of truth for the final report's budget; any value set on the
-    // intermediate `surface_report.budget_used` would be overwritten and
+    // intermediate `surface_report.schema_budget_used` would be overwritten and
     // never consumed. See test
     // `surface_report_from_visible_schemas_is_single_source_for_budget`.
 
@@ -724,7 +724,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     // schemas. The intermediate report may include recommendation hints later
     // stripped by capability/interaction-mode filtering.
     // Final persisted reports must keep `visible_count`, `visible_tools`,
-    // and `budget_used` on the same full-visible-surface basis.
+    // and `schema_budget_used` on the same full-visible-surface basis.
     let visible_tool_costs: Vec<(String, u32)> = final_visible_schemas
         .iter()
         .filter_map(|schema| {
@@ -735,7 +735,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     let final_surface_report = surface_report_from_visible_schemas(
         &final_visible_schemas,
         visible_tool_tokens_total,
-        surface_report.budget_total,
+        surface_report.schema_budget_total,
     );
     *ctx.valid_tool_names = final_visible_tool_names;
 
@@ -1603,19 +1603,19 @@ mod tests {
         assert_eq!(names, vec!["read_file"]);
     }
 
-    /// Regression: the final ToolSurfaceReport's `budget_used` must be derived
-    /// entirely from the explicit `budget_used` argument, NOT from any stale
-    /// `budget_used` field on a pre-existing report. This contract is what
+    /// Regression: the final ToolSurfaceReport's `schema_budget_used` must be derived
+    /// entirely from the explicit `schema_budget_used` argument, NOT from any stale
+    /// `schema_budget_used` field on a pre-existing report. This contract is what
     /// permits removing stale intermediate recomputation at the call site (the value
-    /// set on `surface_report.budget_used` was overwritten by
+    /// set on `surface_report.schema_budget_used` was overwritten by
     /// the final visible-schema token total and never consumed).
     #[test]
     fn surface_report_from_visible_schemas_is_single_source_for_budget() {
         let schemas = vec![schema("grep"), schema("read_file")];
 
         let report = super::surface_report_from_visible_schemas(
-            &schemas, 42,  // budget_used — arbitrary, must pass through verbatim
-            100, // budget_total
+            &schemas, 42,  // schema_budget_used — arbitrary, must pass through verbatim
+            100, // schema_budget_total
         );
 
         assert_eq!(
@@ -1623,8 +1623,8 @@ mod tests {
             vec!["grep".to_string(), "read_file".to_string()]
         );
         assert_eq!(report.visible_count, 2);
-        assert_eq!(report.budget_used, 42);
-        assert_eq!(report.budget_total, 100);
+        assert_eq!(report.schema_budget_used, 42);
+        assert_eq!(report.schema_budget_total, 100);
     }
 
     // ── Tool surface decision: structural signals, not text-based ────────
@@ -1634,13 +1634,13 @@ mod tests {
     // user message text. This keeps the tool surface deterministic and
     // prompt-cache-friendly.
 
-    /// Helper: empty report with the given budget_total.
-    fn empty_report(budget_total: u32) -> astra_runtime::tool_registry::ToolSurfaceReport {
+    /// Helper: empty report with the given schema_budget_total.
+    fn empty_report(schema_budget_total: u32) -> astra_runtime::tool_registry::ToolSurfaceReport {
         astra_runtime::tool_registry::ToolSurfaceReport {
             visible_tools: Vec::new(),
             visible_count: 0,
-            budget_used: 0,
-            budget_total,
+            schema_budget_used: 0,
+            schema_budget_total,
         }
     }
 
@@ -1695,7 +1695,7 @@ mod tests {
         assert_eq!(
             super::tool_surface_should_inject(&[], &empty_report(0), false, false, false, false),
             (true, "budget_starved_surface"),
-            "budget_total == 0 with no prior candidates → structurally starved"
+            "schema_budget_total == 0 with no prior candidates → structurally starved"
         );
 
         // ── Priority: higher signals beat lower when multiple are true ──
@@ -1800,7 +1800,7 @@ mod tests {
         // visible_count > 0 with empty vecs
         let count_only = astra_runtime::tool_registry::ToolSurfaceReport {
             visible_count: 3,
-            budget_total: 100,
+            schema_budget_total: 100,
             ..empty_report(100)
         };
         assert_eq!(
@@ -1808,7 +1808,7 @@ mod tests {
             (true, "surface_report_names"),
         );
 
-        // budget_total == 0 but HadToolsBeforeRuntimeFilter is already set →
+        // schema_budget_total == 0 but HadToolsBeforeRuntimeFilter is already set →
         // the pre-filter signal wins (priority), not BudgetStarved
         assert_eq!(
             super::tool_surface_should_inject(&[], &empty_report(0), true, false, false, false),
@@ -1840,8 +1840,8 @@ mod tests {
         let mut report = ToolSurfaceReport {
             visible_tools: vec!["bash".into(), "read_file".into()],
             visible_count: 2,
-            budget_used: 0,
-            budget_total: 0,
+            schema_budget_used: 0,
+            schema_budget_total: 0,
         };
 
         // Skill allows bash, read_file, grep, glob
@@ -1997,9 +1997,9 @@ mod tests {
         assert_eq!(
             first_surface_report
                 .as_ref()
-                .map(|report| report.budget_used),
+                .map(|report| report.schema_budget_used),
             Some(expected_visible_schema_tokens),
-            "final surface telemetry budget_used must use the same full visible-tool surface as visible_count"
+            "final surface telemetry schema_budget_used must use the same full visible-tool surface as visible_count"
         );
         // Plan-mode escape hatches must be present exactly once each.
         assert!(edge_tool_names.contains(&"enter_plan_mode"));

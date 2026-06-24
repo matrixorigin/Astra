@@ -5,7 +5,6 @@ use serde::Serialize;
 pub struct ChatRouteResponse {
     query: String,
     intent: Option<String>,
-    confidence: f64,
     tier: u8,
     matched_by: String,
     task_type: String,
@@ -19,7 +18,6 @@ pub fn classify_chat_route(query: String) -> ChatRouteResponse {
     ChatRouteResponse {
         query,
         intent: intent.intent.map(str::to_string),
-        confidence: intent.confidence,
         tier: intent.tier,
         matched_by: intent.matched_by.to_string(),
         task_type: task_type.to_string(),
@@ -28,7 +26,6 @@ pub fn classify_chat_route(query: String) -> ChatRouteResponse {
 
 struct RouteIntentClassification {
     intent: Option<&'static str>,
-    confidence: f64,
     tier: u8,
     matched_by: &'static str,
 }
@@ -44,7 +41,6 @@ fn classify_chat_route_intent(query: &str, history_len: usize) -> RouteIntentCla
     if regex_intent.is_some() && regex_intent == heuristic_intent {
         return RouteIntentClassification {
             intent: regex_intent,
-            confidence: 0.95,
             tier: 0,
             matched_by: "both",
         };
@@ -52,7 +48,6 @@ fn classify_chat_route_intent(query: &str, history_len: usize) -> RouteIntentCla
     if let Some(intent) = regex_intent {
         return RouteIntentClassification {
             intent: Some(intent),
-            confidence: 0.80,
             tier: 0,
             matched_by: "regex",
         };
@@ -60,7 +55,6 @@ fn classify_chat_route_intent(query: &str, history_len: usize) -> RouteIntentCla
     if let Some(intent) = heuristic_intent {
         return RouteIntentClassification {
             intent: Some(intent),
-            confidence: 0.80,
             tier: 0,
             matched_by: "heuristic",
         };
@@ -68,7 +62,6 @@ fn classify_chat_route_intent(query: &str, history_len: usize) -> RouteIntentCla
 
     RouteIntentClassification {
         intent: None,
-        confidence: 0.0,
         tier: 0,
         matched_by: "none",
     }
@@ -386,11 +379,10 @@ mod tests {
     // ──────────────────────────────────────────────────────────
 
     #[test]
-    fn combined_intent_both_match_high_confidence() {
+    fn combined_intent_both_match_records_both_match_source() {
         // "run cargo test" → regex matches "command", heuristic also "command" (first turn)
         let r = classify_chat_route_intent("run cargo test", 0);
         assert_eq!(r.intent, Some("command"));
-        assert_eq!(r.confidence, 0.95);
         assert_eq!(r.matched_by, "both");
     }
 

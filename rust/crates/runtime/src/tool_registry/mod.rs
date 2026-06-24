@@ -391,7 +391,7 @@ mod tests {
     // ── Schema-budget report assembly ──
 
     #[test]
-    fn report_budget_total_does_not_change_visible_tools() {
+    fn report_schema_budget_total_does_not_change_visible_tools() {
         let schemas = mock_schemas();
         let registry = ToolRegistry::new(schemas);
         let (small, small_report) =
@@ -402,8 +402,8 @@ mod tests {
             ToolRegistry::visible_names(&large),
             ToolRegistry::visible_names(&small)
         );
-        assert_eq!(small_report.budget_total, 500);
-        assert_eq!(large_report.budget_total, 6000);
+        assert_eq!(small_report.schema_budget_total, 500);
+        assert_eq!(large_report.schema_budget_total, 6000);
     }
 
     #[test]
@@ -417,7 +417,7 @@ mod tests {
             selected.len(),
             registry.always_load_tool_names_sorted().len()
         );
-        assert_eq!(report.budget_total, 0);
+        assert_eq!(report.schema_budget_total, 0);
     }
 
     #[test]
@@ -485,7 +485,7 @@ mod tests {
             registry.build_initial_surface_with_report("matrixorigin 最新的pr?", 1, 3000);
         assert_eq!(schemas.len(), report.visible_count as usize);
         assert_eq!(ToolRegistry::visible_names(&schemas), report.visible_tools);
-        assert_eq!(report.budget_total, 3000);
+        assert_eq!(report.schema_budget_total, 3000);
     }
 
     #[test]
@@ -493,7 +493,7 @@ mod tests {
         let registry = ToolRegistry::new(mock_schemas());
         let (_schemas, report) = registry.build_initial_surface_with_report("你好", 1, 3000);
         assert_eq!(
-            report.budget_used, 0,
+            report.schema_budget_used, 0,
             "conversational query should use 0 budget"
         );
         assert_eq!(report.visible_count, 0);
@@ -506,8 +506,8 @@ mod tests {
         let report = ToolSurfaceReport {
             visible_tools: vec!["bash".into(), "github".into()],
             visible_count: 2,
-            budget_used: 50,
-            budget_total: 3000,
+            schema_budget_used: 50,
+            schema_budget_total: 3000,
         };
         let fb = report.feedback(&["github".into()]);
         // precision = hits(1) / visible(2) = 0.5
@@ -525,8 +525,8 @@ mod tests {
         let report = ToolSurfaceReport {
             visible_tools: vec!["bash".into(), "github".into()],
             visible_count: 2,
-            budget_used: 50,
-            budget_total: 3000,
+            schema_budget_used: 50,
+            schema_budget_total: 3000,
         };
         let fb = report.feedback(&[]);
         // precision = 0/2 = 0.0 (nothing used)
@@ -544,8 +544,8 @@ mod tests {
         let report = ToolSurfaceReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
-            budget_used: 30,
-            budget_total: 3000,
+            schema_budget_used: 30,
+            schema_budget_total: 3000,
         };
         let fb = report.feedback(&["github".into()]);
         // precision = 0/1 = 0.0 (visible bash, never used)
@@ -631,7 +631,7 @@ mod tests {
             schemas.len() >= reg.always_load_tool_names_sorted().len(),
             "should always include always_load tools even with tiny budget"
         );
-        assert!(report.budget_used <= 1 || report.budget_used == 0);
+        assert!(report.schema_budget_used <= 1 || report.schema_budget_used == 0);
     }
 
     #[test]
@@ -690,10 +690,10 @@ mod tests {
     }
 
     #[test]
-    fn surface_report_budget_used_excludes_deferred_discovery_entries() {
+    fn surface_report_schema_budget_used_excludes_deferred_discovery_entries() {
         let registry = ToolRegistry::new(mock_schemas());
         let (_schemas, report) =
             registry.build_initial_surface_with_report("analyze everything", 1, 800);
-        assert_eq!(report.budget_used, 0);
+        assert_eq!(report.schema_budget_used, 0);
     }
 }

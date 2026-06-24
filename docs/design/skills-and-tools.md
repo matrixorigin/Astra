@@ -407,6 +407,10 @@ Always-load is not synonymous with "control-plane." The always-load
 control-plane set is limited to user-facing coordination primitives that should
 not require a discovery round-trip: `ask_user` for blocking clarification and
 `notify` for non-blocking status updates.
+`notify` is intentionally always-load: its compact schema currently costs 126
+tokens under the repository schema-size heuristic (`serde_json` bytes / 4),
+which is below the 180-token regression ceiling and avoids a status-update
+discovery round-trip.
 
 MCP tools are dynamic runtime discoveries, not compile-time builtin declarations.
 They therefore cannot opt into default AlwaysLoad in code via

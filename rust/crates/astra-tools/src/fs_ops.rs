@@ -77,6 +77,15 @@ pub fn validate_read_file_args(args: &Value) -> Result<(), String> {
     }?;
     validate_read_file_line_arg(object, "start_line")?;
     validate_read_file_line_arg(object, "end_line")?;
+    if let (Some(start), Some(end)) = (
+        object.get("start_line").and_then(Value::as_u64),
+        object.get("end_line").and_then(Value::as_u64),
+    ) && start > end
+    {
+        return Err(format!(
+            "Error: invalid read_file line range: start_line ({start}) must be <= end_line ({end}). Valid fields: path, start_line, end_line, outline."
+        ));
+    }
     if let Some(value) = object.get("outline")
         && !value.is_boolean()
     {
@@ -118,7 +127,6 @@ fn validate_read_file_line_arg(
 pub struct ReadLineRange {
     pub start_line: usize,
     pub end_line: usize,
-    pub note: Option<String>,
 }
 
 pub fn normalize_read_file_line_range(
@@ -128,73 +136,10 @@ pub fn normalize_read_file_line_range(
 ) -> ReadLineRange {
     let requested_start = start_line.unwrap_or(1);
     let requested_end = end_line.unwrap_or(total_lines);
-    if requested_start <= requested_end {
-        return ReadLineRange {
-            start_line: requested_start,
-            end_line: requested_end,
-            note: None,
-        };
-    }
-
-    // A common model mistake after migrating from offset/limit-style readers is
-    // `start_line=X, end_line=N`, intending "read N lines from X". For large X
-    // and small N, reading the swapped absolute range would bury the useful
-    // target line behind thousands of earlier lines. Treat that shape as a
-    // bounded count, otherwise repair the transposed absolute range by sorting.
-    let looks_like_count = requested_start >= 100
-        && requested_end <= 500
-        && requested_start >= requested_end.saturating_mul(3);
-    if looks_like_count {
-        let resolved_end = requested_start
-            .saturating_add(requested_end)
-            .saturating_sub(1)
-            .min(total_lines.max(requested_start));
-        return ReadLineRange {
-            start_line: requested_start,
-            end_line: resolved_end,
-            note: Some(format!(
-                "[read_file normalized reversed range: interpreted start_line={requested_start}, end_line={requested_end} as {requested_end} lines starting at {requested_start}; use start_line={requested_start}, end_line={resolved_end} next time]"
-            )),
-        };
-    }
-
     ReadLineRange {
-        start_line: requested_end,
-        end_line: requested_start,
-        note: Some(format!(
-            "[read_file normalized reversed range: swapped start_line={requested_start}, end_line={requested_end}; use start_line={requested_end}, end_line={requested_start} next time]"
-        )),
+        start_line: requested_start,
+        end_line: requested_end,
     }
-}
-
-pub fn render_single_line_json_range_recovery(
-    content: &str,
-    requested_start_line: usize,
-    requested_end_line: usize,
-    total_lines: usize,
-    output_limit: usize,
-) -> Option<String> {
-    let trimmed = content.trim_start();
-    if total_lines != 1 || !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
-        return None;
-    }
-    let parsed = serde_json::from_str::<Value>(content).ok()?;
-    let pretty = serde_json::to_string_pretty(&parsed).ok()?;
-    let header = format!(
-        "[read_file recovered invalid line range: requested start_line={requested_start_line}, end_line={requested_end_line}, but this file has one physical line containing valid JSON. Showing a pretty-printed JSON preview instead; next time call read_file without start_line/end_line or parse the JSON structurally.]\n"
-    );
-    let numbered = add_line_numbers(&pretty, 1);
-    if header.len() >= output_limit {
-        return Some(truncate_output(header, output_limit));
-    }
-    let budget = output_limit.saturating_sub(header.len());
-    let mut body = truncate_output(numbered, budget);
-    if body.len() >= budget {
-        body.push_str(
-            "\n[truncated pretty JSON preview — read without line range or parse JSON structurally for exact extraction]",
-        );
-    }
-    Some(format!("{header}{body}"))
 }
 
 /// Build a structured str_replace failure message.
@@ -677,15 +622,6 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
     let end = range.end_line.min(lines.len());
 
     if start >= lines.len() {
-        if let Some(recovered) = render_single_line_json_range_recovery(
-            &content,
-            range.start_line,
-            range.end_line,
-            lines.len(),
-            per_tool_output_limit("read_file"),
-        ) {
-            return ToolResult::text(recovered);
-        }
         return ToolResult::error(format!(
             "Error: start_line {} exceeds file length {}",
             range.start_line,
@@ -706,9 +642,6 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
         add_line_numbers(&slice, start + 1),
         per_tool_output_limit("read_file"),
     );
-    if let Some(note) = range.note {
-        result = format!("{note}\n{result}");
-    }
     if end < lines.len() {
         result.push_str(&format!(
             "\n[showing lines {}-{} of {}]",
@@ -2888,7 +2821,7 @@ mod tests {
     }
 
     #[test]
-    fn read_file_repairs_small_reversed_absolute_ranges() {
+    fn read_file_rejects_reversed_line_ranges() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("test.txt"), "a\nb\nc\nd").unwrap();
 
@@ -2897,25 +2830,18 @@ mod tests {
             &serde_json::json!({"path": "test.txt", "start_line": 4, "end_line": 2}),
         );
 
-        assert!(!result.is_error, "got: {}", result.output);
+        assert!(result.is_error, "got: {}", result.output);
         assert!(
-            result.output.contains("normalized reversed range"),
+            result
+                .output
+                .contains("start_line (4) must be <= end_line (2)"),
             "got: {}",
             result.output
         );
-        assert!(
-            result.output.contains("use start_line=2, end_line=4"),
-            "got: {}",
-            result.output
-        );
-        assert!(result.output.contains("2\tb"), "got: {}", result.output);
-        assert!(result.output.contains("3\tc"), "got: {}", result.output);
-        assert!(result.output.contains("4\td"), "got: {}", result.output);
-        assert!(!result.output.contains("1\ta"), "got: {}", result.output);
     }
 
     #[test]
-    fn read_file_repairs_legacy_start_plus_count_shape_from_real_trace() {
+    fn read_file_rejects_legacy_start_plus_count_shape_from_real_trace() {
         let tmp = TempDir::new().unwrap();
         let mut content = String::new();
         for line in 1..=3_200 {
@@ -2928,33 +2854,18 @@ mod tests {
             &serde_json::json!({"path": "tool-result.txt", "start_line": 2782, "end_line": 300}),
         );
 
-        assert!(!result.is_error, "got: {}", result.output);
+        assert!(result.is_error, "got: {}", result.output);
         assert!(
             result
                 .output
-                .contains("interpreted start_line=2782, end_line=300 as 300 lines"),
-            "got: {}",
-            result.output
-        );
-        assert!(
-            result.output.contains("use start_line=2782, end_line=3081"),
-            "got: {}",
-            result.output
-        );
-        assert!(
-            result.output.contains("2782\tline 2782"),
-            "got: {}",
-            result.output
-        );
-        assert!(
-            !result.output.contains("300\tline 300"),
-            "legacy count recovery must not bury the requested start line behind the swapped absolute range: {}",
+                .contains("start_line (2782) must be <= end_line (300)"),
+            "legacy count-style ranges must fail instead of being repaired: {}",
             result.output
         );
     }
 
     #[test]
-    fn read_file_recovers_bad_range_on_single_line_json_tool_result() {
+    fn read_file_rejects_bad_range_on_single_line_json_tool_result() {
         let tmp = TempDir::new().unwrap();
         let json = serde_json::json!({
             "status": "completed",
@@ -2975,21 +2886,11 @@ mod tests {
             }),
         );
 
-        assert!(!result.is_error, "got: {}", result.output);
+        assert!(result.is_error, "got: {}", result.output);
         assert!(
             result
                 .output
-                .contains("one physical line containing valid JSON"),
-            "got: {}",
-            result.output
-        );
-        assert!(
-            result.output.contains("\"results\""),
-            "got: {}",
-            result.output
-        );
-        assert!(
-            result.output.contains("first review") && result.output.contains("second review"),
+                .contains("start_line (2782) must be <= end_line (300)"),
             "got: {}",
             result.output
         );

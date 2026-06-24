@@ -804,8 +804,8 @@ impl CacheBreakDetector {
                     .flatten()
                     .collect();
                     return Some(format!(
-                        "Tool schemas changed ({}). Consider pinning tool order and \
-                         avoiding dynamic tool registration mid-session; same-name schema \
+                        "Tool schemas changed ({}). Keep tool schema order stable and \
+                         avoid dynamic tool registration mid-session; same-name schema \
                          churn (e.g. dynamic agent/skill lists embedded in a tool description) \
                          also breaks cache.",
                         parts.join("; ")

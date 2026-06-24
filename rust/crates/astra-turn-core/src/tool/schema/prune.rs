@@ -584,8 +584,8 @@ mod tests {
         let mut report = ToolSurfaceReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
-            budget_used: 0,
-            budget_total: 100,
+            schema_budget_used: 0,
+            schema_budget_total: 100,
         };
         let results = vec![json!({"name": "grep"}), json!({"name": "read_file"})];
 
@@ -605,8 +605,8 @@ mod tests {
         let mut report = ToolSurfaceReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
-            budget_used: 0,
-            budget_total: 100,
+            schema_budget_used: 0,
+            schema_budget_total: 100,
         };
         let results = vec![json!({"name": "bash"})];
 
@@ -623,8 +623,8 @@ mod tests {
         let mut report = ToolSurfaceReport {
             visible_tools: vec![],
             visible_count: 0,
-            budget_used: 0,
-            budget_total: 100,
+            schema_budget_used: 0,
+            schema_budget_total: 100,
         };
         let results = vec![json!({"name": "nonexistent_tool"})];
 
@@ -641,8 +641,8 @@ mod tests {
         let mut report = ToolSurfaceReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
-            budget_used: 0,
-            budget_total: 100,
+            schema_budget_used: 0,
+            schema_budget_total: 100,
         };
 
         let retained = retain_invoked_tool_schemas(&mut selected, &mut report, &[], &all);
@@ -665,8 +665,8 @@ mod tests {
         let mut report = ToolSurfaceReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
-            budget_used: 0,
-            budget_total: 100,
+            schema_budget_used: 0,
+            schema_budget_total: 100,
         };
         // 12 tool results for the same tool (different args, but same name)
         let results: Vec<Value> = (0..12).map(|_| json!({"name": "git"})).collect();
@@ -695,8 +695,8 @@ mod tests {
         let mut report = ToolSurfaceReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
-            budget_used: 0,
-            budget_total: 100,
+            schema_budget_used: 0,
+            schema_budget_total: 100,
         };
         let allowed: Vec<String> = vec!["bash".into(), "grep".into(), "glob".into()];
 
@@ -732,8 +732,8 @@ mod tests {
         let mut report = ToolSurfaceReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
-            budget_used: 0,
-            budget_total: 100,
+            schema_budget_used: 0,
+            schema_budget_total: 100,
         };
         let allowed: Vec<String> = vec!["bash".into(), "nonexistent_tool".into()];
 
@@ -753,8 +753,8 @@ mod tests {
         let mut report = ToolSurfaceReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
-            budget_used: 0,
-            budget_total: 100,
+            schema_budget_used: 0,
+            schema_budget_total: 100,
         };
         let allowed: Vec<String> = vec!["grep".into(), "grep".into()];
 
@@ -780,8 +780,8 @@ mod tests {
         let mut report = ToolSurfaceReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
-            budget_used: 0,
-            budget_total: 100,
+            schema_budget_used: 0,
+            schema_budget_total: 100,
         };
         let empty_allowed: Vec<String> = Vec::new();
 
@@ -810,8 +810,8 @@ mod tests {
         let mut report = ToolSurfaceReport {
             visible_tools: vec!["read_file".into()],
             visible_count: 1,
-            budget_used: 0,
-            budget_total: 100,
+            schema_budget_used: 0,
+            schema_budget_total: 100,
         };
 
         let injected =
@@ -851,8 +851,8 @@ mod tests {
         let mut report = ToolSurfaceReport {
             visible_tools: vec!["exit_plan_mode".into()],
             visible_count: 1,
-            budget_used: 0,
-            budget_total: 100,
+            schema_budget_used: 0,
+            schema_budget_total: 100,
         };
 
         let injected = inject_required_tool_names(
@@ -881,8 +881,8 @@ mod tests {
         let mut report = ToolSurfaceReport {
             visible_tools: vec!["read_file".into()],
             visible_count: 1,
-            budget_used: 0,
-            budget_total: 100,
+            schema_budget_used: 0,
+            schema_budget_total: 100,
         };
 
         let injected = inject_required_tool_names(
@@ -912,8 +912,8 @@ mod tests {
         let mut report = ToolSurfaceReport {
             visible_tools: vec!["read_file".into()],
             visible_count: 1,
-            budget_used: 0,
-            budget_total: 100,
+            schema_budget_used: 0,
+            schema_budget_total: 100,
         };
 
         let injected = inject_required_tool_names(&mut selected, &mut report, &[], &all);

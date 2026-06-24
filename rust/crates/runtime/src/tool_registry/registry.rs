@@ -235,8 +235,8 @@ impl ToolRegistry {
             let report = ToolSurfaceReport {
                 visible_tools: Vec::new(),
                 visible_count: 0,
-                budget_used: 0,
-                budget_total: schema_budget,
+                schema_budget_used: 0,
+                schema_budget_total: schema_budget,
             };
             return (Vec::new(), report);
         }
@@ -247,8 +247,8 @@ impl ToolRegistry {
         let report = ToolSurfaceReport {
             visible_count: schemas.len() as u32,
             visible_tools: names,
-            budget_used: 0,
-            budget_total: schema_budget,
+            schema_budget_used: 0,
+            schema_budget_total: schema_budget,
         };
 
         (schemas, report)
@@ -267,8 +267,8 @@ impl ToolRegistry {
             ToolSurfaceReport {
                 visible_count: names.len() as u32,
                 visible_tools: names,
-                budget_used: 0,
-                budget_total: schema_budget,
+                schema_budget_used: 0,
+                schema_budget_total: schema_budget,
             },
         )
     }
@@ -521,7 +521,7 @@ mod tests {
             !names.contains(&"skill".to_string()),
             "deferred injected tools must not enter the visible surface by lookup alone"
         );
-        assert_eq!(report.budget_used, 0);
+        assert_eq!(report.schema_budget_used, 0);
     }
 
     #[test]
@@ -596,7 +596,7 @@ mod tests {
 
         assert!(names.contains(&"web_fetch".to_string()));
         assert_eq!(
-            report.budget_used, 0,
+            report.schema_budget_used, 0,
             "user-always_load tools are part of this registry's always_load surface and must not consume deferred-tool budget"
         );
     }
@@ -628,7 +628,7 @@ mod tests {
             "default always_load tools stay visible even with zero deferred budget: {names:?}"
         );
         assert_eq!(
-            report.budget_used, 0,
+            report.schema_budget_used, 0,
             "always_load tools must not consume deferred-tool budget"
         );
     }

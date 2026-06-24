@@ -20,6 +20,7 @@
 
 use astra_config::ToolSurfaceConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
+use astra_turn_core::tool_registry_report::{ToolSurfaceSnapshot, ToolSurfaceTierCounts};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -222,6 +223,17 @@ impl ToolSurface {
             .iter()
             .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
             .collect()
+    }
+
+    pub fn snapshot(&self) -> ToolSurfaceSnapshot {
+        ToolSurfaceSnapshot {
+            visible_tools: self.always_load_names(),
+            tier_counts: ToolSurfaceTierCounts {
+                always_load: self.always_load.len().min(u32::MAX as usize) as u32,
+                deferred_active: 0,
+                deferred_available: self.deferred.len().min(u32::MAX as usize) as u32,
+            },
+        }
     }
 
     /// The deferred manifest — one `name + short_desc` entry per non-always_load

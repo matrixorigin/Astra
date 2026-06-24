@@ -12,10 +12,14 @@ pub fn record_agentic_step_plan_after_payload_prep(
     let selected_tool_names: Vec<String> = first_surface_report
         .map(|r| r.visible_tools.clone())
         .unwrap_or_default();
-    let budget_tokens = first_surface_report
-        .map(|r| r.budget_used as u64)
+    let schema_budget_tokens = first_surface_report
+        .map(|r| r.schema_budget_used as u64)
         .unwrap_or(0);
-    step_recorder.record_plan(&selected_tool_names, first_budget_pressure, budget_tokens);
+    step_recorder.record_plan(
+        &selected_tool_names,
+        first_budget_pressure,
+        schema_budget_tokens,
+    );
 }
 
 #[cfg(test)]
@@ -28,8 +32,8 @@ mod tests {
         let rep = ToolSurfaceReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
-            budget_used: 12,
-            budget_total: 100,
+            schema_budget_used: 12,
+            schema_budget_total: 100,
         };
         record_agentic_step_plan_after_payload_prep(&mut rec, Some(&rep), 0.3);
         // Smoke: recorder accepted without panic; phase advanced internally.

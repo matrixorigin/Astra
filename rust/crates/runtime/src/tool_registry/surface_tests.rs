@@ -159,6 +159,25 @@ fn always_load_schemas_are_sorted_alphabetically_for_cache_stability() {
     assert_eq!(names, sorted, "always_load must be sorted alphabetically");
 }
 
+#[test]
+fn surface_snapshot_exposes_visible_tools_and_tier_counts() {
+    let cfg = ToolSurfaceConfig::default();
+    let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
+    let snapshot = surface.snapshot();
+    let always_load = names(&surface.always_load_schemas());
+
+    assert_eq!(snapshot.visible_tools, always_load);
+    assert_eq!(
+        snapshot.tier_counts.always_load as usize,
+        snapshot.visible_tools.len()
+    );
+    assert_eq!(snapshot.tier_counts.deferred_active, 0);
+    assert_eq!(
+        snapshot.tier_counts.deferred_available as usize,
+        surface.deferred().len()
+    );
+}
+
 // ── 2. Config additions ─────────────────────────────────────────────────────
 
 #[test]

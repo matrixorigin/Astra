@@ -78,8 +78,8 @@ fn bench_inject_required_tool_names(c: &mut Criterion) {
                     .map(String::from)
             })
             .collect(),
-        budget_used: 0,
-        budget_total: 800,
+        schema_budget_used: 0,
+        schema_budget_total: 800,
     };
 
     let mut group = c.benchmark_group("inject_required_tool_names");
@@ -133,8 +133,8 @@ fn bench_retain_invoked_tool_schemas(c: &mut Criterion) {
                     .map(String::from)
             })
             .collect(),
-        budget_used: 0,
-        budget_total: 800,
+        schema_budget_used: 0,
+        schema_budget_total: 800,
     };
 
     let mut group = c.benchmark_group("retain_invoked_tool_schemas");

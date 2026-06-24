@@ -78,8 +78,8 @@ mod tests {
         let r1 = ToolSurfaceReport {
             visible_tools: vec!["a".into()],
             visible_count: 1,
-            budget_used: 1,
-            budget_total: 10,
+            schema_budget_used: 1,
+            schema_budget_total: 10,
         };
         capture_first_surface_report_if_empty(&mut slot, &mut bp, r1.clone(), 0.3);
         assert_eq!(slot.as_ref().unwrap().visible_tools, vec!["a"]);
@@ -87,8 +87,8 @@ mod tests {
         let r2 = ToolSurfaceReport {
             visible_tools: vec!["b".into()],
             visible_count: 1,
-            budget_used: 2,
-            budget_total: 10,
+            schema_budget_used: 2,
+            schema_budget_total: 10,
         };
         // Report stays first; pressure updates to peak
         capture_first_surface_report_if_empty(&mut slot, &mut bp, r2, 0.9);
@@ -106,8 +106,8 @@ mod tests {
         let r = ToolSurfaceReport {
             visible_tools: vec!["a".into()],
             visible_count: 1,
-            budget_used: 1,
-            budget_total: 10,
+            schema_budget_used: 1,
+            schema_budget_total: 10,
         };
         capture_first_surface_report_if_empty(&mut slot, &mut bp, r.clone(), 0.8);
         capture_first_surface_report_if_empty(&mut slot, &mut bp, r.clone(), 0.5);

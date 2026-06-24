@@ -10,7 +10,7 @@ use astra_runtime::tool_sandbox::validate_path;
 use astra_sandbox::is_internal_safe_path;
 use astra_tools::fs_ops::{
     check_anchor_vs_replacement_size, normalize_read_file_line_range, read_to_string_lossy,
-    render_single_line_json_range_recovery, str_replace_fail, validate_read_file_args,
+    str_replace_fail, validate_read_file_args,
 };
 use astra_turn_core::tool_result_sanitize::READ_FILE_MODEL_RESULT_CHARS;
 use astra_turn_core::tool_result_semantics::TOOL_SUCCESS_SENTINEL;
@@ -551,21 +551,6 @@ impl ToolExecutor {
                 content.lines().count(),
             )
         });
-        if let Some(range) = normalized_range.as_ref() {
-            let total_lines = content.lines().count();
-            if range.start_line > total_lines
-                && let Some(recovered) = render_single_line_json_range_recovery(
-                    &content,
-                    range.start_line,
-                    range.end_line,
-                    total_lines,
-                    self.read_file_model_output_limit(),
-                )
-            {
-                return recovered;
-            }
-        }
-
         // Dedup: if file was fully read earlier in this turn and hasn't
         // changed, return a stub. Later turns may need the content again after
         // prompt compaction, so cross-turn reads still return the file body.
@@ -611,14 +596,7 @@ impl ToolExecutor {
                 if expanded.chars().count() <= self.read_file_model_output_limit() {
                     // Upgrade to full read — future reads will hit can_dedup_read.
                     self.record_read_cached(&path, false, ReadDedupKey::Full, content.clone());
-                    return if let Some(note) = normalized_range
-                        .as_ref()
-                        .and_then(|range| range.note.as_ref())
-                    {
-                        format!("{note}\n{expanded}")
-                    } else {
-                        expanded
-                    };
+                    return expanded;
                 }
             }
         }
@@ -707,16 +685,12 @@ impl ToolExecutor {
         };
         let s = range.start_line.saturating_sub(1).min(lines.len());
         let e = range.end_line.min(lines.len());
-        if s >= lines.len()
-            && let Some(recovered) = render_single_line_json_range_recovery(
-                &content,
+        if s >= lines.len() {
+            return format!(
+                "Error: start_line {} exceeds file length {}",
                 range.start_line,
-                range.end_line,
-                lines.len(),
-                self.read_file_model_output_limit(),
-            )
-        {
-            return recovered;
+                lines.len()
+            );
         }
         if s >= e {
             return format!(
@@ -775,9 +749,6 @@ impl ToolExecutor {
                 ReadCoverage::None
             };
             dedup_eligible = false;
-        }
-        if let Some(note) = range.note.as_ref() {
-            result = format!("{note}\n{result}");
         }
         self.record_read_cached_with_coverage(
             &path,
@@ -3677,16 +3648,14 @@ type Handler interface {
             "start_line": 3,
             "end_line": 1
         }));
-        assert!(result.contains("normalized reversed range"), "{result}");
-        assert!(result.contains("start_line=1"), "{result}");
-        assert!(result.contains("end_line=3"), "{result}");
-        assert!(result.contains("1\ta"), "{result}");
-        assert!(result.contains("2\tb"), "{result}");
-        assert!(result.contains("3\tc"), "{result}");
+        assert!(
+            result.contains("start_line (3) must be <= end_line (1)"),
+            "{result}"
+        );
     }
 
     #[test]
-    fn read_file_recovers_bad_range_on_single_line_json_tool_result() {
+    fn read_file_rejects_bad_range_on_single_line_json_tool_result() {
         let dir = tempfile::tempdir().unwrap();
         let payload = serde_json::json!({
             "status": "completed",
@@ -3706,12 +3675,9 @@ type Handler interface {
         }));
 
         assert!(
-            result.contains("one physical line containing valid JSON"),
+            result.contains("start_line (2782) must be <= end_line (300)"),
             "{result}"
         );
-        assert!(result.contains("\"results\""), "{result}");
-        assert!(result.contains("first review"), "{result}");
-        assert!(result.contains("second review"), "{result}");
     }
 
     #[test]

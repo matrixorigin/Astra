@@ -252,8 +252,8 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
     let report = first_surface_report.unwrap_or_else(|| tool_registry::ToolSurfaceReport {
         visible_tools: Vec::new(),
         visible_count: 0,
-        budget_used: 0,
-        budget_total: 0,
+        schema_budget_used: 0,
+        schema_budget_total: 0,
     });
 
     let deduped_stall_events: Vec<(String, u32)> = {
@@ -291,7 +291,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         selected_skills,
         tools_used,
         tool_call_records,
-        budget_used: report.budget_used,
+        budget_used: report.schema_budget_used,
         budget_pressure,
         stall_events: deduped_stall_events,
         verdict_events: deduped_verdict_events,

@@ -806,8 +806,8 @@ fn empty_surface_report_for_schemas(
     astra_runtime::tool_registry::ToolSurfaceReport {
         visible_count: visible_tools.len() as u32,
         visible_tools,
-        budget_used: 0,
-        budget_total: 0,
+        schema_budget_used: 0,
+        schema_budget_total: 0,
     }
 }
 

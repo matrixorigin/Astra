@@ -105,7 +105,6 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
                         "name": tool_name,
                         "description": compact_desc,
                         "description_truncated": desc_truncated,
-                        "detail_query": format!("detail:{tool_name}"),
                     });
                     // Include parameter shape, but strip nested prose. The
                     // full schema will be injected into tools[] on the next
@@ -154,85 +153,11 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
         return result.to_string();
     }
 
-    if let Some(tool_names) = detail_payload(query) {
-        let mut requested = Vec::new();
-        for name in tool_names
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-        {
-            if !requested
-                .iter()
-                .any(|existing: &String| existing.eq_ignore_ascii_case(name))
-            {
-                requested.push(name.to_string());
-            }
-        }
-        if requested.is_empty() {
-            return tool_search_error("'detail:' requires at least one tool name").to_string();
-        }
-
-        let mut found = Vec::new();
-        let mut resolved = Vec::new();
-        let mut missing = Vec::new();
-        let mut ambiguous = Vec::new();
-
-        for name in &requested {
-            match resolve_select_tool(&valid_schemas, name) {
-                SelectResolution::Found {
-                    schema,
-                    canonical_name,
-                    matched_by_prefix,
-                } => {
-                    let Some(func) = schema.get("function") else {
-                        missing.push(name.clone());
-                        continue;
-                    };
-                    let mut entry = json!({
-                        "name": func.get("name").and_then(Value::as_str).unwrap_or(""),
-                        "description": func.get("description").and_then(Value::as_str).unwrap_or(""),
-                    });
-                    if let Some(params) = func.get("parameters")
-                        && let Some(obj) = entry.as_object_mut()
-                    {
-                        obj.insert("parameters".to_string(), params.clone());
-                    }
-                    if matched_by_prefix && let Some(obj) = entry.as_object_mut() {
-                        obj.insert("requested".to_string(), json!(name));
-                        obj.insert("matched_by".to_string(), json!("unique_prefix"));
-                    }
-                    resolved.push(canonical_name.to_string());
-                    found.push(entry);
-                }
-                SelectResolution::Ambiguous { candidates } => {
-                    ambiguous.push(json!({
-                        "requested": name,
-                        "candidates": candidates,
-                    }));
-                    missing.push(name.clone());
-                }
-                SelectResolution::Missing => {
-                    missing.push(name.clone());
-                }
-            }
-        }
-
-        let outcome = select_outcome(valid_schemas.len(), found.len(), missing.len());
-        let mut result = json!({
-            "mode": "detail",
-            "status": TOOL_RESULT_STATUS_COMPLETED,
-            "detail_status": outcome,
-            "query": query,
-            "requested": requested,
-            "resolved": resolved,
-            "matches": found,
-            "missing": missing,
-            "ambiguous": ambiguous,
-            "total_tools": valid_schemas.len()
-        });
-        let message = select_message(outcome, &result);
-        add_tool_search_guidance(&mut result, outcome, message);
-        return result.to_string();
+    if has_query_prefix(query, "detail:") {
+        return tool_search_error(
+            "'detail:' mode has been removed; use 'select:NAME' to activate the tool schema",
+        )
+        .to_string();
     }
 
     // Keyword search mode — delegates scoring to shared utility.
@@ -258,7 +183,6 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
                 "name": name,
                 "description": short_desc,
                 "description_truncated": was_truncated,
-                "detail_query": format!("detail:{name}"),
                 "score": score
             })
         })
@@ -281,18 +205,13 @@ pub use astra_core::tool_schema::tool_schema_name;
 
 fn select_payload(query: &str) -> Option<&str> {
     const SELECT_PREFIX: &str = "select:";
-    query
-        .get(..SELECT_PREFIX.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(SELECT_PREFIX))
-        .then(|| &query[SELECT_PREFIX.len()..])
+    has_query_prefix(query, SELECT_PREFIX).then(|| &query[SELECT_PREFIX.len()..])
 }
 
-fn detail_payload(query: &str) -> Option<&str> {
-    const DETAIL_PREFIX: &str = "detail:";
+fn has_query_prefix(query: &str, prefix: &str) -> bool {
     query
-        .get(..DETAIL_PREFIX.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(DETAIL_PREFIX))
-        .then(|| &query[DETAIL_PREFIX.len()..])
+        .get(..prefix.len())
+        .is_some_and(|actual| actual.eq_ignore_ascii_case(prefix))
 }
 
 fn compact_description(description: &str, max_chars: usize) -> (String, bool) {
@@ -628,9 +547,9 @@ mod tests {
             parsed["matches"][0].get("score").is_none(),
             "select mode must return schema entries, not keyword scores: {parsed}"
         );
-        assert_eq!(
-            parsed["matches"][0]["detail_query"].as_str(),
-            Some("detail:bash")
+        assert!(
+            parsed["matches"][0].get("detail_query").is_none(),
+            "detail mode has been removed; select results must not suggest it: {parsed}"
         );
     }
 
@@ -895,8 +814,8 @@ mod tests {
 
     #[test]
     fn select_vs_keyword_params() {
-        // select: mode returns compact parameter shape; detail: returns full
-        // prose only when the model explicitly asks for expansion.
+        // select: mode returns compact parameter shape because the full
+        // callable schema is injected into tools[] on the next request.
         let schemas = schemas_with_params();
 
         let result = tool_search(&schemas, &json!({"query": "select:read_file"}));
@@ -912,11 +831,12 @@ mod tests {
 
         let result = tool_search(&schemas, &json!({"query": "detail:read_file"}));
         let parsed: Value = serde_json::from_str(&result).expect("valid json");
-        assert_eq!(parsed["mode"].as_str(), Some("detail"));
+        assert_eq!(parsed["mode"].as_str(), Some("error"));
+        assert_eq!(parsed["status"].as_str(), Some("failed"));
         assert_eq!(
-            parsed["matches"][0]["parameters"]["properties"]["path"]["description"].as_str(),
-            Some("File path"),
-            "detail result should preserve full parameter prose: {parsed}"
+            parsed["error"].as_str(),
+            Some("'detail:' mode has been removed; use 'select:NAME' to activate the tool schema"),
+            "detail mode must be retired instead of duplicating select semantics: {parsed}"
         );
 
         let result = tool_search(&schemas, &json!({"query": "file"}));
@@ -956,7 +876,8 @@ mod tests {
 
     #[test]
     fn select_vs_keyword_description() {
-        // select and keyword stay compact; detail expands full prose.
+        // select and keyword stay compact; full prose arrives through the
+        // selected tool schema in the next tools[] request.
         let long_desc = "x".repeat(500);
         let schemas = vec![json!({
             "type": "function",
@@ -975,15 +896,15 @@ mod tests {
             parsed["matches"][0]["description_truncated"].as_bool(),
             Some(true)
         );
-        assert_eq!(
-            parsed["matches"][0]["detail_query"].as_str(),
-            Some("detail:big")
+        assert!(
+            parsed["matches"][0].get("detail_query").is_none(),
+            "select result must not carry retired detail guidance: {parsed}"
         );
 
         let result = tool_search(&schemas, &json!({"query": "detail:big"}));
         let parsed: Value = serde_json::from_str(&result).unwrap();
-        let desc = parsed["matches"][0]["description"].as_str().unwrap();
-        assert_eq!(desc.len(), 500);
+        assert_eq!(parsed["mode"].as_str(), Some("error"));
+        assert_eq!(parsed["status"].as_str(), Some("failed"));
 
         let result = tool_search(&schemas, &json!({"query": "big"}));
         let parsed: Value = serde_json::from_str(&result).unwrap();

@@ -867,7 +867,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "introspect",
-                "description": "Query runtime state. Subtopics: `session` (default: token pressure, cache hit rate, tool health, alerts, working memory, plan/task/session lifecycle context including restore/resume state and last lifecycle event when available), `cache` (cache-regression diagnosis), `recent` (recent LLM-round summaries), `volatile` (runtime nudges/coaching queued for next turn), `stall` (loop-guard state), `all` (session + recent + volatile + stall). Use `detail: full` for deep diagnosis (stall forensics, context pressure, performance); use `detail: summary` (default) for quick health checks.",
+                "description": "Query runtime state. Subtopics: `session` (default: token pressure, cache hit rate, tool health, alerts, working memory, plan/task/session lifecycle context including restore/resume state and last lifecycle event when available), `cache` (cache-regression diagnosis), `recent` (recent LLM-round summaries), `volatile` (runtime nudges/coaching queued for next turn), `stall` (loop-guard state), `all` (session + recent + volatile + stall). Set detail='full' for deep diagnosis (stall forensics, context pressure, performance); use detail='summary' for quick health checks.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -901,15 +901,14 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "name": "tool_search",
                 "description":
                     "Search deferred tools. Keywords list candidates. `select:NAME[,NAME]` \
-                     returns compact callable shape and queues schemas for the next request. \
-                     `detail:NAME` expands full docs only when needed.",
+                     returns compact callable shape and queues schemas for the next request.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
                             "description":
-                                "Keyword query, `select:NAME` / `select:NAME1,NAME2`, or `detail:NAME`."
+                                "Keyword query, `select:NAME`, or `select:NAME1,NAME2`."
                         },
                         "max_results": {
                             "type": "integer",
@@ -925,7 +924,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "notify",
-                "description": "Send a notification to the user. Use for proactive updates (background task done, blocker found, unsolicited insight). Gateways route based on notification_type: 'normal' = in-chat reply, 'proactive' = push notification. CLI mode: both render as text. Example: notify(message='Build completed successfully', notification_type='proactive').",
+                "description": "Send a user notification or status update. Use notification_type='proactive' only for push-worthy updates; CLI renders both modes inline.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1475,6 +1474,7 @@ mod tests {
             ("git", 140),
             ("memory", 120),
             ("ask_user", 180),
+            ("notify", 180),
             ("task", 140),
             ("tool_search", 240),
         ] {
@@ -1486,6 +1486,23 @@ mod tests {
                 desc.len()
             );
         }
+    }
+
+    #[test]
+    fn notify_always_load_incremental_schema_cost_is_quantified() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let notify = find_schema(&schemas, "notify").expect("notify schema must exist");
+        let notify_tokens = schema_token_cost(notify);
+        const EXPECTED_NOTIFY_TOKENS: usize = 126;
+        const NOTIFY_ALWAYS_LOAD_TOKEN_CEILING: usize = 180;
+        assert_eq!(
+            notify_tokens, EXPECTED_NOTIFY_TOKENS,
+            "notify always-load cost changed; update docs/design/skills-and-tools.md if intentional"
+        );
+        assert!(
+            notify_tokens <= NOTIFY_ALWAYS_LOAD_TOKEN_CEILING,
+            "notify always-load cost is {notify_tokens} tokens; keep the status-update primitive compact"
+        );
     }
 
     #[test]

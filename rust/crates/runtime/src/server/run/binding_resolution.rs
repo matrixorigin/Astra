@@ -1,8 +1,8 @@
 //! Binding resolution logic for server-side runs.
 //!
 //! Extracted from `lifecycle.rs` to keep the run lifecycle module focused on
-//! state-machine concerns. This module owns the mapping from API requests
-//! (and edge profiles / persisted metadata) to concrete workspace + executor
+//! state-machine concerns. This module owns the mapping from explicit API
+//! request bindings and persisted metadata to concrete workspace + executor
 //! bindings that flow through the agentic loop.
 
 use std::path::{Path, PathBuf};

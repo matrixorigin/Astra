@@ -13,7 +13,7 @@
 //! 5. Runtime overrides (via API)
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ─── Top-Level Configuration ─────────────────────────────────────────────────
 
@@ -1666,6 +1666,74 @@ fn cli_overlay_snapshot() -> Option<RuntimeConfig> {
     cli_overlay_cell().read().ok().and_then(|s| s.clone())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeprecatedRuntimeConfigKey {
+    old_path: &'static str,
+    replacement: &'static str,
+    reason: &'static str,
+}
+
+fn deprecated_runtime_config_keys(content: &str) -> Vec<DeprecatedRuntimeConfigKey> {
+    let Ok(value) = toml::from_str::<toml::Value>(content) else {
+        return Vec::new();
+    };
+    let Some(table) = value.as_table() else {
+        return Vec::new();
+    };
+
+    let mut warnings = Vec::new();
+    if let Some(tool_selection) = table.get("tool_selection") {
+        warnings.push(DeprecatedRuntimeConfigKey {
+            old_path: "tool_selection",
+            replacement: "tool_policy",
+            reason: "tool selection limits moved to tool_policy; unknown TOML sections are otherwise ignored by serde",
+        });
+        if tool_selection
+            .as_table()
+            .and_then(|section| section.get("pinned_tools"))
+            .is_some()
+        {
+            warnings.push(DeprecatedRuntimeConfigKey {
+                old_path: "tool_selection.pinned_tools",
+                replacement: "tool_surface.always_load_tools",
+                reason: "pinned_tools was retired; always-load promotion is the declarative tool-surface override",
+            });
+        }
+    }
+    if table.get("pinned_tools").is_some() {
+        warnings.push(DeprecatedRuntimeConfigKey {
+            old_path: "pinned_tools",
+            replacement: "tool_surface.always_load_tools",
+            reason: "top-level pinned_tools was retired; always-load promotion now lives under tool_surface",
+        });
+    }
+    if table
+        .get("tool_surface")
+        .and_then(toml::Value::as_table)
+        .and_then(|section| section.get("pinned_tools"))
+        .is_some()
+    {
+        warnings.push(DeprecatedRuntimeConfigKey {
+            old_path: "tool_surface.pinned_tools",
+            replacement: "tool_surface.always_load_tools",
+            reason: "pinned_tools was retired; use the always-load terminology directly",
+        });
+    }
+    warnings
+}
+
+fn warn_deprecated_runtime_config_keys(path: &Path, content: &str) {
+    for warning in deprecated_runtime_config_keys(content) {
+        tracing::warn!(
+            path = %path.display(),
+            old_key = warning.old_path,
+            replacement = warning.replacement,
+            reason = warning.reason,
+            "deprecated runtime.toml key ignored; update config to the replacement key"
+        );
+    }
+}
+
 // ─── Configuration Loading ───────────────────────────────────────────────────
 
 impl RuntimeConfig {
@@ -1698,6 +1766,7 @@ impl RuntimeConfig {
         if let Some(home) = dirs::home_dir() {
             let user_config = home.join(".astra/config/runtime.toml");
             if let Ok(content) = std::fs::read_to_string(&user_config) {
+                warn_deprecated_runtime_config_keys(&user_config, &content);
                 match toml::from_str::<RuntimeConfig>(&content) {
                     Ok(user) => config = config.merge(user),
                     Err(err) => {
@@ -1716,6 +1785,7 @@ impl RuntimeConfig {
         // Project-level config
         let project_config = PathBuf::from(".astra/config/runtime.toml");
         if let Ok(content) = std::fs::read_to_string(&project_config) {
+            warn_deprecated_runtime_config_keys(&project_config, &content);
             match toml::from_str::<RuntimeConfig>(&content) {
                 Ok(project) => config = config.merge(project),
                 Err(err) => {
@@ -2386,6 +2456,45 @@ mod tests {
         let toml = config.to_toml().unwrap();
         assert!(toml.contains("max_history_tokens"));
         assert!(toml.contains("retrieval_top_k"));
+    }
+
+    #[test]
+    fn deprecated_tool_config_keys_are_detected_before_serde_ignores_them() {
+        let warnings = deprecated_runtime_config_keys(
+            r#"
+[tool_selection]
+pinned_tools = ["github"]
+max_tools = 12
+
+[tool_surface]
+pinned_tools = ["web_fetch"]
+"#,
+        );
+        let pairs = warnings
+            .iter()
+            .map(|warning| (warning.old_path, warning.replacement))
+            .collect::<Vec<_>>();
+
+        assert!(pairs.contains(&("tool_selection", "tool_policy")));
+        assert!(pairs.contains(&(
+            "tool_selection.pinned_tools",
+            "tool_surface.always_load_tools"
+        )));
+        assert!(pairs.contains(&(
+            "tool_surface.pinned_tools",
+            "tool_surface.always_load_tools"
+        )));
+    }
+
+    #[test]
+    fn deprecated_tool_config_detector_ignores_current_tool_surface_key() {
+        let warnings = deprecated_runtime_config_keys(
+            r#"
+[tool_surface]
+always_load_tools = ["github"]
+"#,
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]
