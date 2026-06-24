@@ -14,7 +14,7 @@ use astra_turn_core::edge_prompt_context::make_args_preview;
 use astra_turn_core::guardrails::turn_guard::TurnGuard;
 use astra_turn_core::headless_tool_assembly::{
     EdgeToolRoundRow, HeadlessResolvedToolSlot, HeadlessRoundToolIdx, READ_ONLY_TOOLS,
-    resolve_headless_tool_slot, take_edge_output_for_tool_call_with_duration,
+    resolve_headless_tool_slot, take_edge_output_for_tool_call_id_or_signature_with_duration,
 };
 
 mod execute;
@@ -269,7 +269,8 @@ fn resolve_headless_tool_execution<E: EdgeToolRoundRow>(
             edge_tool_round[i].tool_result_fields().cloned(),
         )
     } else {
-        let matched = take_edge_output_for_tool_call_with_duration(
+        let matched = take_edge_output_for_tool_call_id_or_signature_with_duration(
+            &id,
             &name,
             &args,
             edge_tool_round,
@@ -285,6 +286,25 @@ fn resolve_headless_tool_execution<E: EdgeToolRoundRow>(
 
     let consumed_after = consumed_edge.iter().filter(|&&c| c).count();
     let is_edge_tool = synthetic_edge_index.is_some() || consumed_after > consumed_before;
+    if !is_edge_tool
+        && matches!(name.as_str(), "agent" | "agent_fanout")
+        && !edge_tool_round.is_empty()
+    {
+        let edge_candidates = edge_tool_round
+            .iter()
+            .enumerate()
+            .map(|(i, edge)| format!("{}:{}", edge.assistant_tool_call_id(i), edge.tool_name()))
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::warn!(
+            target: "astra_runtime::headless_tool_match",
+            tool_name = %name,
+            tool_call_id = %id,
+            edge_round_len = edge_tool_round.len(),
+            edge_candidates = %edge_candidates,
+            "executor-gated tool had edge rows but no matching edge result; falling back to runtime binding"
+        );
+    }
     let early_exit_ms = if is_edge_tool && edge_duration_ms > 0 {
         edge_duration_ms
     } else {
@@ -2352,6 +2372,67 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("headless edge protocol")),
             "journal error should preserve the executor-missing body, got {record:?}"
+        );
+    }
+
+    #[test]
+    fn validate_slot_adopts_agent_fanout_edge_result_by_request_id_when_args_differ() {
+        let mut harness = PipelineHarness::new();
+        let server_args = json!({
+            "action": "start",
+            "target_count": 3,
+            "slots": [{
+                "id": "review",
+                "description": "Review",
+                "prompt": "Review this change."
+            }]
+        });
+        let edge_args = json!({
+            "action": "start",
+            "target_count": 3,
+            "slots": [{
+                "id": "review",
+                "description": "Review",
+                "prompt": "Review this change."
+            }],
+            "title": "Review"
+        });
+        harness.valid_tool_names = HashSet::from(["agent_fanout".to_string()]);
+        harness.tool_calls.push(json!({
+            "id": "call-agent-fanout-1",
+            "function": {
+                "name": "agent_fanout",
+                "arguments": serde_json::to_string(&server_args).unwrap()
+            }
+        }));
+        harness.edge_tool_round = vec![EdgeToolExecResult {
+            request_id: "call-agent-fanout-1".to_string(),
+            tool: "agent_fanout".to_string(),
+            args: edge_args,
+            output: r#"{"completed":3,"group_id":"run-test-fanout-1"}"#.to_string(),
+            tool_result_fields: Some(edge_runtime_environment_fields()),
+            status: "completed".to_string(),
+            duration_ms: 209_858,
+        }];
+
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            HeadlessPipelineStage::ShortCircuit => {
+                panic!("expected fanout edge result to validate, got short-circuit")
+            }
+            HeadlessPipelineStage::AbortRound => {
+                panic!("expected fanout edge result to validate, got abort")
+            }
+        };
+
+        assert_eq!(validated.execution.name, "agent_fanout");
+        assert!(validated.execution.is_edge_tool);
+        assert_eq!(validated.execution.edge_duration_ms, 209_858);
+        assert!(validated.execution.result_str.contains(r#""completed":3"#));
+        assert!(
+            pipeline.ctx.tool_results.is_empty(),
+            "matched edge result must not emit runtime-binding denial"
         );
     }
 

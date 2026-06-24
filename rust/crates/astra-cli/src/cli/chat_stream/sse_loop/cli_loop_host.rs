@@ -945,6 +945,11 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             return ControlToolRecovery::Unsupported;
         }
         let Some(spawn_context) = self.executor.spawn_context.as_ref() else {
+            tracing::warn!(
+                target: "astra_cli::agentic_loop_host",
+                tool_call_id,
+                "agent_fanout recovery skipped: missing spawn context"
+            );
             return ControlToolRecovery::Missing;
         };
         let Some(parent_run_id) = parent_run_id else {

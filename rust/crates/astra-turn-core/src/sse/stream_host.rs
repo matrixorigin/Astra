@@ -91,6 +91,9 @@ impl crate::headless_tool_assembly::EdgeToolRoundRow for EdgeToolExecResult {
             self.request_id.clone()
         }
     }
+    fn has_explicit_assistant_tool_call_id(&self) -> bool {
+        !self.request_id.is_empty()
+    }
 }
 
 /// Result of resolving an approval request via the host.

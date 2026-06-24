@@ -309,6 +309,13 @@ pub trait EdgeToolRoundRow {
     fn assistant_tool_call_id(&self, index: usize) -> String {
         format!("edge-{index}")
     }
+
+    /// True when [`Self::assistant_tool_call_id`] came from a server tool-call
+    /// id or edge executor request id, rather than the synthetic `edge-{index}`
+    /// fallback used for edge-only rounds.
+    fn has_explicit_assistant_tool_call_id(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,6 +323,40 @@ pub struct MatchedEdgeToolOutput {
     pub output: String,
     pub duration_ms: u64,
     pub tool_result_fields: Option<serde_json::Map<String, Value>>,
+}
+
+fn matched_edge_tool_output<T: EdgeToolRoundRow>(row: &T) -> MatchedEdgeToolOutput {
+    MatchedEdgeToolOutput {
+        output: row.tool_output().to_string(),
+        duration_ms: row.tool_duration_ms(),
+        tool_result_fields: row.tool_result_fields().cloned(),
+    }
+}
+
+pub fn take_edge_output_for_tool_call_id_or_signature_with_duration<T: EdgeToolRoundRow>(
+    tool_call_id: &str,
+    name: &str,
+    args: &Value,
+    round: &[T],
+    consumed: &mut [bool],
+    by_sig: &HashMap<String, String>,
+) -> MatchedEdgeToolOutput {
+    if !tool_call_id.is_empty() {
+        for (i, e) in round.iter().enumerate() {
+            if consumed.get(i).copied().unwrap_or(true) {
+                continue;
+            }
+            if e.has_explicit_assistant_tool_call_id()
+                && e.assistant_tool_call_id(i) == tool_call_id
+                && e.tool_name() == name
+            {
+                consumed[i] = true;
+                return matched_edge_tool_output(e);
+            }
+        }
+    }
+
+    take_edge_output_for_tool_call_with_duration(name, args, round, consumed, by_sig)
 }
 
 pub fn take_edge_output_for_tool_call_with_duration<T: EdgeToolRoundRow>(
@@ -332,11 +373,7 @@ pub fn take_edge_output_for_tool_call_with_duration<T: EdgeToolRoundRow>(
         }
         if tool_dedup_signature(e.tool_name(), e.tool_args()) == sig {
             consumed[i] = true;
-            return MatchedEdgeToolOutput {
-                output: e.tool_output().to_string(),
-                duration_ms: e.tool_duration_ms(),
-                tool_result_fields: e.tool_result_fields().cloned(),
-            };
+            return matched_edge_tool_output(e);
         }
     }
     MatchedEdgeToolOutput {
@@ -1114,6 +1151,9 @@ mod tests {
                 self.request_id.clone()
             }
         }
+        fn has_explicit_assistant_tool_call_id(&self) -> bool {
+            !self.request_id.is_empty()
+        }
     }
 
     #[test]
@@ -1127,6 +1167,64 @@ mod tests {
         let msg = openai_assistant_with_tool_calls_message(&[], &edge, "");
         let tc = msg["tool_calls"].as_array().unwrap();
         assert_eq!(tc[0]["id"], "req-abc");
+    }
+
+    #[test]
+    fn take_edge_output_prefers_request_id_when_arguments_differ() {
+        let edge_args = json!({
+            "action": "start",
+            "target_count": 3,
+            "slots": [{"id": "review", "prompt": "review"}],
+            "title": "Review"
+        });
+        let server_args = json!({
+            "action": "start",
+            "target_count": 3,
+            "slots": [{"id": "review", "prompt": "review"}]
+        });
+        let rows = vec![RowWithRequestId {
+            tool: "agent_fanout".into(),
+            args: edge_args,
+            output: r#"{"completed":3}"#.into(),
+            request_id: "call-fanout-1".into(),
+        }];
+        let mut consumed = vec![false];
+
+        let out = take_edge_output_for_tool_call_id_or_signature_with_duration(
+            "call-fanout-1",
+            "agent_fanout",
+            &server_args,
+            &rows,
+            &mut consumed,
+            &HashMap::new(),
+        );
+
+        assert_eq!(out.output, r#"{"completed":3}"#);
+        assert!(consumed[0]);
+    }
+
+    #[test]
+    fn take_edge_output_falls_back_to_signature_when_request_id_differs() {
+        let args = json!({"pattern": "needle"});
+        let rows = vec![RowWithRequestId {
+            tool: "grep".into(),
+            args: args.clone(),
+            output: "matched by args".into(),
+            request_id: "other-call".into(),
+        }];
+        let mut consumed = vec![false];
+
+        let out = take_edge_output_for_tool_call_id_or_signature_with_duration(
+            "call-grep-1",
+            "grep",
+            &args,
+            &rows,
+            &mut consumed,
+            &HashMap::new(),
+        );
+
+        assert_eq!(out.output, "matched by args");
+        assert!(consumed[0]);
     }
 
     #[test]
