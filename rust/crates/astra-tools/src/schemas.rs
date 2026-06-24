@@ -101,10 +101,9 @@ fn enforce_task_schema_unknown_field_contract(schemas: &mut [Value]) {
     }
 }
 
-/// Default `run_script` schema exposed when the caller has not yet wired
-/// session-specific priority/enabled-tool hints. Uses the full sandbox
-/// allowlist + Project mode + neutral priority. Sites that know the session
-/// context (manifest_loader, repl_turn) should call
+/// Default `run_script` schema exposed when the caller has not yet supplied
+/// a session-specific enabled-tool set. Uses the full RPC allowlist in
+/// Project mode. Sites that know the session context should call
 /// `run_script::build_run_script_schema` directly for a tighter schema.
 #[cfg(unix)]
 fn run_script_schema_default() -> Value {
@@ -118,11 +117,7 @@ fn run_script_schema_for(enabled_tool_names: &[&str]) -> Value {
         .iter()
         .map(|s| (*s).to_string())
         .collect();
-    crate::run_script::build_run_script_schema(
-        &enabled,
-        crate::run_script::ExecutionMode::Project,
-        crate::run_script::PriorityHint::Neutral,
-    )
+    crate::run_script::build_run_script_schema(&enabled, crate::run_script::ExecutionMode::Project)
 }
 
 fn all_tool_schemas_core() -> Vec<Value> {
@@ -1335,7 +1330,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_schema_pins_exact_runtime_agent_id_contract() {
+    fn agent_schema_enforces_exact_runtime_agent_id_contract() {
         let schemas = all_tool_schemas();
         let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
         let desc = agent
@@ -1744,7 +1739,7 @@ mod tests {
     }
 
     #[test]
-    fn exit_plan_mode_schema_points_to_task_board_not_legacy_plan_todos() {
+    fn exit_plan_mode_schema_points_to_task_board() {
         let schemas = all_tool_schemas();
         let exit =
             find_schema(&schemas, "exit_plan_mode").expect("exit_plan_mode schema must exist");
@@ -1901,7 +1896,7 @@ mod tests {
         let names = schema_names(&schemas);
         assert!(
             !names.contains(&"execute_code"),
-            "execute_code was removed; legacy references must not leak into the schema list"
+            "removed tool name execute_code must not leak into the schema list"
         );
     }
 
@@ -1910,8 +1905,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_script_visible_by_default_on_unix() {
-        // run_script is the production successor to execute_code and must
-        // be discoverable without any opt-in env var.
         let schemas = all_tool_schemas();
         let names = schema_names(&schemas);
         assert!(
@@ -2021,10 +2014,10 @@ mod tests {
                 "read_file schema should expose `{name}`"
             );
         }
-        for legacy in ["offset", "limit", "length", "count"] {
+        for removed_arg in ["offset", "limit", "length", "count"] {
             assert!(
-                !properties.contains_key(legacy),
-                "read_file schema must not expose legacy/count field `{legacy}`"
+                !properties.contains_key(removed_arg),
+                "read_file schema must not expose removed/count field `{removed_arg}`"
             );
         }
     }

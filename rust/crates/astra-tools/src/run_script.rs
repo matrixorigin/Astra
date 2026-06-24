@@ -41,14 +41,6 @@
 //! isolation should wrap run_script with their own sandbox at the
 //! caller level or use `astra_sandbox::execute_isolated` directly (with
 //! the understanding that it doesn't support the RPC channel).
-//!
-//! ### Differences from legacy `execute_code` (removed)
-//!
-//! - Dynamic schema filtered by session-enabled tools + priority hint.
-//! - Project mode (venv python + session CWD) in addition to strict mode.
-//! - Built-in helpers in the stub: `json_parse`, `shell_quote`, `retry`.
-//! - Full `ToolExecutor` routing so tool_health / dedup / compression apply.
-//! - Response cap, stderr truncation notice, env secret filter, HOME redirect.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -538,30 +530,7 @@ def _call(tool_name, args):
 
 // ─── Dynamic schema builder ───────────────────────────────────────────────
 
-/// Session-level priority signal injected into the `run_script` schema
-/// description. Lets the session state steer the model toward or away
-/// from this tool without changing its availability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PriorityHint {
-    /// No bias. Schema description lists the available tools and built-in
-    /// helpers without additional steering. This is the default.
-    #[default]
-    Neutral,
-    /// Session prefers run_script for multi-step tasks. The schema
-    /// description gains a `**PREFERRED**` marker so the model biases
-    /// toward it for 3+ tool-call pipelines.
-    Preferred,
-    /// Session has found run_script unhelpful / noisy. The schema
-    /// description gains a `**DISCOURAGED**` marker so the model prefers
-    /// individual tool calls.
-    Discouraged,
-}
-
-pub fn build_run_script_schema(
-    enabled_tools: &HashSet<String>,
-    mode: ExecutionMode,
-    priority: PriorityHint,
-) -> Value {
+pub fn build_run_script_schema(enabled_tools: &HashSet<String>, mode: ExecutionMode) -> Value {
     let tool_lines: String = TOOL_DOC_LINES
         .iter()
         .filter(|t| enabled_tools.contains(t.name))
@@ -578,18 +547,6 @@ pub fn build_run_script_schema(
             "Scripts run in an isolated temp directory — use absolute paths or tool calls \
              for file access."
         }
-    };
-
-    let priority_note = match priority {
-        PriorityHint::Preferred => {
-            "\n\n**PREFERRED**: This tool is the preferred approach for multi-step tasks \
-             in this session. Use it when you need 3+ tool calls with processing logic between them."
-        }
-        PriorityHint::Discouraged => {
-            "\n\n**DISCOURAGED**: Prefer individual tool calls unless you specifically need \
-             batch processing with conditional logic."
-        }
-        PriorityHint::Neutral => "",
     };
 
     let import_examples: Vec<&str> = ["read_file", "bash", "web_fetch"]
@@ -652,8 +609,7 @@ pub fn build_run_script_schema(
          Also available (built-in, no import needed):\n  \
          json_parse(text) — json.loads with strict=False\n  \
          shell_quote(s) — shlex.quote() for safe shell interpolation\n  \
-         retry(fn, max_attempts=3, delay=2) — retry with exponential backoff\
-         {priority_note}"
+         retry(fn, max_attempts=3, delay=2) — retry with exponential backoff"
     );
 
     let timeout_desc = format!(
@@ -1306,7 +1262,7 @@ mod tests {
         }
     }
 
-    // ── Config defaults (A3.3: pin secure-by-default choices) ────────────
+    // ── Config defaults (A3.3: assert secure-by-default choices) ─────────
 
     #[test]
     fn default_config_isolates_home_for_security() {
@@ -1388,11 +1344,11 @@ mod tests {
         }
     }
 
-    // S3 (pin): every security-relevant field has a known-safe value.
+    // S3: every security-relevant field has a known-safe value.
     // If a future field is added without a secure default, this test
     // catches the omission.
     #[test]
-    fn strict_defaults_all_security_fields_pinned() {
+    fn strict_defaults_all_security_fields_are_explicit() {
         let cfg = RunScriptConfig::strict_defaults();
         assert_eq!(cfg.mode, ExecutionMode::Strict);
         assert!(cfg.isolate_home);
@@ -1495,7 +1451,7 @@ mod tests {
     // (they aren't valid JSON), so the is_finite check in
     // `parse_timeout_secs` cannot fire via the JSON path. We keep the
     // check as cheap defense for callers who construct Values directly,
-    // and we pin the JSON-level guarantee here.
+    // and assert the JSON-level guarantee here.
     #[test]
     fn resolve_timeout_json_cannot_carry_non_finite_floats() {
         // from_f64 is the only path to a float Number; it returns None for
@@ -1552,13 +1508,6 @@ mod tests {
         assert_eq!(parse_timeout_secs(&serde_json::json!(true)), None);
     }
 
-    // ── PriorityHint rename ──────────────────────────────────────────────
-
-    #[test]
-    fn priority_hint_default_is_neutral() {
-        assert_eq!(PriorityHint::default(), PriorityHint::Neutral);
-    }
-
     // ── Error Display ────────────────────────────────────────────────────
 
     // T54 / R7.3: ScriptFailed's Display output is bounded regardless of
@@ -1610,8 +1559,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let schema =
-            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
+        let schema = build_run_script_schema(&enabled, ExecutionMode::Project);
         let desc = schema["function"]["description"].as_str().unwrap();
         assert!(desc.contains("read_file"));
         assert!(desc.contains("write_file"));
@@ -1624,8 +1572,7 @@ mod tests {
     #[test]
     fn schema_timeout_description_reflects_constants() {
         let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
-        let schema =
-            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
+        let schema = build_run_script_schema(&enabled, ExecutionMode::Project);
         let timeout_desc = schema["function"]["parameters"]["properties"]["timeout"]["description"]
             .as_str()
             .unwrap();
@@ -1652,8 +1599,7 @@ mod tests {
     #[test]
     fn schema_marks_script_required_and_discourages_empty_args() {
         let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
-        let schema =
-            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
+        let schema = build_run_script_schema(&enabled, ExecutionMode::Project);
         assert_eq!(
             schema["function"]["parameters"]["required"],
             serde_json::json!(["script"])
@@ -1672,18 +1618,16 @@ mod tests {
         );
     }
 
-    // T41: extension tools (names NOT in TOOL_DOC_LINES) are silently
-    // skipped rather than causing a panic or malformed schema. Keeps
-    // run_script forward-compatible when callers extend allowed_tools
-    // without updating the module's doc-line table.
+    // T41: extension tools (names NOT in TOOL_DOC_LINES) are skipped
+    // rather than causing a panic, malformed schema, or raw unknown-name
+    // leak into the prompt.
     #[test]
     fn schema_skips_unknown_tool_names_gracefully() {
         let enabled: HashSet<String> = ["read_file", "nonstandard_extension_tool"]
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let schema =
-            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
+        let schema = build_run_script_schema(&enabled, ExecutionMode::Project);
         let desc = schema["function"]["description"].as_str().unwrap();
         // Known tool appears; unknown one is omitted (no panic, no raw name leak).
         assert!(desc.contains("read_file"));
@@ -1703,8 +1647,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let schema =
-            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
+        let schema = build_run_script_schema(&enabled, ExecutionMode::Project);
         let desc = schema["function"]["description"].as_str().unwrap();
         let script_desc = schema["function"]["parameters"]["properties"]["script"]["description"]
             .as_str()
@@ -1725,48 +1668,9 @@ mod tests {
     }
 
     #[test]
-    fn schema_preferred_hint_present() {
+    fn schema_description_has_no_runtime_preference_markers() {
         let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
-        let schema =
-            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Preferred);
-        let desc = schema["function"]["description"].as_str().unwrap();
-        assert!(desc.contains("PREFERRED"));
-        assert!(desc.contains("preferred approach"));
-    }
-
-    #[test]
-    fn schema_discouraged_hint_present() {
-        let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
-        let schema =
-            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Discouraged);
-        let desc = schema["function"]["description"].as_str().unwrap();
-        assert!(desc.contains("DISCOURAGED"));
-        // T48: Discouraged is exclusive of Preferred — no PREFERRED marker leak.
-        assert!(
-            !desc.contains("PREFERRED"),
-            "Discouraged schema must not carry Preferred marker: {desc}"
-        );
-    }
-
-    // T48 (reverse): Preferred is exclusive of Discouraged.
-    #[test]
-    fn schema_preferred_hint_excludes_discouraged_marker() {
-        let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
-        let schema =
-            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Preferred);
-        let desc = schema["function"]["description"].as_str().unwrap();
-        assert!(desc.contains("PREFERRED"));
-        assert!(
-            !desc.contains("DISCOURAGED"),
-            "Preferred schema must not carry Discouraged marker: {desc}"
-        );
-    }
-
-    #[test]
-    fn schema_neutral_has_no_priority_hint() {
-        let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
-        let schema =
-            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
+        let schema = build_run_script_schema(&enabled, ExecutionMode::Project);
         let desc = schema["function"]["description"].as_str().unwrap();
         assert!(!desc.contains("PREFERRED"));
         assert!(!desc.contains("DISCOURAGED"));
@@ -1776,8 +1680,7 @@ mod tests {
     #[test]
     fn schema_empty_enabled_tools_graceful() {
         let enabled: HashSet<String> = HashSet::new();
-        let schema =
-            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
+        let schema = build_run_script_schema(&enabled, ExecutionMode::Project);
         let desc = schema["function"]["description"].as_str().unwrap();
         let script_desc = schema["function"]["parameters"]["properties"]["script"]["description"]
             .as_str()
@@ -1842,7 +1745,7 @@ mod tests {
         assert!(stub.contains(r#""outline": outline"#));
         assert!(
             !stub.contains("offset"),
-            "read_file stub must not advertise or pass legacy offset"
+            "read_file stub must not advertise or pass removed offset args"
         );
     }
 
@@ -1894,8 +1797,7 @@ mod tests {
     #[test]
     fn schema_describes_sync_text_contract() {
         let enabled: HashSet<String> = ["bash"].iter().map(|s| s.to_string()).collect();
-        let schema =
-            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
+        let schema = build_run_script_schema(&enabled, ExecutionMode::Project);
         let desc = schema["function"]["description"].as_str().unwrap();
         let script_desc = schema["function"]["parameters"]["properties"]["script"]["description"]
             .as_str()
@@ -1911,8 +1813,7 @@ mod tests {
     #[test]
     fn schema_describes_current_read_file_args() {
         let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
-        let schema =
-            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
+        let schema = build_run_script_schema(&enabled, ExecutionMode::Project);
         let desc = schema["function"]["description"].as_str().unwrap();
         assert!(
             desc.contains("read_file(path, start_line=None, end_line=None, outline=None)"),
@@ -1920,7 +1821,7 @@ mod tests {
         );
         assert!(
             !desc.contains("read_file(path, offset=None, limit=None)"),
-            "schema must not advertise legacy read_file offset/limit: {desc}"
+            "schema must not advertise removed read_file offset/limit args: {desc}"
         );
     }
 
@@ -2512,11 +2413,11 @@ raise ValueError("boom")
         let script = r#"
 from astra_tools import bash
 
-result = bash("echo compat")
+result = bash("echo ok")
 print(result, end="")
 "#;
         let result = run_script(script, &config, &exec).await.unwrap();
-        assert_eq!(result, "ran: echo compat");
+        assert_eq!(result, "ran: echo ok");
     }
 
     // T32: script that prints only to stderr and exits nonzero — stdout
