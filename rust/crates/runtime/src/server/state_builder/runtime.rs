@@ -89,9 +89,6 @@ pub(super) async fn build_runtime_wiring(
     .with_mcp_registry_service(state.mcp_registry_service.clone())
     .with_agent_binding_service(state.agent_binding_service.clone())
     .with_model_gateway_service(state.model_gateway_service.clone())
-    .with_allow_implicit_request_scoped_mcp(
-        astra_config::runtime_config::RuntimeConfig::cached().allow_implicit_request_scoped_mcp,
-    )
     .with_hook_db_writer(state.turn_persistence.hook_db_writer.clone())
     .with_observer_worker(state.turn_persistence.observer_worker.clone())
     .with_tool_event_writer(state.turn_persistence.tool_event_writer.clone())

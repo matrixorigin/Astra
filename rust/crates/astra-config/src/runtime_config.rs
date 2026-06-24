@@ -24,12 +24,6 @@ pub struct RuntimeConfig {
     #[serde(default = "default_config_version")]
     pub version: String,
 
-    /// Compatibility switch for legacy chat clients that send non-empty
-    /// `runtime_mcp_bindings` without `runtime_profile=request_scoped_runtime_mcp`.
-    /// Defaults to false so request-scoped MCP remains an explicit runtime mode.
-    #[serde(default)]
-    pub allow_implicit_request_scoped_mcp: bool,
-
     /// Compression strategy configuration.
     #[serde(default)]
     pub compression: CompressionConfig,
@@ -312,7 +306,6 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             version: default_config_version(),
-            allow_implicit_request_scoped_mcp: false,
             compression: CompressionConfig::default(),
             memory: MemoryConfig::default(),
             tool_policy: ToolPolicyConfig::default(),
@@ -1795,13 +1788,9 @@ impl RuntimeConfig {
             tool_surface,
             runtime_limits,
             agent_binding_registry,
-            allow_implicit_request_scoped_mcp,
         } = other;
 
         merge_if_non_default(&mut self.version, version, default_config_version());
-        if allow_implicit_request_scoped_mcp {
-            self.allow_implicit_request_scoped_mcp = true;
-        }
 
         let CompressionConfig {
             max_history_tokens,
@@ -2275,9 +2264,6 @@ impl RuntimeConfig {
         {
             self.agent_binding_registry.max_agent_md_bytes = n;
         }
-        if let Ok(val) = std::env::var("ASTRA_ALLOW_IMPLICIT_REQUEST_SCOPED_MCP") {
-            self.allow_implicit_request_scoped_mcp = val == "1" || val.eq_ignore_ascii_case("true");
-        }
         if let Ok(val) = std::env::var("ASTRA_CAPTURE_TRACES")
             && (val == "1" || val.to_lowercase() == "true")
         {
@@ -2454,7 +2440,6 @@ mod tests {
         let config = RuntimeConfig::default();
         // Just verify they exist and serialize
         let toml = config.to_toml().unwrap();
-        assert!(toml.contains("allow_implicit_request_scoped_mcp = false"));
         assert!(toml.contains("[verification]"));
         assert!(toml.contains("[memory_pressure]"));
         assert!(toml.contains("[context_window]"));
@@ -2465,7 +2450,6 @@ mod tests {
     fn test_merge_applies_non_default_fields_across_sections() {
         let merged = RuntimeConfig::default().merge(RuntimeConfig {
             version: "2.0".to_string(),
-            allow_implicit_request_scoped_mcp: true,
             compression: CompressionConfig {
                 max_history_tokens: 12345,
                 compression_threshold: 0.65,
@@ -2566,7 +2550,6 @@ mod tests {
         });
 
         assert_eq!(merged.version, "2.0");
-        assert!(merged.allow_implicit_request_scoped_mcp);
         assert_eq!(merged.compression.max_history_tokens, 12345);
         assert!((merged.compression.compression_threshold - 0.65).abs() < 0.001);
         assert!(!merged.compression.preserve_tool_calls);

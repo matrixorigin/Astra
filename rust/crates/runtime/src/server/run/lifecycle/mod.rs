@@ -1458,9 +1458,6 @@ pub struct AgenticRunLifecycleService {
     agent_binding_service: Arc<dyn astra_services::AgentBindingService>,
     /// Optional model gateway registry for per-turn model resolution.
     model_gateway_service: Arc<dyn astra_services::ModelGatewayService>,
-    /// Compatibility switch for legacy request-scoped MCP clients that omit
-    /// `runtime_profile=request_scoped_runtime_mcp`.
-    allow_implicit_request_scoped_mcp: bool,
     /// Per-run approval request channel receivers (Phase E).
     /// Key: run_id → receiver that the WS handler drains.
     approval_channels: Arc<TokioMutex<HashMap<String, mpsc::Receiver<serde_json::Value>>>>,
@@ -1529,7 +1526,6 @@ impl AgenticRunLifecycleService {
             mcp_registry_service: Arc::new(astra_services::UnconfiguredMcpRegistryService),
             agent_binding_service: Arc::new(astra_services::UnconfiguredAgentBindingService),
             model_gateway_service: Arc::new(astra_services::UnconfiguredModelGatewayService),
-            allow_implicit_request_scoped_mcp: false,
             approval_channels: Arc::new(TokioMutex::new(HashMap::new())),
             user_prompt_channels: Arc::new(TokioMutex::new(HashMap::new())),
             progress_channels: Arc::new(TokioMutex::new(HashMap::new())),
@@ -1653,11 +1649,6 @@ impl AgenticRunLifecycleService {
         service: Arc<dyn astra_services::ModelGatewayService>,
     ) -> Self {
         self.model_gateway_service = service;
-        self
-    }
-
-    pub fn with_allow_implicit_request_scoped_mcp(mut self, allow: bool) -> Self {
-        self.allow_implicit_request_scoped_mcp = allow;
         self
     }
 
@@ -2560,17 +2551,11 @@ impl AgenticRunLifecycleService {
                 Some(RuntimeProfileRequest::RequestScopedRuntimeMcp)
             )
         {
-            if !self.allow_implicit_request_scoped_mcp {
-                return Err(error_response_coded(
-                    StatusCode::BAD_REQUEST,
-                    "runtime_mcp_bindings requires runtime_profile=request_scoped_runtime_mcp",
-                    "agent_binding_runtime_profile_conflict",
-                ));
-            }
-            tracing::warn!(
-                target: "astra_runtime::run_lifecycle",
-                "runtime_mcp_bindings without runtime_profile=request_scoped_runtime_mcp is deprecated; set runtime_profile explicitly"
-            );
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "runtime_mcp_bindings requires runtime_profile=request_scoped_runtime_mcp",
+                "agent_binding_runtime_profile_conflict",
+            ));
         }
         Ok(())
     }
@@ -10337,7 +10322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_request_constraints_rejects_implicit_request_scoped_runtime_mcp_by_default() {
+    async fn validate_request_constraints_rejects_implicit_request_scoped_runtime_mcp() {
         let service = test_service();
         let mut request = test_request("hello");
         request.runtime_mcp_bindings = vec![test_runtime_mcp_binding()];
@@ -10371,19 +10356,6 @@ mod tests {
             .validate_request_constraints("u1", &request)
             .await
             .expect("explicit request_scoped_runtime_mcp profile should allow runtime MCP");
-    }
-
-    #[tokio::test]
-    async fn validate_request_constraints_allows_implicit_request_scoped_runtime_mcp_when_enabled()
-    {
-        let service = test_service().with_allow_implicit_request_scoped_mcp(true);
-        let mut request = test_request("hello");
-        request.runtime_mcp_bindings = vec![test_runtime_mcp_binding()];
-
-        service
-            .validate_request_constraints("u1", &request)
-            .await
-            .expect("compatibility flag should allow implicit request-scoped runtime MCP");
     }
 
     #[tokio::test]

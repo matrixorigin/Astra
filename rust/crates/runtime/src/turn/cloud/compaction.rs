@@ -548,18 +548,6 @@ mod tests {
         json!({"role": "tool", "content": content})
     }
 
-    fn assistant_tool(call_id: &str, name: &str, args: &str) -> Value {
-        json!({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "id": call_id,
-                "type": "function",
-                "function": {"name": name, "arguments": args}
-            }]
-        })
-    }
-
     fn tool_with_id(call_id: &str, content: &str) -> Value {
         json!({
             "role": "tool",
