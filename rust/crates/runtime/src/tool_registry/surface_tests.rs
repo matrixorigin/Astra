@@ -251,7 +251,7 @@ fn deferred_list_contains_every_non_always_load_tool() {
 }
 
 #[test]
-fn deferred_catalog_stays_stable_when_catalog_tools_are_visible() {
+fn deferred_catalog_excludes_catalog_tools_that_are_visible() {
     let cfg = ToolSurfaceConfig::default();
     let visible = std::collections::HashSet::from([
         "enter_plan_mode".to_string(),
@@ -265,19 +265,13 @@ fn deferred_catalog_stays_stable_when_catalog_tools_are_visible() {
         .map(|entry| entry.name.clone())
         .collect();
 
-    // Deferred set is STABLE per session — visible tools MAY also appear
-    // in deferred. The system prompt instructs the model to prefer tools[]
-    // over <deferred_tools>. This test now verifies the deferred set is
-    // non-empty and self-consistent (no duplicates, no always_load tools in deferred).
     assert!(
         !deferred.is_empty(),
         "deferred set should be non-empty even when some tools are visible"
     );
-    let always_load_from_config: std::collections::HashSet<String> =
-        cfg.always_load_tools.iter().cloned().collect();
     assert!(
-        deferred.is_disjoint(&always_load_from_config),
-        "always_load tools must never appear in deferred; always_load={always_load_from_config:?} deferred={deferred:?}"
+        deferred.is_disjoint(&visible),
+        "visible tools must not also appear in deferred; visible={visible:?} deferred={deferred:?}"
     );
 }
 
@@ -423,7 +417,7 @@ fn custom_type_is_rejected_while_missing_type_function_shorthand_can_be_always_l
 }
 
 #[test]
-fn deferred_manifest_exists_when_every_tool_is_visible() {
+fn deferred_manifest_is_absent_when_every_tool_is_visible() {
     let cfg = ToolSurfaceConfig::default();
     let visible: std::collections::HashSet<String> = catalog_schemas()
         .iter()
@@ -437,16 +431,13 @@ fn deferred_manifest_exists_when_every_tool_is_visible() {
         .collect();
     let surface = ToolSurface::build_excluding_visible(catalog_schemas(), &cfg, &[], &visible);
 
-    // Deferred set is STABLE per session — it persists even when every tool
-    // is marked visible. The system prompt's <deferred_tools> block must
-    // remain byte-stable (CacheScope::Session) regardless of tool surface includes.
     assert!(
-        !surface.deferred().is_empty(),
-        "deferred set must persist even when all tools are referenced as visible"
+        surface.deferred().is_empty(),
+        "all visible tools must be removed from deferred"
     );
     assert!(
-        surface.deferred_manifest(Some("gpt-4o")).is_some(),
-        "callers must still get names/activatable state from the persisted deferred manifest"
+        surface.deferred_manifest(Some("gpt-4o")).is_none(),
+        "no deferred prompt block should be rendered when every tool is already visible"
     );
 }
 

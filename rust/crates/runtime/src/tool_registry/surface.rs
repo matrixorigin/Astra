@@ -164,11 +164,10 @@ impl ToolSurface {
     /// Build a deferred manifest from the eligible schema pool after the caller
     /// has already decided the final visible `tools[]` set for this turn.
     ///
-    /// `visible_names` filters only per-turn plugin/MCP schemas. Catalog schemas
-    /// pass through unfiltered so the `<deferred_tools>` block remains stable
-    /// per session. An activated catalog tool may therefore appear in both
-    /// `tools[]` and `<deferred_tools>`; the system prompt instructs the model
-    /// to prefer the visible `tools[]` schema.
+    /// `visible_names` is authoritative for the current request: a tool that
+    /// already appears in `tools[]` must not also be advertised as deferred.
+    /// The deferred manifest is discovery metadata for tools that still require
+    /// explicit activation, not a second copy of the visible surface.
     pub fn build_excluding_visible(
         catalog_schemas: Vec<Value>,
         cfg: &ToolSurfaceConfig,
@@ -180,20 +179,16 @@ impl ToolSurface {
             .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
             .collect();
 
-        // Catalog schemas are NOT filtered by visible_names — the deferred set
-        // must be stable per session (CacheScope::Session). Activated catalog
-        // tools may appear in both tools[] and <deferred_tools>; the system
-        // prompt instructs the model to prefer tools[].
-        //
-        // Plugin/MCP schemas are different: they are per-runtime dynamic
-        // capabilities, and callers may pass a mixed all-schemas pool that
-        // already contains those plugin names. Remove plugin names from the
-        // catalog half first so the visible-name filter below remains
-        // authoritative for dynamic tools.
+        // Callers may pass a mixed all-schemas pool that already contains
+        // plugin/MCP names. Remove plugin names from the catalog half first,
+        // then apply the same visible-name exclusion to both catalog and
+        // dynamic schemas so the deferred manifest is disjoint from tools[].
         let catalog_schemas: Vec<Value> = catalog_schemas
             .into_iter()
             .filter(|schema| {
-                tool_schema_name(schema).is_none_or(|name| !plugin_names.contains(name))
+                tool_schema_name(schema).is_none_or(|name| {
+                    !plugin_names.contains(name) && !visible_names.contains(name)
+                })
             })
             .collect();
 

@@ -903,7 +903,6 @@ mod tests {
     fn sync_session_state_to_workspace_copies_skills_and_adaptive_state() {
         let mut state = SessionState::default();
         state.session_persistence_error = Some("journal append failed".to_string());
-        state.pinned_skills.insert("skill-a".to_string());
         state.discovered_skills.insert("skill-b".to_string());
 
         let obs = std::sync::Arc::new(std::sync::RwLock::new(
@@ -924,7 +923,6 @@ mod tests {
             ws.last_persistence_error.as_deref(),
             Some("journal append failed")
         );
-        assert_eq!(ws.pinned_skills, vec!["skill-a".to_string()]);
         assert_eq!(ws.discovered_skills, vec!["skill-b".to_string()]);
         assert_eq!(ws.last_scenario_change_turn, Some(11));
         assert_eq!(ws.last_token_budget_direction, -1);

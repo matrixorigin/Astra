@@ -440,7 +440,6 @@ fn format_skills_within_budget(
     skills: &[SkillToolInfo],
     budget: usize,
     quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
-    pinned_skills: Option<&std::collections::HashSet<String>>,
 ) -> (Vec<String>, Vec<String>) {
     if skills.is_empty() {
         return (Vec::new(), Vec::new());
@@ -469,8 +468,7 @@ fn format_skills_within_budget(
     let mut bundled_entries = Vec::new();
     let mut rest_skills: Vec<&SkillToolInfo> = Vec::new();
     for (i, s) in skills.iter().enumerate() {
-        let is_pinned = pinned_skills.is_some_and(|p| p.contains(&s.name));
-        if s.source == SkillSourceKind::Bundled || is_pinned {
+        if s.source == SkillSourceKind::Bundled {
             bundled_entries.push(full_entries[i].clone());
         } else {
             rest_skills.push(s);
@@ -4189,7 +4187,7 @@ mod tests {
                 tags: Vec::new(),
             })
             .collect();
-        let (entries, names) = format_skills_within_budget(&skills, 10_000, None, None);
+        let (entries, names) = format_skills_within_budget(&skills, 10_000, None);
         assert_eq!(entries.len(), 5);
         assert_eq!(names.len(), 5);
         // All entries have full descriptions
@@ -4214,7 +4212,7 @@ mod tests {
                 tags: Vec::new(),
             })
             .collect();
-        let (entries, names) = format_skills_within_budget(&skills, 500, None, None);
+        let (entries, names) = format_skills_within_budget(&skills, 500, None);
         assert_eq!(names.len(), 20); // All names still present in enum
         assert_eq!(entries.len(), 20); // All entries present
         // Entries should be shorter than full descriptions
@@ -4247,7 +4245,7 @@ mod tests {
                 tags: Vec::new(),
             });
         }
-        let (entries, names) = format_skills_within_budget(&skills, 800, None, None);
+        let (entries, names) = format_skills_within_budget(&skills, 800, None);
         assert_eq!(names.len(), 23);
         // Bundled entries should have full descriptions
         assert!(entries[0].contains("Important bundled skill 0"));
@@ -4269,7 +4267,7 @@ mod tests {
             })
             .collect();
         // With 100 skills and 200 byte budget, names-only
-        let (entries, names) = format_skills_within_budget(&skills, 200, None, None);
+        let (entries, names) = format_skills_within_budget(&skills, 200, None);
         assert_eq!(names.len(), 100);
         // At least some entries should be names-only (no ":")
         let names_only_count = entries.iter().filter(|e| !e.contains(": ")).count();
@@ -4291,7 +4289,7 @@ mod tests {
             category: None,
             tags: Vec::new(),
         }];
-        let (entries, _) = format_skills_within_budget(&skills, 10_000, None, None);
+        let (entries, _) = format_skills_within_budget(&skills, 10_000, None);
         // Description should be capped at MAX_LISTING_DESC_CHARS
         assert!(
             entries[0].len() < long_desc.len(),
@@ -4318,7 +4316,7 @@ mod tests {
             category: None,
             tags: Vec::new(),
         }];
-        let (entries, _) = format_skills_within_budget(&skills, 10_000, None, None);
+        let (entries, _) = format_skills_within_budget(&skills, 10_000, None);
         // Entry = "- **name**: <desc>" — strip the prefix to measure desc only.
         let desc_only = entries[0]
             .strip_prefix("- **long**: ")
@@ -4378,7 +4376,7 @@ mod tests {
         }
 
         // Under budget pressure, high-quality should come first
-        let (entries, _) = format_skills_within_budget(&skills, 80, Some(&tracker), None);
+        let (entries, _) = format_skills_within_budget(&skills, 80, Some(&tracker));
         // With quality sorting, high-quality should appear before low-quality
         let high_pos = entries
             .iter()
@@ -4392,32 +4390,6 @@ mod tests {
             high_pos < low_pos,
             "high-quality skill should be listed first"
         );
-    }
-
-    #[test]
-    fn pinned_skills_bypass_budget_cutoff() {
-        let skills: Vec<SkillToolInfo> = (0..10)
-            .map(|i| SkillToolInfo {
-                name: format!("skill-{i}"),
-                description: format!("Description for skill {i} which is moderately long"),
-                when_to_use: None,
-                source: SkillSourceKind::Local,
-                aliases: Vec::new(),
-                category: None,
-                tags: Vec::new(),
-            })
-            .collect();
-
-        // Tiny budget — without pinning, many skills would be truncated
-        let pinned: std::collections::HashSet<String> =
-            ["skill-7".to_string()].into_iter().collect();
-
-        let (entries, names) = format_skills_within_budget(&skills, 200, None, Some(&pinned));
-        // All skill names should still be in the enum (names)
-        assert!(names.contains(&"skill-7".to_string()));
-        // The pinned skill should have a full description (not names-only)
-        let pinned_entry = entries.iter().find(|e| e.contains("skill-7")).unwrap();
-        assert!(pinned_entry.contains("Description for skill 7"));
     }
 
     #[test]
@@ -5548,54 +5520,6 @@ mod tests {
             "Expected validation error, got: {}",
             r.output
         );
-    }
-
-    #[test]
-    fn pinned_skill_gets_full_description_even_with_quality_sorting() {
-        use crate::skills::quality::SkillQualityTracker;
-
-        let mut tracker = SkillQualityTracker::new();
-        // Record high-quality outcomes for skill-0 to give it high boost
-        for _ in 0..5 {
-            tracker.record_outcome(&crate::skills::quality::SkillOutcome {
-                skill_name: "skill-0".into(),
-                tokens_used: 100,
-                duration_ms: 50,
-                all_required_passed: true,
-                partial: false,
-            });
-        }
-        // skill-9 (pinned) has no quality data — would normally be low priority
-
-        let skills: Vec<SkillToolInfo> = (0..10)
-            .map(|i| SkillToolInfo {
-                name: format!("skill-{i}"),
-                description: format!("Description for skill {i} which is moderately long text"),
-                when_to_use: None,
-                source: SkillSourceKind::Local,
-                aliases: Vec::new(),
-                category: None,
-                tags: Vec::new(),
-            })
-            .collect();
-
-        let pinned: std::collections::HashSet<String> =
-            ["skill-9".to_string()].into_iter().collect();
-
-        // Very tight budget — forces truncation
-        let (entries, names) =
-            format_skills_within_budget(&skills, 250, Some(&tracker), Some(&pinned));
-
-        // Pinned skill-9 must have full description (treated as bundled)
-        let pinned_entry = entries.iter().find(|e| e.contains("skill-9")).unwrap();
-        assert!(
-            pinned_entry.contains("Description for skill 9"),
-            "Pinned skill should have full description, got: {pinned_entry}"
-        );
-
-        // All names still in enum
-        assert!(names.contains(&"skill-9".to_string()));
-        assert!(names.contains(&"skill-0".to_string()));
     }
 
     // ─── Pipeline execution tests ────────────────────────────────────────────

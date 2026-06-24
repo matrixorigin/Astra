@@ -451,7 +451,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "query": {
                             "type": "string",
-                            "description": "Search query (TF-IDF over commit messages). Used by: log_search (required)."
+                            "description": "Commit-message search query. Used by: log_search (required)."
                         },
                         "since": {
                             "type": "string",
@@ -937,11 +937,9 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "function": {
                 "name": "tool_search",
                 "description":
-                    "Search deferred tools. Use keyword queries to find matches, or \
-                     `query=\"select:NAME\"` / `select:NAME1,NAME2` to queue selected tools \
-                     for the next request's tools[] and return compact callable shape. Use \
-                     `detail:NAME` only when full description/parameter prose is needed. Then \
-                     invoke the chosen tool directly.",
+                    "Search deferred tools. Keywords list candidates. `select:NAME[,NAME]` \
+                     returns compact callable shape and queues schemas for the next request. \
+                     `detail:NAME` expands full docs only when needed.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2136,7 +2134,7 @@ mod tests {
 
         assert!(
             desc.contains("Do not use aliases"),
-            "str_replace description should steer models away from legacy alias fields: {desc}"
+            "str_replace description should steer models away from retired alias fields: {desc}"
         );
         assert_eq!(
             params.get("additionalProperties").and_then(Value::as_bool),

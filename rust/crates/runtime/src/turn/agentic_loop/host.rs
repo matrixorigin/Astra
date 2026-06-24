@@ -478,8 +478,6 @@ pub struct SkillState {
     pub quality_tracker: crate::skills::quality::SkillQualityTracker,
     /// Skill auto-improvement tracker — detects user corrections and proposes SKILL.md rewrites.
     pub improvement_tracker: astra_skills::improvement::ImprovementTracker,
-    /// Skills pinned by the user — always included in budget (never truncated).
-    pub pinned: std::collections::HashSet<String>,
     /// Canonical skill names surfaced via `discover_skills` this session.
     pub discovered: HashSet<String>,
     /// Scoring thresholds for deterministic pre-turn skill auto-routing.
@@ -516,7 +514,6 @@ impl Default for SkillState {
             sandbox_policy: None,
             quality_tracker: Default::default(),
             improvement_tracker: Default::default(),
-            pinned: HashSet::new(),
             discovered: HashSet::new(),
             auto_routing: Default::default(),
             search: Default::default(),

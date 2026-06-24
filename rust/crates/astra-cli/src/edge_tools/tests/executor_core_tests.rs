@@ -180,6 +180,33 @@ async fn execute_with_metadata_bash_non_zero_exit_is_structured_failure() {
 }
 
 #[tokio::test]
+async fn execute_with_metadata_bash_non_zero_exit_preserves_structured_failure() {
+    let executor = test_executor();
+    let outcome = executor
+        .execute_with_metadata("bash", &json!({"command": "exit 7"}))
+        .await;
+
+    assert!(outcome.is_error, "{outcome:?}");
+    let fields = outcome.tool_result_fields.expect("metadata fields");
+    assert_eq!(
+        fields.get("exit_code").and_then(serde_json::Value::as_i64),
+        Some(7)
+    );
+    assert_eq!(
+        fields
+            .get("exit_semantics")
+            .and_then(serde_json::Value::as_str),
+        Some("execution_error")
+    );
+    assert_eq!(
+        fields
+            .get("result_class")
+            .and_then(serde_json::Value::as_str),
+        Some("execution_error")
+    );
+}
+
+#[tokio::test]
 async fn execute_with_metadata_bash_domain_negative_is_structured_non_error() {
     let executor = test_executor();
     let outcome = executor

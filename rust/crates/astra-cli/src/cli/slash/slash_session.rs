@@ -4827,7 +4827,6 @@ mod export_tests {
 struct PreparedWorkspaceRestore {
     workspace: Option<session_workspace::WorkspaceMetadata>,
     session_persistence_error: Option<String>,
-    pinned_skills: std::collections::HashSet<String>,
     discovered_skills: std::collections::HashSet<String>,
     pending_adaptive_state: Option<session_state::PersistedAdaptiveState>,
 }
@@ -4849,7 +4848,6 @@ fn prepared_workspace_restore_from_workspace(
     });
     PreparedWorkspaceRestore {
         session_persistence_error: ws.last_persistence_error.clone(),
-        pinned_skills: ws.pinned_skills.iter().cloned().collect(),
         discovered_skills: ws.discovered_skills.iter().cloned().collect(),
         pending_adaptive_state,
         workspace: Some(ws),
@@ -4898,7 +4896,6 @@ fn load_prepared_workspace_restore(
 
 fn apply_prepared_workspace_restore(state: &mut SessionState, prepared: &PreparedWorkspaceRestore) {
     state.session_persistence_error = prepared.session_persistence_error.clone();
-    state.pinned_skills = prepared.pinned_skills.clone();
     state.discovered_skills = prepared.discovered_skills.clone();
     state.pending_adaptive_state = prepared.pending_adaptive_state.clone();
     session_startup::apply_pending_adaptive_state(state);
@@ -6870,7 +6867,7 @@ mod resume_tests {
             session_id: Some("existing-session".into()),
             turn: 7,
             history: vec![("old".into(), "state".into())],
-            pinned_skills: ["keep-me".to_string()].into_iter().collect(),
+            discovered_skills: ["stale-skill".to_string()].into_iter().collect(),
             ..Default::default()
         };
 
@@ -6880,10 +6877,7 @@ mod resume_tests {
 
         assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
         assert_eq!(state.turn, 2);
-        assert!(
-            !state.pinned_skills.contains("keep-me"),
-            "resume must not leak live-session workspace state into the restored session"
-        );
+        assert!(state.discovered_skills.is_empty());
         let warning = state
             .session_persistence_error
             .as_deref()
@@ -7719,7 +7713,6 @@ mod resume_tests {
         write_local_resumable_session(&session_id, 2);
 
         let mut ws = session_workspace::read_workspace(&session_id).unwrap();
-        ws.pinned_skills = vec!["rust-review".to_string()];
         ws.discovered_skills = vec!["session-recovery".to_string()];
         ws.last_scenario_change_turn = Some(2);
         ws.last_token_budget_direction = 1;
@@ -7730,7 +7723,6 @@ mod resume_tests {
         let mut state = SessionState {
             session_id: Some("current-session".into()),
             history: vec![("old".into(), "state".into())],
-            pinned_skills: ["stale".to_string()].into_iter().collect(),
             discovered_skills: ["obsolete".to_string()].into_iter().collect(),
             ..Default::default()
         };
@@ -7759,7 +7751,6 @@ mod resume_tests {
             state.history,
             vec![("continue".to_string(), "restored".to_string())]
         );
-        assert!(state.pinned_skills.contains("rust-review"));
         assert!(state.discovered_skills.contains("session-recovery"));
         assert_eq!(
             state.session_persistence_error.as_deref(),
@@ -7806,7 +7797,6 @@ mod resume_tests {
         workspace.total_cache_read_tokens = 22;
         workspace.total_cache_creation_tokens = 7;
         workspace.status = "active".to_string();
-        workspace.pinned_skills = vec!["rust-review".to_string()];
         workspace.discovered_skills = vec!["cloud-recovery".to_string()];
         workspace.last_scenario_change_turn = Some(3);
         workspace.last_token_budget_direction = 1;
@@ -7856,10 +7846,6 @@ mod resume_tests {
         assert_eq!(state.total_cache_read_tokens, 22);
         assert_eq!(state.total_cache_creation_tokens, 7);
         assert_eq!(
-            state.pinned_skills,
-            ["rust-review".to_string()].into_iter().collect()
-        );
-        assert_eq!(
             state.discovered_skills,
             ["cloud-recovery".to_string()].into_iter().collect()
         );
@@ -7877,7 +7863,6 @@ mod resume_tests {
         assert_eq!(persisted.git_head.as_deref(), Some("abc1234"));
         assert_eq!(persisted.turn_count, 3);
         assert_eq!(persisted.total_cache_read_tokens, 22);
-        assert_eq!(persisted.pinned_skills, vec!["rust-review".to_string()]);
         assert_eq!(
             persisted.discovered_skills,
             vec!["cloud-recovery".to_string()]

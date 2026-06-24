@@ -4541,6 +4541,12 @@ impl ToolExecutor {
             return denied.into_outcome();
         }
         self.consume_activated_deferred_tool_if_called(name);
+        if name == "bash" {
+            let mut outcome = self.bash_outcome_with_cancel(args, None);
+            outcome.output = self.finalize_tool_output(outcome.output, name);
+            self.record_output_size(outcome.output.len());
+            return outcome;
+        }
         if name == "mo_query" {
             let mut outcome = self.mo_query_with_metadata(args);
             let output = self.finalize_tool_output(outcome.output, name);

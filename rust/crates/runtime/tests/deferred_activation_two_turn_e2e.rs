@@ -71,16 +71,16 @@ fn turn_n_tool_search_select_returns_callable_shape_for_deferred_tool() {
 fn turn_n_plus_1_validator_admits_github_only_after_schema_is_injected() {
     // Turn N+1 before surface assembly consumes the selection: github is still
     // absent from tools[], so execution stays rejected.
-    let pinned_visible = vec![
+    let base_visible = vec![
         json!({"type": "function", "function": {"name": "bash"}}),
         json!({"type": "function", "function": {"name": "read_file"}}),
         json!({"type": "function", "function": {"name": "tool_search"}}),
     ];
-    let admitted = admissible_tool_names_from_visible(&pinned_visible);
+    let admitted = admissible_tool_names_from_visible(&base_visible);
     assert!(!admitted.contains("github"));
 
     let schemas = all_tool_schemas();
-    let mut visible_after_activation = pinned_visible;
+    let mut visible_after_activation = base_visible;
     visible_after_activation.push(pick_schema(&schemas, "github").unwrap());
     let admitted = admissible_tool_names_from_visible(&visible_after_activation);
     assert!(
@@ -110,15 +110,15 @@ fn two_turn_flow_composes_end_to_end() {
     let activated = activated_tool_names_from_tool_search_output(&t1);
     assert_eq!(activated, vec!["web_fetch".to_string()]);
 
-    // Turn N+1 before injection: `tools[]` has pinned only, NOT web_fetch.
-    let pinned_visible = vec![
+    // Turn N+1 before injection: `tools[]` has the baseline visible tools only, NOT web_fetch.
+    let base_visible = vec![
         pick_schema(&schemas, "bash").unwrap(),
         pick_schema(&schemas, "read_file").unwrap(),
     ];
-    let admitted = admissible_tool_names_from_visible(&pinned_visible);
+    let admitted = admissible_tool_names_from_visible(&base_visible);
     assert!(!admitted.contains("web_fetch"));
 
-    let mut injected_visible = pinned_visible.clone();
+    let mut injected_visible = base_visible.clone();
     for name in &activated {
         injected_visible.push(pick_schema(&schemas, name).unwrap());
     }
@@ -128,7 +128,7 @@ fn two_turn_flow_composes_end_to_end() {
         "turn N+1: web_fetch must be admissible after its schema is injected"
     );
 
-    let followup_without_schema = admissible_tool_names_from_visible(&pinned_visible);
+    let followup_without_schema = admissible_tool_names_from_visible(&base_visible);
     assert!(
         !followup_without_schema.contains("web_fetch"),
         "activation metadata must not make web_fetch executable unless its schema is visible"

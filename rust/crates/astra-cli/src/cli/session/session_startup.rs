@@ -30,7 +30,6 @@ pub(crate) struct SessionStartupArtifacts {
     pub pipeline_modules: PipelineModules,
     pub edge_heartbeat_task: Option<tokio::task::JoinHandle<()>>,
     pub skill_quality_path: std::path::PathBuf,
-    pub pinned_skills_path: std::path::PathBuf,
     pub shutdown_signal_rx: tokio::sync::watch::Receiver<Option<session_guard::ShutdownSignal>>,
 }
 
@@ -710,17 +709,6 @@ pub(crate) async fn complete_session_startup(
     state.skill_quality_tracker =
         astra_skills::quality::SkillQualityTracker::load(&skill_quality_path);
 
-    // Load pinned skills from previous sessions
-    let pinned_skills_path = dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("astra")
-        .join("pinned_skills.json");
-    if let Ok(data) = std::fs::read_to_string(&pinned_skills_path) {
-        match serde_json::from_str::<std::collections::HashSet<String>>(&data) {
-            Ok(set) => state.pinned_skills = set,
-            Err(e) => eprintln!("⚠ Failed to parse pinned_skills.json: {e}"),
-        }
-    }
     tracer.phase("config_load");
 
     // Session-scoped confidence calibrator: thresholds adapt to correction rates
@@ -825,7 +813,6 @@ pub(crate) async fn complete_session_startup(
         pipeline_modules,
         edge_heartbeat_task,
         skill_quality_path,
-        pinned_skills_path,
         shutdown_signal_rx,
     })
 }

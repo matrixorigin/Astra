@@ -349,8 +349,6 @@ pub(crate) struct SessionState {
     pub skill_search: astra_core::SkillSearchSettings,
     /// Skill auto-improvement tracker — detects user corrections and proposes SKILL.md rewrites.
     pub skill_improvement_tracker: astra_skills::improvement::ImprovementTracker,
-    /// Skills pinned by the user — always included in budget (never truncated).
-    pub pinned_skills: std::collections::HashSet<String>,
     /// Skills surfaced by `discover_skills` during this CLI session.
     pub discovered_skills: std::collections::HashSet<String>,
     pub mcp_manager: std::sync::Arc<tokio::sync::RwLock<mcp_client::McpClientManager>>,
@@ -653,7 +651,6 @@ impl Default for SessionState {
             skill_quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
             skill_search: astra_core::SkillSearchSettings::default(),
             skill_improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
-            pinned_skills: std::collections::HashSet::new(),
             discovered_skills: std::collections::HashSet::new(),
             mcp_manager: std::sync::Arc::new(tokio::sync::RwLock::new(
                 mcp_client::McpClientManager::new(),
@@ -860,7 +857,6 @@ impl SessionState {
     pub fn reset_for_session_restore(&mut self) {
         self.reset_for_new_session();
         self.clear_session_id();
-        self.pinned_skills.clear();
         self.discovered_skills.clear();
     }
 
@@ -1158,7 +1154,6 @@ mod default_tests {
             session_id: Some("sess-restore".into()),
             history: vec![("u".into(), "a".into())],
             recent_tools: vec!["bash".into()],
-            pinned_skills: ["skill-a".to_string()].into_iter().collect(),
             discovered_skills: ["skill-b".to_string()].into_iter().collect(),
             executing_plan_id: Some("plan-1".into()),
             plan_execution_last_error: Some("stale".into()),
@@ -1175,7 +1170,6 @@ mod default_tests {
         assert!(state.session_id.is_none());
         assert!(state.history.is_empty());
         assert!(state.recent_tools.is_empty());
-        assert!(state.pinned_skills.is_empty());
         assert!(state.discovered_skills.is_empty());
         assert!(state.executing_plan_id.is_none());
         assert!(state.plan_execution_last_error.is_none());

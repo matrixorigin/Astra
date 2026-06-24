@@ -550,7 +550,7 @@ pub enum PriorityHint {
     /// Session prefers run_script for multi-step tasks. The schema
     /// description gains a `**PREFERRED**` marker so the model biases
     /// toward it for 3+ tool-call pipelines.
-    Pinned,
+    Preferred,
     /// Session has found run_script unhelpful / noisy. The schema
     /// description gains a `**DEPRIORITIZED**` marker so the model
     /// prefers individual tool calls.
@@ -581,8 +581,8 @@ pub fn build_run_script_schema(
     };
 
     let priority_note = match priority {
-        PriorityHint::Pinned => {
-            "\n\n**PREFERRED**: This tool is pinned as the preferred approach for multi-step tasks \
+        PriorityHint::Preferred => {
+            "\n\n**PREFERRED**: This tool is the preferred approach for multi-step tasks \
              in this session. Use it when you need 3+ tool calls with processing logic between them."
         }
         PriorityHint::Deprioritized => {
@@ -1725,13 +1725,13 @@ mod tests {
     }
 
     #[test]
-    fn schema_pinned_hint_present() {
+    fn schema_preferred_hint_present() {
         let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
         let schema =
-            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Pinned);
+            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Preferred);
         let desc = schema["function"]["description"].as_str().unwrap();
         assert!(desc.contains("PREFERRED"));
-        assert!(desc.contains("pinned"));
+        assert!(desc.contains("preferred approach"));
     }
 
     #[test]
@@ -1744,24 +1744,24 @@ mod tests {
         );
         let desc = schema["function"]["description"].as_str().unwrap();
         assert!(desc.contains("DEPRIORITIZED"));
-        // T48: Deprioritized is exclusive of Pinned — no PREFERRED marker leak.
+        // T48: Deprioritized is exclusive of Preferred — no PREFERRED marker leak.
         assert!(
             !desc.contains("PREFERRED"),
-            "Deprioritized schema must not carry Pinned marker: {desc}"
+            "Deprioritized schema must not carry Preferred marker: {desc}"
         );
     }
 
-    // T48 (reverse): Pinned is exclusive of Deprioritized.
+    // T48 (reverse): Preferred is exclusive of Deprioritized.
     #[test]
-    fn schema_pinned_hint_excludes_deprioritized_marker() {
+    fn schema_preferred_hint_excludes_deprioritized_marker() {
         let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
         let schema =
-            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Pinned);
+            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Preferred);
         let desc = schema["function"]["description"].as_str().unwrap();
         assert!(desc.contains("PREFERRED"));
         assert!(
             !desc.contains("DEPRIORITIZED"),
-            "Pinned schema must not carry Deprioritized marker: {desc}"
+            "Preferred schema must not carry Deprioritized marker: {desc}"
         );
     }
 

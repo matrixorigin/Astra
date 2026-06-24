@@ -350,9 +350,6 @@ pub struct WorkspaceMetadata {
     pub last_persistence_error: Option<String>,
 
     // ─── Session state persistence (for resume) ───
-    /// Skills explicitly pinned by the user.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pinned_skills: Vec<String>,
     /// Skills discovered during this session.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discovered_skills: Vec<String>,
@@ -491,7 +488,6 @@ impl WorkspaceMetadata {
             background_shell_tasks: Vec::new(),
             background_local_agent_tasks: Vec::new(),
             last_persistence_error: None,
-            pinned_skills: Vec::new(),
             discovered_skills: Vec::new(),
             prioritized_tools: Vec::new(),
             deprioritized_tools: Vec::new(),
@@ -544,7 +540,6 @@ impl WorkspaceMetadata {
             background_shell_tasks: Vec::new(),
             background_local_agent_tasks: Vec::new(),
             last_persistence_error: None,
-            pinned_skills: Vec::new(),
             discovered_skills: Vec::new(),
             prioritized_tools: Vec::new(),
             deprioritized_tools: Vec::new(),

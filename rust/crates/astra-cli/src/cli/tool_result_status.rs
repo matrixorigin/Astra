@@ -1,4 +1,6 @@
 use crate::cli::theme;
+use astra_tools::tool_result_status::ToolResultStatusKind;
+
 pub(crate) fn tool_result_status_is_skipped(status: &str) -> bool {
     let normalized = status.trim().to_lowercase();
     normalized.as_str() == "skipped"
@@ -9,12 +11,12 @@ pub(crate) fn tool_result_status_is_failure(status: &str) -> bool {
     if tool_result_status_is_skipped(status) {
         return false;
     }
-    let kind = astra_tools::tool_result_status::tool_result_status_kind(status);
+    let kind = ToolResultStatusKind::from_status_str(status);
     kind.is_failure()
 }
 
 pub(crate) fn tool_result_status_is_success(status: &str) -> bool {
-    let kind = astra_tools::tool_result_status::tool_result_status_kind(status);
+    let kind = ToolResultStatusKind::from_status_str(status);
     kind.is_success()
 }
 

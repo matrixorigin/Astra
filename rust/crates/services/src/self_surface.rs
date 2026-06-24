@@ -1706,7 +1706,7 @@ fn merged_deprioritized_tools(artifacts: &SessionArtifacts) -> Vec<String> {
 fn merged_skills(workspace: Option<&WorkspaceMetadata>) -> Vec<String> {
     let mut skills = BTreeSet::new();
     if let Some(ws) = workspace {
-        for skill in ws.pinned_skills.iter().chain(ws.discovered_skills.iter()) {
+        for skill in &ws.discovered_skills {
             skills.insert(skill.clone());
         }
     }

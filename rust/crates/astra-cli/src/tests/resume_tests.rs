@@ -250,7 +250,6 @@ async fn initialize_session_state_marks_workspace_session_as_pending_recovery() 
     ws.turn_count = 1;
     ws.total_tokens_in = 5;
     ws.total_tokens_out = 3;
-    ws.pinned_skills = vec!["session-lifecycle".into(), "goal-driven-evolution".into()];
     ws.discovered_skills = vec!["episodic-memory".into(), "knowledge-graph-reasoning".into()];
     astra_services::session_workspace::write_workspace(&ws).unwrap();
 

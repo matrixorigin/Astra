@@ -844,17 +844,6 @@ pub(crate) fn parse_bash_timeout_secs_for(args: &Value, command: &str) -> f64 {
     default_bash_timeout_for(command).clamp(BASH_TIMEOUT_MIN_SECS, BASH_TIMEOUT_MAX_SECS)
 }
 
-/// Backwards-compatible wrapper: when the caller doesn't have the command
-/// string handy (e.g. tests constructed from only `args`), falls back to
-/// [`DEFAULT_BASH_TIMEOUT_SECS`] on the classifier-unknown path.
-#[cfg(test)]
-pub(crate) fn parse_bash_timeout_secs(args: &Value) -> f64 {
-    args.get("timeout")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS)
-        .clamp(BASH_TIMEOUT_MIN_SECS, BASH_TIMEOUT_MAX_SECS)
-}
-
 /// Execute a bash command with bounded partial-output capture.
 pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     let workspace_root = ctx.workspace_root.as_path();
@@ -5565,10 +5554,12 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[test]
-    fn bash_default_timeout_is_120s() {
-        // Regression guard: missing `timeout` falls back to 120s.
-        let args = serde_json::json!({"command": "echo hi"});
-        assert_eq!(parse_bash_timeout_secs(&args), DEFAULT_BASH_TIMEOUT_SECS);
+    fn bash_unknown_command_default_timeout_is_120s() {
+        let args = serde_json::json!({"command": "custom-runner"});
+        assert_eq!(
+            parse_bash_timeout_secs_for(&args, "custom-runner"),
+            DEFAULT_BASH_TIMEOUT_SECS
+        );
         assert_eq!(DEFAULT_BASH_TIMEOUT_SECS, 120.0);
     }
 
@@ -5577,11 +5568,14 @@ printf 'probe.txt:1:needle\n'
         // Regression guard: high timeouts (e.g. 500s) pass through to the
         // subprocess without being clamped down to the old 120s limit.
         let args = serde_json::json!({"command": "echo ok", "timeout": 500});
-        assert_eq!(parse_bash_timeout_secs(&args), 500.0);
+        assert_eq!(parse_bash_timeout_secs_for(&args, "echo ok"), 500.0);
 
         // Above the cap is clamped.
         let args_big = serde_json::json!({"command": "echo ok", "timeout": 10_000});
-        assert_eq!(parse_bash_timeout_secs(&args_big), BASH_TIMEOUT_MAX_SECS);
+        assert_eq!(
+            parse_bash_timeout_secs_for(&args_big, "echo ok"),
+            BASH_TIMEOUT_MAX_SECS
+        );
         assert_eq!(BASH_TIMEOUT_MAX_SECS, 600.0);
     }
 

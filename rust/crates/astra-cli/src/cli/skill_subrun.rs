@@ -1305,12 +1305,12 @@ mod tests {
         assert!(executor.inherited_permissions.is_background);
     }
 
-    // ── Phase-R10 adversarial contract pins (CLI-side constants) ────────
+    // ── Phase-R10 adversarial contract guards (CLI-side constants) ───────
     //
-    // These pin the exact values of [`SUBRUN_MAX_TURNS`] and
+    // These assert the exact values of [`SUBRUN_MAX_TURNS`] and
     // [`SUBRUN_MAX_CUMULATIVE_TOKENS`] so silent drift (e.g. a typo
     // bumping 25→35 or 120_000→12_000) breaks this test loudly.
-    // The server-side equivalents are pinned in
+    // The server-side equivalents are covered in
     // `rust/crates/astra-cli/tests/phase_r10_skill_subrun_contracts.rs`
     // via the now-`pub` constants in
     // [`astra_runtime::server::server_skill_subrun`].

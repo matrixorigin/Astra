@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-/// Tool result outcome — intentionally coarse. Detail lives in output text.
+/// Tool result outcome — intentionally coarse. Detail lives in structured
+/// metadata or the tool result body.
 ///
 /// Aligned with [`ToolResultStatus`](astra_turn_core::tool_result_semantics::ToolResultStatus):
 /// - `Completed` ↔ `Completed`
@@ -49,26 +50,9 @@ impl ToolResultStatusKind {
     }
 }
 
-// ── Deprecated free functions (preserved for existing callers) ─────────────────
-
-pub fn tool_result_status_kind(status: &str) -> ToolResultStatusKind {
-    ToolResultStatusKind::from_status_str(status)
-}
-
-pub fn tool_result_status_is_success(status: &str) -> bool {
-    ToolResultStatusKind::from_status_str(status).is_success()
-}
-
-pub fn tool_result_status_is_failure(status: &str) -> bool {
-    ToolResultStatusKind::from_status_str(status).is_failure()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        ToolResultStatusKind, tool_result_status_is_failure, tool_result_status_is_success,
-        tool_result_status_kind,
-    };
+    use super::ToolResultStatusKind;
 
     #[test]
     fn from_status_str_accepts_canonical_statuses_and_success_aliases() {
@@ -138,27 +122,6 @@ mod tests {
             ToolResultStatusKind::from_status_str("PERMISSION_DENIED"),
             ToolResultStatusKind::Failed
         );
-    }
-
-    // Regression: free functions still work (but with new semantics)
-    #[test]
-    fn free_functions_share_parser_semantics() {
-        // "completed" and "skipped" work as expected
-        assert!(tool_result_status_is_success("completed"));
-        assert!(!tool_result_status_is_success("err"));
-        assert!(tool_result_status_is_failure("err"));
-        assert!(!tool_result_status_is_failure("completed"));
-        assert_eq!(
-            tool_result_status_kind("completed"),
-            ToolResultStatusKind::Completed
-        );
-        assert!(tool_result_status_is_success("ok"));
-        assert!(tool_result_status_is_success("success"));
-        assert!(tool_result_status_is_success("done"));
-        assert!(!tool_result_status_is_failure("ok"));
-        // "skipped" is neither success nor failure
-        assert!(!tool_result_status_is_success("skipped"));
-        assert!(!tool_result_status_is_failure("skipped"));
     }
 
     #[test]
