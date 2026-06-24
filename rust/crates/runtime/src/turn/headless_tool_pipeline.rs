@@ -2294,19 +2294,14 @@ mod tests {
     #[tokio::test]
     async fn no_matching_edge_execution_is_failed_tool_binding_without_rollback_class() {
         let mut harness = PipelineHarness::new();
-        harness.valid_tool_names.insert("agent_fanout".to_string());
+        harness.valid_tool_names.insert("github".to_string());
         harness.tool_calls.push(json!({
-            "id": "call-agent-fanout-0",
+            "id": "call-github-0",
             "function": {
-                "name": "agent_fanout",
+                "name": "github",
                 "arguments": serde_json::to_string(&json!({
-                    "action": "start",
-                    "target_count": 1,
-                    "slots": [{
-                        "id": "review",
-                        "description": "Review",
-                        "prompt": "Review this change."
-                    }]
+                    "action": "search",
+                    "query": "astra"
                 })).unwrap()
             }
         }));
@@ -2338,7 +2333,7 @@ mod tests {
         );
         assert!(
             !astra_turn_core::tool_result_semantics::tool_error_triggers_rollback(
-                "agent_fanout",
+                "github",
                 &executed.execution.result_str,
             ),
             "no executor means no tool implementation ran, so rollback is wrong"
@@ -2358,6 +2353,82 @@ mod tests {
                 .is_some_and(|error| error.contains("headless edge protocol")),
             "journal error should preserve the executor-missing body, got {record:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_executor_gated_tool_without_binding_short_circuits() {
+        let cases = [
+            (
+                "agent",
+                json!({
+                    "action": "spawn",
+                    "prompt": "Review this change.",
+                    "description": "Review"
+                }),
+            ),
+            (
+                "agent_fanout",
+                json!({
+                    "action": "start",
+                    "target_count": 1,
+                    "slots": [{
+                        "id": "review",
+                        "description": "Review",
+                        "prompt": "Review this change."
+                    }]
+                }),
+            ),
+        ];
+
+        for (tool_name, args) in cases {
+            let mut harness = PipelineHarness::new();
+            // Simulate stale resume or cached tool-surface state that
+            // incorrectly carried an executor-gated tool into the validator
+            // allow-set.
+            harness.valid_tool_names.insert(tool_name.to_string());
+            harness.tool_calls.push(json!({
+                "id": format!("call-{tool_name}-0"),
+                "function": {
+                    "name": tool_name,
+                    "arguments": serde_json::to_string(&args).unwrap()
+                }
+            }));
+            begin_recorded_turn(&mut harness, 1);
+            let mut pipeline = harness.pipeline();
+
+            assert!(matches!(
+                pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)),
+                HeadlessPipelineStage::ShortCircuit
+            ));
+            let body = pipeline
+                .ctx
+                .tool_results
+                .last()
+                .and_then(|tr| tr.get("result"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                body.contains("multi-agent runtime is not connected"),
+                "executor-gated stale call should name the missing runtime for {tool_name}: {body}"
+            );
+            assert!(
+                !body.contains("headless edge protocol"),
+                "stale executor-gated calls must be denied before no-matching-edge fallback for {tool_name}: {body}"
+            );
+            let record = pipeline
+                .ctx
+                .tool_call_records
+                .last()
+                .expect("blocked runtime call should be journaled");
+            assert!(!record.ok);
+            assert!(
+                record
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("multi-agent runtime is not connected")),
+                "journal should preserve runtime-binding denial for {tool_name}, got {record:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2743,6 +2814,16 @@ mod tests {
             "id": "call-agent-1",
             "function": { "name": "agent", "arguments": serde_json::to_string(&args).unwrap() }
         }));
+        harness.edge_tool_round = vec![EdgeToolExecResult {
+            request_id: "call-agent-1".to_string(),
+            tool: "agent".to_string(),
+            args: args.clone(),
+            output: r#"{"status":"still_running","agent_id":"general-purpose_demo@123"}"#
+                .to_string(),
+            tool_result_fields: Some(edge_runtime_environment_fields()),
+            status: "completed".to_string(),
+            duration_ms: 4,
+        }];
         let sig = astra_turn_core::tool_result_semantics::tool_dedup_signature("agent", &args);
         let now_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -18,6 +18,22 @@ pub fn tool_name_requires_runtime_binding(name: &str) -> bool {
     })
 }
 
+/// Whether a tool needs an executor handle rather than only a service/plugin
+/// binding.
+///
+/// MCP names also require runtime binding, but their binding comes from the
+/// MCP manager/plugin transport and may be granted out-of-band by validator
+/// extras. Executor-gated tools need a concrete executor path in the current
+/// turn; if neither a matched edge result nor a server executor exists, the
+/// call is not executable.
+pub fn tool_name_requires_executor_binding(name: &str) -> bool {
+    crate::tool::registry::meta::tool_meta(name).is_some_and(|meta| {
+        meta.requires
+            .iter()
+            .any(|capability| capability.is_executor_gated())
+    })
+}
+
 /// User-facing explanation for a tool call whose backing runtime is absent.
 ///
 /// This intentionally names the real recovery path. `tool_search` can only
@@ -82,6 +98,14 @@ mod tests {
         assert!(tool_name_requires_runtime_binding("mcp__weather"));
         assert!(!tool_name_requires_runtime_binding("github"));
         assert!(!tool_name_requires_runtime_binding("definitely_unknown"));
+    }
+
+    #[test]
+    fn executor_binding_requirement_is_distinct_from_mcp_binding() {
+        assert!(tool_name_requires_executor_binding("agent_fanout"));
+        assert!(tool_name_requires_executor_binding("agent"));
+        assert!(!tool_name_requires_executor_binding("mcp__weather"));
+        assert!(!tool_name_requires_executor_binding("github"));
     }
 
     #[test]

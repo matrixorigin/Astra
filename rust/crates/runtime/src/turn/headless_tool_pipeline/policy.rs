@@ -89,6 +89,41 @@ fn validator_denial_body(
     }
 }
 
+fn runtime_binding_denial_for_unmatched_execution(
+    execution: &HeadlessResolvedExecution,
+    server_tool_executor: Option<&crate::server::server_tool_executor::ServerToolExecutor>,
+) -> Option<String> {
+    if execution.is_edge_tool {
+        return None;
+    }
+    let requires_executor_binding =
+        astra_turn_core::tool::runtime_binding::tool_name_requires_executor_binding(
+            &execution.name,
+        );
+    if !requires_executor_binding {
+        return None;
+    }
+    let action = execution.args.get("action").and_then(Value::as_str);
+    if astra_turn_core::tool::registry::meta::tool_allows_validation_without_runtime_binding(
+        &execution.name,
+        action,
+    ) {
+        return None;
+    }
+    let has_runtime_binding =
+        server_tool_executor.is_some_and(|executor| executor.has_runtime_binding(&execution.name));
+    if has_runtime_binding {
+        return None;
+    }
+    Some(format!(
+        "Error: {}",
+        astra_turn_core::tool::runtime_binding::runtime_binding_denial_message(
+            &execution.name,
+            action,
+        )
+    ))
+}
+
 fn trace_short_circuit_tool_skip(
     step_recorder: &mut astra_pipeline::step_recorder::StepRecorder,
     tool_id: &str,
@@ -542,6 +577,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     .server_tool_executor
                     .is_some_and(|exec| exec.has_runtime_binding(name))
             };
+            let action = execution.args.get("action").and_then(Value::as_str);
             let (err_msg, skip_reason) = match classify_direct_deferred_call(
                 &execution.name,
                 is_activatable_deferred,
@@ -559,7 +595,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 DirectDeferredCallAdmission::NotAdmitted => (
                     astra_turn_core::tool::runtime_binding::runtime_binding_denial_message(
                         &execution.name,
-                        execution.args.get("action").and_then(Value::as_str),
+                        action,
                     ),
                     "tool_not_admitted",
                 ),
@@ -572,12 +608,12 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                             )
                         } else {
                             (
-                                    astra_turn_core::tool::runtime_binding::runtime_binding_denial_message(
-                                        &execution.name,
-                                        execution.args.get("action").and_then(Value::as_str),
-                                    ),
-                                    "tool_not_admitted",
-                                )
+                                astra_turn_core::tool::runtime_binding::runtime_binding_denial_message(
+                                    &execution.name,
+                                    action,
+                                ),
+                                "tool_not_admitted",
+                            )
                         }
                     } else {
                         (
@@ -634,6 +670,41 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             // protocol issues, not runtime failures. Do not persist them into
             // ToolHealth/deprioritized state; otherwise removed or deferred
             // tools keep resurfacing as "failed repeatedly" context.
+            return HeadlessPipelineStage::ShortCircuit;
+        }
+
+        if let Some(err_msg) = runtime_binding_denial_for_unmatched_execution(
+            &execution,
+            self.ctx.server_tool_executor,
+        ) {
+            if !self.ctx.quiet {
+                self.ctx.term.emit_line(
+                    HeadlessStderrStyle::Red,
+                    headless_stderr_unknown_tool_header(&execution.name),
+                );
+                self.ctx.term.emit_line(
+                    HeadlessStderrStyle::Dim,
+                    headless_stderr_unknown_tool_detail(&err_msg),
+                );
+            }
+            emit_blocked_tool_result(
+                HeadlessBlockedTool {
+                    id: &execution.id,
+                    name: &execution.name,
+                    args: &execution.args,
+                    reason_code: "runtime_binding_unavailable",
+                    err_msg: err_msg.clone(),
+                    journal_reason: err_msg,
+                    early_exit_ms: execution.early_exit_ms,
+                    status_line: None,
+                },
+                self.ctx.step_recorder,
+                self.ctx.quiet,
+                self.ctx.term,
+                self.ctx.messages,
+                self.ctx.tool_results,
+                self.ctx.tool_call_records,
+            );
             return HeadlessPipelineStage::ShortCircuit;
         }
 
