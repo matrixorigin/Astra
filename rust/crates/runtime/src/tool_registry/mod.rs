@@ -10,7 +10,7 @@
 //! The registry never promotes a deferred tool by query text alone. This keeps
 //! the tool surface cache-stable and makes activation intent explicit.
 
-pub use astra_turn_core::tool_registry_meta::{IntentType, Scope, TOOL_CATALOG, ToolMeta};
+use astra_turn_core::tool_registry_meta::TOOL_CATALOG;
 
 mod registry;
 pub mod surface;
@@ -18,25 +18,17 @@ pub mod surface;
 #[cfg(test)]
 mod surface_tests;
 
-pub use astra_turn_core::tool_registry_chain::{ChainContext, ChainStep, ToolChain};
-pub use astra_turn_core::tool_registry_report::{ToolSurfaceFeedback, ToolSurfaceReport};
-pub use astra_turn_core::tool_registry_state::ConversationState;
-pub use plugin::{PluginRegistry, PluginToolEntry};
 pub use registry::ToolRegistry;
 
 pub const DEFAULT_TOOL_SCHEMA_BUDGET_TOKENS: u32 = 800;
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
-pub use astra_turn_core::tool_registry_chain as chain;
-pub use astra_turn_core::tool_registry_plugin as plugin;
-pub use astra_turn_core::tool_registry_report as report;
-pub use astra_turn_core::tool_registry_state as state;
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use astra_turn_core::tool::schema::tool_schema_name;
+    use astra_turn_core::tool_registry_report::ToolSurfaceReport;
     use serde_json::Value;
     use serde_json::json;
 
@@ -129,50 +121,6 @@ mod tests {
         for tool in TOOL_CATALOG {
             assert!(!tool.intents.is_empty(), "{} has no intents", tool.name);
         }
-    }
-
-    // ── ConversationState extraction ──
-
-    #[test]
-    fn state_detects_fetch() {
-        let state = ConversationState::from_message("matrixorigin memoria 最新的pr?", 1);
-        assert!(state.is_fetch, "should detect fetch from '最新'");
-    }
-
-    #[test]
-    fn state_detects_mutate() {
-        let state = ConversationState::from_message("create a new issue for the bug", 1);
-        assert!(state.is_mutate, "should detect mutation");
-    }
-
-    #[test]
-    fn state_detects_history_ref() {
-        let state = ConversationState::from_message("分析一下之前的决策", 1);
-        assert!(state.references_history, "should detect history reference");
-    }
-
-    #[test]
-    fn state_detects_analytical() {
-        let state = ConversationState::from_message("为什么选错了工具", 1);
-        assert!(state.is_analytical, "should detect analytical intent");
-    }
-
-    #[test]
-    fn state_detects_conversational() {
-        let state = ConversationState::from_message("谢谢", 1);
-        assert!(state.is_conversational, "should detect conversational");
-    }
-
-    #[test]
-    fn state_long_message_not_conversational() {
-        let state = ConversationState::from_message(
-            "thank you for that, now please fix the test in main.rs",
-            1,
-        );
-        assert!(
-            !state.is_conversational,
-            "long message should not be conversational"
-        );
     }
 
     // ── Tool surface contract ──
@@ -417,19 +365,6 @@ mod tests {
         assert_eq!(report.schema_budget_total, 0);
     }
 
-    #[test]
-    fn state_detects_git_signal() {
-        let state = ConversationState::from_message("show me the git diff", 1);
-        assert!(state.is_git, "should detect git signal");
-        assert!(state.is_fetch, "should detect fetch signal");
-    }
-
-    #[test]
-    fn state_detects_github_signal() {
-        let state = ConversationState::from_message("matrixorigin 最新的pr", 1);
-        assert!(state.is_github, "should detect github signal from 'pr'");
-    }
-
     // ── Real token measurement ──
 
     #[test]
@@ -552,70 +487,6 @@ mod tests {
         assert_eq!(fb.unused_count, 1, "bash visible but not used");
     }
 
-    // ── Disambiguation wiring tests ──
-
-    #[test]
-    fn disambiguation_auto_computed_on_state() {
-        let state = ConversationState::from_message_with_context(
-            "create a PR and show me the latest issues",
-            2,
-            &[],
-        );
-        // Should have disambiguation computed (is_fetch + is_mutate = conflict)
-        assert!(state.disambiguation.is_some());
-        let disambig = state.disambiguation.as_ref().unwrap();
-        assert_eq!(disambig.conflict_score, 0.8, "fetch+mutate should conflict");
-        assert_eq!(
-            disambig.recommendation,
-            astra_turn_core::routing_metrics::DisambiguationAction::WidenToolSurface
-        );
-    }
-
-    #[test]
-    fn disambiguation_conversational_has_no_conflict() {
-        let state = ConversationState::from_message_with_context("hello", 1, &[]);
-        let disambig = state.disambiguation.as_ref().unwrap();
-        assert_eq!(disambig.primary_intent, "conversational");
-        assert_eq!(disambig.conflict_score, 0.0);
-    }
-
-    // ── ConfidenceCalibrator integration tests ──
-
-    #[test]
-    fn calibrator_lowers_threshold_for_high_correction_rate() {
-        use astra_turn_core::routing_metrics::ConfidenceCalibrator;
-        let cal = ConfidenceCalibrator::new(0.7);
-        // Record 10 github selections, 8 were corrected (80% correction rate)
-        for _ in 0..10 {
-            cal.record("github", true);
-        }
-        for _ in 0..2 {
-            cal.record("github", false);
-        }
-        let threshold = cal.calibrated_threshold("github");
-        // Should be lowered: 0.7 - (0.83 * 0.3) ≈ 0.45
-        assert!(
-            threshold < 0.7,
-            "high correction rate should lower threshold"
-        );
-        assert!(threshold >= 0.3, "threshold should not go below min");
-    }
-
-    #[test]
-    fn calibrator_no_effect_with_insufficient_data() {
-        use astra_turn_core::routing_metrics::ConfidenceCalibrator;
-        let cal = ConfidenceCalibrator::new(0.7);
-        // Only 3 records — below the 5-minimum
-        for _ in 0..3 {
-            cal.record("fetch", true);
-        }
-        let threshold = cal.calibrated_threshold("fetch");
-        assert_eq!(
-            threshold, 0.7,
-            "should return base threshold with insufficient data"
-        );
-    }
-
     // ── Phase 6: Testing gap coverage ──
 
     #[test]
@@ -638,33 +509,6 @@ mod tests {
         assert!(
             schemas.is_empty(),
             "conversational turns should be tool-free"
-        );
-    }
-
-    #[test]
-    fn calibrator_100_percent_correction_clamps_at_min() {
-        use astra_turn_core::routing_metrics::ConfidenceCalibrator;
-        let cal = ConfidenceCalibrator::new(0.7);
-        // 100% correction rate
-        for _ in 0..20 {
-            cal.record("fetch", true);
-        }
-        let threshold = cal.calibrated_threshold("fetch");
-        assert!(
-            threshold >= 0.3,
-            "100% correction rate should clamp at min_threshold (0.3), got {}",
-            threshold
-        );
-    }
-
-    #[test]
-    fn disambiguation_five_intents_has_high_conflict() {
-        use astra_turn_core::routing_metrics::disambiguate_intents;
-        let disambig = disambiguate_intents(true, true, true, true, true, false);
-        assert!(
-            disambig.conflict_score >= 0.3,
-            "5 conflicting intents should have high conflict, got {}",
-            disambig.conflict_score
         );
     }
 

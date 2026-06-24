@@ -4518,12 +4518,13 @@ impl ToolExecutor {
                     let action = args.get("action").and_then(Value::as_str).unwrap_or("");
                     match action {
                         "run_chain" => {
-                            match serde_json::from_value::<astra_runtime::tool_registry::ToolChain>(
-                                args.clone(),
-                            ) {
+                            match serde_json::from_value::<
+                                astra_turn_core::tool_registry_chain::ToolChain,
+                            >(args.clone())
+                            {
                                 Ok(chain) => {
                                     let known: Vec<&str> =
-                                        astra_runtime::tool_registry::TOOL_CATALOG
+                                        astra_turn_core::tool_registry_meta::TOOL_CATALOG
                                             .iter()
                                             .map(|t| t.name)
                                             .collect();
@@ -4831,7 +4832,7 @@ impl ToolExecutor {
     /// Execution stops on the first error unless the step has a skip condition.
     pub fn execute_chain(
         &self,
-        chain: &astra_runtime::tool_registry::ToolChain,
+        chain: &astra_turn_core::tool_registry_chain::ToolChain,
         input: Value,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + '_>> {
         use astra_turn_core::tool_registry_chain::{ChainContext, resolve_args};

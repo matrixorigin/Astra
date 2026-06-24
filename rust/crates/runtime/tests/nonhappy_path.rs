@@ -300,7 +300,7 @@ mod turn_guard_integration {
 //    with different arguments (legitimate multi-file edits)
 
 mod multi_file_edit_regression {
-    use astra_runtime::tool_registry::ToolSurfaceReport;
+    use astra_turn_core::tool_registry_report::ToolSurfaceReport;
     use astra_turn_core::tool_schema_prune::retain_invoked_tool_schemas;
     use astra_turn_core::turn_guard::{TurnGuard, VerdictSeverity};
     use serde_json::{Value, json};
@@ -522,7 +522,7 @@ mod multi_file_edit_regression {
 // ── Input Guard Integration ─────────────────────────────────────────────────
 
 mod input_guards {
-    use astra_runtime::tool_registry::state::ConversationState;
+    use astra_turn_core::tool_registry_state::ConversationState;
 
     #[test]
     fn empty_query_is_conversational() {

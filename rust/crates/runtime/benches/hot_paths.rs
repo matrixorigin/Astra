@@ -8,7 +8,7 @@ use serde_json::json;
 use astra_runtime::bridge::sse_events::{find_sse_frame_end, parse_sse_json_frame};
 use astra_runtime::prompts::{estimate_str_tokens, estimate_tokens};
 use astra_runtime::text_tokenize::{build_tf, tokenize};
-use astra_runtime::tool_registry::ConversationState;
+use astra_turn_core::tool_registry_state::ConversationState;
 
 // ── Tool Surface: always-load build (hot path, every turn) ──────
 

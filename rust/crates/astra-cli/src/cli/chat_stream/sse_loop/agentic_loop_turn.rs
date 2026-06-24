@@ -42,6 +42,7 @@ use astra_runtime::{
     turn::turn_guard::TurnGuard,
 };
 use astra_turn_core::tool::schema::tool_schema_name;
+use astra_turn_core::tool_registry_report::ToolSurfaceReport;
 use crossterm::style::Stylize;
 use serde_json::{Value, json};
 
@@ -175,7 +176,7 @@ fn retained_turn_role_priority(role: &str) -> u8 {
 /// First-turn / cross-turn counters updated while building the payload.
 pub(crate) struct PrepareTurnTelemetry<'a> {
     pub first_memoria_ms: &'a mut Option<u64>,
-    pub first_surface_report: &'a mut Option<tool_registry::ToolSurfaceReport>,
+    pub first_surface_report: &'a mut Option<ToolSurfaceReport>,
     pub first_budget_pressure: &'a mut f64,
     pub first_context_assembly_ms: &'a mut Option<u64>,
     pub all_selected_skills: &'a mut Vec<String>,
@@ -197,7 +198,7 @@ struct PrepareChatTurnRequest<'a> {
     recent_tools: &'a [String],
     executor: Arc<ToolExecutor>,
 
-    registry: &'a tool_registry::ToolRegistry,
+    registry: &'a ToolRegistry,
     tool_results: &'a [Value],
     all_schemas: &'a [Value],
     valid_tool_names: &'a mut HashSet<String>,
@@ -269,12 +270,12 @@ fn surface_report_from_visible_schemas(
     schemas: &[Value],
     schema_budget_used: u32,
     schema_budget_total: u32,
-) -> tool_registry::ToolSurfaceReport {
+) -> ToolSurfaceReport {
     let visible_tools: Vec<String> = schemas
         .iter()
         .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
         .collect();
-    tool_registry::ToolSurfaceReport {
+    ToolSurfaceReport {
         visible_count: visible_tools.len() as u32,
         visible_tools,
         schema_budget_used,
@@ -285,7 +286,7 @@ fn surface_report_from_visible_schemas(
 fn runtime_filter_turn_schemas_and_report(
     executor: &crate::edge_tools::ToolExecutor,
     turn_schemas: &mut Vec<Value>,
-    surface_report: &mut tool_registry::ToolSurfaceReport,
+    surface_report: &mut ToolSurfaceReport,
 ) -> bool {
     let had_tools_before =
         !turn_schemas.is_empty() || surface_report_has_visible_tools(surface_report);
@@ -299,7 +300,7 @@ fn runtime_filter_turn_schemas_and_report(
     had_tools_before
 }
 
-fn surface_report_has_visible_tools(report: &tool_registry::ToolSurfaceReport) -> bool {
+fn surface_report_has_visible_tools(report: &ToolSurfaceReport) -> bool {
     !report.visible_tools.is_empty() || report.visible_count > 0
 }
 
@@ -308,7 +309,7 @@ fn surface_report_has_visible_tools(report: &tool_registry::ToolSurfaceReport) -
 /// observability only — never branched on by downstream code.
 fn tool_surface_should_inject(
     turn_schemas: &[Value],
-    surface_report: &tool_registry::ToolSurfaceReport,
+    surface_report: &ToolSurfaceReport,
     had_tools_before_runtime_filter: bool,
     has_recent_tools: bool,
     has_tool_results: bool,
@@ -1022,8 +1023,8 @@ fn inject_bridge_turn_identity(
     }
 }
 
-// `load_skill_instructions_text` removed — skill activation now goes through
-// the `skill` tool in the agentic loop, not through proactive payload injection.
+// Skill activation goes through the `skill` tool in the agentic loop, not
+// hidden payload injection.
 
 // ─── Fetch: payload → POST → consume_turn_sse ─────────────────────────────────
 
@@ -1634,8 +1635,10 @@ mod tests {
     // prompt-cache-friendly.
 
     /// Helper: empty report with the given schema_budget_total.
-    fn empty_report(schema_budget_total: u32) -> astra_runtime::tool_registry::ToolSurfaceReport {
-        astra_runtime::tool_registry::ToolSurfaceReport {
+    fn empty_report(
+        schema_budget_total: u32,
+    ) -> astra_turn_core::tool_registry_report::ToolSurfaceReport {
+        astra_turn_core::tool_registry_report::ToolSurfaceReport {
             visible_tools: Vec::new(),
             visible_count: 0,
             schema_budget_used: 0,
@@ -1706,7 +1709,7 @@ mod tests {
         };
         struct PriorityCase {
             schemas: Vec<Value>,
-            report: astra_runtime::tool_registry::ToolSurfaceReport,
+            report: astra_turn_core::tool_registry_report::ToolSurfaceReport,
             had_tools_before_runtime_filter: bool,
             recent_tool_context: bool,
             tool_results_followup: bool,
@@ -1797,7 +1800,7 @@ mod tests {
     #[test]
     fn tool_surface_decision_edge_cases() {
         // visible_count > 0 with empty vecs
-        let count_only = astra_runtime::tool_registry::ToolSurfaceReport {
+        let count_only = astra_turn_core::tool_registry_report::ToolSurfaceReport {
             visible_count: 3,
             schema_budget_total: 100,
             ..empty_report(100)
@@ -1824,7 +1827,7 @@ mod tests {
 
     #[test]
     fn skill_allowed_tools_injected_into_selection() {
-        use astra_runtime::tool_registry::ToolSurfaceReport;
+        use astra_turn_core::tool_registry_report::ToolSurfaceReport;
         use astra_turn_core::tool_schema_prune::inject_skill_allowed_tools;
 
         let all_schemas = [

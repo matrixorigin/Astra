@@ -800,10 +800,10 @@ fn resolve_subrun_schemas(
 
 fn empty_surface_report_for_schemas(
     schemas: &[Value],
-) -> astra_runtime::tool_registry::ToolSurfaceReport {
+) -> astra_turn_core::tool_registry_report::ToolSurfaceReport {
     let mut visible_tools: Vec<String> = tool_names_from_schemas(schemas).into_iter().collect();
     visible_tools.sort();
-    astra_runtime::tool_registry::ToolSurfaceReport {
+    astra_turn_core::tool_registry_report::ToolSurfaceReport {
         visible_count: visible_tools.len() as u32,
         visible_tools,
         schema_budget_used: 0,

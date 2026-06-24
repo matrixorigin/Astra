@@ -112,10 +112,11 @@ fn every_catalog_tool_has_schema() {
 
     // Validate the allowlist itself: every entry must exist in TOOL_CATALOG
     // and must NOT have a static schema (otherwise remove it from the list).
-    let catalog_names: std::collections::HashSet<&str> = astra_runtime::tool_registry::TOOL_CATALOG
-        .iter()
-        .map(|t| t.name)
-        .collect();
+    let catalog_names: std::collections::HashSet<&str> =
+        astra_turn_core::tool_registry_meta::TOOL_CATALOG
+            .iter()
+            .map(|t| t.name)
+            .collect();
     for &dyn_tool in DYNAMIC_SCHEMA_TOOLS {
         assert!(
             catalog_names.contains(dyn_tool),
@@ -128,7 +129,7 @@ fn every_catalog_tool_has_schema() {
             dyn_tool
         );
     }
-    for tool in astra_runtime::tool_registry::TOOL_CATALOG {
+    for tool in astra_turn_core::tool_registry_meta::TOOL_CATALOG {
         if DYNAMIC_SCHEMA_TOOLS.contains(&tool.name) {
             continue;
         }

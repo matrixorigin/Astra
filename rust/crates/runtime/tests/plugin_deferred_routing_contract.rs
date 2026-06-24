@@ -2,7 +2,7 @@
 //!
 //! Pre-phase-5 state:
 //!   - `ToolRegistry::register_plugins` made plugin schemas lookupable and
-//!     also fed them into the selector's proactive candidate set.
+//!     also fed them into the query-shaped visible surface.
 //!   - Result: the moment a plugin registers, the Anthropic prompt-cache
 //!     prefix breaks; every subsequent `tools[]` also includes the plugin.
 //!   - Intended contract: MCP tools default to a deferred listing;
@@ -12,16 +12,16 @@
 //!   1. Plugin schemas are still **looked up** by name (so the executor
 //!      can dispatch, and `tool_search(select:NAME)` can return the
 //!      schema).
-//!   2. Plugin names are **NOT** proactively selected — they stay out of
+//!   2. Plugin names are **NOT** query-promoted — they stay out of
 //!      `tools[]` unless the caller builds a visible surface with the plugin
 //!      explicitly always_load.
 //!   3. Registering a plugin leaves the always_load `tools[]` bytes stable.
 
 use astra_config::ToolSurfaceConfig;
+use astra_runtime::tool_registry::ToolRegistry;
 use astra_runtime::tool_registry::surface::ToolSurface;
-use astra_runtime::tool_registry::{PluginRegistry, ToolRegistry};
 use astra_turn_core::tool_registry_meta::{IntentType, Scope, TOOL_CATALOG};
-use astra_turn_core::tool_registry_plugin::PluginToolEntry;
+use astra_turn_core::tool_registry_plugin::{PluginRegistry, PluginToolEntry};
 use serde_json::{Value, json};
 
 fn catalog_schemas() -> Vec<Value> {

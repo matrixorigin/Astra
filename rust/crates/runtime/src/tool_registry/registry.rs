@@ -386,7 +386,10 @@ impl ToolRegistry {
     /// This keeps the Anthropic prompt-cache prefix byte-stable across
     /// plugin registration: schemas are added to lookup/execution indexes,
     /// but the selected `tools[]` surface remains always_load-only.
-    pub fn register_plugins(&mut self, plugins: &super::plugin::PluginRegistry) {
+    pub fn register_plugins(
+        &mut self,
+        plugins: &astra_turn_core::tool_registry_plugin::PluginRegistry,
+    ) {
         let plugin_schemas = plugins.schemas();
         if plugin_schemas.is_empty() {
             return;

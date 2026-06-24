@@ -1,10 +1,10 @@
-use astra_runtime::tool_registry::ToolChain;
 use astra_turn_core::cloud_approval_policy::{
     CloudGatedToolKind, bash_command_is_read_only, cloud_gated_tool_kind_with_args,
 };
 use astra_turn_core::stall::{
     SERVER_STALL_WINDOW, detect_server_stall, record_server_tool_signatures,
 };
+use astra_turn_core::tool_registry_chain::ToolChain;
 use serde_json::{Value, json};
 
 pub(crate) const MAX_RUN_CHAIN_STEPS: usize = 16;
@@ -111,7 +111,7 @@ fn is_mutating_tool(name: &str, args: Option<&Value>) -> bool {
 mod tests {
     use super::{MAX_RUN_CHAIN_MUTATING_STEPS, ToolSafetyGuard};
     use crate::cli::permission_manager::{GateOutcome, PermissionManager};
-    use astra_runtime::tool_registry::ToolChain;
+    use astra_turn_core::tool_registry_chain::ToolChain;
     use serde_json::json;
 
     #[test]

@@ -5,7 +5,7 @@ use serde_json::json;
 
 #[tokio::test]
 async fn chain_write_read_roundtrip() {
-    use astra_runtime::tool_registry::ToolChain;
+    use astra_turn_core::tool_registry_chain::ToolChain;
 
     let dir = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(dir.path());
@@ -45,7 +45,7 @@ async fn chain_write_read_roundtrip() {
 
 #[tokio::test]
 async fn chain_stops_on_error() {
-    use astra_runtime::tool_registry::ToolChain;
+    use astra_turn_core::tool_registry_chain::ToolChain;
 
     let dir = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(dir.path());
@@ -74,7 +74,7 @@ async fn chain_stops_on_error() {
 
 #[tokio::test]
 async fn chain_rollback_on_failure_reverts_bounded_file_edits() {
-    use astra_runtime::tool_registry::ToolChain;
+    use astra_turn_core::tool_registry_chain::ToolChain;
 
     let dir = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(dir.path());
@@ -106,7 +106,7 @@ async fn chain_rollback_on_failure_reverts_bounded_file_edits() {
 
 #[tokio::test]
 async fn chain_without_rollback_on_failure_keeps_prior_edits() {
-    use astra_runtime::tool_registry::ToolChain;
+    use astra_turn_core::tool_registry_chain::ToolChain;
 
     let dir = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(dir.path());
@@ -131,7 +131,7 @@ async fn chain_without_rollback_on_failure_keeps_prior_edits() {
 
 #[tokio::test]
 async fn chain_rollback_on_failure_blocks_mutating_bash_before_execution() {
-    use astra_runtime::tool_registry::ToolChain;
+    use astra_turn_core::tool_registry_chain::ToolChain;
 
     let dir = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(dir.path());
@@ -164,7 +164,7 @@ async fn chain_rollback_on_failure_blocks_mutating_bash_before_execution() {
 
 #[tokio::test]
 async fn chain_rollback_on_failure_allows_read_only_bash_step() {
-    use astra_runtime::tool_registry::ToolChain;
+    use astra_turn_core::tool_registry_chain::ToolChain;
 
     let dir = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(dir.path());
@@ -188,7 +188,7 @@ async fn chain_rollback_on_failure_allows_read_only_bash_step() {
 
 #[tokio::test]
 async fn chain_variable_substitution_end_to_end() {
-    use astra_runtime::tool_registry::ToolChain;
+    use astra_turn_core::tool_registry_chain::ToolChain;
 
     let dir = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(dir.path());
@@ -230,8 +230,8 @@ async fn chain_variable_substitution_end_to_end() {
 
 #[tokio::test]
 async fn chain_skip_condition_end_to_end() {
-    use astra_runtime::tool_registry::ToolChain;
     use astra_turn_core::tool_registry_chain::ChainStep;
+    use astra_turn_core::tool_registry_chain::ToolChain;
 
     let dir = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(dir.path());
@@ -384,7 +384,7 @@ async fn run_chain_blocks_repeated_identical_steps() {
 
 #[tokio::test]
 async fn execute_chain_blocks_mutating_burst() {
-    use astra_runtime::tool_registry::ToolChain;
+    use astra_turn_core::tool_registry_chain::ToolChain;
 
     let executor = test_executor();
     let mut chain = ToolChain::new("writes", "writes");

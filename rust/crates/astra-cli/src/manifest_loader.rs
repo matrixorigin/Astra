@@ -31,8 +31,8 @@
 //! ```
 
 use crate::cli::theme;
-use astra_runtime::tool_registry::plugin::{PluginRegistry, PluginToolEntry};
-use astra_runtime::tool_registry::{IntentType, Scope};
+use astra_turn_core::tool_registry_meta::{IntentType, Scope};
+use astra_turn_core::tool_registry_plugin::{PluginRegistry, PluginToolEntry};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;

@@ -142,7 +142,8 @@ pub(crate) fn explicit_file_tool_path_targets(
 }
 
 fn agent_run_chain_explicit_path_targets(args: &Value) -> Vec<ExplicitPathPreflightTarget> {
-    let Ok(chain) = serde_json::from_value::<astra_runtime::tool_registry::ToolChain>(args.clone())
+    let Ok(chain) =
+        serde_json::from_value::<astra_turn_core::tool_registry_chain::ToolChain>(args.clone())
     else {
         return Vec::new();
     };
