@@ -2451,17 +2451,6 @@ impl AgenticRunLifecycleService {
                 "selected_model_invalid",
             ));
         }
-        if request
-            .mcp_binding_ids
-            .as_deref()
-            .is_some_and(|ids| !ids.is_empty())
-        {
-            return Err(error_response(
-                StatusCode::BAD_REQUEST,
-                "mcp_binding_ids is no longer supported on /chat/stream; use runtime_mcp_bindings"
-                    .to_string(),
-            ));
-        }
         let request_constraints = Self::try_request_constraints(request)
             .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
         if request.agent_binding.is_none() {
@@ -2511,17 +2500,6 @@ impl AgenticRunLifecycleService {
                 return Err(error_response_coded(
                     StatusCode::BAD_REQUEST,
                     "agent_binding cannot be combined with runtime_mcp_bindings",
-                    "agent_binding_runtime_profile_conflict",
-                ));
-            }
-            if request
-                .mcp_binding_ids
-                .as_deref()
-                .is_some_and(|ids| !ids.is_empty())
-            {
-                return Err(error_response_coded(
-                    StatusCode::BAD_REQUEST,
-                    "agent_binding cannot be combined with mcp_binding_ids",
                     "agent_binding_runtime_profile_conflict",
                 ));
             }
@@ -9043,7 +9021,6 @@ mod tests {
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
-            mcp_binding_ids: None,
             context: None,
             edge_executor_id: None,
             capabilities: Vec::new(),
@@ -10185,26 +10162,6 @@ mod tests {
         assert_eq!(workspace.cwd.as_deref(), Some("/tmp/child-workspace"));
         assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
         assert!(snapshot.runtime.is_none());
-    }
-
-    #[tokio::test]
-    async fn validate_request_constraints_rejects_legacy_mcp_binding_ids() {
-        let service = test_service();
-        let mut request = test_request("hello");
-        request.mcp_binding_ids = Some(vec![301]);
-
-        let err = service
-            .validate_request_constraints("u1", &request)
-            .await
-            .expect_err("legacy mcp_binding_ids must be rejected on chat stream");
-
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert!(
-            err.1
-                .0
-                .detail
-                .contains("mcp_binding_ids is no longer supported")
-        );
     }
 
     #[test]
@@ -11731,7 +11688,6 @@ mod tests {
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
-            mcp_binding_ids: None,
             context: Some(ctx),
             edge_executor_id: None,
             capabilities: Vec::new(),
@@ -11891,7 +11847,6 @@ mod tests {
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
-            mcp_binding_ids: None,
             context: Some(ctx),
             edge_executor_id: None,
             capabilities: Vec::new(),

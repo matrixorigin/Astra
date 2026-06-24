@@ -414,7 +414,7 @@ fn canonical_binding_ids(
         if *id <= 0 {
             return Err(error_response_coded(
                 StatusCode::BAD_REQUEST,
-                "mcp_binding_ids must contain positive integers",
+                "binding_ids must contain positive integers",
                 "mcp_binding_invalid",
             ));
         }
@@ -858,5 +858,6 @@ mod tests {
         let (status, Json(error)) = canonical_binding_ids(&[1, 0]).unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(error.error_code.as_deref(), Some("mcp_binding_invalid"));
+        assert_eq!(error.detail, "binding_ids must contain positive integers");
     }
 }

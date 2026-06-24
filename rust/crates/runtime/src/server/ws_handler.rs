@@ -1029,7 +1029,6 @@ fn build_ws_chat_request(
         workspace_binding: None,
         executor_binding: None,
         runtime_mcp_bindings: Vec::new(),
-        mcp_binding_ids: None,
         context: merge_plan_subtask_context(context, plan_subtask_id, is_plan_subtask),
         edge_executor_id: None,
         capabilities: Vec::new(),

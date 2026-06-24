@@ -111,8 +111,6 @@ pub struct ChatRequest {
     pub executor_binding: Option<astra_services::runs::ExecutorBindingRequest>,
     #[serde(default)]
     pub runtime_mcp_bindings: Vec<astra_services::runs::RuntimeMcpBindingRequest>,
-    #[serde(default)]
-    pub mcp_binding_ids: Option<Vec<i64>>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
     pub edge_executor_id: Option<String>,
@@ -1086,7 +1084,6 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         workspace_binding: request.workspace_binding,
         executor_binding: request.executor_binding,
         runtime_mcp_bindings: request.runtime_mcp_bindings,
-        mcp_binding_ids: request.mcp_binding_ids,
         context,
         edge_executor_id: request.edge_executor_id,
         capabilities: request.capabilities,

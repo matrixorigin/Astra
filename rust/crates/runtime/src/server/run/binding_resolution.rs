@@ -487,7 +487,6 @@ mod tests {
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
-            mcp_binding_ids: None,
             context: None,
             edge_executor_id: None,
             capabilities: Vec::new(),

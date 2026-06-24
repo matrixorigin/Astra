@@ -661,7 +661,6 @@ mod tests {
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
-            mcp_binding_ids: Some(vec![301]),
             context: Some(context),
             edge_executor_id: None,
             capabilities: Vec::new(),
@@ -694,7 +693,6 @@ mod tests {
         assert_eq!(obj["allow_skills"], serde_json::json!(["plan"]));
         assert_eq!(obj["allow_skill_sources"], serde_json::Value::Null);
         assert_eq!(obj["allow_tools"], serde_json::json!(["bash"]));
-        assert!(!obj.contains_key("mcp_binding_ids"));
         assert_eq!(
             obj["edge_profile"]["system_prompt_override"],
             "override text"
@@ -741,7 +739,6 @@ mod tests {
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
-            mcp_binding_ids: None,
             context: None,
             edge_executor_id: None,
             capabilities: Vec::new(),

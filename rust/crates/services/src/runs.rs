@@ -444,7 +444,6 @@ pub struct ChatRequestData {
     pub workspace_binding: Option<WorkspaceBindingRequest>,
     pub executor_binding: Option<ExecutorBindingRequest>,
     pub runtime_mcp_bindings: Vec<RuntimeMcpBindingRequest>,
-    pub mcp_binding_ids: Option<Vec<i64>>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     pub edge_executor_id: Option<String>,
     pub capabilities: Vec<String>,
@@ -498,7 +497,6 @@ impl std::fmt::Debug for ChatRequestData {
             .field("workspace_binding", &self.workspace_binding)
             .field("executor_binding", &self.executor_binding)
             .field("runtime_mcp_bindings", &self.runtime_mcp_bindings)
-            .field("deprecated_mcp_binding_ids", &self.mcp_binding_ids)
             .field("context", &self.context)
             .field("edge_executor_id", &self.edge_executor_id)
             .field("capabilities", &self.capabilities)
@@ -4191,7 +4189,6 @@ mod tests {
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
-            mcp_binding_ids: None,
             context: None,
             edge_executor_id: None,
             capabilities: Vec::new(),
@@ -4253,7 +4250,6 @@ mod tests {
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
-            mcp_binding_ids: None,
             context: None,
             edge_executor_id: None,
             capabilities: Vec::new(),
@@ -4329,7 +4325,6 @@ mod tests {
                     workspace_binding: None,
                     executor_binding: None,
                     runtime_mcp_bindings: Vec::new(),
-                    mcp_binding_ids: None,
                     context: None,
                     edge_executor_id: None,
                     capabilities: Vec::new(),
