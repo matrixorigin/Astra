@@ -13,8 +13,7 @@
 //!   calls that tool once.
 //!
 //! The default T1 set is the coding core, derived from the tool declaration table.
-//! Users override via `runtime.tool_surface.always_load_tools` in TOML. A name
-//! prefixed with `-` removes a default (e.g. `"-grep"`).
+//! Users can add extra T1 tools via `runtime.tool_surface.always_load_tools` in TOML.
 //!
 //! Implementation is complete and wired into production.
 
@@ -82,8 +81,8 @@ impl ToolSurface {
     ///
     /// Algorithm:
     /// 1. Start from names classified as `ToolLoadPolicy::AlwaysLoad`.
-    /// 2. Apply `cfg.always_load_tools`: a bare name adds, a `-name` removes.
-    ///    Unknown names are silently ignored.
+    /// 2. Apply `cfg.always_load_tools`: a canonical tool name adds that tool
+    ///    to always_load. Unknown or non-canonical entries are ignored.
     /// 3. Partition the union of catalog + plugins: names in the resolved
     ///    always_load set → `always_load_schemas`; everything else → `deferred`.
     /// 4. Sort both alphabetically for byte-stability.
@@ -113,25 +112,27 @@ impl ToolSurface {
             }
         }
 
-        // Resolve the always_load name set: defaults + additive overrides, minus
-        // any `-name` removals. Unknown names emit a warning — they are likely
-        // typos (`+web_fetc`) or stale entries after a tool was renamed.
+        // Resolve the always_load name set: defaults plus additive overrides.
+        // Unknown or non-canonical names emit a warning — they are likely typos
+        // or stale entries after a tool was renamed.
         let mut always_load_names: std::collections::BTreeSet<String> = default_always_load_names()
             .iter()
             .map(|s| s.to_string())
             .collect();
         for entry in &cfg.always_load_tools {
             let trimmed = entry.trim();
-            // Empty / whitespace-only / bare "-" / double-prefixed "--" are
-            // user-config noise — silently skip. The fence against "-- foo"
-            // becoming "-foo" (which tries to remove a tool named "-foo")
-            // is also a bug prevention.
-            if trimmed.is_empty() || trimmed == "-" || trimmed.starts_with("--") {
+            if trimmed.is_empty() {
                 continue;
             }
-            if let Some(name) = trimmed.strip_prefix('-') {
-                always_load_names.remove(name);
-            } else if by_name.contains_key(trimmed) {
+            if trimmed.starts_with('-') {
+                tracing::warn!(
+                    target: "astra.tool_surface",
+                    entry = trimmed,
+                    "tool_surface.always_load_tools: non-canonical tool name '{trimmed}' ignored: always_load_tools only adds tools"
+                );
+                continue;
+            }
+            if by_name.contains_key(trimmed) {
                 always_load_names.insert(trimmed.to_string());
             } else {
                 tracing::warn!(
@@ -215,7 +216,7 @@ impl ToolSurface {
     /// This is the single runtime answer to "which tools are T1 for this
     /// surface?". Callers that need cache markers, edge metadata, or diagnostics
     /// should derive from the resolved surface instead of rebuilding the
-    /// declaration + TOML override rules locally.
+    /// declaration + TOML addition rules locally.
     pub fn always_load_names(&self) -> Vec<String> {
         self.always_load
             .iter()

@@ -706,9 +706,9 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     );
     let mut activatable_tool_names = HashSet::new();
     // Always send always_load tool names so the server can place cache_control
-    // markers at the correct always_load/dynamic boundary. User TOML overrides
-    // can add or remove tools from the default always_load set, so this must be
-    // the resolved runtime set — not a compile-time constant.
+    // markers at the correct always_load/dynamic boundary. User TOML can add
+    // tools to the declaration defaults, so this must be the resolved runtime
+    // set — not a compile-time constant.
     let always_load_names = ctx.registry.always_load_tool_names_sorted();
     if !final_visible_tool_names.is_empty() && !always_load_names.is_empty() {
         merge_edge_profile_extensions(
@@ -2006,7 +2006,7 @@ mod tests {
         assert_eq!(
             always_load_names,
             registry.always_load_tool_names_sorted(),
-            "CLI must send the resolved always_load set so runtime cache boundaries follow user tool_surface overrides"
+            "CLI must send the resolved always_load set so runtime cache boundaries follow tool_surface config"
         );
         assert_eq!(
             valid_tool_names, edge_tool_name_set,
@@ -2194,7 +2194,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_chat_turn_payload_empty_tool_surface_preserves_activation() {
+    async fn prepare_chat_turn_payload_surface_edges_preserve_activation() {
         use crate::edge_tools::ToolExecutor;
         use astra_pipeline::step_recorder::StepRecorder;
         use astra_runtime::{
@@ -2426,14 +2426,7 @@ mod tests {
         );
         executor.clear_current_tool_surface_for_tests();
 
-        let cfg = astra_config::ToolSurfaceConfig {
-            always_load_tools: astra_runtime::tool_registry::surface::default_always_load_names()
-                .iter()
-                .map(|name| format!("-{name}"))
-                .collect(),
-        };
-        let registry =
-            ToolRegistry::new_with_tool_surface(all_schemas.clone(), &cfg).with_budget(0);
+        let registry = ToolRegistry::new(all_schemas.clone()).with_budget(0);
         let messages = vec![json!({"role": "user", "content": "inspect the repository"})];
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
@@ -2508,7 +2501,7 @@ mod tests {
             .collect();
         assert!(
             edge_tool_names.contains(&"tool_search"),
-            "budget-starved turns must keep deferred discovery reachable even when custom surface/budget selected no tools: {edge_tool_names:?}"
+            "budget-starved turns must keep deferred discovery reachable through the declarative default surface: {edge_tool_names:?}"
         );
         assert!(
             payload["edge_profile"]

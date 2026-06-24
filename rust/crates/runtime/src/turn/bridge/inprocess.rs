@@ -227,9 +227,9 @@ fn deferred_tools_block_for_bridge_model(
 /// Extract the always_load (T1) tool names from the CLI-built `edge_profile`.
 ///
 /// When the key is present, the names reflect the resolved `ToolSurface` always_load
-/// set (user TOML overrides included). When absent (test-only path or
+/// set (user TOML additions included). When absent (test-only path or
 /// server-side tools), falls back to the runtime-configured surface so
-/// cache_control markers still match TOML overrides.
+/// cache_control markers still match tool_surface config.
 fn always_load_tool_names_for_bridge(
     edge_profile: &Map<String, Value>,
 ) -> std::collections::HashSet<String> {
@@ -2305,10 +2305,10 @@ impl InProcessChatTurnBridge {
             // full `<available_skills>` catalog in `CacheScope::Session`, so a
             // catalog change flips the cache once then stabilizes.
             //
-            // `ToolSurfaceConfig` honours the user's `runtime.tool_surface`
-            // TOML: always_load_tools additive over defaults; `-name` removes a
-            // default. Loaded via the same `RuntimeConfig::load()` path as
-            // `tool_surface` above (line 1451) for consistency.
+            // `ToolSurfaceConfig` honors the user's `runtime.tool_surface`
+            // TOML: always_load_tools add extra always_load tools over the
+            // declaration defaults. Loaded via the same `RuntimeConfig::load()`
+            // path as `tool_surface` above (line 1451) for consistency.
             let deferred_block_str = deferred_tools_block_for_bridge_model(
                 &edge_profile,
                 &model_name,

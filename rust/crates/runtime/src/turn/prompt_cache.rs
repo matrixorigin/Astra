@@ -705,7 +705,7 @@ pub(crate) fn annotate_tool_schemas_for_caching_with_always_load(
 /// edge metadata.
 ///
 /// CLI/Edge should normally send the resolved names explicitly; server-side-tools
-/// and tests use this to keep cache markers aligned with TOML overrides.
+/// and tests use this to keep cache markers aligned with tool_surface config.
 ///
 /// **Hidden dependency**: reads `RuntimeConfig::cached().tool_surface` — a
 /// process-wide singleton. Callers that already hold a `ToolSurfaceConfig`
@@ -723,7 +723,7 @@ pub(crate) fn runtime_always_load_tool_names() -> std::collections::HashSet<Stri
 /// this config?". All callers that need cache markers or edge metadata should
 /// route through this (or [`runtime_always_load_tool_names`] when the runtime
 /// singleton is intentionally needed) rather than
-/// rebuilding identity + TOML override rules locally.
+/// rebuilding identity + TOML addition rules locally.
 ///
 /// **Cold path**: this rebuilds `all_tool_schemas()` + `ToolSurface::build()`
 /// (O(tool count)). Expected call frequency is O(1) per session. The per-turn
@@ -891,7 +891,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_static_prefix_tool_names_follow_toml_surface_overrides() {
+    fn cache_static_prefix_tool_names_follow_toml_surface_additions() {
         let cfg = ToolSurfaceConfig {
             always_load_tools: vec!["github".into(), "-grep".into()],
         };
@@ -902,8 +902,8 @@ mod tests {
             "config-always_load github must be part of the cache static prefix"
         );
         assert!(
-            !always_load.contains("grep"),
-            "config-demoted grep must not remain cache always_load"
+            always_load.contains("grep"),
+            "dash-prefixed entries are ignored for default always_load tools"
         );
         assert!(
             always_load.contains("bash"),
@@ -2066,7 +2066,7 @@ mod cache_stability_regression {
 
     /// The tool list for these tests intentionally uses names that overlap
     /// `default_test_always_load_tool_names()` so the marker-placement logic exercises
-    /// the real always_load set, not a local override.
+    /// the real always_load set, not a local fixture.
     fn always_load_prefix_fixture() -> Vec<Value> {
         vec![
             schema("bash"),
@@ -2112,8 +2112,8 @@ mod cache_stability_regression {
     /// The marker always lands on the LAST always_load tool — even if the always_load
     /// count shrinks or dynamic tools are interleaved by a buggy caller.
 
-    /// Default always_load set must contain the static-lib tools — if someone
-    /// demotes one, cache hit rate drops proportional to its token cost.
+    /// Default always_load set must contain the static-lib tools; losing one
+    /// drops cache hit rate proportional to its token cost.
     #[test]
     fn default_always_load_set_contains_static_lib() {
         let always_load = default_test_always_load_tool_names();

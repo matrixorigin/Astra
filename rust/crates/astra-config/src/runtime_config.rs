@@ -342,10 +342,9 @@ impl Default for RuntimeConfig {
 /// **Within a single config file** (e.g. one `runtime.toml`), entries
 /// apply additively to the built-in [`default always-load`](runtime crate) set:
 /// - A plain name (e.g. `"github"`) *adds* that tool to the always-load set.
-/// - A name prefixed with `-` (e.g. `"-grep"`) *removes* a default from
-///   the always-load set (it lands in deferred instead).
-/// - Unknown names, whitespace-only, bare `-`, or `--foo` are silently
-///   ignored (see `ToolSurface::build`).
+/// - Surrounding whitespace is trimmed before matching.
+/// - Unknown names, whitespace-only values, and non-canonical entries such as
+///   `"-grep"` are ignored (see `ToolSurface::build`).
 ///
 /// **Across config layers** (user `~/.astra/config/runtime.toml` vs.
 /// project `.astra/config/runtime.toml`), the merge is **atomic, not
@@ -359,7 +358,7 @@ impl Default for RuntimeConfig {
 /// Example `runtime.toml`:
 /// ```toml
 /// [tool_surface]
-/// always_load_tools = ["github", "memory", "-grep"]
+/// always_load_tools = ["github", "memory"]
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolSurfaceConfig {
@@ -2209,7 +2208,7 @@ impl RuntimeConfig {
         }
 
         // ToolSurfaceConfig: whole-struct replacement when `other` is
-        // non-empty. `always_load_tools` is a user-expressed override list —
+        // non-empty. `always_load_tools` is a user-expressed config list;
         // additive merge would let a project config silently inherit a
         // user's personal always-load preferences, which is surprising.
         // Treat it atomically: if the project (or env) file sets it, it

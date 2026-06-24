@@ -63,7 +63,7 @@ fn with_user_runtime_toml<F: FnOnce(&RuntimeConfig)>(contents: &str, f: F) {
 
 #[test]
 #[serial_test::serial]
-fn user_always_load_tools_with_dash_removes_default_from_wire() {
+fn user_always_load_tools_dash_entry_is_ignored_in_wire() {
     with_user_runtime_toml(
         r#"
 [tool_surface]
@@ -73,14 +73,13 @@ always_load_tools = ["-grep"]
             let surface = ToolSurface::build(catalog_schemas(), &config.tool_surface, &[]);
             let always_load = names(&surface.always_load_schemas());
             assert!(
-                !always_load.iter().any(|n| n == "grep"),
-                "user TOML said `-grep` — grep must NOT be in wire tools[]: got {always_load:?}"
+                always_load.iter().any(|n| n == "grep"),
+                "`-grep` is not a supported removal syntax; grep remains default always_load: {always_load:?}"
             );
-            // grep now lives in deferred.
             let deferred: Vec<&str> = surface.deferred().iter().map(|e| e.name.as_str()).collect();
             assert!(
-                deferred.contains(&"grep"),
-                "grep must appear in deferred list"
+                !deferred.contains(&"grep"),
+                "default always_load grep must not also appear in deferred list"
             );
         },
     );

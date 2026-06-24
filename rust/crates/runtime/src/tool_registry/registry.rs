@@ -554,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn new_with_tool_surface_honors_runtime_always_load_overrides() {
+    fn new_with_tool_surface_honors_runtime_always_load_additions() {
         let schemas = vec![
             sample_schema("bash"),
             sample_schema("grep"),
@@ -563,7 +563,7 @@ mod tests {
             sample_schema("skill"),
         ];
         let cfg = ToolSurfaceConfig {
-            always_load_tools: vec!["github".into(), "-grep".into()],
+            always_load_tools: vec!["github".into()],
         };
 
         let reg = ToolRegistry::new_with_tool_surface(schemas, &cfg);
@@ -574,7 +574,10 @@ mod tests {
             .collect();
 
         assert!(always_load_names.iter().any(|name| name == "github"));
-        assert!(!always_load_names.iter().any(|name| name == "grep"));
+        assert!(
+            always_load_names.iter().any(|name| name == "grep"),
+            "default always_load declarations must stay in the resolved runtime surface"
+        );
         assert_eq!(
             reg.always_load_tool_names_sorted(),
             {
@@ -582,7 +585,7 @@ mod tests {
                 names.sort();
                 names
             },
-            "cross-crate always_load metadata must be stable and reflect runtime overrides"
+            "cross-crate always_load metadata must be stable and reflect runtime additions"
         );
     }
 
@@ -609,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn removed_default_always_load_tool_stays_deferred_even_when_relevant() {
+    fn dash_prefixed_always_load_config_is_ignored_for_default_tool() {
         let schemas = vec![
             sample_schema("bash"),
             sample_schema("grep"),
@@ -621,22 +624,22 @@ mod tests {
         let reg = ToolRegistry::new_with_tool_surface(schemas, &cfg);
 
         let (selected, report) =
-            reg.build_initial_surface_with_report("grep for UserSession in the code", 1, 800);
+            reg.build_initial_surface_with_report("grep for UserSession in the code", 1, 0);
         let names = ToolRegistry::visible_names(&selected);
 
         assert!(
-            !reg.always_load_schemas
+            reg.always_load_schemas
                 .iter()
                 .any(|(name, _)| name == "grep"),
-            "grep is intentionally deferred for this registry instance"
+            "-grep is not a supported removal syntax; grep remains default always_load"
         );
         assert!(
-            !names.contains(&"grep".to_string()),
-            "user-deferred tools stay deferred until explicitly activated; got: {names:?}"
+            names.contains(&"grep".to_string()),
+            "default always_load tools stay visible even with zero deferred budget: {names:?}"
         );
         assert_eq!(
             report.budget_used, 0,
-            "user-deferred tools must stay deferred and consume no proactive surface budget"
+            "always_load tools must not consume deferred-tool budget"
         );
     }
 

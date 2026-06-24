@@ -6,7 +6,7 @@
 //! Contracts under test:
 //!   1. Default T1 (always_load) members are a configurable set — not the
 //!      whole TOOL_CATALOG.
-//!   2. User config can add, remove, or replace the default always_load set.
+//!   2. User config can add extra tools to the default always_load set.
 //!   3. Every non-T1 tool appears in the deferred list as `name + short_desc`
 //!      (no schema, no parameters).
 //!   4. `tools[]` bytes are stable across two successive builds with the
@@ -145,7 +145,7 @@ fn always_load_schemas_are_sorted_alphabetically_for_cache_stability() {
     assert_eq!(names, sorted, "always_load must be sorted alphabetically");
 }
 
-// ── 2. Config overrides ─────────────────────────────────────────────────────
+// ── 2. Config additions ─────────────────────────────────────────────────────
 
 #[test]
 fn config_always_load_tools_additive_appends_to_defaults() {
@@ -163,8 +163,7 @@ fn config_always_load_tools_additive_appends_to_defaults() {
 }
 
 #[test]
-fn config_always_load_tools_prefix_dash_removes_default() {
-    // Remove grep from the default set — user prefers `bash grep` instead.
+fn config_always_load_tools_prefix_dash_is_ignored() {
     let cfg = ToolSurfaceConfig {
         always_load_tools: vec!["-grep".into()],
     };
@@ -172,21 +171,19 @@ fn config_always_load_tools_prefix_dash_removes_default() {
 
     let always_load = names(&surface.always_load_schemas());
     assert!(
-        !always_load.iter().any(|n| n == "grep"),
-        "-grep in config must remove grep from always_load; got {always_load:?}"
+        always_load.iter().any(|n| n == "grep"),
+        "-grep is not a supported removal syntax; grep must remain default always_load: {always_load:?}"
     );
-    // grep now appears in deferred instead.
     assert!(
-        surface.deferred().iter().any(|e| e.name == "grep"),
-        "grep removed from always_load must land in deferred"
+        !surface.deferred().iter().any(|e| e.name == "grep"),
+        "default always_load grep must not also land in deferred"
     );
 }
 
 #[test]
 fn empty_and_malformed_config_entries_are_ignored_not_panic() {
-    // Footguns the user might type by accident: bare "-", "--foo",
-    // empty string, leading whitespace. All should be silently ignored
-    // (or sanitised), not panic and not misinterpret.
+    // Footguns the user might type by accident: empty string, dash-prefixed
+    // names, surrounding whitespace. They must not panic or change defaults.
     let cfg = ToolSurfaceConfig {
         always_load_tools: vec![
             "".into(),
@@ -198,15 +195,14 @@ fn empty_and_malformed_config_entries_are_ignored_not_panic() {
     };
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
     let always_load = names(&surface.always_load_schemas());
-    // `--foo` is NOT a valid "remove -foo" because -foo isn't a real tool
-    // AND double-dash is not our syntax. Must be ignored, not applied.
-    // ` github` (leading space) is NOT the same as `github` — must be ignored.
     assert!(!always_load.iter().any(|n| n == "foo"));
+    assert!(always_load.iter().any(|n| n == "github"));
     assert!(
         !always_load.iter().any(|n| n == " github"),
-        "whitespace-prefixed names must be rejected"
+        "stored tool names must stay canonical"
     );
     // Defaults survive all this malformed input.
+    assert!(always_load.iter().any(|n| n == "grep"));
     assert!(always_load.iter().any(|n| n == "bash"));
     assert!(always_load.iter().any(|n| n == "tool_search"));
 }
@@ -220,6 +216,7 @@ fn unknown_tool_name_in_config_is_ignored_not_panic() {
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
     let always_load = names(&surface.always_load_schemas());
     assert!(!always_load.iter().any(|n| n == "not_a_real_tool"));
+    assert!(always_load.iter().any(|n| n == "grep"));
     // Defaults preserved.
     assert!(always_load.iter().any(|n| n == "bash"));
 }
