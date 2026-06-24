@@ -285,11 +285,12 @@ pub enum FallbackPolicyRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceBindingRequest {
     pub kind: WorkspaceBindingRequestKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    #[serde(default, alias = "cwd", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<WorkspaceSourceRequest>,

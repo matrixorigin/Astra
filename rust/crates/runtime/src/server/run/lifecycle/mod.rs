@@ -10117,33 +10117,20 @@ mod tests {
     }
 
     #[test]
-    fn workspace_binding_request_accepts_legacy_cwd_alias() {
-        let mut request = test_request("review this repo");
-        request.workspace_binding = Some(
-            serde_json::from_value(json!({
-                "kind": "edge_workspace",
-                "display_name": "MacBook Pro",
-                "cwd": "/Users/test/repo",
-                "authority": "read_write",
-                "fallback_policy": "disabled"
-            }))
-            .expect("legacy cwd alias should deserialize"),
+    fn workspace_binding_request_rejects_cwd_alias() {
+        let err = serde_json::from_value::<astra_services::runs::WorkspaceBindingRequest>(json!({
+            "kind": "edge_workspace",
+            "display_name": "MacBook Pro",
+            "cwd": "/Users/test/repo",
+            "authority": "read_write",
+            "fallback_policy": "disabled"
+        }))
+        .expect_err("workspace_binding must use explicit root, not cwd");
+
+        assert!(
+            err.to_string().contains("unknown field `cwd`"),
+            "unexpected error: {err}"
         );
-        request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
-            kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
-            executor_id: Some("edge-1".to_string()),
-            display_name: Some("MacBook Pro".to_string()),
-            transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWs),
-            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
-        });
-
-        let (workspace, executor) =
-            resolve_request_execution_bindings(&request, Path::new("/tmp/server-workspace"));
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
-        assert_eq!(workspace.cwd.as_deref(), Some("/Users/test/repo"));
-        assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
-        assert_eq!(executor.transport, ToolTransportKind::EdgeWs);
     }
 
     #[test]
