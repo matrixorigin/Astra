@@ -1103,8 +1103,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // Bug B step 3: capture the parent turn's cacheable prefix
         // so subsequent agent-spawn / delegate calls can inherit it
         // for prompt-cache reuse. No-op unless:
-        //   - the `prefix_store` Arc was plumbed in (CLI startup
-        //     sets this on every host when fork_prefix.enabled)
+        //   - the `prefix_store` Arc was plumbed in by the host
         //   - ingest populated the expected state fields
         let Some(store) = self.prefix_store.as_ref() else {
             return;

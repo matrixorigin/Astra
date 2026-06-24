@@ -199,12 +199,8 @@ pub enum ForkCacheSinkKind {
 /// runtime (via `ForkCacheThresholds::validate`); callers that want
 /// strict config rejection should `validate()` the loaded config.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ForkPrefixConfig {
-    /// Deprecated no-op. Fork capture is now always-on. Retained
-    /// for backward-compatible TOML deserialization only.
-    #[serde(default)]
-    pub enabled: bool,
-
     /// Telemetry sink to install. `Noop` discards events; `Stderr`
     /// writes JSON lines with `[fork-cache]` prefix.
     #[serde(default)]
@@ -234,7 +230,6 @@ fn default_fork_miss_floor() -> f64 {
 impl Default for ForkPrefixConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             sink: ForkCacheSinkKind::Noop,
             hit_threshold: default_fork_hit_threshold(),
             miss_floor: default_fork_miss_floor(),
@@ -2281,8 +2276,6 @@ impl RuntimeConfig {
                 .enabled_categories
                 .push(TraceCategory::LlmExchanges);
         }
-        // ASTRA_FORK_INHERIT_PREFIX env var is ignored — fork capture
-        // is now always-on. The `enabled` field is a deprecated no-op.
     }
 
     /// Get configuration as TOML string.
@@ -3279,9 +3272,8 @@ mod tests {
     // ─── Fork-prefix config ─────────────────────────────────────────
 
     #[test]
-    fn fork_prefix_defaults_to_disabled_noop_sink() {
+    fn fork_prefix_defaults_to_noop_sink() {
         let cfg = ForkPrefixConfig::default();
-        assert!(!cfg.enabled, "fork-prefix must default to disabled");
         assert_eq!(cfg.sink, ForkCacheSinkKind::Noop);
         assert!((cfg.hit_threshold - 0.80).abs() < 1e-9);
         assert!((cfg.miss_floor - 0.05).abs() < 1e-9);
@@ -3293,13 +3285,11 @@ mod tests {
             version = "1.0"
 
             [fork_prefix]
-            enabled = true
             sink = "stderr"
             hit_threshold = 0.85
             miss_floor = 0.10
         "#;
         let cfg: RuntimeConfig = toml::from_str(toml_str).unwrap();
-        assert!(cfg.fork_prefix.enabled);
         assert_eq!(cfg.fork_prefix.sink, ForkCacheSinkKind::Stderr);
         assert!((cfg.fork_prefix.hit_threshold - 0.85).abs() < 1e-9);
         assert!((cfg.fork_prefix.miss_floor - 0.10).abs() < 1e-9);
@@ -3310,7 +3300,6 @@ mod tests {
         // A TOML without the section must not fail — defaults fill in.
         let toml_str = r#"version = "1.0""#;
         let cfg: RuntimeConfig = toml::from_str(toml_str).unwrap();
-        assert!(!cfg.fork_prefix.enabled);
         assert_eq!(cfg.fork_prefix.sink, ForkCacheSinkKind::Noop);
     }
 
@@ -3320,7 +3309,6 @@ mod tests {
         // tripwire pins both directions so a future rename to e.g.
         // `SnakeCase` is an explicit breaking config change.
         let s = toml::to_string(&ForkPrefixConfig {
-            enabled: true,
             sink: ForkCacheSinkKind::Stderr,
             ..Default::default()
         })
@@ -3332,14 +3320,20 @@ mod tests {
     }
 
     #[test]
-    fn fork_prefix_enabled_field_is_deprecated_noop() {
-        // The `enabled` field remains for backward-compatible TOML
-        // deserialization but has no runtime effect. Fork capture is
-        // always-on.
-        let cfg = ForkPrefixConfig::default();
-        // Default value doesn't matter for runtime behavior since
-        // the field is a no-op; we just verify it deserializes.
-        let _ = cfg.enabled;
+    fn fork_prefix_rejects_retired_enabled_field() {
+        let err = toml::from_str::<RuntimeConfig>(
+            r#"
+            version = "1.0"
+
+            [fork_prefix]
+            enabled = true
+            "#,
+        )
+        .expect_err("retired fork_prefix.enabled must be rejected");
+        assert!(
+            err.to_string().contains("unknown field `enabled`"),
+            "unexpected error: {err}"
+        );
     }
 
     // ─── SessionTraceConfig::from_cli() tests ─────────────────────
