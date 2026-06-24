@@ -895,9 +895,10 @@ fn should_emit_stream_turn_complete(final_status: &RunStatus) -> bool {
     matches!(final_status, RunStatus::Completed | RunStatus::Paused)
 }
 
+use crate::server::session_turn::infer_session_turn;
 pub(crate) use persistence::{
     PostLoopPersistContext, TranscriptPersistItem, build_run_turn_complete_event_with_interruption,
-    format_task_board_resume_hint, infer_session_turn, persist_server_loop_core_events,
+    format_task_board_resume_hint, persist_server_loop_core_events,
     persist_server_loop_trace_events, persist_session_transcript_items,
     restore_session_state_compact, restore_step_checkpoint_runtime_state, server_trace_context,
     trace_context_from_subrun_context,

@@ -477,21 +477,6 @@ fn bridge_cache_key(user_id: &str, session_id: &str) -> String {
     format!("{user_id}\x1f{session_id}")
 }
 
-async fn infer_bridge_session_turn(state: &AppState, user_id: &str, session_id: &str) -> u32 {
-    let Some(shared_pool) = state.shared_pool.as_ref() else {
-        return 1;
-    };
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND event_type = 'user_query'",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .fetch_one(shared_pool.get())
-    .await
-    .unwrap_or(0);
-    (count.max(0) as u32).saturating_add(1)
-}
-
 async fn seed_bridge_session_created_at(
     state: &AppState,
     user_id: &str,
@@ -574,7 +559,12 @@ async fn prepare_chat_turn_bridge_identifiers(
             identity.session_turn,
         );
     }
-    let inferred_session_turn = infer_bridge_session_turn(state, user_id, session_id).await;
+    let inferred_session_turn = crate::server::session_turn::infer_session_turn(
+        state.shared_pool.as_ref(),
+        user_id,
+        session_id,
+    )
+    .await;
     let now = current_unix_seconds();
     let cache_key = bridge_cache_key(user_id, session_id);
     let mut cache = state.chat_turn_bridge_cache.lock().await;
