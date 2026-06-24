@@ -39,9 +39,39 @@ pub fn default_always_load_names() -> &'static [String] {
             .map(|spec| spec.name.clone())
             .collect();
         names.sort_unstable();
+
+        assert_always_load_schemas(&names);
+
         names
     });
     &NAMES
+}
+
+fn canonical_builtin_surface_schema_names() -> std::collections::BTreeSet<String> {
+    let mut schemas = astra_tools::schemas::all_tool_schemas();
+    schemas.push(crate::turn::skill_tool::skill_tool_schema_v2());
+    schemas
+        .iter()
+        .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
+        .collect()
+}
+
+pub(crate) fn missing_always_load_schema_names(always_load_names: &[String]) -> Vec<String> {
+    let schema_names = canonical_builtin_surface_schema_names();
+    always_load_names
+        .iter()
+        .filter(|name| !schema_names.contains(name.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn assert_always_load_schemas(always_load_names: &[String]) {
+    let missing = missing_always_load_schema_names(always_load_names);
+    assert!(
+        missing.is_empty(),
+        "AlwaysLoad tools missing schemas in canonical builtin surface pool: {}",
+        missing.join(", ")
+    );
 }
 
 /// One entry in the deferred manifest.

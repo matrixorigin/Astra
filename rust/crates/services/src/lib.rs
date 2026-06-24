@@ -275,10 +275,10 @@ pub use self_surface::{
     AcceptanceSurface, BudgetConfig, BudgetState, BudgetSurface, CapabilitySurface,
     EnvironmentSurface, EventPreview, EvolutionRecord, EvolutionSurface, GoalSurface,
     HealthSurface, JournalSurface, LocalSelfSurfaceService, NoopSelfSurfaceRuntimeSupport,
-    PersistentSelfSnapshot, ProfileSurface, RunSurface, RunTotals, ScoredAlternative,
-    SelfSurfaceCheck, SelfSurfaceDimension, SelfSurfaceResponse, SelfSurfaceRuntimeSupport,
-    SelfSurfaceService, SignalsSurface, StepRecord, SurfaceConstraints, ToolCallView,
-    ToolFailureView, ToolHealthView, TraceSurface, VerificationSurface,
+    PersistentSelfSnapshot, ProfileSurface, RunSurface, RunTotals, SelfSurfaceCheck,
+    SelfSurfaceDimension, SelfSurfaceResponse, SelfSurfaceRuntimeSupport, SelfSurfaceService,
+    SignalsSurface, StepRecord, SurfaceConstraints, ToolCallView, ToolFailureView, ToolHealthView,
+    TraceSurface, VerificationSurface,
 };
 pub use session_artifact_store::{
     DatabaseSessionArtifactStore, LOCAL_SESSION_LAYOUT_VERSION, LocalSessionArtifactStore,

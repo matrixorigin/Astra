@@ -1595,18 +1595,8 @@ fn execution_retry_reason(state: &AgenticLoopState) -> Option<ExecutionRetryReas
     if state.final_text.trim().is_empty() {
         return None;
     }
-    let attempted_work_without_mutation = state.total_tool_calls > 0;
-    let defers = final_text_defers_execution(&state.final_text);
     if state.task_profile.mutates_workspace {
-        if !defers && final_text_concludes_no_change_needed(&state.final_text) {
-            return None;
-        }
-        // Only retry when the model engaged with the task (made tool calls but
-        // committed nothing) or explicitly deferred. A bare "Done." or "no fix
-        // needed" reply with zero tool calls is treated as a legitimate no-op
-        // — retrying would burn a turn for nothing.
-        return (attempted_work_without_mutation || defers)
-            .then_some(ExecutionRetryReason::MissingMutation);
+        return Some(ExecutionRetryReason::MissingMutation);
     }
     None
 }
@@ -1806,6 +1796,9 @@ fn should_skip_auto_verify_stop_hooks(state: &AgenticLoopState) -> bool {
     {
         return false;
     }
+    if !has_concrete_workspace_mutation(state) {
+        return true;
+    }
     has_successful_verification_after_latest_mutation(state)
 }
 
@@ -1923,53 +1916,6 @@ fn command_looks_like_verification(command: &str) -> bool {
         "just test",
         "just check",
         "git diff --check",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
-fn final_text_defers_execution(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    [
-        "需要我直接执行",
-        "要继续吗",
-        "即可执行",
-        "等待确认",
-        "shall i",
-        "should i",
-        "want me to",
-        "ready to apply",
-        "can apply",
-        "can execute",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
-fn final_text_concludes_no_change_needed(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    [
-        "bug does not exist",
-        "bug doesn't exist",
-        "issue does not exist",
-        "issue doesn't exist",
-        "no change needed",
-        "no changes needed",
-        "nothing to change",
-        "already correct",
-        "already fixed",
-        "not reproducible",
-        "cannot reproduce",
-        "can't reproduce",
-        "无需修改",
-        "不需要修改",
-        "没有需要修改",
-        "问题不存在",
-        "没有这个问题",
-        "无法复现",
-        "未复现",
-        "已经正确",
-        "已经修复",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -3274,18 +3220,14 @@ mod tests {
     }
 
     #[test]
-    fn execution_retry_skips_done_without_tools_for_mutating_task() {
-        // A mutating-profile task where the model produces a bare conclusion
-        // with zero tool calls is treated as a legitimate no-op completion
-        // (e.g. "I reviewed the code and the bug doesn't exist"). Forcing a
-        // retry here would just waste a turn.
+    fn execution_retry_fires_for_zero_tool_mutating_finish() {
         let mut state = make_state();
         state.task_profile =
             astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
         state.message = "fix the bug".into();
-        state.final_text = "I reviewed the code and the bug does not exist.".into();
+        state.final_text = "Done.".into();
 
-        assert!(!should_force_execution_retry(&state));
+        assert!(should_force_execution_retry(&state));
     }
 
     #[test]
@@ -3309,12 +3251,12 @@ mod tests {
     }
 
     #[test]
-    fn execution_retry_skips_reviewed_no_bug_conclusion_after_read_only_inspection() {
+    fn execution_retry_fires_after_read_only_inspection_without_mutation() {
         let mut state = make_state();
         state.task_profile =
             astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
         state.message = "fix the bug".into();
-        state.final_text = "I reviewed the code path and the bug does not exist.".into();
+        state.final_text = "No workspace mutation was needed.".into();
         state.total_tool_calls = 2;
         state.stall.tool_call_records.push(ToolCallRecord {
             name: "bash".into(),
@@ -3328,7 +3270,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert!(!should_force_execution_retry(&state));
+        assert!(should_force_execution_retry(&state));
     }
 
     #[test]
@@ -3577,6 +3519,14 @@ mod tests {
             result_preview: Some("✓ cargo | 426 passed, 0 failed".into()),
             ..Default::default()
         });
+
+        assert!(should_skip_auto_verify_stop_hooks(&state));
+    }
+
+    #[test]
+    fn auto_verify_stop_hook_skips_when_no_workspace_mutation_exists() {
+        let mut state = make_state();
+        state.hooks.stop_hooks = vec![auto_verify_hook()];
 
         assert!(should_skip_auto_verify_stop_hooks(&state));
     }

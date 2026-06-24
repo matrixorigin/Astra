@@ -7740,7 +7740,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         state.telemetry.observability_hub = Some(hub);
         state.telemetry.observability_session = Some(session.clone());
         state.message = "review the PR diff and approve the change".into();
-        state.recent_tools = vec!["view".into()];
+        state.recent_tools = vec!["read_file".into(), "grep".into(), "github".into()];
 
         {
             let mut guard = session.write().unwrap();

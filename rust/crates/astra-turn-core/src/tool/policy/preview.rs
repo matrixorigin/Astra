@@ -173,12 +173,12 @@ pub fn render_preview(tool: &str, args: &Value, style: PreviewStyle, desc_budget
         "task_output" => background_task_output_preview(args, path_budget, verbose),
         "task_stop" => background_task_stop_preview(args, path_budget, verbose),
         "task_list" => "List background tasks".to_string(),
-
-        // ── Web ─────────────────────────────────────────────────────
         "tool_search" => {
             let query = args.get("query").and_then(Value::as_str).unwrap_or("");
             format!("Searching tools: \"{}\"", trunc(query, path_budget(17)))
         }
+
+        // ── Web ─────────────────────────────────────────────────────
         "web_fetch" => {
             let url = args.get("url").and_then(Value::as_str).unwrap_or("");
             format!("Fetching: {}", trunc(url, path_budget(10)))

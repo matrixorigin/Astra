@@ -16,7 +16,9 @@
 
 #![cfg(test)]
 
-use crate::tool_registry::surface::{DeferredEntry, ToolSurface, default_always_load_names};
+use crate::tool_registry::surface::{
+    DeferredEntry, ToolSurface, default_always_load_names, missing_always_load_schema_names,
+};
 use astra_config::ToolSurfaceConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
 use serde_json::{Value, json};
@@ -60,15 +62,11 @@ fn schema_name_set() -> std::collections::BTreeSet<String> {
 
 #[test]
 fn every_default_always_load_has_a_schema_in_the_canonical_pool() {
-    let schema_names: std::collections::HashSet<String> =
-        names(&catalog_schemas()).into_iter().collect();
-
-    for always_load in default_always_load_names() {
-        assert!(
-            schema_names.contains(always_load),
-            "default always_load ToolSpec contains {always_load}, but the canonical schema pool has no schema for it"
-        );
-    }
+    let missing = missing_always_load_schema_names(default_always_load_names());
+    assert!(
+        missing.is_empty(),
+        "default always_load ToolSpec contains tools missing from the canonical schema pool: {missing:?}"
+    );
 }
 
 #[test]

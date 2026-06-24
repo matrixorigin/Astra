@@ -142,17 +142,8 @@ pub struct DecisionRecord {
     pub ts: String,
     pub visible_tools: Vec<String>,
     pub selected_skills: Vec<String>,
-    pub alternatives: Vec<ScoredAlternative>,
-    pub boost_terms: Vec<String>,
-    pub learned_context_summary: Option<String>,
     pub routing_domain_hint: Option<String>,
     pub source_step_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ScoredAlternative {
-    pub tool: String,
-    pub score: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1349,9 +1340,6 @@ fn build_recent_decisions(
                 .as_ref()
                 .map(|workspace| merged_skills(Some(workspace)))
                 .unwrap_or_default(),
-            alternatives: Vec::new(),
-            boost_terms: Vec::new(),
-            learned_context_summary: None,
             routing_domain_hint: None,
             source_step_id: None,
         });
@@ -1374,9 +1362,6 @@ fn decision_from_event(event: &JournalEvent) -> Option<DecisionRecord> {
         ts: event.ts.clone(),
         visible_tools,
         selected_skills,
-        alternatives: Vec::new(),
-        boost_terms: Vec::new(),
-        learned_context_summary: None,
         routing_domain_hint: event.routing_domain_hint.clone(),
         source_step_id: Some(step_id(event)),
     })
@@ -2534,13 +2519,11 @@ mod tests {
                 .risk_flags
                 .contains(&"session_persistence_degraded".to_string())
         );
-        assert!(
-            snapshot
-                .run
-                .pending_blockers
-                .iter()
-                .any(|blocker| blocker.contains("session_persistence: failed to append turn event"))
-        );
+        assert!(snapshot
+            .run
+            .pending_blockers
+            .iter()
+            .any(|blocker| blocker.contains("session_persistence: failed to append turn event")));
         assert!(!snapshot.acceptance.ok);
         assert!(
             snapshot

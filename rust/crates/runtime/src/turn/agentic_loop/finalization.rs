@@ -1027,18 +1027,16 @@ mod tests {
         );
     }
 
-    // E2E negative: when the model finishes with a legitimate "no change
-    // needed" reply (zero tool calls, no defer signal), the guard must NOT
-    // fire — even on a mutating-profile task — and no corrective message
-    // should ever be injected.
+    // E2E: a mutating-profile task cannot complete on the first text-only
+    // response without any concrete workspace mutation. The guard forces one
+    // corrective retry, then the one-shot flag lets the next response finish
+    // so the loop cannot spin forever.
     #[tokio::test]
-    async fn execution_retry_does_not_fire_on_legitimate_no_op_completion() {
-        let mut host = MockHost::new(vec![text_result(
-            "I reviewed the code and the bug does not exist.",
-            10,
-            5,
-            Some(20),
-        )]);
+    async fn execution_retry_forces_one_retry_on_text_only_mutating_completion() {
+        let mut host = MockHost::new(vec![
+            text_result("No workspace mutation was needed.", 10, 5, Some(20)),
+            text_result("Done.", 10, 5, Some(20)),
+        ]);
         let mut state = make_state();
         state.message = "fix the bug".to_string();
         state.task_profile =
@@ -1048,18 +1046,24 @@ mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
 
+        assert_eq!(
+            host.turn_count(),
+            2,
+            "first text-only mutating completion must force one retry"
+        );
+        assert_eq!(state.final_text, "Done.");
         assert!(
             !state.stall.forced_execution_retry,
-            "guard must not fire when the model genuinely concludes no fix is needed"
+            "completion should clear the one-shot retry flag"
         );
-        let injected = state
+        let leftover = state
             .messages
             .iter()
             .filter(|m| {
                 crate::turn::agentic_loop::execution_phase::is_execution_retry_correction(m)
             })
             .count();
-        assert_eq!(injected, 0, "no corrective message should be injected");
+        assert_eq!(leftover, 0, "corrective message should be stripped");
     }
 
     // E2E: model defers twice in a row. The one-shot `forced_execution_retry`
