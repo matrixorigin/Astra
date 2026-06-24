@@ -1845,7 +1845,11 @@ impl crate::state_sync::MatrixOneSyncService {
                  WHERE session_id = ? AND user_id <> ? \
                  LIMIT 1 \
              ) \
-             ON DUPLICATE KEY UPDATE metadata = VALUES(metadata), updated_at = NOW(6), last_active_at = NOW(6)",
+             ON DUPLICATE KEY UPDATE \
+             status = CASE WHEN user_id = VALUES(user_id) THEN status ELSE NULL END, \
+             metadata = CASE WHEN user_id = VALUES(user_id) THEN VALUES(metadata) ELSE metadata END, \
+             updated_at = CASE WHEN user_id = VALUES(user_id) THEN NOW(6) ELSE updated_at END, \
+             last_active_at = CASE WHEN user_id = VALUES(user_id) THEN NOW(6) ELSE last_active_at END",
         )
         .bind(session_id)
         .bind(user_id)

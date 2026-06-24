@@ -43,6 +43,7 @@ use astra_services::{
 };
 use sqlx::Row;
 use std::collections::HashSet;
+use std::sync::Arc;
 use uuid::Uuid;
 
 mod common;
@@ -549,6 +550,227 @@ async fn cleanup_restore_fixture(pool: &sqlx::Pool<sqlx::MySql>, session_ids: &[
             .execute(pool)
             .await;
     }
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn concurrent_agent_session_event_count_upsert_preserves_single_owner() {
+    let (shared, _settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let session_id = Uuid::new_v4().to_string();
+    let user_a = format!("owner-a-{}", Uuid::new_v4());
+    let user_b = format!("owner-b-{}", Uuid::new_v4());
+    cleanup_restore_fixture(&pool, std::slice::from_ref(&session_id)).await;
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let task_a = {
+        let pool = pool.clone();
+        let barrier = Arc::clone(&barrier);
+        let session_id = session_id.clone();
+        let user_a = user_a.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            astra_services::storage::upsert_agent_session_event_count(
+                &pool,
+                &session_id,
+                &user_a,
+                11,
+            )
+            .await
+            .map(|_| (user_a, 11_i64))
+            .map_err(|error| error.to_string())
+        })
+    };
+    let task_b = {
+        let pool = pool.clone();
+        let barrier = Arc::clone(&barrier);
+        let session_id = session_id.clone();
+        let user_b = user_b.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            astra_services::storage::upsert_agent_session_event_count(
+                &pool,
+                &session_id,
+                &user_b,
+                22,
+            )
+            .await
+            .map(|_| (user_b, 22_i64))
+            .map_err(|error| error.to_string())
+        })
+    };
+
+    barrier.wait().await;
+    let (result_a, result_b) = tokio::join!(task_a, task_b);
+    let outcomes = [result_a.unwrap(), result_b.unwrap()];
+    let successes: Vec<_> = outcomes
+        .iter()
+        .filter_map(|result| result.as_ref().ok())
+        .collect();
+    assert_eq!(
+        successes.len(),
+        1,
+        "exactly one owner may create or reconcile a session_id; outcomes: {outcomes:?}"
+    );
+    assert!(
+        outcomes.iter().any(|result| result.is_err()),
+        "losing owner must fail atomically instead of stealing the session"
+    );
+
+    let row =
+        sqlx::query("SELECT user_id, event_count FROM agent_sessions WHERE session_id = ? LIMIT 1")
+            .bind(&session_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load winner session row");
+    assert_eq!(row.try_get::<String, _>("user_id").unwrap(), successes[0].0);
+    assert_eq!(
+        row.try_get::<i64, _>("event_count").unwrap(),
+        successes[0].1
+    );
+
+    cleanup_restore_fixture(&pool, &[session_id]).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn load_agent_event_count_for_user_returns_zero_for_empty_owned_session() {
+    let (shared, _settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let session_id = Uuid::new_v4().to_string();
+    let user_id = Uuid::new_v4().to_string();
+    cleanup_restore_fixture(&pool, std::slice::from_ref(&session_id)).await;
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'empty-event-count', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("insert empty session");
+
+    let count =
+        astra_services::storage::load_agent_event_count_for_user(&pool, &session_id, &user_id)
+            .await
+            .expect("COUNT(*) returns one aggregate row even when there are no events");
+
+    assert_eq!(count, 0);
+    cleanup_restore_fixture(&pool, &[session_id]).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn concurrent_push_session_state_preserves_single_owner_metadata() {
+    let (shared, _settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+
+    let session_id = Uuid::new_v4().to_string();
+    let user_a = format!("state-owner-a-{}", Uuid::new_v4());
+    let user_b = format!("state-owner-b-{}", Uuid::new_v4());
+    cleanup_restore_fixture(&pool, std::slice::from_ref(&session_id)).await;
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let task_a = {
+        let pool = pool.clone();
+        let audit = flusher.writer.clone();
+        let barrier = Arc::clone(&barrier);
+        let session_id = session_id.clone();
+        let user_a = user_a.clone();
+        tokio::spawn(async move {
+            let service = MatrixOneSyncService::new(pool, audit);
+            barrier.wait().await;
+            service
+                .push_session_state(
+                    &session_id,
+                    &user_a,
+                    None,
+                    Some("owner A plan"),
+                    None,
+                    1,
+                    Some("owner-a-branch"),
+                    Some("gpt-5.4-owner-a"),
+                )
+                .await
+                .map(|_| (user_a, "owner-a-branch".to_string()))
+        })
+    };
+    let task_b = {
+        let pool = pool.clone();
+        let audit = flusher.writer.clone();
+        let barrier = Arc::clone(&barrier);
+        let session_id = session_id.clone();
+        let user_b = user_b.clone();
+        tokio::spawn(async move {
+            let service = MatrixOneSyncService::new(pool, audit);
+            barrier.wait().await;
+            service
+                .push_session_state(
+                    &session_id,
+                    &user_b,
+                    None,
+                    Some("owner B plan"),
+                    None,
+                    1,
+                    Some("owner-b-branch"),
+                    Some("gpt-5.4-owner-b"),
+                )
+                .await
+                .map(|_| (user_b, "owner-b-branch".to_string()))
+        })
+    };
+
+    barrier.wait().await;
+    let (result_a, result_b) = tokio::join!(task_a, task_b);
+    let outcomes = [result_a.unwrap(), result_b.unwrap()];
+    let successes: Vec<_> = outcomes
+        .iter()
+        .filter_map(|result| result.as_ref().ok())
+        .collect();
+    assert_eq!(
+        successes.len(),
+        1,
+        "exactly one owner may create session restore metadata; outcomes: {outcomes:?}"
+    );
+    assert!(
+        outcomes.iter().any(|result| result.is_err()),
+        "losing owner must fail instead of updating the winner's metadata"
+    );
+
+    let row = sqlx::query(
+        "SELECT user_id, CAST(metadata AS CHAR) AS metadata_json \
+         FROM agent_sessions WHERE session_id = ? LIMIT 1",
+    )
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load winner session state");
+    let stored_user = row.try_get::<String, _>("user_id").unwrap();
+    let metadata = row
+        .try_get::<Option<String>, _>("metadata_json")
+        .unwrap()
+        .unwrap_or_default();
+    assert_eq!(stored_user, successes[0].0);
+    assert!(
+        metadata.contains(&successes[0].1),
+        "winner branch must be retained in metadata: {metadata}"
+    );
+    let loser_branch = if successes[0].1 == "owner-a-branch" {
+        "owner-b-branch"
+    } else {
+        "owner-a-branch"
+    };
+    assert!(
+        !metadata.contains(loser_branch),
+        "loser metadata must not overwrite the winner: {metadata}"
+    );
+
+    cleanup_restore_fixture(&pool, &[session_id]).await;
+    flusher.shutdown.cancel();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), flusher.join_handle).await;
 }
 
 async fn force_session_artifacts_created_at(
