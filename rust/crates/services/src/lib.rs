@@ -281,9 +281,10 @@ pub use self_surface::{
     ToolFailureView, ToolHealthView, TraceSurface, VerificationSurface,
 };
 pub use session_artifact_store::{
-    DatabaseSessionArtifactStore, LocalSessionArtifactStore, SessionArtifactJsonRecord,
-    SessionArtifactJsonStore, SessionArtifactStore, SessionArtifactStoreError,
-    StoredSessionArtifact, local_session_artifact_store,
+    DatabaseSessionArtifactStore, LOCAL_SESSION_LAYOUT_VERSION, LocalSessionArtifactStore,
+    OwnerScope, OwnerScopeKind, SessionArtifactJsonRecord, SessionArtifactJsonStore,
+    SessionArtifactStore, SessionArtifactStoreError, StoredSessionArtifact, local_owner_user_id,
+    local_session_artifact_store,
 };
 pub use session_fork::{ForkSessionOptions, ForkSessionResult, fork_local_session};
 pub use skill_config::{

@@ -1736,7 +1736,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "55555555-5555-5555-5555-555555555555";
-        std::fs::create_dir_all(temp.path().join(format!("{session_id}.jsonl"))).unwrap();
+        let journal_path = astra_services::session_journal::journal_file_path(session_id);
+        std::fs::create_dir_all(journal_path).unwrap();
 
         let error = execute_self_command(
             &SelfCmd::Snapshot(SelfSessionArgs {

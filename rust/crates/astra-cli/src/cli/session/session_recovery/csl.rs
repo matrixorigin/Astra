@@ -1,10 +1,9 @@
 //! CSL (Conversation State Log) operations: load, rebuild, snapshot.
 use super::io::{
-    csl_log_path_for, read_optional_file_bytes, restore_optional_file_bytes, sync_parent_dir,
-    write_bytes_atomic,
+    csl_log_path_for, csl_store_base_dir, read_optional_file_bytes, restore_optional_file_bytes,
+    sync_parent_dir, write_bytes_atomic,
 };
 use crate::cli::session::session_state::SessionState;
-use astra_services::session_journal;
 
 pub(crate) async fn ensure_loaded_csl_state(
     state: &mut SessionState,
@@ -16,9 +15,7 @@ pub(crate) async fn ensure_loaded_csl_state(
         .is_none_or(|mgr| mgr.session_id() != sid);
     if needs_new_manager {
         let store = std::sync::Arc::new(
-            astra_turn_core::conversation_log::file_store::FileCslStore::new(
-                session_journal::local_sessions_dir(),
-            ),
+            astra_turn_core::conversation_log::file_store::FileCslStore::new(csl_store_base_dir()),
         );
         state.csl_manager = match astra_turn_core::conversation_log::manager::CslManager::new(
             store,
@@ -65,9 +62,7 @@ pub(crate) async fn rebuild_csl_from_history(
     }
 
     let store = std::sync::Arc::new(
-        astra_turn_core::conversation_log::file_store::FileCslStore::new(
-            session_journal::local_sessions_dir(),
-        ),
+        astra_turn_core::conversation_log::file_store::FileCslStore::new(csl_store_base_dir()),
     );
     let mut mgr = astra_turn_core::conversation_log::manager::CslManager::new(
         store,

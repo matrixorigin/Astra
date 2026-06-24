@@ -1,8 +1,9 @@
 //! Session checkpoints — periodic snapshots for debugging and replay.
 //!
 //! A checkpoint captures a summary of the session state at a specific turn.
-//! Checkpoints are stored as individual files in the session directory:
-//! `~/.astra/sessions/<session_id>/checkpoints/<number>-<slug>.md`
+//! Checkpoints are stored as individual files in the owner-bound session
+//! directory:
+//! `~/.astra/sessions/v1/users/<owner>/sessions/<session_id>/checkpoints/<number>-<slug>.md`
 //!
 //! Checkpoints enable:
 //! - Quick overview of session progress without reading JSONL
@@ -591,7 +592,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let session_id = "test-cp-turns";
         let sessions_dir = tmp.path().join(".astra").join("sessions");
-        let dir = sessions_dir.join(session_id).join("checkpoints");
+        let _guard = crate::session_journal::JournalDirGuard::new(&sessions_dir);
+        let dir = crate::session_workspace::workspace_dir_for(session_id).join("checkpoints");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("index.md"),
@@ -599,7 +601,6 @@ mod tests {
         )
         .unwrap();
 
-        let _guard = crate::session_journal::JournalDirGuard::new(&sessions_dir);
         let turns = read_checkpoint_turns(session_id).unwrap();
         assert_eq!(turns, vec![5, 12]);
     }
@@ -609,11 +610,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let session_id = "test-cp-turns-bad";
         let sessions_dir = tmp.path().join(".astra").join("sessions");
-        let dir = sessions_dir.join(session_id).join("checkpoints");
+        let _guard = crate::session_journal::JournalDirGuard::new(&sessions_dir);
+        let dir = crate::session_workspace::workspace_dir_for(session_id).join("checkpoints");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("index.md"), "# Checkpoint Index\n\n  nonsense\n").unwrap();
 
-        let _guard = crate::session_journal::JournalDirGuard::new(&sessions_dir);
         let error = read_checkpoint_turns(session_id).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }

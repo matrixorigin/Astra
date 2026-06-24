@@ -39,6 +39,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use astra_services::session_journal;
 use serde::Serialize;
 
 use crate::cli::session::session_state::SessionState;
@@ -163,11 +164,12 @@ fn build_dump_from_repl(state: &SessionState, chat_history: Vec<ChatTurnDump>) -
 ///      prefixes error out with the candidate list so the user
 ///      can pick.
 ///   2. Default-latest — when `arg` is `None`, returns the most
-///      recently modified `.jsonl` in `~/.astra/sessions/`.  Makes
-///      `astra context dump` a zero-arg operation for bug reports.
+///      recently modified owner-bound journal. Makes `astra context
+///      dump` a zero-arg operation for bug reports.
 pub fn resolve_session_id(arg: Option<&str>) -> Result<String, String> {
-    let sessions_dir = sessions_dir()?;
-    let entries = list_session_ids(&sessions_dir)?;
+    let sessions_dir = session_journal::local_owner_sessions_dir();
+    let entries = session_journal::list_sessions_by_time(usize::MAX)
+        .map_err(|error| format!("read {}: {error}", sessions_dir.display()))?;
     if entries.is_empty() {
         return Err(format!(
             "no sessions found in {} — is ASTRA running?",
@@ -176,9 +178,9 @@ pub fn resolve_session_id(arg: Option<&str>) -> Result<String, String> {
     }
     match arg {
         None => {
-            // Pick the most recently modified. `list_session_ids`
+            // Pick the most recently modified. `list_sessions_by_time`
             // returns entries sorted newest-first by mtime.
-            Ok(entries[0].0.clone())
+            Ok(entries[0].clone())
         }
         Some(raw) => {
             let needle = raw.trim();
@@ -187,13 +189,11 @@ pub fn resolve_session_id(arg: Option<&str>) -> Result<String, String> {
             }
             // Full match wins first — a user who types the full
             // UUID should never get a "multiple matches" error.
-            if entries.iter().any(|(id, _)| id == needle) {
+            if entries.iter().any(|id| id == needle) {
                 return Ok(needle.to_string());
             }
-            let matches: Vec<&String> = entries
-                .iter()
-                .filter_map(|(id, _)| id.starts_with(needle).then_some(id))
-                .collect();
+            let matches: Vec<&String> =
+                entries.iter().filter(|id| id.starts_with(needle)).collect();
             match matches.len() {
                 0 => Err(format!(
                     "no session matches prefix `{needle}` in {}",
@@ -272,42 +272,6 @@ fn fmt_tokens_u64(n: u64) -> String {
     } else {
         format!("{:.1}M", n as f64 / 1_000_000.0)
     }
-}
-
-/// Path to the on-disk session directory. Follows the same
-/// convention as `session_journal::journal_file_path` — we only
-/// need the directory, so we compute it independently to avoid
-/// dragging in more of the journal crate.
-fn sessions_dir() -> Result<PathBuf, String> {
-    let home = std::env::var("HOME").map_err(|_| "HOME env var is unset".to_string())?;
-    Ok(PathBuf::from(home).join(".astra").join("sessions"))
-}
-
-/// Return `(session_id, mtime)` pairs for every `*.jsonl` in the
-/// sessions dir, newest first.  Non-UTF-8 filenames are skipped.
-fn list_session_ids(dir: &Path) -> Result<Vec<(String, SystemTime)>, String> {
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut out: Vec<(String, SystemTime)> = Vec::new();
-    for entry in fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))? {
-        let entry = entry.map_err(|e| format!("read dir entry: {e}"))?;
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let mtime = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        out.push((stem.to_string(), mtime));
-    }
-    // Newest first so `[0]` is the most recent session.
-    out.sort_by_key(|e| std::cmp::Reverse(e.1));
-    Ok(out)
 }
 
 /// Rebuild a dump from a persisted session journal.  Used by the
@@ -631,9 +595,9 @@ mod tests {
 
     // ─── Session resolver ────────────────────────────────────────
 
-    /// Seed a fake `~/.astra/sessions/*.jsonl` tree under a tempdir
-    /// and return the guarded `HomeGuard` alongside the tempdir
-    /// handle (so the tempdir outlives the test).
+    /// Seed fake owner-bound session journals under a tempdir-backed HOME and
+    /// return the guarded `HomeGuard` alongside the tempdir handle (so the
+    /// tempdir outlives the test).
     ///
     /// `ids` are written IN ORDER. On filesystems with per-file
     /// mtime granularity (nsec on Linux) this gives ascending
@@ -641,10 +605,10 @@ mod tests {
     /// enough to cover the default-latest resolver path.
     fn seed_sessions_tmp(ids: &[&str]) -> (crate::tests::HomeGuard, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join(".astra/sessions");
-        fs::create_dir_all(&dir).unwrap();
+        let g = crate::tests::HomeGuard::set(tmp.path());
         for (i, id) in ids.iter().enumerate() {
-            let path = dir.join(format!("{id}.jsonl"));
+            let path = astra_services::session_journal::journal_file_path(id);
+            fs::create_dir_all(path.parent().expect("journal parent")).unwrap();
             fs::write(&path, "{}\n").unwrap();
             // Some filesystems coalesce mtimes written in the same
             // tick. A 10ms nap between writes keeps ordering
@@ -654,7 +618,6 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
-        let g = crate::tests::HomeGuard::set(tmp.path());
         (g, tmp)
     }
 

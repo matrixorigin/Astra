@@ -1942,8 +1942,9 @@ mod state_command_tests {
             .mount(&server)
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        std::fs::create_dir_all(session_journal::local_sessions_dir().join(format!("{sid}.jsonl")))
-            .unwrap();
+        let journal = session_journal::journal_file_path(&sid);
+        std::fs::create_dir_all(journal.parent().expect("journal parent")).unwrap();
+        std::fs::create_dir_all(&journal).unwrap();
 
         let mut state = SessionState::default();
         state.set_session_id(sid);

@@ -226,10 +226,10 @@ pub fn fork_local_session(opts: ForkSessionOptions) -> Result<ForkSessionResult,
     // stale future context. Higher-level CLI flows synthesize a fresh child
     // snapshot immediately after the fork completes.
     if workspace_turn_count.is_some() && forked_at_turn == max_turn {
-        let sessions_dir = crate::local_session_artifact_store().sessions_root();
-        let parent_cp_dir = sessions_dir.join(&parent).join("step_checkpoints");
+        let store = crate::local_session_artifact_store();
+        let parent_cp_dir = store.session_dir(&parent)?.join("step_checkpoints");
         if parent_cp_dir.is_dir() {
-            let new_cp_dir = sessions_dir.join(&new_id).join("step_checkpoints");
+            let new_cp_dir = store.session_dir(&new_id)?.join("step_checkpoints");
             std::fs::create_dir_all(&new_cp_dir)
                 .map_err(|e| format!("create step_checkpoints dir: {e}"))?;
             let mut entries: Vec<_> = std::fs::read_dir(&parent_cp_dir)
@@ -514,8 +514,11 @@ mod tests {
         setup_test_session(&parent_id, 3);
 
         // Create fake checkpoints in parent
-        let sessions_dir = crate::session_journal::local_sessions_dir();
-        let cp_dir = sessions_dir.join(&parent_id).join("step_checkpoints");
+        let store = crate::local_session_artifact_store();
+        let cp_dir = store
+            .session_dir(&parent_id)
+            .unwrap()
+            .join("step_checkpoints");
         std::fs::create_dir_all(&cp_dir).unwrap();
         std::fs::write(cp_dir.join("000001-heavy.json"), r#"{"turn":1}"#).unwrap();
         std::fs::write(cp_dir.join("000002-light.json"), r#"{"turn":2}"#).unwrap();
@@ -532,8 +535,9 @@ mod tests {
         };
         let result = fork_local_session(opts).expect("fork should succeed");
 
-        let new_cp_dir = sessions_dir
-            .join(&result.new_session_id)
+        let new_cp_dir = store
+            .session_dir(&result.new_session_id)
+            .unwrap()
             .join("step_checkpoints");
         assert!(new_cp_dir.exists(), "step_checkpoints dir should be copied");
         assert!(
@@ -563,8 +567,11 @@ mod tests {
         let parent_id = uuid::Uuid::new_v4().to_string();
         setup_test_session(&parent_id, 4);
 
-        let sessions_dir = crate::session_journal::local_sessions_dir();
-        let cp_dir = sessions_dir.join(&parent_id).join("step_checkpoints");
+        let store = crate::local_session_artifact_store();
+        let cp_dir = store
+            .session_dir(&parent_id)
+            .unwrap()
+            .join("step_checkpoints");
         std::fs::create_dir_all(&cp_dir).unwrap();
         std::fs::write(cp_dir.join("000001-heavy.json"), r#"{"turn":1}"#).unwrap();
         std::fs::write(cp_dir.join("000004-heavy.json"), r#"{"turn":4}"#).unwrap();
@@ -579,8 +586,9 @@ mod tests {
         })
         .expect("fork should succeed");
 
-        let child_cp_dir = sessions_dir
-            .join(&result.new_session_id)
+        let child_cp_dir = store
+            .session_dir(&result.new_session_id)
+            .unwrap()
             .join("step_checkpoints");
         assert!(
             !child_cp_dir.exists(),
@@ -597,8 +605,11 @@ mod tests {
         let parent_id = uuid::Uuid::new_v4().to_string();
         setup_test_session(&parent_id, 3);
 
-        let sessions_dir = crate::session_journal::local_sessions_dir();
-        let cp_dir = sessions_dir.join(&parent_id).join("step_checkpoints");
+        let store = crate::local_session_artifact_store();
+        let cp_dir = store
+            .session_dir(&parent_id)
+            .unwrap()
+            .join("step_checkpoints");
         std::fs::create_dir_all(&cp_dir).unwrap();
         std::fs::write(cp_dir.join("000003-heavy.json"), r#"{"turn":3}"#).unwrap();
         std::fs::remove_file(
@@ -616,8 +627,9 @@ mod tests {
         })
         .expect("fork should succeed");
 
-        let child_cp_dir = sessions_dir
-            .join(&result.new_session_id)
+        let child_cp_dir = store
+            .session_dir(&result.new_session_id)
+            .unwrap()
             .join("step_checkpoints");
         assert!(
             !child_cp_dir.exists(),
@@ -671,8 +683,11 @@ mod tests {
         let child_id = uuid::Uuid::new_v4().to_string();
         setup_test_session(&parent_id, 3);
 
-        let sessions_dir = crate::session_journal::local_sessions_dir();
-        let cp_dir = sessions_dir.join(&parent_id).join("step_checkpoints");
+        let store = crate::local_session_artifact_store();
+        let cp_dir = store
+            .session_dir(&parent_id)
+            .unwrap()
+            .join("step_checkpoints");
         std::fs::create_dir_all(&cp_dir).unwrap();
         std::fs::create_dir(cp_dir.join("000003-heavy.json")).unwrap();
 

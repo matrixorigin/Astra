@@ -12,8 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use astra_services::SessionArtifactStore;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use astra_services::{OwnerScope, SessionArtifactStore};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::step_protocol::{
@@ -22,7 +21,7 @@ use crate::step_protocol::{
 
 /// Directory name within session workspace for step checkpoints.
 const STEP_CHECKPOINT_DIR: &str = "step_checkpoints";
-pub const STEP_LOCAL_LAYOUT_VERSION: &str = "v1";
+pub const STEP_LOCAL_LAYOUT_VERSION: &str = astra_services::LOCAL_SESSION_LAYOUT_VERSION;
 pub const STEP_ARTIFACT_SCHEMA_VERSION: u32 = 1;
 const STEP_CHECKPOINT_ARTIFACT_KIND: &str = "step_checkpoint";
 const STEP_EVENT_ARTIFACT_KIND: &str = "step_event";
@@ -145,35 +144,21 @@ fn file_needs_trailing_newline(path: &Path) -> std::io::Result<bool> {
     Ok(last[0] != b'\n')
 }
 
-fn owner_key(user_id: &str) -> std::io::Result<String> {
-    let user_id = user_id.trim();
-    if user_id.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "user_id must not be empty for owner-bound step artifacts",
-        ));
-    }
-    Ok(format!(
-        "b64-{}",
-        URL_SAFE_NO_PAD.encode(user_id.as_bytes())
-    ))
-}
-
 pub fn owner_session_dir_for(user_id: &str, session_id: &str) -> std::io::Result<PathBuf> {
-    astra_services::session_journal::validate_session_id(session_id).map_err(|e| {
+    let owner_scope = OwnerScope::user(user_id).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("invalid session_id for owner-bound step artifact: {e}"),
+            format!("invalid owner for owner-bound step artifact: {e}"),
         )
     })?;
-    let owner_key = owner_key(user_id)?;
-    Ok(astra_services::local_session_artifact_store()
-        .sessions_root()
-        .join(STEP_LOCAL_LAYOUT_VERSION)
-        .join("users")
-        .join(owner_key)
-        .join("sessions")
-        .join(session_id))
+    astra_services::local_session_artifact_store()
+        .session_dir_for_owner(&owner_scope, session_id)
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid session_id for owner-bound step artifact: {e}"),
+            )
+        })
 }
 
 fn checkpoint_dir_for(user_id: &str, session_id: &str) -> std::io::Result<PathBuf> {
@@ -1008,22 +993,13 @@ mod tests {
         let user_id = "owner+matrixone@example.com";
         let session_id = "owner-layout";
 
-        let owner_key = owner_key(user_id).unwrap();
-        assert_eq!(owner_key, "b64-b3duZXIrbWF0cml4b25lQGV4YW1wbGUuY29t");
-        assert!(!owner_key.starts_with("sha256-"));
-        assert!(!owner_key.contains('/'));
-        assert!(!owner_key.contains('='));
-
-        let decoded = URL_SAFE_NO_PAD
-            .decode(owner_key.strip_prefix("b64-").unwrap())
-            .unwrap();
-        assert_eq!(decoded, user_id.as_bytes());
-
         let path = owner_session_dir_for(user_id, session_id).unwrap();
         let rendered = path.to_string_lossy();
         assert!(rendered.contains(&format!(
             "/{STEP_LOCAL_LAYOUT_VERSION}/users/b64-b3duZXIrbWF0cml4b25lQGV4YW1wbGUuY29t/sessions/owner-layout"
         )));
+        assert!(!rendered.contains("sha256-"));
+        assert!(!rendered.contains('='));
     }
 
     #[test]

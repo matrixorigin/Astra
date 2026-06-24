@@ -2,9 +2,13 @@
 use astra_services::session_journal;
 
 pub(crate) fn csl_log_path_for(session_id: &str) -> std::path::PathBuf {
-    session_journal::local_sessions_dir()
-        .join(session_id)
-        .join("conversation_log.jsonl")
+    let store = astra_services::local_session_artifact_store();
+    astra_services::SessionArtifactStore::session_path(&store, session_id, "conversation_log.jsonl")
+        .expect("session id must resolve owner-bound conversation log path")
+}
+
+pub(crate) fn csl_store_base_dir() -> std::path::PathBuf {
+    session_journal::local_owner_sessions_dir()
 }
 pub(crate) fn workspace_path_for(session_id: &str) -> std::path::PathBuf {
     astra_services::session_workspace::workspace_dir_for(session_id).join("workspace.yaml")

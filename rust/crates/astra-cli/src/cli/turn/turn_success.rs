@@ -176,7 +176,7 @@ impl TurnSuccessLiveSnapshot {
 fn build_csl_manager(session_id: &str) -> Option<CslManager> {
     let store = Arc::new(
         astra_turn_core::conversation_log::file_store::FileCslStore::new(
-            astra_services::session_journal::local_sessions_dir(),
+            astra_services::session_journal::local_owner_sessions_dir(),
         ),
     );
     match CslManager::new(store, session_id.to_string(), Default::default()) {

@@ -29,7 +29,7 @@ mod tests {
         write_full_csl_snapshot_atomic,
     };
     use super::io::{
-        composite_index_path_for, csl_log_path_for, read_optional_file_bytes,
+        composite_index_path_for, csl_log_path_for, csl_store_base_dir, read_optional_file_bytes,
         restore_optional_file_bytes, with_workspace_lock, write_bytes_atomic,
     };
     use super::{
@@ -131,9 +131,8 @@ mod tests {
     fn workspace_metadata_from_live_state_recovers_checkpoint_turns_from_index() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("workspace-live-checkpoints-{}", uuid::Uuid::new_v4());
-        let checkpoint_dir = session_journal::local_sessions_dir()
-            .join(&sid)
-            .join("checkpoints");
+        let checkpoint_dir =
+            astra_services::session_workspace::workspace_dir_for(&sid).join("checkpoints");
         std::fs::create_dir_all(&checkpoint_dir).unwrap();
         std::fs::write(
             checkpoint_dir.join("index.md"),
@@ -1016,9 +1015,7 @@ mod tests {
         assert!(restored.pipeline_state.is_none());
 
         let store = std::sync::Arc::new(
-            astra_turn_core::conversation_log::file_store::FileCslStore::new(
-                session_journal::local_sessions_dir(),
-            ),
+            astra_turn_core::conversation_log::file_store::FileCslStore::new(csl_store_base_dir()),
         );
         let mut mgr = astra_turn_core::conversation_log::manager::CslManager::new(
             store,
@@ -1037,9 +1034,7 @@ mod tests {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("csl-state-{}", uuid::Uuid::new_v4());
         let store = std::sync::Arc::new(
-            astra_turn_core::conversation_log::file_store::FileCslStore::new(
-                session_journal::local_sessions_dir(),
-            ),
+            astra_turn_core::conversation_log::file_store::FileCslStore::new(csl_store_base_dir()),
         );
         let mut mgr = astra_turn_core::conversation_log::manager::CslManager::new(
             store,
@@ -1108,7 +1103,8 @@ mod tests {
     async fn ensure_loaded_csl_state_returns_err_for_corrupt_csl_snapshot() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("csl-corrupt-{}", uuid::Uuid::new_v4());
-        let session_dir = session_journal::local_sessions_dir().join(&sid);
+        let store = astra_services::local_session_artifact_store();
+        let session_dir = astra_services::SessionArtifactStore::session_dir(&store, &sid).unwrap();
         std::fs::create_dir_all(&session_dir).unwrap();
         let csl_path = session_dir.join("conversation_log.jsonl");
         std::fs::write(
@@ -1149,9 +1145,7 @@ mod tests {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("empty-turn-{}", uuid::Uuid::new_v4());
         let store = std::sync::Arc::new(
-            astra_turn_core::conversation_log::file_store::FileCslStore::new(
-                session_journal::local_sessions_dir(),
-            ),
+            astra_turn_core::conversation_log::file_store::FileCslStore::new(csl_store_base_dir()),
         );
         let mgr = astra_turn_core::conversation_log::manager::CslManager::new(
             store,
@@ -1176,10 +1170,7 @@ mod tests {
         let mgr = state.csl_manager.as_ref().expect("manager");
         assert_eq!(mgr.last_seq(), 0);
         assert!(
-            !session_journal::local_sessions_dir()
-                .join(&sid)
-                .join("conversation_log.jsonl")
-                .exists(),
+            !csl_log_path_for(&sid).exists(),
             "empty turn zero should not persist a snapshot"
         );
     }
@@ -1209,16 +1200,15 @@ mod tests {
         ws.turn_count = 9;
         astra_services::session_workspace::write_workspace(&ws).unwrap();
 
-        let session_dir = session_journal::local_sessions_dir().join(&sid);
+        let store = astra_services::local_session_artifact_store();
+        let session_dir = astra_services::SessionArtifactStore::session_dir(&store, &sid).unwrap();
         std::fs::create_dir_all(&session_dir).unwrap();
         let csl_path = session_dir.join("conversation_log.jsonl");
         std::fs::write(&csl_path, b"{\"stale\":true}\n").unwrap();
         std::fs::create_dir(session_dir.join(".tmp-conversation_log.jsonl")).unwrap();
 
         let store = std::sync::Arc::new(
-            astra_turn_core::conversation_log::file_store::FileCslStore::new(
-                session_journal::local_sessions_dir(),
-            ),
+            astra_turn_core::conversation_log::file_store::FileCslStore::new(csl_store_base_dir()),
         );
         let mgr = astra_turn_core::conversation_log::manager::CslManager::new(
             store,
@@ -1373,9 +1363,7 @@ mod tests {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("history-sync-success-{}", uuid::Uuid::new_v4());
         let store = std::sync::Arc::new(
-            astra_turn_core::conversation_log::file_store::FileCslStore::new(
-                session_journal::local_sessions_dir(),
-            ),
+            astra_turn_core::conversation_log::file_store::FileCslStore::new(csl_store_base_dir()),
         );
         let mgr = astra_turn_core::conversation_log::manager::CslManager::new(
             store,

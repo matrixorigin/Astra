@@ -3973,10 +3973,12 @@ esac
     }
 
     fn cleanup_session_artifacts(session_id: &str) {
-        std::fs::remove_dir_all(
-            astra_services::session_journal::local_sessions_dir().join(session_id),
-        )
-        .ok();
+        let store = astra_services::local_session_artifact_store();
+        if let Ok(session_dir) =
+            astra_services::SessionArtifactStore::session_dir(&store, session_id)
+        {
+            std::fs::remove_dir_all(session_dir).ok();
+        }
     }
 
     fn session_state_test_executor(

@@ -685,19 +685,13 @@ fn resolve_session_id(input: &str) -> String {
 }
 
 fn session_dir(session_id: &str) -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".astra")
-        .join("sessions")
-        .join(session_id)
+    let store = astra_services::local_session_artifact_store();
+    astra_services::SessionArtifactStore::session_dir(&store, session_id)
+        .expect("session id must resolve owner-bound debug session directory")
 }
 
 fn session_journal_path(session_id: &str) -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".astra")
-        .join("sessions")
-        .join(format!("{session_id}.jsonl"))
+    astra_services::session_journal::journal_file_path(session_id)
 }
 
 #[derive(Debug)]

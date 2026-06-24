@@ -961,7 +961,11 @@ mod tests {
 
     impl SessionDirGuard {
         fn new(session_id: &str) -> Self {
-            Self(astra_services::session_journal::local_sessions_dir().join(session_id))
+            let store = astra_services::local_session_artifact_store();
+            Self(
+                astra_services::SessionArtifactStore::session_dir(&store, session_id)
+                    .expect("session id must resolve owner-bound test session directory"),
+            )
         }
     }
 

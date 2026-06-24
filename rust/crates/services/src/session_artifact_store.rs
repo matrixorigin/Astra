@@ -10,6 +10,7 @@ use std::path::{Component, Path, PathBuf};
 
 use astra_core::{MatrixOneSettings, SharedPool};
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Row, mysql::MySqlRow, query};
@@ -58,11 +59,102 @@ pub enum SessionArtifactStoreError {
     SessionNotOwned { session_id: String, user_id: String },
 }
 
+pub const LOCAL_SESSION_LAYOUT_VERSION: &str = "v1";
+pub const LOCAL_SESSION_JOURNAL_FILE_SUFFIX: &str = "jsonl";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerScopeKind {
+    User,
+    Team,
+    Org,
+    ServiceAccount,
+}
+
+impl OwnerScopeKind {
+    fn directory_segment(self) -> &'static str {
+        match self {
+            OwnerScopeKind::User => "users",
+            OwnerScopeKind::Team => "teams",
+            OwnerScopeKind::Org => "orgs",
+            OwnerScopeKind::ServiceAccount => "service_accounts",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerScope {
+    kind: OwnerScopeKind,
+    id: String,
+}
+
+impl OwnerScope {
+    pub fn new(kind: OwnerScopeKind, id: impl Into<String>) -> Result<Self, String> {
+        let id = id.into();
+        let trimmed = id.trim();
+        if trimmed.is_empty() {
+            return Err("owner id must not be empty".to_string());
+        }
+        Ok(Self {
+            kind,
+            id: trimmed.to_string(),
+        })
+    }
+
+    pub fn user(user_id: impl Into<String>) -> Result<Self, String> {
+        Self::new(OwnerScopeKind::User, user_id)
+    }
+
+    pub fn local_user() -> Self {
+        Self::user(local_owner_user_id()).expect("local owner user id is non-empty")
+    }
+
+    pub fn kind(&self) -> OwnerScopeKind {
+        self.kind
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn directory_segment(&self) -> &'static str {
+        self.kind.directory_segment()
+    }
+
+    fn storage_key(&self) -> String {
+        format!("b64-{}", URL_SAFE_NO_PAD.encode(self.id.as_bytes()))
+    }
+}
+
+pub fn local_owner_user_id() -> String {
+    std::env::var("ASTRA_CLI_USER_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "local".to_string())
+}
+
 pub trait SessionArtifactStore {
     fn sessions_root(&self) -> PathBuf;
+    fn owner_sessions_root(&self, owner_scope: &OwnerScope) -> Result<PathBuf, String>;
+    fn session_dir_for_owner(
+        &self,
+        owner_scope: &OwnerScope,
+        session_id: &str,
+    ) -> Result<PathBuf, String>;
     fn session_dir(&self, session_id: &str) -> Result<PathBuf, String>;
+    fn session_path_for_owner(
+        &self,
+        owner_scope: &OwnerScope,
+        session_id: &str,
+        relative: impl AsRef<Path>,
+    ) -> Result<PathBuf, String>;
     fn session_path(&self, session_id: &str, relative: impl AsRef<Path>)
     -> Result<PathBuf, String>;
+    fn journal_path_for_owner(
+        &self,
+        owner_scope: &OwnerScope,
+        session_id: &str,
+    ) -> Result<PathBuf, String>;
     fn journal_path(&self, session_id: &str) -> Result<PathBuf, String>;
 }
 
@@ -469,9 +561,39 @@ impl SessionArtifactStore for LocalSessionArtifactStore {
         crate::session_journal::local_sessions_dir()
     }
 
-    fn session_dir(&self, session_id: &str) -> Result<PathBuf, String> {
+    fn owner_sessions_root(&self, owner_scope: &OwnerScope) -> Result<PathBuf, String> {
+        Ok(self
+            .sessions_root()
+            .join(LOCAL_SESSION_LAYOUT_VERSION)
+            .join(owner_scope.directory_segment())
+            .join(owner_scope.storage_key())
+            .join("sessions"))
+    }
+
+    fn session_dir_for_owner(
+        &self,
+        owner_scope: &OwnerScope,
+        session_id: &str,
+    ) -> Result<PathBuf, String> {
         crate::session_journal::validate_session_id(session_id)?;
-        Ok(self.sessions_root().join(session_id))
+        Ok(self.owner_sessions_root(owner_scope)?.join(session_id))
+    }
+
+    fn session_dir(&self, session_id: &str) -> Result<PathBuf, String> {
+        self.session_dir_for_owner(&OwnerScope::local_user(), session_id)
+    }
+
+    fn session_path_for_owner(
+        &self,
+        owner_scope: &OwnerScope,
+        session_id: &str,
+        relative: impl AsRef<Path>,
+    ) -> Result<PathBuf, String> {
+        let relative = relative.as_ref();
+        validate_relative_path(relative)?;
+        Ok(self
+            .session_dir_for_owner(owner_scope, session_id)?
+            .join(relative))
     }
 
     fn session_path(
@@ -479,14 +601,22 @@ impl SessionArtifactStore for LocalSessionArtifactStore {
         session_id: &str,
         relative: impl AsRef<Path>,
     ) -> Result<PathBuf, String> {
-        let relative = relative.as_ref();
-        validate_relative_path(relative)?;
-        Ok(self.session_dir(session_id)?.join(relative))
+        self.session_path_for_owner(&OwnerScope::local_user(), session_id, relative)
+    }
+
+    fn journal_path_for_owner(
+        &self,
+        owner_scope: &OwnerScope,
+        session_id: &str,
+    ) -> Result<PathBuf, String> {
+        crate::session_journal::validate_session_id(session_id)?;
+        Ok(self
+            .owner_sessions_root(owner_scope)?
+            .join(format!("{session_id}.{LOCAL_SESSION_JOURNAL_FILE_SUFFIX}")))
     }
 
     fn journal_path(&self, session_id: &str) -> Result<PathBuf, String> {
-        crate::session_journal::validate_session_id(session_id)?;
-        Ok(self.sessions_root().join(format!("{session_id}.jsonl")))
+        self.journal_path_for_owner(&OwnerScope::local_user(), session_id)
     }
 }
 
@@ -500,16 +630,26 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let store = local_session_artifact_store();
+        let owner_sessions_root = store
+            .owner_sessions_root(&OwnerScope::local_user())
+            .expect("owner sessions root");
         let session_dir = store.session_dir("sess-123").unwrap();
-        assert_eq!(session_dir, temp.path().join("sess-123"));
+        assert_eq!(session_dir, owner_sessions_root.join("sess-123"));
         let artifact_path = store
             .session_path("sess-123", "step_checkpoints/000001-heavy.json")
             .unwrap();
         assert_eq!(
             artifact_path,
-            temp.path()
+            owner_sessions_root
                 .join("sess-123")
                 .join("step_checkpoints/000001-heavy.json")
+        );
+        assert_eq!(
+            store.journal_path("sess-123").unwrap(),
+            store
+                .owner_sessions_root(&OwnerScope::local_user())
+                .unwrap()
+                .join("sess-123.jsonl")
         );
     }
 

@@ -1,6 +1,7 @@
 //! Session Journal — local JSONL persistence for observability & auditability.
 //!
-//! Writes one line per event to `~/.astra/sessions/<session_id>.jsonl`.
+//! Writes one line per event to
+//! `~/.astra/sessions/v1/users/<owner>/sessions/<session_id>.jsonl`.
 //! Events include: turn completions, config changes, errors, compactions.
 //!
 //! The journal is append-only and survives process exits.
@@ -16,7 +17,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
-use crate::SessionArtifactStore;
+use crate::{OwnerScope, SessionArtifactStore};
 
 thread_local! {
     static LOCAL_SESSIONS_DIR_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
@@ -420,6 +421,9 @@ fn prepend_session_start_if_needed<'a>(
 /// file already exists, fall through to a plain append-open without chmod.
 fn open_locked_journal_file(path: &Path) -> std::io::Result<std::fs::File> {
     use fs2::FileExt;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let create_attempt = std::fs::OpenOptions::new()
         .create_new(true)
         .read(true)
@@ -1515,9 +1519,10 @@ impl JournalWriter {
     pub fn new(session_id: &str) -> std::io::Result<Self> {
         validate_session_id(session_id)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        let dir = journal_dir();
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{session_id}.jsonl"));
+        let path = journal_file_path(session_id);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
         Ok(Self { path })
     }
 
@@ -1838,7 +1843,7 @@ fn parse_journal_text(content: &str) -> (Vec<JournalEvent>, usize, usize) {
 pub fn read_journal(session_id: &str) -> std::io::Result<Vec<JournalEvent>> {
     validate_session_id(session_id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let path = journal_dir().join(format!("{session_id}.jsonl"));
+    let path = journal_file_path(session_id);
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -1859,7 +1864,7 @@ pub fn read_journal_tail(session_id: &str, limit: usize) -> std::io::Result<Vec<
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let path = journal_dir().join(format!("{session_id}.jsonl"));
+    let path = journal_file_path(session_id);
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -1892,14 +1897,14 @@ pub fn read_journal_tail(session_id: &str, limit: usize) -> std::io::Result<Vec<
 pub fn journal_needs_session_start(session_id: &str) -> std::io::Result<bool> {
     validate_session_id(session_id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let path = journal_dir().join(format!("{session_id}.jsonl"));
+    let path = journal_file_path(session_id);
     journal_needs_session_start_for_path(&path)
 }
 
 pub fn ensure_session_start_event(session_id: &str, model: Option<&str>) -> std::io::Result<()> {
     validate_session_id(session_id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let path = journal_dir().join(format!("{session_id}.jsonl"));
+    let path = journal_file_path(session_id);
 
     // Acquire the lock first — concurrent writers (including external
     // processes or edge-cloud sync replays) may have modified the file
@@ -2000,7 +2005,7 @@ pub fn read_journal_for_digest(
 ) -> std::io::Result<(Vec<JournalEvent>, usize, usize)> {
     validate_session_id(session_id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let path = journal_dir().join(format!("{session_id}.jsonl"));
+    let path = journal_file_path(session_id);
     if !path.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -2013,7 +2018,17 @@ pub fn read_journal_for_digest(
 
 /// List all session IDs that have journal files.
 pub fn list_sessions() -> std::io::Result<Vec<String>> {
-    let dir = journal_dir();
+    list_sessions_for_owner(&OwnerScope::local_user())
+}
+
+pub fn list_sessions_for_user(user_id: &str) -> std::io::Result<Vec<String>> {
+    let owner_scope = OwnerScope::user(user_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    list_sessions_for_owner(&owner_scope)
+}
+
+pub fn list_sessions_for_owner(owner_scope: &OwnerScope) -> std::io::Result<Vec<String>> {
+    let dir = journal_dir_for_owner(owner_scope)?;
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -2030,6 +2045,11 @@ pub fn list_sessions() -> std::io::Result<Vec<String>> {
     Ok(sessions)
 }
 
+#[must_use]
+pub fn local_owner_sessions_dir() -> PathBuf {
+    journal_dir()
+}
+
 /// Path to the JSONL journal file for a session.
 ///
 /// # Panics
@@ -2041,16 +2061,46 @@ pub fn journal_file_path(session_id: &str) -> PathBuf {
         validate_session_id(session_id).is_ok(),
         "unsafe session ID passed to journal_file_path: {session_id}"
     );
-    journal_dir().join(format!("{session_id}.jsonl"))
+    crate::local_session_artifact_store()
+        .journal_path(session_id)
+        .expect("validated session_id must resolve journal path")
+}
+
+pub fn journal_file_path_for_owner(
+    owner_scope: &OwnerScope,
+    session_id: &str,
+) -> std::io::Result<PathBuf> {
+    crate::local_session_artifact_store()
+        .journal_path_for_owner(owner_scope, session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+}
+
+pub fn journal_file_path_for_user(user_id: &str, session_id: &str) -> std::io::Result<PathBuf> {
+    let owner_scope = OwnerScope::user(user_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    journal_file_path_for_owner(&owner_scope, session_id)
 }
 
 /// List local session IDs sorted by file modification time (most recent first).
 /// Only returns the `limit` most recent sessions to avoid scanning all files.
 pub fn list_sessions_by_time(limit: usize) -> std::io::Result<Vec<String>> {
+    list_sessions_by_time_for_owner(&OwnerScope::local_user(), limit)
+}
+
+pub fn list_sessions_by_time_for_user(user_id: &str, limit: usize) -> std::io::Result<Vec<String>> {
+    let owner_scope = OwnerScope::user(user_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    list_sessions_by_time_for_owner(&owner_scope, limit)
+}
+
+pub fn list_sessions_by_time_for_owner(
+    owner_scope: &OwnerScope,
+    limit: usize,
+) -> std::io::Result<Vec<String>> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
-    let dir = journal_dir();
+    let dir = journal_dir_for_owner(owner_scope)?;
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -2090,7 +2140,7 @@ pub fn count_turns(session_id: &str) -> u32 {
         return 0;
     }
     use std::io::BufRead;
-    let path = journal_dir().join(format!("{session_id}.jsonl"));
+    let path = journal_file_path(session_id);
     let file = match std::fs::File::open(&path) {
         Ok(f) => f,
         Err(_) => return 0,
@@ -2109,7 +2159,7 @@ pub fn count_turns(session_id: &str) -> u32 {
 pub fn peek_session_meta(session_id: &str) -> Option<SessionPeek> {
     validate_session_id(session_id).ok()?;
     use std::io::BufRead;
-    let path = journal_dir().join(format!("{session_id}.jsonl"));
+    let path = journal_file_path(session_id);
     let file = std::fs::File::open(&path).ok()?;
     let reader = std::io::BufReader::new(file);
 
@@ -2496,18 +2546,33 @@ pub fn find_stale_sessions(
 ///
 /// Returns `Ok(bytes_freed)` on success.
 pub fn delete_session(session_id: &str) -> std::io::Result<u64> {
+    delete_session_for_owner(&OwnerScope::local_user(), session_id)
+}
+
+pub fn delete_session_for_user(user_id: &str, session_id: &str) -> std::io::Result<u64> {
+    let owner_scope = OwnerScope::user(user_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    delete_session_for_owner(&owner_scope, session_id)
+}
+
+pub fn delete_session_for_owner(
+    owner_scope: &OwnerScope,
+    session_id: &str,
+) -> std::io::Result<u64> {
     validate_session_id(session_id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let journal = journal_file_path(session_id);
-    let ws_dir = crate::session_workspace::workspace_dir_for(session_id);
+    let journal = journal_file_path_for_owner(owner_scope, session_id)?;
+    let session_dir = crate::local_session_artifact_store()
+        .session_dir_for_owner(owner_scope, session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let mut freed = 0u64;
     if journal.exists() {
         freed += std::fs::metadata(&journal).map(|m| m.len()).unwrap_or(0);
         std::fs::remove_file(&journal)?;
     }
-    if ws_dir.exists() {
-        freed += dir_size_recursive(&ws_dir);
-        std::fs::remove_dir_all(&ws_dir)?;
+    if session_dir.exists() {
+        freed += dir_size_recursive(&session_dir);
+        std::fs::remove_dir_all(&session_dir)?;
     }
     Ok(freed)
 }
@@ -2579,7 +2644,7 @@ pub fn archive_journal(session_id: &str) -> std::io::Result<(u64, u64)> {
         ));
     }
     let original_bytes = content.len() as u64;
-    let dst = journal_dir().join(format!("{session_id}.jsonl.gz"));
+    let dst = src.with_extension("jsonl.gz");
     let out_file = std::fs::File::create(&dst)?;
     let mut encoder = GzEncoder::new(out_file, Compression::default());
     encoder.write_all(&content)?;
@@ -2651,9 +2716,16 @@ pub fn resolve_session_id(query: &str) -> std::io::Result<String> {
     resolve_session_id_from_list(query, &sessions)
 }
 
-/// Helper: get the journal directory path (same as [`local_sessions_dir()`]).
+fn journal_dir_for_owner(owner_scope: &OwnerScope) -> std::io::Result<PathBuf> {
+    crate::local_session_artifact_store()
+        .owner_sessions_root(owner_scope)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+}
+
+/// Helper: get the current owner's journal directory under [`local_sessions_dir()`].
 fn journal_dir() -> PathBuf {
-    crate::local_session_artifact_store().sessions_root()
+    journal_dir_for_owner(&OwnerScope::local_user())
+        .expect("local owner user id must resolve journal dir")
 }
 
 fn resolve_session_id_from_list(query: &str, sessions: &[String]) -> std::io::Result<String> {
@@ -4738,11 +4810,9 @@ mod tests {
         let tmp = tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
         let sid = "0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0";
-        std::fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
-            REAL_SESSION_0AC769_FIXTURE,
-        )
-        .unwrap();
+        let path = journal_file_path(sid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, REAL_SESSION_0AC769_FIXTURE).unwrap();
 
         let (events, non_empty_lines, malformed_lines) = read_journal_for_digest(sid).unwrap();
         assert_eq!(non_empty_lines, 14);
@@ -4802,11 +4872,9 @@ mod tests {
         let tmp = tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
         let sid = "1d21375d-18f5-4e53-9145-1fa197b564dd";
-        std::fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
-            REAL_SESSION_1D21375_FIXTURE,
-        )
-        .unwrap();
+        let path = journal_file_path(sid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, REAL_SESSION_1D21375_FIXTURE).unwrap();
 
         let (events, non_empty_lines, malformed_lines) = read_journal_for_digest(sid).unwrap();
         assert_eq!(non_empty_lines, 31);
@@ -5166,11 +5234,9 @@ mod tests {
                 0,
             );
             let valid = serde_json::to_string(&event).unwrap();
-            std::fs::write(
-                journal_file_path(sid),
-                format!("{valid}\n{{\"type\":\"turn\",\"turn\":"),
-            )
-            .unwrap();
+            let path = journal_file_path(sid);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("{valid}\n{{\"type\":\"turn\",\"turn\":")).unwrap();
             let events = read_journal(sid).expect("truncated tail should not poison journal");
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].turn, Some(1));
@@ -5976,11 +6042,8 @@ mod tests {
     #[test]
     fn count_turns_counts_only_turn_events() {
         let dir = tempfile::tempdir().unwrap();
-        // Override journal_dir by writing directly
+        let _guard = JournalDirGuard::new(dir.path());
         let sid = format!("count-test-{}", uuid::Uuid::new_v4());
-        let path = dir.path().join(format!("{sid}.jsonl"));
-
-        // Write mixed event types
         let lines = [
             r#"{"type":"session_start","ts":"2026-01-01T00:00:00Z","session_id":"s"}"#,
             r#"{"type":"turn","ts":"2026-01-01T00:00:01Z","session_id":"s","turn":1}"#,
@@ -5988,19 +6051,12 @@ mod tests {
             r#"{"type":"turn","ts":"2026-01-01T00:00:03Z","session_id":"s","turn":2}"#,
             r#"{"type":"session_end","ts":"2026-01-01T00:00:04Z","session_id":"s"}"#,
         ];
-        std::fs::write(&path, lines.join("\n")).unwrap();
-
-        // count_turns reads from journal_dir(), so test via the actual function
-        // by writing to the real journal dir
-        let real_path = journal_dir().join(format!("{sid}.jsonl"));
-        std::fs::create_dir_all(journal_dir()).ok();
+        let real_path = journal_file_path(&sid);
+        std::fs::create_dir_all(real_path.parent().unwrap()).unwrap();
         std::fs::write(&real_path, lines.join("\n")).unwrap();
 
         let count = count_turns(&sid);
         assert_eq!(count, 2, "should count exactly 2 turn events");
-
-        // Cleanup
-        let _ = std::fs::remove_file(&real_path);
     }
 
     #[test]
@@ -6093,6 +6149,75 @@ mod tests {
         for (_, path) in &created {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn list_sessions_by_time_for_user_is_owner_scoped() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let user_a_sid = format!("owner-a-{}", uuid::Uuid::new_v4());
+        let user_b_sid = format!("owner-b-{}", uuid::Uuid::new_v4());
+        let user_a_path = journal_file_path_for_user("user-a", &user_a_sid).unwrap();
+        let user_b_path = journal_file_path_for_user("user-b", &user_b_sid).unwrap();
+        std::fs::create_dir_all(user_a_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(user_b_path.parent().unwrap()).unwrap();
+        std::fs::write(&user_a_path, "{}").unwrap();
+        std::fs::write(&user_b_path, "{}").unwrap();
+
+        let user_a_sessions = list_sessions_by_time_for_user("user-a", 100).unwrap();
+        let user_b_sessions = list_sessions_by_time_for_user("user-b", 100).unwrap();
+
+        assert!(user_a_sessions.contains(&user_a_sid));
+        assert!(!user_a_sessions.contains(&user_b_sid));
+        assert!(user_b_sessions.contains(&user_b_sid));
+        assert!(!user_b_sessions.contains(&user_a_sid));
+    }
+
+    #[test]
+    fn delete_session_for_user_removes_only_owner_bound_artifacts() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = format!("owner-delete-{}", uuid::Uuid::new_v4());
+        let user_a = OwnerScope::user("user-a").unwrap();
+        let user_b = OwnerScope::user("user-b").unwrap();
+        let store = crate::local_session_artifact_store();
+        let user_a_journal = journal_file_path_for_owner(&user_a, &sid).unwrap();
+        let user_b_journal = journal_file_path_for_owner(&user_b, &sid).unwrap();
+        let user_a_session_dir = store.session_dir_for_owner(&user_a, &sid).unwrap();
+        let user_b_session_dir = store.session_dir_for_owner(&user_b, &sid).unwrap();
+        std::fs::create_dir_all(user_a_journal.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(user_b_journal.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(user_a_session_dir.join("step_checkpoints")).unwrap();
+        std::fs::create_dir_all(user_b_session_dir.join("step_checkpoints")).unwrap();
+        std::fs::write(&user_a_journal, "{}").unwrap();
+        std::fs::write(&user_b_journal, "{}").unwrap();
+        std::fs::write(
+            user_a_session_dir
+                .join("step_checkpoints")
+                .join("000001-heavy.json"),
+            "{}",
+        )
+        .unwrap();
+        std::fs::write(
+            user_b_session_dir
+                .join("step_checkpoints")
+                .join("000001-heavy.json"),
+            "{}",
+        )
+        .unwrap();
+
+        let freed = delete_session_for_user("user-a", &sid).unwrap();
+
+        assert!(freed > 0);
+        assert!(!user_a_journal.exists());
+        assert!(!user_a_session_dir.exists());
+        assert!(user_b_journal.exists());
+        assert!(
+            user_b_session_dir
+                .join("step_checkpoints")
+                .join("000001-heavy.json")
+                .exists()
+        );
     }
 
     #[test]
@@ -8311,6 +8436,7 @@ mod session_start_detection_tests {
         // --- needs session_start when file doesn't exist ---
         let tmp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
+        std::fs::create_dir_all(journal_dir()).unwrap();
         let path = journal_dir().join("nonexistent-session.jsonl");
         assert!(journal_needs_session_start_for_path(&path).unwrap());
 
@@ -8522,6 +8648,7 @@ mod session_start_detection_tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
+        std::fs::create_dir_all(journal_dir()).unwrap();
 
         // Does NOT chmod when file already exists
         let path = journal_dir().join("preexisting.jsonl");

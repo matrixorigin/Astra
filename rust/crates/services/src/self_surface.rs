@@ -2205,7 +2205,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "svc-self-journal-error";
-        std::fs::create_dir_all(temp.path().join(format!("{session_id}.jsonl"))).unwrap();
+        let journal_path = crate::session_journal::journal_file_path(session_id);
+        std::fs::create_dir_all(&journal_path).unwrap();
 
         let service = LocalSelfSurfaceService::new();
         let error = service
@@ -2377,11 +2378,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0";
-        std::fs::write(
-            temp.path().join(format!("{session_id}.jsonl")),
-            REAL_SESSION_0AC769_FIXTURE,
-        )
-        .unwrap();
+        let path = crate::session_journal::journal_file_path(session_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, REAL_SESSION_0AC769_FIXTURE).unwrap();
 
         let service =
             LocalSelfSurfaceService::new().with_runtime_support(Arc::new(StubRuntimeSupport));
@@ -2423,11 +2422,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0";
-        std::fs::write(
-            temp.path().join(format!("{session_id}.jsonl")),
-            REAL_SESSION_0AC769_FIXTURE,
-        )
-        .unwrap();
+        let path = crate::session_journal::journal_file_path(session_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, REAL_SESSION_0AC769_FIXTURE).unwrap();
 
         let service =
             LocalSelfSurfaceService::new().with_runtime_support(Arc::new(StubRuntimeSupport));

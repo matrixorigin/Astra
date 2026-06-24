@@ -1310,24 +1310,11 @@ fn restored_session_from_workspace(
 }
 
 fn cloud_heavy_payload(root: &serde_json::Value) -> Option<&serde_json::Value> {
-    if let Some(heavy) = root.get("Heavy") {
-        return Some(heavy);
-    }
-    if root.get("messages").is_some()
-        || root.get("blocked_tools").is_some()
-        || root.get("recent_tools").is_some()
-        || root.get("approval_overrides").is_some()
-        || root.get("interruption").is_some()
-        || root.get("compaction_state").is_some()
-    {
-        return Some(root);
-    }
-    None
+    root.get("Heavy")
 }
 
 /// Parse cloud step-checkpoint JSON into the heavy-state fields needed for restore.
-/// Accepts both the current externally tagged `{"Heavy": ...}` shape and legacy
-/// rows that stored the heavy payload unwrapped.
+/// Accepts only the current externally tagged `{"Heavy": ...}` shape.
 pub fn parse_cloud_heavy_checkpoint_state(
     state_json: &str,
 ) -> Result<Option<CloudHeavyCheckpointState>, String> {
@@ -2372,11 +2359,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
         let sid = "0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0";
-        std::fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
-            REAL_SESSION_0AC769_FIXTURE,
-        )
-        .unwrap();
+        let path = crate::session_journal::journal_file_path(sid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, REAL_SESSION_0AC769_FIXTURE).unwrap();
 
         let svc = HybridRestoreService::local_only();
         let restored = svc
@@ -2400,11 +2385,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
         let sid = "0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0";
-        std::fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
-            REAL_SESSION_0AC769_FIXTURE,
-        )
-        .unwrap();
+        let path = crate::session_journal::journal_file_path(sid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, REAL_SESSION_0AC769_FIXTURE).unwrap();
 
         let ws = session_workspace::WorkspaceMetadata::with_context(sid, "glm-5.1", "/repo", None);
         session_workspace::write_workspace(&ws).unwrap();
@@ -2564,7 +2547,8 @@ mod tests {
         let _guard = JournalDirGuard::new(tmp.path());
         let sid = uuid::Uuid::new_v4().to_string();
 
-        std::fs::create_dir_all(tmp.path().join(format!("{sid}.jsonl"))).unwrap();
+        let path = crate::session_journal::journal_file_path(&sid);
+        std::fs::create_dir_all(&path).unwrap();
 
         let svc = HybridRestoreService::local_only();
         let error = svc
@@ -3277,7 +3261,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_cloud_heavy_checkpoint_state_accepts_tagged_and_legacy_shapes() {
+    fn parse_cloud_heavy_checkpoint_state_accepts_only_tagged_shape() {
         let messages = vec![serde_json::json!({"role":"user","content":"hi"})];
         let approval_overrides = serde_json::json!({"rules": []});
         let interruption = serde_json::json!({"kind":"rate_limited"});
@@ -3303,7 +3287,7 @@ mod tests {
             }
         })
         .to_string();
-        let legacy = serde_json::json!({
+        let untagged = serde_json::json!({
             "messages": expected.messages.clone(),
             "blocked_tools": expected.blocked_tools.clone(),
             "recent_tools": expected.recent_tools.clone(),
@@ -3318,8 +3302,9 @@ mod tests {
             Ok(Some(expected.clone()))
         );
         assert_eq!(
-            parse_cloud_heavy_checkpoint_state(&legacy),
-            Ok(Some(expected))
+            parse_cloud_heavy_checkpoint_state(&untagged),
+            Ok(None),
+            "unversioned/unwrapped cloud heavy payloads must not be restored"
         );
     }
 

@@ -2513,11 +2513,21 @@ pub(crate) mod tests {
         )])
     }
 
-    /// Unwind-safe cleanup guard for tests that write under
-    /// `session_journal::local_sessions_dir()`. Removes the provided directory
-    /// on drop — including during panic unwinds from failed assertions — so
-    /// repeated runs don't leak `tier-gate-*` / `precompact-spill-*` siblings.
+    /// Unwind-safe cleanup guard for tests that write owner-bound session
+    /// artifacts. Removes the provided directory on drop — including during
+    /// panic unwinds from failed assertions — so repeated runs don't leak
+    /// `tier-gate-*` / `precompact-spill-*` siblings.
     struct SpillDirGuard(std::path::PathBuf);
+
+    impl SpillDirGuard {
+        fn new(session_id: &str) -> Self {
+            let store = astra_services::local_session_artifact_store();
+            Self(
+                astra_services::SessionArtifactStore::session_dir(&store, session_id)
+                    .expect("session id must resolve owner-bound spill directory"),
+            )
+        }
+    }
 
     impl Drop for SpillDirGuard {
         fn drop(&mut self) {
@@ -6262,8 +6272,7 @@ pub(crate) mod tests {
                 .expect("system time")
                 .as_nanos()
         );
-        let _guard =
-            SpillDirGuard(astra_services::session_journal::local_sessions_dir().join(&session_id));
+        let _guard = SpillDirGuard::new(&session_id);
 
         let mut host = MockHost::new(vec![
             edge_tool_result(
@@ -6331,8 +6340,7 @@ pub(crate) mod tests {
                 .expect("system time")
                 .as_nanos()
         );
-        let _guard =
-            SpillDirGuard(astra_services::session_journal::local_sessions_dir().join(&session_id));
+        let _guard = SpillDirGuard::new(&session_id);
 
         let mut host = MockHost::new(vec![
             edge_tool_result(
@@ -6399,8 +6407,7 @@ pub(crate) mod tests {
                 .expect("system time")
                 .as_nanos()
         );
-        let _guard =
-            SpillDirGuard(astra_services::session_journal::local_sessions_dir().join(&session_id));
+        let _guard = SpillDirGuard::new(&session_id);
 
         let mut host = MockHost::new(vec![
             edge_tool_result(

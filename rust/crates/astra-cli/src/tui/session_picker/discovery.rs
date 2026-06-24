@@ -347,6 +347,7 @@ fn haystack(e: &SessionEntry) -> String {
 mod tests {
     use super::*;
     use astra_services::{
+        session_journal,
         session_journal::{JournalDirGuard, JournalEvent, JournalWriter},
         session_workspace,
     };
@@ -365,7 +366,10 @@ mod tests {
         session_id: &str,
     ) -> session_workspace::WorkspaceMetadata {
         std::fs::create_dir_all(sessions_dir).expect("create sessions dir");
-        std::fs::write(sessions_dir.join(format!("{session_id}.jsonl")), "").expect("journal file");
+        let journal_path = session_journal::journal_file_path(session_id);
+        std::fs::create_dir_all(journal_path.parent().expect("journal parent"))
+            .expect("journal parent");
+        std::fs::write(journal_path, "").expect("journal file");
         let mut ws = session_workspace::WorkspaceMetadata::new(session_id, "claude-sonnet-4.6");
         ws.cwd = "/tmp/astra".into();
         ws.updated_at = "2026-05-18T12:00:00Z".into();

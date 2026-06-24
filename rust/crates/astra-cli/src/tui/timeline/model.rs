@@ -169,7 +169,7 @@ impl TurnSource for StaticTurnSource {
 mod tests {
     use super::JournalTurnSource;
     use super::TurnSource;
-    use astra_services::session_journal::{JournalDirGuard, JournalEvent, JournalWriter};
+    use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalWriter};
     use tempfile::tempdir;
 
     // `#[serial]` because `JournalDirGuard` is thread-local but
@@ -216,7 +216,7 @@ mod tests {
         let sessions_dir = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
         let _guard = JournalDirGuard::new(&sessions_dir);
-        std::fs::create_dir_all(sessions_dir.join("sess-timeline.jsonl"))
+        std::fs::create_dir_all(session_journal::journal_file_path("sess-timeline"))
             .expect("bad journal path");
 
         let error = JournalTurnSource::new()

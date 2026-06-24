@@ -1075,9 +1075,16 @@ mod tests {
     };
     use astra_services::session_journal::JournalDirGuard;
     use std::fs;
+    use std::path::PathBuf;
 
     const REAL_SESSION_0AC769_FIXTURE: &str =
         include_str!("../../../services/fixtures/real_session_0ac769_min.jsonl");
+
+    fn journal_path_for_test(sid: &str) -> PathBuf {
+        let path = astra_services::session_journal::journal_file_path(sid);
+        std::fs::create_dir_all(path.parent().expect("journal parent")).expect("journal parent");
+        path
+    }
 
     #[test]
     fn digest_counts_turns_and_aggregates() {
@@ -1086,7 +1093,7 @@ mod tests {
 
         let sid = "test-digest-00000000-0000-0000-0000-000000000001";
         fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
+            journal_path_for_test(sid),
             r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tokens_in":100,"tokens_out":20,"duration_ms":500,"user_input":"hi","tool_calls":[]}
 {"type":"turn","ts":"2026-01-01T00:00:01Z","session_id":"S","turn":2,"tokens_in":200,"tokens_out":40,"duration_ms":600,"user_input":"bye","tool_calls":[{"name":"bash","ok":true,"ms":10}]}
 {"type":"compact","ts":"2026-01-01T00:00:02Z","turns_compacted":1,"facts_stored":0}
@@ -1115,7 +1122,7 @@ mod tests {
 
         let sid = "test-digest-groups-00000000-0000-0000-0000-000000000003";
         fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
+            journal_path_for_test(sid),
             r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"read_file","ok":true,"ms":10,"args_preview":"src/lib.rs","batch_id":"b-0-0","parallel":true,"round":0},{"name":"grep","ok":true,"ms":11,"args_preview":"SessionState","batch_id":"b-0-0","parallel":true,"round":0},{"name":"bash","ok":false,"ms":20,"round":1,"error":"boom"}]}
 "#,
         )
@@ -1137,11 +1144,7 @@ mod tests {
         let _g = JournalDirGuard::new(tmp.path());
 
         let sid = "0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0";
-        fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
-            REAL_SESSION_0AC769_FIXTURE,
-        )
-        .expect("write journal");
+        fs::write(journal_path_for_test(sid), REAL_SESSION_0AC769_FIXTURE).expect("write journal");
 
         let d = build_digest(sid, DigestFocus::All).expect("digest");
         assert_eq!(d.journal_lines_non_empty, 14);
@@ -1187,7 +1190,7 @@ mod tests {
 
         let sid = "test-digest-telemetry-00000000-0000-0000-0000-000000000004";
         fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
+            journal_path_for_test(sid),
             r#"{"type":"llm_round","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":3,"agentic_step":5,"round":0,"tokens_in":100,"tokens_out":20,"duration_ms":50,"tool_calls_returned":1,"metadata":{"source":"bridge_inprocess","run_id":"run-1","finish_reason":"tool_calls","tool_call_names":["bash"]}}
 {"type":"interruption_recorded","ts":"2026-01-01T00:00:01Z","session_id":"S","turn":3,"agentic_step":5,"metadata":{"interruption":{"kind":"budget_exhausted","resumable":true,"tool_calls_completed":2,"turns_completed":5,"remaining_turns":0}}}
 {"type":"turn","ts":"2026-01-01T00:00:02Z","session_id":"S","turn":3,"tokens_in":100,"tokens_out":20,"duration_ms":500,"user_input":"continue","tool_calls":[{"name":"bash","ok":true,"ms":10}],"llm_rounds":1}
@@ -1217,7 +1220,7 @@ mod tests {
 
         let sid = "test-digest-turn-attempts-00000000-0000-0000-0000-000000000011";
         fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
+            journal_path_for_test(sid),
             concat!(
                 r#"{"type":"llm_round","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":2,"round":0,"tokens_in":57,"tokens_out":351,"duration_ms":6075,"metadata":{"source":"agentic_loop","run_id":"run-cancel-1","finish_reason":"tool_calls"}}"#,
                 "\n",
@@ -1266,7 +1269,7 @@ mod tests {
         let _g = JournalDirGuard::new(tmp.path());
         let sid = "test-digest-malformed-00000000-0000-0000-0000-000000000002";
         fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
+            journal_path_for_test(sid),
             "{\"type\":\"turn\",\"ts\":\"2026-01-01T00:00:00Z\",\"turn\":1,\"tool_calls\":[]}\nnot json\n",
         )
         .expect("write");
@@ -1301,7 +1304,7 @@ mod tests {
 
         let sid = "test-digest-review-00000000-0000-0000-0000-000000000005";
         fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
+            journal_path_for_test(sid),
             concat!(
                 r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tokens_in":38000,"tokens_out":500,"duration_ms":30000,"user_input":"/review latest 2 commits","tool_calls":[{"name":"git_show","ok":true,"ms":10},{"name":"git_show","ok":true,"ms":8}],"llm_rounds":3,"total_llm_ms":29900,"total_tool_ms":100}"#,
                 "\n",
@@ -1343,7 +1346,7 @@ mod tests {
         let line = format!(
             r#"{{"type":"compact","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":5,"turns_compacted":4,"facts_stored":2,"metadata":{{"compact_summary":"{summary}"}}}}"#,
         );
-        fs::write(tmp.path().join(format!("{sid}.jsonl")), format!("{line}\n")).expect("write");
+        fs::write(journal_path_for_test(sid), format!("{line}\n")).expect("write");
         let d = build_digest(sid, DigestFocus::All).expect("digest");
         assert_eq!(d.compaction_events.len(), 1);
         let detail = &d.compaction_events[0].detail;
@@ -1368,7 +1371,7 @@ mod tests {
         let _g = JournalDirGuard::new(tmp.path());
         let sid = "test-digest-compact-no-summary-00000000-0000-0000-0002";
         fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
+            journal_path_for_test(sid),
             r#"{"type":"compact","ts":"2026-01-01T00:00:00Z","turns_compacted":3,"facts_stored":1}
 "#,
         )
@@ -1390,7 +1393,7 @@ mod tests {
         let _g = JournalDirGuard::new(tmp.path());
         let sid = "test-digest-compact-empty-summary-00000000-0000-0003";
         fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
+            journal_path_for_test(sid),
             r#"{"type":"compact","ts":"2026-01-01T00:00:00Z","turns_compacted":2,"facts_stored":0,"metadata":{"compact_summary":""}}
 "#,
         )
@@ -1416,7 +1419,7 @@ mod tests {
             r#"{{"type":"compact","ts":"2026-01-01T00:00:00Z","turns_compacted":5,"facts_stored":3,"metadata":{{"compact_summary":"{}"}}}}"#,
             long_summary
         );
-        fs::write(tmp.path().join(format!("{sid}.jsonl")), format!("{line}\n")).expect("write");
+        fs::write(journal_path_for_test(sid), format!("{line}\n")).expect("write");
         let d = build_digest(sid, DigestFocus::All).expect("digest");
         let sp = d.compaction_events[0].detail["summary_preview"]
             .as_str()
@@ -1435,7 +1438,7 @@ mod tests {
         let _g = JournalDirGuard::new(tmp.path());
         let sid = "test-digest-compact-extra-meta-00000000-0000-0005";
         fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
+            journal_path_for_test(sid),
             r#"{"type":"compact","ts":"2026-01-01T00:00:00Z","turns_compacted":2,"facts_stored":1,"metadata":{"compact_summary":"Fixed auth flow","extra_key":"ignored"}}
 "#,
         )
@@ -1455,7 +1458,7 @@ mod tests {
         let _g = JournalDirGuard::new(tmp.path());
         let sid = "test-digest-multi-compact-00000000-0000-0000-0006";
         fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
+            journal_path_for_test(sid),
             r#"{"type":"compact","ts":"2026-01-01T00:00:00Z","turn":3,"turns_compacted":2,"facts_stored":1,"metadata":{"compact_summary":"First compaction: setup phase"}}
 {"type":"compact","ts":"2026-01-01T00:01:00Z","turn":8,"turns_compacted":5,"facts_stored":3,"metadata":{"compact_summary":"Second compaction: implementation phase"}}
 {"type":"compact","ts":"2026-01-01T00:02:00Z","turn":12,"turns_compacted":4,"facts_stored":0}
@@ -1494,7 +1497,7 @@ mod tests {
         let _g = JournalDirGuard::new(tmp.path());
         let sid = "test-digest-git-turn-00000000-0000-0000-0001";
         fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
+            journal_path_for_test(sid),
             r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tokens_in":100,"tokens_out":20,"duration_ms":500,"user_input":"hi","tool_calls":[],"git_head":"abc1234","git_branch":"feat/auth"}
 "#,
         )
@@ -1511,7 +1514,7 @@ mod tests {
         let _g = JournalDirGuard::new(tmp.path());
         let sid = "test-digest-no-git-turn-00000000-0000-0000-0002";
         fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
+            journal_path_for_test(sid),
             r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tokens_in":100,"tokens_out":20,"duration_ms":500,"user_input":"hi","tool_calls":[]}
 "#,
         )
@@ -1572,7 +1575,7 @@ mod tests {
 
         let sid = "test-failed-tools-00000000-0000-0000-0000-000000000010";
         fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
+            journal_path_for_test(sid),
             r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"bash","ok":false,"ms":0,"error":"Error: blocked by safety guard 'shell_obfuscation': shell command contains command substitution","args_preview":"node -e \"const x = hi\""},{"name":"bash","ok":false,"ms":0,"error":"Error: Dangerous command\nSafe alternative: ...","args_preview":"ls && grep file"},{"name":"write_file","ok":true,"ms":5,"args_preview":"/tmp/out.txt"}]}"#,
         )
         .expect("write journal");
@@ -1611,7 +1614,7 @@ mod tests {
 
         let sid = "test-no-failures-00000000-0000-0000-0000-000000000011";
         fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
+            journal_path_for_test(sid),
             r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"bash","ok":true,"ms":10}]}"#,
         )
         .expect("write journal");
@@ -1674,7 +1677,7 @@ mod tests {
 
         let sid = "test-bodyfail-00000000-0000-0000-0000-000000000099";
         fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
+            journal_path_for_test(sid),
             r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"agent","ok":true,"ms":0,"args_preview":"{\"action\":\"spawn\",\"name\":\"x\"}","result_preview":"{\"error\":\"Invalid input: missing field `description`\",\"status\":\"failed\"}\n⚠ agent returned an error."},{"name":"bash","ok":true,"ms":5,"result_preview":"ok"}]}"#,
         )
         .expect("write journal");
@@ -1718,7 +1721,7 @@ mod tests {
 
         let sid = "test-cachehit-00000000-0000-0000-0000-0000000000aa";
         fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
+            journal_path_for_test(sid),
             r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"read_file","ok":true,"ms":0,"error":"cached_cross_turn","output_bytes":2000,"result_preview":"[cached_cross_turn: reused 2000 bytes]","args_preview":"src/lib.rs"},{"name":"bash","ok":true,"ms":5,"result_preview":"ok"}]}"#,
         )
         .expect("write journal");
@@ -1741,7 +1744,7 @@ mod tests {
 
         let sid = "test-deferred-tool-00000000-0000-0000-0000-000000000013";
         fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
+            journal_path_for_test(sid),
             r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"agent_fanout","ok":true,"ms":0,"error":"tool_not_admitted","result_preview":"Deferred: Error: Tool 'agent_fanout' is not available in this turn yet. First call tool_search with query=\"select:agent_fanout\"."},{"name":"bash","ok":true,"ms":5,"result_preview":"ok"}]}"#,
         )
         .expect("write journal");
@@ -1764,7 +1767,7 @@ mod tests {
 
         let sid = "test-summary-focus-00000000-0000-0000-0000-000000000012";
         fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
+            journal_path_for_test(sid),
             r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"bash","ok":false,"ms":0,"error":"Error: blocked by safety guard 'shell_obfuscation': test"}]}"#,
         )
         .expect("write journal");
@@ -1783,7 +1786,7 @@ mod tests {
 
         let sid = "test-summary-sgb-00000000-0000-0000-0000-000000000013";
         fs::write(
-            tmp.path().join(format!("{sid}.jsonl")),
+            journal_path_for_test(sid),
             r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"bash","ok":false,"ms":0,"error":"Error: blocked by safety guard 'shell_obfuscation': test"}]}"#,
         )
         .expect("write journal");

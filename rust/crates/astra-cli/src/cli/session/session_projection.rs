@@ -1004,7 +1004,7 @@ mod tests {
         let session_id = format!("csl-first-{}", uuid::Uuid::new_v4());
 
         let store = std::sync::Arc::new(FileCslStore::new(
-            astra_services::session_journal::local_sessions_dir(),
+            astra_services::session_journal::local_owner_sessions_dir(),
         ));
         let mut mgr =
             CslManager::new(store.clone(), session_id.clone(), Default::default()).unwrap();
@@ -1048,7 +1048,7 @@ mod tests {
         let session_id = format!("csl-delta-{}", uuid::Uuid::new_v4());
 
         let store = std::sync::Arc::new(FileCslStore::new(
-            astra_services::session_journal::local_sessions_dir(),
+            astra_services::session_journal::local_owner_sessions_dir(),
         ));
         let mut mgr =
             CslManager::new(store.clone(), session_id.clone(), Default::default()).unwrap();
@@ -1104,7 +1104,7 @@ mod tests {
         let session_id = format!("csl-snap5-{}", uuid::Uuid::new_v4());
 
         let store = std::sync::Arc::new(FileCslStore::new(
-            astra_services::session_journal::local_sessions_dir(),
+            astra_services::session_journal::local_owner_sessions_dir(),
         ));
         let mut mgr =
             CslManager::new(store.clone(), session_id.clone(), Default::default()).unwrap();
@@ -1148,7 +1148,7 @@ mod tests {
         let session_id = format!("csl-rt-{}", uuid::Uuid::new_v4());
 
         let store = std::sync::Arc::new(FileCslStore::new(
-            astra_services::session_journal::local_sessions_dir(),
+            astra_services::session_journal::local_owner_sessions_dir(),
         ));
         let mut mgr =
             CslManager::new(store.clone(), session_id.clone(), Default::default()).unwrap();
@@ -1196,7 +1196,7 @@ mod tests {
         let session_id = format!("csl-undo-{}", uuid::Uuid::new_v4());
 
         let store = std::sync::Arc::new(FileCslStore::new(
-            astra_services::session_journal::local_sessions_dir(),
+            astra_services::session_journal::local_owner_sessions_dir(),
         ));
         let mut mgr =
             CslManager::new(store.clone(), session_id.clone(), Default::default()).unwrap();

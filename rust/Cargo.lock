@@ -376,7 +376,6 @@ dependencies = [
  "astra-text-utils",
  "astra-turn-types",
  "async-trait",
- "base64",
  "chrono",
  "serde",
  "serde_json",

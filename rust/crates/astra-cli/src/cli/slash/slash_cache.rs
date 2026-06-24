@@ -69,7 +69,9 @@ pub(crate) fn render_cache_diagnosis(session_id: &str, rounds: &[RoundSnapshot])
 }
 
 pub(crate) fn load_cache_rounds(session_id: &str) -> Vec<RoundSnapshot> {
-    let session_dir = session_journal::local_sessions_dir().join(session_id);
+    let store = astra_services::local_session_artifact_store();
+    let session_dir = astra_services::SessionArtifactStore::session_dir(&store, session_id)
+        .expect("session id must resolve owner-bound cache capture directory");
     cache_diagnosis::load_session_captures(&session_dir).unwrap_or_default()
 }
 

@@ -303,13 +303,8 @@ fn file_checkpoint_dir_for(session_id: &str) -> Option<PathBuf> {
             );
         }
     }
-    let home = dirs::home_dir()?;
-    Some(
-        home.join(".astra")
-            .join("sessions")
-            .join(session_id)
-            .join("file_checkpoints"),
-    )
+    let store = astra_services::local_session_artifact_store();
+    astra_services::SessionArtifactStore::session_path(&store, session_id, "file_checkpoints").ok()
 }
 #[path = "edge_tools/worktree.rs"]
 mod worktree;
@@ -3335,15 +3330,7 @@ impl ToolExecutor {
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
         let agent_filter = args.get("agent_id").and_then(Value::as_str);
 
-        let journal_path = std::path::PathBuf::from(
-            std::env::var("HOME")
-                .ok()
-                .or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().into_owned()))
-                .unwrap_or_else(|| ".".to_string()),
-        )
-        .join(".astra")
-        .join("sessions")
-        .join(format!("{session_id}.jsonl"));
+        let journal_path = astra_services::session_journal::journal_file_path(&session_id);
 
         if !journal_path.exists() {
             return format!("Error: journal not found at {}", journal_path.display());
@@ -3382,8 +3369,7 @@ impl ToolExecutor {
             Some(s) if !s.trim().is_empty() => s,
             _ => return "Error: no active session.".to_string(),
         };
-        let journal_path = astra_services::session_journal::local_sessions_dir()
-            .join(format!("{session_id}.jsonl"));
+        let journal_path = astra_services::session_journal::journal_file_path(&session_id);
 
         let events: Vec<serde_json::Value> = match std::fs::read_to_string(&journal_path) {
             Ok(content) => content
@@ -3488,14 +3474,7 @@ impl ToolExecutor {
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
         let query = args.get("query").and_then(Value::as_str).unwrap_or("");
 
-        let journal_path = std::path::PathBuf::from(
-            dirs::home_dir()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| ".".to_string()),
-        )
-        .join(".astra")
-        .join("sessions")
-        .join(format!("{session_id}.jsonl"));
+        let journal_path = astra_services::session_journal::journal_file_path(&session_id);
 
         let events: Vec<serde_json::Value> = match std::fs::read_to_string(&journal_path) {
             Ok(content) => content
