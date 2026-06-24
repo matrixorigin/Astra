@@ -130,7 +130,7 @@ mod turn_guard_integration {
     fn stall_and_health_compose() {
         let mut guard = TurnGuard::new();
 
-        // 3 consecutive failures on a dedicated tool → deprioritized.
+        // 3 consecutive failures on a dedicated tool → health avoidance.
         // Shell command failures do not poison the generic shell surface.
         guard.record_tool_result("write_file", "Error: permission denied");
         guard.record_tool_result("write_file", "Error: permission denied");
@@ -174,9 +174,9 @@ mod turn_guard_integration {
         assert!(verdict.injections.iter().any(|m| m.contains("CRITICAL")));
     }
 
-    /// Proves: empty results don't deprioritize but are tracked
+    /// Proves: empty results do not trigger health avoidance but are tracked.
     #[test]
-    fn empty_results_tracked_without_deprioritization() {
+    fn empty_results_tracked_without_health_avoidance() {
         let mut guard = TurnGuard::new();
 
         // 10 empty results from grep
@@ -185,8 +185,8 @@ mod turn_guard_integration {
         }
 
         assert!(
-            !guard.health.is_deprioritized("grep"),
-            "Empty results should not deprioritize"
+            !guard.health.is_avoidance_advised("grep"),
+            "empty results should not trigger health avoidance"
         );
         let summary = guard.health.summary();
         assert_eq!(summary.total_errors, 0);
@@ -201,17 +201,17 @@ mod turn_guard_integration {
         for _ in 0..3 {
             guard.record_tool_result("write_file", "Error: fail");
         }
-        assert!(guard.health.is_deprioritized("write_file"));
+        assert!(guard.health.is_avoidance_advised("write_file"));
 
         // Rehabilitate
         guard.record_tool_result("write_file", r#"{"ok": true}"#);
-        assert!(!guard.health.is_deprioritized("write_file"));
+        assert!(!guard.health.is_avoidance_advised("write_file"));
 
         // Second failure cycle
         for _ in 0..3 {
             guard.record_tool_result("write_file", "Error: fail");
         }
-        assert!(guard.health.is_deprioritized("write_file"));
+        assert!(guard.health.is_avoidance_advised("write_file"));
 
         // Rehabilitate again
         guard.record_tool_result("write_file", r#"{"ok": true}"#);
@@ -220,8 +220,8 @@ mod turn_guard_integration {
         guard.record_tool_result("write_file", "Error: fail");
         guard.record_tool_result("write_file", "Error: fail");
         assert!(
-            guard.health.is_deprioritized("write_file"),
-            "Flaky tool should be deprioritized after only 2 failures"
+            guard.health.is_avoidance_advised("write_file"),
+            "flaky tool should trigger health avoidance after only 2 failures"
         );
     }
 
@@ -245,9 +245,9 @@ mod turn_guard_integration {
         use astra_runtime::pipeline::persistence::ToolHealthEntry;
         use astra_turn_core::tool_health::ToolHealthTracker;
 
-        // Tool A: 3 calls, 100% failure → NOT deprioritized (too few calls, need >=8)
-        // Tool B: 10 calls, 80% failure → deprioritized (enough data + above 70% threshold)
-        // Tool C: 10 calls, 60% failure → NOT deprioritized (below 70% threshold)
+        // Tool A: 3 calls, 100% failure → no health avoidance (too few calls, need >=8)
+        // Tool B: 10 calls, 80% failure → health avoidance (enough data + above 70% threshold)
+        // Tool C: 10 calls, 60% failure → no health avoidance (below 70% threshold)
         let entries = vec![
             ToolHealthEntry {
                 name: "tool_a".to_string(),
@@ -277,16 +277,16 @@ mod turn_guard_integration {
 
         let tracker = ToolHealthTracker::from_entries(&entries);
         assert!(
-            !tracker.is_deprioritized("tool_a"),
-            "Too few calls to deprioritize"
+            !tracker.is_avoidance_advised("tool_a"),
+            "too few calls should not trigger health avoidance"
         );
         assert!(
-            tracker.is_deprioritized("tool_b"),
-            "Enough calls + high failure rate → deprioritized"
+            tracker.is_avoidance_advised("tool_b"),
+            "enough calls + high failure rate should trigger health avoidance"
         );
         assert!(
-            !tracker.is_deprioritized("tool_c"),
-            "Below failure threshold → not deprioritized"
+            !tracker.is_avoidance_advised("tool_c"),
+            "below failure threshold should not trigger health avoidance"
         );
     }
 }
@@ -934,9 +934,9 @@ mod chat_stream_turnguard_e2e {
 
     // ── Tool health scenarios ──
 
-    /// Mutating tool deprioritized after 3 errors → shows up in advisory avoid_tools only.
+    /// Mutating tool enters health avoidance after 3 errors and shows up in advisory avoid_tools only.
     #[test]
-    fn tool_deprioritization_is_advisory_only() {
+    fn tool_health_avoidance_is_advisory_only() {
         let mut guard = TurnGuard::new();
         let mut restricted = HashSet::new();
 
@@ -944,7 +944,11 @@ mod chat_stream_turnguard_e2e {
         guard.record_tool_result("rollback_database_snapshots", "Error: connection refused");
         guard.record_tool_result("rollback_database_snapshots", "Error: connection refused");
 
-        assert!(guard.health.is_deprioritized("rollback_database_snapshots"));
+        assert!(
+            guard
+                .health
+                .is_avoidance_advised("rollback_database_snapshots")
+        );
 
         let v = guard.evaluate();
         assert!(
@@ -956,7 +960,7 @@ mod chat_stream_turnguard_e2e {
         apply_verdict(&v, 25, &mut restricted);
         assert!(
             !restricted.contains("rollback_database_snapshots"),
-            "deprioritized tool must not become a hard schema restriction"
+            "health avoidance must not become a hard schema restriction"
         );
     }
 
@@ -1014,7 +1018,7 @@ mod chat_stream_turnguard_e2e {
     fn rehabilitation_clears_tool_from_avoid() {
         let mut guard = TurnGuard::new();
 
-        // Deprioritize
+        // Trigger health avoidance.
         for _ in 0..3 {
             guard.record_tool_result("write_file", "Error: fail");
         }
@@ -1023,14 +1027,14 @@ mod chat_stream_turnguard_e2e {
 
         // Rehabilitate
         guard.record_tool_result("write_file", r#"{"output":"ok"}"#);
-        assert!(!guard.health.is_deprioritized("write_file"));
+        assert!(!guard.health.is_avoidance_advised("write_file"));
 
         // Next evaluation should not list write_file in avoid (from health)
         // Note: it might still appear from escalation/stall — we test health specifically
-        let deprioritized = guard.health.deprioritized_tools();
+        let health_avoidance_tools = guard.health.health_avoidance_tools();
         assert!(
-            !deprioritized.contains(&"write_file"),
-            "rehabilitated tool not in deprioritized list"
+            !health_avoidance_tools.contains(&"write_file"),
+            "rehabilitated tool not in health avoidance list"
         );
     }
 
@@ -1045,8 +1049,8 @@ mod chat_stream_turnguard_e2e {
         guard.record_tool_result("write_file", "Error: permission denied");
         guard.record_tool_result("grep", r#"{"matches":["a.rs"]}"#);
 
-        assert!(guard.health.is_deprioritized("write_file"));
-        assert!(!guard.health.is_deprioritized("grep"));
+        assert!(guard.health.is_avoidance_advised("write_file"));
+        assert!(!guard.health.is_avoidance_advised("grep"));
     }
 
     // ── Result quality feedback ──
@@ -1096,8 +1100,8 @@ mod chat_stream_turnguard_e2e {
         assert_eq!(guard.record_tool_result("f", "null"), ResultQuality::Empty);
 
         // Verify health tracking reflects classification
-        assert!(!guard.health.is_deprioritized("a")); // success
-        assert!(!guard.health.is_deprioritized("c")); // empty → not deprioritized
+        assert!(!guard.health.is_avoidance_advised("a")); // success
+        assert!(!guard.health.is_avoidance_advised("c")); // empty → no health avoidance
     }
 
     // ── Escalation + force stop ──
@@ -1159,7 +1163,7 @@ mod chat_stream_turnguard_e2e {
         let mut guard = TurnGuard::new();
         guard.nudge_count = 6;
 
-        // Many errors + deprioritized tools
+        // Many errors + health avoidance tools
         for _ in 0..5 {
             guard.record_tool_result("t1", "Error: fail");
         }
@@ -1264,7 +1268,7 @@ mod chat_stream_turnguard_e2e {
 
     // ── Cross-session health restore ──
 
-    /// TurnGuard created with pre-existing health data preserves deprioritization.
+    /// TurnGuard created with pre-existing health data preserves health avoidance.
     #[test]
     fn cross_session_health_preserved() {
         use astra_runtime::pipeline::persistence::ToolHealthEntry;
@@ -1281,8 +1285,8 @@ mod chat_stream_turnguard_e2e {
         let tracker = ToolHealthTracker::from_entries(&entries);
         let mut guard = TurnGuard::with_health(tracker);
 
-        // Guard should already have flaky_tool deprioritized
-        assert!(guard.health.is_deprioritized("flaky_tool"));
+        // Guard should already have health avoidance for flaky_tool.
+        assert!(guard.health.is_avoidance_advised("flaky_tool"));
 
         // Evaluate should include it in avoid
         let v = guard.evaluate();
@@ -1380,7 +1384,7 @@ mod chat_stream_turnguard_e2e {
         let mut guard = TurnGuard::new();
         let mut restricted = HashSet::new();
 
-        // Turn 1: deprioritize one tool
+        // Turn 1: put one tool under health avoidance.
         for _ in 0..3 {
             guard.record_tool_result("rollback_database_snapshots", "Error: fail");
         }
@@ -1392,7 +1396,7 @@ mod chat_stream_turnguard_e2e {
         apply_verdict(&v, 25, &mut restricted);
         assert!(!restricted.contains("rollback_database_snapshots"));
 
-        // Turn 2: deprioritize another tool
+        // Turn 2: put another tool under health avoidance.
         for _ in 0..3 {
             guard.record_tool_result("write_file", "Error: fail");
         }
@@ -1499,9 +1503,9 @@ mod chat_stream_turnguard_e2e {
         );
     }
 
-    /// Tool that alternates success/fail does NOT get deprioritized (no consecutive failures).
+    /// Tool that alternates success/fail does not trigger health avoidance.
     #[test]
-    fn alternating_success_fail_no_deprioritization() {
+    fn alternating_success_fail_no_health_avoidance() {
         let mut guard = TurnGuard::new();
 
         for i in 0..10 {
@@ -1513,16 +1517,16 @@ mod chat_stream_turnguard_e2e {
         }
 
         assert!(
-            !guard.health.is_deprioritized("write_file"),
+            !guard.health.is_avoidance_advised("write_file"),
             "alternating results should reset consecutive counter"
         );
     }
 
     // ── Cross-session health restore → selector-level exclusion ──
 
-    /// Cross-session restore with low failure rate does NOT deprioritize (benefit of doubt).
+    /// Cross-session restore with low failure rate does not trigger health avoidance.
     #[test]
-    fn cross_session_low_failure_rate_not_deprioritized() {
+    fn cross_session_low_failure_rate_no_health_avoidance() {
         let entries = vec![ToolHealthEntry {
             name: "bash".to_string(),
             total_calls: 20,
@@ -1533,14 +1537,14 @@ mod chat_stream_turnguard_e2e {
         }];
         let tracker = ToolHealthTracker::from_entries(&entries);
         assert!(
-            !tracker.is_deprioritized("bash"),
-            "15% failure rate should not deprioritize"
+            !tracker.is_avoidance_advised("bash"),
+            "15% failure rate should not trigger health avoidance"
         );
 
         let guard = TurnGuard::with_health(tracker);
         let restricted: Vec<String> = guard
             .health
-            .deprioritized_tools()
+            .health_avoidance_tools()
             .into_iter()
             .map(|s| s.to_string())
             .collect();
@@ -1550,7 +1554,7 @@ mod chat_stream_turnguard_e2e {
         );
     }
 
-    /// Cross-session restore with few calls does NOT deprioritize (insufficient evidence).
+    /// Cross-session restore with few calls does not trigger health avoidance.
     #[test]
     fn cross_session_few_calls_benefit_of_doubt() {
         let entries = vec![ToolHealthEntry {
@@ -1564,7 +1568,7 @@ mod chat_stream_turnguard_e2e {
         let tracker = ToolHealthTracker::from_entries(&entries);
         // 100% failure but only 3 calls — below CROSS_SESSION_MIN_CALLS (5)
         assert!(
-            !tracker.is_deprioritized("mo_query"),
+            !tracker.is_avoidance_advised("mo_query"),
             "too few calls should get benefit of the doubt even at 100% failure"
         );
     }
@@ -1583,19 +1587,19 @@ mod chat_stream_turnguard_e2e {
         let tracker = ToolHealthTracker::from_entries(&entries);
         let mut guard = TurnGuard::with_health(tracker);
 
-        // Initially deprioritized from prior session
-        assert!(guard.health.is_deprioritized("github"));
+        // Initially under health avoidance from prior session.
+        assert!(guard.health.is_avoidance_advised("github"));
 
         // Tool succeeds in new session → rehabilitated
         guard.record_tool_result("github", r#"[{"number":42,"title":"Fix"}]"#);
         assert!(
-            !guard.health.is_deprioritized("github"),
+            !guard.health.is_avoidance_advised("github"),
             "success should rehabilitate the tool"
         );
 
         let restricted: Vec<String> = guard
             .health
-            .deprioritized_tools()
+            .health_avoidance_tools()
             .into_iter()
             .map(|s| s.to_string())
             .collect();
@@ -1634,10 +1638,10 @@ mod chat_stream_turnguard_e2e {
         assert_eq!(git_entry.total_calls, 7);
         assert_eq!(git_entry.total_failures, 0);
 
-        // write_file: 37.5% failure < 50% threshold → not deprioritized
-        assert!(!restored.is_deprioritized("write_file"));
-        // git: 0% → definitely not deprioritized
-        assert!(!restored.is_deprioritized("git"));
+        // write_file: 37.5% failure < 50% threshold → no health avoidance
+        assert!(!restored.is_avoidance_advised("write_file"));
+        // git: 0% → no health avoidance
+        assert!(!restored.is_avoidance_advised("git"));
     }
 
     /// Verdict from restored guard correctly populates avoid_tools for schema exclusion.

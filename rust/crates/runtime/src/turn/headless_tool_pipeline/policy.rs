@@ -668,7 +668,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             }
             // Catalog misses and not-yet-activated deferred names are caller
             // protocol issues, not runtime failures. Do not persist them into
-            // ToolHealth/deprioritized state; otherwise removed or deferred
+            // ToolHealth/avoidance_advised state; otherwise removed or deferred
             // tools keep resurfacing as "failed repeatedly" context.
             return HeadlessPipelineStage::ShortCircuit;
         }

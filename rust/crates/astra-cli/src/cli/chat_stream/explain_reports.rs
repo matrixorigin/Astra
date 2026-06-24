@@ -50,7 +50,7 @@ pub(super) fn print_verdict_report(verdict_events: &[VerdictEvent], verbose: boo
                 ve.interaction_mode.as_str(),
                 ve.suppressed_loop_nudges,
                 ve.recent_error_pressure,
-                ve.deprioritized_count,
+                ve.health_avoidance_count,
                 ve.force_stop,
             )
             .dim()

@@ -1958,7 +1958,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_tool_retries_do_not_deprioritize_missing_catalog_entry() {
+    async fn unknown_tool_retries_do_not_advise_avoidance_missing_catalog_entry() {
         let mut harness = PipelineHarness::new();
         // Push 3 calls with different args so dedup doesn't block them.
         for i in 0..3 {
@@ -1986,9 +1986,9 @@ mod tests {
                 .ctx
                 .turn_guard
                 .health
-                .deprioritized_tools()
+                .health_avoidance_tools()
                 .contains(&"outline"),
-            "unknown catalog tool should not be deprioritized"
+            "unknown catalog tool should not be avoidance_advised"
         );
     }
 
@@ -2137,8 +2137,8 @@ mod tests {
                 "deduped unknown catalog tools may record neutral cache stats, not failures"
             );
             assert!(
-                !health.deprioritized,
-                "deduped unknown catalog tools should not be deprioritized"
+                !health.avoidance_advised,
+                "deduped unknown catalog tools should not be avoidance_advised"
             );
         }
     }
@@ -2175,7 +2175,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_tool_deprioritize_warning_not_generated() {
+    async fn unknown_tool_avoidance_warning_not_generated() {
         let mut harness = PipelineHarness::new();
         // 3 calls with different args to avoid dedup. They should remain
         // short-circuited catalog misses, not health failures.
@@ -2194,10 +2194,10 @@ mod tests {
             pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(i));
         }
 
-        let warning = pipeline.ctx.turn_guard.health.deprioritize_warning();
+        let warning = pipeline.ctx.turn_guard.health.health_avoidance_warning();
         assert!(
             warning.is_none(),
-            "unknown catalog tool should not generate a deprioritize warning"
+            "unknown catalog tool should not generate a advise_avoidance warning"
         );
     }
 

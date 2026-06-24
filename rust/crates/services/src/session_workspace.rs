@@ -1050,9 +1050,10 @@ mod tests {
         assert_eq!(parsed.summary, Some("Done".to_string()));
         assert_eq!(parsed.total_cache_read_tokens, 25);
         assert_eq!(parsed.total_cache_creation_tokens, 4);
-        for removed in ["prioritized", "deprioritized"].map(|prefix| format!("{prefix}_tools")) {
-            assert!(!yaml.contains(&removed));
-        }
+        assert!(
+            !yaml.contains("health_avoidance_tools"),
+            "tool health belongs in turn health surfaces, not workspace metadata"
+        );
     }
 
     #[test]
@@ -1547,9 +1548,10 @@ mod tests {
             !yaml.contains("tuned_config_json"),
             "should omit None fields"
         );
-        for removed in ["prioritized", "deprioritized"].map(|prefix| format!("{prefix}_tools")) {
-            assert!(!yaml.contains(&removed), "removed workspace field leaked");
-        }
+        assert!(
+            !yaml.contains("health_avoidance_tools"),
+            "tool health belongs in turn health surfaces, not workspace metadata"
+        );
     }
 
     #[test]

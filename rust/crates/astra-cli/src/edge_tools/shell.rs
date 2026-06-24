@@ -4352,7 +4352,7 @@ impl ToolExecutor {
         handle: astra_tools::detach::DetachShellHandle,
     ) {
         handle.mark_active(false);
-        if !handle.is_retired() {
+        if !handle.is_blocked() {
             *slot.lock().await = Some(handle);
         }
     }

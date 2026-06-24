@@ -155,7 +155,7 @@ pub struct ObservabilitySession {
     pub cached_skill_names: Vec<String>,
 
     /// Per-turn export of `ToolHealthTracker::export()` so SelfModel can
-    /// reconstruct summaries + deprioritized/outcome memory without holding
+    /// reconstruct summaries + health avoidance/outcome memory without holding
     /// a reference to the live tracker.
     pub last_tool_health_export: Vec<astra_pipeline::ToolHealthEntry>,
 

@@ -247,7 +247,7 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("adjust_config", MU, OR),
     tool("compress_context", MU, OR),
     tool("env", MU, OR),
-    // ── Mutating — task management (immune to deprioritization) ───────
+    // ── Mutating — task management (immune to health avoidance) ───────
     tool("task", MU, OR.union(ToolFlags::TASK_MGMT)),
     tool("task_output", RO, OR.union(ToolFlags::TASK_MGMT)),
     tool("task_list", RO, OR.union(ToolFlags::TASK_MGMT)),

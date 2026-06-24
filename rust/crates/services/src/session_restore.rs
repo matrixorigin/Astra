@@ -71,7 +71,7 @@ pub struct RestoredSession {
     /// Conversation messages from Step Protocol heavy checkpoint (for LLM resume).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conversation_messages: Vec<serde_json::Value>,
-    /// Blocked/deprioritized tools from checkpoint.
+    /// Blocked/health-avoidance tools from checkpoint.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_tools: Vec<String>,
     /// Serialized approval overrides restored from a heavy checkpoint.

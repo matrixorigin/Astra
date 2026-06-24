@@ -195,6 +195,7 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
                                 let result = astra_tools::ToolExecutor::execute(&executor, &tool, &tool_args).await;
                                 let output = result.output;
                                 let is_error = result.is_error;
+                                let tool_result_fields = result.metadata;
                                 let duration_ms = start.elapsed().as_millis() as u64;
                                 tracing::info!(
                                     tool = %tool,
@@ -209,6 +210,7 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
                                     output,
                                     is_error,
                                     duration_ms: Some(duration_ms),
+                                    tool_result_fields,
                                 };
                                 write.send(Message::Text(serde_json::to_string(&result_msg)?.into())).await?;
                             }

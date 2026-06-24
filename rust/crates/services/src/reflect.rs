@@ -334,8 +334,8 @@ pub struct SessionDiagnosticReport {
     pub stall_count: u32,
     /// Count of TurnGuard verdict events.
     pub verdict_count: u32,
-    /// Tools currently deprioritized by health feedback.
-    pub health_deprioritized_tools: Vec<String>,
+    /// Tools currently avoidance_advised by health feedback.
+    pub health_avoidance_tools: Vec<String>,
     /// Summary of error types encountered.
     pub error_summary: Vec<String>,
     /// Actionable recommendations.

@@ -17,7 +17,7 @@ pub struct ToolSurfaceReport {
 
 /// Minimal observable snapshot of a resolved tool surface.
 ///
-/// This intentionally does not restore the retired selector trace
+/// This intentionally does not restore the removed selector trace
 /// (scores/boost terms/confidence). The stable question is smaller:
 /// which tools were visible, and how much surface sat in each tier.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

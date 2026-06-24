@@ -285,7 +285,7 @@ fn builtin_tool_is_internal(name: &str) -> bool {
 }
 
 fn tool_name_is_forbidden_model_surface(name: &str) -> bool {
-    astra_core::tool_names::is_retired_tool_name(name) || builtin_tool_is_internal(name)
+    builtin_tool_is_internal(name)
 }
 
 /// Truncate the schema description to a compact UTF-8 char-boundary summary.

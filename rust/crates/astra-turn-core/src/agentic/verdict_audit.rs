@@ -12,8 +12,8 @@ pub struct AgenticVerdictAuditEvent {
     pub severity: String,
     pub injections: Vec<String>,
     pub avoid_tools: Vec<String>,
-    /// Exact tools currently deprioritized by health tracking.
-    pub deprioritized_tools: Vec<String>,
+    /// Exact tools currently under health avoidance from health tracking.
+    pub health_avoidance_tools: Vec<String>,
     pub force_stop: bool,
     pub nudge_count: usize,
     pub interaction_mode: String,
@@ -25,7 +25,7 @@ pub struct AgenticVerdictAuditEvent {
     /// Lifetime tool errors seen in the session. Telemetry only.
     /// Escalation uses `recent_error_pressure`, not this field.
     pub total_errors: usize,
-    pub deprioritized_count: usize,
+    pub health_avoidance_count: usize,
     /// Lifetime timeout-specific failure count (subset of total_errors).
     pub total_timeouts: usize,
     /// Tools whose failures are mostly timeouts (infra guidance, not hard avoid).

@@ -1,4 +1,5 @@
 use super::all_tool_schemas;
+use serde_json::Value;
 
 // ── all_tool_schemas ──────────────────────────────────────────────────────
 
@@ -381,7 +382,7 @@ fn memory_schema_requires_content_query_new_content_signal() {
 }
 
 #[test]
-fn session_schema_requires_current_action_fields_and_not_retired_actions() {
+fn session_schema_requires_current_action_fields_and_current_action_set() {
     let schemas = all_tool_schemas();
     let sess = tool_schema(&schemas, "session");
     assert_eq!(
@@ -396,21 +397,24 @@ fn session_schema_requires_current_action_fields_and_not_retired_actions() {
         conditional_required_for(sess, "history_around"),
         vec!["item_seq".to_string()]
     );
-    let actions = sess["function"]["parameters"]["properties"]["action"]["enum"]
+    let mut actions = sess["function"]["parameters"]["properties"]["action"]["enum"]
         .as_array()
-        .expect("session action enum");
-    for retired in [
-        "prioritize",
-        "deprioritize",
-        "compact",
-        "set_goal",
-        "ask_user",
-    ] {
-        assert!(
-            !actions.iter().any(|v| v.as_str() == Some(retired)),
-            "{retired} must be a dedicated tool or removed, not a stale session action"
-        );
-    }
+        .expect("session action enum")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    actions.sort_unstable();
+    assert_eq!(
+        actions,
+        [
+            "config",
+            "history_around",
+            "history_page",
+            "history_search",
+            "sleep",
+        ],
+        "session action surface must stay narrow and current"
+    );
 }
 
 #[test]
@@ -456,12 +460,6 @@ fn ask_user_schema_advertises_questionnaire_tabs_and_multi_select() {
 #[test]
 fn mo_query_schema_requires_sql() {
     let schemas = all_tool_schemas();
-    assert!(schemas.iter().all(|schema| {
-        schema
-            .pointer("/function/name")
-            .and_then(serde_json::Value::as_str)
-            != Some("mo")
-    }));
     let mo_query = tool_schema(&schemas, "mo_query");
     assert_eq!(required_fields(mo_query), vec!["sql".to_string()]);
 }
@@ -522,12 +520,6 @@ fn task_schema_does_not_advertise_background_actions() {
 #[test]
 fn typed_background_task_schemas_exist_without_job_schema() {
     let schemas = all_tool_schemas();
-    assert!(
-        schemas
-            .iter()
-            .all(|s| s["function"]["name"].as_str() != Some("agent_job")),
-        "agent_job must not remain in the model-facing schema"
-    );
     assert!(
         schemas
             .iter()

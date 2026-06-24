@@ -176,9 +176,9 @@ pub(crate) fn apply_tactical_actions(
                 from_tool,
                 reason,
             } => {
-                state.turn_guard.health.force_deprioritize(from_tool);
+                state.turn_guard.health.force_avoidance_advice(from_tool);
                 hint_parts.push(format!(
-                    "💡 Consider switching from '{}': {} (deprioritized for follow-up selection)",
+                    "💡 Consider switching from '{}': {} (marked for health avoidance in follow-up selection)",
                     from_tool, reason
                 ));
             }
@@ -882,20 +882,20 @@ pub(crate) fn record_loop_completion_feedback(
     }
 
     // ── 8. Tool health signals ──
-    // Emit signals for deprioritized tools so tuning rules can react.
+    // Emit signals for health avoidance tools so tuning rules can react.
     {
-        let deprioritized = state.turn_guard.health.deprioritized_tools();
-        for tool_name in deprioritized {
+        let avoidance_advised = state.turn_guard.health.health_avoidance_tools();
+        for tool_name in avoidance_advised {
             hub.record_feedback(enrich_signal(
-                FeedbackSignal::new(SignalType::ToolDeprioritized {
+                FeedbackSignal::new(SignalType::ToolHealthAvoidance {
                     tool_name: tool_name.to_string(),
                 })
                 .with_turn(&turn_id),
             ));
         }
-        // Track tools that were rehabilitated this session (rehab count > 0 but not deprioritized).
+        // Track tools that were rehabilitated this session (rehab count > 0 but no active health avoidance).
         for (name, health) in state.turn_guard.health.all() {
-            if health.rehabilitation_count > 0 && !health.deprioritized {
+            if health.rehabilitation_count > 0 && !health.avoidance_advised {
                 hub.record_feedback(enrich_signal(
                     FeedbackSignal::new(SignalType::ToolRehabilitated {
                         tool_name: name.clone(),

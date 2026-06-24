@@ -1030,7 +1030,7 @@ mod tests {
         );
         assert!(
             !rendered.contains("Match:"),
-            "selection hint must not reuse the retired match-target label, got:\n{rendered}"
+            "selection hint must not reuse the blocked match-target label, got:\n{rendered}"
         );
     }
 

@@ -1380,11 +1380,6 @@ mod tests {
                 && find_schema(&schemas, "task_list").is_some(),
             "model-facing schema must expose typed background task tools, not generic job"
         );
-        assert!(
-            find_schema(&schemas, "agent_job").is_none()
-                && find_schema(&schemas, "task_output").is_some(),
-            "agent_job must not remain in the model-facing schema; use agent background lifecycle separately"
-        );
         let output_desc = find_schema(&schemas, "task_output")
             .and_then(|schema| {
                 schema
@@ -1411,10 +1406,6 @@ mod tests {
         assert!(
             output_block_desc.contains("Default false"),
             "task_output must default to snapshot reads unless the user asks to wait"
-        );
-        assert!(
-            find_schema(&schemas, "agent_job").is_none(),
-            "agent_job must not remain in the model-facing schema"
         );
     }
 
@@ -1808,22 +1799,11 @@ mod tests {
             find_schema(&schemas, name)
                 .expect("top-level schema must exist for ToolEngine routing");
         }
-
-        for &retired in astra_core::tool_names::RETIRED_TOOL_NAMES {
-            assert!(
-                find_schema(&schemas, retired).is_none(),
-                "{retired} must not remain in the tool schema surface"
-            );
-        }
     }
 
     #[test]
     fn matrixone_top_level_schemas_exist() {
         let schemas = all_tool_schemas();
-        assert!(
-            find_schema(&schemas, "mo").is_none(),
-            "MatrixOne must expose one public query shape; do not keep the old aggregate mo schema"
-        );
         for name in ["mo_query", "rollback_database_snapshots"] {
             find_schema(&schemas, name)
                 .expect("top-level schema must exist for ToolEngine routing");
@@ -1850,28 +1830,28 @@ mod tests {
     }
 
     #[test]
-    fn session_schema_excludes_retired_session_state_actions() {
+    fn session_schema_exposes_only_lifecycle_and_history_actions() {
         let schemas = all_tool_schemas();
         let session = find_schema(&schemas, "session").expect("session schema");
-        let actions = session["function"]["parameters"]["properties"]["action"]["enum"]
+        let mut actions = session["function"]["parameters"]["properties"]["action"]["enum"]
             .as_array()
             .expect("session action enum")
             .iter()
             .filter_map(Value::as_str)
-            .collect::<std::collections::HashSet<_>>();
+            .collect::<Vec<_>>();
 
-        for retired in [
-            "prioritize",
-            "deprioritize",
-            "compact",
-            "set_goal",
-            "ask_user",
-        ] {
-            assert!(
-                !actions.contains(retired),
-                "session must not expose retired action {retired}; use the dedicated tool"
-            );
-        }
+        actions.sort_unstable();
+        assert_eq!(
+            actions,
+            [
+                "config",
+                "history_around",
+                "history_page",
+                "history_search",
+                "sleep",
+            ],
+            "session action surface must stay narrow and current"
+        );
         for current in [
             "config",
             "sleep",
@@ -1880,7 +1860,7 @@ mod tests {
             "history_around",
         ] {
             assert!(
-                actions.contains(current),
+                actions.contains(&current),
                 "session must expose current action {current}"
             );
         }
@@ -2141,7 +2121,7 @@ mod tests {
 
         assert!(
             desc.contains("Do not use aliases"),
-            "str_replace description should steer models away from retired alias fields: {desc}"
+            "str_replace description should steer models away from unsupported alias fields: {desc}"
         );
         assert_eq!(
             params.get("additionalProperties").and_then(Value::as_bool),

@@ -164,10 +164,10 @@ pub(crate) enum TaskMutationKind {
 impl TaskMutationKind {
     pub(crate) fn event_reason(self) -> &'static str {
         match self {
-            Self::Create => "task_create",
-            Self::Update => "task_update",
-            Self::Stop => "task_stop",
-            Self::Archive => "task_archive",
+            Self::Create => "task.create",
+            Self::Update => "task.update",
+            Self::Stop => "task.stop",
+            Self::Archive => "task.archive",
         }
     }
 
@@ -560,8 +560,8 @@ mod tests {
 
     #[test]
     fn mutation_kind_produces_stable_event_reasons_and_rollback_labels() {
-        assert_eq!(TaskMutationKind::Create.event_reason(), "task_create");
-        assert_eq!(TaskMutationKind::Update.event_reason(), "task_update");
+        assert_eq!(TaskMutationKind::Create.event_reason(), "task.create");
+        assert_eq!(TaskMutationKind::Update.event_reason(), "task.update");
         assert_eq!(
             TaskMutationKind::Create.rollback_label(&json!({"title": "ship"})),
             "task:create:ship"
@@ -589,7 +589,7 @@ mod tests {
             .rollback
             .expect("successful mutation should produce rollback");
         assert_eq!(rollback.label, "task:create:ship");
-        assert_eq!(rollback.event_reason, "task_create");
+        assert_eq!(rollback.event_reason, "task.create");
     }
 
     #[tokio::test]
@@ -656,6 +656,6 @@ mod tests {
         assert!(outcome.result.output.contains("\"success\":true"));
         let rollback = outcome.rollback.expect("successful create rollback");
         assert_eq!(rollback.label, "task:create:ship");
-        assert_eq!(rollback.event_reason, "task_create");
+        assert_eq!(rollback.event_reason, "task.create");
     }
 }

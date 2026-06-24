@@ -751,7 +751,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                         calls: h.total_calls as u32,
                         errors: h.total_failures as u32,
                         avg_ms: 0,
-                        deprioritized: h.deprioritized,
+                        avoidance_advised: h.avoidance_advised,
                         consecutive_failures: h.consecutive_failures as u32,
                         last_failure_category: None,
                     })

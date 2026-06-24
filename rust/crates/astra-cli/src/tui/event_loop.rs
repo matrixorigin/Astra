@@ -4751,7 +4751,7 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("before timeout"));
-        assert!(!handle.is_retired());
+        assert!(!handle.is_blocked());
     }
 
     #[tokio::test]

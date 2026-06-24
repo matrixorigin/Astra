@@ -274,23 +274,23 @@ pub struct DetachShellHandle {
     /// preloaded handle as a foreground bash task.
     active: Arc<AtomicBool>,
     /// Set once the TUI has consumed or abandoned the listener side.
-    /// A retired handle must not be restored to the reusable slot.
-    retired: Arc<AtomicBool>,
+    /// A blocked handle must not be restored to the reusable slot.
+    blocked: Arc<AtomicBool>,
 }
 
 impl DetachShellHandle {
     pub fn mark_active(&self, active: bool) {
-        // Guard: a retired handle must never be reactivated. This prevents
-        // a race where a retired handle could be mistakenly restored to
+        // Guard: a blocked handle must never be reactivated. This prevents
+        // a race where a blocked handle could be mistakenly restored to
         // the reusable slot.
-        if active && self.retired.load(Ordering::Acquire) {
+        if active && self.blocked.load(Ordering::Acquire) {
             return;
         }
         self.active.store(active, Ordering::Release);
     }
 
-    pub fn is_retired(&self) -> bool {
-        self.retired.load(Ordering::Acquire)
+    pub fn is_blocked(&self) -> bool {
+        self.blocked.load(Ordering::Acquire)
     }
 }
 
@@ -302,7 +302,7 @@ pub struct DetachShellListener {
     /// Receive the detached child + streams from the runner.
     pub payload_rx: oneshot::Receiver<DetachedShellPayload>,
     active: Arc<AtomicBool>,
-    retired: Arc<AtomicBool>,
+    blocked: Arc<AtomicBool>,
 }
 
 impl DetachShellListener {
@@ -311,7 +311,7 @@ impl DetachShellListener {
     }
 
     pub fn retire(&self) {
-        self.retired.store(true, Ordering::Release);
+        self.blocked.store(true, Ordering::Release);
         self.active.store(false, Ordering::Release);
     }
 }
@@ -341,18 +341,18 @@ pub fn new_detach_pair() -> (DetachShellHandle, DetachShellListener) {
     let (payload_tx, payload_rx) = oneshot::channel::<DetachedShellPayload>();
     let (signal_tx, signal_rx) = watch::channel(false);
     let active = Arc::new(AtomicBool::new(false));
-    let retired = Arc::new(AtomicBool::new(false));
+    let blocked = Arc::new(AtomicBool::new(false));
     let handle = DetachShellHandle {
         signal_rx: Arc::new(Mutex::new(Some(signal_rx))),
         payload_tx: Arc::new(Mutex::new(Some(payload_tx))),
         active: active.clone(),
-        retired: retired.clone(),
+        blocked: blocked.clone(),
     };
     let listener = DetachShellListener {
         signal_tx,
         payload_rx,
         active,
-        retired,
+        blocked,
     };
     (handle, listener)
 }
@@ -384,14 +384,14 @@ mod tests {
         let (handle, listener) = new_detach_pair();
 
         assert!(!listener.is_active());
-        assert!(!handle.is_retired());
+        assert!(!handle.is_blocked());
 
         handle.mark_active(true);
         assert!(listener.is_active());
 
         listener.retire();
         assert!(!listener.is_active());
-        assert!(handle.is_retired());
+        assert!(handle.is_blocked());
     }
 
     /// Round-trip: when the runner side takes the sender and

@@ -1950,7 +1950,7 @@ fn build_introspect_snapshot(
                 calls: h.total_calls as u32,
                 errors: h.total_failures as u32,
                 avg_ms: 0,
-                deprioritized: h.deprioritized,
+                avoidance_advised: h.avoidance_advised,
                 consecutive_failures: h.consecutive_failures as u32,
                 last_failure_category: last_fail_cat,
             }
@@ -2971,7 +2971,7 @@ esac
     }
 
     #[test]
-    fn task_round_mutator_detection_uses_action_not_legacy_tool_names() {
+    fn task_round_mutator_detection_uses_task_action_only() {
         assert!(server_session_state_mutator_in_round(&[json!({
             "function": {
                 "name": "task",
@@ -2992,8 +2992,8 @@ esac
         })]));
         assert!(!server_session_state_mutator_in_round(&[json!({
             "function": {
-                "name": "task_create",
-                "arguments": "{\"title\":\"old\"}"
+                "name": "taskish",
+                "arguments": "{\"action\":\"create\",\"title\":\"ignored\"}"
             }
         })]));
     }

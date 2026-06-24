@@ -12,7 +12,7 @@
 //!
 //! After the Phase 1 refactor, the authoritative per-turn tier comes from
 //! the context pipeline's planner (`ContextPlan::compact_tier`). The
-//! legacy `compaction_tier_calibrated` helper was retired along with its
+//! legacy `compaction_tier_calibrated` helper was removed along with its
 //! integration tests; what remains here exercises the pure-function
 //! `ContextBudget::compaction_tier` that the planner itself consults.
 

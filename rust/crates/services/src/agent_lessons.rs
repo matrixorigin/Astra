@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 #[non_exhaustive]
 pub enum LessonKind {
     /// Avoid this tool for this scope — it failed or was slow last time.
-    ToolDeprioritize,
+    ToolAvoidance,
     /// Prefer this tool for this scope — it worked well last time.
     ToolBoost,
     /// The system prompt / context shape that led to success.
@@ -38,7 +38,7 @@ impl LessonKind {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::ToolDeprioritize => "tool_deprioritize",
+            Self::ToolAvoidance => "tool_avoidance",
             Self::ToolBoost => "tool_boost",
             Self::PromptShape => "prompt_shape",
             Self::ErrorRecovery => "error_recovery",
@@ -48,7 +48,7 @@ impl LessonKind {
 
     pub fn parse_tag(tag: &str) -> Option<Self> {
         match tag {
-            "tool_deprioritize" => Some(Self::ToolDeprioritize),
+            "tool_avoidance" => Some(Self::ToolAvoidance),
             "tool_boost" => Some(Self::ToolBoost),
             "prompt_shape" => Some(Self::PromptShape),
             "error_recovery" => Some(Self::ErrorRecovery),
@@ -70,7 +70,7 @@ pub struct Lesson {
     /// (e.g. `"3 consecutive ToolMisuse on grep"`). ≤255 chars.
     pub trigger_signal: String,
     /// Short imperative of what to do next time
-    /// (e.g. `"deprioritize grep for regex-heavy tasks"`). ≤1024 chars.
+    /// (e.g. `"avoid grep for regex-heavy tasks"`). ≤1024 chars.
     pub action: String,
     pub confidence: f64,
     pub hit_count: i64,

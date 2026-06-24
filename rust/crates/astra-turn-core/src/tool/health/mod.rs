@@ -1,8 +1,8 @@
 //! Per-tool health tracking for error budget enforcement.
 //!
 //! Tracks success/failure rates per tool within a session. When a tool
-//! fails consecutively beyond a threshold, it gets deprioritized — the
-//! agent is told to avoid it and try alternatives.
+//! fails consecutively beyond a threshold, the guard advises the agent to
+//! avoid repeating it blindly and try alternatives.
 //!
 //! This is a **session-scoped** mechanism: health resets when the session
 //! ends.
@@ -166,7 +166,7 @@ pub fn failure_category_from_tag(tag: &str) -> Option<FailureCategory> {
     })
 }
 
-/// Maximum consecutive failures before a tool is deprioritized.
+/// Maximum consecutive failures before health avoidance advice is enabled.
 const CONSECUTIVE_FAILURE_THRESHOLD: usize = 3;
 
 /// Consecutive successes needed to clear the "flaky" flag after rehabilitation.
@@ -174,12 +174,12 @@ const CONSECUTIVE_FAILURE_THRESHOLD: usize = 3;
 /// restoring the standard (higher) failure threshold.
 const REHAB_STABILITY_WINDOW: usize = 5;
 
-/// Maximum failure rate from cross-session import that triggers deprioritization.
+/// Maximum failure rate from cross-session import that triggers health avoidance.
 /// Tools below this threshold start fresh even with historical failures.
 /// Set to 0.7 (was 0.5): tools like str_replace often fail due to LLM-generated
 /// match strings, not tool bugs. A higher threshold avoids penalizing tools
 /// for user/LLM errors on small sample sizes.
-const CROSS_SESSION_DEPRIORITIZE_RATE: f64 = 0.7;
+const CROSS_SESSION_AVOIDANCE_RATE: f64 = 0.7;
 
 /// Minimum historical calls before cross-session failure rate is meaningful.
 /// Tools with fewer calls get the benefit of the doubt.
@@ -193,10 +193,10 @@ pub struct ToolHealth {
     pub total_calls: usize,
     pub total_failures: usize,
     pub consecutive_failures: usize,
-    /// Whether this tool has been deprioritized due to repeated failures.
-    pub deprioritized: bool,
+    /// Whether repeated failures should produce health avoidance advice.
+    pub avoidance_advised: bool,
     /// Number of times this tool was rehabilitated this session.
-    /// Rising rehab count means the tool is flaky — deprioritize more aggressively.
+    /// Rising rehab count means the tool is flaky, so health avoidance triggers faster.
     pub rehabilitation_count: usize,
     /// Consecutive successes since last failure/rehabilitation.
     /// When this reaches REHAB_STABILITY_WINDOW, the tool is no longer "flaky".
@@ -269,9 +269,9 @@ impl ToolHealthTracker {
         health.total_calls += 1;
         health.consecutive_failures = 0;
         health.consecutive_successes += 1;
-        // Success can rehabilitate a deprioritized tool
-        if health.deprioritized {
-            health.deprioritized = false;
+        // Success can rehabilitate a tool after health avoidance advice.
+        if health.avoidance_advised {
+            health.avoidance_advised = false;
             health.rehabilitation_count += 1;
             health.consecutive_successes = 1; // reset counter on rehab
         }
@@ -285,7 +285,7 @@ impl ToolHealthTracker {
     }
 
     /// Record a failed tool execution.
-    /// Flaky tools (rehabilitated 2+ times) get deprioritized faster.
+    /// Flaky tools (rehabilitated 2+ times) trigger health avoidance faster.
     pub fn record_failure(&mut self, tool_name: &str) {
         let health = self.tools.entry(tool_name.to_string()).or_default();
         health.total_calls += 1;
@@ -299,7 +299,7 @@ impl ToolHealthTracker {
             CONSECUTIVE_FAILURE_THRESHOLD
         };
         if health.consecutive_failures >= threshold {
-            health.deprioritized = true;
+            health.avoidance_advised = true;
         }
         // Mark dirty for delta sync
         self.dirty_tools.insert(tool_name.to_string());
@@ -308,11 +308,11 @@ impl ToolHealthTracker {
     /// Record an input-validation failure (LLM passed wrong arg types,
     /// missing required fields, etc.). The TOOL is fine — the caller's
     /// arguments are wrong. Does NOT increment `consecutive_failures`
-    /// or trigger deprioritization, because the tool itself isn't
+    /// or trigger health avoidance, because the tool itself isn't
     /// broken and will succeed if the LLM fixes its args next round.
     ///
     /// Session 7e3fecb5: 3× `"background": "true"` (string instead of
-    /// bool) caused agent tool to be deprioritized. The tool was
+    /// bool) caused avoid advice for the agent tool. The tool was
     /// perfectly healthy — serde just rejected the input shape.
     ///
     /// ## Reporting note
@@ -322,9 +322,9 @@ impl ToolHealthTracker {
     /// `failure_rate` to flag "unhealthy" tools should either
     /// (a) separately surface `input_validation_failures` (TODO:
     /// add as dedicated counter), or (b) cross-check with
-    /// `consecutive_failures` / `deprioritized` before alerting —
+    /// `consecutive_failures` / `avoidance_advised` before alerting —
     /// a tool with high `failure_rate` but `consecutive_failures == 0`
-    /// and `!deprioritized` is almost certainly being misused by the
+    /// and `!avoidance_advised` is almost certainly being misused by the
     /// LLM, not broken.
     pub fn record_input_validation_failure(&mut self, tool_name: &str) {
         let health = self.tools.entry(tool_name.to_string()).or_default();
@@ -337,7 +337,7 @@ impl ToolHealthTracker {
     }
 
     /// Record an empty result (not error, but useless).
-    /// Counts as a "soft failure" — doesn't trigger deprioritization alone,
+    /// Counts as a "soft failure" — doesn't trigger health avoidance alone,
     /// but contributes to overall health metrics.
     pub fn record_empty(&mut self, tool_name: &str) {
         let health = self.tools.entry(tool_name.to_string()).or_default();
@@ -362,14 +362,14 @@ impl ToolHealthTracker {
         health.consecutive_successes = 0;
         // Use standard threshold (not flaky), since timeouts are infrastructure issues
         if health.consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD {
-            health.deprioritized = true;
+            health.avoidance_advised = true;
         }
         // Mark dirty for delta sync
         self.dirty_tools.insert(tool_name.to_string());
     }
 
     /// Record a system resource-limit failure (fork exhaustion, OOM, disk full).
-    /// Immediately deprioritizes the tool — the entire system is constrained,
+    /// Immediately enables health avoidance for the tool — the entire system is constrained,
     /// retrying will only make things worse.
     pub fn record_resource_limit_failure(&mut self, tool_name: &str) {
         let health = self.tools.entry(tool_name.to_string()).or_default();
@@ -377,8 +377,8 @@ impl ToolHealthTracker {
         health.total_failures += 1;
         health.consecutive_failures += 1;
         health.consecutive_successes = 0;
-        // Immediate deprioritization — resource limits affect the whole system
-        health.deprioritized = true;
+        // Immediate health avoidance — resource limits affect the whole system.
+        health.avoidance_advised = true;
         // Mark dirty for delta sync
         self.dirty_tools.insert(tool_name.to_string());
     }
@@ -415,24 +415,26 @@ impl ToolHealthTracker {
             .unwrap_or_default()
     }
 
-    /// Check if a tool has been deprioritized due to repeated failures.
-    pub fn is_deprioritized(&self, tool_name: &str) -> bool {
-        self.tools.get(tool_name).is_some_and(|h| h.deprioritized)
+    /// Check whether health avoidance advice is active for a tool.
+    pub fn is_avoidance_advised(&self, tool_name: &str) -> bool {
+        self.tools
+            .get(tool_name)
+            .is_some_and(|h| h.avoidance_advised)
     }
 
-    /// Manually deprioritize a tool when a higher-level policy decides the
-    /// current turn should steer away from it immediately.
-    pub fn force_deprioritize(&mut self, tool_name: &str) {
+    /// Manually enable health avoidance when a higher-level policy decides the
+    /// current turn should steer away from a tool immediately.
+    pub fn force_avoidance_advice(&mut self, tool_name: &str) {
         let health = self.tools.entry(tool_name.to_string()).or_default();
-        health.deprioritized = true;
+        health.avoidance_advised = true;
         self.dirty_tools.insert(tool_name.to_string());
     }
 
-    /// Get list of all deprioritized tools.
-    pub fn deprioritized_tools(&self) -> Vec<&str> {
+    /// Get all tools with active health avoidance advice.
+    pub fn health_avoidance_tools(&self) -> Vec<&str> {
         self.tools
             .iter()
-            .filter(|(_, h)| h.deprioritized)
+            .filter(|(_, h)| h.avoidance_advised)
             .map(|(name, _)| name.as_str())
             .collect()
     }
@@ -447,10 +449,10 @@ impl ToolHealthTracker {
         &self.tools
     }
 
-    /// Build a structured warning message for deprioritized tools.
-    /// Returns None if no tools are deprioritized.
-    pub fn deprioritize_warning(&self) -> Option<String> {
-        let blocked: Vec<&str> = self.deprioritized_tools();
+    /// Build a structured warning message for tools under health avoidance.
+    /// Returns None if no tools need health avoidance guidance.
+    pub fn health_avoidance_warning(&self) -> Option<String> {
+        let blocked: Vec<&str> = self.health_avoidance_tools();
         if blocked.is_empty() {
             return None;
         }
@@ -627,20 +629,20 @@ impl ToolHealthTracker {
     }
 
     /// Create a tracker seeded from persisted entries.
-    /// Tools with failure_rate >= 0.5 AND sufficient historical calls start deprioritized.
+    /// Tools with high failure rate and enough historical calls start under health avoidance.
     /// Tools with too few calls get the benefit of the doubt.
     pub fn from_entries(entries: &[astra_pipeline::ToolHealthEntry]) -> Self {
         let mut tracker = Self::new();
         for entry in entries {
-            let deprioritized = entry.total_calls >= CROSS_SESSION_MIN_CALLS
-                && entry.failure_rate >= CROSS_SESSION_DEPRIORITIZE_RATE;
+            let avoidance_advised = entry.total_calls >= CROSS_SESSION_MIN_CALLS
+                && entry.failure_rate >= CROSS_SESSION_AVOIDANCE_RATE;
             tracker.tools.insert(
                 entry.name.clone(),
                 ToolHealth {
                     total_calls: entry.total_calls,
                     total_failures: entry.total_failures,
                     consecutive_failures: 0, // Reset per-session
-                    deprioritized,
+                    avoidance_advised,
                     rehabilitation_count: 0,
                     consecutive_successes: 0,
                     timeout_count: 0,
@@ -735,7 +737,7 @@ impl ToolHealthTracker {
     /// Get a summary of tool health for diagnostics.
     pub fn summary(&self) -> ToolHealthSummary {
         let total_tools = self.tools.len();
-        let deprioritized_count = self.tools.values().filter(|h| h.deprioritized).count();
+        let health_avoidance_count = self.tools.values().filter(|h| h.avoidance_advised).count();
         let flaky_count = self
             .tools
             .values()
@@ -746,7 +748,7 @@ impl ToolHealthTracker {
         let total_cache_hits: usize = self.tools.values().map(|h| h.cache_hit_count).sum();
         ToolHealthSummary {
             total_tools,
-            deprioritized_count,
+            health_avoidance_count,
             flaky_count,
             total_errors,
             total_timeouts,
@@ -755,12 +757,12 @@ impl ToolHealthTracker {
     }
 
     /// Tools where majority of failures are timeouts (>= 70%).
-    /// These should get softer deprioritization messaging (infrastructure issue, not tool bug).
+    /// These should get softer health guidance (infrastructure issue, not tool bug).
     pub fn timeout_dominant_tools(&self) -> Vec<&str> {
         self.tools
             .iter()
             .filter(|(_, h)| {
-                h.deprioritized
+                h.avoidance_advised
                     && h.total_failures > 0
                     && h.timeout_count as f64 / h.total_failures as f64 >= 0.7
             })
@@ -1161,7 +1163,7 @@ impl ToolHealthTracker {
 #[derive(Debug, Clone)]
 pub struct ToolHealthSummary {
     pub total_tools: usize,
-    pub deprioritized_count: usize,
+    pub health_avoidance_count: usize,
     pub flaky_count: usize,
     pub total_errors: usize,
     pub total_timeouts: usize,
@@ -1177,18 +1179,18 @@ mod tests {
     #[test]
     fn new_tracker_empty() {
         let tracker = ToolHealthTracker::new();
-        assert!(!tracker.is_deprioritized("bash"));
-        assert!(tracker.deprioritized_tools().is_empty());
-        assert!(tracker.deprioritize_warning().is_none());
+        assert!(!tracker.is_avoidance_advised("bash"));
+        assert!(tracker.health_avoidance_tools().is_empty());
+        assert!(tracker.health_avoidance_warning().is_none());
     }
 
     #[test]
-    fn success_not_deprioritized() {
+    fn success_not_health_avoidance() {
         let mut tracker = ToolHealthTracker::new();
         for _ in 0..10 {
             tracker.record_success("bash");
         }
-        assert!(!tracker.is_deprioritized("bash"));
+        assert!(!tracker.is_avoidance_advised("bash"));
         let health = tracker.get("bash").unwrap();
         assert_eq!(health.total_calls, 10);
         assert_eq!(health.total_failures, 0);
@@ -1197,7 +1199,7 @@ mod tests {
     }
 
     #[test]
-    fn intermittent_failures_not_deprioritized() {
+    fn intermittent_failures_not_health_avoidance() {
         let mut tracker = ToolHealthTracker::new();
         // Fail, succeed, fail, succeed — never 3 consecutive
         tracker.record_failure("bash");
@@ -1206,35 +1208,35 @@ mod tests {
         tracker.record_success("bash");
         tracker.record_failure("bash");
         tracker.record_success("bash");
-        assert!(!tracker.is_deprioritized("bash"));
+        assert!(!tracker.is_avoidance_advised("bash"));
     }
 
     #[test]
-    fn three_consecutive_failures_deprioritizes() {
+    fn three_consecutive_failures_enable_health_avoidance() {
         let mut tracker = ToolHealthTracker::new();
         tracker.record_failure("bash");
-        assert!(!tracker.is_deprioritized("bash"));
+        assert!(!tracker.is_avoidance_advised("bash"));
         tracker.record_failure("bash");
-        assert!(!tracker.is_deprioritized("bash"));
+        assert!(!tracker.is_avoidance_advised("bash"));
         tracker.record_failure("bash");
-        assert!(tracker.is_deprioritized("bash"));
+        assert!(tracker.is_avoidance_advised("bash"));
 
         let health = tracker.get("bash").unwrap();
         assert_eq!(health.consecutive_failures, 3);
-        assert!(health.deprioritized);
+        assert!(health.avoidance_advised);
     }
 
     #[test]
-    fn success_after_deprioritize_rehabilitates() {
+    fn success_after_health_avoidance_rehabilitates() {
         let mut tracker = ToolHealthTracker::new();
         tracker.record_failure("bash");
         tracker.record_failure("bash");
         tracker.record_failure("bash");
-        assert!(tracker.is_deprioritized("bash"));
+        assert!(tracker.is_avoidance_advised("bash"));
 
         // One success rehabilitates
         tracker.record_success("bash");
-        assert!(!tracker.is_deprioritized("bash"));
+        assert!(!tracker.is_avoidance_advised("bash"));
         assert_eq!(tracker.get("bash").unwrap().consecutive_failures, 0);
     }
 
@@ -1246,13 +1248,13 @@ mod tests {
         tracker.record_failure("bash");
         tracker.record_success("read_file");
 
-        assert!(tracker.is_deprioritized("bash"));
-        assert!(!tracker.is_deprioritized("read_file"));
-        assert!(!tracker.is_deprioritized("git")); // never called
+        assert!(tracker.is_avoidance_advised("bash"));
+        assert!(!tracker.is_avoidance_advised("read_file"));
+        assert!(!tracker.is_avoidance_advised("git")); // never called
     }
 
     #[test]
-    fn deprioritized_tools_list() {
+    fn health_avoidance_tools_list() {
         let mut tracker = ToolHealthTracker::new();
         for _ in 0..3 {
             tracker.record_failure("bash");
@@ -1262,20 +1264,20 @@ mod tests {
         }
         tracker.record_success("git");
 
-        let mut blocked = tracker.deprioritized_tools();
+        let mut blocked = tracker.health_avoidance_tools();
         blocked.sort();
         assert_eq!(blocked, vec!["bash", "read_file"]);
     }
 
     #[test]
-    fn deprioritize_warning_message() {
+    fn health_avoidance_warning_message() {
         let mut tracker = ToolHealthTracker::new();
-        assert!(tracker.deprioritize_warning().is_none());
+        assert!(tracker.health_avoidance_warning().is_none());
 
         for _ in 0..3 {
             tracker.record_failure("bash");
         }
-        let warning = tracker.deprioritize_warning().unwrap();
+        let warning = tracker.health_avoidance_warning().unwrap();
         assert!(warning.contains("bash"));
         assert!(warning.contains("3"));
         assert!(warning.contains("retried blindly"));
@@ -1287,12 +1289,12 @@ mod tests {
     }
 
     #[test]
-    fn deprioritize_warning_read_file_suggests_grep() {
+    fn health_avoidance_warning_read_file_suggests_grep() {
         let mut tracker = ToolHealthTracker::new();
         for _ in 0..3 {
             tracker.record_failure("read_file");
         }
-        let warning = tracker.deprioritize_warning().unwrap();
+        let warning = tracker.health_avoidance_warning().unwrap();
         assert!(warning.contains("read_file"));
         assert!(
             warning.contains("grep"),
@@ -1372,12 +1374,12 @@ mod tests {
         let health = tracker.get("bash").unwrap();
         assert_eq!(health.total_calls, 10);
         assert_eq!(health.total_failures, 8);
-        // High failure rate (0.8 >= 0.7) AND sufficient calls (10 >= 8) → start deprioritized
-        assert!(health.deprioritized);
+        // High failure rate (0.8 >= 0.7) AND sufficient calls (10 >= 8) → start under health avoidance
+        assert!(health.avoidance_advised);
     }
 
     #[test]
-    fn import_borderline_failure_rate_not_deprioritized() {
+    fn import_borderline_failure_rate_not_health_avoidance() {
         use astra_pipeline::ToolHealthEntry;
         // 5 calls, 3 failures (60%) — below both thresholds (need 8 calls AND 70% rate)
         let entries = vec![ToolHealthEntry {
@@ -1390,13 +1392,13 @@ mod tests {
         }];
         let tracker = ToolHealthTracker::from_entries(&entries);
         assert!(
-            !tracker.is_deprioritized("str_replace"),
-            "5 calls with 60% failure should NOT deprioritize (need >=8 calls AND >=70% rate)"
+            !tracker.is_avoidance_advised("str_replace"),
+            "5 calls with 60% failure should NOT trigger health avoidance (need >=8 calls AND >=70% rate)"
         );
     }
 
     #[test]
-    fn import_sufficient_calls_moderate_rate_not_deprioritized() {
+    fn import_sufficient_calls_moderate_rate_not_health_avoidance() {
         use astra_pipeline::ToolHealthEntry;
         // 10 calls, 6 failures (60%) — enough calls but rate below 70%
         let entries = vec![ToolHealthEntry {
@@ -1409,13 +1411,13 @@ mod tests {
         }];
         let tracker = ToolHealthTracker::from_entries(&entries);
         assert!(
-            !tracker.is_deprioritized("str_replace"),
-            "60% failure rate should NOT deprioritize (need >=70%)"
+            !tracker.is_avoidance_advised("str_replace"),
+            "60% failure rate should NOT trigger health avoidance (need >=70%)"
         );
     }
 
     #[test]
-    fn import_low_failure_rate_not_deprioritized() {
+    fn import_low_failure_rate_not_health_avoidance() {
         use astra_pipeline::ToolHealthEntry;
         let entries = vec![ToolHealthEntry {
             name: "read_file".to_string(),
@@ -1426,15 +1428,15 @@ mod tests {
             recent_outcomes: vec![],
         }];
         let tracker = ToolHealthTracker::from_entries(&entries);
-        assert!(!tracker.is_deprioritized("read_file"));
+        assert!(!tracker.is_avoidance_advised("read_file"));
     }
 
     #[test]
-    fn resource_limit_immediately_deprioritizes() {
+    fn resource_limit_immediately_enables_health_avoidance() {
         let mut tracker = ToolHealthTracker::new();
-        // A single resource-limit failure should immediately block
+        // A single resource-limit failure should immediately advise avoidance.
         tracker.record_resource_limit_failure("bash");
-        assert!(tracker.is_deprioritized("bash"));
+        assert!(tracker.is_avoidance_advised("bash"));
         let health = tracker.get("bash").unwrap();
         assert_eq!(health.total_calls, 1);
         assert_eq!(health.total_failures, 1);
@@ -1445,39 +1447,39 @@ mod tests {
     fn resource_limit_not_rehabilitated_by_success() {
         let mut tracker = ToolHealthTracker::new();
         tracker.record_resource_limit_failure("bash");
-        assert!(tracker.is_deprioritized("bash"));
+        assert!(tracker.is_avoidance_advised("bash"));
         // Even after a success, the tool should be rehabilitated (standard behavior)
         // but the system should have already blocked it in restricted_tools
         tracker.record_success("bash");
-        assert!(!tracker.is_deprioritized("bash")); // rehabilitated
+        assert!(!tracker.is_avoidance_advised("bash")); // rehabilitated
         assert_eq!(tracker.get("bash").unwrap().rehabilitation_count, 1);
     }
 
     #[test]
-    fn normal_failure_needs_three_for_deprioritize() {
+    fn normal_failure_needs_three_for_health_avoidance() {
         let mut tracker = ToolHealthTracker::new();
         tracker.record_failure("bash");
-        assert!(!tracker.is_deprioritized("bash"));
+        assert!(!tracker.is_avoidance_advised("bash"));
         tracker.record_failure("bash");
-        assert!(!tracker.is_deprioritized("bash"));
+        assert!(!tracker.is_avoidance_advised("bash"));
         tracker.record_failure("bash");
-        assert!(tracker.is_deprioritized("bash")); // 3rd failure triggers
+        assert!(tracker.is_avoidance_advised("bash")); // 3rd failure triggers
     }
 
-    /// Regression: resource-limit deprioritization MUST NOT be overwritten by
+    /// Regression: health-avoidance resource-limit state MUST NOT be overwritten by
     /// a subsequent record_success(). In production, the resource-limit path
     /// records health directly, then skips record_tool_result() to prevent
     /// classify_result() from returning Success (since the output text doesn't
     /// start with "Error:") and calling record_success() which clears
-    /// deprioritized status. This test documents the overwrite hazard.
+    /// health-avoidance state. This test documents the overwrite hazard.
     #[test]
     fn resource_limit_overwrite_hazard_documented() {
         let mut tracker = ToolHealthTracker::new();
-        // Step 1: resource limit → immediate deprioritize
+        // Step 1: resource limit -> immediate health avoidance.
         tracker.record_resource_limit_failure("bash");
         assert!(
-            tracker.is_deprioritized("bash"),
-            "must be deprioritized after resource limit"
+            tracker.is_avoidance_advised("bash"),
+            "must be health avoidance after resource limit"
         );
 
         // Step 2: if record_success is called (what the old code did via
@@ -1486,7 +1488,7 @@ mod tests {
         // resource_limit_recorded=true, preventing this path.
         tracker.record_success("bash");
         assert!(
-            !tracker.is_deprioritized("bash"),
+            !tracker.is_avoidance_advised("bash"),
             "record_success does rehabilitate — this is why we skip record_tool_result()"
         );
 
@@ -1525,16 +1527,16 @@ mod tests {
     #[test]
     fn rehabilitation_count_resets_after_stability_window() {
         let mut tracker = ToolHealthTracker::new();
-        // Cycle 1: fail 3 → deprioritize → succeed → rehab_count=1
+        // Cycle 1: fail 3 → health avoidance → succeed → rehab_count=1
         for _ in 0..3 {
             tracker.record_failure("bash");
         }
-        assert!(tracker.is_deprioritized("bash"));
+        assert!(tracker.is_avoidance_advised("bash"));
         tracker.record_success("bash"); // rehabilitates
-        assert!(!tracker.is_deprioritized("bash"));
+        assert!(!tracker.is_avoidance_advised("bash"));
         assert_eq!(tracker.get("bash").unwrap().rehabilitation_count, 1);
 
-        // Cycle 2: fail 3 → deprioritize → succeed → rehab_count=2
+        // Cycle 2: fail 3 → health avoidance → succeed → rehab_count=2
         for _ in 0..3 {
             tracker.record_failure("bash");
         }
@@ -1544,8 +1546,8 @@ mod tests {
         tracker.record_failure("bash");
         tracker.record_failure("bash");
         assert!(
-            tracker.is_deprioritized("bash"),
-            "flaky tool should deprioritize faster"
+            tracker.is_avoidance_advised("bash"),
+            "flaky tool should trigger health avoidance faster"
         );
 
         // Rehabilitate and then sustain success for stability window
@@ -1566,11 +1568,11 @@ mod tests {
         tracker.record_failure("bash");
         tracker.record_failure("bash");
         assert!(
-            !tracker.is_deprioritized("bash"),
-            "after stability reset, 2 failures should NOT deprioritize (need 3)"
+            !tracker.is_avoidance_advised("bash"),
+            "after stability reset, 2 failures should NOT trigger health avoidance (need 3)"
         );
         tracker.record_failure("bash");
-        assert!(tracker.is_deprioritized("bash"));
+        assert!(tracker.is_avoidance_advised("bash"));
     }
 
     #[test]
@@ -1651,7 +1653,7 @@ mod tests {
         tracker.record_resource_limit_failure("bash");
         let health = tracker.get("bash").unwrap();
         assert_eq!(health.consecutive_successes, 0);
-        assert!(health.deprioritized);
+        assert!(health.avoidance_advised);
         assert_eq!(health.rehabilitation_count, 1);
     }
 
@@ -2058,7 +2060,7 @@ mod tests {
         for _ in 0..4 {
             tracker.record_failure("str_replace");
         }
-        let msg = tracker.deprioritize_warning().unwrap();
+        let msg = tracker.health_avoidance_warning().unwrap();
         assert!(
             msg.contains("write_file"),
             "injection should suggest write_file fallback, got: {msg}"

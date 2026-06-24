@@ -3664,7 +3664,7 @@ pub(crate) mod tests {
                 severity: "warning".into(),
                 injections: vec!["stall detected".into()],
                 avoid_tools: vec!["write_file".into()],
-                deprioritized_tools: vec![],
+                health_avoidance_tools: vec![],
                 force_stop: false,
                 nudge_count: 1,
                 interaction_mode: "prompt".into(),
@@ -3672,7 +3672,7 @@ pub(crate) mod tests {
                 recent_error_pressure: 0,
                 recent_timeout_pressure: 0,
                 total_errors: 0,
-                deprioritized_count: 0,
+                health_avoidance_count: 0,
                 total_timeouts: 0,
                 timeout_dominant_tools: vec![],
                 total_cache_hits: 0,
@@ -8853,7 +8853,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         let guard = session.read().unwrap();
         assert!(guard.config.verification.strictness > 0.5);
-        assert!(state.turn_guard.health.is_deprioritized("bash"));
+        assert!(state.turn_guard.health.is_avoidance_advised("bash"));
         assert!(guard.config.compression.compression_threshold < 0.8);
         assert!(guard.config.token_budget.max_turn_input_tokens < 100_000);
         assert_eq!(

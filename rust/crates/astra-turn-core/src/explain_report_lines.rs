@@ -167,11 +167,11 @@ pub fn verdict_event_summary_line(
     interaction_mode: &str,
     suppressed_loop_nudges: bool,
     recent_error_pressure: usize,
-    deprioritized_count: usize,
+    health_avoidance_count: usize,
     force_stop: bool,
 ) -> String {
     format!(
-        "T{} {} {}  mode={}{}  nudges={}  pressure={}  deprioritized={}{}",
+        "T{} {} {}  mode={}{}  nudges={}  pressure={}  health_avoidance={}{}",
         turn,
         icon,
         severity,
@@ -183,7 +183,7 @@ pub fn verdict_event_summary_line(
         },
         nudge_count,
         recent_error_pressure,
-        deprioritized_count,
+        health_avoidance_count,
         if force_stop { "  FORCE_STOP" } else { "" },
     )
 }
@@ -453,7 +453,7 @@ mod tests {
         let s = verdict_event_summary_line(1, "🛑", "critical", 0, "auto", true, 5, 2, true);
         assert!(s.contains("FORCE_STOP"));
         assert!(s.contains("suppress_nudges=1"));
-        assert!(s.contains("deprioritized=2"));
+        assert!(s.contains("health_avoidance=2"));
     }
 
     // ──────────────────────────────────────────────────────────

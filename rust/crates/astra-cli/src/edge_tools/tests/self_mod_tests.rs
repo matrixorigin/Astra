@@ -221,7 +221,7 @@ async fn set_session_lessons_feeds_build_self_model_snapshot() {
     let (exe, _session) = executor_with_session();
     let lessons = vec![
         astra_services::LessonHint {
-            kind: astra_services::LessonKind::ToolDeprioritize,
+            kind: astra_services::LessonKind::ToolAvoidance,
             trigger_signal: "3 stalls on grep".into(),
             action: "switch to rg".into(),
             workload_tag: None,

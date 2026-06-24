@@ -135,7 +135,7 @@ pub(crate) fn persist_failed_subrun(state: &mut AgenticLoopState, error: &str) -
     let blocked_tools = state
         .turn_guard
         .health
-        .deprioritized_tools()
+        .health_avoidance_tools()
         .iter()
         .map(|tool| tool.to_string())
         .collect::<Vec<_>>();

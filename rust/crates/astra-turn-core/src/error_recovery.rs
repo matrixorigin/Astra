@@ -100,13 +100,13 @@ const TOOL_GROUPS: &[&[&str]] = &[
 
 /// Suggest alternative tools when a tool fails.
 /// Returns a list of tools in the same functional group, excluding the failed one
-/// and any deprioritized tools.
-pub fn suggest_alternatives(failed_tool: &str, deprioritized: &[&str]) -> Vec<String> {
+/// and any health-avoidance tools.
+pub fn suggest_alternatives(failed_tool: &str, avoidance_advised: &[&str]) -> Vec<String> {
     for group in TOOL_GROUPS {
         if group.contains(&failed_tool) {
             return group
                 .iter()
-                .filter(|&&t| t != failed_tool && !deprioritized.contains(&t))
+                .filter(|&&t| t != failed_tool && !avoidance_advised.contains(&t))
                 .map(|&t| t.to_string())
                 .collect();
         }
@@ -120,9 +120,9 @@ pub fn build_recovery_message(
     tool_name: &str,
     error_str: &str,
     category: ErrorCategory,
-    deprioritized: &[&str],
+    avoidance_advised: &[&str],
 ) -> String {
-    let alternatives = suggest_alternatives(tool_name, deprioritized);
+    let alternatives = suggest_alternatives(tool_name, avoidance_advised);
     let error_lower = error_str.to_lowercase();
     let ask_user_shape_error = tool_name == "ask_user"
         && (matches!(
@@ -289,18 +289,18 @@ pub enum EscalationLevel {
 ///
 /// - `nudge_count`: how many stall nudges have been sent
 /// - `total_errors`: total tool errors this session (excluding auth + timeouts)
-/// - `deprioritized_count`: number of deprioritized tools
+/// - `health_avoidance_count`: number of health-avoidance tools
 ///
 /// Thresholds are deliberately generous: normal agent behavior (search→read→search)
 /// should NEVER trigger escalation. Only truly stuck/broken sessions escalate.
 pub fn escalation_level(
     nudge_count: usize,
     total_errors: usize,
-    deprioritized_count: usize,
+    health_avoidance_count: usize,
 ) -> EscalationLevel {
     // Critical: nudges + errors coupled (prevents pure-stall sessions from
     // force-stopping when the agent is actually making progress with 0 errors),
-    // or many errors with deprioritized tools,
+    // or many errors with health-avoidance tools,
     // or very high total errors (scattered failures are still broken),
     // or very high nudge count alone (the agent is spinning even without errors).
     //
@@ -318,7 +318,7 @@ pub fn escalation_level(
     // - nudge_count alone requires 10 (not 6) to avoid false Critical on
     //   normal sessions with repeated exploration but no tool errors.
     if (nudge_count >= 4 && total_errors >= 3)
-        || (total_errors >= 12 && deprioritized_count >= 2)
+        || (total_errors >= 12 && health_avoidance_count >= 2)
         || total_errors >= 15
         || nudge_count >= 10
     {
@@ -719,16 +719,16 @@ mod tests {
         assert_eq!(escalation_level(4, 0, 0), EscalationLevel::Warning);
         assert_eq!(escalation_level(0, 8, 0), EscalationLevel::Warning);
         assert_eq!(escalation_level(0, 14, 0), EscalationLevel::Warning);
-        // 8 errors + 1 deprioritized → Warning
+        // 8 errors + 1 health-avoidance tool → Warning
         assert_eq!(escalation_level(0, 8, 1), EscalationLevel::Warning);
 
         // Critical: 4+ nudges + 3+ errors
         assert_eq!(escalation_level(4, 3, 0), EscalationLevel::Critical);
         assert_eq!(escalation_level(5, 4, 0), EscalationLevel::Critical);
-        // 12+ errors + 2+ deprioritized → Critical
+        // 12+ errors + 2+ health-avoidance tools → Critical
         assert_eq!(escalation_level(0, 12, 2), EscalationLevel::Critical);
         assert_eq!(escalation_level(0, 13, 3), EscalationLevel::Critical);
-        // 12 errors + 1 deprioritized → Warning
+        // 12 errors + 1 health-avoidance tool → Warning
         assert_eq!(escalation_level(0, 12, 1), EscalationLevel::Warning);
         // 15+ errors regardless → Critical
         assert_eq!(escalation_level(0, 15, 0), EscalationLevel::Critical);

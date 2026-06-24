@@ -26,24 +26,8 @@ fn setup() -> (tempfile::TempDir, ToolExecutor) {
 // ── Task tool tests ─────────────────────────────────────────��────────────
 
 #[tokio::test]
-async fn retired_public_tool_names_are_not_executable() {
+async fn task_tool_create_is_executable() {
     let (_dir, exe) = setup();
-
-    for &retired in astra_core::tool_names::RETIRED_TOOL_NAMES {
-        let legacy = exe
-            .execute_with_metadata(retired, &json!({"title": "old surface"}))
-            .await;
-        assert!(legacy.is_error, "{retired}: {legacy:?}");
-        assert_eq!(
-            legacy
-                .tool_result_fields
-                .as_ref()
-                .and_then(|fields| fields.get("error_kind"))
-                .and_then(serde_json::Value::as_str),
-            Some(astra_core::ErrorKind::ToolBinding.as_str()),
-            "{retired}: {legacy:?}"
-        );
-    }
 
     let unified = exe
         .execute("task", &json!({"action": "create", "title": "new surface"}))
@@ -426,18 +410,17 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
         "adopt typo should be rejected locally before cloud checks: {adopt_typo}"
     );
 
-    let old_background_action = exe
+    let unknown_background_action = exe
         .execute(
             "task",
             &json!({"action": "background_shell", "command": "echo hi"}),
         )
         .await;
     assert!(
-        old_background_action.starts_with("Error:")
-            && old_background_action.contains("unknown `task` action")
-            && old_background_action.contains("background_shell")
-            && !old_background_action.contains("agent_job(action='"),
-        "old task background actions should be ordinary unknown task actions: {old_background_action}"
+        unknown_background_action.starts_with("Error:")
+            && unknown_background_action.contains("unknown `task` action")
+            && unknown_background_action.contains("background_shell"),
+        "background_shell should be an ordinary unknown task action: {unknown_background_action}"
     );
 }
 
@@ -649,7 +632,7 @@ async fn task_mutations_append_lifecycle_events_to_session_journal() {
         .await;
     exe.task_action_stop(&json!({"task_id": "task-1", "reason": "user cancelled"}))
         .await;
-    exe.task_archive(&json!({"task_id": "task-1"})).await;
+    exe.task_action_archive(&json!({"task_id": "task-1"})).await;
 
     let raw = std::fs::read_to_string(session_journal::journal_file_path("task-journal-session"))
         .unwrap();
@@ -773,7 +756,7 @@ async fn task_action_stop_cancels_subtasks() {
     assert_eq!(parsed["cancelled_subtasks"], 2);
 }
 
-// ── task_archive tests ───────────────────────────────────────────────────
+// ── task(action=archive) tests ────────────────────────────────────────────
 
 #[tokio::test]
 async fn task_archive_works_without_cloud_connection() {
@@ -784,7 +767,7 @@ async fn task_archive_works_without_cloud_connection() {
     exe.task_action_update(&json!({"task_id": "task-1", "new_status": "completed"}))
         .await;
 
-    let result = exe.task_archive(&json!({"task_id": "task-1"})).await;
+    let result = exe.task_action_archive(&json!({"task_id": "task-1"})).await;
     let parsed = parse_task_json(&result);
     assert!(
         parsed["success"].as_bool().unwrap(),

@@ -413,15 +413,15 @@ fn compress_context_compensation_summary() -> &'static str {
     "prefer `rollback_session_state` with scope=`current_turn` to restore session-local compression state; manual compression journal markers remain append-only if you inspect the persisted journal later"
 }
 
-fn task_create_compensation_summary() -> &'static str {
+fn task_action_create_compensation_summary() -> &'static str {
     "prefer `rollback_session_state` with scope=`current_turn` to restore the pre-task snapshot; `task(action='stop')` with the returned `task_id` remains the manual fallback if you only want to cancel the created task"
 }
 
-fn task_update_compensation_summary() -> &'static str {
+fn task_action_update_compensation_summary() -> &'static str {
     "prefer `rollback_session_state` with scope=`current_turn` to restore the pre-update task snapshot; otherwise use `task(action='get')` plus the `previous_status` from the tool result and rerun `task(action='update', task_id='...', new_status='<previous_status>')` manually"
 }
 
-fn task_stop_compensation_summary() -> &'static str {
+fn task_action_stop_compensation_summary() -> &'static str {
     "prefer `rollback_session_state` with scope=`current_turn` to restore the pre-stop task snapshot; otherwise use `task(action='update', task_id='...', new_status='<previous_status>')` with the `previous_status` from the tool result to reopen the task manually"
 }
 
@@ -431,19 +431,20 @@ fn task_action_profile(args: &Value) -> ActionCompensationProfile {
         .to_ascii_lowercase()
         .as_str()
     {
-        "create" => {
-            session_state_action_profile(ActionCategory::Write, task_create_compensation_summary())
-        }
+        "create" => session_state_action_profile(
+            ActionCategory::Write,
+            task_action_create_compensation_summary(),
+        ),
         "update" => {
             let category = match string_arg(args, "new_status") {
                 Some("deleted") => ActionCategory::Destructive,
                 _ => ActionCategory::Write,
             };
-            session_state_action_profile(category, task_update_compensation_summary())
+            session_state_action_profile(category, task_action_update_compensation_summary())
         }
         "stop" => session_state_action_profile(
             ActionCategory::Destructive,
-            task_stop_compensation_summary(),
+            task_action_stop_compensation_summary(),
         ),
         "archive" => session_state_action_profile(
             ActionCategory::Write,
@@ -1052,8 +1053,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_task_tool_names_are_not_special_compensation_surfaces() {
-        let profile = tool_action_profile("task_create", &json!({"title": "demo"}));
+    fn unknown_tool_names_are_not_special_compensation_surfaces() {
+        let profile = tool_action_profile("unknown_task_surface", &json!({"title": "demo"}));
         assert_eq!(profile.category, ActionCategory::Read);
         assert!(profile.compensation_kind.is_none());
     }

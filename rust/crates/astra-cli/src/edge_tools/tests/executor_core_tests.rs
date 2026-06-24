@@ -86,15 +86,14 @@ async fn git_github_helper_style_names_are_unknown_on_cli_edge_executor() {
 }
 
 #[tokio::test]
-async fn retired_session_state_actions_are_rejected_on_cli_edge_executor() {
+async fn unsupported_session_state_actions_are_rejected_on_cli_edge_executor() {
     let executor = test_executor();
 
     for action in [
-        "prioritize",
-        "deprioritize",
-        "compact",
-        "set_goal",
-        "ask_user",
+        "configure_later",
+        "wait_until",
+        "restore_context",
+        "questionnaire",
         "rollback_edits",
         "timeline",
         "summary",
@@ -273,7 +272,7 @@ async fn execute_with_metadata_bash_empty_result_is_structured_non_error() {
     );
 }
 
-/// REGRESSION: the consolidated `agent` tool must reject the retired
+/// REGRESSION: the consolidated `agent` tool must reject the blocked
 /// delegate action instead of returning a successful placeholder.
 ///
 /// The fix is twofold: (1) the schema enum drops "delegate" so the
@@ -293,12 +292,12 @@ async fn agent_action_delegate_is_rejected_with_redirect_to_spawn() {
         .await;
     assert!(
         result.starts_with("Error"),
-        "retired delegate action must return an Error: prefix so the TUI renders \
+        "blocked delegate action must return an Error: prefix so the TUI renders \
          it as a failure (red banner), not as a normal tool result. Got: {result}"
     );
     assert!(
         result.contains("spawn"),
-        "retired delegate action error must name the `agent` spawn action as the \
+        "blocked delegate action error must name the `agent` spawn action as the \
          alternative — without that, the model has no path to recovery. \
          Got: {result}"
     );
@@ -384,7 +383,6 @@ async fn task_background_actions_are_plain_unknown_task_actions() {
             result.contains("unknown `task` action") && result.contains(action),
             "task.{action} must be rejected by the ordinary unknown-action path. Got: {result}"
         );
-        assert!(!result.contains("agent_job(action='"), "{result}");
         assert!(
             astra_turn_core::tool_result_semantics::is_tool_error(&result),
             "task.{action} rejection must classify as an error so cloud \
@@ -1162,24 +1160,6 @@ async fn typed_background_task_tools_dispatch_through_executor() {
             && !result.contains("Unknown tool"),
         "task_list should reach the registry-unwired fail-fast path. Got: {result}"
     );
-}
-
-#[tokio::test]
-async fn removed_background_job_aliases_are_unknown_tools() {
-    let executor = test_executor();
-    for name in ["job", "agent_job"] {
-        let result = executor.execute(name, &json!({})).await;
-        assert!(
-            result.contains("Unknown tool")
-                || result.contains("unknown")
-                || result.contains("not available"),
-            "{name} must not remain executable as a background-task alias. Got: {result}"
-        );
-        assert!(
-            !result.contains("interactive REPL") && !result.contains("task_output"),
-            "{name} must not route through removed background-task compatibility guidance. Got: {result}"
-        );
-    }
 }
 
 /// The `agent` tool's action enum must NOT advertise "delegate" to

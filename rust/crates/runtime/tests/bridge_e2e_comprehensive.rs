@@ -8661,7 +8661,7 @@ async fn b1_think_before_act_directive_in_system_prompt() {
     );
 }
 
-/// B2: Bridge accepts round_index from payload without reintroducing retired
+/// B2: Bridge accepts round_index from payload without reintroducing removed
 /// countdown directives.
 #[tokio::test]
 async fn b2_bridge_accepts_round_index_without_countdown_directive() {
@@ -8685,7 +8685,7 @@ async fn b2_bridge_accepts_round_index_without_countdown_directive() {
 
     cap.wait_persist_idle().await;
 
-    // Late round: budget directives are retired, but bridge payload handling
+    // Late round: budget directives are removed, but bridge payload handling
     // must remain stable for non-zero round_index.
     let threshold = 8;
     let payload_rt = json!({

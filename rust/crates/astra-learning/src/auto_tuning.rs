@@ -96,9 +96,9 @@ pub enum SignalType {
     TaskFailure { reason: String },
 
     // ─── Tool Health Signals ───
-    /// A tool was deprioritized due to repeated failures.
-    ToolDeprioritized { tool_name: String },
-    /// A tool was rehabilitated after being deprioritized.
+    /// A tool triggered health avoidance due to repeated failures.
+    ToolHealthAvoidance { tool_name: String },
+    /// A tool was rehabilitated after health avoidance.
     ToolRehabilitated { tool_name: String },
 }
 
@@ -119,7 +119,7 @@ impl SignalType {
     pub const NAME_FOCUS_DRIFT: &'static str = "focus_drift";
     pub const NAME_TASK_SUCCESS: &'static str = "task_success";
     pub const NAME_TASK_FAILURE: &'static str = "task_failure";
-    pub const NAME_TOOL_DEPRIORITIZED: &'static str = "tool_deprioritized";
+    pub const NAME_TOOL_HEALTH_AVOIDANCE: &'static str = "tool_health_avoidance";
     pub const NAME_TOOL_REHABILITATED: &'static str = "tool_rehabilitated";
 
     /// Canonical string name for this signal type, used for accumulation matching.
@@ -139,7 +139,7 @@ impl SignalType {
             Self::FocusDrift => Self::NAME_FOCUS_DRIFT,
             Self::TaskSuccess => Self::NAME_TASK_SUCCESS,
             Self::TaskFailure { .. } => Self::NAME_TASK_FAILURE,
-            Self::ToolDeprioritized { .. } => Self::NAME_TOOL_DEPRIORITIZED,
+            Self::ToolHealthAvoidance { .. } => Self::NAME_TOOL_HEALTH_AVOIDANCE,
             Self::ToolRehabilitated { .. } => Self::NAME_TOOL_REHABILITATED,
         }
     }
@@ -1633,11 +1633,11 @@ mod tests {
 
         // Tool signal type names
         assert_eq!(
-            SignalType::ToolDeprioritized {
+            SignalType::ToolHealthAvoidance {
                 tool_name: "bash".into()
             }
             .type_name(),
-            "tool_deprioritized"
+            "tool_health_avoidance"
         );
         assert_eq!(
             SignalType::ToolRehabilitated {

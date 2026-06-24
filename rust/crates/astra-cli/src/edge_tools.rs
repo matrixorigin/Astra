@@ -1438,9 +1438,6 @@ impl ToolExecutor {
     }
 
     fn tool_has_runtime_binding(&self, name: &str) -> bool {
-        if astra_core::tool_names::is_retired_tool_name(name) {
-            return false;
-        }
         if name.starts_with("mcp__") {
             return self.mcp_tool_has_runtime_binding(name);
         }
@@ -2986,7 +2983,7 @@ impl ToolExecutor {
     /// `task(action='archive', task_id?)` — either archive one
     /// current-session task immediately, or bulk-archive stale
     /// completed history in the current session.
-    async fn task_archive(&self, args: &Value) -> String {
+    async fn task_action_archive(&self, args: &Value) -> String {
         if let Some(output) = self.route_task_action("archive", args).await {
             self.record_task_lifecycle_event("archive", args, &output);
             return output;
@@ -4649,7 +4646,7 @@ impl ToolExecutor {
                         },
                         "archive" => {
                             match Self::validate_task_tool_args_for_action("archive", args) {
-                                Ok(()) => self.task_archive(args).await,
+                                Ok(()) => self.task_action_archive(args).await,
                                 Err(error) => format!("Error: {error}"),
                             }
                         }
@@ -5107,14 +5104,14 @@ impl ToolExecutor {
                 "tools_dropped_by_surface": caps.dropped_by_surface,
                 "tools_pass_through_mcp": caps.mcp_pass_through,
                 "tool_count": model.capabilities.total_tools,
-                "health_deprioritized_tools": model.capabilities.health_deprioritized_tools,
+                "health_avoidance_tools": model.capabilities.health_avoidance_tools,
                 "skills": model.capabilities.skills,
                 "tool_health": model.capabilities.tool_health.iter().map(|t| {
                     json!({
                         "name": t.name,
                         "total_calls": t.total_calls,
                         "success_rate": t.success_rate,
-                        "deprioritized": t.deprioritized,
+                        "avoidance_advised": t.avoidance_advised,
                     })
                 }).collect::<Vec<_>>(),
             })

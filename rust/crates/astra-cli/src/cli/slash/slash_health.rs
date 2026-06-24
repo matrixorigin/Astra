@@ -27,7 +27,7 @@ pub(crate) async fn handle_health_command(arg: &str, state: &SessionState) {
         );
     } else {
         // Overall status
-        let status = if summary.deprioritized_count > 0 || summary.flaky_count > 0 {
+        let status = if summary.health_avoidance_count > 0 || summary.flaky_count > 0 {
             "⚠ Degraded".yellow().to_string()
         } else if summary.total_errors > 0 {
             "● Minor issues".to_string()
@@ -50,10 +50,10 @@ pub(crate) async fn handle_health_command(arg: &str, state: &SessionState) {
             },
             summary.total_cache_hits,
         );
-        if summary.deprioritized_count > 0 {
+        if summary.health_avoidance_count > 0 {
             eprintln!(
-                "  {} deprioritized, {} flaky",
-                summary.deprioritized_count.to_string().red(),
+                "  {} health avoidance, {} flaky",
+                summary.health_avoidance_count.to_string().red(),
                 summary.flaky_count,
             );
         }
@@ -75,8 +75,8 @@ pub(crate) async fn handle_health_command(arg: &str, state: &SessionState) {
             let mut sorted: Vec<_> = all.iter().collect();
             sorted.sort_by_key(|x| std::cmp::Reverse(x.1.total_failures));
             for (name, health) in &sorted {
-                let status_str = if health.deprioritized {
-                    "⛔ deprioritized".red().to_string()
+                let status_str = if health.avoidance_advised {
+                    "⛔ health avoidance".red().to_string()
                 } else if health.rehabilitation_count >= 2 {
                     "⚠ flaky".yellow().to_string()
                 } else if health.total_failures > 0 {
@@ -117,18 +117,18 @@ pub(crate) async fn handle_health_command(arg: &str, state: &SessionState) {
             }
         } else {
             // Compact view: only show problematic tools
-            let deprioritized = tracker.deprioritized_tools();
-            if !deprioritized.is_empty() {
+            let avoidance_advised = tracker.health_avoidance_tools();
+            if !avoidance_advised.is_empty() {
                 eprintln!(
                     "  {} {}",
-                    "Deprioritized:".red(),
-                    deprioritized.join(", ").red()
+                    "Health avoidance:".red(),
+                    avoidance_advised.join(", ").red()
                 );
             }
             let all = tracker.all();
             let recovering: Vec<&str> = all
                 .iter()
-                .filter(|(_, h)| h.total_failures > 0 && !h.deprioritized)
+                .filter(|(_, h)| h.total_failures > 0 && !h.avoidance_advised)
                 .map(|(n, _)| n.as_str())
                 .collect();
             if !recovering.is_empty() {

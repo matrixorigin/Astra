@@ -238,7 +238,6 @@ mod tests {
             );
         }
         assert_eq!(classify("task"), ToolIdempotency::NonIdempotent);
-        assert_eq!(classify("task_get"), ToolIdempotency::NonIdempotent);
     }
 
     #[test]

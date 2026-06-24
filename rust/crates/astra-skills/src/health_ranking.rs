@@ -26,9 +26,9 @@
 //! * The total is clamped to `[0.2, 1.5]` to bound the influence of noisy
 //!   samples and keep ranking stable across small changes.
 //!
-//! ## Health-deprioritization short-circuit
+//! ## Health-avoidance short-circuit
 //!
-//! If a tool appears in the explicit health-deprioritized set, the multiplier
+//! If a tool appears in the explicit health-avoidance set, the multiplier
 //! for that tool is capped at `0.3` regardless of the raw failure rate. This
 //! encodes the cross-cutting signal already surfaced elsewhere in SelfModel
 //! text, so ranking agrees with the self-awareness narrative.
@@ -50,8 +50,8 @@ pub const MIN_HEALTH_BOOST: f64 = 0.2;
 pub const MAX_HEALTH_BOOST: f64 = 1.5;
 
 /// Penalty multiplier applied when a tool appears in the explicit
-/// health-deprioritization set (see [`HealthRankingInputs::health_deprioritized_tools`]).
-pub const DEPRIORITIZED_TOOL_FACTOR: f64 = 0.3;
+/// health-avoidance set (see [`HealthRankingInputs::health_avoidance_tools`]).
+pub const HEALTH_AVOIDANCE_TOOL_FACTOR: f64 = 0.3;
 
 /// Inputs for ranking.
 ///
@@ -61,8 +61,8 @@ pub const DEPRIORITIZED_TOOL_FACTOR: f64 = 0.3;
 pub struct HealthRankingInputs<'a> {
     /// Per-tool failure rate in `[0.0, 1.0]`.
     pub tool_failure_rates: &'a std::collections::HashMap<String, f64>,
-    /// Tools explicitly deprioritized by health feedback.
-    pub health_deprioritized_tools: &'a HashSet<String>,
+    /// Tools explicitly health_avoidance by health feedback.
+    pub health_avoidance_tools: &'a HashSet<String>,
     /// Optional skill-level quality tracker. If `None`, all skills start
     /// from boost `1.0` and are penalized only by tool health.
     pub skill_quality: Option<&'a SkillQualityTracker>,
@@ -84,8 +84,8 @@ pub fn rank_multiplier(
         .unwrap_or(1.0);
 
     for tool in primary_tools {
-        let factor = if inputs.health_deprioritized_tools.contains(*tool) {
-            DEPRIORITIZED_TOOL_FACTOR
+        let factor = if inputs.health_avoidance_tools.contains(*tool) {
+            HEALTH_AVOIDANCE_TOOL_FACTOR
         } else {
             let r = inputs
                 .tool_failure_rates
@@ -150,7 +150,7 @@ mod tests {
         let dep = HashSet::new();
         let inputs = HealthRankingInputs {
             tool_failure_rates: &r,
-            health_deprioritized_tools: &dep,
+            health_avoidance_tools: &dep,
             skill_quality: None,
         };
         let m = rank_multiplier("explore", &["read_file"], &inputs);
@@ -163,7 +163,7 @@ mod tests {
         let dep = HashSet::new();
         let inputs = HealthRankingInputs {
             tool_failure_rates: &r,
-            health_deprioritized_tools: &dep,
+            health_avoidance_tools: &dep,
             skill_quality: None,
         };
         let m = rank_multiplier("risky_skill", &["flaky"], &inputs);
@@ -172,17 +172,17 @@ mod tests {
     }
 
     #[test]
-    fn deprioritized_tool_pins_factor_regardless_of_rate() {
+    fn health_avoidance_tool_pins_factor_regardless_of_rate() {
         let r = rates(&[("bash", 0.0)]); // looks healthy by rate
         let mut dep = HashSet::new();
         dep.insert("bash".to_string());
         let inputs = HealthRankingInputs {
             tool_failure_rates: &r,
-            health_deprioritized_tools: &dep,
+            health_avoidance_tools: &dep,
             skill_quality: None,
         };
         let m = rank_multiplier("shell_skill", &["bash"], &inputs);
-        assert!((m - DEPRIORITIZED_TOOL_FACTOR).abs() < 1e-9);
+        assert!((m - HEALTH_AVOIDANCE_TOOL_FACTOR).abs() < 1e-9);
     }
 
     #[test]
@@ -192,7 +192,7 @@ mod tests {
         let q = SkillQualityTracker::new();
         let inputs = HealthRankingInputs {
             tool_failure_rates: &r,
-            health_deprioritized_tools: &dep,
+            health_avoidance_tools: &dep,
             skill_quality: Some(&q),
         };
         let m = rank_multiplier("abstract_skill", &[], &inputs);
@@ -205,7 +205,7 @@ mod tests {
         let dep = HashSet::new();
         let inputs = HealthRankingInputs {
             tool_failure_rates: &r,
-            health_deprioritized_tools: &dep,
+            health_avoidance_tools: &dep,
             skill_quality: None,
         };
         let m = rank_multiplier("chain_skill", &["a", "b"], &inputs);
@@ -219,7 +219,7 @@ mod tests {
         let dep = HashSet::new();
         let inputs = HealthRankingInputs {
             tool_failure_rates: &r,
-            health_deprioritized_tools: &dep,
+            health_avoidance_tools: &dep,
             skill_quality: None,
         };
         let m = rank_multiplier("tripled_broken", &["x", "y", "z"], &inputs);
@@ -237,7 +237,7 @@ mod tests {
         let dep = HashSet::new();
         let inputs = HealthRankingInputs {
             tool_failure_rates: &r,
-            health_deprioritized_tools: &dep,
+            health_avoidance_tools: &dep,
             skill_quality: None,
         };
         let scores = sort_by_health_rank(&mut skills, &inputs);
@@ -259,7 +259,7 @@ mod tests {
         let dep = HashSet::new();
         let inputs = HealthRankingInputs {
             tool_failure_rates: &r,
-            health_deprioritized_tools: &dep,
+            health_avoidance_tools: &dep,
             skill_quality: None,
         };
         sort_by_health_rank(&mut skills, &inputs);

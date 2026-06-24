@@ -5,7 +5,7 @@
 //! 1. **Purge working memory** tied to the session.
 //! 2. **Write an `episodic` memory** summarising what happened — derived
 //!    from [`SessionFacts`] (deterministic, no LLM call). Replaces the
-//!    retired L1b narrative protocol.
+//!    blocked L1b narrative protocol.
 //! 3. **Trigger reflection** so Memoria's graph-consolidation picks up
 //!    recent memories into scene nodes. Respects the backend's cooldown
 //!    (v1 defaults to 1h), so hot sessions won't thrash.

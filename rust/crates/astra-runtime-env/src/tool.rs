@@ -386,9 +386,6 @@ impl CapabilityResolver {
                 if !seen.insert(tool_name.to_string()) {
                     return false;
                 }
-                if astra_core::tool_names::is_retired_tool_name(tool_name) {
-                    return false;
-                }
                 let dynamic_spec = dynamic_tool_spec(tool_name);
                 let Some(spec) = registry.get(tool_name).or(dynamic_spec.as_ref()) else {
                     return false;
@@ -408,9 +405,6 @@ impl CapabilityResolver {
         tool_name: &str,
         capabilities: &EffectiveCapabilitySet,
     ) -> Result<(), ToolUnavailableReason> {
-        if astra_core::tool_names::is_retired_tool_name(tool_name) {
-            return Err(ToolUnavailableReason::UnknownTool);
-        }
         let dynamic_spec = dynamic_tool_spec(tool_name);
         let spec = registry
             .get(tool_name)
@@ -426,9 +420,6 @@ impl CapabilityResolver {
         args: &Value,
         capabilities: &EffectiveCapabilitySet,
     ) -> Result<(), ToolUnavailableReason> {
-        if astra_core::tool_names::is_retired_tool_name(tool_name) {
-            return Err(ToolUnavailableReason::UnknownTool);
-        }
         if tool_name == "git" && git_action_requires_write(args) {
             let spec = git_write(tool_name, ToolLoadPolicy::AlwaysLoad);
             return self.check(&spec, capabilities);
@@ -939,26 +930,6 @@ mod tests {
     }
 
     #[test]
-    fn retired_control_plane_tool_names_are_unknown_tools() {
-        let registry = registry();
-        let binding = RunBinding::cloud_control_plane(&registry);
-
-        for &tool in astra_core::tool_names::RETIRED_TOOL_NAMES {
-            assert!(!binding.tool_surface.contains(tool));
-            assert_eq!(
-                CapabilityResolver.check_tool_call(
-                    &registry,
-                    tool,
-                    &serde_json::json!({}),
-                    &binding.capabilities,
-                ),
-                Err(ToolUnavailableReason::UnknownTool),
-                "{tool} must not remain registered in the runtime capability surface"
-            );
-        }
-    }
-
-    #[test]
     fn control_plane_user_communication_tools_are_always_load() {
         let registry = registry();
         let ask_user = registry.get("ask_user").expect("ask_user registered");
@@ -1378,27 +1349,6 @@ mod tests {
             .collect();
 
         assert_eq!(names, vec!["read_file".to_string()]);
-    }
-
-    #[test]
-    fn schema_filter_hides_retired_tool_names_even_if_schema_exists() {
-        let registry = registry();
-        let binding = RunBinding::local_developer("/repo", &registry);
-        let schemas: Vec<Value> = astra_core::tool_names::RETIRED_TOOL_NAMES
-            .iter()
-            .map(|name| serde_json::json!({"type": "function", "function": {"name": name}}))
-            .collect();
-
-        let names: Vec<String> = CapabilityResolver
-            .filter_tool_schemas(&registry, schemas, &binding.capabilities)
-            .into_iter()
-            .filter_map(|schema| tool_schema_name(&schema).map(str::to_string))
-            .collect();
-
-        assert!(
-            names.is_empty(),
-            "retired public tool names must not re-enter the runtime schema surface: {names:?}"
-        );
     }
 
     #[test]

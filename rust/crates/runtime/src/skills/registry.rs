@@ -51,8 +51,8 @@ fn default_metadata_budget() -> u32 {
 pub struct SkillHealthInputs {
     /// Per-tool recent failure rate in `[0.0, 1.0]`.
     pub tool_failure_rates: HashMap<String, f64>,
-    /// Tools explicitly deprioritized by health feedback.
-    pub health_deprioritized_tools: HashSet<String>,
+    /// Tools explicitly under health avoidance.
+    pub health_avoidance_tools: HashSet<String>,
     /// Optional per-skill quality tracker used as the base multiplier.
     pub skill_quality: Option<Arc<SkillQualityTracker>>,
 }
@@ -70,7 +70,7 @@ pub struct UnifiedSkillRegistry {
     /// Optional health signals used to reorder skills before budget filtering.
     ///
     /// When `Some`, `discover_all` stable-sorts within each source-priority
-    /// bucket so skills backed by unhealthy / deprioritized tools are the
+    /// bucket so skills backed by unhealthy or health-avoidance tools are the
     /// first to be truncated when the metadata budget is exhausted.
     health_inputs: RwLock<Option<SkillHealthInputs>>,
 }
@@ -160,7 +160,7 @@ impl UnifiedSkillRegistry {
 
         // Sort by source priority so higher-priority sources win on name collisions.
         // When health inputs are registered, use a secondary key so unhealthy or
-        // deprioritized skills are truncated first when the metadata budget is
+        // Health-avoidance skills are truncated first when the metadata budget is
         // exhausted. The sort is stable w.r.t. insertion order within a bucket
         // when no health data changes its rank.
         let health_snapshot = self.health_inputs.read().ok().and_then(|g| g.clone());
@@ -168,7 +168,7 @@ impl UnifiedSkillRegistry {
             let q_ref = h.skill_quality.as_deref();
             let inputs = HealthRankingInputs {
                 tool_failure_rates: &h.tool_failure_rates,
-                health_deprioritized_tools: &h.health_deprioritized_tools,
+                health_avoidance_tools: &h.health_avoidance_tools,
                 skill_quality: q_ref,
             };
             let ranks: HashMap<String, f64> = all_manifests
@@ -1582,7 +1582,7 @@ Shared MCP.
         rates.insert("stable".to_string(), 0.0);
         registry.update_health_inputs(SkillHealthInputs {
             tool_failure_rates: rates,
-            health_deprioritized_tools: HashSet::new(),
+            health_avoidance_tools: HashSet::new(),
             skill_quality: None,
         });
 
@@ -1591,7 +1591,7 @@ Shared MCP.
     }
 
     #[tokio::test]
-    async fn deprioritized_tool_set_forces_low_rank() {
+    async fn health_avoidance_tool_set_forces_low_rank() {
         let mut registry = UnifiedSkillRegistry::new();
         registry.add_provider(Box::new(StubProvider {
             skills: vec![
@@ -1610,7 +1610,7 @@ Shared MCP.
         dep.insert("bash".to_string());
         registry.update_health_inputs(SkillHealthInputs {
             tool_failure_rates: HashMap::new(), // bash "looks healthy" by rate
-            health_deprioritized_tools: dep,
+            health_avoidance_tools: dep,
             skill_quality: None,
         });
 
@@ -1643,7 +1643,7 @@ Shared MCP.
         rates.insert("stable".to_string(), 0.0);
         registry.update_health_inputs(SkillHealthInputs {
             tool_failure_rates: rates,
-            health_deprioritized_tools: HashSet::new(),
+            health_avoidance_tools: HashSet::new(),
             skill_quality: None,
         });
         let registered = registry.discover_all().await.unwrap();
@@ -1675,7 +1675,7 @@ Shared MCP.
         rates.insert("flaky".to_string(), 0.9);
         registry.update_health_inputs(SkillHealthInputs {
             tool_failure_rates: rates,
-            health_deprioritized_tools: HashSet::new(),
+            health_avoidance_tools: HashSet::new(),
             skill_quality: None,
         });
         let registered = registry.discover_all().await.unwrap();
@@ -1707,7 +1707,7 @@ Shared MCP.
         rates.insert("flaky".to_string(), 0.9);
         registry.update_health_inputs(SkillHealthInputs {
             tool_failure_rates: rates,
-            health_deprioritized_tools: HashSet::new(),
+            health_avoidance_tools: HashSet::new(),
             skill_quality: None,
         });
         let with_health = registry.discover_all().await.unwrap();

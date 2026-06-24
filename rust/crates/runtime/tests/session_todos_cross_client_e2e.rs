@@ -4,7 +4,7 @@
 //! Scenario:
 //!   1. Two `MatrixOneTaskStore` instances (one for each "node") share the
 //!      same MatrixOne pool — this is the cross-node setup in production.
-//!   2. An edge-side `TaskManager` creates a task via `task_create`.
+//!   2. An edge-side `TaskManager` creates a task through `task(action=create)`.
 //!   3. A cloud-side `TaskManager` with the **same** `session_id` lists
 //!      tasks and must see it.
 //!   4. Snapshot → mutate → restore round-trips through MO (turn rollback

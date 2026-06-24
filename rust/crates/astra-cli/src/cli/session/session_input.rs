@@ -625,14 +625,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_effective_line_does_not_treat_legacy_task_tool_names_as_recent_use() {
+    async fn finalize_effective_line_does_not_treat_non_task_tool_names_as_recent_use() {
         let mut state = SessionState {
-            recent_tools: vec!["task_create".into()],
+            recent_tools: vec!["taskish".into()],
             turns_since_task_use: 9,
             turns_since_task_reminder: 9,
             ..SessionState::default()
         };
-        state.task_manager.rebind("sess-task-legacy-nudge");
+        state.task_manager.rebind("sess-task-non-task-nudge");
         let create = state
             .task_manager
             .create(&serde_json::json!({"title": "Open work"}))
@@ -644,7 +644,7 @@ mod tests {
         assert!(
             finalized.contains("The task tools haven't been used recently.")
                 && finalized.contains("Open work"),
-            "legacy task_* tool names should not suppress the canonical task reminder: {finalized}"
+            "non-task tool names should not suppress the canonical task reminder: {finalized}"
         );
         assert_eq!(state.turns_since_task_use, 10);
         assert_eq!(state.turns_since_task_reminder, 0);

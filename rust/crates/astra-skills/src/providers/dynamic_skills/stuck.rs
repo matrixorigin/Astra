@@ -40,7 +40,7 @@ You've been going in circles or hitting dead ends. Use the runtime data below to
 | Tool calls (total) | ${{CTX_TOTAL_TOOL_CALLS}} |
 | Stall nudges sent | ${{CTX_NUDGE_COUNT}} |
 | Errors | ${{CTX_ERROR_COUNT}} |
-| Health-deprioritized tools | ${{CTX_HEALTH_DEPRIORITIZED_TOOLS}} |
+| Health avoidance tools | ${{CTX_HEALTH_AVOIDANCE_TOOLS}} |
 | Stall events | ${{CTX_STALL_EVENTS}} |
 | Correction follow rate | ${{CTX_CORRECTION_FOLLOW_RATE}} |
 
@@ -52,7 +52,7 @@ Read the metrics and classify the blocker:
 |---------|-----------|-------|
 | `nudge_count` ≥ 2 | System already told you to stop. You ignored it. | Step 3 option 5 |
 | `error_count` / `tool_calls` > 30% | Tool or environment is broken | Step 2: challenge assumption #1–#4 |
-| `health_deprioritized_tools` non-empty | These tools are failing repeatedly — stop using them | Step 3: use different tools |
+| `health_avoidance_tools` non-empty | These tools are failing repeatedly — stop using them | Step 3: use different tools |
 | `stall_events` present | Exact stall type tells you what's repeating | Step 3: pick the opposite strategy |
 | High `tool_calls`, low progress | Exploring without a plan | Step 3 option 1 |
 | High `prompt_tokens`, few turns | Context bloated from large reads | Step 3 option 2 |
@@ -90,7 +90,7 @@ If nothing works:
 
 ## Rules
 - Do NOT keep trying the same approach with small variations
-- If `health_deprioritized_tools` lists a tool, do NOT use it
+- If `health_avoidance_tools` lists a tool, do NOT use it
 - If `nudge_count` ≥ 3, you MUST stop and ask the user — no more autonomous attempts
 "#.to_string()
 }

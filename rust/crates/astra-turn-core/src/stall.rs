@@ -490,7 +490,7 @@ pub struct StallReflection {
     pub what_to_try: String,
     /// Confidence in the diagnosis (0.0-1.0).
     pub confidence: f64,
-    /// Tools to avoid (deprioritized or repeatedly failing).
+    /// Tools to avoid (under health avoidance or repeatedly failing).
     pub avoid_tools: Vec<String>,
 }
 
@@ -516,7 +516,7 @@ impl StallReflection {
 /// Analyze stall history and build a structured reflection.
 ///
 /// `tool_sigs`: per-turn tool signatures (name:args sets).
-/// `error_tools`: tools that have been deprioritized due to repeated errors.
+/// `error_tools`: tools that have active health avoidance due to repeated errors.
 /// `nudge_count`: how many nudges have been sent already (escalation).
 pub fn build_stall_reflection(
     tool_sigs: &[BTreeSet<String>],

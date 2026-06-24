@@ -132,7 +132,7 @@ pub struct ToolHealthEntry {
     pub errors: u32,
     pub avg_ms: u64,
     #[serde(default)]
-    pub deprioritized: bool,
+    pub avoidance_advised: bool,
     #[serde(default)]
     pub consecutive_failures: u32,
     #[serde(default)]
@@ -267,14 +267,14 @@ fn render_full(s: &IntrospectSnapshot) -> String {
 
     if !s.tool_health.is_empty() {
         out.push_str("\n## Tool Health\n");
-        out.push_str("| Tool | Calls | Errors | Avg ms | ConsecFail | Depri | LastFail |\n");
+        out.push_str("| Tool | Calls | Errors | Avg ms | ConsecFail | Avoid | LastFail |\n");
         out.push_str("|------|-------|--------|--------|------------|-------|----------|\n");
         for t in &s.tool_health {
-            let depri = if t.deprioritized { "YES" } else { "-" };
+            let avoidance = if t.avoidance_advised { "YES" } else { "-" };
             let last_fail = t.last_failure_category.as_deref().unwrap_or("-");
             out.push_str(&format!(
                 "| {} | {} | {} | {} | {} | {} | {} |\n",
-                t.name, t.calls, t.errors, t.avg_ms, t.consecutive_failures, depri, last_fail
+                t.name, t.calls, t.errors, t.avg_ms, t.consecutive_failures, avoidance, last_fail
             ));
         }
     }
@@ -613,7 +613,7 @@ mod tests {
                     calls: 15,
                     errors: 5,
                     avg_ms: 2300,
-                    deprioritized: false,
+                    avoidance_advised: false,
                     consecutive_failures: 0,
                     last_failure_category: None,
                 },
@@ -622,7 +622,7 @@ mod tests {
                     calls: 22,
                     errors: 0,
                     avg_ms: 12,
-                    deprioritized: false,
+                    avoidance_advised: false,
                     consecutive_failures: 0,
                     last_failure_category: None,
                 },
@@ -631,7 +631,7 @@ mod tests {
                     calls: 8,
                     errors: 1,
                     avg_ms: 45,
-                    deprioritized: true,
+                    avoidance_advised: true,
                     consecutive_failures: 3,
                     last_failure_category: Some("Timeout".into()),
                 },
@@ -1082,10 +1082,10 @@ mod tests {
     // ── Tests for enhanced tool health rendering ─────────────────────────
 
     #[test]
-    fn render_full_shows_deprioritized_tool() {
+    fn render_full_shows_health_avoidance_tool() {
         let snap = sample_snapshot();
         let out = render_full(&snap);
-        assert!(out.contains("YES"), "deprioritized YES missing: {out}");
+        assert!(out.contains("YES"), "health avoidance YES missing: {out}");
         assert!(
             out.contains("Timeout"),
             "last failure category missing: {out}"

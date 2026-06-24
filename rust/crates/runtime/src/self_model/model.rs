@@ -185,8 +185,8 @@ pub struct CapabilityView {
     pub tool_names: Vec<String>,
     /// Tools with health issues (name → health summary).
     pub tool_health: Vec<ToolHealthSummary>,
-    /// Tools currently deprioritized by health feedback.
-    pub health_deprioritized_tools: Vec<String>,
+    /// Tools currently under health avoidance from repeated failures.
+    pub health_avoidance_tools: Vec<String>,
     /// Discovered skills.
     pub skills: Vec<String>,
     /// Tools currently boosted by the last auto-reflection strategy delta.
@@ -211,7 +211,7 @@ pub struct ToolHealthSummary {
     pub name: String,
     pub total_calls: usize,
     pub success_rate: f64,
-    pub deprioritized: bool,
+    pub avoidance_advised: bool,
     pub consecutive_failures: usize,
     pub rehabilitation_count: usize,
 }
@@ -369,7 +369,7 @@ impl SelfModel {
     ) -> Self {
         // ── Capabilities ──
         let mut tool_health_summaries = Vec::new();
-        let mut health_deprioritized = Vec::new();
+        let mut health_avoidance = Vec::new();
         let mut outcome_memory = Vec::new();
 
         if let Some(health) = tool_health {
@@ -379,15 +379,15 @@ impl SelfModel {
                         name: name.clone(),
                         total_calls: h.total_calls,
                         success_rate: h.success_rate(),
-                        deprioritized: h.deprioritized,
+                        avoidance_advised: h.avoidance_advised,
                         consecutive_failures: h.consecutive_failures,
                         rehabilitation_count: h.rehabilitation_count,
                     });
                 }
-                if h.deprioritized
+                if h.avoidance_advised
                     && !astra_turn_core::tool::categories::registry().is_never_restrict(name)
                 {
-                    health_deprioritized.push(name.clone());
+                    health_avoidance.push(name.clone());
                 }
             }
             // Sort by name for stability
@@ -414,7 +414,7 @@ impl SelfModel {
                 .collect();
         }
 
-        health_deprioritized.sort();
+        health_avoidance.sort();
 
         let (boosted_tools, widen_surface_pending) = match last_strategy {
             Some(app) => {
@@ -435,7 +435,7 @@ impl SelfModel {
             total_tools: tool_names.len(),
             tool_names: tool_names.iter().map(|s| s.to_string()).collect(),
             tool_health: tool_health_summaries,
-            health_deprioritized_tools: health_deprioritized,
+            health_avoidance_tools: health_avoidance,
             skills: skills.to_vec(),
             boosted_tools,
             widen_surface_pending,
@@ -659,11 +659,11 @@ impl SelfModel {
         }
 
         // ── Tool health ──
-        if !self.capabilities.health_deprioritized_tools.is_empty() {
+        if !self.capabilities.health_avoidance_tools.is_empty() {
             let _ = writeln!(
                 s,
-                "Health-deprioritized tools: {} (repeated failures — try alternatives)",
-                self.capabilities.health_deprioritized_tools.join(", ")
+                "Health avoidance tools: {} (repeated failures; try alternatives)",
+                self.capabilities.health_avoidance_tools.join(", ")
             );
         }
         if !self.capabilities.outcome_memory.is_empty() {
@@ -980,7 +980,7 @@ impl SelfModel {
                 .map(String::as_str)
                 .collect();
             // Filter relevant + dedup conflicting tool advice (e.g.,
-            // ToolDeprioritize("grep") + ToolBoost("grep")). Lessons are
+            // ToolAvoidance("grep") + ToolBoost("grep")). Lessons are
             // pre-sorted by confidence DESC, so the first occurrence for
             // a tool name wins.
             let mut seen_tools: std::collections::HashSet<String> =
@@ -1037,7 +1037,7 @@ impl SelfModel {
     ///
     /// "Substantive" means any of:
     /// - an active goal / plan / tracked goal
-    /// - outcome memory, deprioritized / boosted / low-confidence tools
+    /// - outcome memory, health avoidance / boosted / low-confidence tools
     /// - strategy diff from the last reflection
     /// - guardrail auto-tuner with a measured fail rate
     /// - session denial pressure > 0
@@ -1055,7 +1055,7 @@ impl SelfModel {
             return true;
         }
         if !self.capabilities.outcome_memory.is_empty()
-            || !self.capabilities.health_deprioritized_tools.is_empty()
+            || !self.capabilities.health_avoidance_tools.is_empty()
             || !self.capabilities.boosted_tools.is_empty()
             || self.capabilities.widen_surface_pending
         {
@@ -1123,7 +1123,7 @@ fn extract_tool_from_trigger(trigger: &str) -> Option<&str> {
 /// the named tool is in the current session's capability set.
 fn is_lesson_relevant(l: &LessonHint, tool_set: &std::collections::HashSet<&str>) -> bool {
     match l.kind {
-        astra_services::LessonKind::ToolDeprioritize | astra_services::LessonKind::ToolBoost => {
+        astra_services::LessonKind::ToolAvoidance | astra_services::LessonKind::ToolBoost => {
             if let Some((_prefix, tool_name)) = l.trigger_signal.split_once(':') {
                 tool_set.is_empty() || tool_set.contains(tool_name)
             } else {
@@ -1185,11 +1185,11 @@ impl SelfModel {
         // ── Capabilities ──
         s.push_str("\n## Capabilities\n");
         let _ = writeln!(s, "- Total tools: {}", self.capabilities.total_tools);
-        if !self.capabilities.health_deprioritized_tools.is_empty() {
+        if !self.capabilities.health_avoidance_tools.is_empty() {
             let _ = writeln!(
                 s,
-                "- Health-deprioritized tools: {}",
-                self.capabilities.health_deprioritized_tools.join(", ")
+                "- Health avoidance tools: {}",
+                self.capabilities.health_avoidance_tools.join(", ")
             );
         }
         if !self.capabilities.skills.is_empty() {
@@ -1215,7 +1215,7 @@ impl SelfModel {
             .capabilities
             .tool_health
             .iter()
-            .filter(|t| t.deprioritized || t.success_rate < 0.8 || t.consecutive_failures > 0)
+            .filter(|t| t.avoidance_advised || t.success_rate < 0.8 || t.consecutive_failures > 0)
             .collect();
         if !troubled.is_empty() {
             s.push_str("\n## Tool Health (issues only)\n");
@@ -1227,8 +1227,8 @@ impl SelfModel {
                     t.success_rate * 100.0,
                     t.total_calls,
                     t.consecutive_failures,
-                    if t.deprioritized {
-                        ", DEPRIORITIZED"
+                    if t.avoidance_advised {
+                        ", AVOIDANCE ADVISED"
                     } else {
                         ""
                     }
@@ -1299,8 +1299,8 @@ fn signal_type_display(st: &SignalType) -> String {
         SignalType::ToolChurn { calls, .. } => format!("ToolChurn({}calls)", calls),
         SignalType::TaskSuccess => "TaskSuccess".to_string(),
         SignalType::TaskFailure { .. } => "TaskFailure".to_string(),
-        SignalType::ToolDeprioritized { tool_name } => {
-            format!("ToolDeprioritized({})", tool_name)
+        SignalType::ToolHealthAvoidance { tool_name } => {
+            format!("ToolHealthAvoidance({})", tool_name)
         }
         SignalType::ToolRehabilitated { tool_name } => {
             format!("ToolRehabilitated({})", tool_name)
@@ -1395,14 +1395,14 @@ mod tests {
             &config,
         );
         assert_eq!(
-            model.capabilities.health_deprioritized_tools,
+            model.capabilities.health_avoidance_tools,
             vec!["write_file"]
         );
         assert_eq!(model.capabilities.tool_health.len(), 2);
     }
 
     #[test]
-    fn snapshot_filters_read_only_health_from_deprioritized_capabilities() {
+    fn snapshot_filters_read_only_health_from_health_avoidance_capabilities() {
         let config = RuntimeConfig::default();
         let mut health = ToolHealthTracker::new();
         health.record_resource_limit_failure("read_file");
@@ -1426,13 +1426,13 @@ mod tests {
             &config,
         );
 
-        assert_eq!(model.capabilities.health_deprioritized_tools, vec!["bash"]);
+        assert_eq!(model.capabilities.health_avoidance_tools, vec!["bash"]);
         assert!(
             model
                 .capabilities
                 .tool_health
                 .iter()
-                .any(|entry| entry.name == "read_file" && entry.deprioritized),
+                .any(|entry| entry.name == "read_file" && entry.avoidance_advised),
             "diagnostics should still show the read-only tool health record"
         );
     }
@@ -2312,11 +2312,11 @@ mod tests {
     }
 
     #[test]
-    fn meaningful_when_health_deprioritized_tools_present() {
+    fn meaningful_when_health_avoidance_tools_present() {
         let mut model = minimal_model();
         model
             .capabilities
-            .health_deprioritized_tools
+            .health_avoidance_tools
             .push("grep".into());
         assert!(model.has_meaningful_self_awareness());
     }

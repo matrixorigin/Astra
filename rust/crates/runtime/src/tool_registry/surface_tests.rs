@@ -142,39 +142,6 @@ fn surface_build_rejects_internal_builtin_schemas_from_any_pool() {
 }
 
 #[test]
-fn retired_public_tool_names_never_enter_model_surface() {
-    let cfg = ToolSurfaceConfig {
-        always_load_tools: astra_core::tool_names::RETIRED_TOOL_NAMES
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect(),
-    };
-    let retired_schemas: Vec<Value> = astra_core::tool_names::RETIRED_TOOL_NAMES
-        .iter()
-        .map(|name| plugin_schema(name, "Retired public tool shape."))
-        .collect();
-    let surface = ToolSurface::build(retired_schemas.clone(), &cfg, &retired_schemas);
-
-    let always_load = names(&surface.always_load_schemas());
-    let deferred: std::collections::BTreeSet<&str> = surface
-        .deferred()
-        .iter()
-        .map(|entry| entry.name.as_str())
-        .collect();
-
-    for &retired in astra_core::tool_names::RETIRED_TOOL_NAMES {
-        assert!(
-            !always_load.iter().any(|name| name == retired),
-            "{retired} must not be promoted by always_load config"
-        );
-        assert!(
-            !deferred.contains(retired),
-            "{retired} must not reappear as deferred discovery metadata"
-        );
-    }
-}
-
-#[test]
 fn server_builtin_inventory_is_public_schema_backed() {
     let schema_names = schema_name_set();
     let registry = astra_runtime_env::ToolRegistry::builtins();

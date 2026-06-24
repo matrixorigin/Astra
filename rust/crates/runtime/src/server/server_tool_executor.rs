@@ -760,9 +760,6 @@ impl ServerToolExecutor {
     }
 
     fn tool_has_runtime_binding(&self, name: &str) -> bool {
-        if astra_core::tool_names::is_retired_tool_name(name) {
-            return false;
-        }
         if name.starts_with("mcp__") {
             return self.mcp_tool_has_runtime_binding(name);
         }
@@ -1750,13 +1747,6 @@ mod tests {
                 "{name} should be registered in ToolEngine for server-local execution"
             );
         }
-        for &retired in astra_core::tool_names::RETIRED_TOOL_NAMES {
-            assert!(
-                !exec.tool_engine.contains(retired),
-                "{retired} must not be registered in ToolEngine"
-            );
-        }
-
         let compress = exec
             .execute_with_metadata("compress_context", &json!({}))
             .await;
@@ -1795,10 +1785,6 @@ mod tests {
     #[tokio::test]
     async fn matrixone_tools_execute_from_tool_engine_registry() {
         let (exec, _dir) = test_executor();
-        assert!(
-            !exec.tool_engine.contains("mo"),
-            "old aggregate mo tool must not remain registered"
-        );
         for name in ["mo_query", "rollback_database_snapshots"] {
             assert!(
                 exec.tool_engine.contains(name),
@@ -2174,20 +2160,29 @@ mod tests {
         .into_iter()
         .find(|schema| schema.pointer("/function/name").and_then(Value::as_str) == Some("session"))
         .expect("session schema should exist");
-        let actions = session_schema
+        let mut actions = session_schema
             .pointer("/function/parameters/properties/action/enum")
             .and_then(Value::as_array)
-            .expect("session action enum should exist");
+            .expect("session action enum should exist")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        actions.sort_unstable();
+        assert_eq!(
+            actions,
+            [
+                "config",
+                "history_around",
+                "history_page",
+                "history_search",
+                "sleep",
+            ],
+            "session action surface must stay narrow and current"
+        );
         for action in ["history_page", "history_search", "history_around"] {
             assert!(
-                actions.iter().any(|value| value.as_str() == Some(action)),
+                actions.contains(&action),
                 "session action {action} must be advertised for web-agent history recall"
-            );
-        }
-        for action in ["prioritize", "deprioritize", "compact", "ask_user"] {
-            assert!(
-                !actions.iter().any(|value| value.as_str() == Some(action)),
-                "session action {action} must not remain as a public sub-action"
             );
         }
     }
@@ -2505,39 +2500,6 @@ esac
                 .as_ref()
                 .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
             "ToolEngine task errors should still receive execution metadata"
-        );
-    }
-
-    #[tokio::test]
-    async fn retired_public_tool_names_are_unknown_on_server_executor() {
-        let (exec, _dir) = test_executor();
-
-        for &retired in astra_core::tool_names::RETIRED_TOOL_NAMES {
-            let result = exec
-                .execute_with_metadata(retired, &json!({"title": "old surface"}))
-                .await;
-            assert!(result.is_error, "{retired}: {result:?}");
-            let metadata = result.metadata.as_ref().expect("metadata should exist");
-            assert_eq!(
-                metadata.get("capability_denial").and_then(Value::as_str),
-                Some("UnknownTool"),
-                "{retired}: {result:?}"
-            );
-            assert!(
-                metadata
-                    .get("execution_started")
-                    .and_then(Value::as_bool)
-                    .is_some_and(|started| !started),
-                "{retired}: {result:?}"
-            );
-        }
-
-        let unified = exec
-            .execute("task", &json!({"action": "create", "title": "new surface"}))
-            .await;
-        assert!(
-            unified.contains("\"success\":true") && unified.contains("task-1"),
-            "unified task(action=create) should remain the executable surface: {unified}"
         );
     }
 
@@ -3909,7 +3871,7 @@ esac
             .expect("task_board_snapshot");
         assert_eq!(snapshot["session_id"], "test-session");
         assert_eq!(snapshot["run_id"], "run-task");
-        assert_eq!(snapshot["reason"], "task_create");
+        assert_eq!(snapshot["reason"], "task.create");
         assert_eq!(snapshot["workspace"]["kind"], "server_sandbox");
         assert_eq!(snapshot["executor"]["kind"], "server_local");
         assert_eq!(snapshot["transport"], "server_local");
@@ -4368,44 +4330,6 @@ esac
             exec.activated_deferred_tool_names(),
             Vec::<String>::new(),
             "tool_search must not record activation for a tool that lacks its runtime binding"
-        );
-    }
-
-    #[tokio::test]
-    async fn server_retired_plugin_schema_cannot_become_activatable() {
-        let (exec, _dir) = test_executor();
-        exec.set_current_visible_tool_schemas(&[
-            json!({"type": "function", "function": {"name": "bash"}}),
-            json!({"type": "function", "function": {"name": "tool_search"}}),
-        ]);
-        exec.set_plugin_schemas(vec![json!({
-            "type": "function",
-            "function": {
-                "name": "task_create",
-                "description": "Retired task creation surface.",
-                "parameters": {"type": "object", "properties": {}}
-            }
-        })]);
-        exec.set_current_activatable_tool_names(HashSet::from(["task_create".to_string()]));
-
-        assert!(
-            exec.current_activatable_tool_names_snapshot().is_empty(),
-            "retired plugin schemas must not be treated as runtime-bound activatable tools"
-        );
-
-        let result = exec
-            .execute_with_metadata("tool_search", &json!({"query": "select:task_create"}))
-            .await;
-        let parsed = parse_tool_search_output(&result.output);
-        assert_eq!(tool_search_match_names(&parsed), Vec::<String>::new());
-        assert_eq!(
-            tool_search_string_array(&parsed, "missing"),
-            vec!["task_create".to_string()]
-        );
-        assert_eq!(
-            exec.activated_deferred_tool_names(),
-            Vec::<String>::new(),
-            "retired plugin schemas must not record deferred activation"
         );
     }
 
@@ -5997,7 +5921,7 @@ esac
     }
 
     #[tokio::test]
-    async fn session_enter_plan_retired_action_is_unknown() {
+    async fn session_enter_plan_unknown_action_is_unknown() {
         let (exec, _dir) = test_executor();
         let result = exec
             .execute("session", &json!({"action": "enter_plan"}))
@@ -7237,7 +7161,7 @@ esac
     }
 
     #[tokio::test]
-    async fn exit_plan_mode_approved_does_not_reuse_retired_cli_style_plan_tree() {
+    async fn exit_plan_mode_approved_does_not_reuse_stale_cli_style_plan_tree() {
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
             "ship user-visible plan".into(),
@@ -7311,7 +7235,7 @@ esac
             approved_plan_tasks
                 .iter()
                 .all(|task| task.subtasks.len() == 1),
-            "retired tree-shaped history should remain untouched while approval is pending: {approved_plan_tasks:?}"
+            "stale tree-shaped history should remain untouched while approval is pending: {approved_plan_tasks:?}"
         );
     }
 
@@ -7699,7 +7623,7 @@ esac
                     .and_then(serde_json::Value::as_str)
                     == Some(stale_fingerprint.as_str())
             })
-            .expect("stale retired task remains");
+            .expect("stale task remains");
         assert!(
             verify
                 .subtasks

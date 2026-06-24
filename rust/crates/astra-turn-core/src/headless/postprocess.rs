@@ -65,9 +65,9 @@ pub fn enrich_headless_tool_output_for_errors_and_limits(
             ctx.turn_guard.errors.record_retry(false);
         }
 
-        let deprioritized = ctx.turn_guard.health.deprioritized_tools();
+        let avoidance_advised = ctx.turn_guard.health.health_avoidance_tools();
         let recovery_msg =
-            build_recovery_message(name, result_str.as_str(), category, &deprioritized);
+            build_recovery_message(name, result_str.as_str(), category, &avoidance_advised);
         result_str.push_str(&format!("\n{recovery_msg}"));
     }
 

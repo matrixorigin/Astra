@@ -1760,7 +1760,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 .filter(|(_, t)| *t as usize >= turn_index.saturating_sub(1))
                 .collect();
             if !recent_events.is_empty() {
-                let error_tools: Vec<&str> = state.turn_guard.health.deprioritized_tools();
+                let error_tools: Vec<&str> = state.turn_guard.health.health_avoidance_tools();
                 let reflection = astra_turn_core::stall::build_stall_reflection(
                     &state.stall.turn_sigs,
                     &error_tools,
@@ -3384,7 +3384,7 @@ mod tests {
                 .record_tool_result("bash", "Error: command timed out");
             state.turn_guard.health.record_failure("bash");
         }
-        assert!(state.turn_guard.health.is_deprioritized("bash"));
+        assert!(state.turn_guard.health.is_avoidance_advised("bash"));
         assert!(!state.turn_guard.tool_sigs.is_empty());
         assert!(state.turn_guard.errors.recent_error_pressure() > 0);
 
@@ -3397,7 +3397,7 @@ mod tests {
         assert!(state.turn_guard.tool_sigs.is_empty());
         assert_eq!(state.turn_guard.errors.recent_error_pressure(), 0);
         assert!(
-            state.turn_guard.health.is_deprioritized("bash"),
+            state.turn_guard.health.is_avoidance_advised("bash"),
             "durable tool diagnostics should remain available"
         );
         assert!(

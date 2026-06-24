@@ -364,8 +364,6 @@ pub struct LearningHealthResponse {
     pub timestamp: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lesson_count: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retired_count: Option<u64>,
 }
 
 #[cfg(feature = "server")]

@@ -115,9 +115,9 @@ pub fn apply_agentic_post_tool_policy(
                 VerdictSeverity::Healthy => unreachable!(),
             };
             let health_summary = turn_guard.health.summary();
-            let deprioritized_tools = turn_guard
+            let health_avoidance_tools = turn_guard
                 .health
-                .deprioritized_tools()
+                .health_avoidance_tools()
                 .iter()
                 .map(|tool| (*tool).to_string())
                 .collect::<Vec<_>>();
@@ -132,7 +132,7 @@ pub fn apply_agentic_post_tool_policy(
                 severity: severity_str.to_string(),
                 injections: verdict.injections.clone(),
                 avoid_tools: verdict.avoid_tools.clone(),
-                deprioritized_tools,
+                health_avoidance_tools,
                 force_stop: verdict.force_stop,
                 nudge_count: turn_guard.nudge_count,
                 interaction_mode: interaction_mode.label().to_string(),
@@ -142,7 +142,7 @@ pub fn apply_agentic_post_tool_policy(
                     .errors
                     .recent_error_count(crate::error_recovery::ErrorCategory::ToolTimeout),
                 total_errors: turn_guard.errors.total_errors,
-                deprioritized_count: health_summary.deprioritized_count,
+                health_avoidance_count: health_summary.health_avoidance_count,
                 total_timeouts: health_summary.total_timeouts,
                 timeout_dominant_tools,
                 total_cache_hits: health_summary.total_cache_hits,
@@ -453,7 +453,7 @@ mod tests {
                 .contains(&"agent_fanout".to_string())
         );
         assert!(
-            !turn_guard.health.is_deprioritized("agent_fanout"),
+            !turn_guard.health.is_avoidance_advised("agent_fanout"),
             "stall advice alone must not mark the tool unhealthy"
         );
         assert!(
@@ -463,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn health_deprioritized_tools_remain_same_turn_advisory() {
+    fn health_avoidance_tools_remain_same_turn_advisory() {
         let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();
         let mut stall_events = Vec::new();
@@ -499,10 +499,10 @@ mod tests {
         });
 
         assert_eq!(out, AgenticPostToolPolicyOutcome::RetryLlmClearToolResults);
-        assert!(turn_guard.health.is_deprioritized("write_file"));
+        assert!(turn_guard.health.is_avoidance_advised("write_file"));
         assert!(
             !restricted_tools.contains("write_file"),
-            "soft health-deprioritized tools must not be hidden"
+            "soft health-avoidance tools must not be hidden"
         );
     }
 
@@ -516,13 +516,13 @@ mod tests {
         for _ in 0..3 {
             turn_guard.health.record_failure("flaky_soft_tool");
         }
-        assert!(turn_guard.health.is_deprioritized("flaky_soft_tool"));
+        assert!(turn_guard.health.is_avoidance_advised("flaky_soft_tool"));
 
         let blocked = super::checkpoint_blocked_tools(&restricted_tools);
         assert_eq!(blocked, vec!["bash".to_string(), "write_file".to_string()]);
         assert!(
             !blocked.contains(&"flaky_soft_tool".to_string()),
-            "soft tool-health deprioritization must not persist as hard checkpoint blocked_tools"
+            "soft tool-health avoidance must not persist as hard checkpoint blocked_tools"
         );
     }
 

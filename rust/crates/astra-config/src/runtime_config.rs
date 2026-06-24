@@ -3250,7 +3250,7 @@ mod tests {
     }
 
     #[test]
-    fn fork_prefix_rejects_retired_enabled_field() {
+    fn fork_prefix_rejects_removed_enabled_field() {
         let err = toml::from_str::<RuntimeConfig>(
             r#"
             version = "1.0"
@@ -3259,7 +3259,7 @@ mod tests {
             enabled = true
             "#,
         )
-        .expect_err("retired fork_prefix.enabled must be rejected");
+        .expect_err("removed fork_prefix.enabled must be rejected");
         assert!(
             err.to_string().contains("unknown field `enabled`"),
             "unexpected error: {err}"

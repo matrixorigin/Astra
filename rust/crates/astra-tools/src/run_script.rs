@@ -552,9 +552,9 @@ pub enum PriorityHint {
     /// toward it for 3+ tool-call pipelines.
     Preferred,
     /// Session has found run_script unhelpful / noisy. The schema
-    /// description gains a `**DEPRIORITIZED**` marker so the model
-    /// prefers individual tool calls.
-    Deprioritized,
+    /// description gains a `**DISCOURAGED**` marker so the model prefers
+    /// individual tool calls.
+    Discouraged,
 }
 
 pub fn build_run_script_schema(
@@ -585,8 +585,8 @@ pub fn build_run_script_schema(
             "\n\n**PREFERRED**: This tool is the preferred approach for multi-step tasks \
              in this session. Use it when you need 3+ tool calls with processing logic between them."
         }
-        PriorityHint::Deprioritized => {
-            "\n\n**DEPRIORITIZED**: Prefer individual tool calls unless you specifically need \
+        PriorityHint::Discouraged => {
+            "\n\n**DISCOURAGED**: Prefer individual tool calls unless you specifically need \
              batch processing with conditional logic."
         }
         PriorityHint::Neutral => "",
@@ -1735,33 +1735,30 @@ mod tests {
     }
 
     #[test]
-    fn schema_deprioritized_hint_present() {
+    fn schema_discouraged_hint_present() {
         let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
-        let schema = build_run_script_schema(
-            &enabled,
-            ExecutionMode::Project,
-            PriorityHint::Deprioritized,
-        );
+        let schema =
+            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Discouraged);
         let desc = schema["function"]["description"].as_str().unwrap();
-        assert!(desc.contains("DEPRIORITIZED"));
-        // T48: Deprioritized is exclusive of Preferred — no PREFERRED marker leak.
+        assert!(desc.contains("DISCOURAGED"));
+        // T48: Discouraged is exclusive of Preferred — no PREFERRED marker leak.
         assert!(
             !desc.contains("PREFERRED"),
-            "Deprioritized schema must not carry Preferred marker: {desc}"
+            "Discouraged schema must not carry Preferred marker: {desc}"
         );
     }
 
-    // T48 (reverse): Preferred is exclusive of Deprioritized.
+    // T48 (reverse): Preferred is exclusive of Discouraged.
     #[test]
-    fn schema_preferred_hint_excludes_deprioritized_marker() {
+    fn schema_preferred_hint_excludes_discouraged_marker() {
         let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
         let schema =
             build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Preferred);
         let desc = schema["function"]["description"].as_str().unwrap();
         assert!(desc.contains("PREFERRED"));
         assert!(
-            !desc.contains("DEPRIORITIZED"),
-            "Preferred schema must not carry Deprioritized marker: {desc}"
+            !desc.contains("DISCOURAGED"),
+            "Preferred schema must not carry Discouraged marker: {desc}"
         );
     }
 
@@ -1772,7 +1769,7 @@ mod tests {
             build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
         let desc = schema["function"]["description"].as_str().unwrap();
         assert!(!desc.contains("PREFERRED"));
-        assert!(!desc.contains("DEPRIORITIZED"));
+        assert!(!desc.contains("DISCOURAGED"));
     }
 
     // C1: empty enabled_tools must not produce malformed `from astra_tools import , ...`

@@ -1502,7 +1502,7 @@ mod tests {
     }
 
     #[test]
-    fn heavy_checkpoint_blocked_tools_do_not_include_soft_deprioritized_health() {
+    fn heavy_checkpoint_blocked_tools_do_not_include_soft_health_avoidance_health() {
         let session_id = format!("wm-checkpoint-{}", uuid::Uuid::new_v4());
         let _guard = SessionDirGuard::new(&session_id);
         let mut state = make_state();
@@ -1513,7 +1513,12 @@ mod tests {
         for _ in 0..3 {
             state.turn_guard.health.record_failure("flaky_soft_tool");
         }
-        assert!(state.turn_guard.health.is_deprioritized("flaky_soft_tool"));
+        assert!(
+            state
+                .turn_guard
+                .health
+                .is_avoidance_advised("flaky_soft_tool")
+        );
 
         try_write_heavy_checkpoint(&mut state);
 
@@ -2484,7 +2489,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_round_guidance_is_ephemeral_not_accumulated() {
-        // Simulate multiple tool rounds. The retired tool-round directive
+        // Simulate multiple tool rounds. The blocked tool-round directive
         // must not reappear or accumulate in state.messages.
         let mut results = Vec::new();
         for _ in 0..5 {

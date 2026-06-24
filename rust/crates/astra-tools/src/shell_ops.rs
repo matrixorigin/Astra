@@ -143,7 +143,7 @@ impl<'a> DetachHandleGuard<'a> {
     async fn restore(mut self) {
         if let (Some(slot), Some(handle)) = (self.slot.as_ref(), self.handle.take()) {
             handle.mark_active(false);
-            if !handle.is_retired() {
+            if !handle.is_blocked() {
                 *slot.lock().await = Some(handle);
             }
         }
@@ -6143,7 +6143,7 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
-    async fn retired_detach_slot_is_not_restored_after_normal_completion() {
+    async fn blocked_detach_slot_is_not_restored_after_normal_completion() {
         let dir = tempdir().unwrap();
         let mut ctx = crate::ToolContext::test(dir.path());
         let (slot, listener) = crate::detach::new_slot_with_handle();
@@ -6155,7 +6155,7 @@ printf 'probe.txt:1:needle\n'
         assert!(result.output.contains("done"), "{}", result.output);
         assert!(
             slot.lock().await.is_none(),
-            "retired detach handles must not be restored with a consumed or abandoned listener"
+            "blocked detach handles must not be restored with a consumed or abandoned listener"
         );
     }
 

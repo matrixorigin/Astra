@@ -10,7 +10,6 @@ pub(super) async fn learning_health_handler() -> Json<LearningHealthResponse> {
         version: "1.0.0".to_string(),
         timestamp: Utc::now().to_rfc3339(),
         lesson_count: None,
-        retired_count: None,
     })
 }
 

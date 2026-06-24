@@ -56,7 +56,7 @@ pub enum VerdictSeverity {
 pub struct CorrectionRecord {
     /// Turn number (0-indexed) at which the correction was issued.
     pub turn: u32,
-    /// Examples: "stall_nudge", "divergence", "deprioritize", "cache_waste".
+    /// Examples: "stall_nudge", "divergence", "health_avoidance", "cache_waste".
     pub correction_type: String,
     /// Tools the agent was told to avoid.
     pub avoid_tools: Vec<String>,
@@ -110,8 +110,8 @@ pub struct TurnGuard {
     last_cache_hit_total: usize,
     /// Whether the current tool round recorded at least one error.
     round_had_error: bool,
-    /// Fingerprint of the most recently emitted deprioritize warning.
-    last_deprioritize_warning_fingerprint: Option<String>,
+    /// Fingerprint of the most recently emitted health-avoidance warning.
+    last_health_avoidance_warning_fingerprint: Option<String>,
     /// Fingerprint of the most recently emitted cache guidance.
     last_cache_warning_fingerprint: Option<String>,
     /// Fingerprint of the most recently emitted escalation guidance.
@@ -136,16 +136,16 @@ fn insert_avoid_tool(avoid_tools: &mut HashSet<String>, tool: &str) {
     }
 }
 
-fn avoidable_deprioritized_tools(health: &ToolHealthTracker) -> Vec<String> {
+fn avoidable_health_avoidance_tools(health: &ToolHealthTracker) -> Vec<String> {
     health
-        .deprioritized_tools()
+        .health_avoidance_tools()
         .into_iter()
         .filter(|tool| !is_read_only_never_restrict(tool))
         .map(str::to_string)
         .collect()
 }
 
-fn deprioritize_warning_for_tools(tools: &[String]) -> Option<String> {
+fn health_avoidance_warning_for_tools(tools: &[String]) -> Option<String> {
     if tools.is_empty() {
         return None;
     }
@@ -174,7 +174,7 @@ impl TurnGuard {
             consecutive_warnings: 0,
             last_cache_hit_total: 0,
             round_had_error: false,
-            last_deprioritize_warning_fingerprint: None,
+            last_health_avoidance_warning_fingerprint: None,
             last_cache_warning_fingerprint: None,
             last_escalation_fingerprint: None,
             pending_correction: None,
@@ -289,7 +289,7 @@ impl TurnGuard {
                     }
                     error_recovery::ErrorCategory::ToolUnavailable => {}
                     // Schema / input-validation failures are the *caller*'s fault
-                    // (bad args from the LLM), not the tool's. Don't deprioritize
+                    // (bad args from the LLM), not the tool's. Do not enable health avoidance
                     // the tool — otherwise a few malformed calls can banish a
                     // perfectly healthy tool (regression from session 7e3fecb5).
                     // See commit 60203cab for the new API; this is the wiring.
@@ -431,7 +431,7 @@ impl TurnGuard {
     ///
     /// ## De-duplication
     ///
-    /// Every warning category (escalation message, deprioritized tools,
+    /// Every warning category (escalation message, health-avoidance tools,
     /// timeout-dominant tools, cache waste) is emitted at most once per
     /// unique fingerprint. The warning re-fires only when the fingerprint
     /// changes — i.e. the underlying health state actually shifts.
@@ -463,11 +463,11 @@ impl TurnGuard {
             });
 
         if stall_detected {
-            let deprioritized = self.health.deprioritized_tools();
-            let deprioritized_refs: Vec<&str> = deprioritized.to_vec();
+            let avoidance_advised = self.health.health_avoidance_tools();
+            let health_avoidance_refs: Vec<&str> = avoidance_advised.to_vec();
             let reflection = stall::build_stall_reflection(
                 &self.tool_sigs,
-                &deprioritized_refs,
+                &health_avoidance_refs,
                 self.nudge_count,
             );
             injections.push(reflection.to_nudge_message());
@@ -559,24 +559,26 @@ impl TurnGuard {
         }
 
         // 5. Tool health warnings
-        let mut fresh_deprioritize_warning = false;
-        let deprioritized_tools = avoidable_deprioritized_tools(&self.health);
-        let deprioritized_fingerprint =
-            tool_fingerprint(deprioritized_tools.iter().map(String::as_str));
-        if let Some(fingerprint) = deprioritized_fingerprint {
-            if self.last_deprioritize_warning_fingerprint.as_deref() != Some(fingerprint.as_str()) {
-                if let Some(warning) = deprioritize_warning_for_tools(&deprioritized_tools) {
+        let mut fresh_health_avoidance_warning = false;
+        let health_avoidance_tools = avoidable_health_avoidance_tools(&self.health);
+        let health_avoidance_fingerprint =
+            tool_fingerprint(health_avoidance_tools.iter().map(String::as_str));
+        if let Some(fingerprint) = health_avoidance_fingerprint {
+            if self.last_health_avoidance_warning_fingerprint.as_deref()
+                != Some(fingerprint.as_str())
+            {
+                if let Some(warning) = health_avoidance_warning_for_tools(&health_avoidance_tools) {
                     injections.push(warning);
-                    for tool in &deprioritized_tools {
+                    for tool in &health_avoidance_tools {
                         insert_avoid_tool(&mut avoid_tools, tool);
                     }
                     severity = severity.max(VerdictSeverity::Warning);
-                    fresh_deprioritize_warning = true;
+                    fresh_health_avoidance_warning = true;
                 }
-                self.last_deprioritize_warning_fingerprint = Some(fingerprint);
+                self.last_health_avoidance_warning_fingerprint = Some(fingerprint);
             }
         } else {
-            self.last_deprioritize_warning_fingerprint = None;
+            self.last_health_avoidance_warning_fingerprint = None;
         }
 
         // 5a. Cache duplication warning
@@ -654,7 +656,7 @@ impl TurnGuard {
         let escalation = error_recovery::escalation_level(
             self.nudge_count,
             actionable_errors,
-            deprioritized_tools.len(),
+            health_avoidance_tools.len(),
         );
         let mut escalation_message_emitted = false;
         if let Some(fingerprint) = escalation_fingerprint(escalation, &avoid_tools) {
@@ -762,8 +764,8 @@ impl TurnGuard {
                     "divergence"
                 } else if reward_hacking_detected {
                     "reward_hacking"
-                } else if fresh_deprioritize_warning {
-                    "deprioritize"
+                } else if fresh_health_avoidance_warning {
+                    "health_avoidance"
                 } else if cache_warning_emitted {
                     "cache_waste"
                 } else {
@@ -997,7 +999,7 @@ mod tests {
     #[test]
     fn tool_errors_accumulate_to_warning() {
         let mut guard = TurnGuard::new();
-        // 3 failures → deprioritized
+        // 3 failures → health avoidance
         guard.record_tool_result("test_tool", "Error: permission denied");
         guard.record_tool_result("test_tool", "Error: permission denied");
         guard.record_tool_result("test_tool", "Error: permission denied");
@@ -1008,15 +1010,15 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_tool_deprioritized_immediately() {
+    fn unavailable_tool_health_avoidance_immediately() {
         let mut guard = TurnGuard::new();
-        // Single "command not found" → immediate deprioritize (no consecutive threshold)
+        // Single "command not found" → immediate health avoidance (no consecutive threshold)
         guard.record_tool_result("mo_query", "Error: command not found");
-        assert!(guard.health.is_deprioritized("mo_query"));
+        assert!(guard.health.is_avoidance_advised("mo_query"));
     }
 
     #[test]
-    fn shell_command_failures_do_not_deprioritize_shell_tool() {
+    fn shell_command_failures_do_not_advise_avoidance_shell_tool() {
         let mut guard = TurnGuard::new();
         for _ in 0..5 {
             guard.record_tool_result(
@@ -1027,7 +1029,7 @@ mod tests {
 
         assert_eq!(guard.errors.total_errors, 5);
         assert!(
-            !guard.health.is_deprioritized("bash"),
+            !guard.health.is_avoidance_advised("bash"),
             "a failing command must not make the shell executor unavailable"
         );
         assert!(
@@ -1037,7 +1039,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_command_not_found_does_not_deprioritize_shell_tool() {
+    fn shell_command_not_found_does_not_advise_avoidance_shell_tool() {
         let mut guard = TurnGuard::new();
         for _ in 0..3 {
             guard.record_tool_result("bash", "Error: command not found: rg");
@@ -1045,13 +1047,13 @@ mod tests {
 
         assert_eq!(guard.errors.total_errors, 3);
         assert!(
-            !guard.health.is_deprioritized("bash"),
+            !guard.health.is_avoidance_advised("bash"),
             "missing inner command is not shell tool unavailability"
         );
     }
 
     #[test]
-    fn tool_contract_errors_do_not_deprioritize_tool() {
+    fn tool_contract_errors_do_not_advise_avoidance_tool() {
         let mut guard = TurnGuard::new();
         let errors = [
             "Error: field 'subtask_id' only supports new_status updates; unsupported with subtask_id: reason",
@@ -1075,7 +1077,7 @@ mod tests {
             "caller-fixable contract errors must not count toward tool quarantine"
         );
         assert!(
-            !guard.health.is_deprioritized("task"),
+            !guard.health.is_avoidance_advised("task"),
             "bad tool-call shape must not hide a healthy task tool"
         );
     }
@@ -1118,48 +1120,48 @@ mod tests {
     }
 
     #[test]
-    fn empty_result_tracked_not_deprioritized() {
+    fn empty_result_tracked_not_health_avoidance() {
         let mut guard = TurnGuard::new();
-        // 3 empty results → NOT deprioritized (just empty)
+        // 3 empty results → NOT avoidance_advised (just empty)
         guard.record_tool_result("grep", "[]");
         guard.record_tool_result("grep", "[]");
         guard.record_tool_result("grep", "[]");
 
-        assert!(!guard.health.is_deprioritized("grep"));
+        assert!(!guard.health.is_avoidance_advised("grep"));
     }
 
     #[test]
     fn flaky_tool_gets_stricter_threshold() {
         let mut guard = TurnGuard::new();
-        // First cycle: 3 failures → deprioritized
+        // First cycle: 3 failures → health avoidance
         guard.record_tool_result("test_tool", "Error: fail 1");
         guard.record_tool_result("test_tool", "Error: fail 2");
         guard.record_tool_result("test_tool", "Error: fail 3");
-        assert!(guard.health.is_deprioritized("test_tool"));
+        assert!(guard.health.is_avoidance_advised("test_tool"));
 
         // Rehabilitate
         guard.record_tool_result("test_tool", r#"{"output": "ok"}"#);
-        assert!(!guard.health.is_deprioritized("test_tool"));
+        assert!(!guard.health.is_avoidance_advised("test_tool"));
 
-        // Second cycle: 3 failures again → deprioritized
+        // Second cycle: 3 failures again → avoidance_advised
         guard.record_tool_result("test_tool", "Error: fail 4");
         guard.record_tool_result("test_tool", "Error: fail 5");
         guard.record_tool_result("test_tool", "Error: fail 6");
-        assert!(guard.health.is_deprioritized("test_tool"));
+        assert!(guard.health.is_avoidance_advised("test_tool"));
 
         // Rehabilitate again (now rehabilitation_count == 2)
         guard.record_tool_result("test_tool", r#"{"output": "ok"}"#);
-        assert!(!guard.health.is_deprioritized("test_tool"));
+        assert!(!guard.health.is_avoidance_advised("test_tool"));
 
         // Third cycle: only 2 failures needed (stricter threshold)
         guard.record_tool_result("test_tool", "Error: fail 7");
         guard.record_tool_result("test_tool", "Error: fail 8");
-        assert!(guard.health.is_deprioritized("test_tool"));
+        assert!(guard.health.is_avoidance_advised("test_tool"));
     }
 
     #[test]
-    fn cross_session_low_calls_not_deprioritized() {
-        // Tools with < 5 calls should not be deprioritized even with high failure rate
+    fn cross_session_low_calls_not_health_avoidance() {
+        // Tools with < 5 calls should not be avoidance_advised even with high failure rate
         let entries = vec![astra_pipeline::ToolHealthEntry {
             name: "bash".to_string(),
             total_calls: 3,
@@ -1170,13 +1172,13 @@ mod tests {
         }];
         let tracker = ToolHealthTracker::from_entries(&entries);
         assert!(
-            !tracker.is_deprioritized("bash"),
-            "too few calls to deprioritize"
+            !tracker.is_avoidance_advised("bash"),
+            "too few calls to enable health avoidance"
         );
     }
 
     #[test]
-    fn cross_session_many_failures_deprioritized() {
+    fn cross_session_many_failures_health_avoidance() {
         let entries = vec![astra_pipeline::ToolHealthEntry {
             name: "mo_query".to_string(),
             total_calls: 10,
@@ -1186,7 +1188,7 @@ mod tests {
             recent_outcomes: vec![],
         }];
         let tracker = ToolHealthTracker::from_entries(&entries);
-        assert!(tracker.is_deprioritized("mo_query"));
+        assert!(tracker.is_avoidance_advised("mo_query"));
     }
 
     #[test]
@@ -1199,7 +1201,7 @@ mod tests {
 
         let summary = guard.health.summary();
         assert_eq!(summary.total_tools, 2);
-        assert_eq!(summary.deprioritized_count, 1);
+        assert_eq!(summary.health_avoidance_count, 1);
         assert_eq!(summary.total_errors, 3);
     }
 
@@ -1527,7 +1529,7 @@ mod tests {
 
     #[test]
     fn four_errors_spread_across_tools_below_warning() {
-        // 4 errors spread across tools: no consecutive failure deprioritization,
+        // 4 errors spread across tools: no consecutive health-avoidance trigger,
         // and total_errors(4) < 5 = no Warning from error count
         let mut guard = TurnGuard::new();
         guard.record_tool_result("read_file", "Error: file not found");
@@ -1596,7 +1598,7 @@ mod tests {
     }
 
     #[test]
-    fn deprioritize_warning_emits_once_until_health_changes() {
+    fn advise_avoidance_warning_emits_once_until_health_changes() {
         let mut guard = TurnGuard::new();
         for _ in 0..3 {
             guard.record_tool_result("write_file", "Error: write failed");
@@ -1606,7 +1608,7 @@ mod tests {
         assert_eq!(first.severity, VerdictSeverity::Warning);
         assert!(
             !first.injections.is_empty(),
-            "new deprioritization should emit guidance once"
+            "new health avoidance should emit guidance once"
         );
         assert!(first.avoid_tools.contains(&"write_file".to_string()));
 
@@ -1614,7 +1616,7 @@ mod tests {
         assert_eq!(
             second.severity,
             VerdictSeverity::Healthy,
-            "steady-state deprioritization should not keep re-warning"
+            "steady-state health avoidance should not keep re-warning"
         );
         assert!(second.injections.is_empty());
         assert!(second.avoid_tools.is_empty());
@@ -1822,7 +1824,7 @@ mod tests {
     /// When resource-limit output is detected in a "successful" tool call
     /// (e.g., bash returns "fork: Resource temporarily unavailable" with exit 0),
     /// classify_result() sees it as Success because it doesn't start with "Error:".
-    /// If record_tool_result() is called, record_success() clears the deprioritized
+    /// If record_tool_result() is called, record_success() clears the avoidance_advised
     /// flag that record_resource_limit_failure() just set.
     ///
     /// The fix: chat_stream.rs sets resource_limit_recorded=true and skips
@@ -1836,8 +1838,8 @@ mod tests {
         // Step 1: resource-limit handler records the failure directly
         guard.health.record_resource_limit_failure("bash");
         assert!(
-            guard.health.is_deprioritized("bash"),
-            "must be deprioritized"
+            guard.health.is_avoidance_advised("bash"),
+            "must enable health avoidance"
         );
 
         // Step 2: if record_tool_result is called on the same output, it classifies
@@ -1849,8 +1851,8 @@ mod tests {
             "resource-limit output is classified as Success (the root cause)"
         );
         assert!(
-            !guard.health.is_deprioritized("bash"),
-            "BUG REPRODUCED: record_tool_result overwrites the deprioritization"
+            !guard.health.is_avoidance_advised("bash"),
+            "BUG REPRODUCED: record_tool_result clears health avoidance"
         );
         // This is why chat_stream.rs must skip record_tool_result() when
         // resource_limit_recorded is true.
@@ -2492,7 +2494,7 @@ mod tests {
     }
 
     #[test]
-    fn deprioritized_non_read_only_tools_remain_advisory() {
+    fn health_avoidance_non_read_only_tools_remain_advisory() {
         let mut guard = TurnGuard::new();
         // Direct health failures still produce avoid guidance.
         record_tool_failures(&mut guard, "write_file", 3);
@@ -2502,7 +2504,7 @@ mod tests {
     }
 
     #[test]
-    fn never_restrict_deprioritized_tools_do_not_enter_verdict_avoid_tools() {
+    fn never_restrict_health_avoidance_tools_do_not_enter_verdict_avoid_tools() {
         let mut guard = TurnGuard::new();
         record_tool_failures(&mut guard, "read_file", 8);
 
@@ -2511,7 +2513,7 @@ mod tests {
         assert_eq!(
             verdict.severity,
             VerdictSeverity::Healthy,
-            "read-only depriority alone should not degrade the session"
+            "read-only health avoidance alone should not degrade the session"
         );
         assert!(
             !verdict.avoid_tools.contains(&"read_file".to_string()),
@@ -2526,7 +2528,7 @@ mod tests {
     }
 
     #[test]
-    fn deprioritize_guidance_filters_never_restrict_tools_from_mixed_sets() {
+    fn advise_avoidance_guidance_filters_never_restrict_tools_from_mixed_sets() {
         let mut guard = TurnGuard::new();
         record_tool_failures(&mut guard, "read_file", 8);
         record_tool_failures(&mut guard, "bash", 8);
@@ -2568,7 +2570,7 @@ mod tests {
         guard.record_cache_hit("read_file");
         guard.record_cache_hit("read_file");
         guard.record_cache_hit("read_file");
-        // 3. Tool errors (will trigger deprioritize warning)
+        // 3. Tool errors (will trigger health-avoidance warning)
         guard.record_tool_result("write_file", "Error: write failed");
         guard.record_tool_result("write_file", "Error: write failed");
         guard.record_tool_result("write_file", "Error: write failed");

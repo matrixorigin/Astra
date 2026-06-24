@@ -36,7 +36,7 @@ Pause and critically examine your own behavior using both your conversation hist
 | Tool calls (total) | ${{CTX_TOTAL_TOOL_CALLS}} |
 | Stall nudges sent | ${{CTX_NUDGE_COUNT}} |
 | Errors | ${{CTX_ERROR_COUNT}} |
-| Health-deprioritized tools | ${{CTX_HEALTH_DEPRIORITIZED_TOOLS}} |
+| Health avoidance tools | ${{CTX_HEALTH_AVOIDANCE_TOOLS}} |
 | Stall events | ${{CTX_STALL_EVENTS}} |
 | Correction follow rate | ${{CTX_CORRECTION_FOLLOW_RATE}} |
 
@@ -47,7 +47,7 @@ Use these numbers — don't guess. A blank value means zero/none.
 Read the snapshot above and answer:
 
 - **Token burn rate**: Is `prompt_tokens` growing faster than expected? Over 50k in <5 turns suggests context bloat (large tool results, repeated file reads, or compaction not triggering).
-- **Tool failure rate**: `errors / tool_calls` — above 20% means something systemic is wrong. Check which tools are health-deprioritized.
+- **Tool failure rate**: `errors / tool_calls` — above 20% means something systemic is wrong. Check which tools are under health avoidance.
 - **Stall signals**: Any `nudge_count > 0` or `stall_events` means the system already detected you're stuck. What pattern triggered it? Are you still doing the same thing?
 - **Correction compliance**: If `correction_follow_rate` is below 80%, you're ignoring the system's guidance. Why?
 
@@ -60,7 +60,7 @@ Based on Step 1, identify the root cause. Common patterns:
 | Symptom | Likely Cause | Fix |
 |---------|-------------|-----|
 | High prompt tokens, few turns | Reading large files or getting huge tool outputs | Read specific line ranges; use grep first |
-| Errors climbing | Wrong tool or wrong arguments | Check deprioritized list; switch tools |
+| Errors climbing | Wrong tool or wrong arguments | Check health_avoidance_tools; switch tools |
 | Stall detected | Repeating same approach | Stop. Try a completely different tool or strategy |
 | Nudges ignored | Fixated on one approach | Respect the avoid list. Use suggested alternatives |
 | Many tool calls, little progress | Exploring without a plan | State your plan in 3 bullet points, then execute |

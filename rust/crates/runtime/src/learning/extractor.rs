@@ -31,7 +31,7 @@ pub struct SessionSummary {
     /// issues (ResourceLimit, Network, ServerError, Auth, StreamIdle,
     /// StreamTransport) rather than tool-inherent bugs (ToolInvalidArgs,
     /// ToolTimeout, ToolNotFound). The extractor will **not** create
-    /// ToolDeprioritize lessons for these — it would be wrong to teach
+    /// ToolAvoidance lessons for these — it would be wrong to teach
     /// the agent to avoid `grep` because the network was flaky.
     pub transient_failure_tools: std::collections::HashSet<String>,
     /// Tools with failures in the aggregate count but NO detailed outcome
@@ -44,7 +44,7 @@ pub struct SessionSummary {
     /// User-correction snippets recorded during the session.
     pub user_corrections: Vec<String>,
     /// Tools that were successfully used ≥ SUCCESS_REHABILITATE_THRESHOLD
-    /// times this session. Used to weaken stale ToolDeprioritize lessons:
+    /// times this session. Used to weaken stale ToolAvoidance lessons:
     /// if the agent successfully used grep 5 times today, the "avoid grep"
     /// lesson from last week should lose confidence.
     pub rehabilitated_tools: std::collections::HashSet<String>,
@@ -61,10 +61,10 @@ pub struct SessionSummary {
 // cost), so it can be more sensitive.
 
 /// A tool must fail at least this many times to warrant a
-/// ToolDeprioritize lesson.
+/// ToolAvoidance lesson.
 pub const TOOL_FAILURE_LESSON_THRESHOLD: u32 = 3;
 /// A tool must succeed at least this many times in one session to
-/// rehabilitate (weaken) an existing ToolDeprioritize lesson.
+/// rehabilitate (weaken) an existing ToolAvoidance lesson.
 pub const SUCCESS_REHABILITATE_THRESHOLD: usize = 3;
 /// Stall events that warrant a PromptShape lesson.
 pub const STALL_LESSON_THRESHOLD: u32 = 3;
@@ -76,7 +76,7 @@ pub const CORRECTION_LESSON_THRESHOLD: usize = 2;
 /// Distil a session summary into durable lessons for
 /// `(user_id, persona, workload_tag)`.
 ///
-/// Output ordering is deterministic: tool deprioritize lessons first,
+/// Output ordering is deterministic: tool-avoidance lessons first,
 /// then stall / correction prompt-shape lessons. Deterministic output
 /// keeps upstream tests stable.
 #[must_use]
@@ -88,9 +88,9 @@ pub fn extract_lessons(
 ) -> Vec<NewLesson> {
     let mut out = Vec::new();
 
-    // Tool failures → ToolDeprioritize, one per over-threshold tool.
+    // Tool failures → ToolAvoidance, one per over-threshold tool.
     // SAFETY: skip tools whose failures are predominantly transient infra
-    // issues (network, resource limit, etc.). Creating a ToolDeprioritize
+    // issues (network, resource limit, etc.). Creating a ToolAvoidance
     // lesson for "grep timed out because the network was flaky" would
     // teach the agent to avoid grep for 7+ days — exactly the cascading
     // block scenario that caused outages before this guard.
@@ -109,7 +109,7 @@ pub fn extract_lessons(
             user_id: user_id.to_string(),
             persona: persona.to_string(),
             workload_tag: workload_tag.map(str::to_string),
-            kind: LessonKind::ToolDeprioritize,
+            kind: LessonKind::ToolAvoidance,
             trigger_signal: format!("tool_failures:{name}"),
             action: format!(
                 "consider alternatives to `{name}` — failed {count} times last session due to tool-specific issues",
@@ -177,7 +177,7 @@ pub fn summarise_from_runtime(
     // Tools with failures in the aggregate count but NO detailed outcome
     // records — we can't classify these as inherent or transient, so we
     // err on the safe side: skip lesson creation rather than risk a false
-    // ToolDeprioritize that blocks the tool for days.
+    // ToolAvoidance that blocks the tool for days.
     let mut undetermined_failure_tools = std::collections::HashSet::new();
 
     for entry in tool_health {
@@ -222,7 +222,7 @@ pub fn summarise_from_runtime(
     };
 
     // Tools that were successfully used enough times this session to
-    // rehabilitate stale ToolDeprioritize lessons.
+    // rehabilitate stale ToolAvoidance lessons.
     let mut rehabilitated_tools = std::collections::HashSet::new();
     for entry in tool_health {
         let successes = entry.total_calls.saturating_sub(entry.total_failures);
@@ -242,7 +242,7 @@ pub fn summarise_from_runtime(
 }
 
 /// Transient infrastructure error kinds that should NOT produce
-/// ToolDeprioritize lessons. These are environmental failures, not
+/// ToolAvoidance lessons. These are environmental failures, not
 /// evidence that the tool itself is broken.
 ///
 /// Differs from [`astra_core::ErrorKind::is_retryable`]: that method
@@ -290,12 +290,12 @@ mod tests {
     // ── Each rule in isolation ──────────────────────────────────────────────
 
     #[test]
-    fn tool_failure_at_threshold_yields_tool_deprioritize() {
+    fn tool_failure_at_threshold_yields_tool_avoidance() {
         let mut s = base_summary();
         s.tool_failures.insert("grep".into(), 3);
         let out = extract_lessons(&s, "u1", "generic", None);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].kind, LessonKind::ToolDeprioritize);
+        assert_eq!(out[0].kind, LessonKind::ToolAvoidance);
         assert_eq!(out[0].trigger_signal, "tool_failures:grep");
         assert!(out[0].action.contains("`grep`"));
         assert_eq!(out[0].user_id, "u1");
@@ -314,7 +314,7 @@ mod tests {
         let names: Vec<&str> = out
             .iter()
             .filter_map(|l| {
-                if l.kind == LessonKind::ToolDeprioritize {
+                if l.kind == LessonKind::ToolAvoidance {
                     Some(l.trigger_signal.as_str())
                 } else {
                     None
@@ -386,7 +386,7 @@ mod tests {
         let out = extract_lessons(&s, "u", "p", None);
         assert_eq!(out.len(), 3);
         let kinds: std::collections::HashSet<LessonKind> = out.iter().map(|l| l.kind).collect();
-        assert!(kinds.contains(&LessonKind::ToolDeprioritize));
+        assert!(kinds.contains(&LessonKind::ToolAvoidance));
         assert!(kinds.contains(&LessonKind::PromptShape));
     }
 
@@ -563,7 +563,7 @@ mod tests {
     #[test]
     fn summarise_with_stalls_yields_expected_lesson_kinds_end_to_end() {
         // Full stack: observability counters → summary → extractor must
-        // produce ToolDeprioritize + PromptShape (stalls).
+        // produce ToolAvoidance + PromptShape (stalls).
         use crate::observability::ObservabilitySession;
         let entries = vec![health_inherent("grep", 3, 5)];
         let mut obs = ObservabilitySession::new_simple("s-p7a-e2e");
@@ -575,7 +575,7 @@ mod tests {
         let lessons = extract_lessons(&summary, "u1", "generic", None);
 
         let kinds: std::collections::HashSet<LessonKind> = lessons.iter().map(|l| l.kind).collect();
-        assert!(kinds.contains(&LessonKind::ToolDeprioritize));
+        assert!(kinds.contains(&LessonKind::ToolAvoidance));
         assert!(kinds.contains(&LessonKind::PromptShape));
     }
 }
