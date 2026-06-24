@@ -1281,10 +1281,11 @@ pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
                 project_root,
                 &["diff", ref_str, "--no-ext-diff", "--no-color", "--", p],
                 limit,
-            ) {
-                GitCliDiffResult::Output(result) => return result,
-                GitCliDiffResult::Failed(error) => return error,
-                GitCliDiffResult::Unavailable => {}
+            )
+            .output_or_else(|| diff_tree_to_tree_str(&repo, ref_str, limit))
+            {
+                Ok(result) => return result,
+                Err(error) => return error,
             }
         }
         return diff_tree_to_tree_str(&repo, ref_str, limit);
@@ -1297,10 +1298,11 @@ pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
         } else {
             vec!["diff", "--cached", "--no-ext-diff", "--no-color"]
         };
-        let result = match diff_via_git_cli_result(project_root, &cli_args, limit) {
-            GitCliDiffResult::Output(result) => result,
-            GitCliDiffResult::Failed(error) => return error,
-            GitCliDiffResult::Unavailable => diff_index_to_head(&repo, limit),
+        let result = match diff_via_git_cli_result(project_root, &cli_args, limit)
+            .output_or_else(|| diff_index_to_head(&repo, limit))
+        {
+            Ok(r) => r,
+            Err(error) => return error,
         };
         if result == "No changes" {
             return "No staged changes".to_string();
@@ -1315,10 +1317,9 @@ pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
     } else {
         vec!["diff", "HEAD", "--no-ext-diff", "--no-color"]
     };
-    match diff_via_git_cli_result(project_root, &cli_args, limit) {
-        GitCliDiffResult::Output(result) => result,
-        GitCliDiffResult::Failed(error) => error,
-        GitCliDiffResult::Unavailable => diff_worktree(&repo, limit),
+    match diff_via_git_cli_result(project_root, &cli_args, limit).output_or_else(|| diff_worktree(&repo, limit)) {
+        Ok(result) => result,
+        Err(error) => error,
     }
 }
 
@@ -1327,6 +1328,18 @@ enum GitCliDiffResult {
     Output(String),
     Failed(String),
     Unavailable,
+}
+
+impl GitCliDiffResult {
+    /// Returns `Ok(output)` for `Output`, `Err(error)` for `Failed`.
+    /// For `Unavailable`, calls `fallback` and returns `Ok(fallback_result)`.
+    fn output_or_else<F: FnOnce() -> String>(self, fallback: F) -> Result<String, String> {
+        match self {
+            Self::Output(s) => Ok(s),
+            Self::Failed(e) => Err(e),
+            Self::Unavailable => Ok(fallback()),
+        }
+    }
 }
 
 fn diff_via_git_cli_or_error(project_root: &Path, args: &[&str], limit: usize) -> String {
