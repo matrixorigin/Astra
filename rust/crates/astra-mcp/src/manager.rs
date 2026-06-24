@@ -145,7 +145,7 @@ impl McpClientManager {
     }
 
     /// Get all MCP tool schemas in OpenAI function-calling format.
-    /// Names follow the `mcp_{server}_{tool}` convention. Deduplicates on name collision.
+    /// Names follow the `mcp__{server}__{tool}` convention. Deduplicates on name collision.
     pub fn all_tool_schemas(&self) -> Vec<Value> {
         let mut seen: HashMap<String, &str> = HashMap::new();
         let mut schemas = Vec::new();
@@ -177,7 +177,7 @@ impl McpClientManager {
         schemas
     }
 
-    /// Find which server owns a sanitized MCP tool name (e.g. "mcp_moi_query_sql").
+    /// Find which server owns a sanitized MCP tool name (e.g. "mcp__moi__query_sql").
     /// Returns (server_name, original_tool_name) if found.
     pub fn find_tool_by_mcp_name(&self, mcp_name: &str) -> Option<(&str, &str)> {
         self.tool_routes_by_public_name.get(mcp_name).map(|route| {
@@ -220,7 +220,7 @@ impl McpClientManager {
             .map_err(McpError::Service)
     }
 
-    /// Call a tool by its MCP-prefixed public name (e.g. "mcp_moi_query_sql").
+    /// Call a tool by its MCP-prefixed public name (e.g. "mcp__moi__query_sql").
     /// Resolves the server + original name, executes, and returns text result.
     pub async fn call_tool_by_mcp_name(
         &self,
@@ -268,6 +268,28 @@ impl McpClientManager {
             tracing::info!("Refreshed tool lists for: {}", refreshed.join(", "));
         }
         refreshed
+    }
+
+    /// Consume prompt-list change notifications and return changed servers.
+    pub fn consume_prompt_changes(&self) -> Vec<String> {
+        let mut changed = Vec::new();
+        for (name, conn) in &self.connections {
+            if conn.consume_prompt_change() {
+                changed.push(name.clone());
+            }
+        }
+        changed
+    }
+
+    /// Consume resource-list change notifications and return changed servers.
+    pub fn consume_resource_changes(&self) -> Vec<String> {
+        let mut changed = Vec::new();
+        for (name, conn) in &self.connections {
+            if conn.consume_resource_change() {
+                changed.push(name.clone());
+            }
+        }
+        changed
     }
 
     /// Aggregate all prompts from all connected servers.

@@ -339,6 +339,7 @@ dependencies = [
 name = "astra-mcp"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "futures-util",
  "reqwest 0.12.28",
  "rmcp",

@@ -1167,7 +1167,7 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
         retry: crate::mcp_client::RetryConfig::default(),
     };
     manager
-        .connect_for_test(config)
+        .connect(config)
         .await
         .expect("connect to mock MCP server");
 
@@ -1181,38 +1181,62 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
         tool_names
     );
 
-    // Tool name as it will appear in SSE: mcp_{server}_{tool}
-    let mcp_tool_name = crate::mcp_client::sanitize_tool_name("mcp_mock_echo");
+    let schemas = manager.all_tool_schemas();
+    let mcp_tool_name = schemas
+        .iter()
+        .find_map(|schema| {
+            let name = schema.get("function")?.get("name")?.as_str()?;
+            (name == "mcp__mock__echo").then_some(name.to_string())
+        })
+        .expect("mock MCP echo schema should use the canonical public name");
 
-    // HTTP mock: first call returns MCP tool_call, second returns text
+    // HTTP mock: first call activates the deferred MCP schema via tool_search,
+    // second call returns the MCP tool_call, third returns final text.
     let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let cc = call_count.clone();
     let tool_name_clone = mcp_tool_name.clone();
-    let app = axum::Router::new().route(
-        "/chat/turn",
-        axum::routing::post(move || {
+    let posted_results = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let posted_results_for_route = posted_results.clone();
+    let app = axum::Router::new()
+        .route(
+            "/chat/turn",
+            axum::routing::post(move || {
             let cc = cc.clone();
             let tn = tool_name_clone.clone();
             async move {
                 let n = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let body = if n == 0 {
-                    format!(
+                let body = match n {
+                    0 => format!(
                         "data: {{\"type\":\"session_info\",\"session_id\":\"sess-mcp\"}}\n\n\
-                         data: {{\"type\":\"tool_call\",\"id\":\"mcp-1\",\"name\":\"{}\",\"arguments\":{{\"message\":\"hello from test\"}}}}\n\n\
-                         data: {{\"type\":\"turn_complete\",\"has_tool_calls\":true}}\n\n\
+                         data: {{\"type\":\"tool_request\",\"request_id\":\"search-1\",\"tool\":\"tool_search\",\"args\":{{\"query\":\"select:{}\"}}}}\n\n\
                          data: [DONE]\n\n",
                         tn
-                    )
-                } else {
-                    sse_text_response("MCP done!", "sess-mcp")
+                    ),
+                    1 => format!(
+                        "data: {{\"type\":\"session_info\",\"session_id\":\"sess-mcp\"}}\n\n\
+                         data: {{\"type\":\"tool_request\",\"request_id\":\"mcp-1\",\"tool\":\"{}\",\"args\":{{\"message\":\"hello from test\"}}}}\n\n\
+                         data: [DONE]\n\n",
+                        tn
+                    ),
+                    _ => sse_text_response("MCP done!", "sess-mcp"),
                 };
                 (
                     [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
                     body,
                 )
             }
-        }),
-    );
+            }),
+        )
+        .route(
+            "/tools/result",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let posted_results = posted_results_for_route.clone();
+                async move {
+                    posted_results.lock().await.push(body);
+                    axum::Json(serde_json::json!({"ok": true}))
+                }
+            }),
+        );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
 
@@ -1225,7 +1249,7 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
         token: "fake-token",
         auth_profile: None,
         message: "call echo",
-        semantic_query_override: None,
+        semantic_query_override: Some("run external MCP echo tool"),
         session_id: None,
         model: Some("test-model"),
         provider: None,
@@ -1255,7 +1279,7 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
         approval_request_tx: None,
         ask_user_request_tx: None,
         plan_review_request_tx: None,
-        mcp_manager: Some(mcp_arc),
+        mcp_manager: Some(mcp_arc.clone()),
         skill_quality_tracker: &mut skill_qt,
         discovered_skills: None,
         messaging_metrics: None,
@@ -1300,7 +1324,26 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
         "expected at least one MCP tool call"
     );
     assert!(
-        call_count.load(std::sync::atomic::Ordering::SeqCst) >= 2,
-        "expected at least 2 HTTP rounds (tool_call + final text)"
+        call_count.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+        "expected at least 3 HTTP rounds (tool_search + MCP tool_call + final text)"
     );
+    assert_eq!(
+        posted_results.lock().await.len(),
+        2,
+        "tool_search and MCP requests should both post edge results"
+    );
+
+    let conn = {
+        let manager = mcp_arc.read().await;
+        manager.get("mock").expect("mock MCP connection")
+    };
+    let log = conn.call_log.read().await;
+    assert_eq!(
+        log.len(),
+        1,
+        "MCP call should be recorded in shared core log; tool records: {:?}",
+        result.tool_call_records
+    );
+    assert_eq!(log[0].tool, "echo");
+    assert!(log[0].success, "echo MCP call should succeed");
 }

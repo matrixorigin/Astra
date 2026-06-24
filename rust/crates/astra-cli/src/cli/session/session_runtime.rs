@@ -239,29 +239,6 @@ fn create_pipeline_modules_inner(
     let mcp_manager =
         std::sync::Arc::new(tokio::sync::RwLock::new(mcp_client::McpClientManager::new()));
 
-    // Configure sampling so MCP servers can request LLM completions.
-    {
-        if let Some(token) = current_access_token(profile) {
-            let sampling = mcp_client::SamplingConfig {
-                api: std::sync::Arc::new(
-                    astra_thin_client::ThinClient::new(api.api_origin().as_str(), None)
-                        .expect("valid API origin for sampling"),
-                ),
-                token,
-                model: "default".to_string(),
-                max_tokens_cap: mcp_client::DEFAULT_SAMPLING_MAX_TOKENS_CAP,
-            };
-            tokio::task::block_in_place(|| {
-                handle.block_on(async {
-                    mcp_manager
-                        .write()
-                        .await
-                        .set_sampling_config(Some(sampling));
-                })
-            });
-        }
-    }
-
     // Set initial roots to the current working directory.
     {
         if let Ok(cwd) = std::env::current_dir() {
@@ -290,7 +267,13 @@ fn create_pipeline_modules_inner(
                         let mut results: Vec<(String, Result<(), String>)> = Vec::new();
                         for config in mcp_configs {
                             let name = config.name.clone();
-                            match manager.connect_and_discover_skills(config, &reg).await {
+                            match mcp_client::connect_and_discover_skills(
+                                &mut manager,
+                                config,
+                                &reg,
+                            )
+                            .await
+                            {
                                 Ok(_) => results.push((name, Ok(()))),
                                 Err(e) => results.push((name, Err(format_mcp_error(&e)))),
                             }

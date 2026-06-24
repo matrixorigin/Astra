@@ -2083,15 +2083,9 @@ async fn mcp_overview_text(state: &SessionState) -> String {
     let tools = manager.all_tools().len();
     let prompts = manager.all_prompts().await.len();
     let resources = manager.all_resources().await.len();
-    let mut capabilities = vec!["elicitation"];
-    if manager.has_sampling() {
-        capabilities.insert(0, "sampling");
-    }
-
     let mut lines = vec![
         "MCP overview".into(),
         format!("Servers: {count} connected"),
-        format!("Capabilities: {}", capabilities.join(", ")),
         format!("Tools: {tools}  ·  Prompts: {prompts}  ·  Resources: {resources}"),
     ];
 
@@ -2349,17 +2343,22 @@ async fn mcp_read_text(state: &SessionState, spec: &str) -> String {
 }
 
 async fn mcp_history_text(state: &SessionState) -> String {
-    let manager = state.mcp_manager.read().await;
-    if manager.connection_count() == 0 {
-        return mcp_no_servers_text();
-    }
+    let connections = {
+        let manager = state.mcp_manager.read().await;
+        if manager.connection_count() == 0 {
+            return mcp_no_servers_text();
+        }
+        manager
+            .connected_servers()
+            .into_iter()
+            .filter_map(|name| manager.get(name))
+            .collect::<Vec<_>>()
+    };
 
     let mut entries = Vec::new();
-    for name in manager.server_names() {
-        if let Some(conn) = manager.get_connection(name) {
-            let log = conn.call_log.read().await;
-            entries.extend(log.iter().cloned());
-        }
+    for conn in connections {
+        let log = conn.call_log.read().await;
+        entries.extend(log.iter().cloned());
     }
     if entries.is_empty() {
         return "No MCP tool calls recorded yet.\nUse an MCP tool, then run `/mcp history` again."
@@ -2452,10 +2451,7 @@ async fn mcp_inspect_text(state: &SessionState, query: &str) -> String {
         Ok((server, tool)) => mcp_protocol_tool_text(server, tool),
         Err(protocol_error) => {
             for meta in astra_turn_core::tool::registry::meta::TOOL_CATALOG {
-                if meta.name == query
-                    || format!("mcp_{}", meta.name) == query
-                    || format!("mcp_memoria_{}", meta.name) == query
-                {
+                if meta.name == query {
                     return mcp_builtin_tool_text(meta);
                 }
             }
@@ -2465,7 +2461,7 @@ async fn mcp_inspect_text(state: &SessionState, query: &str) -> String {
 }
 
 async fn mcp_ping_text(state: &SessionState, server: Option<&str>) -> String {
-    let mut manager = state.mcp_manager.write().await;
+    let manager = state.mcp_manager.read().await;
     if manager.connection_count() == 0 {
         return mcp_no_servers_text();
     }

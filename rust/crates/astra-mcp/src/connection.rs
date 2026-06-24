@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use rmcp::{
@@ -16,6 +16,7 @@ use rmcp::{
     service::{NotificationContext, RequestContext, RunningService, ServiceError},
     transport::TokioChildProcess,
 };
+use serde::Serialize;
 use tokio::sync::RwLock;
 
 use crate::error::McpError;
@@ -142,6 +143,26 @@ impl ClientHandler for ChangeHandler {
 
 // ── McpConnection ──────────────────────────────────────────────────────
 
+/// A logged MCP tool call entry.
+#[derive(Debug, Clone, Serialize)]
+pub struct CallLogEntry {
+    /// When the call was made.
+    pub timestamp: String,
+    /// Tool name used in the call.
+    pub tool: String,
+    /// Server this call was routed to.
+    pub server: String,
+    /// Whether the call succeeded.
+    pub success: bool,
+    /// Call latency.
+    pub latency_ms: u64,
+    /// Error message if the call failed.
+    pub error: Option<String>,
+}
+
+/// Maximum number of call log entries kept per connection.
+const CALL_LOG_MAX_ENTRIES: usize = 100;
+
 /// Running MCP client connection.
 pub struct McpConnection {
     pub name: String,
@@ -152,9 +173,28 @@ pub struct McpConnection {
     tools_changed: Arc<AtomicBool>,
     prompts_changed: Arc<AtomicBool>,
     resources_changed: Arc<AtomicBool>,
+    /// Total number of tool calls made through this connection.
+    pub call_count: AtomicU64,
+    /// Number of failed tool calls.
+    pub error_count: AtomicU64,
+    /// Latency of the most recent tool call.
+    pub last_latency: RwLock<Option<std::time::Duration>>,
+    /// Error message from the most recent failed call, if any.
+    pub last_error: RwLock<Option<String>>,
+    /// Ring buffer of recent call log entries.
+    pub call_log: RwLock<VecDeque<CallLogEntry>>,
     #[allow(dead_code)]
     ws_bridge_handles: Option<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)>,
     _running: Option<RunningService<RoleClient, ChangeHandler>>,
+}
+
+impl Drop for McpConnection {
+    fn drop(&mut self) {
+        if let Some((read_handle, write_handle)) = self.ws_bridge_handles.take() {
+            read_handle.abort();
+            write_handle.abort();
+        }
+    }
 }
 
 impl McpConnection {
@@ -196,6 +236,9 @@ impl McpConnection {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<CallToolResult, ServiceError> {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
+        let start = Instant::now();
+
         let arguments = match arguments {
             serde_json::Value::Object(map) => Some(map),
             serde_json::Value::Null => None,
@@ -209,22 +252,70 @@ impl McpConnection {
         } else {
             CallToolRequestParams::new(name.to_string())
         };
-        tokio::time::timeout(
+        let result = match tokio::time::timeout(
             std::time::Duration::from_secs(MCP_TOOL_CALL_TIMEOUT_SECS),
             self.peer.call_tool(params),
         )
         .await
-        .map_err(|_| {
-            tracing::warn!(
-                "MCP tool '{}' on server '{}' timed out after {}s",
-                name,
-                self.name,
-                MCP_TOOL_CALL_TIMEOUT_SECS
-            );
-            ServiceError::Timeout {
-                timeout: std::time::Duration::from_secs(MCP_TOOL_CALL_TIMEOUT_SECS),
+        {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!(
+                    "MCP tool '{}' on server '{}' timed out after {}s",
+                    name,
+                    self.name,
+                    MCP_TOOL_CALL_TIMEOUT_SECS
+                );
+                Err(ServiceError::Timeout {
+                    timeout: std::time::Duration::from_secs(MCP_TOOL_CALL_TIMEOUT_SECS),
+                })
             }
-        })?
+        };
+
+        let latency = start.elapsed();
+        let latency_ms = latency.as_millis() as u64;
+        *self.last_latency.write().await = Some(latency);
+
+        let mut success = true;
+        let mut error_msg = None;
+        match &result {
+            Ok(_) => {
+                *self.last_error.write().await = None;
+                tracing::debug!(
+                    server = %self.name,
+                    tool = name,
+                    "MCP tool call succeeded"
+                );
+            }
+            Err(error) => {
+                self.error_count.fetch_add(1, Ordering::Relaxed);
+                let error = error.to_string();
+                *self.last_error.write().await = Some(error.clone());
+                success = false;
+                error_msg = Some(error.clone());
+                tracing::warn!(
+                    server = %self.name,
+                    tool = name,
+                    error = %error,
+                    "MCP tool call failed"
+                );
+            }
+        }
+
+        let mut log = self.call_log.write().await;
+        if log.len() >= CALL_LOG_MAX_ENTRIES {
+            log.pop_front();
+        }
+        log.push_back(CallLogEntry {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            tool: name.to_string(),
+            server: self.name.clone(),
+            success,
+            latency_ms,
+            error: error_msg,
+        });
+
+        result
     }
 
     pub fn has_tool(&self, name: &str) -> bool {
@@ -486,6 +577,11 @@ async fn connect_stdio(
         tools_changed,
         prompts_changed,
         resources_changed,
+        call_count: AtomicU64::new(0),
+        error_count: AtomicU64::new(0),
+        last_latency: RwLock::new(None),
+        last_error: RwLock::new(None),
+        call_log: RwLock::new(VecDeque::with_capacity(CALL_LOG_MAX_ENTRIES)),
         ws_bridge_handles: None,
         _running: Some(running),
     })
@@ -531,6 +627,11 @@ async fn connect_sse(
         tools_changed,
         prompts_changed,
         resources_changed,
+        call_count: AtomicU64::new(0),
+        error_count: AtomicU64::new(0),
+        last_latency: RwLock::new(None),
+        last_error: RwLock::new(None),
+        call_log: RwLock::new(VecDeque::with_capacity(CALL_LOG_MAX_ENTRIES)),
         ws_bridge_handles: None,
         _running: Some(running),
     })
@@ -598,6 +699,11 @@ async fn connect_streamable_http(
         tools_changed,
         prompts_changed,
         resources_changed,
+        call_count: AtomicU64::new(0),
+        error_count: AtomicU64::new(0),
+        last_latency: RwLock::new(None),
+        last_error: RwLock::new(None),
+        call_log: RwLock::new(VecDeque::with_capacity(CALL_LOG_MAX_ENTRIES)),
         ws_bridge_handles: None,
         _running: Some(running),
     })
@@ -738,6 +844,11 @@ async fn connect_ws(
         tools_changed,
         prompts_changed,
         resources_changed,
+        call_count: AtomicU64::new(0),
+        error_count: AtomicU64::new(0),
+        last_latency: RwLock::new(None),
+        last_error: RwLock::new(None),
+        call_log: RwLock::new(VecDeque::with_capacity(CALL_LOG_MAX_ENTRIES)),
         ws_bridge_handles: Some((ws_read_handle, ws_write_handle)),
         _running: Some(running),
     })

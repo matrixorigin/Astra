@@ -595,6 +595,7 @@ pub(crate) async fn stream_chat_sse(
         term_width,
         render_policy: p.render_policy,
         message: p.message,
+        semantic_query_override: p.semantic_query_override,
         history: p.history,
         recent_tools: p.recent_tools,
         project_root: project_root.clone(),

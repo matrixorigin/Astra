@@ -913,7 +913,7 @@ pub struct ToolExecutor {
     /// Optional passive LSP sessions (rust-analyzer, typescript-language-server).
     passive_lsp: passive_lsp::PassiveLspManager,
     /// MCP client manager for external tool servers.
-    /// When present, tool names starting with `mcp_` are routed to MCP servers.
+    /// When present, tool names starting with `mcp__` are routed to MCP servers.
     pub mcp_manager:
         Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
     /// File edit journal — records before-state of every file write for undo.
@@ -4687,7 +4687,7 @@ impl ToolExecutor {
                 "config" => self.config_tool(args),
                 "brief" => self.brief(args).await,
                 "context_analysis" => self.context_analysis(args),
-                _ if name.starts_with("mcp_") => self.execute_mcp_tool(name, args).await,
+                _ if name.starts_with("mcp__") => self.execute_mcp_tool(name, args).await,
                 _ => {
                     // Delegate unknown tools to the shared DefaultToolExecutor.
                     use astra_tools::ToolExecutor as _;

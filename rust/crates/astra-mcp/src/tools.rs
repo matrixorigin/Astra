@@ -35,7 +35,7 @@ pub fn sanitize_tool_name(name: &str) -> String {
 }
 
 /// Convert MCP Tool to Astra tool schema (OpenAI function-calling format).
-/// Naming: `mcp_{server}_{tool}` with sanitization.
+/// Naming: `mcp__{server}__{tool}` with sanitization.
 pub fn mcp_tool_to_schema(server_name: &str, tool: &Tool) -> Value {
     let params = serde_json::to_value(tool.input_schema.as_ref()).unwrap_or_else(|_| {
         serde_json::json!({

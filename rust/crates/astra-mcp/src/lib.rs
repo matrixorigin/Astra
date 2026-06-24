@@ -11,7 +11,7 @@ mod manager;
 mod tools;
 mod types;
 
-pub use connection::McpConnection;
+pub use connection::{CallLogEntry, McpConnection};
 pub use error::McpError;
 pub use manager::McpClientManager;
 pub use rmcp::model::Tool as McpTool;

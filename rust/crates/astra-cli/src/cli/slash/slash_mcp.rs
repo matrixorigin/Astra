@@ -191,7 +191,7 @@ pub(crate) fn resolve_protocol_tool_query<'a>(
         .all_tools()
         .into_iter()
         .filter(|(server, tool)| {
-            crate::mcp_client::sanitize_tool_name(&format!("mcp_{server}_{}", tool.name)) == query
+            crate::mcp_client::sanitize_tool_name(&format!("mcp__{server}__{}", tool.name)) == query
         })
         .collect();
     match sanitized.len() {
@@ -365,12 +365,6 @@ async fn show_status(state: &SessionState) {
             "{}",
             format!("  Servers: {count} connected").bold().magenta()
         );
-        let mut caps = Vec::new();
-        if manager.has_sampling() {
-            caps.push("sampling");
-        }
-        caps.push("elicitation");
-        eprintln!("  {}", format!("Capabilities: {}", caps.join(", ")).dim());
         let roots = manager.roots().read().await;
         if !roots.is_empty() {
             let names: Vec<&str> = roots
@@ -614,20 +608,24 @@ async fn show_resources(state: &SessionState) {
 
 /// `/mcp history` — show recent MCP tool call history from all connected servers.
 async fn show_history(state: &SessionState) {
-    let manager = state.mcp_manager.read().await;
-
-    if manager.connection_count() == 0 {
-        eprintln!("{}", "  No MCP servers connected.".dim());
-        return;
-    }
+    let connections = {
+        let manager = state.mcp_manager.read().await;
+        if manager.connection_count() == 0 {
+            eprintln!("{}", "  No MCP servers connected.".dim());
+            return;
+        }
+        manager
+            .connected_servers()
+            .into_iter()
+            .filter_map(|name| manager.get(name))
+            .collect::<Vec<_>>()
+    };
 
     // Collect all log entries from all servers, sorted by timestamp (newest first)
     let mut entries: Vec<crate::mcp_client::CallLogEntry> = Vec::new();
-    for name in manager.server_names() {
-        if let Some(conn) = manager.get_connection(name) {
-            let log = conn.call_log.read().await;
-            entries.extend(log.iter().cloned());
-        }
+    for conn in connections {
+        let log = conn.call_log.read().await;
+        entries.extend(log.iter().cloned());
     }
     entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
@@ -860,12 +858,9 @@ async fn show_inspect(tool_name: &str, state: &SessionState) {
         Err(message) => message,
     };
 
-    // 2) Check built-in mcp_memoria_* tools
+    // 2) Check built-in tools by their canonical catalog name.
     for meta in astra_turn_core::tool::registry::meta::TOOL_CATALOG {
-        if meta.name == tool_name
-            || format!("mcp_{}", meta.name) == tool_name
-            || format!("mcp_memoria_{}", meta.name) == tool_name
-        {
+        if meta.name == tool_name {
             show_builtin_tool_info(meta);
             return;
         }
@@ -1699,7 +1694,7 @@ async fn handle_mcp_complete(arg: &str, state: &SessionState) {
 
 /// Handle `/mcp ping [server]` — ping one server or all.
 async fn handle_mcp_ping(server: Option<&str>, state: &SessionState) {
-    let mut manager = state.mcp_manager.write().await;
+    let manager = state.mcp_manager.read().await;
 
     if manager.connection_count() == 0 {
         eprintln!("{}", "  No MCP servers connected.".dim());
