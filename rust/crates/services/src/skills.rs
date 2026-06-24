@@ -659,7 +659,7 @@ impl SkillService for DatabaseSkillService {
         let deps_json = request
             .dependencies
             .as_ref()
-            .map(|d| serde_json::to_string(d).unwrap_or_else(|_| "[]".into()));
+            .map(|d| serde_json::to_string(d).expect("dependency serialization should not fail"));
         let mut manifest_map = match request.manifest.clone() {
             Some(serde_json::Value::Object(mut map)) => {
                 strip_reserved_skill_definition_keys(&mut map);
@@ -793,7 +793,7 @@ impl SkillService for DatabaseSkillService {
             )
         })?;
 
-        let created_by: String = row.try_get("created_by").unwrap_or_default();
+        let created_by: String = row.try_get("created_by").map_err(internal_error)?;
         if created_by != user_id {
             return Err(error_response(
                 StatusCode::FORBIDDEN,

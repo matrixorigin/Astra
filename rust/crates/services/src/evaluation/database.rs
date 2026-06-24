@@ -1168,8 +1168,55 @@ impl EvaluationService for DatabaseEvaluationService {
         agent_id: Option<&str>,
         days: i32,
     ) -> ServiceResult<CalibrationResponse> {
-        let _ = (user_id, agent_id, days);
-        let samples: Vec<(f64, f64)> = Vec::new();
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let days = clamp_eval_days(days);
+
+        let sql = if agent_id.is_some() {
+            "SELECT CAST(ca.confidence AS DOUBLE) AS confidence, \
+                    CAST(ca.quality_score AS DOUBLE) AS quality_score \
+             FROM eval_calibration_assessments ca \
+             INNER JOIN eval_quality_assessments qa \
+               ON qa.user_id = ca.user_id \
+              AND qa.target_id = ca.session_id \
+              AND qa.level = 'session' \
+             WHERE ca.user_id = ? \
+               AND ca.agent_id = ? \
+               AND ca.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)"
+        } else {
+            "SELECT CAST(ca.confidence AS DOUBLE) AS confidence, \
+                    CAST(ca.quality_score AS DOUBLE) AS quality_score \
+             FROM eval_calibration_assessments ca \
+             INNER JOIN eval_quality_assessments qa \
+               ON qa.user_id = ca.user_id \
+              AND qa.target_id = ca.session_id \
+              AND qa.level = 'session' \
+             WHERE ca.user_id = ? \
+               AND ca.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)"
+        };
+
+        let mut query_builder = query(sql).bind(user_id);
+        if let Some(agent) = agent_id {
+            query_builder = query_builder.bind(agent);
+        }
+        query_builder = query_builder.bind(days);
+
+        let rows = query_builder
+            .fetch_all(&pool)
+            .await
+            .map_err(internal_error)?;
+
+        let samples: Vec<(f64, f64)> = rows
+            .iter()
+            .filter_map(|row| {
+                let confidence: Option<f64> = row.try_get("confidence").ok();
+                let quality: Option<f64> = row.try_get("quality_score").ok();
+                match (confidence, quality) {
+                    (Some(c), Some(q)) => Some((c, q)),
+                    _ => None,
+                }
+            })
+            .collect();
+
         let summary = summarize_calibration_samples(&samples);
         let noise_filtered_summary =
             summarize_calibration_samples(&noise_filtered_calibration_samples(&samples));
@@ -1798,11 +1845,15 @@ impl EvaluationService for DatabaseEvaluationService {
         let sql = "SELECT qa.target_id AS session_id, \
                    MAX(CAST(qa.score AS DOUBLE)) AS quality_score, \
                    MAX(COALESCE(qa.step_count, 0)) AS step_count, \
-                   CAST(NULL AS DOUBLE) AS avg_confidence, \
+                   AVG(CAST(ca.confidence AS DOUBLE)) AS avg_confidence, \
                    COUNT(ev.event_id) AS trace_count, \
                    DATE_FORMAT(MAX(qa.updated_at), '%Y-%m-%dT%H:%i:%s') AS quality_updated_at, \
                    DATE_FORMAT(MAX(ev.created_at), '%Y-%m-%dT%H:%i:%s') AS latest_context_trace_at \
             FROM eval_quality_assessments qa \
+            LEFT JOIN eval_calibration_assessments ca \
+              ON ca.session_id = qa.target_id \
+             AND ca.user_id = qa.user_id \
+             AND ca.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
             LEFT JOIN agent_events ev \
               ON ev.session_id = qa.target_id \
              AND ev.user_id = qa.user_id \
@@ -1823,6 +1874,7 @@ impl EvaluationService for DatabaseEvaluationService {
             ORDER BY quality_score DESC, MAX(qa.updated_at) DESC \
             LIMIT ?";
         let rows = query(sql)
+            .bind(days)
             .bind(days)
             .bind(user_id)
             .bind(days)

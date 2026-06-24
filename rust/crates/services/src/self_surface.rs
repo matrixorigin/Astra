@@ -1665,8 +1665,12 @@ fn persistence_pending_blockers(persistence_error: Option<&str>) -> Vec<String> 
 }
 
 fn merged_health_avoidance_tools(artifacts: &SessionArtifacts) -> Vec<String> {
+    // Use BTreeSet for deduplication and sorted output
+    // Only scan the last 100 events for performance (avoid full scan on large sessions)
+    let events_to_scan = artifacts.journal_events.len().saturating_sub(100)..;
     let mut health_avoidance_tools = BTreeSet::new();
-    for event in &artifacts.journal_events {
+
+    for event in &artifacts.journal_events[events_to_scan] {
         let Some(names) = event
             .metadata
             .as_ref()
