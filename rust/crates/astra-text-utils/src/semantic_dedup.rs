@@ -420,13 +420,21 @@ pub struct SemanticDedup {
     threshold: f64,
     /// Tier 2: semantic_key → (turn, tool_name)
     param_cache: HashMap<String, (usize, String)>,
-    /// Tier 3: (tool_name, turn) → truncated output for similarity comparison
+    /// Tier 3: truncated output for same semantic key similarity comparison.
     /// Only stores first 2000 chars of output to bound memory.
-    output_log: Vec<(String, usize, String)>,
+    output_log: Vec<OutputLogEntry>,
     /// Max entries in output_log before oldest are evicted
     max_output_entries: usize,
     /// Structured audit trail of detected duplicates.
     dedup_audit: Vec<DedupAuditRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct OutputLogEntry {
+    tool_name: String,
+    semantic_key: Option<String>,
+    turn: usize,
+    output: String,
 }
 
 impl SemanticDedup {
@@ -456,11 +464,11 @@ impl SemanticDedup {
         current_turn: usize,
     ) -> Option<(usize, String)> {
         let sem_key = semantic_call_key(tool_name, args)?;
-        let (prev_turn, _prev_tool) = self.param_cache.get(&sem_key)?;
-        if current_turn <= *prev_turn {
+        let (latest_turn, _prev_tool) = self.param_cache.get(&sem_key)?;
+        if current_turn <= *latest_turn {
             return None;
         }
-        // Find the most recent output from the same tool in output_log.
+        // Find the most recent output from the same tool and semantic key.
         // Skip outputs that have been microcompact-cleared or are stubs —
         // returning "[Cleared]" or a short placeholder instead of real content
         // would leave the caller with nothing useful, forcing them to re-fetch
@@ -471,15 +479,15 @@ impl SemanticDedup {
         // re-executed — the side-effect already happened. For write tools we
         // return the cached short output as-is so the caller short-circuits.
         let tool_is_read_only = is_read_only_tool(tool_name, args);
-        for (prev_tool, _out_turn, prev_output) in self.output_log.iter().rev() {
-            if prev_tool == tool_name {
-                if prev_output.starts_with("[Cleared") || prev_output.starts_with("(cached") {
+        for entry in self.output_log.iter().rev() {
+            if entry.tool_name == tool_name && entry.semantic_key.as_deref() == Some(&sem_key) {
+                if entry.output.starts_with("[Cleared") || entry.output.starts_with("(cached") {
                     return None; // Force re-execution — cached content is gone
                 }
-                if tool_is_read_only && prev_output.len() < 20 {
+                if tool_is_read_only && entry.output.len() < 20 {
                     return None; // Read-only + trivial output → cheap to re-run
                 }
-                return Some((*prev_turn, prev_output.clone()));
+                return Some((entry.turn, entry.output.clone()));
             }
         }
         None
@@ -499,25 +507,34 @@ impl SemanticDedup {
         current_turn: usize,
     ) -> Option<(usize, String)> {
         let mut result = None;
+        let sem_key = semantic_call_key(tool_name, args);
 
         // Tier 2: Parameter-aware match
-        if let Some(sem_key) = semantic_call_key(tool_name, args) {
-            if let Some((prev_turn, _prev_tool)) = self.param_cache.get(&sem_key)
+        if let Some(key) = sem_key.as_ref() {
+            if let Some((prev_turn, _prev_tool)) = self.param_cache.get(key)
                 && current_turn > *prev_turn
             {
                 result = Some((*prev_turn, "param_match".to_string()));
             }
             self.param_cache
-                .insert(sem_key, (current_turn, tool_name.to_string()));
+                .insert(key.clone(), (current_turn, tool_name.to_string()));
         }
 
-        // Tier 3: Output similarity (only if Tier 2 didn't match)
-        if result.is_none() && output.len() >= MIN_OUTPUT_LEN {
-            for (prev_tool, prev_turn, prev_output) in self.output_log.iter().rev() {
-                if prev_tool == tool_name && current_turn > *prev_turn {
-                    let sim = token_cosine_similarity(output, prev_output);
+        // Tier 3: Output similarity, scoped to the same semantic key.
+        // Without key scoping, unrelated read_file ranges or grep patterns can
+        // look highly similar and produce false "do not read again" guidance.
+        if let Some(key) = sem_key.as_deref()
+            && result.is_none()
+            && output.len() >= MIN_OUTPUT_LEN
+        {
+            for entry in self.output_log.iter().rev() {
+                if entry.tool_name == tool_name
+                    && entry.semantic_key.as_deref() == Some(key)
+                    && current_turn > entry.turn
+                {
+                    let sim = token_cosine_similarity(output, &entry.output);
                     if sim >= self.threshold {
-                        result = Some((*prev_turn, format!("token_cosine={:.2}", sim)));
+                        result = Some((entry.turn, format!("token_cosine={:.2}", sim)));
                         break;
                     }
                 }
@@ -525,7 +542,8 @@ impl SemanticDedup {
         }
 
         if let Some((_, ref reason)) = result {
-            let sig = semantic_call_key(tool_name, args)
+            let sig = sem_key
+                .clone()
                 .unwrap_or_else(|| format!("{}:<no-key>", tool_name));
             let existing = self
                 .dedup_audit
@@ -554,8 +572,12 @@ impl SemanticDedup {
         } else {
             output
         };
-        self.output_log
-            .push((tool_name.to_string(), current_turn, truncated.to_string()));
+        self.output_log.push(OutputLogEntry {
+            tool_name: tool_name.to_string(),
+            semantic_key: sem_key,
+            turn: current_turn,
+            output: truncated.to_string(),
+        });
         if self.output_log.len() > self.max_output_entries {
             self.output_log.remove(0);
         }
@@ -575,9 +597,9 @@ impl SemanticDedup {
             self.check_and_record(tool_name, args, result_str.as_str(), turn_index)
         {
             result_str.push_str(&format!(
-                "\n\n⚠️ DUPLICATE DETECTED: This {tool_name} result is identical/similar to turn {} ({reason}). \
-                 You already have this information in context. Do NOT call this tool again for the same data. \
-                 Use the information from the earlier call instead of making more redundant requests.",
+                "\n\n⚠️ DUPLICATE HINT: This {tool_name} output matches turn {} ({reason}). \
+                 If this is the same data, use the earlier result. \
+                 If you intentionally changed arguments or need fresher data, this hint is informational.",
                 prev_turn + 1,
             ));
         }
@@ -1162,18 +1184,19 @@ mod tests {
         let mut out1 = "fn main() {}".to_string();
         tracker.append_near_duplicate_hint_if_any(&mut out1, "read_file", &args, 1);
         assert!(
-            !out1.contains("DUPLICATE DETECTED"),
+            !out1.contains("DUPLICATE HINT"),
             "first recording should not append hint"
         );
 
         let mut out2 = "fn main() {}".to_string();
         tracker.append_near_duplicate_hint_if_any(&mut out2, "read_file", &args, 2);
-        assert!(out2.contains("DUPLICATE DETECTED"));
+        assert!(out2.contains("DUPLICATE HINT"));
+        assert!(!out2.contains("Do NOT call this tool again"));
         assert!(out2.contains("read_file"));
     }
 
     #[test]
-    fn tracker_detects_token_cosine_similarity() {
+    fn tracker_does_not_use_output_similarity_across_different_semantic_keys() {
         let mut tracker = SemanticDedup::new(0.7);
         let output1 = "PR #1: fix\nPR #2: feature\nPR #3: docs\nPR #4: perf improvement";
         tracker.check_and_record(
@@ -1185,17 +1208,89 @@ mod tests {
 
         // Same tool, different args, but very similar output
         let output2 = "PR #1: fix\nPR #2: feature\nPR #3: docs\nPR #5: refactor code";
+        assert!(
+            token_cosine_similarity(output1, output2) >= 0.7,
+            "test must exercise an output pair that old tool-name-only Tier 3 would flag"
+        );
         let result = tracker.check_and_record(
             "github",
             &json!({"action": "list_prs", "repo": "a/c"}),
             output2,
             2,
         );
-        // Should detect via token cosine similarity (different repo → no param match)
-        // Note: may or may not trigger depending on exact cosine score
-        if let Some((_, reason)) = &result {
-            assert!(reason.starts_with("token_cosine"));
-        }
+        assert!(
+            result.is_none(),
+            "different semantic keys must not be deduped by output similarity"
+        );
+    }
+
+    #[test]
+    fn tracker_detects_token_cosine_only_with_same_semantic_key() {
+        let mut tracker = SemanticDedup::new(0.7);
+        let args = json!({"path": "src/main.rs", "start_line": 1, "end_line": 80});
+        let sem_key = semantic_call_key("read_file", &args).expect("read_file key");
+        let output1 =
+            "fn parse_user() {}\nfn parse_team() {}\nfn parse_token() {}\nfn parse_config() {}";
+        let output2 =
+            "fn parse_user() {}\nfn parse_team() {}\nfn parse_token() {}\nfn parse_runtime() {}";
+        assert!(
+            token_cosine_similarity(output1, output2) >= 0.7,
+            "test must exercise a high-similarity output pair"
+        );
+        tracker.output_log.push(OutputLogEntry {
+            tool_name: "read_file".to_string(),
+            semantic_key: Some(sem_key),
+            turn: 1,
+            output: output1.to_string(),
+        });
+
+        let result = tracker.check_and_record("read_file", &args, output2, 2);
+        let (prev_turn, reason) = result.expect("same-key output similarity should be detected");
+        assert_eq!(prev_turn, 1);
+        assert!(reason.starts_with("token_cosine"));
+    }
+
+    #[test]
+    fn read_file_different_ranges_do_not_trigger_output_similarity_hint() {
+        let mut tracker = SemanticDedup::new(0.7);
+        let range1 = json!({"path": "src/lib.rs", "start_line": 1, "end_line": 500});
+        let range2 = json!({"path": "src/lib.rs", "start_line": 501, "end_line": 1000});
+        let output1 = "pub fn handler_a() {}\npub fn handler_b() {}\npub fn handler_c() {}\npub fn handler_d() {}\n";
+        let output2 = "pub fn handler_e() {}\npub fn handler_f() {}\npub fn handler_g() {}\npub fn handler_h() {}\n";
+        assert!(
+            token_cosine_similarity(output1, output2) >= 0.7,
+            "test must reproduce the high-similarity same-file range case"
+        );
+
+        let mut first = output1.to_string();
+        tracker.append_near_duplicate_hint_if_any(&mut first, "read_file", &range1, 1);
+        let mut second = output2.to_string();
+        tracker.append_near_duplicate_hint_if_any(&mut second, "read_file", &range2, 2);
+        assert!(
+            !second.contains("DUPLICATE HINT") && !second.contains("DUPLICATE DETECTED"),
+            "different read_file ranges must not receive duplicate guidance: {second}"
+        );
+    }
+
+    #[test]
+    fn pre_check_block_does_not_reuse_cached_output_for_different_read_file_range() {
+        let mut tracker = SemanticDedup::new(0.75);
+        tracker.check_and_record(
+            "read_file",
+            &json!({"path": "src/lib.rs", "start_line": 1, "end_line": 500}),
+            "first range content that is long enough to be a useful cached output",
+            1,
+        );
+
+        let block = tracker.pre_check_block(
+            "read_file",
+            &json!({"path": "src/lib.rs", "start_line": 501, "end_line": 1000}),
+            2,
+        );
+        assert!(
+            block.is_none(),
+            "different read_file ranges must not reuse cached output from another range"
+        );
     }
 
     #[test]
@@ -1509,8 +1604,8 @@ mod tests {
         );
         // Simulate microcompact clearing the output_log entry
         for entry in dedup.output_log.iter_mut() {
-            if entry.0 == "read_file" {
-                entry.2 = "[Cleared]".to_string();
+            if entry.tool_name == "read_file" {
+                entry.output = "[Cleared]".to_string();
             }
         }
         // Re-read same file — must NOT be blocked (content is gone)
@@ -1610,10 +1705,11 @@ mod tests {
         assert!(block.is_some(), "identical grep must be deduplicated");
     }
 
-    /// Scenario: Tier 3 token cosine similarity — two different tool calls that
-    /// produce nearly identical output should be flagged.
+    /// Scenario: an unkeyed tool may produce identical output for different
+    /// commands. Without a semantic key, output similarity is not enough to
+    /// infer duplicate intent.
     #[test]
-    fn token_cosine_similarity_detects_near_duplicate() {
+    fn unkeyed_tools_do_not_dedupe_on_output_similarity() {
         let mut dedup = SemanticDedup::new(0.75);
         let output = "error: cannot find module `auth`\n  --> src/main.rs:5:1\n  |\n5 | mod auth;\n  | ^^^^^^^^^ file not found";
 
@@ -1628,8 +1724,8 @@ mod tests {
             1,
         );
         assert!(
-            dup.is_some(),
-            "identical output from different commands should be flagged"
+            dup.is_none(),
+            "unkeyed tools must not dedupe solely because outputs match"
         );
     }
 }
