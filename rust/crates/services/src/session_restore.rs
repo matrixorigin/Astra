@@ -1920,14 +1920,24 @@ impl crate::state_sync::MatrixOneSyncService {
             );
         };
 
-        if let Err(e) = sqlx::query(
+        let event_id = uuid::Uuid::now_v7().to_string();
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                let err = format!("push_context_trace_signal begin transaction: {e}");
+                log_result("error", Some(&err));
+                return Err(err);
+            }
+        };
+
+        let insert_result = match sqlx::query(
             "INSERT INTO agent_events \
              (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
               parent_event_id, causal_chain_id, metadata, reasoning_content, meta_tool_name, \
               meta_duration_ms, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
         )
-        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(&event_id)
         .bind(session_id)
         .bind(user_id)
         .bind("astra-cli")
@@ -1945,17 +1955,48 @@ impl crate::state_sync::MatrixOneSyncService {
                 .and_then(|selection| selection.visible_tools.first().cloned()),
         )
         .bind(duration_ms)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         {
-            let err = format!("push_context_trace_signal: {e}");
+            Ok(result) => result,
+            Err(e) => {
+                let err = format!("push_context_trace_signal insert event: {e}");
+                log_result("error", Some(&err));
+                return Err(err);
+            }
+        };
+        let inserted_events = match i64::try_from(insert_result.rows_affected()) {
+            Ok(count) if count > 0 => count,
+            Ok(_) => {
+                let err = "push_context_trace_signal inserted no event rows".to_string();
+                log_result("error", Some(&err));
+                return Err(err);
+            }
+            Err(_) => {
+                let err = "push_context_trace_signal inserted row count overflow".to_string();
+                log_result("error", Some(&err));
+                return Err(err);
+            }
+        };
+
+        if let Err(e) = crate::storage::add_agent_session_event_count_or_create(
+            &mut *tx,
+            session_id,
+            user_id,
+            inserted_events,
+            Some(&event_id),
+        )
+        .await
+        {
+            let err = format!("push_context_trace_signal event_count delta: {e}");
             log_result("error", Some(&err));
             return Err(err);
         }
 
-        if let Err(e) = reconcile_session_event_count(&self.pool, session_id, user_id).await {
-            log_result("error", Some(&e));
-            return Err(e);
+        if let Err(e) = tx.commit().await {
+            let err = format!("push_context_trace_signal commit: {e}");
+            log_result("error", Some(&err));
+            return Err(err);
         }
 
         log_result("success", None);
@@ -2038,20 +2079,6 @@ pub async fn pull_step_checkpoint_from_cloud(
 }
 
 // ─── Plan State Cloud Sync ──────────────────────────────────────────────────
-
-async fn reconcile_session_event_count(
-    pool: &sqlx::Pool<sqlx::MySql>,
-    session_id: &str,
-    user_id: &str,
-) -> Result<(), String> {
-    let event_count = crate::storage::load_agent_event_count_for_user(pool, session_id, user_id)
-        .await
-        .map_err(|e| format!("reconcile_session_event_count load: {e}"))?;
-    crate::storage::upsert_agent_session_event_count(pool, session_id, user_id, event_count)
-        .await
-        .map_err(|e| format!("reconcile_session_event_count: {e}"))?;
-    Ok(())
-}
 
 fn cloud_step_checkpoint_number(checkpoint_number: u32) -> Result<i32, String> {
     let namespaced = STEP_CHECKPOINT_NUMBER_OFFSET
@@ -3046,6 +3073,31 @@ mod tests {
         assert!(
             !implementation.contains("COUNT(*) FROM agent_events WHERE session_id = s.session_id AND user_id = s.user_id AND event_type = 'user_query'"),
             "resumable listing must not count user_query rows as turn_count"
+        );
+    }
+
+    #[test]
+    fn context_trace_push_updates_event_count_from_insert_delta() {
+        let source = include_str!("session_restore.rs");
+        let implementation = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("implementation source");
+        assert!(
+            implementation.contains("add_agent_session_event_count_or_create("),
+            "context trace push must update session event_count from the actual insert delta"
+        );
+        assert!(
+            !implementation.contains("reconcile_session_event_count"),
+            "context trace push must not reconcile event_count with a follow-up COUNT(*)"
+        );
+        assert!(
+            !implementation.contains("load_agent_event_count_for_user"),
+            "context trace push must not COUNT agent_events on the write path"
+        );
+        assert!(
+            !implementation.contains("upsert_agent_session_event_count"),
+            "context trace push must not overwrite event_count from a recomputed total"
         );
     }
 

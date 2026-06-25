@@ -239,6 +239,52 @@ where
     Ok(())
 }
 
+pub async fn add_agent_session_event_count_or_create<'e, E>(
+    executor: E,
+    session_id: &str,
+    user_id: &str,
+    delta: i64,
+    last_event_id: Option<&str>,
+) -> Result<(), sqlx::Error>
+where
+    E: Executor<'e, Database = MySql>,
+{
+    if delta < 0 {
+        return Err(sqlx::Error::Protocol(
+            "add_agent_session_event_count_or_create requires a non-negative delta".into(),
+        ));
+    }
+
+    let result = query(
+        "INSERT INTO agent_sessions \
+         (session_id, user_id, status, event_count, last_event_id, created_at, updated_at, last_active_at) \
+         SELECT ?, ?, 'active', ?, ?, NOW(6), NOW(6), NOW(6) \
+         FROM DUAL \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM agent_sessions \
+             WHERE session_id = ? AND user_id <> ? \
+             LIMIT 1 \
+         ) \
+         ON DUPLICATE KEY UPDATE \
+         event_count = CASE WHEN user_id = VALUES(user_id) THEN event_count + VALUES(event_count) ELSE NULL END, \
+         last_event_id = CASE WHEN user_id = VALUES(user_id) THEN COALESCE(VALUES(last_event_id), last_event_id) ELSE last_event_id END, \
+         updated_at = CASE WHEN user_id = VALUES(user_id) THEN NOW(6) ELSE updated_at END, \
+         last_active_at = CASE WHEN user_id = VALUES(user_id) THEN NOW(6) ELSE last_active_at END",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(delta)
+    .bind(last_event_id)
+    .bind(session_id)
+    .bind(user_id)
+    .execute(executor)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    Ok(())
+}
+
 pub async fn touch_agent_session_activity<'e, E>(
     executor: E,
     session_id: &str,
@@ -3017,6 +3063,30 @@ mod tests {
                 "ALTER TABLE agent_events ADD INDEX idx_agent_events_owner_session_turn (user_id, session_id, turn_seq)"
             ),
             "agent_events must reconcile the session-turn inference index in schema ensure"
+        );
+    }
+
+    #[test]
+    fn add_agent_session_event_count_or_create_is_delta_upsert_not_count_reconcile() {
+        let source = include_str!("storage.rs");
+        let helper = source
+            .split("pub async fn add_agent_session_event_count_or_create")
+            .nth(1)
+            .expect("helper source")
+            .split("pub async fn touch_agent_session_activity")
+            .next()
+            .expect("helper body");
+        assert!(
+            helper.contains("event_count + VALUES(event_count)"),
+            "helper must add the actual event insert delta"
+        );
+        assert!(
+            helper.contains("WHERE NOT EXISTS"),
+            "helper must keep owner-bound lazy creation explicit"
+        );
+        assert!(
+            !helper.contains("COUNT(*)"),
+            "helper must not recompute event_count from agent_events"
         );
     }
 }
