@@ -458,6 +458,37 @@ fn iso8601_to_mysql_datetime(ts: &str) -> String {
         .unwrap_or_else(|_| ts.to_string())
 }
 
+fn ingestion_event_has_parent_edges(event: &IngestionEvent) -> bool {
+    event
+        .parent_event_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty())
+        || event
+            .parent_event_ids
+            .iter()
+            .any(|id| !id.trim().is_empty())
+}
+
+fn bind_ingestion_event<'q>(
+    mut query: sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments>,
+    event: &'q IngestionEvent,
+) -> sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments> {
+    query = query
+        .bind(&event.event_id)
+        .bind(&event.session_id)
+        .bind(&event.user_id)
+        .bind(&event.event_type)
+        .bind(&event.content)
+        .bind(event.token_usage.as_ref().map(|v| v.to_string()))
+        .bind(&event.llm_model_used)
+        .bind(&event.skill_name)
+        .bind(event.metadata.as_ref().map(|v| v.to_string()))
+        .bind(iso8601_to_mysql_datetime(&event.created_at))
+        .bind(&event.parent_event_id)
+        .bind(&event.causal_chain_id);
+    query
+}
+
 /// The background worker that batches and flushes events to MatrixOne.
 pub struct EventIngestionWorker {
     rx: mpsc::Receiver<IngestionEvent>,
@@ -688,46 +719,62 @@ impl EventIngestionWorker {
 
         let mut rows_inserted = 0usize;
         for ((user_id, session_id), session_events) in grouped_events {
-            let placeholders: Vec<String> = (0..session_events.len())
-                .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
-                .collect();
-            let sql = format!(
-                "INSERT IGNORE INTO agent_events \
-                 (event_id, session_id, user_id, event_type, content, \
-                  token_usage, llm_model_used, skill_name, metadata, \
-                  created_at, parent_event_id, causal_chain_id) \
-                 VALUES {}",
-                placeholders.join(", ")
-            );
-
-            let mut query = sqlx::query(&sql);
-            for event in &session_events {
-                query = query
-                    .bind(&event.event_id)
-                    .bind(&event.session_id)
-                    .bind(&event.user_id)
-                    .bind(&event.event_type)
-                    .bind(&event.content)
-                    .bind(event.token_usage.as_ref().map(|v| v.to_string()))
-                    .bind(&event.llm_model_used)
-                    .bind(&event.skill_name)
-                    .bind(event.metadata.as_ref().map(|v| v.to_string()))
-                    .bind(iso8601_to_mysql_datetime(&event.created_at))
-                    .bind(&event.parent_event_id)
-                    .bind(&event.causal_chain_id);
+            let mut plain_events = Vec::new();
+            let mut parented_events = Vec::new();
+            for event in session_events {
+                if ingestion_event_has_parent_edges(event) {
+                    parented_events.push(event);
+                } else {
+                    plain_events.push(event);
+                }
             }
 
-            let insert_result = query
+            let mut session_rows_inserted = 0usize;
+            if !plain_events.is_empty() {
+                let placeholders: Vec<String> = (0..plain_events.len())
+                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
+                    .collect();
+                let sql = format!(
+                    "INSERT IGNORE INTO agent_events \
+                     (event_id, session_id, user_id, event_type, content, \
+                      token_usage, llm_model_used, skill_name, metadata, \
+                      created_at, parent_event_id, causal_chain_id) \
+                     VALUES {}",
+                    placeholders.join(", ")
+                );
+
+                let mut query = sqlx::query(&sql);
+                for event in &plain_events {
+                    query = bind_ingestion_event(query, event);
+                }
+
+                let insert_result = query
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| format!("batch insert ({user_id}/{session_id}): {e}"))?;
+                session_rows_inserted +=
+                    usize::try_from(insert_result.rows_affected()).unwrap_or(usize::MAX);
+            }
+
+            for event in parented_events {
+                let insert_result = bind_ingestion_event(
+                    sqlx::query(
+                        "INSERT IGNORE INTO agent_events \
+                         (event_id, session_id, user_id, event_type, content, \
+                          token_usage, llm_model_used, skill_name, metadata, \
+                          created_at, parent_event_id, causal_chain_id) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ),
+                    event,
+                )
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| format!("batch insert ({user_id}/{session_id}): {e}"))?;
-            let session_rows_inserted = insert_result.rows_affected() as usize;
-            rows_inserted += session_rows_inserted;
-
-            if session_rows_inserted == 0 {
-                continue;
-            }
-            for event in &session_events {
+                .map_err(|e| format!("event insert ({user_id}/{session_id}): {e}"))?;
+                if insert_result.rows_affected() == 0 {
+                    continue;
+                }
+                session_rows_inserted +=
+                    usize::try_from(insert_result.rows_affected()).unwrap_or(usize::MAX);
                 crate::storage::insert_agent_event_edges(
                     &mut *tx,
                     &event.event_id,
@@ -736,6 +783,10 @@ impl EventIngestionWorker {
                 )
                 .await
                 .map_err(|e| format!("edge insert for {}: {e}", event.event_id))?;
+            }
+
+            if session_rows_inserted == 0 {
+                continue;
             }
             crate::storage::add_agent_session_event_count_or_create(
                 &mut *tx,
@@ -746,6 +797,7 @@ impl EventIngestionWorker {
             )
             .await
             .map_err(|e| format!("event_count delta for {session_id}: {e}"))?;
+            rows_inserted += session_rows_inserted;
         }
 
         // Log if duplicates were detected (useful for debugging)

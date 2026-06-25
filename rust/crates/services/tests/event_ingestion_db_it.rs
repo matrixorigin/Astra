@@ -252,3 +252,68 @@ async fn event_ingest_batch_partial_duplicate_no_error() {
     // Cleanup
     cleanup_session(&pool, &session_id).await;
 }
+
+/// Verifies that a duplicate event in a mixed batch cannot mutate causal
+/// edges just because another event in the same session was inserted.
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn event_ingest_parent_edges_only_for_rows_inserted_in_this_flush() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+
+    let session_id = Uuid::new_v4().to_string();
+    cleanup_session(&pool, &session_id).await;
+    insert_session_root(&pool, &session_id).await;
+
+    let duplicate_event_id = format!("evt-edge-dup-{}", Uuid::new_v4());
+    let unique_event_id = format!("evt-edge-new-{}", Uuid::new_v4());
+    let first = test_event(&duplicate_event_id, &session_id, "test_edge");
+
+    let config = IngestionConfig::default();
+    let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    sender.enqueue_async(first.clone()).await;
+    shutdown.signal();
+    handle.await.unwrap();
+
+    let mut duplicate_with_parent = first;
+    duplicate_with_parent.parent_event_id = Some(format!("parent-stale-{}", Uuid::new_v4()));
+
+    let mut unique_with_parent = test_event(&unique_event_id, &session_id, "test_edge");
+    let unique_parent_id = format!("parent-new-{}", Uuid::new_v4());
+    unique_with_parent.parent_event_id = Some(unique_parent_id.clone());
+
+    let config = IngestionConfig {
+        batch_size: 50,
+        flush_interval_secs: 300,
+        channel_capacity: 8,
+        ..Default::default()
+    };
+    let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    sender.enqueue_async(duplicate_with_parent).await;
+    sender.enqueue_async(unique_with_parent).await;
+    shutdown.signal();
+    handle.await.unwrap();
+
+    let duplicate_edges: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_event_edges WHERE child_event_id = ?")
+            .bind(&duplicate_event_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count duplicate edges");
+    assert_eq!(
+        duplicate_edges, 0,
+        "duplicate event rows must not gain parent edges from a later ignored retry"
+    );
+
+    let unique_parent: Option<String> = sqlx::query_scalar(
+        "SELECT parent_event_id FROM agent_event_edges WHERE child_event_id = ?",
+    )
+    .bind(&unique_event_id)
+    .fetch_optional(&pool)
+    .await
+    .expect("load unique edge");
+    assert_eq!(unique_parent.as_deref(), Some(unique_parent_id.as_str()));
+    assert_session_event_count(&pool, &session_id, 2).await;
+
+    cleanup_session(&pool, &session_id).await;
+}
