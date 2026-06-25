@@ -95,7 +95,7 @@ async fn cleanup_session_bundle(
     session_id_2: &str,
     _user_id: &str,
     event_ids: &[String],
-    decision_id: &str,
+    decision_ids: &[String],
     audit_ids: &[String],
 ) {
     for eid in event_ids {
@@ -108,10 +108,12 @@ async fn cleanup_session_bundle(
             .execute(pool)
             .await;
     }
-    let _ = sqlx::query("DELETE FROM ctx_decision_audits WHERE decision_id = ?")
-        .bind(decision_id)
-        .execute(pool)
-        .await;
+    for did in decision_ids {
+        let _ = sqlx::query("DELETE FROM ctx_decision_audits WHERE decision_id = ?")
+            .bind(did)
+            .execute(pool)
+            .await;
+    }
     for aid in audit_ids {
         let _ = sqlx::query("DELETE FROM auth_audit_logs WHERE log_id = ?")
             .bind(aid)
@@ -299,12 +301,18 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
     let e2 = Uuid::new_v4().to_string();
     let e3 = Uuid::new_v4().to_string();
     let decision_id = Uuid::new_v4().to_string();
-    let decision_event_id = e1.clone();
+    let decision_id_2 = Uuid::new_v4().to_string();
+    let decision_id_3 = Uuid::new_v4().to_string();
     let a0 = Uuid::new_v4().to_string();
     let a1 = Uuid::new_v4().to_string();
     let a2 = Uuid::new_v4().to_string();
     let audit_ids = vec![a0.clone(), a1.clone(), a2.clone()];
     let event_ids = vec![e1.clone(), e2.clone(), e3.clone()];
+    let decision_ids = vec![
+        decision_id.clone(),
+        decision_id_2.clone(),
+        decision_id_3.clone(),
+    ];
 
     cleanup_session_bundle(
         &pool,
@@ -312,7 +320,7 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
         &session_id_2,
         &user_id,
         &event_ids,
-        &decision_id,
+        &decision_ids,
         &audit_ids,
     )
     .await;
@@ -436,18 +444,25 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
     );
     assert!(second_session_page.next_cursor.is_none());
 
-    sqlx::query(
-        "INSERT INTO ctx_decision_audits \
-         (decision_id, user_id, session_id, event_id, context_capture_id, decision_type, decision_output, model_params) \
-         VALUES (?, ?, ?, ?, 'cc', 'it_dec', CAST('{}' AS JSON), CAST('{}' AS JSON))",
-    )
-    .bind(&decision_id)
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&decision_event_id)
-    .execute(&pool)
-    .await
-    .expect("insert decision");
+    for (did, event_id, ts) in [
+        (&decision_id, &e1, "2026-05-01 10:00:00.000000"),
+        (&decision_id_2, &e2, "2026-05-01 12:00:00.000000"),
+        (&decision_id_3, &e3, "2026-05-01 11:00:00.000000"),
+    ] {
+        sqlx::query(
+            "INSERT INTO ctx_decision_audits \
+             (decision_id, user_id, session_id, event_id, context_capture_id, decision_type, decision_output, model_params, created_at) \
+             VALUES (?, ?, ?, ?, 'cc', 'it_dec', CAST('{}' AS JSON), CAST('{}' AS JSON), ?)",
+        )
+        .bind(did)
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(event_id)
+        .bind(ts)
+        .execute(&pool)
+        .await
+        .expect("insert decision");
+    }
 
     let dec = DatabaseDecisionService::new(settings.clone()).with_pool(shared.clone());
     let dlist = dec
@@ -456,12 +471,50 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
             session_id: None,
             decision_type: None,
             limit: 99_999,
-            offset: 0,
+            cursor: None,
         })
         .await
         .expect("list_decisions");
     assert_eq!(dlist.limit, MAX_API_LIST_LIMIT);
-    assert_eq!(dlist.decisions.len(), 1);
+    assert_eq!(dlist.decisions.len(), 3);
+
+    let first_decision_page = dec
+        .list_decisions(DecisionListFilter {
+            user_id: user_id.clone(),
+            session_id: None,
+            decision_type: None,
+            limit: 2,
+            cursor: None,
+        })
+        .await
+        .expect("list first decision page");
+    assert_eq!(
+        first_decision_page
+            .decisions
+            .iter()
+            .map(|decision| decision.decision_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![decision_id_2.as_str(), decision_id_3.as_str()]
+    );
+    let second_decision_page = dec
+        .list_decisions(DecisionListFilter {
+            user_id: user_id.clone(),
+            session_id: None,
+            decision_type: None,
+            limit: 2,
+            cursor: first_decision_page.next_cursor.clone(),
+        })
+        .await
+        .expect("list second decision page");
+    assert_eq!(
+        second_decision_page
+            .decisions
+            .iter()
+            .map(|decision| decision.decision_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![decision_id.as_str()]
+    );
+    assert!(second_decision_page.next_cursor.is_none());
 
     sqlx::query(
         "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
@@ -529,7 +582,7 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
         &session_id_2,
         &user_id,
         &event_ids,
-        &decision_id,
+        &decision_ids,
         &audit_ids,
     )
     .await;

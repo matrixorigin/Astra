@@ -37,6 +37,7 @@ pub async fn list_decisions_handler(
     Query(q): Query<DecisionListQuery>,
 ) -> Result<Json<DecisionListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let cursor = q.cursor()?;
     let list = state
         .decision_service
         .list_decisions(DecisionListFilter {
@@ -44,7 +45,7 @@ pub async fn list_decisions_handler(
             session_id: q.session_id,
             decision_type: q.decision_type,
             limit: q.limit,
-            offset: q.offset,
+            cursor,
         })
         .await?;
     Ok(Json(DecisionListResponse::from(list)))

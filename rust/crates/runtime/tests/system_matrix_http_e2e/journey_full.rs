@@ -696,7 +696,7 @@ pub async fn run_product_matrix_full_journey(
     .await;
     assert_eq!(st_audit, StatusCode::OK, "decision audit: {audit}");
 
-    let list_dec_path = format!("/decisions?session_id={session_id}&limit=20&offset=0");
+    let list_dec_path = format!("/decisions?session_id={session_id}&limit=20");
     let (st_list_d, list_d) = get_json(app, &list_dec_path, Some(auth_header.as_str()), &[]).await;
     assert_eq!(st_list_d, StatusCode::OK, "list decisions: {list_d}");
     assert!(

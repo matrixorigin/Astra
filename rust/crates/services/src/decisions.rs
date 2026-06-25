@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
-use crate::pagination::clamp_api_list_pagination;
+use crate::pagination::MAX_API_LIST_LIMIT;
 use crate::storage::{agent_event_exists_for_user_session, agent_session_exists_for_user};
 
 // ── Data types ───────────────────────────────────────────────────────────────
@@ -45,7 +45,7 @@ pub struct DecisionListFilter {
     pub session_id: Option<String>,
     pub decision_type: Option<String>,
     pub limit: u32,
-    pub offset: u32,
+    pub cursor: Option<DecisionListCursor>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -53,7 +53,78 @@ pub struct DecisionListRecord {
     pub decisions: Vec<DecisionRecord>,
     pub total: i64,
     pub limit: u32,
-    pub offset: u32,
+    pub next_cursor: Option<DecisionListCursor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionListCursor {
+    pub created_at: String,
+    pub decision_id: String,
+}
+
+fn validate_decision_list_limit(limit: u32) -> u32 {
+    limit.clamp(1, MAX_API_LIST_LIMIT)
+}
+
+fn decision_list_query_limit(limit: u32) -> i64 {
+    i64::from(limit) + 1
+}
+
+fn decision_list_cursor_db_created_at(
+    cursor: &DecisionListCursor,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let created_at = cursor.created_at.trim();
+    if created_at.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid decision list cursor: created_at is required",
+        ));
+    }
+    let db_created_at = created_at.replace('T', " ");
+    if db_created_at.len() != "YYYY-MM-DD HH:MM:SS.ffffff".len()
+        || db_created_at.as_bytes().get(10) != Some(&b' ')
+        || db_created_at.as_bytes().get(19) != Some(&b'.')
+        || chrono::NaiveDateTime::parse_from_str(&db_created_at, "%Y-%m-%d %H:%M:%S%.6f").is_err()
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("invalid decision list cursor timestamp: {created_at}"),
+        ));
+    }
+    Ok(db_created_at)
+}
+
+fn decision_list_cursor_decision_id(
+    cursor: &DecisionListCursor,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let decision_id = cursor.decision_id.trim();
+    if decision_id.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid decision list cursor: decision_id is required",
+        ));
+    }
+    Ok(decision_id.to_string())
+}
+
+fn decision_list_cursor_from_record(
+    decision: &DecisionRecord,
+) -> Result<DecisionListCursor, (StatusCode, Json<ErrorResponse>)> {
+    if decision.created_at.trim().is_empty() {
+        return Err(internal_error(format!(
+            "invalid ctx_decision_audits cursor: decision_id={}, column=created_at, value is empty",
+            decision.decision_id
+        )));
+    }
+    if decision.decision_id.trim().is_empty() {
+        return Err(internal_error(
+            "invalid ctx_decision_audits cursor: column=decision_id, value is empty",
+        ));
+    }
+    Ok(DecisionListCursor {
+        created_at: decision.created_at.clone(),
+        decision_id: decision.decision_id.clone(),
+    })
 }
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
@@ -236,11 +307,11 @@ impl DecisionService for DatabaseDecisionService {
 
     async fn list_decisions(
         &self,
-        mut filter: DecisionListFilter,
+        filter: DecisionListFilter,
     ) -> Result<DecisionListRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        (filter.limit, filter.offset) = clamp_api_list_pagination(filter.limit, filter.offset);
+        let limit = validate_decision_list_limit(filter.limit);
 
         let mut count_qb = QueryBuilder::<MySql>::new(
             "SELECT COUNT(d.decision_id) AS total FROM ctx_decision_audits d \
@@ -266,7 +337,7 @@ impl DecisionService for DatabaseDecisionService {
             "SELECT d.decision_id, d.session_id, d.event_id, d.context_capture_id, d.decision_type, \
              IFNULL(CAST(d.decision_output AS CHAR), '{}') AS decision_output_json, \
              IFNULL(CAST(d.model_params AS CHAR), '{}') AS model_params_json, \
-             DATE_FORMAT(d.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+             DATE_FORMAT(d.created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at \
              FROM ctx_decision_audits d \
              WHERE d.user_id = ".to_string(),
         );
@@ -279,10 +350,19 @@ impl DecisionService for DatabaseDecisionService {
             list_qb.push(" AND d.decision_type = ");
             list_qb.push_bind(dt);
         }
-        list_qb.push(" ORDER BY d.created_at DESC LIMIT ");
-        list_qb.push_bind(i64::from(filter.limit));
-        list_qb.push(" OFFSET ");
-        list_qb.push_bind(i64::from(filter.offset));
+        if let Some(cursor) = &filter.cursor {
+            let created_at = decision_list_cursor_db_created_at(cursor)?;
+            let decision_id = decision_list_cursor_decision_id(cursor)?;
+            list_qb.push(" AND (d.created_at < ");
+            list_qb.push_bind(created_at.clone());
+            list_qb.push(" OR (d.created_at = ");
+            list_qb.push_bind(created_at);
+            list_qb.push(" AND d.decision_id < ");
+            list_qb.push_bind(decision_id);
+            list_qb.push("))");
+        }
+        list_qb.push(" ORDER BY d.created_at DESC, d.decision_id DESC LIMIT ");
+        list_qb.push_bind(decision_list_query_limit(limit));
 
         let rows = list_qb
             .build()
@@ -293,12 +373,24 @@ impl DecisionService for DatabaseDecisionService {
         for row in rows {
             decisions.push(Self::decision_record_from_row(row)?);
         }
+        let has_more = decisions.len() > limit as usize;
+        if has_more {
+            decisions.truncate(limit as usize);
+        }
+        let next_cursor = if has_more {
+            decisions
+                .last()
+                .map(decision_list_cursor_from_record)
+                .transpose()?
+        } else {
+            None
+        };
 
         Ok(DecisionListRecord {
             decisions,
             total,
-            limit: filter.limit,
-            offset: filter.offset,
+            limit,
+            next_cursor,
         })
     }
 
@@ -426,12 +518,28 @@ pub struct DecisionListQuery {
     pub decision_type: Option<String>,
     #[serde(default = "default_decision_limit")]
     pub limit: u32,
-    #[serde(default)]
-    pub offset: u32,
+    pub after_created_at: Option<String>,
+    pub after_decision_id: Option<String>,
 }
 
 pub fn default_decision_limit() -> u32 {
     50
+}
+
+impl DecisionListQuery {
+    pub fn cursor(&self) -> Result<Option<DecisionListCursor>, (StatusCode, Json<ErrorResponse>)> {
+        match (&self.after_created_at, &self.after_decision_id) {
+            (None, None) => Ok(None),
+            (Some(created_at), Some(decision_id)) => Ok(Some(DecisionListCursor {
+                created_at: created_at.clone(),
+                decision_id: decision_id.clone(),
+            })),
+            _ => Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "decision list cursor requires both after_created_at and after_decision_id",
+            )),
+        }
+    }
 }
 
 #[derive(Serialize, PartialEq)]
@@ -464,7 +572,7 @@ pub struct DecisionListResponse {
     pub decisions: Vec<DecisionResponse>,
     pub total: i64,
     pub limit: u32,
-    pub offset: u32,
+    pub next_cursor: Option<DecisionListCursor>,
 }
 
 impl From<DecisionRecord> for DecisionResponse {
@@ -508,7 +616,7 @@ impl From<DecisionListRecord> for DecisionListResponse {
                 .collect(),
             total: r.total,
             limit: r.limit,
-            offset: r.offset,
+            next_cursor: r.next_cursor,
         }
     }
 }
@@ -516,25 +624,79 @@ impl From<DecisionListRecord> for DecisionListResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pagination::{MAX_API_LIST_LIMIT, clamp_api_list_pagination};
 
     #[test]
     fn decision_list_query_defaults() {
         let q: DecisionListQuery = serde_json::from_str("{}").unwrap();
         assert_eq!(q.limit, 50);
-        assert_eq!(q.offset, 0);
+        assert_eq!(q.cursor().unwrap(), None);
         assert!(q.session_id.is_none());
         assert!(q.decision_type.is_none());
     }
 
     #[test]
-    fn default_decision_limit_value() {
-        assert_eq!(default_decision_limit(), 50);
+    fn decision_list_query_requires_complete_cursor() {
+        let q: DecisionListQuery =
+            serde_json::from_str(r#"{"after_created_at":"2026-04-01T10:00:00.000000"}"#).unwrap();
+        assert_eq!(q.cursor().unwrap_err().0, StatusCode::BAD_REQUEST);
     }
 
     #[test]
-    fn list_decisions_paging_contract_matches_shared_clamp() {
-        let (limit, _) = clamp_api_list_pagination(u32::MAX, 0);
-        assert_eq!(limit, MAX_API_LIST_LIMIT);
+    fn decision_list_limit_has_hard_cap_and_minimum() {
+        assert_eq!(validate_decision_list_limit(0), 1);
+        assert_eq!(validate_decision_list_limit(10), 10);
+        assert_eq!(validate_decision_list_limit(u32::MAX), MAX_API_LIST_LIMIT);
+        assert_eq!(decision_list_query_limit(MAX_API_LIST_LIMIT), 201);
+    }
+
+    #[test]
+    fn decision_list_cursor_rejects_invalid_inputs() {
+        let cursor = DecisionListCursor {
+            created_at: "2026-04-01T10:00:00.123456".to_string(),
+            decision_id: "decision-1".to_string(),
+        };
+        assert_eq!(
+            decision_list_cursor_db_created_at(&cursor).unwrap(),
+            "2026-04-01 10:00:00.123456"
+        );
+        assert_eq!(
+            decision_list_cursor_decision_id(&cursor).unwrap(),
+            "decision-1".to_string()
+        );
+
+        let invalid_time = DecisionListCursor {
+            created_at: "2026-04-01T10:00:00".to_string(),
+            decision_id: "decision-1".to_string(),
+        };
+        assert_eq!(
+            decision_list_cursor_db_created_at(&invalid_time)
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let missing_id = DecisionListCursor {
+            created_at: "2026-04-01T10:00:00.123456".to_string(),
+            decision_id: "  ".to_string(),
+        };
+        assert_eq!(
+            decision_list_cursor_decision_id(&missing_id).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn decision_list_sql_contract_uses_seek_cursor_not_offset() {
+        let sql = "SELECT d.decision_id FROM ctx_decision_audits d \
+             WHERE d.user_id = ? \
+             AND (d.created_at < ? OR (d.created_at = ? AND d.decision_id < ?)) \
+             ORDER BY d.created_at DESC, d.decision_id DESC LIMIT ?";
+        assert!(!sql.to_ascii_uppercase().contains(" OFFSET "));
+        assert!(sql.contains("d.decision_id < ?"));
+    }
+
+    #[test]
+    fn default_decision_limit_value() {
+        assert_eq!(default_decision_limit(), 50);
     }
 }
