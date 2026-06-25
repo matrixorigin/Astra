@@ -111,7 +111,7 @@ impl SessionService for CaptureEnabledSessionService {
             sessions: Vec::new(),
             total: 0,
             limit: 20,
-            offset: 0,
+            next_cursor: None,
         })
     }
 

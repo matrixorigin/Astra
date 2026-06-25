@@ -64,7 +64,7 @@ fn deserialization_applies_defaults() {
     // SessionListQuery
     let q: SessionListQuery = serde_json::from_str("{}").unwrap();
     assert_eq!(q.limit, 50);
-    assert_eq!(q.offset, 0);
+    assert_eq!(q.cursor().unwrap(), None);
 
     // RunStreamQuery
     let q: RunStreamQuery = serde_json::from_str("{}").unwrap();
@@ -327,13 +327,32 @@ fn session_list_query_all_fields() {
         "agent_id": "a1",
         "session_status": "active",
         "limit": 20,
-        "offset": 5
+        "after_updated_at": "2026-04-01T10:00:00.123456",
+        "after_session_id": "s1"
     });
     let q: SessionListQuery = serde_json::from_value(input).unwrap();
     assert_eq!(q.agent_id.as_deref(), Some("a1"));
     assert_eq!(q.session_status.as_deref(), Some("active"));
     assert_eq!(q.limit, 20);
-    assert_eq!(q.offset, 5);
+    assert_eq!(
+        q.cursor().unwrap(),
+        Some(SessionListCursor {
+            updated_at: "2026-04-01T10:00:00.123456".into(),
+            session_id: "s1".into(),
+        })
+    );
+}
+
+#[test]
+fn session_list_query_requires_complete_cursor() {
+    let q: SessionListQuery = serde_json::from_value(json!({
+        "after_updated_at": "2026-04-01T10:00:00.123456"
+    }))
+    .unwrap();
+    assert_eq!(
+        q.cursor().unwrap_err(),
+        "session list cursor requires both after_updated_at and after_session_id"
+    );
 }
 
 #[test]
@@ -571,7 +590,7 @@ fn session_list_response_serializes() {
         sessions: vec![],
         total: 0,
         limit: 50,
-        offset: 0,
+        next_cursor: None,
     };
     let v = serde_json::to_value(&resp).unwrap();
     assert_eq!(v["sessions"], json!([]));
@@ -884,19 +903,29 @@ fn session_list_record_to_response() {
         }],
         total: 1,
         limit: 50,
-        offset: 0,
+        next_cursor: Some(SessionListCursor {
+            updated_at: "2026-04-01T10:00:00.123456".into(),
+            session_id: "s1".into(),
+        }),
     };
     let resp: SessionListResponse = record.into();
     assert_eq!(resp.sessions.len(), 1);
     assert_eq!(resp.total, 1);
     assert_eq!(resp.limit, 50);
+    assert_eq!(
+        resp.next_cursor,
+        Some(SessionListCursor {
+            updated_at: "2026-04-01T10:00:00.123456".into(),
+            session_id: "s1".into(),
+        })
+    );
 
     // empty
     let record = SessionListRecord {
         sessions: vec![],
         total: 0,
         limit: 20,
-        offset: 10,
+        next_cursor: None,
     };
     let resp: SessionListResponse = record.into();
     assert!(resp.sessions.is_empty());

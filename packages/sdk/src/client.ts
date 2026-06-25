@@ -487,7 +487,12 @@ export class AstraClient {
   ): Promise<RuntimeSessionListResponse> {
     const q = buildQueryString({
       ...(params.limit !== undefined ? { limit: params.limit } : {}),
-      ...(params.offset !== undefined ? { offset: params.offset } : {}),
+      ...(params.cursor
+        ? {
+            after_updated_at: params.cursor.updated_at,
+            after_session_id: params.cursor.session_id,
+          }
+        : {}),
     });
     return this.fetch<RuntimeSessionListResponse>(`${PATH_SESSIONS}${q}`);
   }

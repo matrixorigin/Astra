@@ -323,6 +323,9 @@ pub(crate) async fn list_sessions_handler(
     Query(query): Query<SessionListQuery>,
 ) -> Result<Json<SessionListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let cursor = query
+        .cursor()
+        .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
     let sessions = state
         .session_service
         .list_sessions(SessionListFilter {
@@ -330,7 +333,7 @@ pub(crate) async fn list_sessions_handler(
             agent_id: query.agent_id,
             status: query.session_status,
             limit: query.limit,
-            offset: query.offset,
+            cursor,
         })
         .await?;
     Ok(Json(SessionListResponse::from(sessions)))

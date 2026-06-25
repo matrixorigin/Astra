@@ -135,8 +135,8 @@ pub use auth::{
     DatabaseAdminFeedbackStatsReader, DatabaseAdminInitializer, DatabaseAdminTokenReader,
     DatabaseAdminTokenWriter, DatabaseAdminUserRoleManager, DatabaseAuthService,
     DatabaseSessionService, FernetTokenEncryptor, SessionActivityCursor, SessionActivityRecord,
-    SessionCreateRequestData, SessionListFilter, SessionListRecord, SessionRecord, SessionService,
-    SessionUpdateRequestData,
+    SessionCreateRequestData, SessionListCursor, SessionListFilter, SessionListRecord,
+    SessionRecord, SessionService, SessionUpdateRequestData,
 };
 pub use branches::{BranchService, DatabaseBranchService, UnconfiguredBranchService};
 pub use context::{

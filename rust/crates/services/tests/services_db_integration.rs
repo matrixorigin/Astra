@@ -612,6 +612,24 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
     .await
     .expect("insert session 2");
 
+    for (sid, ts) in [
+        (&session_id, "2026-05-01 12:00:00.000000"),
+        (&session_id_2, "2026-05-01 10:00:00.000000"),
+    ] {
+        sqlx::query(
+            "UPDATE agent_sessions SET created_at = ?, updated_at = ?, last_active_at = ? \
+             WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(ts)
+        .bind(ts)
+        .bind(ts)
+        .bind(sid)
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("update session timestamps");
+    }
+
     let sess = DatabaseSessionService::new(settings.clone()).with_pool(shared.clone());
     let slist = sess
         .list_sessions(SessionListFilter {
@@ -619,11 +637,49 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
             agent_id: None,
             status: None,
             limit: 50_000,
-            offset: 0,
+            cursor: None,
         })
         .await
         .expect("list_sessions");
     assert_eq!(slist.limit, MAX_API_LIST_LIMIT);
+
+    let first_session_page = sess
+        .list_sessions(SessionListFilter {
+            user_id: user_id.clone(),
+            agent_id: None,
+            status: None,
+            limit: 1,
+            cursor: None,
+        })
+        .await
+        .expect("list first session page");
+    assert_eq!(
+        first_session_page
+            .sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![session_id.as_str()]
+    );
+    let second_session_page = sess
+        .list_sessions(SessionListFilter {
+            user_id: user_id.clone(),
+            agent_id: None,
+            status: None,
+            limit: 1,
+            cursor: first_session_page.next_cursor.clone(),
+        })
+        .await
+        .expect("list second session page");
+    assert_eq!(
+        second_session_page
+            .sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![session_id_2.as_str()]
+    );
+    assert!(second_session_page.next_cursor.is_none());
 
     for (log_id, action, ts) in [
         (

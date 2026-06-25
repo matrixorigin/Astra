@@ -212,7 +212,7 @@ describe("AstraClient — Sessions", () => {
       sessions: [],
       total: 0,
       limit: 50,
-      offset: 0,
+      next_cursor: null,
     });
     const result = await createClient().listSessions();
     expect(Array.isArray(result)).toBe(true);
@@ -223,16 +223,24 @@ describe("AstraClient — Sessions", () => {
       sessions: [],
       total: 3,
       limit: 2,
-      offset: 1,
+      next_cursor: {
+        updated_at: "2026-04-01T10:00:00.123456",
+        session_id: "s1",
+      },
     });
     const result = await createClient().listRuntimeSessions({
       limit: 2,
-      offset: 1,
+      cursor: {
+        updated_at: "2026-04-01T10:00:00.123456",
+        session_id: "s1",
+      },
     });
     expect(result.total).toBe(3);
+    expect(result.next_cursor?.session_id).toBe("s1");
     const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
     expect(url).toContain("limit=2");
-    expect(url).toContain("offset=1");
+    expect(url).toContain("after_updated_at=2026-04-01T10%3A00%3A00.123456");
+    expect(url).toContain("after_session_id=s1");
   });
 
   test("deleteSession", async () => {
@@ -999,7 +1007,7 @@ describe("AstraClient — Errors", () => {
       ok: true,
       status: 200,
       text: () =>
-        Promise.resolve('{"sessions":[], "total":0, "limit":20, "offset":0}'),
+        Promise.resolve('{"sessions":[], "total":0, "limit":20, "next_cursor":null}'),
       headers: new Headers(),
     } as unknown as Response);
 
@@ -1019,7 +1027,7 @@ describe("AstraClient — Errors", () => {
       ok: true,
       status: 200,
       text: () =>
-        Promise.resolve('{"sessions":[], "total":0, "limit":20, "offset":0}'),
+        Promise.resolve('{"sessions":[], "total":0, "limit":20, "next_cursor":null}'),
       headers: new Headers(),
     } as unknown as Response);
 

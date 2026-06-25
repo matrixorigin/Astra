@@ -976,7 +976,12 @@ export type RuntimeSessionListResponse = {
   sessions: RuntimeSessionResponse[];
   total?: number;
   limit?: number;
-  offset?: number;
+  next_cursor?: RuntimeSessionListCursor | null;
+};
+
+export type RuntimeSessionListCursor = {
+  updated_at: string;
+  session_id: string;
 };
 
 export type RuntimeSessionCreateBody = {
@@ -993,7 +998,7 @@ export type RuntimeSessionUpdateBody = {
 
 export type RuntimeSessionListParams = {
   limit?: number;
-  offset?: number;
+  cursor?: RuntimeSessionListCursor;
 };
 
 export type RuntimeTranscriptItemResponse = {

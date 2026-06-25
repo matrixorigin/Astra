@@ -850,7 +850,7 @@ mod session_resolution_tests {
                 sessions: Vec::new(),
                 total: 0,
                 limit: 20,
-                offset: 0,
+                next_cursor: None,
             })
         }
 
@@ -1188,7 +1188,7 @@ mod chat_stream_bridge_fallback_tests {
                 sessions: Vec::new(),
                 total: 0,
                 limit: 20,
-                offset: 0,
+                next_cursor: None,
             })
         }
 
@@ -1277,7 +1277,7 @@ mod chat_stream_bridge_fallback_tests {
                 sessions: Vec::new(),
                 total: 0,
                 limit: 20,
-                offset: 0,
+                next_cursor: None,
             })
         }
 
@@ -1367,7 +1367,7 @@ mod chat_stream_bridge_fallback_tests {
                 sessions: Vec::new(),
                 total: 0,
                 limit: 20,
-                offset: 0,
+                next_cursor: None,
             })
         }
 

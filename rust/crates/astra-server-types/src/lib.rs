@@ -19,7 +19,7 @@ pub mod worktree_isolation;
 pub mod ws_progress_callback;
 
 #[cfg(feature = "server")]
-use astra_services::auth::{SessionActivityCursor, SessionActivityRecord};
+use astra_services::auth::{SessionActivityCursor, SessionActivityRecord, SessionListCursor};
 #[cfg(feature = "server")]
 use astra_services::{
     AdminAuditRecord, AdminFeedbackStatsRecord, AdminInitRecord, AdminTokenRecord,
@@ -160,8 +160,22 @@ pub struct SessionListQuery {
     pub session_status: Option<String>,
     #[serde(default = "default_session_limit")]
     pub limit: u32,
-    #[serde(default)]
-    pub offset: u32,
+    pub after_updated_at: Option<String>,
+    pub after_session_id: Option<String>,
+}
+
+#[cfg(feature = "server")]
+impl SessionListQuery {
+    pub fn cursor(&self) -> Result<Option<SessionListCursor>, &'static str> {
+        match (&self.after_updated_at, &self.after_session_id) {
+            (None, None) => Ok(None),
+            (Some(updated_at), Some(session_id)) => Ok(Some(SessionListCursor {
+                updated_at: updated_at.clone(),
+                session_id: session_id.clone(),
+            })),
+            _ => Err("session list cursor requires both after_updated_at and after_session_id"),
+        }
+    }
 }
 
 #[cfg(feature = "server")]
@@ -303,7 +317,7 @@ pub struct SessionListResponse {
     pub sessions: Vec<SessionResponse>,
     pub total: i64,
     pub limit: u32,
-    pub offset: u32,
+    pub next_cursor: Option<SessionListCursor>,
 }
 
 #[cfg(feature = "server")]
@@ -948,7 +962,7 @@ impl From<SessionListRecord> for SessionListResponse {
                 .collect(),
             total: value.total,
             limit: value.limit,
-            offset: value.offset,
+            next_cursor: value.next_cursor,
         }
     }
 }

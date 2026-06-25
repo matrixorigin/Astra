@@ -200,7 +200,7 @@ export async function startLocalE2eServer(pathPrefix = ''): Promise<LocalE2eServ
             sessions: [...sessions.values()],
             total: sessions.size,
             limit: 50,
-            offset: 0,
+            next_cursor: null,
           });
           return;
         }

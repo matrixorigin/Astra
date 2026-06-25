@@ -76,6 +76,7 @@ export type {
   SessionInfo,
   RuntimeChatResponse,
   RuntimeSessionResponse,
+  RuntimeSessionListCursor,
   RuntimeSessionListResponse,
   RuntimeSessionCreateBody,
   RuntimeSessionUpdateBody,

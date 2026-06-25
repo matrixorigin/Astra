@@ -31,7 +31,7 @@ pub(super) async fn platform_snapshot_handler(
             agent_id: None,
             status: None,
             limit: 50,
-            offset: 0,
+            cursor: None,
         }),
         state.event_service.list_events(EventListFilter {
             user_id: user.user_id,
