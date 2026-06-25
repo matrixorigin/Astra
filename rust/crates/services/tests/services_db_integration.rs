@@ -800,7 +800,24 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
         })
         .await
         .expect("list_audit_logs");
-    assert_eq!(logs.len(), 3);
+    assert_eq!(logs.len(), 6);
+    let audit_actions = logs
+        .iter()
+        .map(|record| record.action.as_str())
+        .collect::<HashSet<_>>();
+    for expected_action in [
+        "it_session_activity_1",
+        "it_session_activity_2",
+        "it_session_activity_3",
+        "it_svc_0",
+        "it_svc_1",
+        "it_svc_2",
+    ] {
+        assert!(
+            audit_actions.contains(expected_action),
+            "missing expected audit action {expected_action}"
+        );
+    }
 
     for (installation_id, skill_name, ts) in [
         (&installation_id, &skill_name, "2026-05-01 10:00:00.000000"),
