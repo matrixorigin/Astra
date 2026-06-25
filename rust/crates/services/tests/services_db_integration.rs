@@ -2082,10 +2082,11 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
             .expect("update title");
     }
 
-    for (event_id, session_id, content, token_in, token_out, model, ts) in [
+    for (event_id, session_id, turn_seq, content, token_in, token_out, model, ts) in [
         (
             Uuid::new_v4().to_string(),
             session_a.clone(),
+            1_i64,
             "first turn",
             120_i64,
             30_i64,
@@ -2095,6 +2096,7 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
         (
             Uuid::new_v4().to_string(),
             session_a.clone(),
+            2_i64,
             "second turn",
             80_i64,
             20_i64,
@@ -2104,6 +2106,7 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
         (
             Uuid::new_v4().to_string(),
             session_b.clone(),
+            1_i64,
             "legacy turn",
             40_i64,
             10_i64,
@@ -2118,8 +2121,8 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
         sqlx::query(
             "INSERT INTO agent_events \
              (event_id, session_id, user_id, event_type, content, token_usage, llm_model_used, \
-              token_input, token_output, token_total, created_at) \
-             VALUES (?, ?, ?, 'user_query', ?, CAST(? AS JSON), ?, ?, ?, ?, ?)",
+              token_input, token_output, token_total, turn_seq, created_at) \
+             VALUES (?, ?, ?, 'user_query', ?, CAST(? AS JSON), ?, ?, ?, ?, ?, ?)",
         )
         .bind(&event_id)
         .bind(&session_id)
@@ -2130,6 +2133,7 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
         .bind(token_in)
         .bind(token_out)
         .bind(token_total)
+        .bind(turn_seq)
         .bind(&ts)
         .execute(&pool)
         .await
@@ -2882,8 +2886,8 @@ async fn restore_recent_tools_ignores_agent_events_turn_complete_metadata_on_liv
 
     sqlx::query(
         "INSERT INTO agent_events \
-         (event_id, session_id, user_id, event_type, content, token_usage, token_input, token_output, token_total, created_at) \
-         VALUES (?, ?, ?, 'user_query', 'agent events only recent tools turn', CAST(? AS JSON), 20, 10, 30, '2026-09-05 08:00:00.000000')",
+         (event_id, session_id, user_id, event_type, content, token_usage, token_input, token_output, token_total, turn_seq, created_at) \
+         VALUES (?, ?, ?, 'user_query', 'agent events only recent tools turn', CAST(? AS JSON), 20, 10, 30, 1, '2026-09-05 08:00:00.000000')",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(&session_id)
@@ -3082,8 +3086,8 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
 
     sqlx::query(
         "INSERT INTO agent_events \
-         (event_id, session_id, user_id, event_type, content, token_usage, token_input, token_output, token_total, created_at) \
-         VALUES (?, ?, ?, 'user_query', 'checkpoint turn', CAST(? AS JSON), 10, 5, 15, '2026-09-04 09:00:00.000000')",
+         (event_id, session_id, user_id, event_type, content, token_usage, token_input, token_output, token_total, turn_seq, created_at) \
+         VALUES (?, ?, ?, 'user_query', 'checkpoint turn', CAST(? AS JSON), 10, 5, 15, 1, '2026-09-04 09:00:00.000000')",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(&session_id)
@@ -3105,8 +3109,8 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
 
     sqlx::query(
         "INSERT INTO agent_events \
-         (event_id, session_id, user_id, event_type, content, token_usage, token_input, token_output, token_total, created_at) \
-         VALUES (?, ?, ?, 'user_query', 'heavy-only turn', CAST(? AS JSON), 11, 4, 15, '2026-09-04 09:10:00.000000')",
+         (event_id, session_id, user_id, event_type, content, token_usage, token_input, token_output, token_total, turn_seq, created_at) \
+         VALUES (?, ?, ?, 'user_query', 'heavy-only turn', CAST(? AS JSON), 11, 4, 15, 1, '2026-09-04 09:10:00.000000')",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(&heavy_only_session)

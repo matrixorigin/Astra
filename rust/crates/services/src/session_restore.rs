@@ -558,7 +558,7 @@ impl HybridRestoreService {
 
         let row = sqlx::query(
             "SELECT session_id, user_id, title, status, event_count, CAST(metadata AS CHAR) AS metadata_json, \
-             (SELECT COUNT(*) FROM agent_events ae WHERE ae.session_id = agent_sessions.session_id AND ae.user_id = agent_sessions.user_id AND event_type = 'user_query') AS turn_count, \
+             (SELECT COALESCE(MAX(ae.turn_seq), 0) FROM agent_events ae WHERE ae.session_id = agent_sessions.session_id AND ae.user_id = agent_sessions.user_id) AS turn_count, \
              (SELECT COALESCE(SUM(CASE WHEN event_type = 'user_query' AND token_usage IS NOT NULL \
                  THEN COALESCE(token_input, 0) ELSE 0 END), 0) \
                FROM agent_events ae WHERE ae.session_id = agent_sessions.session_id AND ae.user_id = agent_sessions.user_id) AS total_tokens_in, \
@@ -1372,7 +1372,7 @@ impl SessionRestoreService for HybridRestoreService {
 
         let rows = sqlx::query(
             "SELECT s.session_id, s.title, s.status, CAST(s.metadata AS CHAR) AS metadata_json, \
-         (SELECT COUNT(*) FROM agent_events WHERE session_id = s.session_id AND user_id = s.user_id AND event_type = 'user_query') AS turn_count, \
+         (SELECT COALESCE(MAX(turn_seq), 0) FROM agent_events WHERE session_id = s.session_id AND user_id = s.user_id) AS turn_count, \
          (SELECT e.llm_model_used FROM agent_events e WHERE e.session_id = s.session_id AND e.user_id = s.user_id AND e.llm_model_used IS NOT NULL AND e.llm_model_used != '' ORDER BY e.created_at DESC LIMIT 1) AS latest_model \
          FROM agent_sessions s \
          WHERE s.user_id = ? AND s.status IN ('active', 'paused') \
@@ -3022,6 +3022,31 @@ mod tests {
         assert_eq!(loaded.plan_goal, s.plan_goal);
         assert_eq!(loaded.plan_config_json, s.plan_config_json);
         assert_eq!(loaded.plan_execution_rounds, 5);
+    }
+
+    #[test]
+    fn cloud_restore_turn_count_uses_turn_seq_fact_source() {
+        let source = include_str!("session_restore.rs");
+        let implementation = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("implementation source");
+        assert!(
+            implementation.contains("COALESCE(MAX(ae.turn_seq), 0)"),
+            "single-session restore must derive turn_count from turn_seq"
+        );
+        assert!(
+            implementation.contains("COALESCE(MAX(turn_seq), 0)"),
+            "resumable-session listing must derive turn_count from turn_seq"
+        );
+        assert!(
+            !implementation.contains("COUNT(*) FROM agent_events ae WHERE ae.session_id = agent_sessions.session_id AND ae.user_id = agent_sessions.user_id AND event_type = 'user_query'"),
+            "cloud restore must not count user_query rows as turn_count"
+        );
+        assert!(
+            !implementation.contains("COUNT(*) FROM agent_events WHERE session_id = s.session_id AND user_id = s.user_id AND event_type = 'user_query'"),
+            "resumable listing must not count user_query rows as turn_count"
+        );
     }
 
     // -----------------------------------------------------------------------
