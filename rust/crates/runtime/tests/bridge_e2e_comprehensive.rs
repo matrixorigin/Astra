@@ -189,12 +189,14 @@ impl SessionService for StubSession {
         _: String,
         _: String,
         _: u32,
-        _: u32,
+        _: Option<astra_services::SessionActivityCursor>,
     ) -> Result<SessionActivityRecord, (StatusCode, axum::Json<ErrorResponse>)> {
         Ok(SessionActivityRecord {
             session_id: "s-comp-created".into(),
             activities: vec![],
             total: 0,
+            limit: 1,
+            next_cursor: None,
         })
     }
 }

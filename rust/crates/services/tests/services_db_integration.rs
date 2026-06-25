@@ -325,7 +325,17 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
     let a0 = Uuid::new_v4().to_string();
     let a1 = Uuid::new_v4().to_string();
     let a2 = Uuid::new_v4().to_string();
-    let audit_ids = vec![a0.clone(), a1.clone(), a2.clone()];
+    let activity_id = Uuid::new_v4().to_string();
+    let activity_id_2 = Uuid::new_v4().to_string();
+    let activity_id_3 = Uuid::new_v4().to_string();
+    let audit_ids = vec![
+        a0.clone(),
+        a1.clone(),
+        a2.clone(),
+        activity_id.clone(),
+        activity_id_2.clone(),
+        activity_id_3.clone(),
+    ];
     let event_ids = vec![e1.clone(), e2.clone(), e3.clone()];
     let decision_ids = vec![
         decision_id.clone(),
@@ -614,6 +624,71 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
         .await
         .expect("list_sessions");
     assert_eq!(slist.limit, MAX_API_LIST_LIMIT);
+
+    for (log_id, action, ts) in [
+        (
+            &activity_id,
+            "it_session_activity_1",
+            "2026-05-01 10:00:00.000000",
+        ),
+        (
+            &activity_id_2,
+            "it_session_activity_2",
+            "2026-05-01 12:00:00.000000",
+        ),
+        (
+            &activity_id_3,
+            "it_session_activity_3",
+            "2026-05-01 11:00:00.000000",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO auth_audit_logs \
+             (log_id, user_id, action, resource_type, resource_id, details, created_at) \
+             VALUES (?, ?, ?, 'session', ?, CAST('{}' AS JSON), ?)",
+        )
+        .bind(log_id)
+        .bind(&user_id)
+        .bind(action)
+        .bind(&session_id)
+        .bind(ts)
+        .execute(&pool)
+        .await
+        .expect("insert session activity");
+    }
+
+    let first_activity_page = sess
+        .get_session_activity(session_id.clone(), user_id.clone(), 2, None)
+        .await
+        .expect("list first session activity page");
+    assert_eq!(first_activity_page.total, 3);
+    assert_eq!(first_activity_page.limit, 2);
+    assert_eq!(
+        first_activity_page
+            .activities
+            .iter()
+            .map(|activity| activity.log_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![activity_id_2.as_str(), activity_id_3.as_str()]
+    );
+    let second_activity_page = sess
+        .get_session_activity(
+            session_id.clone(),
+            user_id.clone(),
+            2,
+            first_activity_page.next_cursor.clone(),
+        )
+        .await
+        .expect("list second session activity page");
+    assert_eq!(
+        second_activity_page
+            .activities
+            .iter()
+            .map(|activity| activity.log_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![activity_id.as_str()]
+    );
+    assert!(second_activity_page.next_cursor.is_none());
 
     for (log_id, k) in [(a0.clone(), 0_i32), (a1.clone(), 1), (a2.clone(), 2)] {
         sqlx::query(

@@ -192,12 +192,14 @@ impl SessionService for StubSession {
         _session_id: String,
         _user_id: String,
         _limit: u32,
-        _offset: u32,
+        _cursor: Option<astra_services::SessionActivityCursor>,
     ) -> Result<SessionActivityRecord, (StatusCode, axum::Json<ErrorResponse>)> {
         Ok(SessionActivityRecord {
             session_id: "stub".into(),
             activities: vec![],
             total: 0,
+            limit: 1,
+            next_cursor: None,
         })
     }
 }

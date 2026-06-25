@@ -579,6 +579,52 @@ fn session_list_response_serializes() {
 }
 
 #[test]
+fn session_activity_query_requires_complete_cursor() {
+    let missing_log = SessionActivityQuery {
+        limit: 10,
+        after_created_at: Some("2026-04-01T10:00:00.123456".into()),
+        after_log_id: None,
+    };
+    assert_eq!(
+        missing_log.cursor().unwrap_err(),
+        "session activity cursor requires both after_created_at and after_log_id"
+    );
+
+    let cursor = SessionActivityQuery {
+        limit: 10,
+        after_created_at: Some("2026-04-01T10:00:00.123456".into()),
+        after_log_id: Some("log-1".into()),
+    }
+    .cursor()
+    .unwrap();
+    assert_eq!(
+        cursor,
+        Some(SessionActivityCursor {
+            created_at: "2026-04-01T10:00:00.123456".into(),
+            log_id: "log-1".into(),
+        })
+    );
+}
+
+#[test]
+fn session_activity_response_serializes_next_cursor() {
+    let resp = SessionActivityResponse {
+        session_id: "s1".into(),
+        activities: vec![],
+        total: 2,
+        limit: 1,
+        next_cursor: Some(SessionActivityCursor {
+            created_at: "2026-04-01T10:00:00.123456".into(),
+            log_id: "log-1".into(),
+        }),
+    };
+    let v = serde_json::to_value(&resp).unwrap();
+    assert_eq!(v["session_id"], "s1");
+    assert_eq!(v["limit"], 1);
+    assert_eq!(v["next_cursor"]["log_id"], "log-1");
+}
+
+#[test]
 fn admin_token_response_serializes() {
     let resp = AdminTokenResponse {
         token_id: "t1".into(),

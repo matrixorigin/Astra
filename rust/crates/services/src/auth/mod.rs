@@ -51,8 +51,8 @@ use encryption::sha256_hex;
 use jwt::{JwtTokenClaims, create_jwt_token, decode_jwt_claims, decode_jwt_claims_with_detail};
 pub use session::UnconfiguredSessionService;
 pub use session::{
-    DatabaseSessionService, SessionActivityRecord, SessionCreateRequestData, SessionListFilter,
-    SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
+    DatabaseSessionService, SessionActivityCursor, SessionActivityRecord, SessionCreateRequestData,
+    SessionListFilter, SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
 };
 use validation::validate_register_request;
 
