@@ -2369,17 +2369,15 @@ async fn sse_text_delta_content_matches_full_text() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Test: Session activity event_count_increment accuracy
+// Test: Session activity last_event_id accuracy
 // ══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn session_activity_event_count_increment_accuracy() {
+async fn session_activity_last_event_id_accuracy() {
     init_env();
     let cap = AllCaptures::default();
     let app = build_test_app(cap.clone());
 
-    // Text-only turn: should have event_count_increment = 2
-    // (1 user_query + 1 llm_response)
     let payload = json!({
         "agent_id": "activity-agent",
         "messages": [{ "role": "user", "content": "simple question" }],
@@ -2394,32 +2392,37 @@ async fn session_activity_event_count_increment_accuracy() {
 
     cap.wait_persist_idle().await;
 
+    let core = cap.core_plans.lock().await;
+    let expected_last_event_id = core[0]
+        .llm_response_event
+        .as_ref()
+        .expect("llm_response event persisted")
+        .event_id
+        .clone();
+    drop(core);
+
     let acts = cap.activity_plans.lock().await;
     assert!(!acts.is_empty(), "activity writer should be called");
     let (session_id, user_id, plan) = &acts[0];
     assert!(!session_id.is_empty(), "session_id should be non-empty");
     assert!(!user_id.is_empty(), "user_id should be non-empty");
-    // Text-only: 1 user_query + 1 llm_response = 2 events.
     assert_eq!(
-        plan.event_count_increment, 2,
-        "text-only turn: event_count_increment should be 2 (user_query + llm_response)"
+        plan.last_event_id.as_deref(),
+        Some(expected_last_event_id.as_str()),
+        "activity last_event_id should point at the persisted llm_response event"
     );
-    // last_event_id should be the llm_response event_id.
-    assert!(plan.last_event_id.is_some(), "last_event_id should be set");
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Test: Activity event_count for tool-call turn
+// Test: Activity last_event_id for tool-call turn
 // ══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn session_activity_event_count_for_tool_call_turn() {
+async fn session_activity_last_event_id_for_tool_call_turn() {
     init_env();
     let cap = AllCaptures::default();
     let app = build_test_app(cap.clone());
 
-    // Turn with 2 tool calls: event_count_increment should account for
-    // user_query + 2 tool_calls + llm_response = 4
     let payload = json!({
         "agent_id": "activity-tool-agent",
         "messages": [{ "role": "user", "content": "read two files" }],
@@ -2437,29 +2440,36 @@ async fn session_activity_event_count_for_tool_call_turn() {
 
     cap.wait_persist_idle().await;
 
+    let core = cap.core_plans.lock().await;
+    let expected_last_event_id = core[0]
+        .llm_response_event
+        .as_ref()
+        .expect("llm_response event persisted")
+        .event_id
+        .clone();
+    drop(core);
+
     let acts = cap.activity_plans.lock().await;
     assert!(!acts.is_empty());
     let (_, user_id, plan) = &acts[0];
     assert!(!user_id.is_empty(), "user_id should be non-empty");
-    // user_query(1) + tool_calls(2) + llm_response(1) = 4
     assert_eq!(
-        plan.event_count_increment, 4,
-        "tool-call turn: event_count_increment should be 4 (user_query + 2 tool_calls + llm_response), got {}",
-        plan.event_count_increment
+        plan.last_event_id.as_deref(),
+        Some(expected_last_event_id.as_str()),
+        "activity last_event_id should point at the persisted llm_response event"
     );
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Test: Activity event_count for continuation turn (no user_query re-persist)
+// Test: Activity last_event_id for continuation turn (no user_query re-persist)
 // ══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn session_activity_event_count_for_continuation_turn() {
+async fn session_activity_last_event_id_for_continuation_turn() {
     init_env();
     let cap = AllCaptures::default();
     let app = build_test_app(cap.clone());
 
-    // Continuation: tool_results present, so user_query is NOT counted.
     let payload = json!({
         "agent_id": "activity-cont-agent",
         "session_id": "s-comp-created",
@@ -2482,19 +2492,23 @@ async fn session_activity_event_count_for_continuation_turn() {
 
     cap.wait_persist_idle().await;
 
+    let core = cap.core_plans.lock().await;
+    let expected_last_event_id = core[0]
+        .llm_response_event
+        .as_ref()
+        .expect("llm_response event persisted")
+        .event_id
+        .clone();
+    drop(core);
+
     let acts = cap.activity_plans.lock().await;
     assert!(!acts.is_empty());
     let (_, user_id, plan) = &acts[0];
     assert!(!user_id.is_empty(), "user_id should be non-empty");
-    // core_event_count counts user_content.is_some() (1) + should_persist_llm (1) = 2,
-    // even though user_query_event is NOT persisted on continuation (P2 fix).
-    // Plus tool_event_count = 1 (tool_result). Total = 3.
-    // Note: the activity counter slightly over-counts on continuations because it
-    // still counts user_content presence despite skipping the actual persist.
     assert_eq!(
-        plan.event_count_increment, 3,
-        "continuation turn: event_count_increment should be 3, got {}",
-        plan.event_count_increment
+        plan.last_event_id.as_deref(),
+        Some(expected_last_event_id.as_str()),
+        "activity last_event_id should point at the persisted llm_response event"
     );
 }
 
@@ -3714,7 +3728,7 @@ async fn unhappy_core_persist_failure_still_completes_sse() {
 }
 
 /// Persistence failure: tool writer returns Err → PERSIST_FAIL counter increments,
-/// but core events still persisted and activity still updated (with reduced count).
+/// but core events still persist and activity metadata still updates.
 #[tokio::test]
 async fn unhappy_tool_persist_failure_core_still_persists() {
     init_env();
@@ -3986,9 +4000,9 @@ async fn sync_all_writers_same_session_id() {
     }
 }
 
-/// Activity event_count_increment matches actual persisted event count
+/// Activity last_event_id matches the persisted llm_response event.
 #[tokio::test]
-async fn sync_activity_count_matches_persisted_events() {
+async fn sync_activity_last_event_matches_persisted_llm_response() {
     init_env();
     let cap = AllCaptures::default();
     let app = build_test_app(cap.clone());
@@ -4012,25 +4026,20 @@ async fn sync_activity_count_matches_persisted_events() {
 
     let core = cap.core_plans.lock().await;
     let plan = &core[0];
-    let core_count =
-        plan.user_query_event.is_some() as usize + plan.llm_response_event.is_some() as usize;
-
-    let tools = cap.tool_plans.lock().await;
-    let tool_count = if !tools.is_empty() {
-        tools[0].events.len()
-    } else {
-        0
-    };
+    let expected_last_event_id = plan
+        .llm_response_event
+        .as_ref()
+        .expect("llm_response event persisted")
+        .event_id
+        .clone();
+    drop(core);
 
     let activity = cap.activity_plans.lock().await;
     assert!(!activity.is_empty());
-    let increment = activity[0].2.event_count_increment;
-
-    // Increment should be core_count + tool_count
     assert_eq!(
-        increment,
-        core_count + tool_count,
-        "activity increment ({increment}) should equal core({core_count}) + tool({tool_count})"
+        activity[0].2.last_event_id.as_deref(),
+        Some(expected_last_event_id.as_str()),
+        "activity should record the last persisted core event"
     );
 }
 
@@ -6303,10 +6312,7 @@ async fn deep_all_event_types_single_turn() {
     let (sid, user_id, act_plan) = &activity[0];
     assert!(!sid.is_empty(), "session_id non-empty");
     assert!(!user_id.is_empty(), "user_id non-empty");
-    assert!(
-        act_plan.event_count_increment > 0,
-        "event_count_increment > 0"
-    );
+    assert!(act_plan.last_event_id.is_some(), "last_event_id is set");
 
     // 5. Hook writer
     let hooks = cap.hook_plans.lock().await;
@@ -6384,27 +6390,14 @@ async fn deep_session_activity_cumulative_across_turns() {
     let activity = cap.activity_plans.lock().await;
     assert_eq!(activity.len(), 3, "3 activity updates");
 
-    // Each turn's event_count reflects that turn's events (not cumulative in the plan itself;
-    // the writer is responsible for accumulating). But each plan should have positive count.
+    // Each turn should update the activity marker with a concrete last event id.
     for (i, (_sid, _user_id, plan)) in activity.iter().enumerate() {
         assert!(
-            plan.event_count_increment > 0,
-            "turn {} event_count_increment should be > 0, got {}",
-            i + 1,
-            plan.event_count_increment
+            plan.last_event_id.is_some(),
+            "turn {} last_event_id should be set",
+            i + 1
         );
     }
-
-    // Turn 1 (text-only): 2 events (user_query + llm_response)
-    assert_eq!(
-        activity[0].2.event_count_increment, 2,
-        "turn 1: user_query + llm_response"
-    );
-    // Turn 2 (tool call): 2 core + 1 tool = 3
-    assert_eq!(
-        activity[1].2.event_count_increment, 3,
-        "turn 2: user_query + llm_response + tool_call"
-    );
 }
 
 /// Snapshot link plan: verify it exists in core persist plan (bridge sets None currently)
@@ -9617,10 +9610,7 @@ async fn c1_trace_activity_plan_has_session_id() {
         "session_id should match payload"
     );
     assert!(!user_id.is_empty(), "user_id should be non-empty");
-    assert!(
-        plan.event_count_increment > 0,
-        "should count at least one event"
-    );
+    assert!(plan.last_event_id.is_some(), "last_event_id should be set");
 }
 
 /// C1: Causal chain IDs link user query → LLM response → tool events.
@@ -9779,9 +9769,9 @@ async fn c2_journal_tool_events_match_tool_calls() {
     }
 }
 
-/// C2: Activity update event_count_increment is consistent with persisted events.
+/// C2: Activity update records a traceable last event id.
 #[tokio::test]
-async fn c2_journal_activity_count_consistent() {
+async fn c2_journal_activity_last_event_consistent() {
     init_env();
     let cap = AllCaptures::default();
     let app = build_test_app(cap.clone());
@@ -9800,12 +9790,7 @@ async fn c2_journal_activity_count_consistent() {
     assert!(!activities.is_empty(), "activity update required");
     let (_, user_id, plan) = &activities[0];
     assert!(!user_id.is_empty(), "user_id should be non-empty");
-    // Text-only turn: user_query + llm_response = at least 2 events
-    assert!(
-        plan.event_count_increment >= 2,
-        "text-only turn should count at least 2 events (user+response), got {}",
-        plan.event_count_increment
-    );
+    assert!(plan.last_event_id.is_some(), "last_event_id should be set");
 }
 
 /// C2: Auxiliary events have valid structure when emitted.

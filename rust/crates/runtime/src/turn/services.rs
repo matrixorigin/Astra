@@ -1,5 +1,5 @@
 use crate::data_layer::storage::{
-    insert_trace_event, load_agent_event_count_for_user, upsert_agent_session_event_count,
+    bump_agent_session_event_count, insert_trace_event, touch_agent_session_activity,
 };
 use crate::*;
 use astra_turn_core::trace_event::{TraceEvent, TraceEventWriter, TraceWriteError};
@@ -144,6 +144,20 @@ fn metadata_tool_name(metadata: Option<&serde_json::Value>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn record_session_event_delta(
+    deltas: &mut std::collections::BTreeMap<(String, String), (i64, Option<String>)>,
+    event: &TurnCoreEventRecord,
+    last_event_id: Option<&str>,
+) {
+    let entry = deltas
+        .entry((event.user_id.clone(), event.session_id.clone()))
+        .or_default();
+    entry.0 += 1;
+    if let Some(last_event_id) = last_event_id {
+        entry.1 = Some(last_event_id.to_string());
+    }
+}
+
 impl DatabaseTurnReflectionLessonWriter {
     pub fn new(base_url: String, master_key: Option<String>) -> Self {
         Self {
@@ -173,15 +187,34 @@ impl TurnCoreEventWriter for DatabaseTurnCoreEventWriter {
         }
         let pool = self.get_pool()?;
         let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+        let mut deltas =
+            std::collections::BTreeMap::<(String, String), (i64, Option<String>)>::new();
         if let Some(event) = plan.user_query_event.as_ref() {
-            insert_core_turn_event(&mut tx, event)
+            if insert_core_turn_event(&mut tx, event)
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())?
+            {
+                record_session_event_delta(&mut deltas, event, Some(&event.event_id));
+            }
         }
         if let Some(event) = plan.llm_response_event.as_ref() {
-            insert_core_turn_event(&mut tx, event)
+            if insert_core_turn_event(&mut tx, event)
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())?
+            {
+                record_session_event_delta(&mut deltas, event, Some(&event.event_id));
+            }
+        }
+        for ((user_id, session_id), (delta, last_event_id)) in deltas {
+            bump_agent_session_event_count(
+                &mut *tx,
+                &session_id,
+                &user_id,
+                delta,
+                last_event_id.as_deref(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
         }
         tx.commit().await.map_err(|error| error.to_string())?;
         if let Some(snapshot_link_plan) = plan.snapshot_link_plan.as_ref()
@@ -213,14 +246,25 @@ impl TurnToolEventWriter for DatabaseTurnToolEventWriter {
         .await
         .map_err(|error| error.to_string())?;
         let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+        let mut deltas = std::collections::BTreeMap::<(String, String), i64>::new();
         for event in &plan.events {
-            insert_tool_turn_event(
+            if insert_tool_turn_event(
                 &mut tx,
                 event,
                 skill_versions.get(event.skill_name.as_deref().unwrap_or("")),
             )
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?
+            {
+                *deltas
+                    .entry((event.user_id.clone(), event.session_id.clone()))
+                    .or_default() += 1;
+            }
+        }
+        for ((user_id, session_id), delta) in deltas {
+            bump_agent_session_event_count(&mut *tx, &session_id, &user_id, delta, None)
+                .await
+                .map_err(|error| error.to_string())?;
         }
         tx.commit().await.map_err(|error| error.to_string())?;
         Ok(())
@@ -260,33 +304,28 @@ impl DatabaseTraceEventWriter {
         if events.is_empty() {
             return Ok(());
         }
-        let mut touched_sessions = std::collections::BTreeMap::<String, (String, String)>::new();
+        let mut touched_sessions =
+            std::collections::BTreeMap::<(String, String), (i64, Option<String>)>::new();
         for event in &events {
-            insert_trace_event(tx, event)
+            if insert_trace_event(tx, event)
                 .await
-                .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
-            touched_sessions.insert(
-                event.session_id.clone(),
-                (event.user_id.clone(), event.event_id.clone()),
-            );
+                .map_err(|error| TraceWriteError::Persist(error.to_string()))?
+            {
+                let entry = touched_sessions
+                    .entry((event.user_id.clone(), event.session_id.clone()))
+                    .or_default();
+                entry.0 += 1;
+                entry.1 = Some(event.event_id.clone());
+            }
         }
-        for (session_id, (user_id, last_event_id)) in touched_sessions {
-            let event_count = load_agent_event_count_for_user(&mut **tx, &session_id, &user_id)
-                .await
-                .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
-            upsert_agent_session_event_count(&mut **tx, &session_id, &user_id, event_count)
-                .await
-                .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
-            query(
-                "UPDATE agent_sessions \
-                 SET last_event_id = COALESCE(?, last_event_id), \
-                     last_active_at = NOW(), updated_at = NOW() \
-                 WHERE session_id = ? AND user_id = ?",
+        for ((user_id, session_id), (delta, last_event_id)) in touched_sessions {
+            bump_agent_session_event_count(
+                &mut **tx,
+                &session_id,
+                &user_id,
+                delta,
+                last_event_id.as_deref(),
             )
-            .bind(last_event_id)
-            .bind(&session_id)
-            .bind(&user_id)
-            .execute(&mut **tx)
             .await
             .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
         }
@@ -454,6 +493,7 @@ impl TurnAuxiliaryEventWriter for DatabaseTurnAuxiliaryEventWriter {
         }
         let pool = self.get_pool()?;
         let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+        let mut deltas = std::collections::BTreeMap::<(String, String), i64>::new();
         for event in events {
             let meta_tool_name = metadata_tool_name(event.metadata.as_ref());
             let meta_duration_ms = event
@@ -463,7 +503,7 @@ impl TurnAuxiliaryEventWriter for DatabaseTurnAuxiliaryEventWriter {
                 .and_then(|v| v.as_i64())
                 .map(|v| v as i32);
             let metadata_json = event.metadata.as_ref().map(|metadata| metadata.to_string());
-            query(
+            let result = query(
                 "INSERT IGNORE INTO agent_events \
                  (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
                   parent_event_id, causal_chain_id, `metadata`, reasoning_content, \
@@ -486,14 +526,24 @@ impl TurnAuxiliaryEventWriter for DatabaseTurnAuxiliaryEventWriter {
             .execute(&mut *tx)
             .await
             .map_err(|error| error.to_string())?;
-            crate::data_layer::storage::insert_agent_event_edges(
-                &mut *tx,
-                &event.event_id,
-                event.parent_event_id.as_deref(),
-                &event.parent_event_ids,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+            if result.rows_affected() > 0 {
+                crate::data_layer::storage::insert_agent_event_edges(
+                    &mut *tx,
+                    &event.event_id,
+                    event.parent_event_id.as_deref(),
+                    &event.parent_event_ids,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                *deltas
+                    .entry((event.user_id.clone(), event.session_id.clone()))
+                    .or_default() += 1;
+            }
+        }
+        for ((user_id, session_id), delta) in deltas {
+            bump_agent_session_event_count(&mut *tx, &session_id, &user_id, delta, None)
+                .await
+                .map_err(|error| error.to_string())?;
         }
         tx.commit().await.map_err(|error| error.to_string())?;
         Ok(())
@@ -509,28 +559,9 @@ impl TurnSessionActivityWriter for DatabaseTurnSessionActivityWriter {
         plan: SessionActivityUpdatePlan,
     ) -> Result<(), String> {
         let pool = self.get_pool()?;
-        // BUG FIX (Session 7875e355 diagnostic): Use COUNT(*) reconcile instead of
-        // increment to prevent drift from concurrent requests or duplicate detection.
-        // This matches the fix in event_ingestion.rs flush_batch() and services/events.rs.
-        //
-        // Note: We add the increment first as a hint for the DB optimizer, then reconcile
-        // with actual count. The subquery ensures accuracy even if events are deduplicated.
-        let result = query(
-            "UPDATE agent_sessions \
-             SET event_count = (SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND user_id = ?), \
-                 last_active_at = NOW(), updated_at = NOW(), \
-                 last_event_id = COALESCE(?, last_event_id) \
-             WHERE session_id = ? AND user_id = ?",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .bind(plan.last_event_id)
-        .bind(session_id)
-        .bind(user_id)
-        .execute(&pool)
-        .await
-        .map_err(|error| error.to_string());
-        result.map(|_| ())
+        touch_agent_session_activity(&pool, session_id, user_id, plan.last_event_id.as_deref())
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -635,6 +666,34 @@ mod tests {
     fn metadata_tool_name_missing_both_fields() {
         let v = json!({"other": "field"});
         assert!(metadata_tool_name(Some(&v)).is_none());
+    }
+
+    #[test]
+    fn turn_event_writers_use_delta_updates_not_count_reconcile() {
+        let source = include_str!("services.rs");
+        let forbidden_load = concat!("load_agent_event_count", "_for_user");
+        let forbidden_upsert = concat!("upsert_agent_session", "_event_count");
+        let forbidden_subquery = concat!("event_count = (SELECT ", "COUNT(*)");
+        assert!(
+            source.contains("bump_agent_session_event_count"),
+            "event writers must maintain agent_sessions.event_count with actual insert deltas"
+        );
+        assert!(
+            source.contains("touch_agent_session_activity"),
+            "activity writer should only touch activity metadata"
+        );
+        assert!(
+            !source.contains(forbidden_load),
+            "turn event writer hot path must not COUNT(*) agent_events"
+        );
+        assert!(
+            !source.contains(forbidden_upsert),
+            "turn event writer hot path must not reconcile event_count from COUNT(*)"
+        );
+        assert!(
+            !source.contains(forbidden_subquery),
+            "turn activity update must not embed a COUNT(*) subquery"
+        );
     }
 
     #[test]
@@ -760,7 +819,6 @@ mod tests {
                 "s",
                 "u",
                 SessionActivityUpdatePlan {
-                    event_count_increment: 1,
                     last_event_id: Some("e5".into()),
                 },
             )

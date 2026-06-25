@@ -7,10 +7,7 @@ use uuid::Uuid;
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
 use crate::pagination::clamp_api_list_pagination;
-use crate::storage::{
-    agent_session_exists_for_user, load_agent_event_count_for_user,
-    upsert_agent_session_event_count,
-};
+use crate::storage::{agent_session_exists_for_user, bump_agent_session_event_count};
 
 const MAX_CAUSAL_CHAIN_EVENTS: i64 = 500;
 
@@ -268,7 +265,7 @@ impl EventService for DatabaseEventService {
             .and_then(|v| v.as_i64())
             .map(|v| v as i32);
 
-        query(
+        let insert_result = query(
             "INSERT INTO agent_events \
              (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
               parent_event_id, causal_chain_id, `metadata`, meta_tool_name, meta_duration_ms, created_at) \
@@ -299,16 +296,15 @@ impl EventService for DatabaseEventService {
         .await
         .map_err(internal_error)?;
 
-        // BUG FIX (Session 7875e355 diagnostic): Use COUNT(*) reconcile instead of
-        // increment to prevent drift from concurrent requests or duplicate detection.
-        // MatrixOne rejects the earlier subquery-in-upsert form, so count first and
-        // then upsert with bound values.
-        let event_count = load_agent_event_count_for_user(&mut *tx, &session_id, &user_id)
-            .await
-            .map_err(internal_error)?;
-        upsert_agent_session_event_count(&mut *tx, &session_id, &user_id, event_count)
-            .await
-            .map_err(internal_error)?;
+        bump_agent_session_event_count(
+            &mut *tx,
+            &session_id,
+            &user_id,
+            i64::try_from(insert_result.rows_affected()).unwrap_or(i64::MAX),
+            Some(&event_id),
+        )
+        .await
+        .map_err(internal_error)?;
 
         let select_sql = format!(
             "SELECT {} FROM agent_events WHERE event_id = ?",
@@ -550,19 +546,17 @@ impl EventService for DatabaseEventService {
             .execute(&mut *tx)
             .await
             .map_err(internal_error)?;
-        query("DELETE FROM agent_events WHERE event_id = ? AND user_id = ?")
+        let delete_result = query("DELETE FROM agent_events WHERE event_id = ? AND user_id = ?")
             .bind(&event_id)
             .bind(&user_id)
             .execute(&mut *tx)
             .await
             .map_err(internal_error)?;
-        // Reconcile session event_count after deletion to prevent permanent drift.
-        let event_count = load_agent_event_count_for_user(&mut *tx, &record.session_id, &user_id)
-            .await
-            .map_err(internal_error)?;
-        upsert_agent_session_event_count(&mut *tx, &record.session_id, &user_id, event_count)
-            .await
-            .map_err(internal_error)?;
+        if delete_result.rows_affected() > 0 {
+            bump_agent_session_event_count(&mut *tx, &record.session_id, &user_id, -1, None)
+                .await
+                .map_err(internal_error)?;
+        }
         tx.commit().await.map_err(internal_error)?;
 
         Ok(())
@@ -899,7 +893,7 @@ mod tests {
         );
     }
 
-    /// P1-C: delete_event must reconcile session event_count after deletion.
+    /// P1-C: delete_event must decrement session event_count by the actual deleted row.
     /// P2-A: get_event and delete_event must return 404 (not 403) for
     /// non-owner access to prevent IDOR information leakage.
     /// P2-E: EventListQuery::default() must use the same limit as serde deserialization.

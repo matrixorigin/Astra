@@ -1,31 +1,9 @@
 //! Turn-level metrics and quality utilities.
 //!
-//! This module consolidates small, related helpers for counting turn events
-//! and building quality payloads that were previously in standalone files.
+//! This module consolidates small, related helpers for building quality
+//! payloads that were previously in standalone files.
 
 use serde_json::{Map, Value, json};
-
-/// Count how many events should be persisted for a turn given the
-/// constituent parts.
-pub fn count_persisted_turn_events(
-    has_user_content: bool,
-    tool_results_len: usize,
-    tool_calls_len: usize,
-    cloud_tool_results_len: usize,
-    has_full_text: bool,
-) -> usize {
-    let mut n_events = 0usize;
-    if has_user_content {
-        n_events += 1;
-    }
-    n_events += tool_results_len;
-    n_events += tool_calls_len;
-    n_events += cloud_tool_results_len;
-    if has_full_text || tool_calls_len > 0 {
-        n_events += 1;
-    }
-    n_events.max(1)
-}
 
 /// Build the JSON payload for a tool-result quality event.
 pub fn build_tool_result_quality_event_payload(
@@ -49,31 +27,6 @@ pub fn build_tool_result_quality_event_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn count_all_false_returns_1() {
-        assert_eq!(count_persisted_turn_events(false, 0, 0, 0, false), 1);
-    }
-
-    #[test]
-    fn count_user_content_only() {
-        assert_eq!(count_persisted_turn_events(true, 0, 0, 0, false), 1);
-    }
-
-    #[test]
-    fn count_with_tool_calls_adds_response() {
-        assert_eq!(count_persisted_turn_events(false, 0, 3, 0, false), 4);
-    }
-
-    #[test]
-    fn count_with_full_text() {
-        assert_eq!(count_persisted_turn_events(false, 0, 0, 0, true), 1);
-    }
-
-    #[test]
-    fn count_all_populated() {
-        assert_eq!(count_persisted_turn_events(true, 2, 3, 1, true), 8);
-    }
 
     #[test]
     fn quality_payload_full() {

@@ -330,17 +330,12 @@ impl BridgeTraceCorrelation {
     }
 }
 
-fn count_inprocess_persisted_events(
+fn has_inprocess_persisted_events(
     core_event_count: usize,
     tool_event_count: usize,
     tool_events_persisted: bool,
-) -> usize {
-    core_event_count
-        + if tool_events_persisted {
-            tool_event_count
-        } else {
-            0
-        }
+) -> bool {
+    core_event_count > 0 || (tool_events_persisted && tool_event_count > 0)
 }
 
 #[derive(Debug, Default)]
@@ -4213,21 +4208,17 @@ impl InProcessChatTurnBridge {
                     }
                     None => false,
                 };
-                let persisted_event_count = count_inprocess_persisted_events(
+                if !has_inprocess_persisted_events(
                     core_event_count,
                     tool_event_count,
                     tool_events_persisted,
-                );
-                if persisted_event_count == 0 {
+                ) {
                     return;
                 }
                 let last_event_id = core_outcome
                     .llm_response_event_id
                     .or(Some(user_query_event_id_for_activity));
-                let plan = SessionActivityUpdatePlan {
-                    event_count_increment: persisted_event_count,
-                    last_event_id,
-                };
+                let plan = SessionActivityUpdatePlan { last_event_id };
                 if let Err(e) = sa_writer
                     .update_session_activity(&sid, &activity_user_id, plan)
                     .await
@@ -5046,9 +5037,11 @@ mod tests {
     }
 
     #[test]
-    fn count_inprocess_persisted_events_skips_failed_tool_events() {
-        assert_eq!(count_inprocess_persisted_events(2, 3, false), 2);
-        assert_eq!(count_inprocess_persisted_events(2, 3, true), 5);
+    fn has_inprocess_persisted_events_skips_failed_tool_events() {
+        assert!(has_inprocess_persisted_events(2, 3, false));
+        assert!(has_inprocess_persisted_events(2, 3, true));
+        assert!(!has_inprocess_persisted_events(0, 3, false));
+        assert!(has_inprocess_persisted_events(0, 3, true));
     }
 
     // ── effective_volatile_sections_for_round ────────────────────────────

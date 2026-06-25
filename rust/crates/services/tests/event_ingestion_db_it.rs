@@ -12,11 +12,13 @@ use uuid::Uuid;
 
 mod common;
 
+const TEST_USER_ID: &str = "test-user";
+
 fn test_event(event_id: &str, session_id: &str, event_type: &str) -> IngestionEvent {
     IngestionEvent {
         event_id: event_id.to_string(),
         session_id: session_id.to_string(),
-        user_id: "test-user".to_string(),
+        user_id: TEST_USER_ID.to_string(),
         event_type: event_type.to_string(),
         content: None,
         token_usage: None,
@@ -30,6 +32,59 @@ fn test_event(event_id: &str, session_id: &str, event_type: &str) -> IngestionEv
     }
 }
 
+async fn insert_session_root(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str) {
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'event-ingestion-test', 'active', 0)",
+    )
+    .bind(session_id)
+    .bind(TEST_USER_ID)
+    .execute(pool)
+    .await
+    .expect("insert session root");
+}
+
+async fn assert_session_event_count(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    session_id: &str,
+    expected: i64,
+) {
+    let row = sqlx::query("SELECT event_count FROM agent_sessions WHERE session_id = ?")
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .expect("load session event_count");
+    let actual: i64 = row.get("event_count");
+    assert_eq!(
+        actual, expected,
+        "agent_sessions.event_count for {session_id}"
+    );
+}
+
+async fn cleanup_session(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str) {
+    let event_rows = sqlx::query("SELECT event_id FROM agent_events WHERE session_id = ?")
+        .bind(session_id)
+        .fetch_all(pool)
+        .await;
+    if let Ok(event_rows) = event_rows {
+        for row in event_rows {
+            let event_id: String = row.get("event_id");
+            let _ = sqlx::query("DELETE FROM agent_event_edges WHERE child_event_id = ?")
+                .bind(&event_id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM agent_events WHERE event_id = ?")
+                .bind(&event_id)
+                .execute(pool)
+                .await;
+        }
+    }
+    let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ?")
+        .bind(session_id)
+        .execute(pool)
+        .await;
+}
+
 /// Verifies that inserting the same event_id twice does not surface a
 /// duplicate key error. This guards against the MySQL 1062 error that
 /// occurred when INSERT IGNORE was not properly handling idempotent retries.
@@ -41,6 +96,8 @@ async fn event_ingest_idempotent_duplicate_key_no_error() {
 
     let event_id = format!("evt-test-{}", Uuid::new_v4());
     let session_id = Uuid::new_v4().to_string();
+    cleanup_session(&pool, &session_id).await;
+    insert_session_root(&pool, &session_id).await;
     let event = test_event(&event_id, &session_id, "test_idempotent");
 
     // Spawn worker, send event, shutdown — first insert
@@ -68,12 +125,10 @@ async fn event_ingest_idempotent_duplicate_key_no_error() {
         count, 1,
         "expected exactly 1 row for event_id {event_id}, got {count}"
     );
+    assert_session_event_count(&pool, &session_id, 1).await;
 
     // Cleanup
-    let _ = sqlx::query("DELETE FROM agent_events WHERE event_id = ?")
-        .bind(&event_id)
-        .execute(&pool)
-        .await;
+    cleanup_session(&pool, &session_id).await;
 }
 
 /// Verifies that concurrent writes with the same event_id both succeed
@@ -90,6 +145,8 @@ async fn event_ingest_concurrent_duplicate_key_no_error() {
 
     let event_id = format!("evt-test-{}", Uuid::new_v4());
     let session_id = Uuid::new_v4().to_string();
+    cleanup_session(&pool, &session_id).await;
+    insert_session_root(&pool, &session_id).await;
     let event = test_event(&event_id, &session_id, "test_concurrent");
 
     let config = IngestionConfig::default();
@@ -137,12 +194,10 @@ async fn event_ingest_concurrent_duplicate_key_no_error() {
         count, 1,
         "expected exactly 1 row for event_id {event_id}, got {count}"
     );
+    assert_session_event_count(&pool, &session_id, 1).await;
 
     // Cleanup
-    let _ = sqlx::query("DELETE FROM agent_events WHERE event_id = ?")
-        .bind(&event_id)
-        .execute(&pool)
-        .await;
+    cleanup_session(&pool, &session_id).await;
 }
 
 /// Verifies that batch insert with multiple events succeeds and
@@ -154,6 +209,8 @@ async fn event_ingest_batch_partial_duplicate_no_error() {
     let pool = shared.get().clone();
 
     let session_id = Uuid::new_v4().to_string();
+    cleanup_session(&pool, &session_id).await;
+    insert_session_root(&pool, &session_id).await;
     let event1 = test_event(
         &format!("evt-batch1-{}", Uuid::new_v4()),
         &session_id,
@@ -190,12 +247,8 @@ async fn event_ingest_batch_partial_duplicate_no_error() {
         let count: i64 = row.get("cnt");
         assert_eq!(count, 1, "expected 1 row for {}", event.event_id);
     }
+    assert_session_event_count(&pool, &session_id, 2).await;
 
     // Cleanup
-    for event in [&event1, &event2] {
-        let _ = sqlx::query("DELETE FROM agent_events WHERE event_id = ?")
-            .bind(&event.event_id)
-            .execute(&pool)
-            .await;
-    }
+    cleanup_session(&pool, &session_id).await;
 }

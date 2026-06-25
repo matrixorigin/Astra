@@ -187,6 +187,88 @@ where
     Ok(())
 }
 
+pub async fn bump_agent_session_event_count<'e, E>(
+    executor: E,
+    session_id: &str,
+    user_id: &str,
+    delta: i64,
+    last_event_id: Option<&str>,
+) -> Result<(), sqlx::Error>
+where
+    E: Executor<'e, Database = MySql>,
+{
+    let result = if delta >= 0 {
+        query(
+            "UPDATE agent_sessions \
+             SET event_count = event_count + ?, \
+                 updated_at = NOW(6), \
+                 last_active_at = NOW(6), \
+                 last_event_id = COALESCE(?, last_event_id) \
+             WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(delta)
+        .bind(last_event_id)
+        .bind(session_id)
+        .bind(user_id)
+        .execute(executor)
+        .await?
+    } else {
+        let decrement = delta.saturating_abs();
+        query(
+            "UPDATE agent_sessions \
+             SET event_count = CASE \
+                     WHEN event_count >= ? THEN event_count - ? \
+                     ELSE 0 \
+                 END, \
+                 updated_at = NOW(6), \
+                 last_active_at = NOW(6), \
+                 last_event_id = COALESCE(?, last_event_id) \
+             WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(decrement)
+        .bind(decrement)
+        .bind(last_event_id)
+        .bind(session_id)
+        .bind(user_id)
+        .execute(executor)
+        .await?
+    };
+    if result.rows_affected() == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    Ok(())
+}
+
+pub async fn touch_agent_session_activity<'e, E>(
+    executor: E,
+    session_id: &str,
+    user_id: &str,
+    last_event_id: Option<&str>,
+) -> Result<(), sqlx::Error>
+where
+    E: Executor<'e, Database = MySql> + Copy,
+{
+    let result = query(
+        "UPDATE agent_sessions \
+         SET updated_at = NOW(6), \
+             last_active_at = NOW(6), \
+             last_event_id = COALESCE(?, last_event_id) \
+         WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(last_event_id)
+    .bind(session_id)
+    .bind(user_id)
+    .execute(executor)
+    .await?;
+    if result.rows_affected() == 0 {
+        let exists = agent_session_exists_for_user(executor, session_id, user_id).await?;
+        if !exists {
+            return Err(sqlx::Error::RowNotFound);
+        }
+    }
+    Ok(())
+}
+
 pub async fn insert_agent_event_edges<'e, E>(
     executor: E,
     child_event_id: &str,

@@ -33,8 +33,8 @@ fn mysql_datetime(dt: chrono::DateTime<chrono::Utc>) -> String {
 pub(crate) async fn insert_trace_event(
     tx: &mut sqlx::Transaction<'_, MySql>,
     event: &TraceEvent,
-) -> Result<(), sqlx::Error> {
-    query(
+) -> Result<bool, sqlx::Error> {
+    let result = query(
         "INSERT IGNORE INTO agent_events \
          (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
           parent_event_id, causal_chain_id, run_id, parent_run_id, turn_id, turn_seq, \
@@ -95,25 +95,28 @@ pub(crate) async fn insert_trace_event(
     .bind(mysql_datetime(event.created_at))
     .execute(&mut **tx)
     .await?;
-    insert_agent_event_edges(
-        &mut **tx,
-        &event.event_id,
-        event.parent_event_id.as_deref(),
-        event
-            .parent_event_id
-            .as_ref()
-            .map(|id| std::slice::from_ref(id))
-            .unwrap_or(&[]),
-    )
-    .await?;
-    Ok(())
+    let inserted = result.rows_affected() > 0;
+    if inserted {
+        insert_agent_event_edges(
+            &mut **tx,
+            &event.event_id,
+            event.parent_event_id.as_deref(),
+            event
+                .parent_event_id
+                .as_ref()
+                .map(|id| std::slice::from_ref(id))
+                .unwrap_or(&[]),
+        )
+        .await?;
+    }
+    Ok(inserted)
 }
 
 pub(crate) async fn insert_core_turn_event(
     tx: &mut sqlx::Transaction<'_, MySql>,
     event: &TurnCoreEventRecord,
-) -> Result<(), sqlx::Error> {
-    query(
+) -> Result<bool, sqlx::Error> {
+    let result = query(
         "INSERT IGNORE INTO agent_events \
          (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
           parent_event_id, causal_chain_id, token_usage, llm_model_used, llm_params, reasoning_content, \
@@ -146,22 +149,25 @@ pub(crate) async fn insert_core_turn_event(
     .bind(event.token_usage.as_ref().and_then(|v| v.get("total_tokens")).and_then(|v| v.as_i64()))
     .execute(&mut **tx)
     .await?;
-    insert_agent_event_edges(
-        &mut **tx,
-        &event.event_id,
-        event.parent_event_id.as_deref(),
-        &event.parent_event_ids,
-    )
-    .await?;
-    Ok(())
+    let inserted = result.rows_affected() > 0;
+    if inserted {
+        insert_agent_event_edges(
+            &mut **tx,
+            &event.event_id,
+            event.parent_event_id.as_deref(),
+            &event.parent_event_ids,
+        )
+        .await?;
+    }
+    Ok(inserted)
 }
 
 pub(crate) async fn insert_tool_turn_event(
     tx: &mut sqlx::Transaction<'_, MySql>,
     event: &TurnToolEventRecord,
     skill_version: Option<&String>,
-) -> Result<(), sqlx::Error> {
-    query(
+) -> Result<bool, sqlx::Error> {
+    let result = query(
         "INSERT IGNORE INTO agent_events \
          (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
           parent_event_id, causal_chain_id, metadata, skill_name, skill_version, reasoning_content, \
@@ -185,14 +191,17 @@ pub(crate) async fn insert_tool_turn_event(
     .bind(metadata_duration_ms(event.metadata.as_ref()))
     .execute(&mut **tx)
     .await?;
-    insert_agent_event_edges(
-        &mut **tx,
-        &event.event_id,
-        event.parent_event_id.as_deref(),
-        &event.parent_event_ids,
-    )
-    .await?;
-    Ok(())
+    let inserted = result.rows_affected() > 0;
+    if inserted {
+        insert_agent_event_edges(
+            &mut **tx,
+            &event.event_id,
+            event.parent_event_id.as_deref(),
+            &event.parent_event_ids,
+        )
+        .await?;
+    }
+    Ok(inserted)
 }
 
 pub(crate) async fn insert_turn_decision_audit(

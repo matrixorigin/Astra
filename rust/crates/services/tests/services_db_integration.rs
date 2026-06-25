@@ -663,6 +663,112 @@ async fn load_agent_event_count_for_user_returns_zero_for_empty_owned_session() 
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn bump_agent_session_event_count_applies_delta_without_count_reconcile() {
+    let (shared, _settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let session_id = Uuid::new_v4().to_string();
+    let user_id = Uuid::new_v4().to_string();
+    let other_user_id = Uuid::new_v4().to_string();
+    cleanup_restore_fixture(&pool, std::slice::from_ref(&session_id)).await;
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'delta-event-count', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("insert session root");
+
+    astra_services::storage::bump_agent_session_event_count(
+        &pool,
+        &session_id,
+        &user_id,
+        3,
+        Some("event-3"),
+    )
+    .await
+    .expect("positive delta");
+    astra_services::storage::bump_agent_session_event_count(&pool, &session_id, &user_id, -1, None)
+        .await
+        .expect("negative delta");
+    astra_services::storage::bump_agent_session_event_count(
+        &pool,
+        &session_id,
+        &user_id,
+        -99,
+        None,
+    )
+    .await
+    .expect("saturating negative delta");
+
+    let row = sqlx::query(
+        "SELECT event_count, last_event_id FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load session root");
+    assert_eq!(row.try_get::<i64, _>("event_count").unwrap(), 0);
+    assert_eq!(
+        row.try_get::<Option<String>, _>("last_event_id").unwrap(),
+        Some("event-3".to_string())
+    );
+
+    astra_services::storage::touch_agent_session_activity(
+        &pool,
+        &session_id,
+        &user_id,
+        Some("event-activity"),
+    )
+    .await
+    .expect("touch activity for existing owner");
+    let row = sqlx::query(
+        "SELECT event_count, last_event_id FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load touched session root");
+    assert_eq!(row.try_get::<i64, _>("event_count").unwrap(), 0);
+    assert_eq!(
+        row.try_get::<Option<String>, _>("last_event_id").unwrap(),
+        Some("event-activity".to_string())
+    );
+
+    let missing_owner = astra_services::storage::bump_agent_session_event_count(
+        &pool,
+        &session_id,
+        &other_user_id,
+        1,
+        Some("event-other"),
+    )
+    .await;
+    assert!(
+        matches!(missing_owner, Err(sqlx::Error::RowNotFound)),
+        "owner mismatch must fail instead of creating or stealing a session: {missing_owner:?}"
+    );
+
+    let missing_touch = astra_services::storage::touch_agent_session_activity(
+        &pool,
+        &session_id,
+        &other_user_id,
+        Some("event-other"),
+    )
+    .await;
+    assert!(
+        matches!(missing_touch, Err(sqlx::Error::RowNotFound)),
+        "owner mismatch activity touch must fail instead of creating or stealing a session: {missing_touch:?}"
+    );
+
+    cleanup_restore_fixture(&pool, &[session_id]).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn concurrent_push_session_state_preserves_single_owner_metadata() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
