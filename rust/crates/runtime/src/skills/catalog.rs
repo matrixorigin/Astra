@@ -18,8 +18,11 @@ use std::sync::Arc;
 
 use astra_core::ErrorResponse;
 use astra_services::{
-    pagination::clamp_api_list_pagination,
-    skills::{SkillListItem, SkillListRecord, SkillRecord, SkillService},
+    pagination::MAX_API_LIST_LIMIT,
+    skills::{
+        SkillListCursor, SkillListItem, SkillListRecord, SkillRecord, SkillService,
+        skill_list_cursor_from_item,
+    },
 };
 use axum::{Json, http::StatusCode};
 
@@ -100,9 +103,9 @@ pub async fn list_server_visible_skills(
     skill_service: Arc<dyn SkillService>,
     user_id: &str,
     limit: u32,
-    offset: u32,
+    cursor: Option<SkillListCursor>,
 ) -> Result<SkillListRecord, (StatusCode, Json<ErrorResponse>)> {
-    let (limit, offset) = clamp_api_list_pagination(limit, offset);
+    let limit = limit.clamp(1, MAX_API_LIST_LIMIT);
 
     let mut skills = LocalSkillProvider::home_global()
         .discover()
@@ -127,17 +130,36 @@ pub async fn list_server_visible_skills(
         left.skill_name
             .cmp(&right.skill_name)
             .then_with(|| left.version.cmp(&right.version))
+            .then_with(|| left.skill_id.cmp(&right.skill_id))
     });
 
     let total = skills.len() as i64;
-    let start = (offset as usize).min(skills.len());
-    let end = start.saturating_add(limit as usize).min(skills.len());
+    let start = cursor
+        .as_ref()
+        .map(|cursor| {
+            skills
+                .iter()
+                .position(|item| skill_item_after_cursor(item, cursor))
+                .unwrap_or(skills.len())
+        })
+        .unwrap_or(0);
+    let end = start.saturating_add(limit as usize + 1).min(skills.len());
+    let mut page = skills[start..end].to_vec();
+    let has_more = page.len() > limit as usize;
+    if has_more {
+        page.truncate(limit as usize);
+    }
+    let next_cursor = if has_more {
+        page.last().map(skill_list_cursor_from_item).transpose()?
+    } else {
+        None
+    };
 
     Ok(SkillListRecord {
-        skills: skills[start..end].to_vec(),
+        skills: page,
         total,
         limit,
-        offset,
+        next_cursor,
     })
 }
 
@@ -264,25 +286,37 @@ async fn list_database_skill_items(
     skill_service: Arc<dyn SkillService>,
     user_id: &str,
 ) -> Result<Vec<SkillListItem>, (StatusCode, Json<ErrorResponse>)> {
-    let mut offset = 0;
+    let mut cursor = None;
     let mut skills = Vec::new();
     loop {
-        let remaining = SERVER_CATALOG_DB_MAX_ROWS.saturating_sub(offset);
+        let remaining = SERVER_CATALOG_DB_MAX_ROWS.saturating_sub(skills.len() as u32);
         if remaining == 0 {
             break;
         }
         let limit = remaining.min(SERVER_CATALOG_DB_PAGE_SIZE);
         let page = skill_service
-            .list_skills(user_id.to_string(), limit, offset)
+            .list_skills(user_id.to_string(), limit, cursor)
             .await?;
         let page_len = page.skills.len() as u32;
+        cursor = page.next_cursor.clone();
         skills.extend(page.skills);
-        offset = offset.saturating_add(page_len);
-        if page_len < limit || offset as i64 >= page.total {
+        if page_len < limit || cursor.is_none() || skills.len() as i64 >= page.total {
             break;
         }
     }
     Ok(skills)
+}
+
+fn skill_item_after_cursor(item: &SkillListItem, cursor: &SkillListCursor) -> bool {
+    (
+        item.skill_name.as_str(),
+        item.version.as_str(),
+        item.skill_id.as_str(),
+    ) > (
+        cursor.skill_name.as_str(),
+        cursor.version.as_str(),
+        cursor.skill_id.as_str(),
+    )
 }
 
 #[cfg(test)]

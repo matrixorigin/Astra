@@ -256,14 +256,14 @@ impl SkillService for TestSkillService {
         &self,
         _user_id: String,
         limit: u32,
-        offset: u32,
+        cursor: Option<astra_services::skills::SkillListCursor>,
     ) -> Result<SkillListRecord, (StatusCode, Json<ErrorResponse>)> {
-        if offset > 0 {
+        if cursor.is_some() {
             return Ok(SkillListRecord {
                 skills: Vec::new(),
                 total: 1,
                 limit,
-                offset,
+                next_cursor: None,
             });
         }
 
@@ -280,7 +280,7 @@ impl SkillService for TestSkillService {
             }],
             total: 1,
             limit,
-            offset,
+            next_cursor: None,
         })
     }
 

@@ -95,17 +95,18 @@ impl SkillProvider for DatabaseSkillProvider {
     }
 
     async fn discover(&self) -> Result<Vec<SkillManifest>, SkillError> {
-        let mut offset = 0;
+        let mut cursor = None;
         let mut manifests = Vec::new();
         loop {
-            let remaining = DATABASE_SKILL_DISCOVERY_MAX_ROWS.saturating_sub(offset);
+            let remaining =
+                DATABASE_SKILL_DISCOVERY_MAX_ROWS.saturating_sub(manifests.len() as u32);
             if remaining == 0 {
                 break;
             }
             let limit = remaining.min(DATABASE_SKILL_DISCOVERY_PAGE_SIZE);
             let result = self
                 .service
-                .list_skills(self.user_id.clone(), limit, offset)
+                .list_skills(self.user_id.clone(), limit, cursor)
                 .await
                 .map_err(|(_, err)| {
                     SkillError::Internal(format!(
@@ -128,8 +129,8 @@ impl SkillProvider for DatabaseSkillProvider {
                 }
             }));
 
-            offset = offset.saturating_add(page_len);
-            if page_len < limit || offset as i64 >= result.total {
+            cursor = result.next_cursor.clone();
+            if page_len < limit || cursor.is_none() || manifests.len() as i64 >= result.total {
                 break;
             }
         }
@@ -224,15 +225,45 @@ mod tests {
             &self,
             _user_id: String,
             limit: u32,
-            offset: u32,
+            cursor: Option<SkillListCursor>,
         ) -> Result<SkillListRecord, (StatusCode, Json<ErrorResponse>)> {
-            let end = ((offset + limit) as usize).min(self.skills.len());
-            let start = (offset as usize).min(end);
+            let start = cursor
+                .as_ref()
+                .map(|cursor| {
+                    self.skills
+                        .iter()
+                        .position(|skill| {
+                            (
+                                skill.skill_name.as_str(),
+                                skill.version.as_str(),
+                                skill.skill_id.as_str(),
+                            ) > (
+                                cursor.skill_name.as_str(),
+                                cursor.version.as_str(),
+                                cursor.skill_id.as_str(),
+                            )
+                        })
+                        .unwrap_or(self.skills.len())
+                })
+                .unwrap_or(0);
+            let end = start
+                .saturating_add(limit as usize + 1)
+                .min(self.skills.len());
+            let mut skills = self.skills[start..end].to_vec();
+            let has_more = skills.len() > limit as usize;
+            if has_more {
+                skills.truncate(limit as usize);
+            }
+            let next_cursor = if has_more {
+                skills.last().map(skill_list_cursor_from_item).transpose()?
+            } else {
+                None
+            };
             Ok(SkillListRecord {
-                skills: self.skills[start..end].to_vec(),
+                skills,
                 total: self.skills.len() as i64,
                 limit,
-                offset,
+                next_cursor,
             })
         }
 

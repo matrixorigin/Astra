@@ -1,4 +1,4 @@
-//! Live MatrixOne checks for list endpoints (`pagination` caps, `skills_registry` list SQL + index),
+//! Live MatrixOne checks for list endpoints (`pagination` caps, `skills_registry` seek list + index),
 //! cross-session audit aggregates (`get_cross_session_stats`, `list_sessions`, runtime
 //! promotions), and durable-task `resume_task` verification history reads.
 //!
@@ -9,7 +9,7 @@
 //! Uses `MATRIXONE_*` after `dotenvy` (defaults match `.env.example`).
 //!
 //! **Index note:** `ensure_core_schema` only applies new indexes on first `CREATE TABLE`. For dev DBs
-//! created before `idx_skill_active_created_at` existed, this suite runs a **test-only** `CREATE INDEX`
+//! created before `idx_skill_active_name_ver` existed, this suite runs a **test-only** `CREATE INDEX`
 //! (ignores duplicate-name errors) so the listing path is validated against the intended DDL.
 
 use astra_core::{MatrixOneSettings, SharedPool};
@@ -36,11 +36,11 @@ use astra_services::{
     DatabaseReflectService, DatabaseReplayService, DatabaseSessionArtifactStore,
     DatabaseSessionService, DatabaseSkillService, DecisionCreateRequestData, DecisionListFilter,
     DecisionService, DurableTaskLifecycle, EventCreateRequestData, EventListFilter, EventService,
-    IntrospectionService, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET, MAX_MARKETPLACE_SEARCH_OFFSET,
-    MarketplaceService, MarketplaceStatsService, MatrixOneDurableTaskLifecycle,
-    MatrixOneSyncService, ReflectService, ReplayService, SessionArtifactJsonStore,
-    SessionArtifactStore, SessionArtifactStoreError, SessionListFilter, SessionService,
-    SkillSearchQuery, SkillService, SnapshotCreateRequestData, SnapshotListFilter,
+    IntrospectionService, MAX_API_LIST_LIMIT, MAX_MARKETPLACE_SEARCH_OFFSET, MarketplaceService,
+    MarketplaceStatsService, MatrixOneDurableTaskLifecycle, MatrixOneSyncService, ReflectService,
+    ReplayService, SessionArtifactJsonStore, SessionArtifactStore, SessionArtifactStoreError,
+    SessionListFilter, SessionService, SkillSearchQuery, SkillService, SnapshotCreateRequestData,
+    SnapshotListFilter,
 };
 use sqlx::Row;
 use std::collections::HashSet;
@@ -58,7 +58,7 @@ async fn ensure_skill_list_index(pool: &sqlx::Pool<sqlx::MySql>) {
     let r = sqlx::query(
         "SELECT COUNT(*) AS c FROM information_schema.statistics \
          WHERE table_schema = DATABASE() AND table_name = 'skills_registry' \
-         AND index_name = 'idx_skill_active_created_at'",
+         AND index_name = 'idx_skill_active_name_ver'",
     )
     .fetch_one(pool)
     .await
@@ -68,7 +68,7 @@ async fn ensure_skill_list_index(pool: &sqlx::Pool<sqlx::MySql>) {
         return;
     }
     let res = sqlx::query(
-        "CREATE INDEX idx_skill_active_created_at ON skills_registry (is_active, created_at)",
+        "CREATE INDEX idx_skill_active_name_ver ON skills_registry (is_active, skill_name, version)",
     )
     .execute(pool)
     .await;
@@ -77,7 +77,7 @@ async fn ensure_skill_list_index(pool: &sqlx::Pool<sqlx::MySql>) {
         if msg.contains("Duplicate") || msg.contains("1061") || msg.contains("already exists") {
             return;
         }
-        panic!("CREATE INDEX idx_skill_active_created_at: {e}");
+        panic!("CREATE INDEX idx_skill_active_name_ver: {e}");
     }
 }
 
@@ -147,22 +147,26 @@ async fn skills_registry_index_list_order_and_get_skill_definition() {
     let idx_row = sqlx::query(
         "SELECT COUNT(*) AS c FROM information_schema.statistics \
          WHERE table_schema = DATABASE() AND table_name = 'skills_registry' \
-         AND index_name = 'idx_skill_active_created_at'",
+         AND index_name = 'idx_skill_active_name_ver'",
     )
     .fetch_one(&pool)
     .await
     .expect("information_schema query");
     assert!(idx_row.try_get::<i64, _>("c").unwrap_or(0) >= 1);
 
-    let id_a = Uuid::new_v4().to_string();
-    let id_b = Uuid::new_v4().to_string();
-    let id_c = Uuid::new_v4().to_string();
+    let id_a = format!("{}-a", Uuid::new_v4());
+    let id_b = format!("{}-b", Uuid::new_v4());
+    let id_c = format!("{}-c", Uuid::new_v4());
+    let name_base = format!("zzzz-it-skill-{}", Uuid::new_v4());
+    let name_a = format!("{name_base}-a");
+    let name_b = format!("{name_base}-b");
+    let name_c = format!("{name_base}-c");
     let owner_id = format!("test-user-{}", Uuid::new_v4());
 
-    for (sid, ts) in [
-        (&id_a, "2026-04-01 10:00:00.000000"),
-        (&id_b, "2026-04-01 12:00:00.000000"),
-        (&id_c, "2026-04-01 11:00:00.000000"),
+    for (sid, skill_name, ts) in [
+        (&id_a, &name_a, "2026-04-01 10:00:00.000000"),
+        (&id_b, &name_b, "2026-04-01 12:00:00.000000"),
+        (&id_c, &name_c, "2026-04-01 11:00:00.000000"),
     ] {
         sqlx::query(
             "INSERT INTO skills_registry \
@@ -171,7 +175,7 @@ async fn skills_registry_index_list_order_and_get_skill_definition() {
              VALUES (?, ?, '1.0', 'd', CAST(? AS JSON), 1, 'active', 'user', 'c', ?, ?, ?)",
         )
         .bind(sid)
-        .bind(sid)
+        .bind(skill_name)
         .bind(serde_json::json!({"marker": sid, "blob": "x".repeat(4000)}).to_string())
         .bind(&owner_id)
         .bind(ts)
@@ -183,24 +187,59 @@ async fn skills_registry_index_list_order_and_get_skill_definition() {
 
     let svc = DatabaseSkillService::new(settings.clone()).with_pool(shared.clone());
     let page = svc
-        .list_skills(owner_id.clone(), u32::MAX, 0)
+        .list_skills(owner_id.clone(), u32::MAX, None)
         .await
         .expect("list_skills");
     assert_eq!(page.limit, MAX_API_LIST_LIMIT);
-    assert_eq!(page.offset, 0);
 
+    let fixture_start_cursor = astra_services::skills::SkillListCursor {
+        skill_name: name_base,
+        version: "0".to_string(),
+        skill_id: "0".to_string(),
+    };
+    let fixture_page = svc
+        .list_skills(owner_id.clone(), 3, Some(fixture_start_cursor.clone()))
+        .await
+        .expect("list fixture skills");
     let want: HashSet<String> = [id_a.clone(), id_b.clone(), id_c.clone()]
         .into_iter()
         .collect();
-    let ours: Vec<_> = page
+    let ours: Vec<_> = fixture_page
         .skills
         .iter()
         .filter(|s| want.contains(&s.skill_id))
         .collect();
     assert_eq!(ours.len(), 3);
-    assert_eq!(ours[0].skill_id, id_b, "newest first");
-    assert_eq!(ours[1].skill_id, id_c);
-    assert_eq!(ours[2].skill_id, id_a);
+    assert_eq!(ours[0].skill_id, id_a, "name seek order");
+    assert_eq!(ours[1].skill_id, id_b);
+    assert_eq!(ours[2].skill_id, id_c);
+
+    let first_skill_page = svc
+        .list_skills(owner_id.clone(), 1, Some(fixture_start_cursor))
+        .await
+        .expect("first skill page");
+    assert_eq!(
+        first_skill_page
+            .skills
+            .iter()
+            .filter(|skill| want.contains(&skill.skill_id))
+            .map(|skill| skill.skill_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![id_a.as_str()]
+    );
+    let second_skill_page = svc
+        .list_skills(owner_id.clone(), 1, first_skill_page.next_cursor.clone())
+        .await
+        .expect("second skill page");
+    assert_eq!(
+        second_skill_page
+            .skills
+            .iter()
+            .filter(|skill| want.contains(&skill.skill_id))
+            .map(|skill| skill.skill_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![id_b.as_str()]
+    );
 
     let detail = svc
         .get_skill(owner_id.clone(), id_b.clone(), None)
@@ -210,13 +249,6 @@ async fn skills_registry_index_list_order_and_get_skill_definition() {
         detail.metadata.is_some(),
         "detail path must still read skill_definition / metadata"
     );
-
-    let deep = svc
-        .list_skills(owner_id, 10, MAX_API_LIST_OFFSET + 1)
-        .await
-        .expect("list_skills offset clamp");
-    assert_eq!(deep.offset, MAX_API_LIST_OFFSET);
-    assert_eq!(deep.limit, 10);
 
     cleanup_skills_by_ids(&pool, &[id_a, id_b, id_c]).await;
 }
@@ -262,7 +294,7 @@ async fn skills_registry_visibility_is_user_owned_union_public() {
 
     let svc = DatabaseSkillService::new(settings).with_pool(shared);
     let owner_page = svc
-        .list_skills(owner_id.clone(), 100, 0)
+        .list_skills(owner_id.clone(), 100, None)
         .await
         .expect("owner list_skills should succeed");
     let owner_names: HashSet<_> = owner_page

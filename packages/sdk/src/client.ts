@@ -908,7 +908,13 @@ export class AstraClient {
   ): Promise<RuntimeSkillListResponse> {
     const q = buildQueryString({
       ...(params.limit !== undefined ? { limit: params.limit } : {}),
-      ...(params.offset !== undefined ? { offset: params.offset } : {}),
+      ...(params.cursor
+        ? {
+            after_skill_name: params.cursor.skill_name,
+            after_version: params.cursor.version,
+            after_skill_id: params.cursor.skill_id,
+          }
+        : {}),
     });
     return this.fetch<RuntimeSkillListResponse>(`${PATH_SKILLS}${q}`);
   }

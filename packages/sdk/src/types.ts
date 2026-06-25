@@ -1123,12 +1123,18 @@ export type RuntimeSkillListResponse = {
   skills?: RuntimeSkillListItem[];
   total?: number;
   limit?: number;
-  offset?: number;
+  next_cursor?: RuntimeSkillListCursor | null;
+};
+
+export type RuntimeSkillListCursor = {
+  skill_name: string;
+  version: string;
+  skill_id: string;
 };
 
 export type RuntimeSkillListParams = {
   limit?: number;
-  offset?: number;
+  cursor?: RuntimeSkillListCursor;
 };
 
 /** JSON body for `POST /skills` — matches services `RegisterSkillRequest`. */

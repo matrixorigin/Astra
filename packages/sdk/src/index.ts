@@ -90,6 +90,7 @@ export type {
   RuntimeArtifactListResponse,
   RuntimeArtifactListParams,
   RuntimeSkillListItem,
+  RuntimeSkillListCursor,
   RuntimeSkillListParams,
   RuntimeSkillListResponse,
   CapabilityServerType,

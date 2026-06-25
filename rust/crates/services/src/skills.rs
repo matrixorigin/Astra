@@ -8,7 +8,7 @@ use astra_core::{
     is_duplicate_key_error,
 };
 
-use crate::pagination::clamp_api_list_pagination;
+use crate::pagination::MAX_API_LIST_LIMIT;
 
 // ── Data types ───────────────────────────────────────────────────────────────
 
@@ -43,7 +43,14 @@ pub struct SkillListRecord {
     pub skills: Vec<SkillListItem>,
     pub total: i64,
     pub limit: u32,
-    pub offset: u32,
+    pub next_cursor: Option<SkillListCursor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillListCursor {
+    pub skill_name: String,
+    pub version: String,
+    pub skill_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -146,6 +153,11 @@ const SKILL_REGISTRY_LIST_SELECT: &str = "\
     skill_id, skill_name, version, description, \
     status, source, category, \
     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at";
+const SKILL_LIST_ORDER_SQL: &str = " ORDER BY skill_name ASC, version ASC, skill_id ASC LIMIT ?";
+const SKILL_LIST_CURSOR_SQL: &str = "\
+    AND (skill_name > ? \
+     OR (skill_name = ? AND version > ?) \
+     OR (skill_name = ? AND version = ? AND skill_id > ?))";
 
 /// Visibility rule for database-backed skills.
 ///
@@ -168,6 +180,55 @@ const VISIBLE_SKILL_PREDICATE: &str = "is_active = 1 AND (is_public = 1 OR creat
 /// published later.
 const USER_OWNED_SKILL_FIRST_ORDER: &str =
     "CASE WHEN created_by = ? THEN 0 ELSE 1 END, created_at DESC";
+
+fn validate_skill_list_limit(limit: u32) -> u32 {
+    limit.clamp(1, MAX_API_LIST_LIMIT)
+}
+
+fn skill_list_query_limit(limit: u32) -> i64 {
+    i64::from(limit) + 1
+}
+
+fn validate_skill_list_cursor(
+    cursor: &SkillListCursor,
+) -> Result<SkillListCursor, (StatusCode, Json<ErrorResponse>)> {
+    let skill_name = cursor.skill_name.trim();
+    let version = cursor.version.trim();
+    let skill_id = cursor.skill_id.trim();
+    if skill_name.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid skill list cursor: skill_name is required",
+        ));
+    }
+    if version.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid skill list cursor: version is required",
+        ));
+    }
+    if skill_id.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid skill list cursor: skill_id is required",
+        ));
+    }
+    Ok(SkillListCursor {
+        skill_name: skill_name.to_string(),
+        version: version.to_string(),
+        skill_id: skill_id.to_string(),
+    })
+}
+
+pub fn skill_list_cursor_from_item(
+    item: &SkillListItem,
+) -> Result<SkillListCursor, (StatusCode, Json<ErrorResponse>)> {
+    validate_skill_list_cursor(&SkillListCursor {
+        skill_name: item.skill_name.clone(),
+        version: item.version.clone(),
+        skill_id: item.skill_id.clone(),
+    })
+}
 
 // ── Idempotency classifiers ───────────────────────────────────────────────────
 
@@ -246,7 +307,7 @@ pub trait SkillService: Send + Sync {
         &self,
         user_id: String,
         limit: u32,
-        offset: u32,
+        cursor: Option<SkillListCursor>,
     ) -> Result<SkillListRecord, (StatusCode, Json<ErrorResponse>)>;
 
     async fn get_skill(
@@ -318,10 +379,10 @@ impl SkillService for DatabaseSkillService {
         &self,
         user_id: String,
         limit: u32,
-        offset: u32,
+        cursor: Option<SkillListCursor>,
     ) -> Result<SkillListRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
-        let (limit, offset) = clamp_api_list_pagination(limit, offset);
+        let limit = validate_skill_list_limit(limit);
 
         let count_sql =
             format!("SELECT COUNT(*) AS cnt FROM skills_registry WHERE {VISIBLE_SKILL_PREDICATE}",);
@@ -332,19 +393,35 @@ impl SkillService for DatabaseSkillService {
             .map_err(internal_error)?;
         let total: i64 = count_row.try_get("cnt").map_err(internal_error)?;
 
-        let list_sql = format!(
-            "SELECT {SKILL_REGISTRY_LIST_SELECT} FROM skills_registry WHERE {VISIBLE_SKILL_PREDICATE} \
-             ORDER BY created_at DESC LIMIT ? OFFSET ?",
-        );
-        let rows = query(&list_sql)
-            .bind(&user_id)
-            .bind(limit)
-            .bind(offset)
+        let list_sql = if cursor.is_some() {
+            format!(
+                "SELECT {SKILL_REGISTRY_LIST_SELECT} FROM skills_registry \
+                 WHERE {VISIBLE_SKILL_PREDICATE} {SKILL_LIST_CURSOR_SQL}{SKILL_LIST_ORDER_SQL}",
+            )
+        } else {
+            format!(
+                "SELECT {SKILL_REGISTRY_LIST_SELECT} FROM skills_registry \
+                 WHERE {VISIBLE_SKILL_PREDICATE}{SKILL_LIST_ORDER_SQL}",
+            )
+        };
+        let mut list_query = query(&list_sql).bind(&user_id);
+        if let Some(cursor) = &cursor {
+            let cursor = validate_skill_list_cursor(cursor)?;
+            list_query = list_query
+                .bind(cursor.skill_name.clone())
+                .bind(cursor.skill_name.clone())
+                .bind(cursor.version.clone())
+                .bind(cursor.skill_name)
+                .bind(cursor.version)
+                .bind(cursor.skill_id);
+        }
+        let rows = list_query
+            .bind(skill_list_query_limit(limit))
             .fetch_all(&pool)
             .await
             .map_err(internal_error)?;
 
-        let skills: Vec<SkillListItem> = rows
+        let mut skills: Vec<SkillListItem> = rows
             .iter()
             .map(|row| -> Result<SkillListItem, _> {
                 Ok(SkillListItem {
@@ -365,12 +442,21 @@ impl SkillService for DatabaseSkillService {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let has_more = skills.len() > limit as usize;
+        if has_more {
+            skills.truncate(limit as usize);
+        }
+        let next_cursor = if has_more {
+            skills.last().map(skill_list_cursor_from_item).transpose()?
+        } else {
+            None
+        };
 
         Ok(SkillListRecord {
             skills,
             total,
             limit,
-            offset,
+            next_cursor,
         })
     }
 
@@ -824,7 +910,7 @@ impl SkillService for UnconfiguredSkillService {
         &self,
         _: String,
         _: u32,
-        _: u32,
+        _: Option<SkillListCursor>,
     ) -> Result<SkillListRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(internal_error("skill service not configured"))
     }
@@ -907,8 +993,29 @@ fn default_priority() -> i32 {
 pub struct SkillListQuery {
     #[serde(default = "default_limit")]
     pub limit: u32,
-    #[serde(default)]
-    pub offset: u32,
+    pub after_skill_name: Option<String>,
+    pub after_version: Option<String>,
+    pub after_skill_id: Option<String>,
+}
+
+impl SkillListQuery {
+    pub fn cursor(&self) -> Result<Option<SkillListCursor>, &'static str> {
+        match (
+            &self.after_skill_name,
+            &self.after_version,
+            &self.after_skill_id,
+        ) {
+            (None, None, None) => Ok(None),
+            (Some(skill_name), Some(version), Some(skill_id)) => Ok(Some(SkillListCursor {
+                skill_name: skill_name.clone(),
+                version: version.clone(),
+                skill_id: skill_id.clone(),
+            })),
+            _ => Err(
+                "skill list cursor requires after_skill_name, after_version, and after_skill_id",
+            ),
+        }
+    }
 }
 
 fn default_limit() -> u32 {
@@ -1029,7 +1136,61 @@ mod tests {
     fn skill_list_query_defaults() {
         let q: SkillListQuery = serde_json::from_str("{}").unwrap();
         assert_eq!(q.limit, 50);
-        assert_eq!(q.offset, 0);
+        assert_eq!(q.cursor().unwrap(), None);
+    }
+
+    #[test]
+    fn skill_list_query_requires_complete_cursor() {
+        let q: SkillListQuery =
+            serde_json::from_str(r#"{"after_skill_name":"alpha","after_version":"1.0"}"#).unwrap();
+        assert_eq!(
+            q.cursor().unwrap_err(),
+            "skill list cursor requires after_skill_name, after_version, and after_skill_id"
+        );
+    }
+
+    #[test]
+    fn skill_list_limit_has_hard_cap_and_minimum() {
+        assert_eq!(validate_skill_list_limit(0), 1);
+        assert_eq!(validate_skill_list_limit(10), 10);
+        assert_eq!(validate_skill_list_limit(u32::MAX), MAX_API_LIST_LIMIT);
+    }
+
+    #[test]
+    fn skill_list_cursor_rejects_empty_fields() {
+        let ok = validate_skill_list_cursor(&SkillListCursor {
+            skill_name: " alpha ".to_string(),
+            version: " 1.0 ".to_string(),
+            skill_id: " alpha@1.0 ".to_string(),
+        })
+        .unwrap();
+        assert_eq!(ok.skill_name, "alpha");
+        assert_eq!(ok.version, "1.0");
+        assert_eq!(ok.skill_id, "alpha@1.0");
+
+        let err = validate_skill_list_cursor(&SkillListCursor {
+            skill_name: "alpha".to_string(),
+            version: "".to_string(),
+            skill_id: "alpha@1.0".to_string(),
+        })
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn skill_list_sql_contract_uses_seek_cursor_not_offset() {
+        assert!(
+            !SKILL_LIST_ORDER_SQL
+                .to_ascii_uppercase()
+                .contains(" OFFSET ")
+        );
+        assert!(
+            !SKILL_LIST_CURSOR_SQL
+                .to_ascii_uppercase()
+                .contains(" OFFSET ")
+        );
+        assert!(SKILL_LIST_ORDER_SQL.contains("skill_name ASC"));
+        assert!(SKILL_LIST_CURSOR_SQL.contains("skill_id > ?"));
     }
 
     #[test]

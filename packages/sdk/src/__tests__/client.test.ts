@@ -869,7 +869,7 @@ describe("AstraClient — Skills", () => {
       ],
       total: 1,
       limit: 50,
-      offset: 0,
+      next_cursor: null,
     });
     const result = await createClient().listSkills();
     expect(result).toHaveLength(1);
@@ -895,19 +895,30 @@ describe("AstraClient — Skills", () => {
       ],
       total: 11,
       limit: 1,
-      offset: 10,
+      next_cursor: {
+        skill_name: "web-search",
+        version: "2",
+        skill_id: "id2",
+      },
     });
 
     const result = await createClient().listRuntimeSkills({
       limit: 1,
-      offset: 10,
+      cursor: {
+        skill_name: "web-search",
+        version: "2",
+        skill_id: "id2",
+      },
     });
     expect(result.total).toBe(11);
     expect(result.skills?.[0]?.source).toBe("database");
+    expect(result.next_cursor?.skill_id).toBe("id2");
     const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
     expect(url).toContain("/skills");
     expect(url).toContain("limit=1");
-    expect(url).toContain("offset=10");
+    expect(url).toContain("after_skill_name=web-search");
+    expect(url).toContain("after_version=2");
+    expect(url).toContain("after_skill_id=id2");
   });
 });
 

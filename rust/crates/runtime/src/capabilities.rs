@@ -19,7 +19,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use astra_services::skills::{SkillListRecord, SkillRecord, SkillService};
+use astra_services::skills::{SkillListCursor, SkillListRecord, SkillRecord, SkillService};
 use astra_skills::manifest::{
     ExecutionContext, LoadedSkill, SkillManifest, SkillSourceKind, TrustTier,
 };
@@ -316,23 +316,30 @@ impl RemoteSkillCatalogProvider {
         })
     }
 
-    async fn list_page(&self, limit: u32, offset: u32) -> Result<SkillListRecord, SkillError> {
+    async fn list_page(
+        &self,
+        limit: u32,
+        cursor: Option<SkillListCursor>,
+    ) -> Result<SkillListRecord, SkillError> {
         let token = self.current_token()?;
+        let mut params = vec![("limit", limit.to_string())];
+        if let Some(cursor) = &cursor {
+            params.push(("after_skill_name", cursor.skill_name.clone()));
+            params.push(("after_version", cursor.version.clone()));
+            params.push(("after_skill_id", cursor.skill_id.clone()));
+        }
         let body = self
             .api
-            .get_skills_query_text(
-                &token,
-                &[("limit", limit.to_string()), ("offset", offset.to_string())],
-            )
+            .get_skills_query_text(&token, &params)
             .await
             .map_err(|source| {
                 SkillError::LoadFailed(format!(
-                    "failed to list remote skill catalog at offset {offset}: {source}"
+                    "failed to list remote skill catalog page: {source}"
                 ))
             })?;
         serde_json::from_str(&body).map_err(|source| {
             SkillError::ParseFailed(format!(
-                "failed to parse remote skill catalog page at offset {offset}: {source}"
+                "failed to parse remote skill catalog page: {source}"
             ))
         })
     }
@@ -361,16 +368,17 @@ impl SkillProvider for RemoteSkillCatalogProvider {
     }
 
     async fn discover(&self) -> Result<Vec<SkillManifest>, SkillError> {
-        let mut offset = 0;
+        let mut cursor = None;
         let mut manifests = Vec::new();
         loop {
-            let remaining = REMOTE_SKILL_MAX_ROWS.saturating_sub(offset);
+            let remaining = REMOTE_SKILL_MAX_ROWS.saturating_sub(manifests.len() as u32);
             if remaining == 0 {
                 break;
             }
             let limit = remaining.min(REMOTE_SKILL_PAGE_SIZE);
-            let page = self.list_page(limit, offset).await?;
+            let page = self.list_page(limit, cursor).await?;
             let page_len = page.skills.len() as u32;
+            cursor = page.next_cursor.clone();
             manifests.extend(page.skills.into_iter().map(|item| SkillManifest {
                 name: item.skill_name,
                 version: item.version.parse().unwrap_or_default(),
@@ -379,8 +387,7 @@ impl SkillProvider for RemoteSkillCatalogProvider {
                 category: item.category,
                 ..Default::default()
             }));
-            offset = offset.saturating_add(page_len);
-            if page_len < limit || offset as i64 >= page.total {
+            if page_len < limit || cursor.is_none() || manifests.len() as i64 >= page.total {
                 break;
             }
         }
